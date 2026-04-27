@@ -74,7 +74,7 @@ The TUI is SSH-friendly — works on industrial Linux hosts where no GUI
 is permitted. Install with `pip install 'rivet[tui]'`. v0.1 polls; v0.2
 moves to Textual for non-blocking keystrokes (stream toggle, drill-down,
 filter prompt). For the paid hosted aggregator, see
-[`cloud/tui/`](cloud/tui/).
+[`rivet-cloud`](https://github.com/nerdapplabs/rivet-cloud).
 
 ---
 
@@ -109,9 +109,7 @@ filter prompt). For the paid hosted aggregator, see
 
 ## Status
 
-Pre-v1. Build-as-if-extracted — this folder mirrors the shape the reference
-implementation takes when extraction triggers fire (second team or external
-customer wants it standalone).
+Pre-v1. This is the standalone rivet repo — Apache-2.0 SDK, open for contribution once P0-1 / P0-2 land.
 
 ## License
 
