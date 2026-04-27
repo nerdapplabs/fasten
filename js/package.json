@@ -1,0 +1,44 @@
+{
+  "name": "rivet",
+  "version": "0.1.0-alpha.0",
+  "description": "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./shim/http": "./src/shim/http.js",
+    "./shim/mqtt": "./src/shim/mqtt.js",
+    "./shim/scheduler": "./src/shim/scheduler.js",
+    "./store/sqlite": "./src/store/sqlite.js",
+    "./store/postgres": "./src/store/postgres.js",
+    "./reader": "./src/reader/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "lint": "biome check src/"
+  },
+  "keywords": [
+    "audit",
+    "logging",
+    "observability",
+    "correlation",
+    "request-id",
+    "compliance",
+    "mqtt",
+    "industrial-edge"
+  ],
+  "author": "nerdAppLabs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nerdapplabs/rivet"
+  },
+  "homepage": "https://rivet.dev"
+}
