@@ -1,6 +1,6 @@
-# rivet
+# fasten
 
-> *Logs tell you what happened. Traces tell you where. rivet tells you
+> *Logs tell you what happened. Traces tell you where. fasten tells you
 > who changed what — and why.*
 
 Audit + correlation SDK. 5 Ws + H anchors enforced at the type level,
@@ -15,18 +15,18 @@ surface. Apache-2.0.
 ## Install
 
 ```bash
-pip install rivet                                       # Python (reference)
-pip install 'rivet[tui]'                                # + bundled live TUI
-go get github.com/nerdapplabs/rivet-go                 # Go
-npm install @nerdapplabs/rivet                         # Node / TypeScript
-# C++14: copy cpp/include/rivet.hpp — zero dependencies
+pip install fasten                                       # Python (reference)
+pip install 'fasten[tui]'                                # + bundled live TUI
+go get github.com/nerdapplabs/fasten-go                 # Go
+npm install @nerdapplabs/fasten                         # Node / TypeScript
+# C++14: copy cpp/include/fasten.hpp — zero dependencies
 ```
 
 ## Quickstart
 
 ```python
-import rivet
-from rivet.codes import register, Meta, Severity, RetentionClass
+import fasten
+from fasten.codes import register, Meta, Severity, RetentionClass
 
 register("user", [
     ("USER_CREATED", Meta(id="USER_CREATED", domain="user", category="account",
@@ -35,11 +35,11 @@ register("user", [
                           retention_class=RetentionClass.LONG)),
 ])
 
-rivet.init(service_id="auth-service", node_id="host-01")
+fasten.init(service_id="auth-service", node_id="host-01")
 
-rivet.emit(code="USER_CREATED", target="u-42",
+fasten.emit(code="USER_CREATED", target="u-42",
            actor="admin", detail={"email": "alice@example.com"})
-rivet.log.info("signup_complete", user_id="u-42")
+fasten.log.info("signup_complete", user_id="u-42")
 ```
 
 Both lines share the same `request_id` on stdout. That's the join key.
@@ -48,7 +48,7 @@ Both lines share the same `request_id` on stdout. That's the join key.
 
 ## What it solves
 
-| Question                                          | Before rivet          | With rivet            |
+| Question                                          | Before fasten          | With fasten            |
 |---------------------------------------------------|-----------------------|-----------------------|
 | Who deployed this config at 14:32?                | grep + Slack + 20 min | `?since=&until=` → 30 s |
 | Which HTTP request caused this MQTT disconnect?   | Unknown               | Same `request_id`     |
@@ -60,21 +60,21 @@ Both lines share the same `request_id` on stdout. That's the join key.
 ## Bundled tooling
 
 The Python reference SDK ships a CLI and a live TUI — both run against
-any rivet-mounted service (local SQLite, edge-manager, or rivet Cloud)
+any fasten-mounted service (local SQLite, edge-manager, or fasten Cloud)
 via the standard `/api/v1/logs/{audit,sys,api}` reader.
 
 | Tool       | Invoke                          | What it does                                     |
 |------------|---------------------------------|--------------------------------------------------|
-| CLI        | `rivet dump`                    | Print registered codes (CI consistency gate)     |
-| CLI        | `rivet tail --stream sys`       | Stream rows from a mounted reader                |
-| CLI        | `rivet doctor`                  | Verify init config + correlation wiring          |
-| **TUI**    | `rivet tui --request-id <id>`   | Live multi-pane audit + sys + API feed (Rich)    |
+| CLI        | `fasten dump`                    | Print registered codes (CI consistency gate)     |
+| CLI        | `fasten tail --stream sys`       | Stream rows from a mounted reader                |
+| CLI        | `fasten doctor`                  | Verify init config + correlation wiring          |
+| **TUI**    | `fasten tui --request-id <id>`   | Live multi-pane audit + sys + API feed (Rich)    |
 
 The TUI is SSH-friendly — works on industrial Linux hosts where no GUI
-is permitted. Install with `pip install 'rivet[tui]'`. v0.1 polls; v0.2
+is permitted. Install with `pip install 'fasten[tui]'`. v0.1 polls; v0.2
 moves to Textual for non-blocking keystrokes (stream toggle, drill-down,
 filter prompt). For the paid hosted aggregator, see
-[`rivet-cloud`](https://github.com/nerdapplabs/rivet-cloud).
+[`fasten-cloud`](https://github.com/nerdapplabs/fasten-cloud).
 
 ---
 
@@ -86,7 +86,7 @@ filter prompt). For the paid hosted aggregator, see
 | Go         | skeleton       | [`go/`](go/)                                      |
 | Node.js    | skeleton       | [`js/`](js/)                                      |
 | TypeScript | ships with JS  | [`js/src/index.d.ts`](js/src/index.d.ts)          |
-| C++14      | single-header  | [`cpp/include/rivet.hpp`](cpp/include/rivet.hpp)  |
+| C++14      | single-header  | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)  |
 | Rust       | skeleton       | [`rust/`](rust/)                                  |
 | Java       | skeleton       | [`java/`](java/)                                  |
 
@@ -109,7 +109,7 @@ filter prompt). For the paid hosted aggregator, see
 
 ## Status
 
-Pre-v1. This is the standalone rivet repo — Apache-2.0 SDK, open for contribution once P0-1 / P0-2 land.
+Pre-v1. This is the standalone fasten repo — Apache-2.0 SDK, open for contribution once P0-1 / P0-2 land.
 
 ## License
 

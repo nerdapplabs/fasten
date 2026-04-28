@@ -13,7 +13,7 @@ from typing import Iterator, Optional
 
 
 _request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "rivet_request_id", default=None
+    "fasten_request_id", default=None
 )
 
 

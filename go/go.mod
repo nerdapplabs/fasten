@@ -1,3 +1,3 @@
-module github.com/nerdapplabs/rivet-go
+module github.com/nerdapplabs/fasten-go
 
 go 1.22

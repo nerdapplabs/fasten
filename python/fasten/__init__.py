@@ -1,5 +1,5 @@
 """
-rivet — audit + correlation SDK.
+fasten — audit + correlation SDK.
 
 Kernel:
   - `request_id` context carrier (ambient across every emission)

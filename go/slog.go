@@ -1,4 +1,4 @@
-package rivet
+package fasten
 
 import (
 	"context"
@@ -7,13 +7,13 @@ import (
 )
 
 // SlogHandler wraps an underlying slog.Handler and pushes each log record
-// into rivet's syslog ring buffer. The underlying handler still writes to
+// into fasten's syslog ring buffer. The underlying handler still writes to
 // its own destination (e.g. stdout JSON) — no double-write occurs.
 //
 // Usage:
 //
 //	base := slog.NewJSONHandler(os.Stdout, nil)
-//	logger := slog.New(rivet.NewSlogHandler(base))
+//	logger := slog.New(fasten.NewSlogHandler(base))
 //	slog.SetDefault(logger)
 type SlogHandler struct {
 	next      slog.Handler
@@ -22,8 +22,8 @@ type SlogHandler struct {
 	group     string
 }
 
-// NewSlogHandler wraps next and pushes to the global rivet transport.
-// If rivet is not yet initialised, the handler degrades to next-only.
+// NewSlogHandler wraps next and pushes to the global fasten transport.
+// If fasten is not yet initialised, the handler degrades to next-only.
 func NewSlogHandler(next slog.Handler) *SlogHandler {
 	return &SlogHandler{next: next, transport: _transport}
 }

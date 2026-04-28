@@ -1,8 +1,8 @@
 """
-`rivet tail` — polling client for /api/v1/logs/{audit,sys,api}.
+`fasten tail` — polling client for /api/v1/logs/{audit,sys,api}.
 
 Polls the reader every `--interval` seconds, dedupes by timestamp,
-prints only new rows. Honours RIVET_READER_KEY (sends as X-Rivet-Key
+prints only new rows. Honours FASTEN_READER_KEY (sends as X-Fasten-Key
 once P0-4 ships; harmless to send today). `--json` emits NDJSON.
 
 SSE / long-poll path lands once the reader exposes /stream — out of
@@ -38,15 +38,15 @@ def _fetch(
 
     req = urllib.request.Request(url)
     if api_key:
-        req.add_header("X-Rivet-Key", api_key)
+        req.add_header("X-Fasten-Key", api_key)
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             payload = json.loads(resp.read())
     except (urllib.error.URLError, TimeoutError) as e:
-        sys.stderr.write(f"rivet tail: reader unreachable ({e})\n")
+        sys.stderr.write(f"fasten tail: reader unreachable ({e})\n")
         return []
     except json.JSONDecodeError as e:
-        sys.stderr.write(f"rivet tail: bad JSON from reader ({e})\n")
+        sys.stderr.write(f"fasten tail: bad JSON from reader ({e})\n")
         return []
     rows = payload.get("rows") or []
     return rows if isinstance(rows, list) else []
@@ -100,7 +100,7 @@ def run(
         sys.stderr.write(f"unknown stream {stream!r} — choose audit / sys / api\n")
         return 2
 
-    api_key = api_key or os.environ.get("RIVET_READER_KEY")
+    api_key = api_key or os.environ.get("FASTEN_READER_KEY")
 
     # Start window: 5 min back, so first poll picks up recent context.
     last_seen = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()

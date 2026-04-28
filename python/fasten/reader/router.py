@@ -5,8 +5,8 @@ Framework-agnostic core + FastAPI adapter. Adopters on other frameworks
 (Flask, Sanic, aiohttp) wrap the core handler functions.
 
 Usage:
-    from rivet.reader import router, init as init_reader
-    init_reader(rivet._get_audit_store(), rivet._get_stdout())
+    from fasten.reader import router, init as init_reader
+    init_reader(fasten._get_audit_store(), fasten._get_stdout())
     app.include_router(router(), prefix="/api/v1/logs")
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ def router() -> Any:
         from fastapi import APIRouter, Query
     except ImportError as e:
         raise RuntimeError(
-            "rivet.reader.router() requires fastapi; install rivet[fastapi]"
+            "fasten.reader.router() requires fastapi; install fasten[fastapi]"
         ) from e
 
     r = APIRouter()

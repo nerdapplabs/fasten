@@ -35,7 +35,7 @@ _audit_store: Any = None
 _api_store: Any = None
 _stdout: Optional[StdoutTransport] = None
 _redactor: Redactor = Redactor()
-_logger = logging.getLogger("rivet")
+_logger = logging.getLogger("fasten")
 
 
 def init(
@@ -48,34 +48,34 @@ def init(
     redact_replacement: str = "***",
 ) -> None:
     """
-    Initialise rivet. Any argument omitted falls back to env var.
+    Initialise fasten. Any argument omitted falls back to env var.
 
-    Required (env or arg): RIVET_SERVICE_ID, RIVET_NODE_ID.
-    Optional: RIVET_TENANT_ID, RIVET_AUDIT_DSN, RIVET_API_DSN.
+    Required (env or arg): FASTEN_SERVICE_ID, FASTEN_NODE_ID.
+    Optional: FASTEN_TENANT_ID, FASTEN_AUDIT_DSN, FASTEN_API_DSN.
 
     Calling init() with no arguments = "everything from env" — preferred.
     """
     global _service_id, _node_id, _tenant_id, _audit_store, _api_store, _stdout, _redactor
 
-    _service_id = service_id or os.environ.get("RIVET_SERVICE_ID") or ""
-    _node_id = node_id or os.environ.get("RIVET_NODE_ID") or ""
-    _tenant_id = tenant_id or os.environ.get("RIVET_TENANT_ID") or None
+    _service_id = service_id or os.environ.get("FASTEN_SERVICE_ID") or ""
+    _node_id = node_id or os.environ.get("FASTEN_NODE_ID") or ""
+    _tenant_id = tenant_id or os.environ.get("FASTEN_TENANT_ID") or None
 
     if not _service_id or not _node_id:
         raise RuntimeError(
-            "rivet.init: RIVET_SERVICE_ID and RIVET_NODE_ID are required"
+            "fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required"
         )
 
     if audit_store is not None:
         _audit_store = audit_store
     else:
-        dsn = os.environ.get("RIVET_AUDIT_DSN")
+        dsn = os.environ.get("FASTEN_AUDIT_DSN")
         if not dsn:
             raise RuntimeError(
-                "rivet.init: RIVET_AUDIT_DSN is required. "
-                "Audit rows must go to durable storage — rivet does not provide in-memory fallback. "
-                "Set RIVET_AUDIT_DSN to a sqlite:// or postgres:// URL "
-                "(e.g., 'sqlite:///./rivet-audit.db'). "
+                "fasten.init: FASTEN_AUDIT_DSN is required. "
+                "Audit rows must go to durable storage — fasten does not provide in-memory fallback. "
+                "Set FASTEN_AUDIT_DSN to a sqlite:// or postgres:// URL "
+                "(e.g., 'sqlite:///./fasten-audit.db'). "
                 "For tests, construct a store directly and pass via init(audit_store=...)."
             )
         from .store.sqlite import SQLiteStore
@@ -84,15 +84,15 @@ def init(
     if api_store is not None:
         _api_store = api_store
     else:
-        dsn = os.environ.get("RIVET_API_DSN")
+        dsn = os.environ.get("FASTEN_API_DSN")
         if dsn:
             from .store.sqlite import SQLiteStore
             _api_store = SQLiteStore.from_dsn(dsn)
 
     keys = extra_redact_keys or (
-        os.environ.get("RIVET_REDACT_KEYS", "").split(",") if os.environ.get("RIVET_REDACT_KEYS") else None
+        os.environ.get("FASTEN_REDACT_KEYS", "").split(",") if os.environ.get("FASTEN_REDACT_KEYS") else None
     )
-    replacement = redact_replacement or os.environ.get("RIVET_REDACT_REPLACEMENT", "***")
+    replacement = redact_replacement or os.environ.get("FASTEN_REDACT_REPLACEMENT", "***")
     _redactor = Redactor(
         extra_keys=[k.strip() for k in keys if k.strip()] if keys else None,
         replacement=replacement,
@@ -123,7 +123,7 @@ def emit(
     Raises RuntimeError if init() hasn't been called.
     """
     if not _service_id:
-        raise RuntimeError("rivet.init() must be called before emit()")
+        raise RuntimeError("fasten.init() must be called before emit()")
 
     meta = registry().get(code)
     if meta is None:

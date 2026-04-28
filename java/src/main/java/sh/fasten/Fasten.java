@@ -1,4 +1,4 @@
-package dev.rivet;
+package sh.fasten;
 
 import java.time.Instant;
 import java.util.List;
@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * rivet — audit + correlation SDK for Java services.
+ * fasten — audit + correlation SDK for Java services.
  *
  * <p>Same shape as Python / Go / Node.js / Rust references: 6 audit anchors
  * (5 Ws + H) + correlation, opt-in shims per transport, pluggable store +
@@ -14,7 +14,7 @@ import java.util.Optional;
  *
  * <p>See ../README.md for the full design.
  */
-public final class Rivet {
+public final class Fasten {
 
     // ---------------------------------------------------------------------
     // 6 audit anchors as typed row
@@ -133,7 +133,7 @@ public final class Rivet {
     // Init + Emit
     // ---------------------------------------------------------------------
 
-    /** Config. Most values come from env vars (RIVET_*). */
+    /** Config. Most values come from env vars (FASTEN_*). */
     public record Config(
             String serviceId,
             String nodeId,
@@ -142,9 +142,9 @@ public final class Rivet {
             Optional<AuditRepository> apiStore
     ) {}
 
-    /** Initialise rivet. Call once at startup. */
+    /** Initialise fasten. Call once at startup. */
     public static void init(Config cfg) {
-        // TODO: validate, wire transport, construct stores from RIVET_*_DSN
+        // TODO: validate, wire transport, construct stores from FASTEN_*_DSN
     }
 
     /** Fluent emit builder. */
@@ -209,5 +209,5 @@ public final class Rivet {
             int limit
     ) {}
 
-    private Rivet() {}
+    private Fasten() {}
 }

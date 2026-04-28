@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "rivet"
+name = "fasten"
 version = "0.1.0"
 description = "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport"
 license = { text = "Apache-2.0" }
@@ -29,15 +29,15 @@ tui = ["rich>=13"]
 dev = ["pytest>=7", "ruff>=0.4", "mypy>=1.10"]
 
 [project.scripts]
-rivet = "rivet.cli:main"
+fasten = "fasten.cli:main"
 
 [project.urls]
-Homepage = "https://rivet.dev"
-Repository = "https://github.com/nerdapplabs/rivet"
-Plan      = "https://github.com/nerdapplabs/rivet/blob/main/README.md"
+Homepage = "https://fasten.sh"
+Repository = "https://github.com/nerdapplabs/fasten"
+Plan      = "https://github.com/nerdapplabs/fasten/blob/main/README.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["rivet"]
+packages = ["fasten"]
 
 [tool.ruff]
 line-length = 100

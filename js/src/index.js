@@ -1,5 +1,5 @@
 /**
- * rivet — audit + correlation SDK for Node.js.
+ * fasten — audit + correlation SDK for Node.js.
  *
  * Same shape as the Python + Go references: 6 anchors (5 Ws + H) +
  * correlation, opt-in shims, pluggable store, mountable reader.
@@ -30,7 +30,7 @@ export function withRequestID(requestId, fn) {
 const registry = new Map();
 
 // Domain is a plain string — adopters define their own vocabulary.
-// rivet ships no built-in domain constants; use string literals in your codes module.
+// fasten ships no built-in domain constants; use string literals in your codes module.
 export const Domain = {}; // kept for import compatibility; intentionally empty
 
 export const Severity = Object.freeze({
@@ -68,20 +68,20 @@ let seq = 0;
 
 export function init(opts = {}) {
     config = {
-        serviceId: opts.serviceId ?? process.env.RIVET_SERVICE_ID ?? '',
-        nodeId:    opts.nodeId    ?? process.env.RIVET_NODE_ID    ?? '',
-        tenantId:    opts.tenantId    ?? process.env.RIVET_TENANT_ID    ?? null,
-        auditStore: opts.auditStore ?? null,  // TODO: construct from RIVET_AUDIT_DSN
+        serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? '',
+        nodeId:    opts.nodeId    ?? process.env.FASTEN_NODE_ID    ?? '',
+        tenantId:    opts.tenantId    ?? process.env.FASTEN_TENANT_ID    ?? null,
+        auditStore: opts.auditStore ?? null,  // TODO: construct from FASTEN_AUDIT_DSN
         apiStore:   opts.apiStore   ?? null,
     };
     if (!config.serviceId || !config.nodeId) {
-        throw new Error('rivet.init: RIVET_SERVICE_ID and RIVET_NODE_ID are required');
+        throw new Error('fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required');
     }
 }
 
 export function emit({ code, target, actor = 'system', actorKind = 'service',
                        detail = {}, severity, method = 'http' }) {
-    if (!config.serviceId) throw new Error('rivet.init() must be called before emit()');
+    if (!config.serviceId) throw new Error('fasten.init() must be called before emit()');
     const meta = registry.get(code);
     if (!meta) throw new Error(`unknown audit code: ${code}`);
 

@@ -2,7 +2,7 @@
 Stdout transport — JSON lines to stdout. Docker log driver captures + rotates.
 
 Three shapes:
-  {"shape": "sys",   ...}  — structured log lines from rivet.log.*
+  {"shape": "sys",   ...}  — structured log lines from fasten.log.*
   {"shape": "api",   ...}  — HTTP request log lines
   {"shape": "audit", ...}  — audit rows (also persisted to SQL store)
 
@@ -30,7 +30,7 @@ class StdoutTransport:
     # ── syslog ──────────────────────────────────────────────────────────────
 
     def write_syslog(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer. Used by rivet's own logger."""
+        """Write to stdout AND buffer. Used by fasten's own logger."""
         self._syslog.push(row)
         sys.stdout.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stdout.flush()

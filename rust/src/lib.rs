@@ -1,4 +1,4 @@
-//! rivet — audit + correlation SDK for Rust services.
+//! fasten — audit + correlation SDK for Rust services.
 //!
 //! Same shape as Python / Go / Node.js references: 6 audit anchors (5 Ws + H)
 //! + correlation, opt-in shims per transport, pluggable store + transport,
@@ -166,9 +166,9 @@ pub struct Config {
 /// Read env vars; return Config.
 pub fn config_from_env() -> Result<Config, Error> {
     Ok(Config {
-        service_id: std::env::var("RIVET_SERVICE_ID").unwrap_or_default(),
-        node_id: std::env::var("RIVET_NODE_ID").unwrap_or_default(),
-        site_id: std::env::var("RIVET_SITE_ID").ok(),
+        service_id: std::env::var("FASTEN_SERVICE_ID").unwrap_or_default(),
+        node_id: std::env::var("FASTEN_NODE_ID").unwrap_or_default(),
+        site_id: std::env::var("FASTEN_SITE_ID").ok(),
     })
 }
 

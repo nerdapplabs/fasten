@@ -1,4 +1,4 @@
-"""Entry point for `python -m rivet.tui`."""
+"""Entry point for `python -m fasten.tui`."""
 from __future__ import annotations
 
 import sys

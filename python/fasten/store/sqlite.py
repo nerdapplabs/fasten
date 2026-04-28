@@ -63,7 +63,7 @@ class SQLiteStore:
         path = u.path.lstrip("/")
         if not path:
             raise ValueError(
-                f"rivet SQLiteStore: DSN {dsn!r} has no path. "
+                f"fasten SQLiteStore: DSN {dsn!r} has no path. "
                 "Audit storage must be durable — use sqlite:///./audit.db or similar."
             )
         return cls(path=path, table=q.get("table", "audit_log"), wal=q.get("wal", "true") != "false")

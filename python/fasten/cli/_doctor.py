@@ -1,14 +1,14 @@
 """
-`rivet doctor` — verify init config + store + correlation wiring.
+`fasten doctor` — verify init config + store + correlation wiring.
 
 Read-only diagnostic. Runs each check, prints status + message, returns
 exit-code = number of failures. Six checks today:
 
-  1. env vars (RIVET_SERVICE_ID, RIVET_NODE_ID required; tenant + dsn optional)
+  1. env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID required; tenant + dsn optional)
   2. audit DSN — parseable, connectable, table exists, returns count
   3. api DSN — configured? (informational; default ring-only is fine)
   4. catalog — codes registered, domains discovered
-  5. shims — `rivet.shim.http` importable (correlation prerequisite)
+  5. shims — `fasten.shim.http` importable (correlation prerequisite)
   6. correlation — current_request_id() returns sane value when set
 
 Sample-emit roundtrip is deliberately *not* a doctor check — it would
@@ -38,11 +38,11 @@ def _glyph(status: str) -> str:
 
 
 def _check_env() -> CheckResult:
-    sid = os.environ.get("RIVET_SERVICE_ID")
-    nid = os.environ.get("RIVET_NODE_ID")
-    tid = os.environ.get("RIVET_TENANT_ID")
+    sid = os.environ.get("FASTEN_SERVICE_ID")
+    nid = os.environ.get("FASTEN_NODE_ID")
+    tid = os.environ.get("FASTEN_TENANT_ID")
     if not sid or not nid:
-        missing = [v for v, k in [("RIVET_SERVICE_ID", sid), ("RIVET_NODE_ID", nid)] if not k]
+        missing = [v for v, k in [("FASTEN_SERVICE_ID", sid), ("FASTEN_NODE_ID", nid)] if not k]
         return CheckResult(
             name="env",
             status="fail",
@@ -57,12 +57,12 @@ def _check_env() -> CheckResult:
 
 
 def _check_audit_dsn() -> CheckResult:
-    dsn = os.environ.get("RIVET_AUDIT_DSN")
+    dsn = os.environ.get("FASTEN_AUDIT_DSN")
     if not dsn:
         return CheckResult(
             name="audit_dsn",
             status="fail",
-            message="not set — rivet.init() will REFUSE TO START. Set RIVET_AUDIT_DSN to durable storage.",
+            message="not set — fasten.init() will REFUSE TO START. Set FASTEN_AUDIT_DSN to durable storage.",
         )
     try:
         from ..store.sqlite import SQLiteStore
@@ -83,12 +83,12 @@ def _check_audit_dsn() -> CheckResult:
 
 
 def _check_api_dsn() -> CheckResult:
-    dsn = os.environ.get("RIVET_API_DSN")
+    dsn = os.environ.get("FASTEN_API_DSN")
     if not dsn:
         return CheckResult(
             name="api_dsn",
             status="ok",
-            message="not configured — ring-buffer only (default; persist via RIVET_API_DSN if needed)",
+            message="not configured — ring-buffer only (default; persist via FASTEN_API_DSN if needed)",
         )
     try:
         from ..store.sqlite import SQLiteStore
@@ -111,7 +111,7 @@ def _check_catalog() -> CheckResult:
         return CheckResult(
             name="catalog",
             status="warn",
-            message="no codes registered — call rivet.codes.register(...) before emit()",
+            message="no codes registered — call fasten.codes.register(...) before emit()",
         )
     domains = sorted({m.domain for m in reg.values()})
     return CheckResult(
@@ -124,17 +124,17 @@ def _check_catalog() -> CheckResult:
 
 def _check_shim_http() -> CheckResult:
     try:
-        importlib.import_module("rivet.shim.http")
+        importlib.import_module("fasten.shim.http")
         return CheckResult(
             name="shim_http",
             status="ok",
-            message="rivet.shim.http importable (X-Request-ID correlation available)",
+            message="fasten.shim.http importable (X-Request-ID correlation available)",
         )
     except ImportError as e:
         return CheckResult(
             name="shim_http",
             status="warn",
-            message=f"rivet.shim.http not importable: {e} (HTTP correlation will not auto-propagate)",
+            message=f"fasten.shim.http not importable: {e} (HTTP correlation will not auto-propagate)",
         )
 
 
@@ -181,7 +181,7 @@ def run(as_json: bool = False) -> int:
             indent=2,
         ))
     else:
-        sys.stdout.write("rivet doctor\n")
+        sys.stdout.write("fasten doctor\n")
         for r in results:
             sys.stdout.write(f"  {_glyph(r.status)} {r.name:13s} {r.message}\n")
         sys.stdout.write(

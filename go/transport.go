@@ -1,4 +1,4 @@
-package rivet
+package fasten
 
 import (
 	"encoding/json"

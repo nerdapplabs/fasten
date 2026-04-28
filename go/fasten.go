@@ -1,18 +1,18 @@
-// Package rivet — audit + correlation SDK for Go services.
+// Package fasten — audit + correlation SDK for Go services.
 //
 // Zero external dependencies. Three streams: syslog, api-log, audit.
 // One request_id carried across every emission via context.
 //
 // Usage:
 //
-//	rivet.Register("my-domain", map[rivet.Code]rivet.Meta{
-//	    "MY_CODE": {Action: "created", Severity: rivet.SevInfo, ...},
+//	fasten.Register("my-domain", map[fasten.Code]fasten.Meta{
+//	    "MY_CODE": {Action: "created", Severity: fasten.SevInfo, ...},
 //	})
-//	rivet.Init(rivet.Config{ServiceID: "my-svc", NodeID: "node-1", AuditStore: store})
-//	rivet.Emit(ctx, "MY_CODE", rivet.Target("resource/123"))
+//	fasten.Init(fasten.Config{ServiceID: "my-svc", NodeID: "node-1", AuditStore: store})
+//	fasten.Emit(ctx, "MY_CODE", fasten.Target("resource/123"))
 //
 // See ../README.md for the full design.
-package rivet
+package fasten
 
 import (
 	"context"
@@ -72,7 +72,7 @@ type Severity string
 type RetentionClass string
 
 // Domain is a plain string type — adopters define their own vocabulary.
-// rivet has no built-in domain constants; use string literals in your codes package.
+// fasten has no built-in domain constants; use string literals in your codes package.
 
 const (
 	SevDebug    Severity = "debug"
@@ -112,10 +112,10 @@ func Register(domain Domain, codes map[Code]Meta) error {
 	defer regMu.Unlock()
 	for c, m := range codes {
 		if _, exists := _registry[c]; exists {
-			return fmt.Errorf("rivet: duplicate code %q", c)
+			return fmt.Errorf("fasten: duplicate code %q", c)
 		}
 		if m.Domain != domain {
-			return fmt.Errorf("rivet: code %q declares domain %q but registered under %q", c, m.Domain, domain)
+			return fmt.Errorf("fasten: code %q declares domain %q but registered under %q", c, m.Domain, domain)
 		}
 		m.ID = c
 		_registry[c] = m
@@ -182,15 +182,15 @@ type Config struct {
 	AuditStore AuditRepository
 }
 
-// Init configures rivet. Must be called once before Emit.
-// Falls back to env vars RIVET_SERVICE_ID, RIVET_NODE_ID, RIVET_TENANT_ID.
+// Init configures fasten. Must be called once before Emit.
+// Falls back to env vars FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_TENANT_ID.
 func Init(cfg Config) error {
-	_serviceID = firstNonEmpty(cfg.ServiceID, envOr("RIVET_SERVICE_ID", ""))
-	_nodeID = firstNonEmpty(cfg.NodeID, envOr("RIVET_NODE_ID", ""))
-	_tenantID = firstNonEmpty(cfg.TenantID, envOr("RIVET_TENANT_ID", ""))
+	_serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
+	_nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
+	_tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
 
 	if _serviceID == "" || _nodeID == "" {
-		return errors.New("rivet.Init: ServiceID and NodeID are required")
+		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
 	_auditStore = cfg.AuditStore
 	_transport = NewTransport(2000)
@@ -216,11 +216,11 @@ func WithMethod(m string) EmitOption    { return func(r *Row) { r.Method = m } }
 // Returns an error if Init has not been called or the code is not registered.
 func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 	if _serviceID == "" {
-		return Row{}, errors.New("rivet.Init() must be called before Emit()")
+		return Row{}, errors.New("fasten.Init() must be called before Emit()")
 	}
 	m, ok := metaOf(code)
 	if !ok {
-		return Row{}, fmt.Errorf("rivet: unknown audit code %q — call Register() first", code)
+		return Row{}, fmt.Errorf("fasten: unknown audit code %q — call Register() first", code)
 	}
 
 	rid := RequestIDFromContext(ctx)

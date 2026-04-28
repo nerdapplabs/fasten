@@ -14,11 +14,11 @@ from enum import Enum
 from typing import Iterable
 
 # Domain type alias — plain str; defined here for import convenience.
-# Intentionally NOT an enum: rivet has no opinions about your domain vocabulary.
+# Intentionally NOT an enum: fasten has no opinions about your domain vocabulary.
 
 
 # Domain is a plain string — adopters define their own vocabulary.
-# Examples: "user", "billing", "device", "order" — rivet has no opinions.
+# Examples: "user", "billing", "device", "order" — fasten has no opinions.
 Domain = str
 
 

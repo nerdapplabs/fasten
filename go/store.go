@@ -1,4 +1,4 @@
-package rivet
+package fasten
 
 import (
 	"context"
@@ -23,8 +23,8 @@ func envOr(key, fallback string) string {
 // Usage:
 //
 //	import _ "github.com/mattn/go-sqlite3" // or modernc.org/sqlite
-//	db, _ := sql.Open("sqlite3", "./rivet.db")
-//	store := rivet.NewSQLiteStore(db, "rivet_audit")
+//	db, _ := sql.Open("sqlite3", "./fasten.db")
+//	store := fasten.NewSQLiteStore(db, "fasten_audit")
 type SQLiteStore struct {
 	db    *sql.DB
 	table string
@@ -33,11 +33,11 @@ type SQLiteStore struct {
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 func NewSQLiteStore(db *sql.DB, tableName string) (*SQLiteStore, error) {
 	if tableName == "" {
-		tableName = "rivet_audit"
+		tableName = "fasten_audit"
 	}
 	s := &SQLiteStore{db: db, table: tableName}
 	if err := s.migrate(); err != nil {
-		return nil, fmt.Errorf("rivet SQLiteStore migrate: %w", err)
+		return nil, fmt.Errorf("fasten SQLiteStore migrate: %w", err)
 	}
 	return s, nil
 }

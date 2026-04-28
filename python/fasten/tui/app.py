@@ -2,7 +2,7 @@
 Rich-based multi-pane live feed.
 
 Layout:
-    ┌─ rivet · audit · http://… ─────────────────────────────────────┐
+    ┌─ fasten · audit · http://… ─────────────────────────────────────┐
     │ AUDIT (primary pane) — code · actor · target · request_id       │
     ├──────────────────────────────────┬──────────────────────────────┤
     │ SYS  (compact)                   │ API  (compact)               │
@@ -10,7 +10,7 @@ Layout:
 
 The primary pane shows full rows; the other two stay compact. A
 `--request-id` filter carries across all three panes — that's the whole
-point of rivet.
+point of fasten.
 
 v0.1 is a polling read-only view (Rich keeps the dep tree minimal). All
 controls are CLI flags; non-blocking keystrokes (stream toggle, filter
@@ -122,7 +122,7 @@ def _build_view(
         Layout(name="footer", size=1),
     )
 
-    title = f"rivet tui · {base_url}"
+    title = f"fasten tui · {base_url}"
     if request_id:
         title += f"  ·  req={request_id}"
     layout["header"].update(Panel.fit(title, style="bold blue", border_style="dim"))
@@ -174,7 +174,7 @@ def run(
         from rich.live import Live
     except ImportError:
         sys.stderr.write(
-            "rivet TUI requires the `rich` package — install via `pip install rivet[tui]`\n"
+            "fasten TUI requires the `rich` package — install via `pip install fasten[tui]`\n"
         )
         return 2
 
@@ -198,7 +198,7 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="rivet-tui", description="rivet bundled TUI")
+    p = argparse.ArgumentParser(prog="fasten-tui", description="fasten bundled TUI")
     p.add_argument("--url", default=DEFAULT_URL, help="reader base URL")
     p.add_argument("--stream", choices=STREAMS, default="audit", help="primary pane")
     p.add_argument("--request-id", default=None, help="filter by request_id")

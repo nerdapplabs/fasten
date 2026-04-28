@@ -1,5 +1,5 @@
 {
-  "name": "rivet",
+  "name": "fasten",
   "version": "0.1.0-alpha.0",
   "description": "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport",
   "license": "Apache-2.0",
@@ -38,7 +38,7 @@
   "author": "nerdAppLabs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nerdapplabs/rivet"
+    "url": "https://github.com/nerdapplabs/fasten"
   },
-  "homepage": "https://rivet.dev"
+  "homepage": "https://fasten.sh"
 }

@@ -1,5 +1,5 @@
 /**
- * rivet — TypeScript types for the Node.js package.
+ * fasten — TypeScript types for the Node.js package.
  * Same shape as Python / Go / Rust / Java references.
  */
 

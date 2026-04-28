@@ -1,4 +1,4 @@
-package rivet
+package fasten
 
 import (
 	"context"
@@ -42,7 +42,7 @@ func (r *statusRecorder) Status() int {
 	return r.status
 }
 
-// APILogger pushes each inbound HTTP request into rivet's API ring buffer.
+// APILogger pushes each inbound HTTP request into fasten's API ring buffer.
 // Skips paths that match any of skipPaths (e.g. "/_system/health").
 func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 	skip := make(map[string]bool, len(skipPaths))
@@ -80,8 +80,8 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //	GET /api    — api-log ring buffer
 //	GET /audit  — audit SQLite store
 //
-// Mount with chi: r.Mount("/api/v1/logs", rivet.NewReader())
-// Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", rivet.NewReader()))
+// Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
+// Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
 func NewReader() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", handleSys)
@@ -92,7 +92,7 @@ func NewReader() http.Handler {
 
 func handleSys(w http.ResponseWriter, r *http.Request) {
 	if _transport == nil {
-		writeJSON(w, map[string]any{"rows": []any{}, "error": "rivet not initialised"})
+		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
@@ -106,7 +106,7 @@ func handleSys(w http.ResponseWriter, r *http.Request) {
 
 func handleAPI(w http.ResponseWriter, r *http.Request) {
 	if _transport == nil {
-		writeJSON(w, map[string]any{"rows": []any{}, "error": "rivet not initialised"})
+		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()

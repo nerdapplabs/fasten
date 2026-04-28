@@ -1,36 +1,36 @@
 """
-structlog processor shim — pushes every log event into rivet's syslog ring buffer.
+structlog processor shim — pushes every log event into fasten's syslog ring buffer.
 
 Adopters add this to their shared processors list (before the renderer):
 
-    from rivet.shim.structlog import make_rivet_processor
+    from fasten.shim.structlog import make_fasten_processor
 
     structlog.configure(
         processors=[
             ...
             redact_secrets,
-            make_rivet_processor(),   # ← push to rivet ring buffer
+            make_fasten_processor(),   # ← push to fasten ring buffer
             renderer,
         ]
     )
 
-The processor is a side-effect: it writes to rivet's ring buffer and then
+The processor is a side-effect: it writes to fasten's ring buffer and then
 returns event_dict unchanged so structlog continues its own pipeline.
 It does NOT write to stdout (no double-output).
 
-If rivet is not initialised (init() not yet called), the processor is a no-op.
+If fasten is not initialised (init() not yet called), the processor is a no-op.
 """
 from __future__ import annotations
 
 from typing import Any, Callable
 
 
-def make_rivet_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, Any]]:
-    """Return a structlog processor that pushes events to rivet's syslog buffer."""
+def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, Any]]:
+    """Return a structlog processor that pushes events to fasten's syslog buffer."""
 
     def _processor(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         try:
-            from rivet.emit import _get_stdout
+            from fasten.emit import _get_stdout
             transport = _get_stdout()
             if transport is None:
                 return event_dict

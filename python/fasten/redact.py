@@ -5,8 +5,8 @@ Runs before emit. Keys whose name matches the pattern have values replaced
 with the replacement token (default "***"); keys stay visible so the
 *presence* of a secret is observable.
 
-Adopters extend the default pattern via rivet.init(extra_redact_keys=[...])
-and override the replacement token via rivet.init(redact_replacement="<hidden>").
+Adopters extend the default pattern via fasten.init(extra_redact_keys=[...])
+and override the replacement token via fasten.init(redact_replacement="<hidden>").
 """
 from __future__ import annotations
 

@@ -1,12 +1,12 @@
 [package]
-name = "rivet"
+name = "fasten"
 version = "0.1.0-alpha.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
 description = "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport"
-repository = "https://github.com/nerdapplabs/rivet"
-homepage = "https://rivet.dev"
+repository = "https://github.com/nerdapplabs/fasten"
+homepage = "https://fasten.sh"
 readme = "../README.md"
 keywords = ["audit", "logging", "correlation", "observability", "compliance"]
 categories = ["development-tools::debugging", "asynchronous"]
