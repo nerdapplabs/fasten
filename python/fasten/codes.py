@@ -71,6 +71,10 @@ def register(domain: Domain, codes: Iterable[tuple[str, Meta]]) -> None:
     for name, meta in codes:
         if name in _registry:
             raise AuditCatalogError(f"duplicate code: {name}")
+        if meta.id != name:
+            raise AuditCatalogError(
+                f"code {name!r} has meta.id={meta.id!r} — they must match"
+            )
         if meta.domain != domain:
             raise AuditCatalogError(
                 f"code {name} declares domain={meta.domain!r} "

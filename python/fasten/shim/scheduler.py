@@ -7,6 +7,7 @@ job run mints a deterministic-shape id so downstream audit stitches.
 """
 from __future__ import annotations
 
+import inspect
 import uuid
 from contextlib import contextmanager
 from typing import Callable, Iterator, TypeVar
@@ -30,7 +31,16 @@ def job_run(run_id: str | None = None) -> Iterator[str]:
 
 
 def instrument(fn: Callable[..., T]) -> Callable[..., T]:
-    """Decorator — wraps a scheduled callable so each invocation mints a run id."""
+    """Decorator — wraps a scheduled callable so each invocation mints a run id.
+
+    Works for both sync and async callables.
+    """
+    if inspect.iscoroutinefunction(fn):
+        async def async_wrapper(*args: object, **kwargs: object) -> T:
+            with job_run():
+                return await fn(*args, **kwargs)  # type: ignore[return-value]
+        return async_wrapper  # type: ignore[return-value]
+
     def wrapper(*args: object, **kwargs: object) -> T:
         with job_run():
             return fn(*args, **kwargs)

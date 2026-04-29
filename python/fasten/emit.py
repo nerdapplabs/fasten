@@ -120,6 +120,10 @@ def emit(
     """
     Emit an audit row. Anchors auto-filled where possible.
 
+    `method` should reflect the transport that triggered this event
+    (http, mqtt, cli, scheduler, ui, agent_tool). Defaults to "sdk" when
+    called outside any shim context.
+
     Raises RuntimeError if init() has not been called.
     Raises ValueError for an unregistered code.
     """
@@ -149,7 +153,7 @@ def emit(
         target=target,
         category=meta.category,
         domain=meta.domain,
-        method=method or "http",
+        method=method or "sdk",
         request_id=request_id,
         detail=detail,
     )
@@ -170,6 +174,8 @@ class _Logger:
         if _stdout is not None:
             _stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
+            # fasten.init() not yet called — fall back to stdlib logger so
+            # log.* works in tests and library code before init().
             _logger.log(level, json.dumps(payload, default=str))
 
     def debug(self,   event: str, **fields: Any) -> None: self._emit(logging.DEBUG,   event, **fields)

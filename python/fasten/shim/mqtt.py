@@ -4,8 +4,7 @@ MQTT shim — correlation over pub/sub via reserved `_req` field in payload.
 Publish helper injects `_req = current_request_id()`; subscriber helper
 reads `_req` into the ambient ctx before invoking the handler.
 
-Wire convention: JSON payloads carry a reserved `_req` key. Binary payloads
-carry the id as an MQTT v5 user property `req-id` when possible.
+Wire convention: JSON payloads only. Binary payload support is not implemented.
 """
 from __future__ import annotations
 

@@ -17,7 +17,7 @@ See README.md for the full design.
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
-from .codes import Domain, Meta, RetentionClass, Severity, register, registry
+from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
 from .emit import emit, init, log
 from .store.repo import AuditRepository
@@ -27,6 +27,7 @@ __all__ = [
     "Anchor",
     "AuditRow",
     # catalog
+    "AuditCatalogError",
     "Domain",
     "Meta",
     "RetentionClass",

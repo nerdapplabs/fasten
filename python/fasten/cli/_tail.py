@@ -10,6 +10,7 @@ scope here.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sys
@@ -104,6 +105,8 @@ def run(
 
     # Start window: 5 min back, so first poll picks up recent context.
     last_seen = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    # Ordered deque for bounded, deterministic dedup (oldest fall off the left).
+    seen_deque: collections.deque[str] = collections.deque(maxlen=5000)
     seen_ids: set[str] = set()
 
     fmt = _FORMATTERS[stream]
@@ -118,12 +121,13 @@ def run(
                 key = r.get("id") or f"{_row_ts(r)}|{r.get('code', '')}|{r.get('event', '')}"
                 if key in seen_ids:
                     continue
+                # deque(maxlen=5000) evicts oldest key; mirror eviction in set.
+                if len(seen_deque) == seen_deque.maxlen:
+                    evicted = seen_deque[0]
+                    seen_ids.discard(evicted)
+                seen_deque.append(key)
                 seen_ids.add(key)
                 new_rows.append(r)
-
-            # Bound the dedupe set.
-            if len(seen_ids) > 5000:
-                seen_ids = set(list(seen_ids)[-2500:])
 
             new_rows.sort(key=_row_ts)
             for r in new_rows:

@@ -85,8 +85,12 @@ class AuditRow:
             raise ValueError("audit row requires WHERE: service_id + source_node_id")
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable dict of the row."""
-        return dataclasses.asdict(self)
+        """Return a JSON-serialisable dict — datetimes are ISO-8601 strings."""
+        d = dataclasses.asdict(self)
+        d["timestamp"] = self.timestamp.isoformat()
+        if self.shipped_at is not None:
+            d["shipped_at"] = self.shipped_at.isoformat()
+        return d
 
     def to_cloud_event(self) -> dict[str, Any]:
         """CloudEvent 1.0 shape — id / source / type / time / data."""

@@ -5,8 +5,14 @@ Framework-agnostic core + FastAPI adapter. Adopters on other frameworks
 (Flask, Sanic, aiohttp) wrap the core handler functions.
 
 Usage:
+    import fasten
     from fasten.reader import router, init as init_reader
-    init_reader(fasten._get_audit_store(), fasten._get_stdout())
+    from fasten.transport import StdoutTransport
+
+    store = fasten.store.sqlite.SQLiteStore.from_dsn(dsn)
+    transport = StdoutTransport()
+    fasten.init(audit_store=store, ...)
+    init_reader(store, transport)
 
     # No auth — internal / trusted network only:
     app.include_router(router(), prefix="/api/v1/logs")

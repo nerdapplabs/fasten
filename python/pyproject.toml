@@ -29,12 +29,13 @@ tui = ["rich>=13"]
 dev = ["pytest>=7", "ruff>=0.4", "mypy>=1.10"]
 
 [project.scripts]
-fasten = "fasten.cli:main"
+fasten     = "fasten.cli:main"
+fasten-tui = "fasten.tui.app:main"
 
 [project.urls]
-Homepage = "https://fasten.sh"
-Repository = "https://github.com/nerdapplabs/fasten"
-Plan      = "https://github.com/nerdapplabs/fasten/blob/main/README.md"
+Homepage      = "https://fasten.sh"
+Repository    = "https://github.com/nerdapplabs/fasten"
+Documentation = "https://github.com/nerdapplabs/fasten/blob/main/README.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["fasten"]

@@ -100,7 +100,7 @@ class SQLiteStore:
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
         cur = self._conn.execute(
             f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-            "ORDER BY monotonic_seq DESC LIMIT ?",
+            "ORDER BY monotonic_seq ASC LIMIT ?",
             (limit,),
         )
         return [self._row(r) for r in cur.fetchall()]

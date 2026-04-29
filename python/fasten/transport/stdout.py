@@ -6,8 +6,9 @@ Three shapes:
   {"shape": "api",   ...}  — HTTP request log lines
   {"shape": "audit", ...}  — audit rows (also persisted to SQL store)
 
-Each shape is also buffered in an in-memory ring so /logs/{sys,api,audit}
-can serve recent events without reading from disk.
+sys and api are also buffered in an in-memory ring so /logs/sys and /logs/api
+can serve recent events without reading from disk. audit is not ring-buffered
+here — /logs/audit queries the durable SQL store directly.
 
 Adopters who manage their own stdout (e.g. structlog, slog, zap) should call
 push_syslog / push_api instead of write_syslog / write_api — the push variants
