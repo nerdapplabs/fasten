@@ -7,7 +7,19 @@ Framework-agnostic core + FastAPI adapter. Adopters on other frameworks
 Usage:
     from fasten.reader import router, init as init_reader
     init_reader(fasten._get_audit_store(), fasten._get_stdout())
+
+    # No auth — internal / trusted network only:
     app.include_router(router(), prefix="/api/v1/logs")
+
+    # With auth — pass FastAPI dependencies:
+    app.include_router(
+        router(dependencies=[Depends(require_admin)]),
+        prefix="/api/v1/logs",
+    )
+
+WARNING: This router has no built-in authentication. All three endpoints
+(/sys, /api, /audit) return data to any caller who can reach them. Always
+gate with a FastAPI dependency or mount behind a trusted-network boundary.
 """
 from __future__ import annotations
 
@@ -26,8 +38,14 @@ def init(store: Any, transport: Any = None) -> None:
     _transport = transport
 
 
-def router() -> Any:
-    """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths."""
+def router(dependencies: list[Any] | None = None) -> Any:
+    """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
+
+    Args:
+        dependencies: FastAPI dependencies applied to every route, e.g.
+            ``[Depends(require_admin)]``. None means no auth — only use
+            that behind a trusted-network boundary.
+    """
     try:
         from fastapi import APIRouter, Query
     except ImportError as e:
@@ -35,7 +53,7 @@ def router() -> Any:
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
         ) from e
 
-    r = APIRouter()
+    r = APIRouter(dependencies=dependencies or [])
 
     @r.get("/sys")
     def get_sys(
