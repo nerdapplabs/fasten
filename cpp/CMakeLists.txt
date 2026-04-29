@@ -27,6 +27,21 @@ if(FASTEN_BUILD_EXAMPLES)
     if(UNIX AND NOT APPLE)
         target_link_libraries(connector PRIVATE pthread)
     endif()
+
+    # reader_example needs no extra deps (uses fasten_reader.hpp core only).
+    add_executable(reader_example examples/reader_example.cpp)
+    target_link_libraries(reader_example PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(reader_example PRIVATE pthread)
+    endif()
+
+    # Simple-Web-Server adapter — only built when SIMPLE_WEB_SERVER_DIR is set.
+    # cmake -DSIMPLE_WEB_SERVER_DIR=/path/to/Simple-Web-Server ..
+    if(SIMPLE_WEB_SERVER_DIR)
+        add_executable(reader_simplehttp examples/reader_simplehttp_main.cpp)
+        target_include_directories(reader_simplehttp PRIVATE ${SIMPLE_WEB_SERVER_DIR})
+        target_link_libraries(reader_simplehttp PRIVATE fasten pthread)
+    endif()
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────
