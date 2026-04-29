@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
-from ..context import MintID, WithRequestID
+from ..context import _request_id, mint_id, _set_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
@@ -31,8 +31,8 @@ class RequestIDMiddleware:
             return
 
         headers = dict(scope.get("headers", []))
-        rid = headers.get(self.HEADER, b"").decode() or MintID()
-        token = WithRequestID(rid)
+        rid = headers.get(self.HEADER, b"").decode() or mint_id()
+        token = _set_request_id(rid)
 
         async def send_wrapper(msg: dict[str, Any]) -> None:
             if msg["type"] == "http.response.start":
@@ -44,6 +44,4 @@ class RequestIDMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
-            # contextvars auto-reset on task exit; explicit reset for safety
-            from ..context import _request_id
             _request_id.reset(token)

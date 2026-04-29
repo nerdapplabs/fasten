@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Awaitable
 
-from ..context import MintID, with_request_id, current_request_id
+from ..context import mint_id, with_request_id, current_request_id
 
 
 async def publish(client: Any, topic: str, payload: dict[str, Any]) -> None:

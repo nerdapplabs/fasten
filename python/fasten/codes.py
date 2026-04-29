@@ -4,7 +4,7 @@ Audit code catalog — typed constants + per-code metadata.
 Adopter registers their own domain with `register(domain, codes)`; library
 enforces no duplicates, valid severity/retention_class, etc.
 
-`--dump` CLI prints `id,domain,severity` sorted — feeds the cross-language
+`fasten dump` CLI prints `id,domain,severity` sorted — feeds the cross-language
 consistency gate.
 """
 from __future__ import annotations
@@ -13,35 +13,37 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
 
-# Domain type alias — plain str; defined here for import convenience.
-# Intentionally NOT an enum: fasten has no opinions about your domain vocabulary.
-
-
 # Domain is a plain string — adopters define their own vocabulary.
 # Examples: "user", "billing", "device", "order" — fasten has no opinions.
 Domain = str
 
 
 class Severity(str, Enum):
-    DEBUG = "debug"
-    INFO = "info"
-    WARN = "warn"
-    ERROR = "error"
+    DEBUG    = "debug"
+    INFO     = "info"
+    WARN     = "warn"
+    ERROR    = "error"
     CRITICAL = "critical"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class RetentionClass(str, Enum):
-    SHORT = "short"     # 30d default
+    SHORT  = "short"    # 30d default
     MEDIUM = "medium"   # 180d default
-    LONG = "long"       # 1095d (3y) default
+    LONG   = "long"     # 1095d (3y) default
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True, slots=True)
 class Meta:
-    """Per-code metadata carried on every enum member."""
+    """Per-code metadata declared alongside every audit code."""
 
     id: str
-    domain: str  # adopter-defined domain string, e.g. "user", "billing", "node"
+    domain: str               # adopter-defined, e.g. "user", "billing", "node"
     category: str
     action: str
     severity: Severity
@@ -51,15 +53,6 @@ class Meta:
     high_volume: bool = False
     pii_in_detail: bool = False
     declared_unused: bool = False
-
-
-class Code(str, Enum):
-    """
-    Base code enum. Adopters define their own codes by registering via
-    `register(domain, codes)`. This base class provides the shared shape.
-    """
-
-    pass
 
 
 class AuditCatalogError(Exception):
@@ -73,15 +66,15 @@ def register(domain: Domain, codes: Iterable[tuple[str, Meta]]) -> None:
     """
     Register a batch of codes for a domain.
 
-    Raises AuditCatalogError on duplicates or metadata mismatch (e.g., a code
-    whose Meta.domain doesn't match the registration domain).
+    Raises AuditCatalogError on duplicates or domain mismatch.
     """
     for name, meta in codes:
         if name in _registry:
             raise AuditCatalogError(f"duplicate code: {name}")
         if meta.domain != domain:
             raise AuditCatalogError(
-                f"code {name} declares domain={meta.domain} but registered under {domain}"
+                f"code {name} declares domain={meta.domain!r} "
+                f"but registered under {domain!r}"
             )
         _registry[name] = meta
 
@@ -94,6 +87,6 @@ def registry() -> dict[str, Meta]:
 def dump() -> str:
     """`id,domain,severity` sorted one-per-line — feeds cross-language consistency gate."""
     rows = sorted(
-        (m.id, m.domain, m.severity.value) for m in _registry.values()
+        (m.id, m.domain, str(m.severity)) for m in _registry.values()
     )
     return "\n".join(f"{i},{d},{s}" for (i, d, s) in rows)

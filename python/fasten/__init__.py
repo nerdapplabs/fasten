@@ -3,48 +3,46 @@ fasten — audit + correlation SDK.
 
 Kernel:
   - `request_id` context carrier (ambient across every emission)
-  - `emit(code, target, ...)` contract enforcing 6 anchors (5 Ws + H) + correlation
-  - `AuditRepository` interface + SQLite / Postgres implementations
-  - Redaction processor for secret-shaped keys
+  - `emit(code, target, ...)` — enforces 6 anchors (5 Ws + H) + correlation
+  - `AuditRepository` protocol — pluggable storage backend
+  - Redactor — secret-key scrubbing before emit
 
 Opt-in:
-  - `shim.http`, `shim.mqtt`, `shim.scheduler`, `shim.deploy_pipeline`
-  - `transport.stdout` (default), `transport.filerotate` (future)
+  - `shim.http`, `shim.mqtt`, `shim.scheduler`
+  - `transport.stdout` (default)
   - `reader.router()` — mountable /logs/{api,sys,audit}
 
-See ../README.md for the full design.
+See README.md for the full design.
 """
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
-from .codes import Code, Domain, Meta, Severity, register, registry
-from .context import (
-    MintID,
-    WithRequestID,
-    current_request_id,
-    with_request_id,
-)
-from .emit import emit, init, log, _get_audit_store, _get_stdout, _get_redactor
+from .codes import Domain, Meta, RetentionClass, Severity, register, registry
+from .context import current_request_id, mint_id, with_request_id
+from .emit import emit, init, log
+from .store.repo import AuditRepository
 
 __all__ = [
+    # row shape
     "Anchor",
     "AuditRow",
-    "Code",
+    # catalog
     "Domain",
     "Meta",
+    "RetentionClass",
     "Severity",
-    "MintID",
-    "WithRequestID",
+    "register",
+    "registry",
+    # storage protocol
+    "AuditRepository",
+    # context
     "current_request_id",
+    "mint_id",
     "with_request_id",
+    # core
     "emit",
     "init",
     "log",
-    "register",
-    "registry",
-    "_get_audit_store",
-    "_get_stdout",
-    "_get_redactor",
 ]
 
 __version__ = "0.1.0"

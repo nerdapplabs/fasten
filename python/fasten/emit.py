@@ -18,16 +18,15 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .transport.stdout import StdoutTransport
-
 from .attrs import AuditRow
-from .codes import registry
-from .context import MintID, current_request_id
+from .codes import Severity, registry
+from .context import mint_id, current_request_id
 from .redact import Redactor
 
 _lock = threading.Lock()
 _seq: int = 0
 
-# Runtime config (populated by init())
+# Runtime config — populated by init()
 _service_id: str = ""
 _node_id: str = ""
 _tenant_id: Optional[str] = None
@@ -48,7 +47,7 @@ def init(
     redact_replacement: str = "***",
 ) -> None:
     """
-    Initialise fasten. Any argument omitted falls back to env var.
+    Initialise fasten. Any argument omitted falls back to the corresponding env var.
 
     Required (env or arg): FASTEN_SERVICE_ID, FASTEN_NODE_ID.
     Optional: FASTEN_TENANT_ID, FASTEN_AUDIT_DSN, FASTEN_API_DSN.
@@ -58,8 +57,8 @@ def init(
     global _service_id, _node_id, _tenant_id, _audit_store, _api_store, _stdout, _redactor
 
     _service_id = service_id or os.environ.get("FASTEN_SERVICE_ID") or ""
-    _node_id = node_id or os.environ.get("FASTEN_NODE_ID") or ""
-    _tenant_id = tenant_id or os.environ.get("FASTEN_TENANT_ID") or None
+    _node_id    = node_id    or os.environ.get("FASTEN_NODE_ID")    or ""
+    _tenant_id  = tenant_id  or os.environ.get("FASTEN_TENANT_ID") or None
 
     if not _service_id or not _node_id:
         raise RuntimeError(
@@ -89,12 +88,13 @@ def init(
             from .store.sqlite import SQLiteStore
             _api_store = SQLiteStore.from_dsn(dsn)
 
-    keys = extra_redact_keys or (
-        os.environ.get("FASTEN_REDACT_KEYS", "").split(",") if os.environ.get("FASTEN_REDACT_KEYS") else None
+    raw_keys = extra_redact_keys or (
+        os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
+        if os.environ.get("FASTEN_REDACT_KEYS") else None
     )
     replacement = redact_replacement or os.environ.get("FASTEN_REDACT_REPLACEMENT", "***")
     _redactor = Redactor(
-        extra_keys=[k.strip() for k in keys if k.strip()] if keys else None,
+        extra_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
         replacement=replacement,
     )
 
@@ -114,32 +114,33 @@ def emit(
     actor: str = "system",
     actor_kind: str = "service",
     detail: Optional[dict[str, Any]] = None,
-    severity: Optional[str] = None,
+    severity: Optional[str | Severity] = None,
     method: Optional[str] = None,
 ) -> AuditRow:
     """
     Emit an audit row. Anchors auto-filled where possible.
 
-    Raises RuntimeError if init() hasn't been called.
+    Raises RuntimeError if init() has not been called.
+    Raises ValueError for an unregistered code.
     """
     if not _service_id:
         raise RuntimeError("fasten.init() must be called before emit()")
 
     meta = registry().get(code)
     if meta is None:
-        raise ValueError(f"unknown audit code: {code}")
+        raise ValueError(f"unknown audit code: {code!r}")
 
-    request_id = current_request_id() or MintID()
+    request_id = current_request_id() or mint_id()
     detail = _redactor.redact(detail or {})
 
     row = AuditRow(
         id=f"evt-{uuid.uuid4().hex[:20]}",
-        origin_id="",                                   # set below
+        origin_id="",
         monotonic_seq=_next_seq(),
         timestamp=datetime.now(timezone.utc),
         code=code,
         action=meta.action,
-        severity=severity or meta.severity.value,
+        severity=str(severity) if severity is not None else str(meta.severity),
         service_id=_service_id,
         source_node_id=_node_id,
         tenant_id=_tenant_id,
@@ -152,20 +153,17 @@ def emit(
         request_id=request_id,
         detail=detail,
     )
-    row = row.__class__(
-        **{f.name: getattr(row, f.name) for f in dataclasses.fields(row) if f.name != "origin_id"},
-        origin_id=row.id,
-    )
+    row = dataclasses.replace(row, origin_id=row.id)
 
     if _audit_store is not None:
         _audit_store.insert(row)
     if _stdout is not None:
-        _stdout.write_audit(dataclasses.asdict(row))
+        _stdout.write_audit(row.to_dict())
     return row
 
 
 class _Logger:
-    """Convenience wrapper over stdlib logging, stamping request_id automatically."""
+    """Structured syslog writer — stamps request_id automatically."""
 
     def _emit(self, level: int, event: str, **fields: Any) -> None:
         payload = {"event": event, "request_id": current_request_id(), **fields}
@@ -174,25 +172,22 @@ class _Logger:
         else:
             _logger.log(level, json.dumps(payload, default=str))
 
-    def debug(self, event: str, **fields: Any) -> None: self._emit(logging.DEBUG, event, **fields)
-    def info(self, event: str, **fields: Any) -> None: self._emit(logging.INFO, event, **fields)
-    def warning(self, event: str, **fields: Any) -> None: self._emit(logging.WARNING, event, **fields)
-    def error(self, event: str, **fields: Any) -> None: self._emit(logging.ERROR, event, **fields)
+    def debug(self,   event: str, **fields: Any) -> None: self._emit(logging.DEBUG,   event, **fields)
+    def info(self,    event: str, **fields: Any) -> None: self._emit(logging.INFO,     event, **fields)
+    def warn(self,    event: str, **fields: Any) -> None: self._emit(logging.WARNING,  event, **fields)
+    def warning(self, event: str, **fields: Any) -> None: self._emit(logging.WARNING,  event, **fields)
+    def error(self,   event: str, **fields: Any) -> None: self._emit(logging.ERROR,    event, **fields)
 
 
 log = _Logger()
 
 
+# Internal accessors — used by reader and shims; not part of the public API.
 def _get_audit_store() -> Any:
-    """Return the current audit store (set by init()). None before init()."""
     return _audit_store
 
-
-def _get_stdout() -> "Optional[StdoutTransport]":
-    """Return the current StdoutTransport (set by init()). None before init()."""
+def _get_stdout() -> Optional[StdoutTransport]:
     return _stdout
 
-
-def _get_redactor() -> "Redactor":
-    """Return the active Redactor — always non-None (defaults to Redactor()). """
+def _get_redactor() -> Redactor:
     return _redactor

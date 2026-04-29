@@ -1,19 +1,21 @@
 """
 SQLite implementation of AuditRepository.
 
-Parses `sqlite:///path?table=X&wal=true` DSN, creates table on first use,
-uses WAL mode by default.
+Parses `sqlite:///path?table=X&wal=true` DSN, creates the table on first use,
+and uses WAL mode by default.
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
 
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -37,15 +39,20 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_{table}_req ON {table}(request_id);
+CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
 CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
-CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}(timestamp);
+CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
 """
 
 
 class SQLiteStore:
     def __init__(self, path: str, table: str = "audit_log", wal: bool = True) -> None:
+        if not _SAFE_IDENTIFIER.match(table):
+            raise ValueError(
+                f"fasten SQLiteStore: table name {table!r} is not a valid SQL identifier. "
+                "Use only letters, digits, and underscores."
+            )
         self._path = path
         self._table = table
         self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -66,7 +73,11 @@ class SQLiteStore:
                 f"fasten SQLiteStore: DSN {dsn!r} has no path. "
                 "Audit storage must be durable — use sqlite:///./audit.db or similar."
             )
-        return cls(path=path, table=q.get("table", "audit_log"), wal=q.get("wal", "true") != "false")
+        return cls(
+            path=path,
+            table=q.get("table", "audit_log"),
+            wal=q.get("wal", "true") != "false",
+        )
 
     def insert(self, row: AuditRow) -> None:
         self._conn.execute(
@@ -95,7 +106,7 @@ class SQLiteStore:
         return [self._row(r) for r in cur.fetchall()]
 
     def mark_shipped(self, ids: list[str]) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._conn.executemany(
             f"UPDATE {self._table} SET shipped_at=? WHERE id=?",
             [(now, i) for i in ids],
@@ -125,17 +136,17 @@ class SQLiteStore:
         conds: list[str] = []
         params: list[object] = []
         if request_id:
-            conds.append("request_id = ?"); params.append(request_id)
+            conds.append("request_id = ?");     params.append(request_id)
         if code:
-            conds.append("code = ?"); params.append(code)
+            conds.append("code = ?");           params.append(code)
         if domain:
-            conds.append("domain = ?"); params.append(domain)
+            conds.append("domain = ?");         params.append(domain)
         if source_node_id:
             conds.append("source_node_id = ?"); params.append(source_node_id)
         if since:
-            conds.append("timestamp >= ?"); params.append(since.isoformat())
+            conds.append("timestamp >= ?");     params.append(since.isoformat())
         if until:
-            conds.append("timestamp <= ?"); params.append(until.isoformat())
+            conds.append("timestamp <= ?");     params.append(until.isoformat())
         where = f"WHERE {' AND '.join(conds)}" if conds else ""
         cur = self._conn.execute(
             f"SELECT * FROM {self._table} {where} ORDER BY monotonic_seq DESC LIMIT ?",
