@@ -1,0 +1,11 @@
+# fasten canonical severity values
+#
+# Wire format: lowercase string in every audit row.
+# All adapters must use exactly these values.
+# Order: ascending severity.
+
+debug
+info
+warn
+error
+critical

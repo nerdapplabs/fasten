@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fasten.sh/spec/row-schema.json",
+  "title": "AuditRow",
+  "description": "Canonical shape of a fasten audit row on the wire (NDJSON stdout, shape=audit).",
+  "type": "object",
+  "required": [
+    "id", "origin_id", "monotonic_seq", "timestamp",
+    "code", "action", "severity",
+    "service_id", "source_node_id",
+    "actor", "actor_kind",
+    "target", "category", "domain",
+    "method", "request_id", "detail"
+  ],
+  "properties": {
+    "shape":          { "type": "string", "const": "audit" },
+    "id":             { "type": "string", "description": "evt-<20 hex chars>" },
+    "origin_id":      { "type": "string", "description": "Dedup key for replication; equals id on first emission." },
+    "monotonic_seq":  { "type": "integer", "description": "Per-node counter; resolves same-ms ties." },
+    "timestamp":      { "type": "string", "format": "date-time", "description": "UTC ISO-8601 with ms precision." },
+    "code":           { "type": "string", "description": "SCREAMING_SNAKE registered code." },
+    "action":         { "type": "string", "description": "Denormalised from code.Meta." },
+    "severity":       { "type": "string", "enum": ["debug","info","warn","error","critical"] },
+    "service_id":     { "type": "string" },
+    "source_node_id": { "type": "string" },
+    "tenant_id":      { "type": ["string", "null"] },
+    "actor":          { "type": "string", "default": "system" },
+    "actor_kind":     { "type": "string", "description": "user | service | schedule | agent", "default": "service" },
+    "target":         { "type": "string" },
+    "category":       { "type": "string", "description": "Denormalised from code.Meta." },
+    "domain":         { "type": "string", "description": "Adopter-defined domain, e.g. node, user, billing." },
+    "method":         { "type": "string", "enum": ["http","mqtt","cli","scheduler","ui","agent_tool","sdk"] },
+    "request_id":     { "type": "string", "description": "12-char hex correlation id." },
+    "detail":         { "type": "object", "description": "Arbitrary key-value pairs; secret keys are redacted." },
+    "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." }
+  },
+  "additionalProperties": false
+}

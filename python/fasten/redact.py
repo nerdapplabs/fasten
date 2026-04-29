@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
+# Source of truth: spec/redact-keys.txt — all language adapters must match.
 _DEFAULT_KEY_PATTERN = re.compile(
     r"(?i)(api[_-]?key|password|passwd|token|secret|authorization|"
     r"bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"

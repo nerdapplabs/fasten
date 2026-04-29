@@ -208,25 +208,17 @@ inline std::string mint_id_bytes(size_t bytes) {
     return out;
 }
 
-// Default built-in secret-key pattern — matches Python / Go redactor.
-// Case-insensitivity comes from std::regex::icase; no (?i) prefix needed.
-inline const std::string& default_redact_pattern_str() {
-    static const std::string s =
+// Per-process redactor config — stored in Globals, configured by init().
+// Source of truth: spec/redact-keys.txt — all language adapters must match.
+struct RedactConfig {
+    std::regex  pattern;
+    std::string replacement{"***"};
+
+    RedactConfig() : pattern(
         "api[_-]?key|password|passwd|token|secret|authorization|"
         "bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
-        "access_key|session_id|cookie|credential|auth";
-    return s;
-}
-
-inline const std::regex& default_secret_pattern() {
-    static const std::regex pat(default_redact_pattern_str(), std::regex::icase);
-    return pat;
-}
-
-// Per-process redactor config — stored in Globals, set via init().
-struct RedactConfig {
-    std::regex  pattern{default_secret_pattern()};
-    std::string replacement{"***"};
+        "access_key|session_id|cookie|credential|auth",
+        std::regex::icase) {}
 };
 
 // Thread-safe ring buffer (syslog + api streams).
@@ -492,7 +484,10 @@ inline void init(Config cfg = {}) {
     }
 
     // Build combined redact pattern: built-in defaults + any extra keys.
-    std::string pat_str = detail_::default_redact_pattern_str();
+    std::string pat_str =
+        "api[_-]?key|password|passwd|token|secret|authorization|"
+        "bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
+        "access_key|session_id|cookie|credential|auth";
     for (auto& k : cfg.extra_redact_keys) {
         if (!k.empty()) {
             pat_str += '|';
