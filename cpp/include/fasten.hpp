@@ -50,8 +50,72 @@ namespace fasten {
 // Examples: "node", "user", "billing", "device" — fasten has no opinions.
 using Domain = std::string;
 
-enum class Sev        { Debug, Info, Warn, Error, Critical };
-enum class Retention  { Short, Medium, Long };
+// ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
+enum class Sev       { Debug, Info, Warn, Error, Critical };
+enum class Retention { Short, Medium, Long };
+
+inline std::string to_string(Sev s) {
+    switch (s) {
+        case Sev::Debug: return "debug";
+        case Sev::Info: return "info";
+        case Sev::Warn: return "warn";
+        case Sev::Error: return "error";
+        case Sev::Critical: return "critical";
+    }
+    return "info";
+}
+inline std::string to_string(Retention r) {
+    switch (r) {
+        case Retention::Short: return "short";
+        case Retention::Medium: return "medium";
+        case Retention::Long: return "long";
+    }
+    return "medium";
+}
+
+// WHO anchor wire values.
+struct ActorKind {
+    static constexpr const char* user = "user";  // Human user (browser, mobile, CLI on behalf of a user)
+    static constexpr const char* service = "service";  // Internal service or daemon
+    static constexpr const char* schedule = "schedule";  // Cron job or task scheduler
+    static constexpr const char* agent = "agent";  // AI agent
+};
+
+// HOW anchor — set by transport shims. Use Method::sdk for direct calls.
+struct Method {
+    static constexpr const char* http = "http";  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+    static constexpr const char* mqtt = "mqtt";  // MQTT message (IoT telemetry, device command)
+    static constexpr const char* cli = "cli";  // CLI command typed by a human
+    static constexpr const char* scheduler = "scheduler";  // Automated cron or task scheduler
+    static constexpr const char* ui = "ui";  // Web or desktop UI action, human-initiated
+    static constexpr const char* agent_tool = "agent_tool";  // AI agent tool call
+    static constexpr const char* sdk = "sdk";  // Direct SDK call, no transport shim active. Default.
+};
+
+constexpr const char* kRedactReplacement = "***";
+
+// Default PII field key patterns (case-insensitive regex on keys).
+inline const std::vector<std::string>& redact_patterns() {
+    static const std::vector<std::string> kPatterns = {
+        "api[_-]?key",
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "authorization",
+        "bearer",
+        "m2m[_-]?key",
+        "cert[_-]?private",
+        "private[_-]?key",
+        "access_key",
+        "session_id",
+        "cookie",
+        "credential",
+        "auth",
+    };
+    return kPatterns;
+}
+// ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 using Fields = std::unordered_map<std::string, std::string>;
 
@@ -117,16 +181,7 @@ inline std::string env_or(const char* key, const char* fallback = "") {
     return (v && *v) ? v : fallback;
 }
 
-inline std::string sev_str(Sev s) {
-    switch (s) {
-        case Sev::Debug:    return "debug";
-        case Sev::Info:     return "info";
-        case Sev::Warn:     return "warn";
-        case Sev::Error:    return "error";
-        case Sev::Critical: return "critical";
-    }
-    return "info";
-}
+inline std::string sev_str(Sev s) { return fasten::to_string(s); }
 
 // JSON-escape a string value (including control chars below 0x20).
 inline std::string json_str(const std::string& s) {
@@ -208,17 +263,23 @@ inline std::string mint_id_bytes(size_t bytes) {
     return out;
 }
 
-// Per-process redactor config — stored in Globals, configured by init().
-// Source of truth: spec/redact-keys.txt — all language adapters must match.
-struct RedactConfig {
-    std::regex  pattern;
-    std::string replacement{"***"};
+// Build combined regex from a list of pattern alternations.
+inline std::string join_patterns(const std::vector<std::string>& v,
+                                  const std::vector<std::string>& extra = {}) {
+    std::string out = "^(";
+    bool first = true;
+    for (auto& p : v) { if (!first) out += "|"; out += p; first = false; }
+    for (auto& p : extra) { out += "|"; out += p; }
+    out += ")$";
+    return out;
+}
 
-    RedactConfig() : pattern(
-        "api[_-]?key|password|passwd|token|secret|authorization|"
-        "bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
-        "access_key|session_id|cookie|credential|auth",
-        std::regex::icase) {}
+// Per-process redactor config — stored in Globals, configured by init().
+// Patterns come from fasten::redact_patterns() — single source: spec/row-schema.json.
+struct RedactConfig {
+    std::string combined { join_patterns(fasten::redact_patterns()) };
+    std::regex  pattern  { combined, std::regex::icase };
+    std::string replacement { fasten::kRedactReplacement };
 };
 
 // Thread-safe ring buffer (syslog + api streams).
@@ -483,22 +544,19 @@ inline void init(Config cfg = {}) {
         throw InitError("init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required");
     }
 
-    // Build combined redact pattern: built-in defaults + any extra keys.
-    std::string pat_str =
-        "api[_-]?key|password|passwd|token|secret|authorization|"
-        "bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
-        "access_key|session_id|cookie|credential|auth";
-    for (auto& k : cfg.extra_redact_keys) {
-        if (!k.empty()) {
-            pat_str += '|';
-            // Escape the user-supplied literal key before inserting into regex.
-            pat_str += std::regex_replace(k, std::regex(R"([-[\]{}()*+?.,\\^$|#\s])"),
-                                          R"(\$&)");
+    if (!cfg.extra_redact_keys.empty()) {
+        std::vector<std::string> escaped;
+        escaped.reserve(cfg.extra_redact_keys.size());
+        for (auto& k : cfg.extra_redact_keys) {
+            if (!k.empty())
+                escaped.push_back(std::regex_replace(
+                    k, std::regex(R"([-[\]{}()*+?.,\\^$|#\s])"), R"(\$&)"));
         }
+        g.redact_cfg.combined = detail_::join_patterns(fasten::redact_patterns(), escaped);
+        g.redact_cfg.pattern  = std::regex(g.redact_cfg.combined, std::regex::icase);
     }
-    g.redact_cfg.pattern     = std::regex(pat_str, std::regex::icase);
     g.redact_cfg.replacement = cfg.redact_replacement.empty()
-        ? env_or("FASTEN_REDACT_REPLACEMENT", "***")
+        ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
 }
 

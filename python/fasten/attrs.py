@@ -21,7 +21,7 @@ class Anchor(str, Enum):
     WHEN        = "when"         # timestamp, monotonic_seq
     WHERE       = "where"        # source_node_id, service_id, tenant_id
     WHOM        = "whom"         # target, category, domain
-    HOW         = "how"          # method ∈ {http, mqtt, cli, scheduler, ui, agent_tool}
+    HOW         = "how"          # method ∈ {http, mqtt, cli, scheduler, ui, agent_tool, sdk}
     CORRELATION = "correlation"  # request_id
 
     def __str__(self) -> str:
@@ -65,7 +65,7 @@ class AuditRow:
     domain: str = ""    # denormalised
 
     # HOW
-    method: str = "http"  # http | mqtt | cli | scheduler | ui | agent_tool
+    method: str = "sdk"   # http | mqtt | cli | scheduler | ui | agent_tool | sdk
 
     # CORRELATION
     request_id: str = ""

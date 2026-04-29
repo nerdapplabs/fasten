@@ -13,11 +13,11 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-# Source of truth: spec/redact-keys.txt — all language adapters must match.
+# Patterns generated from spec/row-schema.json — see codes._REDACT_PATTERNS.
+from .codes import _REDACT_PATTERNS, _REDACT_REPLACEMENT as _DEFAULT_REPLACEMENT
+
 _DEFAULT_KEY_PATTERN = re.compile(
-    r"(?i)(api[_-]?key|password|passwd|token|secret|authorization|"
-    r"bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
-    r"access_key|session_id|cookie|credential|auth)"
+    r"(?i)(" + "|".join(_REDACT_PATTERNS) + r")"
 )
 
 # Structlog internal keys that must never be redacted even if they match a pattern.
@@ -30,15 +30,14 @@ class Redactor:
     def __init__(
         self,
         extra_keys: list[str] | None = None,
-        replacement: str = "***",
+        replacement: str = _DEFAULT_REPLACEMENT,
     ) -> None:
         self._replacement = replacement
         self._pattern = _DEFAULT_KEY_PATTERN
         if extra_keys:
-            joined = "|".join(re.escape(k) for k in extra_keys)
-            self._pattern = re.compile(
-                f"(?i)({_DEFAULT_KEY_PATTERN.pattern}|{joined})"
-            )
+            extra_escaped = "|".join(re.escape(k) for k in extra_keys)
+            combined = "|".join(_REDACT_PATTERNS) + "|" + extra_escaped
+            self._pattern = re.compile(r"(?i)(" + combined + r")")
 
     def redact(self, value: Any) -> Any:
         """Deep-redact a value (dict / list / scalar)."""

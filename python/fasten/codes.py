@@ -18,24 +18,65 @@ from typing import Iterable
 Domain = str
 
 
+# ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 class Severity(str, Enum):
-    DEBUG    = "debug"
-    INFO     = "info"
-    WARN     = "warn"
-    ERROR    = "error"
-    CRITICAL = "critical"
+    """Ascending severity. Wire value: lowercase string."""
+    DEBUG    = "debug"  # Low-level diagnostic, filtered in production
+    INFO     = "info"  # Normal operational event
+    WARN     = "warn"  # Potentially problematic, not yet an error
+    ERROR    = "error"  # Operation failed, requires attention
+    CRITICAL = "critical"  # Severe failure, may impact availability
 
-    def __str__(self) -> str:
-        return self.value
-
+    def __str__(self) -> str: return self.value
 
 class RetentionClass(str, Enum):
-    SHORT  = "short"    # 30d default
-    MEDIUM = "medium"   # 180d default
-    LONG   = "long"     # 1095d (3y) default
+    """Row retention bucket. Wire value: lowercase string."""
+    SHORT  = "short"  # Default 30 days
+    MEDIUM = "medium"  # Default 180 days
+    LONG   = "long"  # Default 1095 days (3 years)
 
-    def __str__(self) -> str:
-        return self.value
+    def __str__(self) -> str: return self.value
+
+class ActorKind(str, Enum):
+    """WHO anchor — who initiated the action. Wire value: lowercase string."""
+    USER     = "user"  # Human user (browser, mobile, CLI on behalf of a user)
+    SERVICE  = "service"  # Internal service or daemon
+    SCHEDULE = "schedule"  # Cron job or task scheduler
+    AGENT    = "agent"  # AI agent
+
+    def __str__(self) -> str: return self.value
+
+class Method(str, Enum):
+    """HOW anchor — how the event was triggered. Wire value: lowercase string."""
+    HTTP       = "http"  # HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+    MQTT       = "mqtt"  # MQTT message (IoT telemetry, device command)
+    CLI        = "cli"  # CLI command typed by a human
+    SCHEDULER  = "scheduler"  # Automated cron or task scheduler
+    UI         = "ui"  # Web or desktop UI action, human-initiated
+    AGENT_TOOL = "agent_tool"  # AI agent tool call
+    SDK        = "sdk"  # Direct SDK call, no transport shim active. Default.
+
+    def __str__(self) -> str: return self.value
+
+_REDACT_REPLACEMENT = '***'
+_REDACT_PATTERNS = (
+    'api[_-]?key',
+    'password',
+    'passwd',
+    'token',
+    'secret',
+    'authorization',
+    'bearer',
+    'm2m[_-]?key',
+    'cert[_-]?private',
+    'private[_-]?key',
+    'access_key',
+    'session_id',
+    'cookie',
+    'credential',
+    'auth',
+)
+# ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)

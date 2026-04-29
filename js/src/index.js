@@ -33,13 +33,31 @@ const registry = new Map();
 // fasten ships no built-in domain constants; use string literals in your codes module.
 export const Domain = {}; // kept for import compatibility; intentionally empty
 
-export const Severity = Object.freeze({
-    DEBUG: 'debug', INFO: 'info', WARN: 'warn', ERROR: 'error', CRITICAL: 'critical',
-});
+// ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
+export const Severity = Object.freeze({ DEBUG: 'debug', INFO: 'info', WARN: 'warn', ERROR: 'error', CRITICAL: 'critical' });
+export const RetentionClass = Object.freeze({ SHORT: 'short', MEDIUM: 'medium', LONG: 'long' });
+export const ActorKind = Object.freeze({ USER: 'user', SERVICE: 'service', SCHEDULE: 'schedule', AGENT: 'agent' });
+export const Method = Object.freeze({ HTTP: 'http', MQTT: 'mqtt', CLI: 'cli', SCHEDULER: 'scheduler', UI: 'ui', AGENT_TOOL: 'agent_tool', SDK: 'sdk' });
 
-export const RetentionClass = Object.freeze({
-    SHORT: 'short', MEDIUM: 'medium', LONG: 'long',
-});
+export const REDACT_REPLACEMENT = '***';
+export const REDACT_PATTERNS = [
+  'api[_-]?key',
+  'password',
+  'passwd',
+  'token',
+  'secret',
+  'authorization',
+  'bearer',
+  'm2m[_-]?key',
+  'cert[_-]?private',
+  'private[_-]?key',
+  'access_key',
+  'session_id',
+  'cookie',
+  'credential',
+  'auth',
+];
+// ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 export function register(domain, codes) {
     for (const [id, meta] of Object.entries(codes)) {
@@ -80,7 +98,7 @@ export function init(opts = {}) {
 }
 
 export function emit({ code, target, actor = 'system', actorKind = 'service',
-                       detail = {}, severity, method = 'http' }) {
+                       detail = {}, severity, method = 'sdk' }) {
     if (!config.serviceId) throw new Error('fasten.init() must be called before emit()');
     const meta = registry.get(code);
     if (!meta) throw new Error(`unknown audit code: ${code}`);
@@ -115,4 +133,4 @@ export const log = {
 
 export default { init, emit, log, register, metaOf, dump,
                  mintID, currentRequestID, withRequestID,
-                 Domain, Severity, RetentionClass };
+                 Domain, Severity, RetentionClass, ActorKind, Method };

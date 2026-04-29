@@ -28,13 +28,69 @@ public final class Fasten {
         NODE, SYNC, FLEET, AGENT
     }
 
+// ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
     public enum Severity {
-        DEBUG, INFO, WARN, ERROR, CRITICAL
+        DEBUG, INFO, WARN, ERROR, CRITICAL;
+
+        @Override public String toString() {
+            switch (this) {
+                case DEBUG: return "debug";
+                case INFO: return "info";
+                case WARN: return "warn";
+                case ERROR: return "error";
+                case CRITICAL: return "critical";
+                default: throw new IllegalStateException();
+            }
+        }
     }
 
     public enum RetentionClass {
-        SHORT, MEDIUM, LONG
+        SHORT, MEDIUM, LONG;
+
+        @Override public String toString() {
+            switch (this) {
+                case SHORT: return "short";
+                case MEDIUM: return "medium";
+                case LONG: return "long";
+                default: throw new IllegalStateException();
+            }
+        }
     }
+
+    // WHO anchor wire values.
+    public static final String ACTOR_USER = "user";  // Human user (browser, mobile, CLI on behalf of a user)
+    public static final String ACTOR_SERVICE = "service";  // Internal service or daemon
+    public static final String ACTOR_SCHEDULE = "schedule";  // Cron job or task scheduler
+    public static final String ACTOR_AGENT = "agent";  // AI agent
+
+    // HOW anchor wire values.
+    public static final String METHOD_HTTP = "http";  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+    public static final String METHOD_MQTT = "mqtt";  // MQTT message (IoT telemetry, device command)
+    public static final String METHOD_CLI = "cli";  // CLI command typed by a human
+    public static final String METHOD_SCHEDULER = "scheduler";  // Automated cron or task scheduler
+    public static final String METHOD_UI = "ui";  // Web or desktop UI action, human-initiated
+    public static final String METHOD_AGENT_TOOL = "agent_tool";  // AI agent tool call
+    public static final String METHOD_SDK = "sdk";  // Direct SDK call, no transport shim active. Default.
+
+    public static final String REDACT_REPLACEMENT = "***";
+    public static final String[] REDACT_PATTERNS = {
+        "api[_-]?key",
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "authorization",
+        "bearer",
+        "m2m[_-]?key",
+        "cert[_-]?private",
+        "private[_-]?key",
+        "access_key",
+        "session_id",
+        "cookie",
+        "credential",
+        "auth",
+    };
+// ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
     /** Canonical audit row. Lossless conversion to CloudEvent + OTel LogRecord. */
     public record Row(
@@ -153,7 +209,7 @@ public final class Fasten {
         private String target = "";
         private String actor = "system";
         private String actorKind = "service";
-        private String method = "http";
+        private String method = "sdk";
         private Map<String, Object> detail = Map.of();
         private Severity severityOverride;
 

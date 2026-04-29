@@ -25,6 +25,66 @@ import (
 	"time"
 )
 
+// ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
+type Severity string
+
+const (
+	SevDebug    Severity = "debug"  // Low-level diagnostic, filtered in production
+	SevInfo     Severity = "info"  // Normal operational event (default)
+	SevWarn     Severity = "warn"  // Potentially problematic, not yet an error
+	SevError    Severity = "error"  // Operation failed, requires attention
+	SevCritical Severity = "critical"  // Severe failure, may impact availability
+)
+
+type RetentionClass string
+
+const (
+	RetShort  RetentionClass = "short"  // Default 30 days
+	RetMedium RetentionClass = "medium"  // Default 180 days (default)
+	RetLong   RetentionClass = "long"  // Default 1095 days (3 years)
+)
+
+type ActorKind string
+
+const (
+	ActorUser     ActorKind = "user"  // Human user (browser, mobile, CLI on behalf of a user)
+	ActorService  ActorKind = "service"  // Internal service or daemon (default)
+	ActorSchedule ActorKind = "schedule"  // Cron job or task scheduler
+	ActorAgent    ActorKind = "agent"  // AI agent
+)
+
+const (
+	MethodHTTP      = "http"  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+	MethodMQTT      = "mqtt"  // MQTT message (IoT telemetry, device command)
+	MethodCLI       = "cli"  // CLI command typed by a human
+	MethodScheduler = "scheduler"  // Automated cron or task scheduler
+	MethodUI        = "ui"  // Web or desktop UI action, human-initiated
+	MethodAgentTool = "agent_tool"  // AI agent tool call
+	MethodSDK       = "sdk"  // Direct SDK call, no transport shim active. Default. (default)
+)
+
+const RedactReplacement = "***"
+
+// RedactPatterns are the default PII field key patterns (case-insensitive regex on keys).
+var RedactPatterns = []string{
+	"api[_-]?key",
+	"password",
+	"passwd",
+	"token",
+	"secret",
+	"authorization",
+	"bearer",
+	"m2m[_-]?key",
+	"cert[_-]?private",
+	"private[_-]?key",
+	"access_key",
+	"session_id",
+	"cookie",
+	"credential",
+	"auth",
+}
+// ── END FASTEN GENERATED ──────────────────────────────────────────────────
+
 // ── Anchors ───────────────────────────────────────────────────────────────
 
 type Anchor string
@@ -67,26 +127,9 @@ type Row struct {
 // ── Code catalog ──────────────────────────────────────────────────────────
 
 type Code string
+
+// Domain is a plain string — adopters define their own vocabulary.
 type Domain string
-type Severity string
-type RetentionClass string
-
-// Domain is a plain string type — adopters define their own vocabulary.
-// fasten has no built-in domain constants; use string literals in your codes package.
-
-const (
-	SevDebug    Severity = "debug"
-	SevInfo     Severity = "info"
-	SevWarn     Severity = "warn"
-	SevError    Severity = "error"
-	SevCritical Severity = "critical"
-)
-
-const (
-	RetShort  RetentionClass = "short"
-	RetMedium RetentionClass = "medium"
-	RetLong   RetentionClass = "long"
-)
 
 // Meta is the per-code metadata registered once at startup.
 type Meta struct {
@@ -247,7 +290,7 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		Target:       "",
 		Category:     m.Category,
 		Domain:       m.Domain,
-		Method:       "http",
+		Method:       "sdk",
 		RequestID:    rid,
 		Detail:       map[string]any{},
 	}

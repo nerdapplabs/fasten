@@ -9,6 +9,81 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+
+// ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Debug,  // Low-level diagnostic, filtered in production
+    Info,  // Normal operational event
+    Warn,  // Potentially problematic, not yet an error
+    Error,  // Operation failed, requires attention
+    Critical,  // Severe failure, may impact availability
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Severity::Debug => f.write_str("debug"),
+            Severity::Info => f.write_str("info"),
+            Severity::Warn => f.write_str("warn"),
+            Severity::Error => f.write_str("error"),
+            Severity::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionClass {
+    Short,  // Default 30 days
+    Medium,  // Default 180 days
+    Long,  // Default 1095 days (3 years)
+}
+
+impl fmt::Display for RetentionClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RetentionClass::Short => f.write_str("short"),
+            RetentionClass::Medium => f.write_str("medium"),
+            RetentionClass::Long => f.write_str("long"),
+        }
+    }
+}
+
+// WHO anchor wire values.
+pub const ACTOR_USER: &str = "user";  // Human user (browser, mobile, CLI on behalf of a user)
+pub const ACTOR_SERVICE: &str = "service";  // Internal service or daemon
+pub const ACTOR_SCHEDULE: &str = "schedule";  // Cron job or task scheduler
+pub const ACTOR_AGENT: &str = "agent";  // AI agent
+
+// HOW anchor wire values.
+pub const METHOD_HTTP: &str = "http";  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+pub const METHOD_MQTT: &str = "mqtt";  // MQTT message (IoT telemetry, device command)
+pub const METHOD_CLI: &str = "cli";  // CLI command typed by a human
+pub const METHOD_SCHEDULER: &str = "scheduler";  // Automated cron or task scheduler
+pub const METHOD_UI: &str = "ui";  // Web or desktop UI action, human-initiated
+pub const METHOD_AGENT_TOOL: &str = "agent_tool";  // AI agent tool call
+pub const METHOD_SDK: &str = "sdk";  // Direct SDK call, no transport shim active. Default.
+
+pub const REDACT_REPLACEMENT: &str = "***";
+pub const REDACT_PATTERNS: &[&str] = &[
+    "api[_-]?key",
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "authorization",
+    "bearer",
+    "m2m[_-]?key",
+    "cert[_-]?private",
+    "private[_-]?key",
+    "access_key",
+    "session_id",
+    "cookie",
+    "credential",
+    "auth",
+];
+// ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 // --- 6 audit anchors as typed row ----------------------------------------
 
@@ -68,21 +143,6 @@ pub enum Domain {
     Agent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Severity {
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Critical,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RetentionClass {
-    Short,  // 30d default
-    Medium, // 180d default
-    Long,   // 1095d (3y) default
-}
 
 #[derive(Debug, Clone)]
 pub struct Meta {
@@ -115,6 +175,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
 
 /// Register a batch of codes for a domain. Call once per domain at startup.
 pub fn register(_domain: Domain, _codes: impl IntoIterator<Item = (String, Meta)>) -> Result<(), Error> {
@@ -191,7 +252,7 @@ impl EmitBuilder {
             target: target.into(),
             actor: "system".into(),
             actor_kind: "service".into(),
-            method: "http".into(),
+            method: "sdk".into(),
             detail: HashMap::new(),
             severity: None,
         }
