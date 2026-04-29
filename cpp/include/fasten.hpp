@@ -208,26 +208,26 @@ inline std::string mint_id_bytes(size_t bytes) {
     return out;
 }
 
-// Secret-key redactor — same pattern as Python / Go.
-// Note: no (?i) prefix — case-insensitivity comes from std::regex::icase flag.
-inline const std::regex& secret_pattern() {
-    static const std::regex pat(
+// Default built-in secret-key pattern — matches Python / Go redactor.
+// Case-insensitivity comes from std::regex::icase; no (?i) prefix needed.
+inline const std::string& default_redact_pattern_str() {
+    static const std::string s =
         "api[_-]?key|password|passwd|token|secret|authorization|"
         "bearer|m2m[_-]?key|cert[_-]?private|private[_-]?key|"
-        "access_key|session_id|cookie|credential|auth",
-        std::regex::icase);
+        "access_key|session_id|cookie|credential|auth";
+    return s;
+}
+
+inline const std::regex& default_secret_pattern() {
+    static const std::regex pat(default_redact_pattern_str(), std::regex::icase);
     return pat;
 }
 
-inline Fields redact(const Fields& f, const std::string& repl = "***") {
-    Fields out;
-    for (auto& kv : f) {
-        out[kv.first] = std::regex_search(kv.first, secret_pattern())
-            ? repl
-            : kv.second;
-    }
-    return out;
-}
+// Per-process redactor config — stored in Globals, set via init().
+struct RedactConfig {
+    std::regex  pattern{default_secret_pattern()};
+    std::string replacement{"***"};
+};
 
 // Thread-safe ring buffer (syslog + api streams).
 struct RingBuffer {
@@ -305,6 +305,9 @@ struct Globals {
     // Adopter-supplied audit sink — called for every emitted Row.
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
+
+    // Redactor config — built by init(), defaults to built-in pattern + "***".
+    RedactConfig redact_cfg;
 };
 
 inline Globals& globals() {
@@ -316,6 +319,20 @@ inline Globals& globals() {
 inline std::string& tl_request_id() {
     thread_local std::string rid;
     return rid;
+}
+
+// Redact sensitive keys in a Fields map using the process-wide config.
+// Keys matching the pattern have their values replaced; keys are preserved.
+inline Fields redact(const Fields& f) {
+    auto& cfg = globals().redact_cfg;
+    Fields out;
+    out.reserve(f.size());
+    for (auto& kv : f) {
+        out[kv.first] = std::regex_search(kv.first, cfg.pattern)
+            ? cfg.replacement
+            : kv.second;
+    }
+    return out;
 }
 
 } // namespace detail_
@@ -454,9 +471,13 @@ inline std::string dump() {
 // ── Init ───────────────────────────────────────────────────────────────────
 
 struct Config {
-    std::string service_id;
-    std::string node_id;
-    std::string tenant_id;  // optional
+    std::string              service_id;
+    std::string              node_id;
+    std::string              tenant_id;           // optional
+
+    // Redaction — both are additive to / override the built-in defaults.
+    std::vector<std::string> extra_redact_keys;   // appended to built-in pattern
+    std::string              redact_replacement;  // default "***"; env FASTEN_REDACT_REPLACEMENT
 };
 
 inline void init(Config cfg = {}) {
@@ -469,6 +490,33 @@ inline void init(Config cfg = {}) {
     if (g.service_id.empty() || g.node_id.empty()) {
         throw InitError("init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required");
     }
+
+    // Build combined redact pattern: built-in defaults + any extra keys.
+    std::string pat_str = detail_::default_redact_pattern_str();
+    for (auto& k : cfg.extra_redact_keys) {
+        if (!k.empty()) {
+            pat_str += '|';
+            // Escape the user-supplied literal key before inserting into regex.
+            pat_str += std::regex_replace(k, std::regex(R"([-[\]{}()*+?.,\\^$|#\s])"),
+                                          R"(\$&)");
+        }
+    }
+    g.redact_cfg.pattern     = std::regex(pat_str, std::regex::icase);
+    g.redact_cfg.replacement = cfg.redact_replacement.empty()
+        ? env_or("FASTEN_REDACT_REPLACEMENT", "***")
+        : cfg.redact_replacement;
+}
+
+// Convenience overload — positional args for the common case.
+// Extra redact config can still be set via init(Config{...}).
+inline void init(std::string service_id,
+                 std::string node_id,
+                 std::string tenant_id = "") {
+    Config cfg;
+    cfg.service_id = std::move(service_id);
+    cfg.node_id    = std::move(node_id);
+    cfg.tenant_id  = std::move(tenant_id);
+    init(std::move(cfg));
 }
 
 // ── Audit sink ─────────────────────────────────────────────────────────────

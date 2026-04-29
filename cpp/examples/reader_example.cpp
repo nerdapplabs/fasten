@@ -133,7 +133,7 @@ int main() {
         {"CONN_UP", {"CONN_UP", "node", "connector", "up",
                      fasten::Sev::Info, "Connected", "demo"}},
     });
-    fasten::init({"demo-svc", "node-01", ""});
+    fasten::init("demo-svc", "node-01");
 
     // Register a fake audit query (normally this hits your SQLite/Postgres).
     fasten::reader::set_audit_query(

@@ -36,7 +36,7 @@ int main() {
     register_audit_codes();
 
     // Init from env (FASTEN_SERVICE_ID, FASTEN_NODE_ID) or explicit config.
-    fasten::init({"modbus-tcp", "edge-01", ""});
+    fasten::init("modbus-tcp", "edge-01");
 
     // Optional: register a persistent audit sink.
     // Replace with real SQLite/Postgres writes in production.
