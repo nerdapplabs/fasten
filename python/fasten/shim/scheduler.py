@@ -38,7 +38,7 @@ def instrument(fn: Callable[..., T]) -> Callable[..., T]:
     if inspect.iscoroutinefunction(fn):
         async def async_wrapper(*args: object, **kwargs: object) -> T:
             with job_run():
-                return await fn(*args, **kwargs)  # type: ignore[return-value]
+                return await fn(*args, **kwargs)
         return async_wrapper  # type: ignore[return-value]
 
     def wrapper(*args: object, **kwargs: object) -> T:

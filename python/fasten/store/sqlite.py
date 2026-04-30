@@ -10,7 +10,6 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
@@ -136,17 +135,23 @@ class SQLiteStore:
         conds: list[str] = []
         params: list[object] = []
         if request_id:
-            conds.append("request_id = ?");     params.append(request_id)
+            conds.append("request_id = ?")
+            params.append(request_id)
         if code:
-            conds.append("code = ?");           params.append(code)
+            conds.append("code = ?")
+            params.append(code)
         if domain:
-            conds.append("domain = ?");         params.append(domain)
+            conds.append("domain = ?")
+            params.append(domain)
         if source_node_id:
-            conds.append("source_node_id = ?"); params.append(source_node_id)
+            conds.append("source_node_id = ?")
+            params.append(source_node_id)
         if since:
-            conds.append("timestamp >= ?");     params.append(since.isoformat())
+            conds.append("timestamp >= ?")
+            params.append(since.isoformat())
         if until:
-            conds.append("timestamp <= ?");     params.append(until.isoformat())
+            conds.append("timestamp <= ?")
+            params.append(until.isoformat())
         where = f"WHERE {' AND '.join(conds)}" if conds else ""
         cur = self._conn.execute(
             f"SELECT * FROM {self._table} {where} ORDER BY monotonic_seq DESC LIMIT ?",
