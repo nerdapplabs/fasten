@@ -50,7 +50,7 @@ class Redactor:
             return [self.redact(v) for v in value]
         return value
 
-    def as_structlog_processor(self) -> Callable:
+    def as_structlog_processor(self) -> Callable[..., Any]:
         """Return a structlog processor that redacts sensitive keys from event_dict.
 
         Skips structlog internals (timestamp, level, event, etc.) so they are

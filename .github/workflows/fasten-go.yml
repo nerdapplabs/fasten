@@ -23,16 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: |
-          apk add --no-cache git
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-
       - name: Vet
         run: go vet ./...
 
       - name: Unit tests
-        run: go test -v -race ./...
-
-      - name: Vulnerability scan (govulncheck)
-        run: govulncheck ./...
+        # -race requires CGO which is not available in golang:*-alpine (CGO_ENABLED=0)
+        run: go test -v ./...

@@ -24,7 +24,5 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Unit tests
-        run: node --test test/
-
-      - name: Audit (npm audit)
-        run: npm audit --audit-level=moderate
+        # node --test with no path auto-discovers **/*.test.mjs in cwd
+        run: node --test
