@@ -8,7 +8,7 @@ one `request_id` threaded across HTTP / MQTT / scheduler / deploy-pipeline /
 agent-tool — three streams (syslog / API / audit), one mountable query
 surface. Apache-2.0.
 
-**[Full docs →](website/docs/)**
+**[Full docs →](https://fasten.sh/docs/)**
 
 ---
 
@@ -96,19 +96,27 @@ filter prompt). For the paid hosted aggregator, see
 
 | Topic                    | Link                                              |
 |--------------------------|---------------------------------------------------|
-| Quickstart + output      | [docs/ → 5-min quickstart](website/docs/#quickstart) |
-| Incident debugging       | [docs/ → Incident debugging](website/docs/#incident) |
-| 7 anchors                | [docs/ → Anchors](website/docs/#anchors)          |
-| Operational FAQ          | [docs/ → FAQ](website/docs/#faq)                  |
-| Env-var reference        | [docs/ → Env-vars](website/docs/#envvars)         |
-| Retention + PII          | [docs/ → Retention](website/docs/#retention)      |
-| Code evolution + compat  | [docs/ → Evolution](website/docs/#evolution)      |
+| Quickstart + output      | [fasten.sh/docs/#quickstart](https://fasten.sh/docs/#quickstart) |
+| Incident debugging       | [fasten.sh/docs/#incident](https://fasten.sh/docs/#incident) |
+| 7 anchors                | [fasten.sh/docs/#anchors](https://fasten.sh/docs/#anchors) |
+| Operational FAQ          | [fasten.sh/docs/#faq](https://fasten.sh/docs/#faq) |
+| Env-var reference        | [fasten.sh/docs/#envvars](https://fasten.sh/docs/#envvars) |
+| Retention + PII          | [fasten.sh/docs/#retention](https://fasten.sh/docs/#retention) |
+| Code evolution + compat  | [fasten.sh/docs/#evolution](https://fasten.sh/docs/#evolution) |
 
 ---
 
 ## Status
 
-Pre-v1. This is the standalone fasten repo — Apache-2.0 SDK, open for contribution once P0-1 / P0-2 land.
+Pre-v1. Apache-2.0, open for contribution once P0-1 / P0-2 land.
+
+PyPI (`pip install fasten`) and npm (`npm install @nerdapplabs/fasten`) publish at
+v0.1.0-alpha. Until then install from source:
+
+```bash
+pip install ./python           # Python
+npm install ./js               # Node / TypeScript
+```
 
 ## License
 

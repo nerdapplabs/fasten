@@ -1,5 +1,5 @@
 {
-  "name": "fasten",
+  "name": "@nerdapplabs/fasten",
   "version": "0.1.0-alpha.0",
   "description": "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport",
   "license": "Apache-2.0",
