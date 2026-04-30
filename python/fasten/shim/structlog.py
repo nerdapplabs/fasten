@@ -30,8 +30,8 @@ def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, An
 
     def _processor(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         try:
-            from fasten.emit import _get_stdout
-            transport = _get_stdout()
+            from fasten import transport as _transport
+            transport = _transport()
             if transport is None:
                 return event_dict
 

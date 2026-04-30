@@ -121,17 +121,18 @@ class SQLiteStore:
         self._conn.commit()
         return cur.rowcount
 
-    def query(
+    def _build_where(
         self,
         *,
         request_id: str | None = None,
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
-        limit: int = 100,
-    ) -> list[AuditRow]:
+    ) -> tuple[str, list[object]]:
         conds: list[str] = []
         params: list[object] = []
         if request_id:
@@ -146,6 +147,12 @@ class SQLiteStore:
         if source_node_id:
             conds.append("source_node_id = ?")
             params.append(source_node_id)
+        if actor:
+            conds.append("actor = ?")
+            params.append(actor)
+        if target:
+            conds.append("target = ?")
+            params.append(target)
         if since:
             conds.append("timestamp >= ?")
             params.append(since.isoformat())
@@ -153,11 +160,56 @@ class SQLiteStore:
             conds.append("timestamp <= ?")
             params.append(until.isoformat())
         where = f"WHERE {' AND '.join(conds)}" if conds else ""
+        return where, params
+
+    def query(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[AuditRow]:
+        where, params = self._build_where(
+            request_id=request_id, code=code, domain=domain,
+            source_node_id=source_node_id, actor=actor, target=target,
+            since=since, until=until,
+        )
         cur = self._conn.execute(
-            f"SELECT * FROM {self._table} {where} ORDER BY monotonic_seq DESC LIMIT ?",
-            (*params, limit),
+            f"SELECT * FROM {self._table} {where} "
+            "ORDER BY monotonic_seq DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
         )
         return [self._row(r) for r in cur.fetchall()]
+
+    def count(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> int:
+        where, params = self._build_where(
+            request_id=request_id, code=code, domain=domain,
+            source_node_id=source_node_id, actor=actor, target=target,
+            since=since, until=until,
+        )
+        cur = self._conn.execute(
+            f"SELECT COUNT(*) FROM {self._table} {where}",
+            params,
+        )
+        return int(cur.fetchone()[0])
 
     def _row(self, r: tuple) -> AuditRow:
         return AuditRow(

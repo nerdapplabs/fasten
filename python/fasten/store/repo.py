@@ -24,10 +24,28 @@ class AuditRepository(Protocol):
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[AuditRow]: ...
+
+    def count(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> int:
+        """Total rows matching the same filter as query() — for pagination."""
+        ...
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]: ...
     def mark_shipped(self, ids: list[str]) -> None: ...

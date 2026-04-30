@@ -9,6 +9,6 @@ level, service_id, etc.
 """
 from __future__ import annotations
 
-from .router import router, init
+from .router import router
 
-__all__ = ["router", "init"]
+__all__ = ["router"]

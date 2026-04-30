@@ -6,6 +6,44 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Python public-API parity (P1-8)
+
+- `fasten.transport()` — public accessor for the active StdoutTransport,
+  so adopter middleware can push api/sys rows without reaching into
+  `fasten.emit._get_stdout()`.
+- `fasten.redactor()` — public accessor for the active Redactor, so
+  adopter logging layers can apply the same key-pattern scrubbing
+  fasten applies on emit.
+- `fasten.shim.http.APILogger` — ASGI middleware that pushes one api
+  row per request (`method`, `path`, `status`, `duration_ms`,
+  `request_id`, `timestamp`). Mirrors Go's `fasten.APILogger(skipPaths...)`;
+  configurable `skip` set for paths like `/health`, `/metrics`.
+- `AuditRepository.count(...)` — total rows matching a filter, for
+  pagination on top of `query()`.
+- `/audit` reader: `actor`, `target` filters; `offset` query param;
+  response now includes `total`, `limit`, `offset`.
+
+### Changed — Python public-API parity (P1-8)
+
+- `fasten.reader.router()` now auto-fetches the audit store + transport
+  from `fasten.init()` at request time. Pass `store=` / `transport=`
+  to `router()` itself for overrides (tests, read-replica).
+- `fasten.reader.router()` docstring leads with the `Depends(...)`
+  gated example; trusted-network usage demoted to the secondary path.
+- `fasten.init()` docstring lists `FASTEN_AUDIT_DSN` (and friends)
+  explicitly in the required/optional env-var split.
+- Added `fasten.audit_store()` to round out the public accessor trio
+  (`transport`, `redactor`, `audit_store`).
+
+### Removed — Python public-API parity (P1-8)
+
+- `fasten.emit._get_stdout`, `_get_redactor`, `_get_audit_store` —
+  callers must use `fasten.transport()`, `fasten.redactor()`,
+  `fasten.audit_store()` respectively. (Pre-1.0 surface; clean break.)
+- `fasten.reader.init(store, transport)` — redundant with the
+  `router(store=, transport=)` keyword arguments. Remove the call;
+  the router auto-fetches from `fasten.init()` by default.
+
 ## [1.0.0-beta.0] — 2026-05-01
 
 Promotion to 1.0.0-beta. Python, Go, and Node.js SDKs back the API

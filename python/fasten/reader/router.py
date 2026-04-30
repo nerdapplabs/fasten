@@ -4,28 +4,30 @@ Mountable /logs/{sys,api,audit} router.
 Framework-agnostic core + FastAPI adapter. Adopters on other frameworks
 (Flask, Sanic, aiohttp) wrap the core handler functions.
 
-Usage:
+Usage — recommended (gated with adopter auth):
+
     import fasten
-    from fasten.reader import router, init as init_reader
-    from fasten.transport import StdoutTransport
+    from fasten.reader import router
+    from fastapi import Depends
 
-    store = fasten.store.sqlite.SQLiteStore.from_dsn(dsn)
-    transport = StdoutTransport()
-    fasten.init(audit_store=store, ...)
-    init_reader(store, transport)
+    fasten.init()  # reads env: FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_AUDIT_DSN
 
-    # No auth — internal / trusted network only:
-    app.include_router(router(), prefix="/api/v1/logs")
-
-    # With auth — pass FastAPI dependencies:
     app.include_router(
         router(dependencies=[Depends(require_admin)]),
         prefix="/api/v1/logs",
     )
 
-WARNING: This router has no built-in authentication. All three endpoints
-(/sys, /api, /audit) return data to any caller who can reach them. Always
-gate with a FastAPI dependency or mount behind a trusted-network boundary.
+Usage — internal / trusted-network only:
+
+    app.include_router(router(), prefix="/api/v1/logs")
+
+The router pulls the audit store + transport from ``fasten.init()`` at
+request time. Pass ``store=`` / ``transport=`` to ``router()`` to
+override (tests, read-replica, multi-store).
+
+WARNING: This router has no built-in authentication. /sys, /api, and
+/audit return data to any caller who can reach them. Always pass
+``dependencies=[Depends(...)]`` or mount behind a trusted-network boundary.
 """
 from __future__ import annotations
 
@@ -33,24 +35,25 @@ import dataclasses
 from datetime import datetime
 from typing import Any, Optional
 
-_store: Any = None       # AuditRepository (sqlite / postgres)
-_transport: Any = None   # StdoutTransport — carries syslog + api ring buffers
+from .. import audit_store as _active_audit_store
+from .. import transport as _active_transport
 
 
-def init(store: Any, transport: Any = None) -> None:
-    """Inject audit store and stdout transport so route handlers can query them."""
-    global _store, _transport
-    _store = store
-    _transport = transport
-
-
-def router(dependencies: list[Any] | None = None) -> Any:
+def router(
+    dependencies: list[Any] | None = None,
+    *,
+    store: Any = None,
+    transport: Any = None,
+) -> Any:
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
     Args:
         dependencies: FastAPI dependencies applied to every route, e.g.
             ``[Depends(require_admin)]``. None means no auth — only use
             that behind a trusted-network boundary.
+        store: Optional AuditRepository override. Default: pulled from
+            ``fasten.init()`` at request time via ``fasten.audit_store()``.
+        transport: Optional StdoutTransport override. Default: same.
     """
     try:
         from fastapi import APIRouter, Query
@@ -61,6 +64,12 @@ def router(dependencies: list[Any] | None = None) -> Any:
 
     r = APIRouter(dependencies=dependencies or [])
 
+    def _store() -> Any:
+        return store if store is not None else _active_audit_store()
+
+    def _transport() -> Any:
+        return transport if transport is not None else _active_transport()
+
     @r.get("/sys")
     def get_sys(
         level: Optional[str] = Query(default=None),
@@ -68,9 +77,10 @@ def router(dependencies: list[Any] | None = None) -> Any:
         service_id: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
-        if _transport is None:
-            return {"rows": [], "error": "transport not initialised — call init() first"}
-        rows = _transport.query_syslog(
+        t = _transport()
+        if t is None:
+            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+        rows = t.query_syslog(
             limit=limit,
             level=level,
             request_id=request_id,
@@ -85,9 +95,10 @@ def router(dependencies: list[Any] | None = None) -> Any:
         request_id: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
-        if _transport is None:
-            return {"rows": [], "error": "transport not initialised — call init() first"}
-        rows = _transport.query_api(
+        t = _transport()
+        if t is None:
+            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+        rows = t.query_api(
             limit=limit,
             method=method,
             path=path,
@@ -101,21 +112,32 @@ def router(dependencies: list[Any] | None = None) -> Any:
         code: Optional[str] = Query(default=None),
         domain: Optional[str] = Query(default=None),
         source_node_id: Optional[str] = Query(default=None),
+        actor: Optional[str] = Query(default=None),
+        target: Optional[str] = Query(default=None),
         since: Optional[datetime] = Query(default=None),
         until: Optional[datetime] = Query(default=None),
         limit: int = Query(default=100, le=1000),
+        offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
-        if _store is None:
-            return {"rows": [], "error": "audit store not initialised — call init() first"}
-        rows = _store.query(
-            request_id=request_id,
-            code=code,
-            domain=domain,
-            source_node_id=source_node_id,
-            since=since,
-            until=until,
-            limit=limit,
+        s = _store()
+        if s is None:
+            return {
+                "rows": [],
+                "total": 0,
+                "error": "audit store not initialised — call fasten.init() first",
+            }
+        filters = dict(
+            request_id=request_id, code=code, domain=domain,
+            source_node_id=source_node_id, actor=actor, target=target,
+            since=since, until=until,
         )
-        return {"rows": [dataclasses.asdict(r) for r in rows]}
+        rows = s.query(limit=limit, offset=offset, **filters)
+        total = s.count(**filters) if hasattr(s, "count") else len(rows)
+        return {
+            "rows": [dataclasses.asdict(row) for row in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
 
     return r

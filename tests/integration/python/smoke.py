@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 import fasten
 from fasten.codes import register, Meta, Severity, RetentionClass
-from fasten.emit import _get_stdout
 
 os.environ.setdefault("FASTEN_SERVICE_ID", "itest-python")
 os.environ.setdefault("FASTEN_NODE_ID", "host-itest")
@@ -39,7 +38,7 @@ fasten.emit(
 # 3. api row — what an access-log middleware emits after each HTTP request.
 #    In production this is written by RequestIDMiddleware (or a thin wrapper);
 #    here we call write_api directly to keep the smoke dep-free.
-_get_stdout().write_api({
+fasten.transport().write_api({
     "method": "POST",
     "path": "/api/users",
     "status": 201,
@@ -69,7 +68,7 @@ try:
     )
     structlog.get_logger().info("structlog_ok", lang="python")
 
-    ring = _get_stdout().query_syslog(limit=20)
+    ring = fasten.transport().query_syslog(limit=20)
     assert any(r.get("event") == "structlog_ok" for r in ring), (
         "structlog shim: 'structlog_ok' not found in syslog ring buffer"
     )

@@ -49,10 +49,27 @@ def init(
     """
     Initialise fasten. Any argument omitted falls back to the corresponding env var.
 
-    Required (env or arg): FASTEN_SERVICE_ID, FASTEN_NODE_ID.
-    Optional: FASTEN_TENANT_ID, FASTEN_AUDIT_DSN, FASTEN_API_DSN.
+    Required (env or arg):
+      - FASTEN_SERVICE_ID — service identity for the WHERE anchor
+      - FASTEN_NODE_ID — host/node identity for the WHERE anchor
+      - FASTEN_AUDIT_DSN — durable audit store DSN (sqlite:// or postgres://).
+        Audit rows must go to durable storage; fasten does not provide an
+        in-memory fallback. Required when ``audit_store=`` is not passed.
+
+    Optional:
+      - FASTEN_TENANT_ID — tenant / org / site
+      - FASTEN_API_DSN — opt-in persistent api-log store (default: ring buffer only)
+      - FASTEN_REDACT_KEYS — comma-separated extra redaction patterns
+      - FASTEN_REDACT_REPLACEMENT — replacement string (default: "***")
 
     Calling init() with no arguments = "everything from env" — preferred.
+    Errors are explicit: missing FASTEN_SERVICE_ID / FASTEN_NODE_ID /
+    FASTEN_AUDIT_DSN raise RuntimeError with a fix-it message.
+
+    After init(), public accessors are stable:
+      - ``fasten.transport()`` → active StdoutTransport (audit/sys/api streams)
+      - ``fasten.redactor()`` → active Redactor (so adopter logging layers
+        can apply the same key-pattern scrubbing fasten applies on emit)
     """
     global _service_id, _node_id, _tenant_id, _audit_store, _api_store, _stdout, _redactor
 
@@ -194,12 +211,36 @@ class _Logger:
 log = _Logger()
 
 
-# Internal accessors — used by reader and shims; not part of the public API.
-def _get_audit_store() -> Any:
-    return _audit_store
+# ── Public accessors ──────────────────────────────────────────────────────
+# Adopters writing custom middleware / logging layers reach the same
+# transport / redactor / store that emit() uses through these.
 
-def _get_stdout() -> Optional[StdoutTransport]:
+def transport() -> Optional[StdoutTransport]:
+    """Return the active StdoutTransport, or None if init() has not been called.
+
+    The transport carries the audit / sys / api ring buffers and writes
+    NDJSON lines to stdout. Use it for hand-rolled middleware that needs
+    to push api / sys rows the SDK itself wouldn't otherwise emit.
+    """
     return _stdout
 
-def _get_redactor() -> Redactor:
+
+def redactor() -> Redactor:
+    """Return the active Redactor.
+
+    Use it from adopter-side logging layers that want to apply the same
+    secret-key scrubbing fasten applies on emit() — e.g. structlog
+    processors, custom syslog wrappers. Always returns a usable Redactor;
+    pre-init() it returns the default with no extra keys.
+    """
     return _redactor
+
+
+def audit_store() -> Any:
+    """Return the active AuditRepository, or None if init() has not been called.
+
+    The reader uses this to query rows; adopters writing their own
+    reader / replication / outbox layer can use the same store fasten
+    inserts into.
+    """
+    return _audit_store

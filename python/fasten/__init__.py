@@ -19,7 +19,7 @@ from __future__ import annotations
 from .attrs import Anchor, AuditRow
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
-from .emit import emit, init, log
+from .emit import audit_store, emit, init, log, redactor, transport
 from .store.repo import AuditRepository
 
 __all__ = [
@@ -44,6 +44,10 @@ __all__ = [
     "emit",
     "init",
     "log",
+    # adopter hooks
+    "audit_store",
+    "redactor",
+    "transport",
 ]
 
 __version__ = "1.0.0b0"
