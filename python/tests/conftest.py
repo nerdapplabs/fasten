@@ -1,8 +1,15 @@
 """Shared fixtures for fasten unit tests."""
+import importlib
+
 import pytest
 from fasten.store.sqlite import SQLiteStore
 from fasten.codes import register, Meta, Severity, RetentionClass
-import fasten.emit as _emit_mod
+
+# `import fasten.emit as _emit_mod` rebinds to the function `emit` because
+# fasten/__init__.py does `from .emit import emit` (which shadows the
+# submodule attribute). importlib bypasses the attribute path and gives
+# the actual submodule reliably.
+_emit_mod = importlib.import_module("fasten.emit")
 
 
 @pytest.fixture(autouse=True)
