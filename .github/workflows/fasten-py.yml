@@ -30,7 +30,7 @@ jobs:
         run: ruff check fasten/
 
       - name: Type check (mypy)
-        run: mypy fasten/ --ignore-missing-imports
+        run: mypy fasten/
 
       - name: Unit tests
         run: pytest tests/ -v --tb=short
