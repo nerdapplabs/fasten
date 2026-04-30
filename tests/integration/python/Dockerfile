@@ -3,9 +3,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install fasten from local source
+# Install fasten from local source + structlog for shim test
 COPY python/ /app/sdk/
-RUN pip install --no-cache-dir /app/sdk
+RUN pip install --no-cache-dir /app/sdk "structlog>=21.5"
 
 # Copy smoke
 COPY tests/integration/python/smoke.py /app/smoke.py

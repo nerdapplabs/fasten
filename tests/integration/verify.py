@@ -5,12 +5,13 @@ Verify a language SDK's stdout against the fasten wire contract.
 Reads NDJSON lines from stdin (whatever a smoke program emitted) and
 asserts:
 
-  1. At least one {shape: "audit"} row and one {shape: "sys"} row appear.
+  1. At least one {shape: "audit"}, {shape: "sys"}, and {shape: "api"} row appear.
   2. Audit row carries the required wire fields.
   3. Audit detail redaction worked: api_key and nested.token are "***",
      email is preserved.
   4. request_id is a 12-char hex string (or empty for sys before any emit).
   5. Sys row has the canonical level/event/timestamp shape.
+  6. Api row carries method, path, status, request_id, timestamp.
 
 Exit 0 if all assertions pass, non-zero with a readable diff otherwise.
 
@@ -23,6 +24,7 @@ Each SDK must emit (in any order):
     log.info("startup_ok", {extra_field: 1})
     emit(code="USER_CREATED", target="u-42", actor="admin",
          detail={email, api_key, nested.token})
+    write_api({method, path, status, ms, request_id, timestamp})
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ REQUIRED_AUDIT_FIELDS = {
     "method", "request_id", "detail",
 }
 REQUIRED_SYS_FIELDS = {"shape", "level", "event", "request_id", "timestamp"}
+REQUIRED_API_FIELDS = {"shape", "method", "path", "status", "request_id", "timestamp"}
 
 ID_RE = re.compile(r"^evt-[0-9a-f]{16,32}$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{12}$")
@@ -54,6 +57,7 @@ def fail(msg: str, ctx: Any = None) -> None:
 def main() -> None:
     audit_rows: list[dict] = []
     sys_rows: list[dict] = []
+    api_rows: list[dict] = []
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -71,6 +75,8 @@ def main() -> None:
             audit_rows.append(obj)
         elif shape == "sys":
             sys_rows.append(obj)
+        elif shape == "api":
+            api_rows.append(obj)
 
     if not audit_rows:
         fail("no {shape: 'audit'} row produced")
@@ -117,7 +123,22 @@ def main() -> None:
     if sys_row["event"] != "startup_ok":
         fail(f"sys.event expected startup_ok, got {sys_row['event']}")
 
-    print(f"OK — {len(audit_rows)} audit row(s), {len(sys_rows)} sys row(s) — contract holds")
+    # --- Api checks ---
+    if not api_rows:
+        fail("no {shape: 'api'} row produced")
+    api = api_rows[0]
+    missing = REQUIRED_API_FIELDS - set(api.keys())
+    if missing:
+        fail(f"api row missing fields: {sorted(missing)}", api)
+    if not REQ_ID_RE.match(api["request_id"]):
+        fail(f"api.request_id is not 12 hex chars: {api['request_id']}")
+    if api["method"].upper() != "POST":
+        fail(f"api.method expected POST, got {api['method']}")
+    if api["status"] != 201:
+        fail(f"api.status expected 201, got {api['status']}")
+
+    print(f"OK — {len(audit_rows)} audit row(s), {len(sys_rows)} sys row(s), "
+          f"{len(api_rows)} api row(s) — contract holds")
 
 
 if __name__ == "__main__":

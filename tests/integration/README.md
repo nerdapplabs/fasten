@@ -7,22 +7,22 @@ which asserts the wire contract against the canonical
 
 ## Coverage
 
-| Language | Base image           | Streams tested  | Path                  |
-|----------|----------------------|-----------------|-----------------------|
-| Python   | `python:3.10-slim`   | audit · sys     | [`python/`](python/) |
-| Go       | `golang:1.22-alpine` | audit · sys     | [`go/`](go/)         |
-| Node.js  | `node:20-alpine`     | audit · sys     | [`node/`](node/)     |
-| Rust     | `rust:1.82-slim`     | audit · sys     | [`rust/`](rust/)     |
-| C++14    | `gcc:13-bookworm`    | audit · sys     | [`cpp/`](cpp/)       |
-| Java     | _coming soon_        | —               | _placeholder SDK; emit() throws today._ |
+| Language | Base image           | Streams tested       | Path                  |
+|----------|----------------------|----------------------|-----------------------|
+| Python   | `python:3.10-slim`   | audit · sys · **api** | [`python/`](python/) |
+| Go       | `golang:1.22-alpine` | audit · sys          | [`go/`](go/)         |
+| Node.js  | `node:20-alpine`     | audit · sys          | [`node/`](node/)     |
+| Rust     | `rust:1.82-slim`     | audit · sys          | [`rust/`](rust/)     |
+| C++14    | `gcc:13-bookworm`    | audit · sys          | [`cpp/`](cpp/)       |
+| Java     | _coming soon_        | —                    | _placeholder SDK; emit() throws today._ |
 
-The **api stream** (HTTP request log) requires a running HTTP server and
-per-language middleware; it lives in a separate test once shims stabilise
-across languages.
+The **api stream** is tested in the Python smoke via a direct `write_api()` call
+(no HTTP server needed). Go/Node/Rust/C++ api coverage follows once their HTTP
+shims stabilise.
 
 ## What each smoke does
 
-Identical scenario in all five languages:
+Core scenario (all five languages):
 
 ```
 1. Register one code: USER_CREATED (domain=user, severity=info, action=create)
@@ -34,6 +34,15 @@ Identical scenario in all five languages:
           api_key: "sk-secret-abc",       ← redacted to "***"
           nested: {token: "xyz"}          ← nested.token redacted (where SDK supports nested detail)
         })
+```
+
+Python smoke additionally exercises:
+
+```
+5. write_api({method, path, status, ms, request_id, timestamp})
+                                          → {"shape": "api", ...} on stdout
+6. structlog shim: make_fasten_processor() buffers structlog events into
+   fasten's syslog ring (in-process assertion; ring is not on stdout)
 ```
 
 ## Running
