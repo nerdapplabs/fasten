@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -297,6 +298,7 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 	for _, opt := range opts {
 		opt(&row)
 	}
+	row.Detail = RedactDetail(row.Detail)
 
 	if _auditStore != nil {
 		_ = _auditStore.Insert(ctx, row)
@@ -305,6 +307,44 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		_transport.WriteAudit(rowToMap(row))
 	}
 	return row, nil
+}
+
+// ── Built-in structured log (sys stream) ─────────────────────────────────
+//
+// Adopters get NDJSON sys lines without bringing slog wiring or any
+// external lib. Auto-stamps request_id from ctx and service_id from Init.
+// For a slog handler integration that still chains to your existing slog
+// pipeline, see NewSlogHandler in slog.go.
+
+// LogInfo writes a {shape:"sys"} NDJSON line to stdout.
+// Pairs come as key1, value1, key2, value2, ... (slog-style).
+func LogInfo(ctx context.Context, event string, kv ...any)  { logSys(ctx, "info", event, kv) }
+func LogWarn(ctx context.Context, event string, kv ...any)  { logSys(ctx, "warn", event, kv) }
+func LogError(ctx context.Context, event string, kv ...any) { logSys(ctx, "error", event, kv) }
+func LogDebug(ctx context.Context, event string, kv ...any) { logSys(ctx, "debug", event, kv) }
+
+func logSys(ctx context.Context, level, event string, kv []any) {
+	row := SyslogRow{
+		"level":      level,
+		"event":      event,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"request_id": RequestIDFromContext(ctx),
+		"service_id": _serviceID,
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		k, ok := kv[i].(string)
+		if !ok {
+			continue
+		}
+		row[k] = kv[i+1]
+	}
+	if _transport != nil {
+		_transport.PushSyslog(row)
+	}
+	row["shape"] = "sys"
+	if b, err := json.Marshal(row); err == nil {
+		fmt.Println(string(b))
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

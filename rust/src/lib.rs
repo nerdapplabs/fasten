@@ -256,6 +256,56 @@ where
     out
 }
 
+// --- Built-in structured log (sys stream) --------------------------------
+//
+// Adopters get NDJSON sys lines without bringing `tracing` or `log`.
+// Auto-stamps request_id from current_request_id() and service_id from
+// the active config. Falls back to bare line if init() not yet called.
+
+pub mod log {
+    use super::current_request_id;
+    use serde::Serialize;
+    use serde_json::json;
+
+    fn write(level: &str, event: &str, fields: serde_json::Value) {
+        let cfg = super::CONFIG
+            .get()
+            .and_then(|slot| slot.read().ok().and_then(|g| g.clone()));
+        let service_id = cfg.as_ref().map(|c| c.service_id.clone()).unwrap_or_default();
+
+        let mut payload = json!({
+            "shape": "sys",
+            "level": level,
+            "event": event,
+            "request_id": current_request_id().unwrap_or_default(),
+            "service_id": service_id,
+            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        });
+
+        if let serde_json::Value::Object(merge_into) = &mut payload {
+            if let serde_json::Value::Object(extra) = fields {
+                for (k, v) in extra {
+                    merge_into.insert(k, v);
+                }
+            }
+        }
+
+        println!("{}", payload);
+    }
+
+    /// Convenience: pass key-value fields as a `serde_json::Value::Object`.
+    pub fn info(event: &str, fields: serde_json::Value) { write("info", event, fields); }
+    pub fn warn(event: &str, fields: serde_json::Value) { write("warn", event, fields); }
+    pub fn error(event: &str, fields: serde_json::Value) { write("error", event, fields); }
+    pub fn debug(event: &str, fields: serde_json::Value) { write("debug", event, fields); }
+
+    /// Variant for callers without serde_json::json! at hand.
+    pub fn info_with<T: Serialize>(event: &str, fields: &T) {
+        let v = serde_json::to_value(fields).unwrap_or(serde_json::Value::Null);
+        write("info", event, v);
+    }
+}
+
 // --- Redaction -----------------------------------------------------------
 //
 // Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). For v0.1

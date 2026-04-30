@@ -144,16 +144,27 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
     if (!meta) throw new Error(`unknown audit code: ${code}`);
 
     const id = `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    // Wire format is snake_case per spec/row-schema.json — match Python /
+    // Go / Rust / C++ adapters. JS keeps camelCase only at the call-site
+    // API surface (emit options).
     const row = {
         id,
-        originId: id,
-        monotonicSeq: ++seq,
+        origin_id: id,
+        monotonic_seq: ++seq,
         timestamp: new Date().toISOString(),
-        code, action: meta.action, severity: severity ?? meta.severity,
-        serviceId: config.serviceId, sourceNodeId: config.nodeId, tenantId: config.tenantId,
-        actor, actorKind,
-        target, category: meta.category, domain: meta.domain,
-        method, requestId: currentRequestID() ?? mintID(),
+        code,
+        action: meta.action,
+        severity: severity ?? meta.severity,
+        service_id: config.serviceId,
+        source_node_id: config.nodeId,
+        tenant_id: config.tenantId,
+        actor,
+        actor_kind: actorKind,
+        target,
+        category: meta.category,
+        domain: meta.domain,
+        method,
+        request_id: currentRequestID() ?? mintID(),
         detail: redact(detail, config.extraRedactRe),
     };
     config.auditStore?.insert(row);
@@ -164,9 +175,11 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
 export const log = {
     _emit(level, event, fields = {}) {
         const line = {
-            shape: 'sys', level, event,
-            requestId: currentRequestID(),
-            serviceId: config.serviceId || undefined,
+            shape: 'sys',
+            level,
+            event,
+            request_id: currentRequestID(),
+            service_id: config.serviceId || undefined,
             timestamp: new Date().toISOString(),
             ...fields,
         };

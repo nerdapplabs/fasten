@@ -170,7 +170,13 @@ class _Logger:
     """Structured syslog writer — stamps request_id automatically."""
 
     def _emit(self, level: int, event: str, **fields: Any) -> None:
-        payload = {"event": event, "request_id": current_request_id(), **fields}
+        payload = {
+            "event": event,
+            "request_id": current_request_id(),
+            "service_id": _service_id or None,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            **fields,
+        }
         if _stdout is not None:
             _stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
