@@ -16,7 +16,7 @@ from ..context import mint_id, with_request_id, current_request_id
 
 async def publish(client: Any, topic: str, payload: dict[str, Any]) -> None:
     """Publish with `_req` injected from ctx (mint if absent)."""
-    rid = current_request_id() or MintID()
+    rid = current_request_id() or mint_id()
     enriched = {**payload, "_req": rid}
     await client.publish(topic, json.dumps(enriched))
 
