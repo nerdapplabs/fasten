@@ -79,18 +79,58 @@ export function dump() {
         .join('\n');
 }
 
-// --- Init + Emit ----------------------------------------------------------
+// --- Redaction ------------------------------------------------------------
+//
+// Deep redact: dict values whose keys match REDACT_PATTERNS get replaced
+// with REDACT_REPLACEMENT. Arrays + nested dicts are recursed. Patterns
+// come from spec/row-schema.json (single source of truth).
 
-let config = { serviceId: '', nodeId: '', tenantId: null, auditStore: null, apiStore: null };
+const REDACT_RE = new RegExp('(' + REDACT_PATTERNS.join('|') + ')', 'i');
+
+function redact(value, extraRe) {
+    if (Array.isArray(value)) return value.map(v => redact(v, extraRe));
+    if (value !== null && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            const hit = REDACT_RE.test(k) || (extraRe && extraRe.test(k));
+            out[k] = hit ? REDACT_REPLACEMENT : redact(v, extraRe);
+        }
+        return out;
+    }
+    return value;
+}
+
+function buildExtraRe(keys) {
+    if (!keys || keys.length === 0) return null;
+    const escaped = keys
+        .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('|');
+    return new RegExp('(' + escaped + ')', 'i');
+}
+
+// --- Init + Emit ----------------------------------------------------------
+//
+// auditStore is opt-in: pass `init({auditStore: yourStore})` for SQL
+// persistence. JS does not yet construct a store from FASTEN_AUDIT_DSN —
+// the Python reference handles that. Until it does, every emit() still
+// mirrors to stdout (NDJSON), which Docker / journald captures.
+
+let config = { serviceId: '', nodeId: '', tenantId: null, auditStore: null, apiStore: null,
+               extraRedactRe: null };
 let seq = 0;
 
 export function init(opts = {}) {
+    const envExtra = (process.env.FASTEN_REDACT_KEYS ?? '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+    const extraKeys = opts.extraRedactKeys ?? (envExtra.length ? envExtra : null);
+
     config = {
         serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? '',
         nodeId:    opts.nodeId    ?? process.env.FASTEN_NODE_ID    ?? '',
-        tenantId:    opts.tenantId    ?? process.env.FASTEN_TENANT_ID    ?? null,
-        auditStore: opts.auditStore ?? null,  // TODO: construct from FASTEN_AUDIT_DSN
+        tenantId:  opts.tenantId  ?? process.env.FASTEN_TENANT_ID  ?? null,
+        auditStore: opts.auditStore ?? null,
         apiStore:   opts.apiStore   ?? null,
+        extraRedactRe: buildExtraRe(extraKeys),
     };
     if (!config.serviceId || !config.nodeId) {
         throw new Error('fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required');
@@ -103,9 +143,10 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
     const meta = registry.get(code);
     if (!meta) throw new Error(`unknown audit code: ${code}`);
 
+    const id = `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
     const row = {
-        id: `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`,
-        edgeRowId: null,  // set below
+        id,
+        originId: id,
         monotonicSeq: ++seq,
         timestamp: new Date().toISOString(),
         code, action: meta.action, severity: severity ?? meta.severity,
@@ -113,20 +154,26 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
         actor, actorKind,
         target, category: meta.category, domain: meta.domain,
         method, requestId: currentRequestID() ?? mintID(),
-        detail,  // TODO: redact
+        detail: redact(detail, config.extraRedactRe),
     };
-    row.edgeRowId = row.id;
     config.auditStore?.insert(row);
+    process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
     return row;
 }
 
 export const log = {
     _emit(level, event, fields = {}) {
-        const line = { shape: 'json', level, event, requestId: currentRequestID(), ...fields };
+        const line = {
+            shape: 'sys', level, event,
+            requestId: currentRequestID(),
+            serviceId: config.serviceId || undefined,
+            timestamp: new Date().toISOString(),
+            ...fields,
+        };
         process.stdout.write(JSON.stringify(line) + '\n');
     },
-    info(event, fields) { this._emit('info', event, fields); },
-    warn(event, fields) { this._emit('warn', event, fields); },
+    info(event, fields)  { this._emit('info',  event, fields); },
+    warn(event, fields)  { this._emit('warn',  event, fields); },
     error(event, fields) { this._emit('error', event, fields); },
     debug(event, fields) { this._emit('debug', event, fields); },
 };

@@ -80,15 +80,15 @@ filter prompt). For the paid hosted aggregator, see
 
 ## Languages
 
-| Language   | Status         | Location                                          |
-|------------|----------------|---------------------------------------------------|
-| Python     | reference      | [`python/`](python/)                              |
-| Go         | skeleton       | [`go/`](go/)                                      |
-| Node.js    | skeleton       | [`js/`](js/)                                      |
-| TypeScript | ships with JS  | [`js/src/index.d.ts`](js/src/index.d.ts)          |
-| C++14      | single-header  | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)  |
-| Rust       | skeleton       | [`rust/`](rust/)                                  |
-| Java       | skeleton       | [`java/`](java/)                                  |
+| Language   | Status                    | Location                                          |
+|------------|---------------------------|---------------------------------------------------|
+| Python     | reference                 | [`python/`](python/)                              |
+| Go         | usable                    | [`go/`](go/)                                      |
+| C++14      | single-header             | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)  |
+| Node.js    | beta                      | [`js/`](js/)                                      |
+| TypeScript | ships with JS             | [`js/src/index.d.ts`](js/src/index.d.ts)          |
+| Rust       | beta                      | [`rust/`](rust/)                                  |
+| Java       | coming soon (placeholder) | [`java/`](java/)                                  |
 
 ---
 
@@ -103,7 +103,6 @@ filter prompt). For the paid hosted aggregator, see
 | Env-var reference        | [docs/ → Env-vars](website/docs/#envvars)         |
 | Retention + PII          | [docs/ → Retention](website/docs/#retention)      |
 | Code evolution + compat  | [docs/ → Evolution](website/docs/#evolution)      |
-| Open-core roadmap        | [docs/ → Roadmap](website/docs/#opencore)         |
 
 ---
 
