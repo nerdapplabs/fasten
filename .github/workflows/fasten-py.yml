@@ -1,0 +1,39 @@
+name: Python SDK
+
+on:
+  push:
+    paths:
+      - 'python/**'
+      - '.github/workflows/fasten-py.yml'
+  pull_request:
+    paths:
+      - 'python/**'
+      - '.github/workflows/fasten-py.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.10-slim
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check fasten/
+
+      - name: Type check (mypy)
+        run: mypy fasten/ --ignore-missing-imports
+
+      - name: Unit tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Audit (pip-audit)
+        run: pip-audit

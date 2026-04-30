@@ -1,0 +1,29 @@
+name: Release Go SDK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22-alpine
+
+    defaults:
+      run:
+        working-directory: go
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -v -race ./...
+
+      - name: Tag published
+        # Go modules are served by pkg.go.dev via VCS tags — no publish step needed.
+        # The tag push itself makes the module available at pkg.go.dev/github.com/nerdapplabs/fasten-go@<tag>
+        run: echo "Tag ${{ github.ref_name }} pushed — module available via pkg.go.dev"

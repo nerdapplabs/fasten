@@ -115,6 +115,14 @@ filter prompt). For the paid hosted aggregator, see
 
 ---
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy and response SLA.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
 ## Status
 
 Pre-v1. Apache-2.0, open for contribution once P0-1 / P0-2 land.

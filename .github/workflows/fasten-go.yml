@@ -1,0 +1,42 @@
+name: Go SDK
+
+on:
+  push:
+    paths:
+      - 'go/**'
+      - '.github/workflows/fasten-go.yml'
+  pull_request:
+    paths:
+      - 'go/**'
+      - '.github/workflows/fasten-go.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22-alpine
+
+    defaults:
+      run:
+        working-directory: go
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          apk add --no-cache git
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -v -race ./...
+
+      - name: Static analysis (staticcheck)
+        run: staticcheck ./...
+
+      - name: Vulnerability scan (govulncheck)
+        run: govulncheck ./...

@@ -1,0 +1,30 @@
+name: JS SDK
+
+on:
+  push:
+    paths:
+      - 'js/**'
+      - '.github/workflows/fasten-js.yml'
+  pull_request:
+    paths:
+      - 'js/**'
+      - '.github/workflows/fasten-js.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-alpine
+
+    defaults:
+      run:
+        working-directory: js
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: node --test test/
+
+      - name: Audit (npm audit)
+        run: npm audit --audit-level=moderate

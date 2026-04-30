@@ -1,0 +1,36 @@
+name: Release Python SDK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write  # required for Trusted Publishing OIDC exchange
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.10-slim
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fasten
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build distributions
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist/

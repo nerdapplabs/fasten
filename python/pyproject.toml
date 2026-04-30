@@ -26,7 +26,8 @@ postgres = ["psycopg[binary]>=3.1"]
 fastapi = ["fastapi>=0.100", "starlette>=0.27"]
 mqtt = ["paho-mqtt>=2.0"]
 tui = ["rich>=13"]
-dev = ["pytest>=7", "ruff>=0.4", "mypy>=1.10"]
+structlog = ["structlog>=21.5"]
+dev = ["pytest>=7", "ruff>=0.4", "mypy>=1.10", "pip-audit>=2.7"]
 
 [project.scripts]
 fasten     = "fasten.cli:main"

@@ -3,15 +3,15 @@ package fasten
 import "strings"
 
 // Deep redaction: detail values whose keys match a pattern from
-// spec/row-schema.json get replaced with REDACT_REPLACEMENT. Patterns
+// spec/row-schema.json get replaced with RedactReplacement. Patterns
 // are simple keywords (e.g. `api[_-]?key`); we lowercase + strip _/-
 // from both key and pattern, then substring-match — equivalent to
 // case-insensitive search of the original regex for all current
 // patterns. No external regex dep.
 
 var redactWords = func() []string {
-	out := make([]string, 0, len(REDACT_PATTERNS))
-	for _, p := range REDACT_PATTERNS {
+	out := make([]string, 0, len(RedactPatterns))
+	for _, p := range RedactPatterns {
 		s := strings.ReplaceAll(p, "[_-]?", "")
 		s = strings.ReplaceAll(s, "_", "")
 		s = strings.ReplaceAll(s, "-", "")
@@ -54,7 +54,7 @@ func RedactDetail(d map[string]any) map[string]any {
 	out := make(map[string]any, len(d))
 	for k, v := range d {
 		if keyIsSecret(k) {
-			out[k] = REDACT_REPLACEMENT
+			out[k] = RedactReplacement
 		} else {
 			out[k] = redactValue(v)
 		}
