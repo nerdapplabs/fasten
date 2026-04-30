@@ -5,20 +5,14 @@ supported language versions (Python 3.10-slim, Go 1.22-alpine, Node 20-alpine).
 
 ## Python (`pip-audit`)
 
-**Status: CLEAN (after toolchain upgrade)**
+**Status: CLEAN**
 
 fasten's Python SDK has zero runtime dependencies (`dependencies = []` in pyproject.toml).
-Dev dependencies (pytest, ruff, mypy, pip-audit) are not shipped. No findings expected
-in fasten itself.
+Dev dependencies (pytest, ruff, mypy, pip-audit) are not shipped. No findings expected.
 
-`pip-audit` scans the entire interpreter environment, so on the `python:3.10-slim` base
-image it would otherwise flag the bundled `pip` (23.0.1) and `wheel` (0.45.1). The CI
-workflow runs `python -m pip install --upgrade pip wheel setuptools` before any other
-step, which clears PYSEC-2023-228, CVE-2025-8869, CVE-2026-1703, and CVE-2026-24049.
-
-**Currently ignored:** `CVE-2026-3219` (pip) — no fix version published upstream yet.
-Tracked via `--ignore-vuln CVE-2026-3219` in `.github/workflows/fasten-py.yml`. Remove
-the flag once a fixed pip release lands.
+CI uses `uv venv` + `uv pip install` instead of system pip. The resulting venv contains
+only the project + dev deps — no `pip` or `wheel` to flag — so `pip-audit` no longer
+trips over the base image's bundled toolchain.
 
 ## Go (`govulncheck`)
 
