@@ -14,12 +14,21 @@ surface. Apache-2.0.
 
 ## Install
 
+PyPI and npm packages publish at **v0.1.0-alpha**. Install from source today:
+
 ```bash
-pip install fasten                                       # Python (reference)
-pip install 'fasten[tui]'                                # + bundled live TUI
-go get github.com/nerdapplabs/fasten-go                 # Go
-npm install @nerdapplabs/fasten                         # Node / TypeScript
+pip install ./python                        # Python (reference)
+go get github.com/nerdapplabs/fasten-go    # Go — works today via module path
+npm install ./js                            # Node / TypeScript
 # C++14: copy cpp/include/fasten.hpp — zero dependencies
+```
+
+Coming with v0.1.0-alpha:
+
+```bash
+pip install fasten
+pip install 'fasten[tui]'                  # + bundled live TUI
+npm install @nerdapplabs/fasten
 ```
 
 ## Quickstart
@@ -109,14 +118,6 @@ filter prompt). For the paid hosted aggregator, see
 ## Status
 
 Pre-v1. Apache-2.0, open for contribution once P0-1 / P0-2 land.
-
-PyPI (`pip install fasten`) and npm (`npm install @nerdapplabs/fasten`) publish at
-v0.1.0-alpha. Until then install from source:
-
-```bash
-pip install ./python           # Python
-npm install ./js               # Node / TypeScript
-```
 
 ## License
 
