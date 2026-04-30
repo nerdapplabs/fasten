@@ -6,6 +6,34 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Python logging ergonomics (P1-9)
+
+- `fasten.shim.structlog.configure(json=True, debug=False, ...)` — one-call
+  setup for structlog + stdlib bridge. Installs the redactor processor
+  + `make_fasten_processor()` + a renderer (JSON or Console), plus a
+  stdlib `LoggingHandler` so `import logging` calls also reach the ring.
+  Mirrors Go's `slog.New(fasten.NewSlogHandler(base))`.
+- `fasten.shim.stdlib.LoggingHandler` — standalone bridge for adopters
+  who don't use structlog. Pushes every stdlib `LogRecord` to the ring,
+  applies redaction to extras, includes a recursion guard for fasten's
+  own pre-init fallback path.
+- `fasten.log.bound(name=..., **fields)` — per-module logger; emissions
+  carry `logger=<name>` plus any bound fields. Chained `.bound()` calls
+  compose; explicit fields on `.info()` override bound fields. Pythonic
+  mirror of slog's `Logger.With`.
+
+### Added — Catalog ergonomics (P1-10, Python)
+
+- `fasten.codes.register("user", {"USER_CREATED": Meta(...)})` — dict
+  form. Saves the redundant `id="USER_CREATED"` per code; SDK fills
+  `Meta.id` from the key at registration time.
+- Validation: key must be `UPPER_SNAKE_CASE`, explicit `Meta.id` must
+  match the key (raise on mismatch — that's a typo, never a feature).
+- `Meta.id` is now optional (default `""`). Old code passing `id=` still
+  works as long as it matches the key.
+- Legacy tuple-list form `register("user", [("X", Meta(...))])`
+  remains supported.
+
 ### Added — Python public-API parity (P1-8)
 
 - `fasten.transport()` — public accessor for the active StdoutTransport,

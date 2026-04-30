@@ -9,9 +9,10 @@ consistency gate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Mapping, Union
 
 # Domain is a plain string — adopters define their own vocabulary.
 # Examples: "user", "billing", "device", "order" — fasten has no opinions.
@@ -81,15 +82,20 @@ _REDACT_PATTERNS = (
 
 @dataclass(frozen=True, slots=True)
 class Meta:
-    """Per-code metadata declared alongside every audit code."""
+    """Per-code metadata declared alongside every audit code.
 
-    id: str
+    ``id`` is optional in user code — ``register()`` fills it from the
+    dict key. Setting ``id`` explicitly is allowed but must match the key
+    (raises on mismatch — that's a typo, never a feature).
+    """
+
     domain: str               # adopter-defined, e.g. "user", "billing", "node"
     category: str
     action: str
     severity: Severity
     description: str
     emitter: str
+    id: str = ""              # filled from the dict key by register()
     retention_class: RetentionClass = RetentionClass.MEDIUM
     high_volume: bool = False
     pii_in_detail: bool = False
@@ -102,25 +108,59 @@ class AuditCatalogError(Exception):
 
 _registry: dict[str, Meta] = {}
 
+_CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
-def register(domain: Domain, codes: Iterable[tuple[str, Meta]]) -> None:
-    """
-    Register a batch of codes for a domain.
 
-    Raises AuditCatalogError on duplicates or domain mismatch.
+def register(
+    domain: Domain,
+    codes: Union[Mapping[str, Meta], Iterable[tuple[str, Meta]]],
+) -> None:
+    """Register a batch of codes for a domain.
+
+    Two accepted shapes:
+
+        register("user", {                       # preferred — dict
+            "USER_CREATED": Meta(domain="user", action="create", ...),
+            "USER_DELETED": Meta(domain="user", action="delete", ...),
+        })
+
+        register("user", [                        # legacy — list of tuples
+            ("USER_CREATED", Meta(...)),
+        ])
+
+    Validation (raises ``AuditCatalogError`` with a fix-it message):
+      - key shape: UPPER_SNAKE_CASE identifier
+      - ``Meta.id`` empty → fill from key; set → must match key
+      - ``Meta.domain`` must match ``domain``
+      - duplicate code across registrations
     """
-    for name, meta in codes:
-        if name in _registry:
-            raise AuditCatalogError(f"duplicate code: {name}")
-        if meta.id != name:
+    items = codes.items() if isinstance(codes, Mapping) else codes
+
+    for name, meta in items:
+        if not _CODE_KEY_RE.match(name):
             raise AuditCatalogError(
-                f"code {name!r} has meta.id={meta.id!r} — they must match"
+                f"register: code key {name!r} must be UPPER_SNAKE_CASE "
+                f"(letters, digits, underscores; starts with a letter). "
+                f"Got {name!r}."
             )
+
+        if not meta.id:
+            meta = replace(meta, id=name)
+        elif meta.id != name:
+            raise AuditCatalogError(
+                f"register: dict key {name!r} disagrees with Meta.id={meta.id!r}. "
+                f"Drop Meta.id (it fills from the key) or fix the mismatch."
+            )
+
         if meta.domain != domain:
             raise AuditCatalogError(
-                f"code {name} declares domain={meta.domain!r} "
-                f"but registered under {domain!r}"
+                f"register: code {name!r} declares domain={meta.domain!r} "
+                f"but registered under {domain!r}."
             )
+
+        if name in _registry:
+            raise AuditCatalogError(f"register: duplicate code {name!r}")
+
         _registry[name] = meta
 
 

@@ -184,22 +184,62 @@ def emit(
 
 
 class _Logger:
-    """Structured syslog writer — stamps request_id automatically."""
+    """Structured syslog writer — stamps request_id automatically.
+
+    Per-module loggers via :meth:`bound`:
+
+        log = fasten.log.bound("buffer-manager")
+        log.info("flush_complete", batch=42)
+        # emits {"shape":"sys", "logger":"buffer-manager", "event":"flush_complete", ...}
+
+    Bound fields are merged into every emission from this logger; explicit
+    fields passed to ``info()`` / ``warn()`` / ``error()`` override the bound
+    ones for that call.
+    """
+
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        bound: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._name = name
+        self._bound = dict(bound or {})
+
+    def bound(self, name: Optional[str] = None, **fields: Any) -> "_Logger":
+        """Return a new logger that stamps ``logger=<name>`` and merges
+        ``fields`` into every emission.
+
+        Calling without ``name`` keeps the current name; positional-style
+        ``log.bound("svc")`` is the common case.
+        """
+        new_name = name if name is not None else self._name
+        new_bound = {**self._bound, **fields}
+        return _Logger(name=new_name, bound=new_bound)
 
     def _emit(self, level: int, event: str, **fields: Any) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "event": event,
             "request_id": current_request_id(),
             "service_id": _service_id or None,
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            **self._bound,
             **fields,
         }
+        if self._name is not None:
+            payload["logger"] = self._name
+
         if _stdout is not None:
             _stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
             # fasten.init() not yet called — fall back to stdlib logger so
-            # log.* works in tests and library code before init().
-            _logger.log(level, json.dumps(payload, default=str))
+            # log.* works in tests and library code before init(). Tag the
+            # record so fasten.shim.stdlib.LoggingHandler skips it (avoids
+            # an emit -> stdlib -> ring -> emit loop once init runs).
+            _logger.log(
+                level,
+                json.dumps(payload, default=str),
+                extra={"_fasten_internal": True},
+            )
 
     def debug(self,   event: str, **fields: Any) -> None: self._emit(logging.DEBUG,   event, **fields)
     def info(self,    event: str, **fields: Any) -> None: self._emit(logging.INFO,     event, **fields)
