@@ -3,9 +3,11 @@
 > *Logs tell you what happened. Traces tell you where. fasten tells you
 > who changed what — and why.*
 
-Audit + correlation SDK. 5 Ws + H anchors enforced at the type level,
-one `request_id` threaded across HTTP / MQTT / scheduler / deploy-pipeline /
-agent-tool — three streams (syslog / API / audit), one mountable query
+Audit + correlation SDK.
+
+Logs, HTTP access trail, and typed audit rows — one `request_id` threads
+all three streams. 5 Ws + H anchors enforced at the type level; bundled
+shims for HTTP, MQTT, and scheduler-fired jobs. One mountable query
 surface. Apache-2.0.
 
 **[Full docs →](https://fasten.sh/docs/)**
