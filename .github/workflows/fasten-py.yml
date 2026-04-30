@@ -23,6 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The python:3.10-slim base ships pip 23.0.1 + wheel 0.45.1, which
+      # carry transitive CVEs of their own (PYSEC-2023-228, CVE-2025-8869,
+      # CVE-2026-1703, CVE-2026-24049). Upgrade before any other step so
+      # pip-audit doesn't flag the build tooling itself.
+      - name: Upgrade build tooling
+        run: python -m pip install --upgrade pip wheel setuptools
+
       - name: Install dev dependencies
         run: pip install -e ".[dev]"
 
@@ -35,5 +42,8 @@ jobs:
       - name: Unit tests
         run: pytest tests/ -v --tb=short
 
+      # CVE-2026-3219 (pip) has no fix version published yet — ignore until
+      # upstream ships a release; remove the flag once `pip install -U pip`
+      # resolves it.
       - name: Audit (pip-audit)
-        run: pip-audit
+        run: pip-audit --ignore-vuln CVE-2026-3219
