@@ -1,6 +1,6 @@
 {
   "name": "@nerdapplabs/fasten",
-  "version": "0.1.0-alpha.0",
+  "version": "1.0.0-beta.0",
   "description": "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport",
   "license": "Apache-2.0",
   "type": "module",
@@ -10,19 +10,13 @@
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
-    },
-    "./shim/http": "./src/shim/http.js",
-    "./shim/mqtt": "./src/shim/mqtt.js",
-    "./shim/scheduler": "./src/shim/scheduler.js",
-    "./store/sqlite": "./src/store/sqlite.js",
-    "./store/postgres": "./src/store/postgres.js",
-    "./reader": "./src/reader/index.js"
+    }
   },
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test 'test/**/*.test.mjs'",
     "lint": "biome check src/"
   },
   "keywords": [

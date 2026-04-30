@@ -14,7 +14,7 @@ surface. Apache-2.0.
 
 ## Install
 
-PyPI and npm packages publish at **v0.1.0-alpha**. Install from source today:
+PyPI and npm packages publish at **v1.0.0-beta.0**. Install from source today:
 
 ```bash
 pip install ./python                        # Python (reference)
@@ -23,12 +23,12 @@ npm install ./js                            # Node / TypeScript
 # C++14: copy cpp/include/fasten.hpp — zero dependencies
 ```
 
-Coming with v0.1.0-alpha:
+Coming with v1.0.0-beta.0:
 
 ```bash
-pip install fasten
-pip install 'fasten[tui]'                  # + bundled live TUI
-npm install @nerdapplabs/fasten
+pip install fasten==1.0.0b0
+pip install 'fasten[tui]==1.0.0b0'         # + bundled live TUI
+npm install @nerdapplabs/fasten@1.0.0-beta.0
 ```
 
 ## Quickstart

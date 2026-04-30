@@ -2,10 +2,10 @@
 
 ## Supported versions
 
-| Version       | Supported |
-|---------------|-----------|
-| 0.x (current) | Yes       |
-| < 0.1.0-alpha | No        |
+| Version          | Supported |
+|------------------|-----------|
+| 1.0.0-beta.x     | Yes       |
+| 0.1.0-alpha      | No (superseded) |
 
 Only the latest release receives security fixes. There is no LTS branch before v1.0.
 
