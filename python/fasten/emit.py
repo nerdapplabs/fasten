@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from . import audit_queue as _audit_queue
+from .audit_queue import AuditStoreError
 from .transport.stdout import StdoutTransport
 from .attrs import AuditRow
 from .codes import Severity, registry
@@ -34,6 +36,7 @@ _audit_store: Any = None
 _api_store: Any = None
 _stdout: Optional[StdoutTransport] = None
 _redactor: Redactor = Redactor()
+_failure_strategy: str = "queue"  # "queue" (P1-15 default) | "raise"
 _logger = logging.getLogger("fasten")
 
 
@@ -45,6 +48,11 @@ def init(
     api_store: Any = None,
     extra_redact_keys: Optional[list[str]] = None,
     redact_replacement: str = "***",
+    audit_store_failure_strategy: str = "queue",
+    queue_capacity: int = 100,
+    queue_retry_initial_ms: int = 100,
+    queue_retry_max_ms: int = 60_000,
+    queue_retry_jitter: bool = True,
 ) -> None:
     """
     Initialise fasten. Any argument omitted falls back to the corresponding env var.
@@ -61,6 +69,18 @@ def init(
       - FASTEN_API_DSN — opt-in persistent api-log store (default: ring buffer only)
       - FASTEN_REDACT_KEYS — comma-separated extra redaction patterns
       - FASTEN_REDACT_REPLACEMENT — replacement string (default: "***")
+      - FASTEN_AUDIT_STORE_FAILURE_STRATEGY — "queue" (default) | "raise"
+
+    Failure strategy (P1-15):
+      - "queue" — emit() pushes the row onto a bounded in-memory queue and
+        returns immediately. A background drainer writes to the store
+        with exponential backoff. ``queue_capacity`` rows of headroom
+        before emit() blocks waiting for drain (most honest semantic; no
+        silent drop). Drainer state transitions self-report to the sys
+        stream so adopters see audit-pipeline health without polling.
+      - "raise" — synchronous insert; raises ``fasten.AuditStoreError``
+        on store failure. Useful for tests, dev mode, and adopters who
+        want loud failures during configuration debugging.
 
     Calling init() with no arguments = "everything from env" — preferred.
     Errors are explicit: missing FASTEN_SERVICE_ID / FASTEN_NODE_ID /
@@ -70,8 +90,10 @@ def init(
       - ``fasten.transport()`` → active StdoutTransport (audit/sys/api streams)
       - ``fasten.redactor()`` → active Redactor (so adopter logging layers
         can apply the same key-pattern scrubbing fasten applies on emit)
+      - ``fasten.queue_stats()`` → drainer health snapshot ("queue" mode only)
     """
     global _service_id, _node_id, _tenant_id, _audit_store, _api_store, _stdout, _redactor
+    global _failure_strategy
 
     _service_id = service_id or os.environ.get("FASTEN_SERVICE_ID") or ""
     _node_id    = node_id    or os.environ.get("FASTEN_NODE_ID")    or ""
@@ -116,6 +138,48 @@ def init(
     )
 
     _stdout = StdoutTransport()
+
+    # P1-15: failure strategy + queue drainer.
+    env_strategy = os.environ.get("FASTEN_AUDIT_STORE_FAILURE_STRATEGY")
+    strategy = (env_strategy or audit_store_failure_strategy or "queue").lower()
+    if strategy not in ("queue", "raise"):
+        raise RuntimeError(
+            f"fasten.init: audit_store_failure_strategy must be 'queue' or 'raise' "
+            f"(got {strategy!r})"
+        )
+    _failure_strategy = strategy
+    if strategy == "queue":
+        _audit_queue.install(
+            store=_audit_store,
+            sys_log=_drainer_sys_log,
+            capacity=queue_capacity,
+            retry_initial_ms=queue_retry_initial_ms,
+            retry_max_ms=queue_retry_max_ms,
+            retry_jitter=queue_retry_jitter,
+        )
+    else:
+        # Raise mode: ensure no stale drainer thread is left running.
+        _audit_queue.uninstall()
+    _audit_queue._mark_init()
+
+
+def _drainer_sys_log(level: str, event: str, fields: dict[str, Any]) -> None:
+    """Bridge from the drainer to the sys stream.
+
+    Non-recursive: writes only to the in-memory ring + stdout via the
+    transport. Never goes through ``emit()`` / the audit store.
+    """
+    if _stdout is None:
+        return
+    payload: dict[str, Any] = {
+        "level": level,
+        "event": event,
+        "request_id": current_request_id(),
+        "service_id": _service_id or None,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        **fields,
+    }
+    _stdout.write_syslog(payload)
 
 
 def _next_seq() -> int:
@@ -191,8 +255,23 @@ def emit(
     )
     row = dataclasses.replace(row, origin_id=row.id)
 
+    # P1-15: route store insert through the drainer (queue mode) or call
+    # synchronously and wrap any store error (raise mode).
     if _audit_store is not None:
-        _audit_store.insert(row)
+        if _failure_strategy == "queue":
+            drainer = _audit_queue.active()
+            if drainer is not None:
+                drainer.put(row)
+            else:
+                # Defensive fallback — strategy says queue but drainer isn't
+                # installed (e.g. tests bypassed init()). Synchronous insert
+                # so the row isn't silently dropped.
+                _audit_store.insert(row)
+        else:
+            try:
+                _audit_store.insert(row)
+            except Exception as e:  # noqa: BLE001
+                raise AuditStoreError(f"{type(e).__name__}: {e}") from e
     if _stdout is not None:
         _stdout.write_audit(row.to_dict())
     return row

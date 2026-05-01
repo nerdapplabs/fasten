@@ -1,0 +1,417 @@
+"""
+P1-15: bounded audit queue + background drainer with exponential backoff.
+
+When ``fasten.init(audit_store_failure_strategy="queue")`` is set (the
+v1.0 default), ``emit()`` pushes audit rows onto a bounded in-memory queue
+and a background thread drains them into the durable store. Store failures
+trigger exponential backoff (with jitter) instead of raising on the
+request path.
+
+The drainer self-reports state transitions to the sys stream so adopters
+see audit-pipeline health through the same channel they already monitor:
+
+    {"shape":"sys","level":"warn","event":"audit_drain_failed", ...}
+    {"shape":"sys","level":"error","event":"audit_drain_degraded", ...}
+    {"shape":"sys","level":"warn","event":"audit_queue_high_water", ...}
+    {"shape":"sys","level":"error","event":"audit_queue_near_full", ...}
+    {"shape":"sys","level":"info","event":"audit_drain_recovered", ...}
+
+See `fasten-cloud/issues/P1-15-audit-store-failure-handling.md` for the
+full design + acceptance criteria.
+"""
+from __future__ import annotations
+
+import atexit
+import queue
+import random
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+
+class AuditStoreError(RuntimeError):
+    """Raised by ``emit()`` in ``raise`` mode when the store insert fails.
+
+    Wraps the underlying store-specific exception so callers can catch a
+    single fasten-namespaced type without depending on sqlite3 / psycopg /
+    sqlalchemy types.
+    """
+
+
+# ── Drainer ────────────────────────────────────────────────────────────────
+
+
+class _AuditQueueDrainer:
+    """Single bounded queue + single drainer thread.
+
+    ``put(row)`` blocks if the queue is full — most honest semantic for
+    audit (don't silently drop). Adopters who can't tolerate the block
+    bump ``capacity``.
+    """
+
+    # Backoff schedule cap — 60 s. Initial 100 ms doubles each consecutive
+    # failure. Jitter ±20 % avoids thundering-herd on store recovery.
+    _BACKOFF_FLOOR_MS = 100
+    _BACKOFF_CEIL_MS = 60_000
+
+    # Sys-stream report thresholds. 50 % = warn, 80 % = error.
+    _HIGH_WATER_WARN_PCT = 0.50
+    _HIGH_WATER_ERR_PCT = 0.80
+
+    # Drainer reports "degraded" once retry_count crosses this floor.
+    _DEGRADED_AFTER = 5
+
+    def __init__(
+        self,
+        store: Any,
+        sys_log: Callable[[str, str, dict[str, Any]], None],
+        *,
+        capacity: int = 100,
+        retry_initial_ms: int = 100,
+        retry_max_ms: int = 60_000,
+        retry_jitter: bool = True,
+    ) -> None:
+        self._store = store
+        # sys_log(level, event, fields) — non-recursive: writes to ring +
+        # stdout only, never through emit() / the audit store.
+        self._sys_log = sys_log
+        self._capacity = capacity
+        self._retry_initial_ms = retry_initial_ms
+        self._retry_max_ms = retry_max_ms
+        self._retry_jitter = retry_jitter
+
+        # Capacity is enforced by a semaphore over (queued + in-flight) rows
+        # rather than just queue depth. A row the drainer is currently
+        # retrying still occupies an audit-pipeline slot — emit() must
+        # block until that retry succeeds, otherwise an outage with even a
+        # single in-flight row makes "capacity" a lie.
+        self._q: queue.Queue[Any] = queue.Queue()
+        self._slots = threading.Semaphore(capacity)
+        self._stop = threading.Event()
+        self._stats_lock = threading.Lock()
+
+        # Stats — readable via queue_stats()
+        self._high_water = 0
+        self._drained_total = 0
+        self._retry_count = 0
+        self._in_backoff_until = 0.0  # monotonic ts; 0 = not in backoff
+        self._last_error: Optional[str] = None
+        self._failure_burst_started_at: Optional[float] = None
+        # In-flight = row popped from queue but not yet inserted. Tracked so
+        # flush() doesn't return prematurely while a slow insert is mid-call.
+        self._in_flight = 0
+
+        # Threshold debouncing — only emit transition once per crossing.
+        self._warn_high_water_emitted = False
+        self._err_high_water_emitted = False
+        self._degraded_emitted = False
+
+        self._thread = threading.Thread(
+            target=self._run, name="fasten-audit-drainer", daemon=True
+        )
+        self._thread.start()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def put(self, row: Any) -> None:
+        """Push a row onto the queue. Blocks if all capacity slots are taken
+        (queued + in-flight retry combined)."""
+        # Block until a slot frees up. The drainer releases the permit only
+        # on successful insert (or shutdown abandon), so emit() blocks while
+        # an in-flight row is in retry-backoff — capacity really means
+        # "max audit work pending", not just "max queued".
+        self._slots.acquire()
+        self._q.put(row)
+        used = self._used_slots()
+        cap = self._capacity
+        with self._stats_lock:
+            if used > self._high_water:
+                self._high_water = used
+        # Threshold sys-log fires AFTER the row is pending so the warn lands
+        # the moment used capacity crosses 50 % / 80 %, not the emit-after.
+        if cap > 0:
+            pct = used / cap
+            if pct >= self._HIGH_WATER_ERR_PCT and not self._err_high_water_emitted:
+                self._err_high_water_emitted = True
+                self._sys_log(
+                    "error",
+                    "audit_queue_near_full",
+                    {"depth": used, "capacity": cap},
+                )
+            elif pct >= self._HIGH_WATER_WARN_PCT and not self._warn_high_water_emitted:
+                self._warn_high_water_emitted = True
+                self._sys_log(
+                    "warn",
+                    "audit_queue_high_water",
+                    {"depth": used, "capacity": cap},
+                )
+            elif pct < self._HIGH_WATER_WARN_PCT:
+                # Reset watermarks once depth recovers below 50 % so a new
+                # surge re-emits the leading-indicator warn.
+                self._warn_high_water_emitted = False
+                self._err_high_water_emitted = False
+
+    def _free_permits(self) -> int:
+        # threading.Semaphore exposes _value (CPython impl detail). Stable
+        # across versions and cheaper than tracking a parallel counter.
+        return self._slots._value  # type: ignore[attr-defined]
+
+    def _used_slots(self) -> int:
+        return self._capacity - self._free_permits()
+
+    def stats(self) -> dict[str, Any]:
+        """Snapshot of queue + drainer state. See P1-15 spec for fields.
+
+        ``depth`` is total occupied capacity (queued + in-flight retry)
+        because that is what determines whether the next emit() blocks.
+        """
+        with self._stats_lock:
+            now = time.monotonic()
+            in_backoff = max(0.0, self._in_backoff_until - now)
+            return {
+                "depth": self._used_slots(),
+                "capacity": self._capacity,
+                "high_water": self._high_water,
+                "drained_total": self._drained_total,
+                "retry_count_active": self._retry_count,
+                "in_backoff_seconds": round(in_backoff, 3),
+                "last_error": self._last_error,
+            }
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal the drainer to stop and wait briefly for it to exit.
+
+        Pending rows in the queue are not abandoned — the drainer attempts
+        a final pass before returning. Backoff sleeps are interrupted.
+        """
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Block until the queue is empty + no row is in-flight, or timeout.
+
+        Used by tests + atexit. Returns True if the queue drained.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._stats_lock:
+                idle = (
+                    self._q.qsize() == 0
+                    and self._retry_count == 0
+                    and self._in_flight == 0
+                )
+            if idle:
+                return True
+            time.sleep(0.01)
+        return self._q.qsize() == 0 and self._in_flight == 0
+
+    # ── Drainer loop ───────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        # The drainer always honours the stop event. Even when the queue is
+        # empty we use a short get-with-timeout so stop() returns promptly.
+        while not self._stop.is_set():
+            try:
+                row = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._drain_one(row)
+
+        # Stop signalled — best-effort drain of remaining rows so atexit
+        # doesn't lose them. We honour backoff but skip the long sleep so
+        # process shutdown isn't held up by a 60 s wait.
+        while True:
+            try:
+                row = self._q.get_nowait()
+            except queue.Empty:
+                return
+            self._drain_one(row, in_shutdown=True)
+
+    def _drain_one(self, row: Any, *, in_shutdown: bool = False) -> None:
+        # in_flight tracks "popped from queue but not yet inserted" so flush()
+        # can't return prematurely while a slow insert is mid-call. The
+        # capacity semaphore permit travels with the row from emit() →
+        # queue → drainer; we release it only on successful insert (or
+        # shutdown abandonment), so emit() blocks while a row is in retry.
+        with self._stats_lock:
+            self._in_flight += 1
+        slot_released = False
+        try:
+            while True:
+                try:
+                    self._store.insert(row)
+                except Exception as e:  # noqa: BLE001 — drainer must catch all
+                    self._on_failure(e)
+                    if in_shutdown:
+                        # Process is exiting; one attempt is enough. The row
+                        # is lost (matches best-effort shutdown contract).
+                        # Release the slot so any blocked emit() can proceed
+                        # before atexit returns.
+                        self._slots.release()
+                        slot_released = True
+                        return
+                    if self._wait_backoff():
+                        # stop signalled mid-backoff — release slot.
+                        self._slots.release()
+                        slot_released = True
+                        return
+                    continue
+
+                self._on_success()
+                self._slots.release()
+                slot_released = True
+                return
+        finally:
+            with self._stats_lock:
+                self._in_flight -= 1
+            if not slot_released:
+                # Defensive: guarantee no permit leak under unexpected exits.
+                self._slots.release()
+
+    def _on_failure(self, err: Exception) -> None:
+        msg = f"{type(err).__name__}: {err}"
+        first_failure = False
+        crossed_degraded = False
+        with self._stats_lock:
+            if self._retry_count == 0:
+                first_failure = True
+                self._failure_burst_started_at = time.monotonic()
+            self._retry_count += 1
+            self._last_error = msg
+            if (
+                self._retry_count >= self._DEGRADED_AFTER
+                and not self._degraded_emitted
+            ):
+                crossed_degraded = True
+                self._degraded_emitted = True
+
+        if first_failure:
+            self._sys_log("warn", "audit_drain_failed", {"error": msg})
+        if crossed_degraded:
+            stats = self.stats()
+            self._sys_log(
+                "error",
+                "audit_drain_degraded",
+                {
+                    "retry_count": stats["retry_count_active"],
+                    "in_backoff_seconds": stats["in_backoff_seconds"],
+                    "last_error": msg,
+                },
+            )
+
+    def _on_success(self) -> None:
+        recovered_after: Optional[float] = None
+        with self._stats_lock:
+            if self._retry_count > 0 and self._failure_burst_started_at is not None:
+                recovered_after = time.monotonic() - self._failure_burst_started_at
+            self._retry_count = 0
+            self._in_backoff_until = 0.0
+            self._failure_burst_started_at = None
+            self._last_error = None
+            self._degraded_emitted = False
+            self._drained_total += 1
+
+        if recovered_after is not None:
+            self._sys_log(
+                "info",
+                "audit_drain_recovered",
+                {"recovery_after_seconds": round(recovered_after, 3)},
+            )
+
+    def _wait_backoff(self) -> bool:
+        """Sleep the current backoff window; return True if stop was signalled."""
+        with self._stats_lock:
+            n = self._retry_count
+        delay_ms = min(
+            self._retry_initial_ms * (2 ** max(0, n - 1)),
+            self._retry_max_ms,
+        )
+        if self._retry_jitter:
+            jitter = delay_ms * 0.2
+            delay_ms = max(0.0, delay_ms + random.uniform(-jitter, jitter))
+        delay_s = delay_ms / 1000.0
+
+        with self._stats_lock:
+            self._in_backoff_until = time.monotonic() + delay_s
+
+        # stop().wait returns True iff the event was set during the wait,
+        # so the drainer cuts a 60 s sleep short when shutdown is requested.
+        return self._stop.wait(timeout=delay_s)
+
+
+# ── Module-level singleton wired by emit.init() ─────────────────────────────
+
+_drainer: Optional[_AuditQueueDrainer] = None
+_atexit_registered = False
+
+
+def install(
+    *,
+    store: Any,
+    sys_log: Callable[[str, str, dict[str, Any]], None],
+    capacity: int,
+    retry_initial_ms: int,
+    retry_max_ms: int,
+    retry_jitter: bool,
+) -> _AuditQueueDrainer:
+    """Replace the active drainer (called from ``init()``).
+
+    Stops the previous drainer cleanly (best-effort flush) before swapping
+    so tests + reconfiguration don't leak threads.
+    """
+    global _drainer, _atexit_registered
+    if _drainer is not None:
+        _drainer.stop(timeout=2.0)
+    _drainer = _AuditQueueDrainer(
+        store=store,
+        sys_log=sys_log,
+        capacity=capacity,
+        retry_initial_ms=retry_initial_ms,
+        retry_max_ms=retry_max_ms,
+        retry_jitter=retry_jitter,
+    )
+    if not _atexit_registered:
+        atexit.register(_atexit_flush)
+        _atexit_registered = True
+    return _drainer
+
+
+def uninstall() -> None:
+    """Stop the active drainer and clear it (test helper)."""
+    global _drainer
+    if _drainer is not None:
+        _drainer.stop(timeout=2.0)
+        _drainer = None
+
+
+def active() -> Optional[_AuditQueueDrainer]:
+    """Return the active drainer, if any."""
+    return _drainer
+
+
+def queue_stats() -> Optional[dict[str, Any]]:
+    """Snapshot of queue + drainer state. None when ``raise`` mode is active."""
+    if _drainer is None:
+        return None
+    return _drainer.stats()
+
+
+def _atexit_flush() -> None:
+    if _drainer is not None:
+        _drainer.flush(timeout=5.0)
+        _drainer.stop(timeout=2.0)
+
+
+# Marker-checker for whoever needs to know what was last initialised. Filled
+# by emit.init() so the doctor endpoint can report it without re-reading env.
+_last_init_at: Optional[datetime] = None
+
+
+def _mark_init() -> None:
+    global _last_init_at
+    _last_init_at = datetime.now(timezone.utc)
+
+
+def last_init_at() -> Optional[datetime]:
+    return _last_init_at

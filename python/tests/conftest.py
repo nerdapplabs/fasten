@@ -15,6 +15,9 @@ _emit_mod = importlib.import_module("fasten.emit")
 @pytest.fixture(autouse=True)
 def fresh_state():
     """Reset all module-level SDK state before each test."""
+    from fasten import audit_queue as _aq
+
+    _aq.uninstall()  # P1-15: stop any drainer thread from a prior test
     _emit_mod._service_id = ""
     _emit_mod._node_id = ""
     _emit_mod._tenant_id = None
@@ -23,7 +26,9 @@ def fresh_state():
     _emit_mod._stdout = None
     _emit_mod._seq = 0
     _emit_mod._redactor = _emit_mod.Redactor()
+    _emit_mod._failure_strategy = "queue"
     yield
+    _aq.uninstall()
 
 
 @pytest.fixture
@@ -33,12 +38,23 @@ def mem_store():
 
 @pytest.fixture
 def initialized(mem_store):
-    """Initialised SDK with an in-memory store."""
+    """Initialised SDK with an in-memory store.
+
+    Uses ``raise`` failure strategy so the legacy "emit then read store"
+    test pattern stays synchronous. Tests that need to exercise the
+    default ``queue`` drainer set the strategy explicitly (see
+    ``test_audit_queue.py``).
+    """
     import os
     os.environ["FASTEN_SERVICE_ID"] = "test-svc"
     os.environ["FASTEN_NODE_ID"] = "test-node"
     import fasten
-    fasten.init(service_id="test-svc", node_id="test-node", audit_store=mem_store)
+    fasten.init(
+        service_id="test-svc",
+        node_id="test-node",
+        audit_store=mem_store,
+        audit_store_failure_strategy="raise",
+    )
     yield fasten
     del os.environ["FASTEN_SERVICE_ID"]
     del os.environ["FASTEN_NODE_ID"]

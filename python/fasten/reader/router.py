@@ -35,7 +35,9 @@ import dataclasses
 from datetime import datetime
 from typing import Any, Optional
 
+from .. import audit_queue as _audit_queue
 from .. import audit_store as _active_audit_store
+from .. import redactor as _active_redactor
 from .. import transport as _active_transport
 
 
@@ -138,6 +140,77 @@ def router(
             "total": total,
             "limit": limit,
             "offset": offset,
+        }
+
+    @r.get("/audit/doctor")
+    def get_audit_doctor() -> dict[str, Any]:
+        """P1-15: read-side audit-pipeline health snapshot.
+
+        Same auth as ``/audit`` (router-level dependencies). Use cases:
+
+        - Compliance auditor: "is your audit pipeline healthy?" — one curl.
+        - k8s liveness: parse ``store.reachable && queue.retry_count_active``.
+        - Status page: red/yellow/green tiles from this single payload.
+        """
+        # ``fasten.emit`` resolves to the function (re-exported in
+        # __init__) rather than the module, so go through sys.modules to
+        # read init() module-globals like ``_service_id``.
+        import sys
+        _emit_mod = sys.modules["fasten.emit"]
+
+        s = _store()
+        store_block: dict[str, Any] = {
+            "kind": type(s).__name__ if s is not None else None,
+            "reachable": False,
+            "rows": None,
+            "last_insert_at": None,
+            "last_error": None,
+        }
+        if s is not None:
+            try:
+                # Cheap reachability check — count() is supported by the
+                # built-in SQLite + Postgres stores; adopters who plug a
+                # custom store without count() get reachable=true and
+                # rows=null (good enough for the probe).
+                if hasattr(s, "count"):
+                    store_block["rows"] = s.count()
+                store_block["reachable"] = True
+            except Exception as e:  # noqa: BLE001
+                store_block["reachable"] = False
+                store_block["last_error"] = f"{type(e).__name__}: {e}"
+
+        queue_block: Optional[dict[str, Any]] = _audit_queue.queue_stats()
+
+        t = _transport()
+        transport_block = {
+            "stdout_active": t is not None,
+            "syslog_ring_depth": (
+                len(t._syslog._buf) if t is not None else 0  # type: ignore[attr-defined]
+            ),
+            "api_ring_depth": (
+                len(t._api._buf) if t is not None else 0  # type: ignore[attr-defined]
+            ),
+        }
+
+        rd = _active_redactor()
+        # Redactor stores a single compiled regex; surface presence only.
+        redactor_block = {
+            "active": rd is not None,
+        }
+
+        init_block = {
+            "service_id": _emit_mod._service_id or None,
+            "node_id": _emit_mod._node_id or None,
+            "tenant_id": _emit_mod._tenant_id,
+            "failure_strategy": _emit_mod._failure_strategy,
+        }
+
+        return {
+            "store": store_block,
+            "queue": queue_block,
+            "transport": transport_block,
+            "redactor": redactor_block,
+            "init": init_block,
         }
 
     return r
