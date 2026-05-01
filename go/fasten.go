@@ -468,6 +468,18 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		row.Detail = RedactDetail(row.Detail)
 	}
 
+	// Stdout write happens BEFORE any store routing. Two reasons:
+	//   1. Under sustained queue-full outage, drainer.put() blocks. If
+	//      stdout came after, even Docker / journald log capture stalls
+	//      — adopters lose the recoverable audit trail at the worst
+	//      possible moment.
+	//   2. In raise mode, the row should still reach stdout even if the
+	//      sync insert errors — preserves the "stdout is always honest"
+	//      contract.
+	if _transport != nil {
+		_transport.WriteAudit(rowToMap(row))
+	}
+
 	// P1-15: route store insert through the drainer (queue mode) or
 	// call synchronously and wrap the store error (raise mode).
 	if _auditStore != nil {
@@ -483,15 +495,9 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 			}
 		} else {
 			if err := _auditStore.Insert(ctx, row); err != nil {
-				if _transport != nil {
-					_transport.WriteAudit(rowToMap(row))
-				}
 				return row, &AuditStoreError{Err: err}
 			}
 		}
-	}
-	if _transport != nil {
-		_transport.WriteAudit(rowToMap(row))
 	}
 	return row, nil
 }

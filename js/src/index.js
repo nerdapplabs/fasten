@@ -308,6 +308,13 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
         detail: outDetail,
         pii_in_detail: !!meta.piiInDetail,
     };
+    // Stdout write happens BEFORE any store routing — preserves the
+    // "stdout is always honest" contract. In raise mode the row still
+    // reaches the log stream even if the sync insert throws; in queue
+    // mode the row is captured even when the drainer / store is
+    // backlogged. Adopters can always replay from stdout NDJSON.
+    process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
+
     // P1-15: route store insert through the drainer (queue mode) or
     // call synchronously and wrap any store error (raise mode).
     if (config.auditStore) {
@@ -325,12 +332,10 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
             try {
                 config.auditStore.insert(row);
             } catch (err) {
-                process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
                 throw new AuditStoreError(err);
             }
         }
     }
-    process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
     return row;
 }
 

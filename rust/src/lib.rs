@@ -659,6 +659,16 @@ impl EmitBuilder {
             .build_row(&cfg)
             .map_err(|e| AuditStoreError { source: e })?;
 
+        // Stdout write happens BEFORE any store routing. Two reasons:
+        //   1. Under sustained queue-full outage, drainer.put() blocks
+        //      on the slot semaphore. If stdout came after, even
+        //      Docker / journald log capture stalls — adopters lose the
+        //      recoverable audit trail at the worst possible moment.
+        //   2. In raise mode, the row should still reach stdout even
+        //      if the sync insert errors — preserves the "stdout is
+        //      always honest" contract.
+        Self::write_audit_stdout(&row);
+
         let strategy = cfg
             .audit_store_failure_strategy
             .as_deref()
@@ -672,17 +682,14 @@ impl EmitBuilder {
                 // setup, or store-only path). Sync insert so the row
                 // isn't silently dropped.
                 if let Err(e) = s.insert(&row) {
-                    Self::write_audit_stdout(&row);
                     return Err(AuditStoreError { source: e });
                 }
             }
         } else if let Some(s) = cfg.audit_store.as_ref() {
             if let Err(e) = s.insert(&row) {
-                Self::write_audit_stdout(&row);
                 return Err(AuditStoreError { source: e });
             }
         }
-        Self::write_audit_stdout(&row);
         Ok(row)
     }
 

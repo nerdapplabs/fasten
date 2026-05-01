@@ -255,6 +255,17 @@ def emit(
     )
     row = dataclasses.replace(row, origin_id=row.id)
 
+    # Stdout write happens BEFORE any store routing. Two reasons:
+    #   1. Under sustained queue-full outage, drainer.put() blocks. If
+    #      stdout came after, even the Docker / journald log capture
+    #      stalls — adopters lose the recoverable audit trail at the
+    #      worst possible moment.
+    #   2. In raise mode, the row should still reach stdout even if the
+    #      sync insert raises — preserves the "stdout is always honest"
+    #      contract.
+    if _stdout is not None:
+        _stdout.write_audit(row.to_dict())
+
     # P1-15: route store insert through the drainer (queue mode) or call
     # synchronously and wrap any store error (raise mode).
     if _audit_store is not None:
@@ -272,8 +283,6 @@ def emit(
                 _audit_store.insert(row)
             except Exception as e:  # noqa: BLE001
                 raise AuditStoreError(f"{type(e).__name__}: {e}") from e
-    if _stdout is not None:
-        _stdout.write_audit(row.to_dict())
     return row
 
 
