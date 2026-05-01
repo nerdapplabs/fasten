@@ -157,6 +157,7 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
                     retention_class: rc,
                     high_volume: raw.high_volume,
                     pii_in_detail: raw.pii_in_detail,
+                    detail_passthrough_keys: Vec::new(),
                     declared_unused: false,
                 },
             );

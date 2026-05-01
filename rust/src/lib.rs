@@ -150,6 +150,9 @@ pub struct Row {
     pub request_id: String,
     pub detail: HashMap<String, serde_json::Value>,
 
+    #[serde(default)]
+    pub pii_in_detail: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shipped_at: Option<DateTime<Utc>>,
 }
@@ -173,6 +176,9 @@ pub struct Meta {
     pub retention_class: RetentionClass,
     pub high_volume: bool,
     pub pii_in_detail: bool,
+    /// Detail keys that survive force-redact when `pii_in_detail` is true.
+    /// Each surviving value still passes through the secret-key redactor.
+    pub detail_passthrough_keys: Vec<String>,
     pub declared_unused: bool,
 }
 
@@ -250,6 +256,14 @@ where
         }
         if guard.contains_key(&id) {
             return Err(Error::DuplicateCode(id));
+        }
+        // P1-5 #1: pii_in_detail forces retention_class=Short.
+        if meta.pii_in_detail && meta.retention_class != RetentionClass::Short {
+            eprintln!(
+                "fasten: code {} has pii_in_detail=true; retention_class forced to SHORT (was {}).",
+                id, meta.retention_class
+            );
+            meta.retention_class = RetentionClass::Short;
         }
         guard.insert(id, meta);
     }
@@ -546,7 +560,24 @@ impl EmitBuilder {
         let hex = uuid::Uuid::new_v4().simple().to_string();
         let id = format!("evt-{}", &hex[..20]);
         let request_id = current_request_id().unwrap_or_else(mint_id);
-        let detail = redact_detail(self.detail, cfg.extra_redact_keys.as_deref());
+
+        // P1-5 #2: PII codes force-redact whole detail. detail_passthrough_keys
+        // are kept and still scrubbed by the secret-key redactor.
+        let detail = if meta.pii_in_detail {
+            let passthrough: std::collections::HashSet<&str> =
+                meta.detail_passthrough_keys.iter().map(String::as_str).collect();
+            let kept: HashMap<String, serde_json::Value> = self
+                .detail
+                .into_iter()
+                .filter(|(k, _)| passthrough.contains(k.as_str()))
+                .collect();
+            let mut out = redact_detail(kept, cfg.extra_redact_keys.as_deref());
+            out.insert("_redacted".into(), serde_json::Value::String(REDACT_REPLACEMENT.into()));
+            out.insert("_pii_in_detail".into(), serde_json::Value::Bool(true));
+            out
+        } else {
+            redact_detail(self.detail, cfg.extra_redact_keys.as_deref())
+        };
 
         let row = Row {
             id: id.clone(),
@@ -567,6 +598,7 @@ impl EmitBuilder {
             method: self.method,
             request_id,
             detail,
+            pii_in_detail: meta.pii_in_detail,
             shipped_at: None,
         };
 
@@ -613,6 +645,7 @@ mod tests {
             retention_class: RetentionClass::Long,
             high_volume: false,
             pii_in_detail: false,
+            detail_passthrough_keys: Vec::new(),
             declared_unused: false,
         }
     }
@@ -708,6 +741,194 @@ mod tests {
             Err(Error::InvalidKey(k)) => assert_eq!(k, "lowercase_bad"),
             other => panic!("expected InvalidKey, got {:?}", other),
         }
+    }
+
+    // ── P1-5: pii_in_detail enforcement ───────────────────────────────────
+
+    // #1 register() forces RetentionClass::Short for PII codes.
+    #[test]
+    fn p1_5_register_forces_short() {
+        register(
+            "p1_5_force".into(),
+            [(
+                "P1_5_PII_FORCE_SHORT".into(),
+                Meta {
+                    domain: "p1_5_force".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    pii_in_detail: true,
+                    retention_class: RetentionClass::Long,
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        let m = meta_of("P1_5_PII_FORCE_SHORT").expect("meta");
+        assert_eq!(m.retention_class, RetentionClass::Short);
+    }
+
+    // Non-PII code keeps adopter-set retention.
+    #[test]
+    fn p1_5_non_pii_keeps_retention() {
+        register(
+            "p1_5_nonpii".into(),
+            [(
+                "P1_5_NON_PII_LONG".into(),
+                Meta {
+                    domain: "p1_5_nonpii".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    pii_in_detail: false,
+                    retention_class: RetentionClass::Long,
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        assert_eq!(
+            meta_of("P1_5_NON_PII_LONG").unwrap().retention_class,
+            RetentionClass::Long
+        );
+    }
+
+    // #2 emit() force-redacts whole detail; passthrough keys survive.
+    #[test]
+    fn p1_5_emit_force_redacts_with_passthrough() {
+        register(
+            "p1_5_emit".into(),
+            [(
+                "P1_5_PII_PARTIAL".into(),
+                Meta {
+                    domain: "p1_5_emit".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    pii_in_detail: true,
+                    detail_passthrough_keys: vec!["region".into()],
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+
+        init(Config {
+            service_id: "svc".into(),
+            node_id: "node".into(),
+            ..Default::default()
+        })
+        .expect("init");
+
+        let mut detail: HashMap<String, serde_json::Value> = HashMap::new();
+        detail.insert("city".into(), serde_json::json!("Mumbai"));
+        detail.insert("region".into(), serde_json::json!("MH"));
+        detail.insert("api_key".into(), serde_json::json!("sk-secret"));
+
+        let row = EmitBuilder::new("P1_5_PII_PARTIAL", "u-42")
+            .detail(detail)
+            .emit(None)
+            .expect("emit");
+
+        // PII flag mirrored on the row.
+        assert!(row.pii_in_detail, "row.pii_in_detail must be true for PII codes");
+        // Passthrough survives.
+        assert_eq!(row.detail.get("region"), Some(&serde_json::json!("MH")));
+        // Non-passthrough stripped.
+        assert!(!row.detail.contains_key("city"), "city must not survive force-redact");
+        assert!(
+            !row.detail.contains_key("api_key"),
+            "api_key not in passthrough — must not survive"
+        );
+        // Markers present.
+        assert_eq!(row.detail.get("_redacted"), Some(&serde_json::json!("***")));
+        assert_eq!(row.detail.get("_pii_in_detail"), Some(&serde_json::json!(true)));
+    }
+
+    // #2 passthrough that names a secret key is still redacted by the secret-key scrubber.
+    #[test]
+    fn p1_5_passthrough_secret_still_redacted() {
+        register(
+            "p1_5_pthsec".into(),
+            [(
+                "P1_5_PII_PASSTHROUGH_SECRET".into(),
+                Meta {
+                    domain: "p1_5_pthsec".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    pii_in_detail: true,
+                    detail_passthrough_keys: vec!["api_key".into()],
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        init(Config {
+            service_id: "svc".into(),
+            node_id: "node".into(),
+            ..Default::default()
+        })
+        .expect("init");
+
+        let mut detail: HashMap<String, serde_json::Value> = HashMap::new();
+        detail.insert("api_key".into(), serde_json::json!("sk-secret"));
+
+        let row = EmitBuilder::new("P1_5_PII_PASSTHROUGH_SECRET", "u-42")
+            .detail(detail)
+            .emit(None)
+            .expect("emit");
+        assert_eq!(row.detail.get("api_key"), Some(&serde_json::json!("***")));
+    }
+
+    // Non-PII code keeps detail; only secret keys get redacted.
+    #[test]
+    fn p1_5_non_pii_keeps_detail() {
+        register(
+            "p1_5_nonpii_detail".into(),
+            [(
+                "P1_5_NON_PII_BASIC".into(),
+                Meta {
+                    domain: "p1_5_nonpii_detail".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    pii_in_detail: false,
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        init(Config {
+            service_id: "svc".into(),
+            node_id: "node".into(),
+            ..Default::default()
+        })
+        .expect("init");
+
+        let mut detail: HashMap<String, serde_json::Value> = HashMap::new();
+        detail.insert("city".into(), serde_json::json!("Mumbai"));
+        detail.insert("api_key".into(), serde_json::json!("sk-secret"));
+
+        let row = EmitBuilder::new("P1_5_NON_PII_BASIC", "u-42")
+            .detail(detail)
+            .emit(None)
+            .expect("emit");
+        assert!(!row.pii_in_detail);
+        assert_eq!(row.detail.get("city"), Some(&serde_json::json!("Mumbai")));
+        assert_eq!(row.detail.get("api_key"), Some(&serde_json::json!("***")));
+        assert!(!row.detail.contains_key("_redacted"));
+        assert!(!row.detail.contains_key("_pii_in_detail"));
     }
 }
 
