@@ -120,7 +120,10 @@ inline const std::vector<std::string>& redact_patterns() {
 using Fields = std::unordered_map<std::string, std::string>;
 
 struct Meta {
-    std::string id;                             // must equal the registry key
+    // `id` is optional in adopter code — `register_codes()` fills it from
+    // the registry key. Setting `id` explicitly is allowed but must match
+    // the key (mismatch is a typo, never a feature).
+    std::string id;
     Domain      domain;
     std::string category;
     std::string action;
@@ -449,6 +452,57 @@ inline std::string Row::to_cloud_event_json() const {
 
 // ── Registry ───────────────────────────────────────────────────────────────
 
+namespace detail_ {
+
+inline bool is_upper_snake(const std::string& s) {
+    if (s.empty()) return false;
+    char first = s[0];
+    if (!(first >= 'A' && first <= 'Z')) return false;
+    for (std::size_t i = 1; i < s.size(); ++i) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Validate one entry + insert. Caller already holds the registry lock.
+//
+// Validation order — first failure throws AuditCatalogError:
+//   1. key shape: UPPER_SNAKE_CASE
+//   2. meta.id empty → fill from key; set → must match key
+//   3. meta.domain must equal domain
+//   4. duplicate code across registrations
+inline void register_one_locked(
+    const Domain& domain, const std::string& key, Meta meta)
+{
+    if (!is_upper_snake(key)) {
+        throw AuditCatalogError(
+            "register_codes: code key '" + key +
+            "' must be UPPER_SNAKE_CASE (letters, digits, underscores; starts with a letter)");
+    }
+    if (meta.id.empty()) {
+        meta.id = key;
+    } else if (meta.id != key) {
+        throw AuditCatalogError(
+            "register_codes: code key '" + key + "' disagrees with meta.id='" +
+            meta.id + "'. Drop meta.id (it fills from the key) or fix the mismatch.");
+    }
+    if (meta.domain != domain) {
+        throw AuditCatalogError(
+            "register_codes: code '" + key + "' declares domain='" + meta.domain +
+            "' but registered under '" + domain + "'.");
+    }
+    auto& g = globals();
+    if (g.registry.count(key)) {
+        throw AuditCatalogError("register_codes: duplicate code '" + key + "'");
+    }
+    g.registry[key] = std::move(meta);
+}
+
+}  // namespace detail_
+
 inline void register_codes(
     const Domain& domain,
     std::initializer_list<std::pair<std::string, Meta>> codes)
@@ -456,19 +510,7 @@ inline void register_codes(
     auto& g = detail_::globals();
     std::lock_guard<std::mutex> lk(g.reg_mu);
     for (auto& kv : codes) {
-        if (kv.second.id != kv.first) {
-            throw AuditCatalogError(
-                "code " + kv.first + " has meta.id=" + kv.second.id + " — they must match");
-        }
-        if (g.registry.count(kv.first)) {
-            throw AuditCatalogError("duplicate code: " + kv.first);
-        }
-        if (kv.second.domain != domain) {
-            throw AuditCatalogError(
-                "code " + kv.first + " declares domain=" + kv.second.domain +
-                " but registered under " + domain);
-        }
-        g.registry[kv.first] = kv.second;
+        detail_::register_one_locked(domain, kv.first, kv.second);
     }
 }
 
@@ -480,19 +522,7 @@ inline void register_codes(
     auto& g = detail_::globals();
     std::lock_guard<std::mutex> lk(g.reg_mu);
     for (auto& kv : codes) {
-        if (kv.second.id != kv.first) {
-            throw AuditCatalogError(
-                "code " + kv.first + " has meta.id=" + kv.second.id + " — they must match");
-        }
-        if (g.registry.count(kv.first)) {
-            throw AuditCatalogError("duplicate code: " + kv.first);
-        }
-        if (kv.second.domain != domain) {
-            throw AuditCatalogError(
-                "code " + kv.first + " declares domain=" + kv.second.domain +
-                " but registered under " + domain);
-        }
-        g.registry[kv.first] = kv.second;
+        detail_::register_one_locked(domain, kv.first, kv.second);
     }
 }
 
