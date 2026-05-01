@@ -460,18 +460,23 @@ class AuditQueueDrainer {
     }
 
     bool flush(std::chrono::milliseconds timeout) {
+        // Use the slot semaphore as the canonical "rows pending"
+        // signal: slots_free_ is decremented by put() before pushing
+        // onto the queue and incremented only after successful sink
+        // invocation, so it covers the transient window where a row
+        // has been popped from q_ but in_flight_ has not yet been
+        // incremented in drain_one. Checking q_ + in_flight_
+        // separately allowed flush() to return prematurely during
+        // that gap.
         auto deadline = std::chrono::steady_clock::now() + timeout;
         for (;;) {
+            std::size_t used;
             {
-                std::lock_guard<std::mutex> qlk(q_mu_);
-                std::lock_guard<std::mutex> slk(stats_mu_);
-                if (q_.empty() && retry_count_ == 0 && in_flight_ == 0) return true;
+                std::lock_guard<std::mutex> sl(slot_mu_);
+                used = capacity_ - slots_free_;
             }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                std::lock_guard<std::mutex> qlk(q_mu_);
-                std::lock_guard<std::mutex> slk(stats_mu_);
-                return q_.empty() && in_flight_ == 0;
-            }
+            if (used == 0) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }

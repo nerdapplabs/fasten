@@ -176,22 +176,25 @@ func (d *auditQueueDrainer) stats() QueueStats {
 	}
 }
 
-// flush blocks until the queue is empty + no row is in-flight + no
-// retry is active, or the timeout elapses. Returns true iff drained.
+// flush blocks until every pending row reaches the store (or shutdown
+// abandon), or the timeout elapses. Returns true iff drained.
+//
+// Uses len(d.slots) — the capacity semaphore — as the canonical
+// "rows pending" signal because the slot is acquired before the
+// queue.put + released only after successful insert, so it covers the
+// transient window where a row has been popped from d.q but
+// d.inFlight has not yet been incremented in drainOne. Checking q +
+// inFlight separately allowed flush() to return prematurely during
+// that gap (race surfaced by run-to-run flake on TestPublicFlush*).
 func (d *auditQueueDrainer) flush(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		d.mu.Lock()
-		idle := len(d.q) == 0 && d.retryCount == 0 && d.inFlight == 0
-		d.mu.Unlock()
-		if idle {
+		if len(d.slots) == 0 {
 			return true
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.q) == 0 && d.inFlight == 0
+	return len(d.slots) == 0
 }
 
 // shutdown signals the drainer to stop and waits up to timeout. Pending

@@ -189,22 +189,23 @@ class _AuditQueueDrainer:
         self._thread.join(timeout=timeout)
 
     def flush(self, timeout: float = 5.0) -> bool:
-        """Block until the queue is empty + no row is in-flight, or timeout.
+        """Block until every pending row reaches the store (or shutdown
+        abandon), or the timeout elapses. Returns True iff drained.
 
-        Used by tests + atexit. Returns True if the queue drained.
+        Uses the capacity semaphore as the canonical "rows pending"
+        indicator: the slot is acquired by emit() before queue.put and
+        released only after successful insert, so it covers the
+        transient window where a row has been popped from the queue
+        but ``_in_flight`` has not yet been incremented in
+        ``_drain_one``. Checking q + in_flight separately allowed
+        flush() to return prematurely during that gap.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            with self._stats_lock:
-                idle = (
-                    self._q.qsize() == 0
-                    and self._retry_count == 0
-                    and self._in_flight == 0
-                )
-            if idle:
+            if self._used_slots() == 0:
                 return True
             time.sleep(0.01)
-        return self._q.qsize() == 0 and self._in_flight == 0
+        return self._used_slots() == 0
 
     # ── Drainer loop ───────────────────────────────────────────────────────
 

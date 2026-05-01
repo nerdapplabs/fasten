@@ -223,20 +223,21 @@ impl Drainer {
     }
 
     pub(crate) fn flush(&self, timeout: Duration) -> bool {
+        // Use the slot semaphore as the canonical "rows pending"
+        // signal: it's acquired by put() before queue.push and
+        // released only after successful insert, so it covers the
+        // transient window where a row has been popped from the queue
+        // but in_flight has not yet been incremented in drain_one.
+        // Checking queue + in_flight separately allowed flush() to
+        // return prematurely during that gap.
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            {
-                let q = self.inner.queue.lock().unwrap();
-                let s = self.inner.stats.lock().unwrap();
-                if q.is_empty() && s.retry_count == 0 && s.in_flight == 0 {
-                    return true;
-                }
+            if self.inner.slots.used() == 0 {
+                return true;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let q = self.inner.queue.lock().unwrap();
-        let s = self.inner.stats.lock().unwrap();
-        q.is_empty() && s.in_flight == 0
+        self.inner.slots.used() == 0
     }
 
     pub(crate) fn shutdown(&self, timeout: Duration) {
