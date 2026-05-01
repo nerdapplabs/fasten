@@ -6,7 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	// Pure-Go SQLite driver — no CGO required so this test runs under
+	// CGO_ENABLED=0 CI (e.g. GitHub Actions default).
+	_ "modernc.org/sqlite"
 )
 
 // resetForPII clears state set by other tests in this package.
@@ -158,7 +160,7 @@ func TestNonPII_KeepsDetail(t *testing.T) {
 // ── #3 SQLite column persists pii_in_detail ──────────────────────────────
 
 func TestPII_SQLitePersistsColumn(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sqlite open: %v", err)
 	}
