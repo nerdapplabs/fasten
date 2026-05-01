@@ -133,6 +133,9 @@ struct Meta {
     Retention   retention_class = Retention::Medium;
     bool        high_volume     = false;
     bool        pii_in_detail   = false;
+    // P1-5: detail keys that survive force-redact when pii_in_detail=true.
+    // Each surviving value still passes through the secret-key redactor.
+    std::vector<std::string> detail_passthrough_keys;
 };
 
 // ── Row ────────────────────────────────────────────────────────────────────
@@ -156,6 +159,7 @@ struct Row {
     std::string method          = "sdk";
     std::string request_id;
     Fields      detail;
+    bool        pii_in_detail   = false;
     std::string shipped_at;          // empty = not shipped
 
     // Declared here, defined after detail_ helpers below.
@@ -415,6 +419,8 @@ inline std::string Row::to_json() const {
     js += ",\"method\":"         + detail_::json_str(method);
     js += ",\"request_id\":"     + detail_::json_str(request_id);
     js += ",\"detail\":"         + detail_::fields_to_json(detail);
+    js += ",\"pii_in_detail\":";
+    js += (pii_in_detail ? "true" : "false");
     if (!shipped_at.empty()) {
         js += ",\"shipped_at\":" + detail_::json_str(shipped_at);
     }
@@ -497,6 +503,13 @@ inline void register_one_locked(
     auto& g = globals();
     if (g.registry.count(key)) {
         throw AuditCatalogError("register_codes: duplicate code '" + key + "'");
+    }
+    // P1-5 #1: pii_in_detail forces Retention::Short.
+    if (meta.pii_in_detail && meta.retention_class != Retention::Short) {
+        std::cerr << "fasten: code " << key
+                  << " has pii_in_detail=true; retention_class forced to short (was "
+                  << fasten::to_string(meta.retention_class) << ").\n";
+        meta.retention_class = Retention::Short;
     }
     g.registry[key] = std::move(meta);
 }
@@ -735,7 +748,23 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     row.domain         = meta.domain;
     row.method         = o.method_val;
     row.request_id     = rid;
-    row.detail         = detail_::redact(o.fields);
+    row.pii_in_detail  = meta.pii_in_detail;
+
+    // P1-5 #2: PII codes force-redact the whole detail. Detail keys listed
+    // in meta.detail_passthrough_keys survive but still pass through the
+    // secret-key redactor. Adopters opt-in by listing keys explicitly.
+    if (meta.pii_in_detail) {
+        Fields kept;
+        for (const auto& k : meta.detail_passthrough_keys) {
+            auto it = o.fields.find(k);
+            if (it != o.fields.end()) kept[k] = it->second;
+        }
+        row.detail = detail_::redact(kept);
+        row.detail["_redacted"]      = kRedactReplacement;
+        row.detail["_pii_in_detail"] = "true";
+    } else {
+        row.detail = detail_::redact(o.fields);
+    }
 
     // NDJSON to stdout — Docker log driver captures and rotates.
     std::cout << "{\"shape\":\"audit\""
@@ -757,6 +786,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
               << ",\"method\":"         << detail_::json_str(row.method)
               << ",\"request_id\":"     << detail_::json_str(row.request_id)
               << ",\"detail\":"         << detail_::fields_to_json(row.detail)
+              << ",\"pii_in_detail\":"  << (row.pii_in_detail ? "true" : "false")
               << "}\n" << std::flush;
 
     // Invoke adopter-provided audit sink if registered.
