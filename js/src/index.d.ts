@@ -24,6 +24,11 @@ export interface Meta {
     retentionClass?: RetentionClass;
     highVolume?: boolean;
     piiInDetail?: boolean;
+    /**
+     * Detail keys that survive force-redact when piiInDetail=true.
+     * Each surviving value still passes through the secret-key redactor.
+     */
+    detailPassthroughKeys?: string[];
     declaredUnused?: boolean;
 }
 
@@ -52,6 +57,7 @@ export interface Row {
     method: Method;
     requestId: string;
     detail: Record<string, unknown>;
+    piiInDetail?: boolean;
     shippedAt?: string | null;
 }
 

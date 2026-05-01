@@ -123,6 +123,16 @@ export function register(domain, codes) {
         if (_registry.has(id)) {
             throw new Error(`register: duplicate code '${id}'`);
         }
+        // P1-5 #1: pii_in_detail forces retention_class='short'.
+        if (meta.piiInDetail && meta.retentionClass && meta.retentionClass !== RetentionClass.SHORT) {
+            console.warn(
+                `fasten: code ${id} has piiInDetail=true; ` +
+                `retentionClass forced to SHORT (was ${String(meta.retentionClass).toUpperCase()}).`
+            );
+            meta.retentionClass = RetentionClass.SHORT;
+        } else if (meta.piiInDetail && !meta.retentionClass) {
+            meta.retentionClass = RetentionClass.SHORT;
+        }
         _registry.set(id, meta);
     }
 }
@@ -205,6 +215,24 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
     // Wire format is snake_case per spec/row-schema.json — match Python /
     // Go / Rust / C++ adapters. JS keeps camelCase only at the call-site
     // API surface (emit options).
+    // P1-5 #2: PII codes force-redact whole detail. detailPassthroughKeys
+    // are kept and still scrubbed by the secret-key redactor.
+    let outDetail;
+    if (meta.piiInDetail) {
+        const passthrough = new Set(meta.detailPassthroughKeys ?? []);
+        const kept = {};
+        for (const [k, v] of Object.entries(detail)) {
+            if (passthrough.has(k)) kept[k] = v;
+        }
+        outDetail = {
+            _redacted: REDACT_REPLACEMENT,
+            _pii_in_detail: true,
+            ...redact(kept, config.extraRedactRe),
+        };
+    } else {
+        outDetail = redact(detail, config.extraRedactRe);
+    }
+
     const row = {
         id,
         origin_id: id,
@@ -223,7 +251,8 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
         domain: meta.domain,
         method,
         request_id: currentRequestID() ?? mintID(),
-        detail: redact(detail, config.extraRedactRe),
+        detail: outDetail,
+        pii_in_detail: !!meta.piiInDetail,
     };
     config.auditStore?.insert(row);
     process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
