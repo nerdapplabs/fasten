@@ -44,5 +44,35 @@ if(FASTEN_BUILD_EXAMPLES)
     endif()
 endif()
 
+# ── Tests ─────────────────────────────────────────────────────────────────
+# Off by default — adopters embedding fasten don't need to build our tests.
+# CI flips this on with -DFASTEN_BUILD_TESTS=ON.
+option(FASTEN_BUILD_TESTS "Build smoke tests" OFF)
+
+if(FASTEN_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(pii_in_detail_smoke tests/pii_in_detail_smoke.cpp)
+    target_link_libraries(pii_in_detail_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(pii_in_detail_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME pii_in_detail_smoke COMMAND pii_in_detail_smoke)
+
+    # codes_yaml smoke needs libyaml-cpp at link time — guard so the build
+    # doesn't fail on systems without it. CI installs libyaml-cpp-dev.
+    find_library(YAMLCPP_LIB yaml-cpp)
+    if(YAMLCPP_LIB)
+        add_executable(codes_yaml_smoke tests/codes_yaml_smoke.cpp)
+        target_link_libraries(codes_yaml_smoke PRIVATE fasten ${YAMLCPP_LIB})
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(codes_yaml_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME codes_yaml_smoke COMMAND codes_yaml_smoke)
+    else()
+        message(STATUS "yaml-cpp not found — skipping codes_yaml_smoke")
+    endif()
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────
 install(DIRECTORY include/ DESTINATION include)

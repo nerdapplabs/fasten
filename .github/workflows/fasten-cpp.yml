@@ -1,0 +1,39 @@
+name: C++ SDK
+
+on:
+  push:
+    paths:
+      - 'cpp/**'
+      - '.github/workflows/fasten-cpp.yml'
+  pull_request:
+    paths:
+      - 'cpp/**'
+      - '.github/workflows/fasten-cpp.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: gcc:14-bookworm
+
+    defaults:
+      run:
+        working-directory: cpp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        # cmake + libyaml-cpp-dev (required by codes_yaml_smoke; pii smoke is dep-free).
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake libyaml-cpp-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DFASTEN_BUILD_TESTS=ON -DFASTEN_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure

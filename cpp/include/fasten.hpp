@@ -219,6 +219,10 @@ inline std::string json_str(const std::string& s) {
 }
 
 // Serialize Fields to a JSON object — keys sorted for deterministic output.
+//
+// `_pii_in_detail` is the one cross-language P1-5 marker: Fields can only
+// hold strings, but Python/Go/JS/Rust emit it as a JSON boolean. We
+// special-case the wire format here so the NDJSON shape matches.
 inline std::string fields_to_json(const Fields& f) {
     std::vector<std::pair<std::string, std::string>> pairs(f.begin(), f.end());
     std::sort(pairs.begin(), pairs.end());
@@ -226,7 +230,12 @@ inline std::string fields_to_json(const Fields& f) {
     bool first = true;
     for (auto& kv : pairs) {
         if (!first) out += ',';
-        out += json_str(kv.first) + ':' + json_str(kv.second);
+        out += json_str(kv.first) + ':';
+        if (kv.first == "_pii_in_detail") {
+            out += (kv.second == "true" ? "true" : "false");
+        } else {
+            out += json_str(kv.second);
+        }
         first = false;
     }
     out += '}';
@@ -434,15 +443,24 @@ inline std::string Row::to_cloud_event_json() const {
     bool first = true;
     for (auto& kv : detail) {
         if (!first) data += ',';
-        data += detail_::json_str(kv.first) + ':' + detail_::json_str(kv.second);
+        data += detail_::json_str(kv.first) + ':';
+        if (kv.first == "_pii_in_detail") {
+            data += (kv.second == "true" ? "true" : "false");
+        } else {
+            data += detail_::json_str(kv.second);
+        }
         first = false;
     }
     if (!first) data += ',';
-    data += "\"actor\":"       + detail_::json_str(actor);
-    data += ",\"actor_kind\":" + detail_::json_str(actor_kind);
-    data += ",\"target\":"     + detail_::json_str(target);
-    data += ",\"method\":"     + detail_::json_str(method);
-    data += ",\"request_id\":" + detail_::json_str(request_id);
+    data += "\"actor\":"          + detail_::json_str(actor);
+    data += ",\"actor_kind\":"    + detail_::json_str(actor_kind);
+    data += ",\"target\":"        + detail_::json_str(target);
+    data += ",\"method\":"        + detail_::json_str(method);
+    data += ",\"request_id\":"    + detail_::json_str(request_id);
+    // Row-level PII flag — downstream consumers route on this for
+    // retention + access-control before opening `data`.
+    data += ",\"pii_in_detail\":";
+    data += (pii_in_detail ? "true" : "false");
     data += "}";
 
     std::string js = "{";

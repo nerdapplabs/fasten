@@ -111,6 +111,17 @@ void test_emit_force_redacts_detail() {
     assert(row.detail.count("ip") == 0);
     assert(row.detail["_redacted"] == fasten::kRedactReplacement);
     assert(row.detail["_pii_in_detail"] == "true");
+
+    // Wire-format parity with Python/Go/JS/Rust: the marker MUST emit
+    // as a JSON boolean inside detail, not the C++ Fields string "true".
+    auto js = row.to_json();
+    assert(js.find("\"_pii_in_detail\":true") != std::string::npos);
+    assert(js.find("\"_pii_in_detail\":\"true\"") == std::string::npos);
+    assert(js.find("\"pii_in_detail\":true") != std::string::npos);
+
+    auto ce = row.to_cloud_event_json();
+    assert(ce.find("\"_pii_in_detail\":true") != std::string::npos);
+    assert(ce.find("\"pii_in_detail\":true") != std::string::npos);
     std::cout << "emit_force_redacts_detail: PASS\n";
 }
 
