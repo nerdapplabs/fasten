@@ -21,7 +21,7 @@ jobs:
         working-directory: js
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install dev deps
         # js-yaml is an optional peerDep / devDep — required by codes_yaml tests.
