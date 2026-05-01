@@ -270,24 +270,47 @@ func RequestIDFromContext(ctx context.Context) string {
 // ── Init + globals ────────────────────────────────────────────────────────
 
 var (
-	_serviceID  string
-	_nodeID     string
-	_tenantID   string
-	_auditStore AuditRepository
-	_transport  *Transport
-	_seq        int64
+	_serviceID        string
+	_nodeID           string
+	_tenantID         string
+	_auditStore       AuditRepository
+	_transport        *Transport
+	_seq              int64
+	_failureStrategy  string // "queue" (P1-15 default) | "raise"
 )
 
 // Config for Init. AuditStore nil → audit rows are written to stdout only.
+//
+// AuditStoreFailureStrategy (P1-15) governs how Emit reacts when the
+// store rejects a row:
+//
+//   - "queue" (default) — Emit pushes rows onto a bounded in-memory
+//     queue and returns immediately. A background drainer goroutine
+//     writes to the store with exponential backoff. Emit blocks only
+//     when QueueCapacity (queued + in-flight retry) is saturated.
+//   - "raise" — Emit calls Insert synchronously and returns the
+//     wrapped error (*AuditStoreError). Useful for tests and adopters
+//     who want loud failures during configuration debugging.
+//
+// Falls back to env var FASTEN_AUDIT_STORE_FAILURE_STRATEGY when the
+// field is empty.
 type Config struct {
 	ServiceID  string
 	NodeID     string
 	TenantID   string
 	AuditStore AuditRepository
+
+	// P1-15
+	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
+	QueueCapacity             int           // default 100
+	QueueRetryInitial         time.Duration // default 100 * time.Millisecond
+	QueueRetryMax             time.Duration // default 60 * time.Second
+	DisableQueueJitter        bool          // zero (default) = jitter ON
 }
 
 // Init configures fasten. Must be called once before Emit.
-// Falls back to env vars FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_TENANT_ID.
+// Falls back to env vars FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_TENANT_ID,
+// and FASTEN_AUDIT_STORE_FAILURE_STRATEGY.
 func Init(cfg Config) error {
 	_serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
 	_nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
@@ -298,7 +321,68 @@ func Init(cfg Config) error {
 	}
 	_auditStore = cfg.AuditStore
 	_transport = NewTransport(2000)
+
+	// P1-15: failure strategy + drainer wiring.
+	strategy := firstNonEmpty(
+		cfg.AuditStoreFailureStrategy,
+		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
+		"queue",
+	)
+	switch strategy {
+	case "queue", "raise":
+	default:
+		return errInvalidStrategy
+	}
+	_failureStrategy = strategy
+
+	if strategy == "queue" && _auditStore != nil {
+		capacity := cfg.QueueCapacity
+		if capacity <= 0 {
+			capacity = 100
+		}
+		retryInitial := cfg.QueueRetryInitial
+		if retryInitial <= 0 {
+			retryInitial = 100 * time.Millisecond
+		}
+		retryMax := cfg.QueueRetryMax
+		if retryMax <= 0 {
+			retryMax = 60 * time.Second
+		}
+		installDrainer(
+			_auditStore,
+			drainerSysLog,
+			capacity,
+			retryInitial,
+			retryMax,
+			!cfg.DisableQueueJitter,
+		)
+	} else {
+		// Raise mode (or no store) — no drainer thread.
+		uninstallDrainer()
+	}
 	return nil
+}
+
+// drainerSysLog bridges the drainer to the sys stream. Non-recursive:
+// writes to the in-memory ring + stdout only, never through Emit.
+func drainerSysLog(level, event string, fields map[string]any) {
+	row := SyslogRow{
+		"level":      level,
+		"event":      event,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"request_id": "",
+		"service_id": _serviceID,
+	}
+	for k, v := range fields {
+		row[k] = v
+	}
+	if _transport != nil {
+		_transport.PushSyslog(row)
+	}
+	row["shape"] = "sys"
+	if b, err := json.Marshal(row); err == nil {
+		fmt.Println(string(b))
+	}
 }
 
 // Transport returns the active transport (ring buffers + stdout).
@@ -384,8 +468,27 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		row.Detail = RedactDetail(row.Detail)
 	}
 
+	// P1-15: route store insert through the drainer (queue mode) or
+	// call synchronously and wrap the store error (raise mode).
 	if _auditStore != nil {
-		_ = _auditStore.Insert(ctx, row)
+		if _failureStrategy == "queue" {
+			d := activeDrainer()
+			if d != nil {
+				d.put(row)
+			} else {
+				// Defensive fallback — strategy says queue but drainer
+				// isn't installed (e.g. tests bypassed Init). Sync
+				// insert so the row isn't silently dropped.
+				_ = _auditStore.Insert(ctx, row)
+			}
+		} else {
+			if err := _auditStore.Insert(ctx, row); err != nil {
+				if _transport != nil {
+					_transport.WriteAudit(rowToMap(row))
+				}
+				return row, &AuditStoreError{Err: err}
+			}
+		}
 	}
 	if _transport != nil {
 		_transport.WriteAudit(rowToMap(row))
