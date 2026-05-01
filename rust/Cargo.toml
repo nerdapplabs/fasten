@@ -2,7 +2,7 @@
 name = "fasten"
 version = "1.0.0-beta.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "Apache-2.0"
 description = "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport"
 repository = "https://github.com/nerdapplabs/fasten"
@@ -20,6 +20,7 @@ uuid        = { version = "1", features = ["v4"] }
 tokio       = { version = "1", features = ["rt", "macros", "sync"], optional = true }
 tracing     = { version = "0.1", optional = true }
 sqlx        = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "chrono"], optional = true }
+serde_yaml  = { version = "0.9", optional = true }
 
 [features]
 default = []
@@ -27,3 +28,7 @@ async = ["tokio"]
 store-sqlite = ["sqlx"]
 store-postgres = ["sqlx"]
 shim-tracing = ["tracing"]
+codes-yaml = ["serde_yaml"]
+
+[dev-dependencies]
+serde_yaml  = "0.9"

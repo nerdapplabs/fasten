@@ -189,6 +189,8 @@ pub enum Error {
     IdMismatch { key: String, got: String },
     #[error("code key {0:?} must be UPPER_SNAKE_CASE")]
     InvalidKey(String),
+    #[error("yaml catalog: {0}")]
+    YamlInvalid(String),
     #[error("missing required anchor: {0:?}")]
     MissingAnchor(Anchor),
     #[error("init not called")]
@@ -199,12 +201,12 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
-fn registry() -> &'static RwLock<HashMap<String, Meta>> {
+pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
     static REG: OnceLock<RwLock<HashMap<String, Meta>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn is_upper_snake(s: &str) -> bool {
+pub(crate) fn is_upper_snake(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_uppercase() => {}
@@ -262,9 +264,10 @@ pub fn meta_of(code: &str) -> Option<Meta> {
 /// Dump `id,domain,severity` sorted one-per-line — feeds cross-language gate.
 pub fn dump() -> String {
     let guard = registry().read().expect("registry poisoned");
-    let mut rows: Vec<(String, Domain, Severity)> = guard
+    // Sort by stringified severity so we don't need Ord on the codegen enum.
+    let mut rows: Vec<(String, Domain, String)> = guard
         .values()
-        .map(|m| (m.id.clone(), m.domain.clone(), m.severity))
+        .map(|m| (m.id.clone(), m.domain.clone(), m.severity.to_string()))
         .collect();
     rows.sort();
     rows.into_iter()
@@ -706,4 +709,21 @@ mod tests {
             other => panic!("expected InvalidKey, got {:?}", other),
         }
     }
+}
+
+// ── Catalog yaml (P1-11) ─────────────────────────────────────────────────
+//
+// Optional feature, gated behind the `codes-yaml` cargo feature so adopters
+// who stay on programmatic register() never pull in serde_yaml.
+//
+//   fasten = { version = "1", features = ["codes-yaml"] }
+//   fasten::codes::load("fleet.codes.yaml")?;
+//   fasten::codes::reload()?;
+
+#[cfg(feature = "codes-yaml")]
+pub mod codes_yaml;
+
+#[cfg(feature = "codes-yaml")]
+pub mod codes {
+    pub use super::codes_yaml::{load, reload};
 }
