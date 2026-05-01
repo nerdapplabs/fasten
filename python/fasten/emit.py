@@ -152,7 +152,21 @@ def emit(
         raise ValueError(f"unknown audit code: {code!r}")
 
     request_id = current_request_id() or mint_id()
-    detail = _redactor.redact(detail or {})
+    detail = detail or {}
+
+    # P1-5 #2: pii_in_detail force-redacts the entire detail map regardless
+    # of key names. Adopters who genuinely need fields preserved declare
+    # them in Meta.detail_passthrough_keys.
+    if meta.pii_in_detail:
+        passthrough = set(meta.detail_passthrough_keys)
+        kept = {k: v for k, v in detail.items() if k in passthrough}
+        detail = {
+            "_redacted": "***",
+            "_pii_in_detail": True,
+            **_redactor.redact(kept),
+        }
+    else:
+        detail = _redactor.redact(detail)
 
     row = AuditRow(
         id=f"evt-{uuid.uuid4().hex[:20]}",
@@ -172,6 +186,7 @@ def emit(
         domain=meta.domain,
         method=method or "sdk",
         request_id=request_id,
+        pii_in_detail=meta.pii_in_detail,
         detail=detail,
     )
     row = dataclasses.replace(row, origin_id=row.id)

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     method           TEXT NOT NULL,
     request_id       TEXT NOT NULL,
     detail           TEXT NOT NULL,
+    pii_in_detail    INTEGER NOT NULL DEFAULT 0,
     shipped_at       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
@@ -43,6 +44,13 @@ CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
 CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
 """
+
+# Index on pii_in_detail is created after the migration step (legacy tables
+# don't have the column when the DDL above runs).
+_PII_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_{table}_pii "
+    "ON {table}(pii_in_detail) WHERE pii_in_detail = 1"
+)
 
 
 class SQLiteStore:
@@ -60,6 +68,16 @@ class SQLiteStore:
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():
                 self._conn.execute(stmt)
+        # Idempotent migration for existing tables that pre-date pii_in_detail.
+        cur = self._conn.execute(f"PRAGMA table_info({table})")
+        cols = {r[1] for r in cur.fetchall()}
+        if "pii_in_detail" not in cols:
+            self._conn.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN pii_in_detail INTEGER NOT NULL DEFAULT 0"
+            )
+        # Index runs after migration so it exists on both fresh + legacy tables.
+        self._conn.execute(_PII_INDEX.format(table=table))
         self._conn.commit()
 
     @classmethod
@@ -81,7 +99,7 @@ class SQLiteStore:
     def insert(self, row: AuditRow) -> None:
         self._conn.execute(
             f"INSERT OR IGNORE INTO {self._table} VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row.id, row.origin_id, row.monotonic_seq,
                 row.timestamp.isoformat(),
@@ -91,6 +109,7 @@ class SQLiteStore:
                 row.target, row.category, row.domain,
                 row.method, row.request_id,
                 json.dumps(row.detail),
+                int(row.pii_in_detail),
                 row.shipped_at.isoformat() if row.shipped_at else None,
             ),
         )
@@ -221,5 +240,6 @@ class SQLiteStore:
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            shipped_at=datetime.fromisoformat(r[18]) if r[18] else None,
+            pii_in_detail=bool(r[18]),
+            shipped_at=datetime.fromisoformat(r[19]) if r[19] else None,
         )

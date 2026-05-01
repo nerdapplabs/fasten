@@ -73,6 +73,10 @@ class AuditRow:
     # payload
     detail: dict[str, Any] = field(default_factory=dict)
 
+    # P1-5: stamped True when the code declares pii_in_detail=True. Lets the
+    # retention sweep + compliance reports filter PII rows distinctly.
+    pii_in_detail: bool = False
+
     # replication marker (edge only)
     shipped_at: Optional[datetime] = None
 

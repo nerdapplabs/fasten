@@ -9,10 +9,13 @@ consistency gate.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Mapping, Union
+
+_logger = logging.getLogger("fasten")
 
 # Domain is a plain string — adopters define their own vocabulary.
 # Examples: "user", "billing", "device", "order" — fasten has no opinions.
@@ -87,6 +90,19 @@ class Meta:
     ``id`` is optional in user code — ``register()`` fills it from the
     dict key. Setting ``id`` explicitly is allowed but must match the key
     (raises on mismatch — that's a typo, never a feature).
+
+    ``pii_in_detail=True`` carries three enforced runtime effects (P1-5):
+
+    1. ``retention_class`` is forced to :attr:`RetentionClass.SHORT` at
+       register-time. A WARNING is logged if the adopter declared anything
+       else — they almost certainly didn't mean for PII to live for years.
+    2. The ``detail`` payload is force-redacted on emit, regardless of
+       key names: by default the whole map becomes
+       ``{"_redacted": "***", "_pii_in_detail": True}``. Adopters who
+       genuinely need fields preserved declare them in
+       :attr:`detail_passthrough_keys`.
+    3. Audit rows carry a ``pii_in_detail`` column so retention sweeps
+       and compliance reports can filter PII rows distinctly.
     """
 
     domain: str               # adopter-defined, e.g. "user", "billing", "node"
@@ -100,6 +116,9 @@ class Meta:
     high_volume: bool = False
     pii_in_detail: bool = False
     declared_unused: bool = False
+    # When pii_in_detail=True, only these keys (if any) survive emit.
+    # Everything else is replaced. Empty tuple = scrub everything.
+    detail_passthrough_keys: tuple[str, ...] = ()
 
 
 class AuditCatalogError(Exception):
@@ -157,6 +176,15 @@ def register(
                 f"register: code {name!r} declares domain={meta.domain!r} "
                 f"but registered under {domain!r}."
             )
+
+        # P1-5 #1: pii_in_detail forces RetentionClass.SHORT.
+        if meta.pii_in_detail and meta.retention_class is not RetentionClass.SHORT:
+            _logger.warning(
+                "fasten: code %s has pii_in_detail=True; "
+                "retention_class forced to SHORT (was %s).",
+                name, meta.retention_class.value.upper(),
+            )
+            meta = replace(meta, retention_class=RetentionClass.SHORT)
 
         if name in _registry:
             raise AuditCatalogError(f"register: duplicate code {name!r}")
