@@ -15,10 +15,15 @@ build/
 *.out
 vendor/
 
+# Rust
+rust/target/
+rust/Cargo.lock
+
 # Node
 node_modules/
 .npm/
 *.log
+package-lock.json
 
 # IDE
 .vscode/
