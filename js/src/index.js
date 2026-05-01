@@ -27,7 +27,25 @@ export function withRequestID(requestId, fn) {
 
 // --- Code catalog ---------------------------------------------------------
 
-const registry = new Map();
+const _registry = new Map();
+// Codes whose source-of-truth is a yaml file (vs. programmatic register()).
+// Tracked so reload() can drop yaml-removed codes while preserving
+// programmatic registrations. Exported for ./codes_yaml.js.
+export const _yamlCodes = new Set();
+
+export function registry() { return _registry; }
+
+/**
+ * Internal helper for the yaml loader's atomic swap on reload. Replaces
+ * every entry of the registry and the yaml-codes set. Not part of the
+ * public API; codes_yaml.js uses it under the hood.
+ */
+export function _resetRegistryForReload(newRegistry, newYamlCodes) {
+    _registry.clear();
+    for (const [k, v] of newRegistry) _registry.set(k, v);
+    _yamlCodes.clear();
+    for (const k of newYamlCodes) _yamlCodes.add(k);
+}
 
 // Domain is a plain string — adopters define their own vocabulary.
 // fasten ships no built-in domain constants; use string literals in your codes module.
@@ -102,17 +120,17 @@ export function register(domain, codes) {
                 `but registered under '${domain}'.`
             );
         }
-        if (registry.has(id)) {
+        if (_registry.has(id)) {
             throw new Error(`register: duplicate code '${id}'`);
         }
-        registry.set(id, meta);
+        _registry.set(id, meta);
     }
 }
 
-export function metaOf(code) { return registry.get(code); }
+export function metaOf(code) { return _registry.get(code); }
 
 export function dump() {
-    return [...registry.values()]
+    return [..._registry.values()]
         .map(m => [m.id, m.domain, m.severity])
         .sort()
         .map(([i, d, s]) => `${i},${d},${s}`)
@@ -180,7 +198,7 @@ export function init(opts = {}) {
 export function emit({ code, target, actor = 'system', actorKind = 'service',
                        detail = {}, severity, method = 'sdk' }) {
     if (!config.serviceId) throw new Error('fasten.init() must be called before emit()');
-    const meta = registry.get(code);
+    const meta = _registry.get(code);
     if (!meta) throw new Error(`unknown audit code: ${code}`);
 
     const id = `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
@@ -231,6 +249,22 @@ export const log = {
     debug(event, fields) { this._emit('debug', event, fields); },
 };
 
+// ── Catalog yaml (P1-11) ──────────────────────────────────────────────────
+// Lazy: js-yaml is only imported when load() / reload() runs. Adopters
+// who stay on programmatic register() never pay the dep.
+export const codes = {
+    register,
+    async load(path) {
+        const m = await import('./codes_yaml.js');
+        return m.load(path);
+    },
+    async reload() {
+        const m = await import('./codes_yaml.js');
+        return m.reload();
+    },
+};
+
 export default { init, emit, log, register, metaOf, dump,
                  mintID, currentRequestID, withRequestID,
+                 codes,
                  Domain, Severity, RetentionClass, ActorKind, Method };
