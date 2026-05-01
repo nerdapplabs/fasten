@@ -87,6 +87,19 @@ pub const REDACT_PATTERNS: &[&str] = &[
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
+// --- Defaults for codegen enums ------------------------------------------
+//
+// Codegen output has no Default derives; impl them here so Meta { ..Default::default() }
+// works for adopters who only set a few fields. Sensible defaults: INFO + MEDIUM.
+
+impl Default for Severity {
+    fn default() -> Self { Severity::Info }
+}
+
+impl Default for RetentionClass {
+    fn default() -> Self { RetentionClass::Medium }
+}
+
 // --- Domain --------------------------------------------------------------
 //
 // Plain string — adopters define their own vocabulary (e.g. "user",
@@ -143,7 +156,12 @@ pub struct Row {
 
 // --- Code catalog --------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// Per-code metadata.
+///
+/// `id` is optional in adopter code — `register()` fills it from the
+/// tuple key. Setting `id` explicitly is allowed but must match the
+/// key (mismatch is a typo, never a feature).
+#[derive(Debug, Clone, Default)]
 pub struct Meta {
     pub id: String,
     pub domain: Domain,
@@ -167,6 +185,10 @@ pub enum Error {
     UnknownCode(String),
     #[error("code {code} declares domain={got:?} but registered under {want:?}")]
     DomainMismatch { code: String, got: Domain, want: Domain },
+    #[error("code key {key:?} disagrees with Meta.id={got:?}")]
+    IdMismatch { key: String, got: String },
+    #[error("code key {0:?} must be UPPER_SNAKE_CASE")]
+    InvalidKey(String),
     #[error("missing required anchor: {0:?}")]
     MissingAnchor(Anchor),
     #[error("init not called")]
@@ -182,13 +204,41 @@ fn registry() -> &'static RwLock<HashMap<String, Meta>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register a batch of codes for a domain. Call once per domain at startup.
+fn is_upper_snake(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Register a batch of codes for a domain.
+///
+/// Validation runs in this order; first failure returns an error:
+///   - key shape: UPPER_SNAKE_CASE identifier
+///   - `Meta.id` empty → fill from key; set → must match key
+///   - `Meta.domain` must match `domain`
+///   - duplicate code across registrations
+///
+/// Drop `Meta.id` in new code; the tuple key is the single source of truth.
 pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
 {
     let mut guard = registry().write().expect("registry poisoned");
-    for (id, meta) in codes {
+    for (id, mut meta) in codes {
+        if !is_upper_snake(&id) {
+            return Err(Error::InvalidKey(id));
+        }
+        if meta.id.is_empty() {
+            meta.id = id.clone();
+        } else if meta.id != id {
+            return Err(Error::IdMismatch {
+                key: id,
+                got: meta.id,
+            });
+        }
         if meta.domain != domain {
             return Err(Error::DomainMismatch {
                 code: id,
@@ -588,5 +638,72 @@ mod tests {
         assert_eq!(m.domain, "test_dom");
         let dump = dump();
         assert!(dump.contains("CODE_A,test_dom,info"));
+    }
+
+    // P1-10: id is filled from the key when omitted.
+    #[test]
+    fn register_fills_id_from_key() {
+        register(
+            "p1_10".into(),
+            [(
+                "P1_10_FILLED".into(),
+                Meta {
+                    domain: "p1_10".into(),
+                    category: "x".into(),
+                    action: "x".into(),
+                    severity: Severity::Info,
+                    description: "x".into(),
+                    emitter: "t".into(),
+                    ..Default::default()
+                },
+            )],
+        )
+        .unwrap();
+        let m = meta_of("P1_10_FILLED").unwrap();
+        assert_eq!(m.id, "P1_10_FILLED");
+    }
+
+    // P1-10: explicit id that disagrees with the key raises IdMismatch.
+    #[test]
+    fn register_id_mismatch_raises() {
+        let result = register(
+            "p1_10b".into(),
+            [(
+                "P1_10_MISMATCH".into(),
+                Meta {
+                    id: "WRONG_ID".into(),
+                    domain: "p1_10b".into(),
+                    severity: Severity::Info,
+                    ..Default::default()
+                },
+            )],
+        );
+        match result {
+            Err(Error::IdMismatch { key, got }) => {
+                assert_eq!(key, "P1_10_MISMATCH");
+                assert_eq!(got, "WRONG_ID");
+            }
+            other => panic!("expected IdMismatch, got {:?}", other),
+        }
+    }
+
+    // P1-10: lowercase / invalid key shape raises InvalidKey.
+    #[test]
+    fn register_invalid_key_shape_raises() {
+        let result = register(
+            "p1_10c".into(),
+            [(
+                "lowercase_bad".into(),
+                Meta {
+                    domain: "p1_10c".into(),
+                    severity: Severity::Info,
+                    ..Default::default()
+                },
+            )],
+        );
+        match result {
+            Err(Error::InvalidKey(k)) => assert_eq!(k, "lowercase_bad"),
+            other => panic!("expected InvalidKey, got {:?}", other),
+        }
     }
 }
