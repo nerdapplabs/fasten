@@ -175,3 +175,27 @@ def dump() -> str:
         (m.id, m.domain, str(m.severity)) for m in _registry.values()
     )
     return "\n".join(f"{i},{d},{s}" for (i, d, s) in rows)
+
+
+# ── Optional yaml catalog (P1-11) ─────────────────────────────────────────
+# Re-export lazy: pyyaml is only imported when load() / reload() runs.
+# Adopters who stay on programmatic register() never pay the dep.
+
+def load(path: str) -> None:
+    """Load a catalog yaml file (see ``fasten/codes_yaml.py`` for full docs).
+
+    Lazy import — pyyaml is loaded only when this is called. Errors raise
+    loudly (startup, restart-safe).
+    """
+    from .codes_yaml import load as _load
+    _load(path)
+
+
+def reload() -> None:
+    """Re-read all previously-loaded yaml paths and atomically swap the registry.
+
+    Fault-tolerant — if parsing or validation fails, the previous catalog
+    stays active and the error is raised. No partial state.
+    """
+    from .codes_yaml import reload as _reload
+    _reload()

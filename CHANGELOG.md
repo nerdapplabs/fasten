@@ -6,6 +6,31 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Catalog YAML loader (P1-11, Python)
+
+- `fasten.codes.load("path.yaml")` — reads a yaml catalog into the
+  registry. Lazy `pyyaml` import: adopters who stay on programmatic
+  `register()` never pay the dep.
+- `fasten.codes.reload()` — atomic + fault-tolerant. Parses + validates
+  fully into a fresh dict, then swaps under a lock. If anything fails
+  (yaml parse error, invalid severity, missing field), the previous
+  catalog stays active. Reload is **not additive** — codes removed from
+  the file become unknown after the swap (stored audit rows still
+  readable; the wire `code` field is a free string).
+- Validation includes file:key context in error messages. Programmatic
+  registrations survive reload (tracked separately from yaml-loaded
+  codes).
+
+### Added — Cross-language P1-10 (Go, JS, Rust, C++)
+
+- `Meta.id` (Go) / `meta.id` (JS) / `Meta.id` (Rust) / `Meta.id` (C++)
+  is now optional — fills from the registry key at register time.
+- Explicit id mismatch raises with a fix-it message (was silently
+  overwritten before in Go and Rust).
+- Key-shape validation (`UPPER_SNAKE_CASE`) enforced everywhere.
+- New error variants: `Error::IdMismatch`, `Error::InvalidKey` (Rust);
+  matching error messages in Go / JS / C++.
+
 ### Added — Python logging ergonomics (P1-9)
 
 - `fasten.shim.structlog.configure(json=True, debug=False, ...)` — one-call
