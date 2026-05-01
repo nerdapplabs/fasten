@@ -59,12 +59,52 @@ export const REDACT_PATTERNS = [
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
+// UPPER_SNAKE_CASE — letters/digits/underscores; starts with a letter.
+const CODE_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Register a batch of codes for a domain.
+ *
+ * Adopters write the code id once — as the dict key. The SDK fills
+ * `meta.id` from the key at register time. Setting `meta.id` explicitly
+ * is allowed but must match the key (mismatch is a typo, never a feature).
+ *
+ *     register('user', {
+ *         USER_CREATED: { domain: 'user', action: 'create',
+ *                         severity: 'info', ... },
+ *     });
+ *
+ * Validation order — first failure throws:
+ *   - key shape: UPPER_SNAKE_CASE
+ *   - meta.id empty → fill from key; set → must match key
+ *   - meta.domain must equal domain
+ *   - duplicate code across registrations
+ */
 export function register(domain, codes) {
     for (const [id, meta] of Object.entries(codes)) {
-        if (registry.has(id)) throw new Error(`duplicate code: ${id}`);
-        if (meta.domain !== domain) throw new Error(
-            `code ${id} declares domain=${meta.domain} but registered under ${domain}`
-        );
+        if (!CODE_KEY_RE.test(id)) {
+            throw new Error(
+                `register: code key '${id}' must be UPPER_SNAKE_CASE ` +
+                `(letters, digits, underscores; starts with a letter).`
+            );
+        }
+        if (!meta.id) {
+            meta.id = id;
+        } else if (meta.id !== id) {
+            throw new Error(
+                `register: dict key '${id}' disagrees with meta.id='${meta.id}'. ` +
+                `Drop meta.id (it fills from the key) or fix the mismatch.`
+            );
+        }
+        if (meta.domain !== domain) {
+            throw new Error(
+                `register: code '${id}' declares domain='${meta.domain}' ` +
+                `but registered under '${domain}'.`
+            );
+        }
+        if (registry.has(id)) {
+            throw new Error(`register: duplicate code '${id}'`);
+        }
         registry.set(id, meta);
     }
 }

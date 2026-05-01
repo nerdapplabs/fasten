@@ -96,6 +96,40 @@ describe('register', () => {
         assert.equal(m.action, 'create');
         assert.equal(m.domain, 'user');
     });
+
+    // P1-10: id is filled from the dict key when omitted.
+    test('fills id from key when omitted', () => {
+        register('p1_10', {
+            P1_10_FILLED: { domain: 'p1_10', category: 'x', action: 'x',
+                            severity: 'info', description: 'x', emitter: 't' },
+        });
+        const m = metaOf('P1_10_FILLED');
+        assert.equal(m.id, 'P1_10_FILLED');
+    });
+
+    // P1-10: explicit id that disagrees with the key throws.
+    test('id mismatch throws', () => {
+        assert.throws(
+            () => register('p1_10b', {
+                P1_10_MISMATCH: { id: 'WRONG_ID', domain: 'p1_10b',
+                                  severity: 'info', description: 'x',
+                                  category: 'x', action: 'x', emitter: 't' },
+            }),
+            /disagrees with meta\.id/,
+        );
+    });
+
+    // P1-10: lowercase / invalid key shape throws.
+    test('invalid key shape throws', () => {
+        assert.throws(
+            () => register('p1_10c', {
+                lowercase_bad: { domain: 'p1_10c', severity: 'info',
+                                 category: 'x', action: 'x',
+                                 description: 'x', emitter: 't' },
+            }),
+            /UPPER_SNAKE_CASE/,
+        );
+    });
 });
 
 // ── emit ──────────────────────────────────────────────────────────────────
