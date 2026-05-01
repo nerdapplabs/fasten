@@ -183,14 +183,38 @@ function buildExtraRe(keys) {
 // the Python reference handles that. Until it does, every emit() still
 // mirrors to stdout (NDJSON), which Docker / journald captures.
 
-let config = { serviceId: '', nodeId: '', tenantId: null, auditStore: null, apiStore: null,
-               extraRedactRe: null };
+import {
+    AuditStoreError,
+    installDrainer as _installDrainer,
+    uninstallDrainer as _uninstallDrainer,
+    activeDrainer as _activeDrainer,
+    queueStats as _queueStats,
+    flush as _flush,
+} from './audit_queue.js';
+
+let config = {
+    serviceId: '', nodeId: '', tenantId: null,
+    auditStore: null, apiStore: null,
+    extraRedactRe: null,
+    failureStrategy: 'queue', // P1-15 default
+};
 let seq = 0;
 
 export function init(opts = {}) {
     const envExtra = (process.env.FASTEN_REDACT_KEYS ?? '')
         .split(',').map(s => s.trim()).filter(Boolean);
     const extraKeys = opts.extraRedactKeys ?? (envExtra.length ? envExtra : null);
+
+    const strategy = (
+        opts.auditStoreFailureStrategy ??
+        process.env.FASTEN_AUDIT_STORE_FAILURE_STRATEGY ??
+        'queue'
+    ).toLowerCase();
+    if (strategy !== 'queue' && strategy !== 'raise') {
+        throw new Error(
+            `fasten.init: auditStoreFailureStrategy must be 'queue' or 'raise' (got '${strategy}')`
+        );
+    }
 
     config = {
         serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? '',
@@ -199,10 +223,40 @@ export function init(opts = {}) {
         auditStore: opts.auditStore ?? null,
         apiStore:   opts.apiStore   ?? null,
         extraRedactRe: buildExtraRe(extraKeys),
+        failureStrategy: strategy,
     };
     if (!config.serviceId || !config.nodeId) {
         throw new Error('fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required');
     }
+
+    // P1-15 wiring.
+    if (strategy === 'queue' && config.auditStore) {
+        _installDrainer({
+            store: config.auditStore,
+            sysLog: _drainerSysLog,
+            capacity: opts.queueCapacity ?? 100,
+            retryInitialMs: opts.queueRetryInitialMs ?? 100,
+            retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
+            retryJitter: opts.queueRetryJitter ?? true,
+        });
+    } else {
+        _uninstallDrainer();
+    }
+}
+
+// Bridge from drainer to sys stream. Non-recursive: writes only to stdout
+// as a {shape:"sys"} NDJSON line, never through emit().
+function _drainerSysLog(level, event, fields) {
+    const line = {
+        shape: 'sys',
+        level,
+        event,
+        request_id: currentRequestID(),
+        service_id: config.serviceId || undefined,
+        timestamp: new Date().toISOString(),
+        ...fields,
+    };
+    process.stdout.write(JSON.stringify(line) + '\n');
 }
 
 export function emit({ code, target, actor = 'system', actorKind = 'service',
@@ -254,10 +308,34 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
         detail: outDetail,
         pii_in_detail: !!meta.piiInDetail,
     };
-    config.auditStore?.insert(row);
+    // P1-15: route store insert through the drainer (queue mode) or
+    // call synchronously and wrap any store error (raise mode).
+    if (config.auditStore) {
+        if (config.failureStrategy === 'queue') {
+            const d = _activeDrainer();
+            if (d) {
+                d.put(row);
+            } else {
+                // Defensive fallback — strategy says queue but drainer
+                // isn't installed (tests bypassed init()). Sync insert
+                // so the row isn't silently dropped.
+                try { config.auditStore.insert(row); } catch { /* ignore */ }
+            }
+        } else {
+            try {
+                config.auditStore.insert(row);
+            } catch (err) {
+                process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
+                throw new AuditStoreError(err);
+            }
+        }
+    }
     process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
     return row;
 }
+
+// Re-export P1-15 surface so adopters import it from the package root.
+export { AuditStoreError, _queueStats as queueStats, _flush as flush };
 
 export const log = {
     _emit(level, event, fields = {}) {
@@ -296,4 +374,6 @@ export const codes = {
 export default { init, emit, log, register, metaOf, dump,
                  mintID, currentRequestID, withRequestID,
                  codes,
+                 // P1-15
+                 AuditStoreError, queueStats: _queueStats, flush: _flush,
                  Domain, Severity, RetentionClass, ActorKind, Method };
