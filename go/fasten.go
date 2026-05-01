@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -126,7 +127,10 @@ type Row struct {
 	Method       string         `json:"method"`
 	RequestID    string         `json:"request_id"`
 	Detail       map[string]any `json:"detail"`
-	ShippedAt    *time.Time     `json:"shipped_at,omitempty"`
+	// P1-5: stamped true when the code declares PiiInDetail=true. Lets the
+	// retention sweep + compliance reports filter PII rows distinctly.
+	PiiInDetail bool       `json:"pii_in_detail"`
+	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
 }
 
 // ── Code catalog ──────────────────────────────────────────────────────────
@@ -141,6 +145,17 @@ type Domain string
 // ID is optional in adopter code — Register fills it from the map key
 // at registration time. Setting ID explicitly is allowed but must
 // match the map key (mismatch is a typo, never a feature).
+//
+// PiiInDetail=true (P1-5) carries three enforced runtime effects:
+//
+//  1. RetentionClass is forced to RetShort at register-time. Any other
+//     declared retention class triggers a WARNING in the registration log.
+//  2. The Detail payload is force-redacted on Emit, regardless of key
+//     names: by default the whole map becomes
+//     {"_redacted":"***", "_pii_in_detail": true}. Adopters who genuinely
+//     need fields preserved declare them in DetailPassthroughKeys.
+//  3. Audit rows carry a PiiInDetail bool so retention sweeps and
+//     compliance reports can filter PII rows distinctly.
 type Meta struct {
 	ID             Code
 	Domain         Domain
@@ -151,6 +166,10 @@ type Meta struct {
 	Emitter        string
 	RetentionClass RetentionClass
 	HighVolume     bool
+	PiiInDetail    bool
+	// DetailPassthroughKeys: when PiiInDetail=true, only these keys (if any)
+	// survive Emit. Everything else is replaced. Empty = scrub everything.
+	DetailPassthroughKeys []string
 }
 
 var (
@@ -190,6 +209,16 @@ func Register(domain Domain, codes map[Code]Meta) error {
 		if m.Domain != domain {
 			return fmt.Errorf("fasten.Register: code %q declares domain %q but registered under %q", c, m.Domain, domain)
 		}
+
+		// P1-5 #1: PiiInDetail forces RetentionClass=RetShort.
+		if m.PiiInDetail && m.RetentionClass != RetShort && m.RetentionClass != "" {
+			fmt.Fprintf(os.Stderr,
+				"fasten: code %s has PiiInDetail=true; "+
+					"RetentionClass forced to short (was %s).\n",
+				c, m.RetentionClass)
+			m.RetentionClass = RetShort
+		}
+
 		if _, exists := _registry[c]; exists {
 			return fmt.Errorf("fasten.Register: duplicate code %q", c)
 		}
@@ -325,11 +354,35 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		Method:       "sdk",
 		RequestID:    rid,
 		Detail:       map[string]any{},
+		PiiInDetail:  m.PiiInDetail,
 	}
 	for _, opt := range opts {
 		opt(&row)
 	}
-	row.Detail = RedactDetail(row.Detail)
+
+	// P1-5 #2: PiiInDetail force-redacts the entire detail map regardless
+	// of key names. Adopters who genuinely need fields preserved declare
+	// them in Meta.DetailPassthroughKeys.
+	if m.PiiInDetail {
+		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
+		for _, k := range m.DetailPassthroughKeys {
+			passthrough[k] = true
+		}
+		kept := map[string]any{}
+		for k, v := range row.Detail {
+			if passthrough[k] {
+				kept[k] = v
+			}
+		}
+		// Run the secret-key redactor on the kept subset (api_key etc.
+		// is scrubbed even when in passthrough).
+		kept = RedactDetail(kept)
+		kept["_redacted"] = "***"
+		kept["_pii_in_detail"] = true
+		row.Detail = kept
+	} else {
+		row.Detail = RedactDetail(row.Detail)
+	}
 
 	if _auditStore != nil {
 		_ = _auditStore.Insert(ctx, row)
@@ -404,6 +457,7 @@ func rowToMap(r Row) map[string]any {
 		"actor": r.Actor, "actor_kind": r.ActorKind,
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
+		"pii_in_detail": r.PiiInDetail,
 	}
 	if r.ShippedAt != nil {
 		d["shipped_at"] = r.ShippedAt.Format(time.RFC3339Nano)

@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS %s (
     method        TEXT NOT NULL,
     request_id    TEXT NOT NULL,
     detail        TEXT NOT NULL,
+    pii_in_detail INTEGER NOT NULL DEFAULT 0,
     shipped_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
@@ -76,7 +77,44 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		s.table, s.table,
 		s.table, s.table,
 	)
-	_, err := s.db.Exec(ddl)
+	if _, err := s.db.Exec(ddl); err != nil {
+		return err
+	}
+	// P1-5: idempotent migration for legacy tables that pre-date pii_in_detail.
+	// PRAGMA table_info returns one row per column.
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", s.table))
+	if err != nil {
+		return err
+	}
+	hasCol := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "pii_in_detail" {
+			hasCol = true
+		}
+	}
+	rows.Close()
+	if !hasCol {
+		if _, err := s.db.Exec(fmt.Sprintf(
+			"ALTER TABLE %s ADD COLUMN pii_in_detail INTEGER NOT NULL DEFAULT 0",
+			s.table,
+		)); err != nil {
+			return err
+		}
+	}
+	// Partial index sits outside the CREATE TABLE so it works on both fresh
+	// and legacy-migrated tables.
+	_, err = s.db.Exec(fmt.Sprintf(
+		"CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1",
+		s.table, s.table,
+	))
 	return err
 }
 
@@ -90,8 +128,12 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 		v := row.ShippedAt.Format(time.RFC3339Nano)
 		shippedAt = &v
 	}
+	piiFlag := 0
+	if row.PiiInDetail {
+		piiFlag = 1
+	}
 	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table),
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.Format(time.RFC3339Nano),
 		string(row.Code), row.Action, string(row.Severity),
@@ -100,6 +142,7 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 		row.Target, row.Category, string(row.Domain),
 		row.Method, row.RequestID,
 		string(detail),
+		piiFlag,
 		shippedAt,
 	)
 	return err
@@ -202,6 +245,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		var r Row
 		var ts, code, sev, domain string
 		var detail string
+		var piiFlag int
 		var shippedAt *string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
@@ -209,7 +253,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.ServiceID, &r.SourceNodeID, &r.TenantID,
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
-			&r.Method, &r.RequestID, &detail, &shippedAt,
+			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -218,6 +262,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
 		json.Unmarshal([]byte(detail), &r.Detail)
+		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
 			t, _ := time.Parse(time.RFC3339Nano, *shippedAt)
 			r.ShippedAt = &t
