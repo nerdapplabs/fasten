@@ -21,10 +21,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// codeKeyRe validates audit-code identifiers — UPPER_SNAKE_CASE.
+var codeKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 type Severity string
@@ -133,6 +137,10 @@ type Code string
 type Domain string
 
 // Meta is the per-code metadata registered once at startup.
+//
+// ID is optional in adopter code — Register fills it from the map key
+// at registration time. Setting ID explicitly is allowed but must
+// match the map key (mismatch is a typo, never a feature).
 type Meta struct {
 	ID             Code
 	Domain         Domain
@@ -150,18 +158,41 @@ var (
 	_registry  = map[Code]Meta{}
 )
 
-// Register adds a batch of codes. Returns error on duplicates or domain mismatch.
+// Register adds a batch of codes for a domain.
+//
+// Validation runs in this order; first failure returns an error:
+//   - key shape: UPPER_SNAKE_CASE identifier
+//   - Meta.ID empty → fill from map key; set → must match key
+//   - Meta.Domain must match domain
+//   - duplicate code across registrations
+//
+// Drop Meta.ID in new code; the map key is the single source of truth:
+//
+//	fasten.Register("user", map[fasten.Code]fasten.Meta{
+//	    "USER_CREATED": {Domain: "user", Action: "create", Severity: fasten.SevInfo, ...},
+//	})
 func Register(domain Domain, codes map[Code]Meta) error {
 	regMu.Lock()
 	defer regMu.Unlock()
 	for c, m := range codes {
-		if _, exists := _registry[c]; exists {
-			return fmt.Errorf("fasten: duplicate code %q", c)
+		if !codeKeyRe.MatchString(string(c)) {
+			return fmt.Errorf("fasten.Register: code key %q must be UPPER_SNAKE_CASE", c)
+		}
+		if m.ID == "" {
+			m.ID = c
+		} else if m.ID != c {
+			return fmt.Errorf(
+				"fasten.Register: map key %q disagrees with Meta.ID=%q. "+
+					"Drop Meta.ID (it fills from the key) or fix the mismatch.",
+				c, m.ID,
+			)
 		}
 		if m.Domain != domain {
-			return fmt.Errorf("fasten: code %q declares domain %q but registered under %q", c, m.Domain, domain)
+			return fmt.Errorf("fasten.Register: code %q declares domain %q but registered under %q", c, m.Domain, domain)
 		}
-		m.ID = c
+		if _, exists := _registry[c]; exists {
+			return fmt.Errorf("fasten.Register: duplicate code %q", c)
+		}
 		_registry[c] = m
 	}
 	return nil

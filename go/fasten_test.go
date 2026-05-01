@@ -118,6 +118,71 @@ func TestRegister_DomainMismatch(t *testing.T) {
 	}
 }
 
+// P1-10: ID is filled from the map key when omitted.
+func TestRegister_FillsIDFromKey(t *testing.T) {
+	regMu.Lock()
+	for k := range _registry {
+		delete(_registry, k)
+	}
+	regMu.Unlock()
+	t.Cleanup(func() {
+		regMu.Lock()
+		for k := range _registry {
+			delete(_registry, k)
+		}
+		regMu.Unlock()
+	})
+
+	if err := Register("svc", map[Code]Meta{
+		"P1_10_FILLED": {Domain: "svc", Category: "x", Action: "x", Severity: SevInfo},
+	}); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	m, ok := metaOf("P1_10_FILLED")
+	if !ok || m.ID != "P1_10_FILLED" {
+		t.Fatalf("Meta.ID not filled from key: ok=%v id=%q", ok, m.ID)
+	}
+}
+
+// P1-10: explicit ID that disagrees with map key raises.
+func TestRegister_IDMismatchRaises(t *testing.T) {
+	regMu.Lock()
+	for k := range _registry {
+		delete(_registry, k)
+	}
+	regMu.Unlock()
+	t.Cleanup(func() {
+		regMu.Lock()
+		for k := range _registry {
+			delete(_registry, k)
+		}
+		regMu.Unlock()
+	})
+
+	err := Register("svc", map[Code]Meta{
+		"P1_10_MISMATCH": {ID: "WRONG_ID", Domain: "svc", Severity: SevInfo},
+	})
+	if err == nil || !strings.Contains(err.Error(), "disagrees with Meta.ID") {
+		t.Fatalf("expected ID-mismatch error, got %v", err)
+	}
+}
+
+// P1-10: lowercase / invalid key is rejected.
+func TestRegister_InvalidKeyShape(t *testing.T) {
+	regMu.Lock()
+	for k := range _registry {
+		delete(_registry, k)
+	}
+	regMu.Unlock()
+
+	err := Register("svc", map[Code]Meta{
+		"lowercase_bad": {Domain: "svc", Severity: SevInfo},
+	})
+	if err == nil || !strings.Contains(err.Error(), "UPPER_SNAKE_CASE") {
+		t.Fatalf("expected key-shape error, got %v", err)
+	}
+}
+
 // ── Emit ──────────────────────────────────────────────────────────────────
 
 func TestEmit_RequiresInit(t *testing.T) {
