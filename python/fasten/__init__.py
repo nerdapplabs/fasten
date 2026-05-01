@@ -17,7 +17,7 @@ See README.md for the full design.
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
-from .audit_queue import AuditStoreError, queue_stats
+from .audit_queue import AuditStoreError, flush, queue_stats
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
 from .emit import audit_store, emit, init, log, redactor, transport
@@ -39,6 +39,7 @@ __all__ = [
     "AuditRepository",
     # P1-15: audit-store failure handling
     "AuditStoreError",
+    "flush",
     "queue_stats",
     # context
     "current_request_id",

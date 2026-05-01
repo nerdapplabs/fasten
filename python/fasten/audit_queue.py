@@ -357,11 +357,13 @@ def install(
 ) -> _AuditQueueDrainer:
     """Replace the active drainer (called from ``init()``).
 
-    Stops the previous drainer cleanly (best-effort flush) before swapping
-    so tests + reconfiguration don't leak threads.
+    Flushes pending rows from the old drainer before stopping it so
+    re-init under load doesn't lose audit rows. Tests + adopters
+    reconfiguring at runtime get the durability guarantee they expect.
     """
     global _drainer, _atexit_registered
     if _drainer is not None:
+        _drainer.flush(timeout=5.0)
         _drainer.stop(timeout=2.0)
     _drainer = _AuditQueueDrainer(
         store=store,
@@ -395,6 +397,19 @@ def queue_stats() -> Optional[dict[str, Any]]:
     if _drainer is None:
         return None
     return _drainer.stats()
+
+
+def flush(timeout: float = 5.0) -> bool:
+    """Block until pending audit rows are drained, or ``timeout`` elapses.
+
+    Returns True iff every queued row reached the store. Useful for
+    deterministic shutdown paths (k8s preStop hook, CLI subcommand
+    completion, test setup/teardown). No-op + returns True in ``raise``
+    mode (no queue to drain).
+    """
+    if _drainer is None:
+        return True
+    return _drainer.flush(timeout=timeout)
 
 
 def _atexit_flush() -> None:

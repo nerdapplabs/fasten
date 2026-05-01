@@ -283,6 +283,30 @@ def test_queue_high_water_emits_warn_at_50pct():
     assert "audit_queue_high_water" in events, f"expected high-water; got {events}"
 
 
+# ── #6a public flush() ─────────────────────────────────────────────────────
+
+
+def test_public_flush_blocks_until_drained():
+    store = _RecordingStore()
+    _init(store)
+    for i in range(5):
+        fasten.emit(code="USER_CREATED", target=f"u-{i}")
+
+    # fasten.flush() is the public deterministic-drain hook for adopters
+    # (k8s preStop, CLI exit, tests). Returns True when fully drained.
+    assert fasten.flush(timeout=2.0)
+    assert len(store.rows) == 5
+
+
+def test_public_flush_no_op_in_raise_mode():
+    store = _RecordingStore()
+    _init(store, audit_store_failure_strategy="raise")
+    # Synchronous insert; no queue to drain. Public flush() must be a no-op
+    # (and return True) so adopter shutdown code is mode-agnostic.
+    fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=0.1) is True
+
+
 # ── #6 queue_stats ─────────────────────────────────────────────────────────
 
 

@@ -6,6 +6,46 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Audit-store failure handling (P1-15, Python) — DEFAULT BEHAVIOR
+
+- `fasten.emit()` is now **asynchronous by default**: rows are pushed
+  onto a bounded in-memory queue, drained by a background thread with
+  exponential backoff (100 ms → 60 s, ±20 % jitter). A locked / down
+  audit store no longer cascades into 5xxs on the request path.
+- Adopters who relied on the old synchronous-raise contract opt in via
+  `audit_store_failure_strategy="raise"` (or
+  `FASTEN_AUDIT_STORE_FAILURE_STRATEGY=raise`). Test fixtures that
+  emit-then-immediately-query-the-store should switch to `raise` mode
+  or call the eventual `flush()` API.
+
+### Added — Audit-store failure handling (P1-15, Python)
+
+- `fasten.init(audit_store_failure_strategy="queue" | "raise", queue_capacity=100, queue_retry_initial_ms=100, queue_retry_max_ms=60_000, queue_retry_jitter=True)` —
+  full surface for tuning the drainer.
+- `fasten.flush(timeout=5.0)` — block until pending rows drain. Useful
+  for deterministic shutdown (k8s preStop hook, CLI exit) and test
+  setup/teardown. Returns True iff fully drained; no-op + returns True
+  in `raise` mode so adopter shutdown code stays mode-agnostic.
+- `fasten.queue_stats()` — programmatic snapshot of queue depth,
+  capacity, high-water mark, drained-total, retry count, current
+  backoff window, and last error. Returns `None` in `raise` mode.
+- `fasten.AuditStoreError` — single fasten-namespaced exception type
+  raised by `emit()` in `raise` mode; wraps the underlying store
+  exception so callers don't depend on sqlite3 / psycopg types.
+- `GET /logs/audit/doctor` reader endpoint — JSON health snapshot
+  covering store reachability + row count, queue stats, transport
+  ring depths, redactor state, and current init parameters. Inherits
+  the router's `dependencies=[Depends(...)]` for auth.
+- Drainer self-reports state transitions to the sys stream so
+  existing log aggregation catches audit-pipeline issues without
+  polling: `audit_drain_failed` (warn), `audit_drain_degraded` (error,
+  after 5+ consecutive failures), `audit_drain_recovered` (info),
+  `audit_queue_high_water` (warn, ≥ 50 % capacity), and
+  `audit_queue_near_full` (error, ≥ 80 %).
+- Capacity counts queued **and** in-flight retry rows — a row in
+  retry-backoff still occupies a slot, so `emit()` blocks once the
+  audit pipeline is genuinely saturated rather than silently dropping.
+
 ### Added — Catalog YAML loader (P1-11, Python)
 
 - `fasten.codes.load("path.yaml")` — reads a yaml catalog into the
