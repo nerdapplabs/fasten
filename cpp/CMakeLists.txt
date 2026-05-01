@@ -59,6 +59,14 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME pii_in_detail_smoke COMMAND pii_in_detail_smoke)
 
+    # P1-15: audit-store failure handling smoke
+    add_executable(audit_queue_smoke tests/audit_queue_smoke.cpp)
+    target_link_libraries(audit_queue_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(audit_queue_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME audit_queue_smoke COMMAND audit_queue_smoke)
+
     # codes_yaml smoke needs libyaml-cpp at link time — guard so the build
     # doesn't fail on systems without it. CI installs libyaml-cpp-dev.
     find_library(YAMLCPP_LIB yaml-cpp)

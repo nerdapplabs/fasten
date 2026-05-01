@@ -26,12 +26,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -39,6 +41,10 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <atomic>
+#include <condition_variable>
+#include <queue>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -354,6 +360,338 @@ struct RingBuffer {
     }
 };
 
+}  // namespace detail_
+
+// ── P1-15: audit-store failure handling ───────────────────────────────────
+
+// AuditStoreError is thrown by emit() in raise mode when the audit
+// sink throws. Carries the original message so adopters don't depend
+// on sqlite3 / pqxx types directly.
+struct AuditStoreError : std::runtime_error {
+    explicit AuditStoreError(const std::string& msg)
+        : std::runtime_error("fasten audit store: " + msg) {}
+};
+
+// Snapshot returned by queue_stats(). depth = queued + in-flight.
+struct QueueStats {
+    std::size_t depth                = 0;
+    std::size_t capacity             = 0;
+    std::size_t high_water           = 0;
+    std::size_t drained_total        = 0;
+    std::size_t retry_count_active   = 0;
+    double      in_backoff_seconds   = 0.0;
+    std::string last_error;
+};
+
+namespace detail_ {
+
+using SysLog = std::function<void(const std::string&,
+                                  const std::string&,
+                                  const std::vector<std::pair<std::string, std::string>>&)>;
+
+class AuditQueueDrainer {
+  public:
+    static constexpr double      kHwWarnPct     = 0.50;
+    static constexpr double      kHwErrPct      = 0.80;
+    static constexpr std::size_t kDegradedAfter = 5;
+
+    AuditQueueDrainer(std::function<void(const Row&)> sink,
+                      SysLog sys_log,
+                      std::size_t capacity,
+                      std::chrono::milliseconds retry_initial,
+                      std::chrono::milliseconds retry_max,
+                      bool retry_jitter)
+        : sink_(std::move(sink)),
+          sys_log_(std::move(sys_log)),
+          capacity_(capacity),
+          retry_initial_(retry_initial),
+          retry_max_(retry_max),
+          retry_jitter_(retry_jitter),
+          slots_free_(capacity),
+          rng_(std::random_device{}()) {
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~AuditQueueDrainer() { shutdown(std::chrono::seconds(2)); }
+
+    AuditQueueDrainer(const AuditQueueDrainer&)            = delete;
+    AuditQueueDrainer& operator=(const AuditQueueDrainer&) = delete;
+
+    void put(Row row) {
+        // Acquire a slot — blocks if all capacity slots are taken
+        // (queued + in-flight retry combined). Released only on
+        // successful sink invocation or shutdown abandon.
+        {
+            std::unique_lock<std::mutex> lk(slot_mu_);
+            slot_cv_.wait(lk, [this] { return slots_free_ > 0 || stop_.load(); });
+            if (stop_.load()) return;  // best-effort: drop on shutdown
+            --slots_free_;
+        }
+        {
+            std::lock_guard<std::mutex> lk(q_mu_);
+            q_.push(std::move(row));
+        }
+        q_cv_.notify_one();
+        emit_high_water_if_crossed();
+    }
+
+    QueueStats stats() const {
+        std::lock_guard<std::mutex> lk(stats_mu_);
+        QueueStats s;
+        std::size_t free_now;
+        {
+            std::lock_guard<std::mutex> sl(slot_mu_);
+            free_now = slots_free_;
+        }
+        s.depth              = capacity_ - free_now;
+        s.capacity           = capacity_;
+        s.high_water         = high_water_;
+        s.drained_total      = drained_total_;
+        s.retry_count_active = retry_count_;
+        if (in_backoff_until_ms_ > 0) {
+            auto now_ms = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            int64_t rem = in_backoff_until_ms_ - now_ms;
+            if (rem > 0) s.in_backoff_seconds = static_cast<double>(rem) / 1000.0;
+        }
+        s.last_error = last_error_;
+        return s;
+    }
+
+    bool flush(std::chrono::milliseconds timeout) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> qlk(q_mu_);
+                std::lock_guard<std::mutex> slk(stats_mu_);
+                if (q_.empty() && retry_count_ == 0 && in_flight_ == 0) return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::lock_guard<std::mutex> qlk(q_mu_);
+                std::lock_guard<std::mutex> slk(stats_mu_);
+                return q_.empty() && in_flight_ == 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    void shutdown(std::chrono::milliseconds /*timeout*/) {
+        if (stop_.exchange(true)) return;
+        q_cv_.notify_all();
+        slot_cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+  private:
+    void run() {
+        while (!stop_.load()) {
+            Row row;
+            bool got;
+            {
+                std::unique_lock<std::mutex> lk(q_mu_);
+                q_cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
+                    return !q_.empty() || stop_.load();
+                });
+                got = !q_.empty();
+                if (got) { row = std::move(q_.front()); q_.pop(); }
+            }
+            if (got) drain_one(row, /*in_shutdown=*/false);
+        }
+        for (;;) {
+            Row row;
+            bool got;
+            {
+                std::lock_guard<std::mutex> lk(q_mu_);
+                got = !q_.empty();
+                if (got) { row = std::move(q_.front()); q_.pop(); }
+            }
+            if (!got) break;
+            drain_one(row, /*in_shutdown=*/true);
+        }
+    }
+
+    void drain_one(const Row& row, bool in_shutdown) {
+        { std::lock_guard<std::mutex> lk(stats_mu_); ++in_flight_; }
+        bool slot_released = false;
+        for (;;) {
+            try {
+                sink_(row);
+                on_success();
+                release_slot(); slot_released = true;
+                break;
+            } catch (const std::exception& e) {
+                on_failure(e.what());
+                if (in_shutdown) { release_slot(); slot_released = true; break; }
+                if (wait_backoff()) { release_slot(); slot_released = true; break; }
+            } catch (...) {
+                on_failure("unknown exception");
+                if (in_shutdown) { release_slot(); slot_released = true; break; }
+                if (wait_backoff()) { release_slot(); slot_released = true; break; }
+            }
+        }
+        { std::lock_guard<std::mutex> lk(stats_mu_); --in_flight_; }
+        if (!slot_released) release_slot();
+    }
+
+    void release_slot() {
+        { std::lock_guard<std::mutex> lk(slot_mu_); if (slots_free_ < capacity_) ++slots_free_; }
+        slot_cv_.notify_one();
+    }
+
+    void emit_high_water_if_crossed() {
+        std::size_t used;
+        { std::lock_guard<std::mutex> lk(slot_mu_); used = capacity_ - slots_free_; }
+        bool fire_warn = false, fire_err = false;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            if (used > high_water_) high_water_ = used;
+            if (capacity_ == 0) return;
+            double pct = static_cast<double>(used) / static_cast<double>(capacity_);
+            if (pct >= kHwErrPct && !err_hw_fired_) { err_hw_fired_ = true; fire_err = true; }
+            else if (pct >= kHwWarnPct && !warn_hw_fired_) { warn_hw_fired_ = true; fire_warn = true; }
+            else if (pct < kHwWarnPct) { warn_hw_fired_ = false; err_hw_fired_ = false; }
+        }
+        if (fire_err) {
+            sys_log_("error", "audit_queue_near_full",
+                     {{"depth", std::to_string(used)}, {"capacity", std::to_string(capacity_)}});
+        } else if (fire_warn) {
+            sys_log_("warn", "audit_queue_high_water",
+                     {{"depth", std::to_string(used)}, {"capacity", std::to_string(capacity_)}});
+        }
+    }
+
+    void on_failure(const std::string& msg) {
+        bool first = false, crossed = false;
+        std::size_t rc = 0;
+        double bo = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            first = retry_count_ == 0;
+            if (first) {
+                failure_burst_started_at_ms_ = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
+            ++retry_count_;
+            last_error_ = msg;
+            rc = retry_count_;
+            if (in_backoff_until_ms_ > 0) {
+                auto now_ms = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                int64_t rem = in_backoff_until_ms_ - now_ms;
+                if (rem > 0) bo = static_cast<double>(rem) / 1000.0;
+            }
+            if (retry_count_ >= kDegradedAfter && !degraded_fired_) {
+                degraded_fired_ = true; crossed = true;
+            }
+        }
+        if (first) sys_log_("warn", "audit_drain_failed", {{"error", msg}});
+        if (crossed) {
+            sys_log_("error", "audit_drain_degraded",
+                     {{"retry_count", std::to_string(rc)},
+                      {"in_backoff_seconds", std::to_string(bo)},
+                      {"last_error", msg}});
+        }
+    }
+
+    void on_success() {
+        bool emit_recovered = false;
+        double recovery_seconds = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            if (retry_count_ > 0 && failure_burst_started_at_ms_ != 0) {
+                auto now_ms = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                recovery_seconds =
+                    static_cast<double>(now_ms - failure_burst_started_at_ms_) / 1000.0;
+                emit_recovered = true;
+            }
+            retry_count_                 = 0;
+            in_backoff_until_ms_         = 0;
+            failure_burst_started_at_ms_ = 0;
+            last_error_.clear();
+            degraded_fired_              = false;
+            ++drained_total_;
+        }
+        if (emit_recovered) {
+            double r = std::round(recovery_seconds * 1000.0) / 1000.0;
+            sys_log_("info", "audit_drain_recovered",
+                     {{"recovery_after_seconds", std::to_string(r)}});
+        }
+    }
+
+    bool wait_backoff() {
+        std::size_t n;
+        { std::lock_guard<std::mutex> lk(stats_mu_); n = retry_count_; }
+        auto delay = retry_initial_;
+        for (std::size_t i = 1; i < n; ++i) {
+            delay *= 2;
+            if (delay >= retry_max_) { delay = retry_max_; break; }
+        }
+        if (delay > retry_max_) delay = retry_max_;
+        if (retry_jitter_) {
+            std::uniform_real_distribution<double> dist(-0.2, 0.2);
+            double r = dist(rng_);
+            auto adj = std::chrono::milliseconds(static_cast<int64_t>(delay.count() * r));
+            delay += adj;
+            if (delay.count() < 0) delay = std::chrono::milliseconds(0);
+        }
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            auto now_ms = static_cast<int64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            in_backoff_until_ms_ = now_ms + delay.count();
+        }
+        auto deadline = std::chrono::steady_clock::now() + delay;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (stop_.load()) return true;
+            auto rem = deadline - std::chrono::steady_clock::now();
+            auto step = std::min(
+                std::chrono::duration_cast<std::chrono::milliseconds>(rem),
+                std::chrono::milliseconds(50));
+            if (step.count() <= 0) break;
+            std::this_thread::sleep_for(step);
+        }
+        return stop_.load();
+    }
+
+    std::function<void(const Row&)> sink_;
+    SysLog                          sys_log_;
+    std::size_t                     capacity_;
+    std::chrono::milliseconds       retry_initial_;
+    std::chrono::milliseconds       retry_max_;
+    bool                            retry_jitter_;
+
+    std::queue<Row>                 q_;
+    mutable std::mutex              q_mu_;
+    std::condition_variable         q_cv_;
+
+    mutable std::mutex              slot_mu_;
+    std::condition_variable         slot_cv_;
+    std::size_t                     slots_free_;
+
+    std::atomic<bool>               stop_{false};
+    std::thread                     thread_;
+
+    mutable std::mutex              stats_mu_;
+    std::size_t                     high_water_                  = 0;
+    std::size_t                     drained_total_               = 0;
+    std::size_t                     retry_count_                 = 0;
+    std::size_t                     in_flight_                   = 0;
+    int64_t                         in_backoff_until_ms_         = 0;
+    int64_t                         failure_burst_started_at_ms_ = 0;
+    std::string                     last_error_;
+    bool                            warn_hw_fired_  = false;
+    bool                            err_hw_fired_   = false;
+    bool                            degraded_fired_ = false;
+
+    std::mt19937_64                 rng_;
+};
+
 // All mutable global state lives in one Meyers-singleton struct.
 // This is the correct pattern for a single-header library — one instance
 // per process regardless of how many translation units include the header.
@@ -374,6 +712,11 @@ struct Globals {
     // Adopter-supplied audit sink — called for every emitted Row.
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
+
+    // P1-15: failure-strategy + drainer ownership.
+    std::string                                 failure_strategy{"queue"};
+    std::shared_ptr<AuditQueueDrainer>          drainer;
+    std::mutex                                  drainer_mu;
 
     // Redactor config — built by init(), defaults to built-in pattern + "***".
     RedactConfig redact_cfg;
@@ -592,7 +935,26 @@ struct Config {
     // Redaction — both are additive to / override the built-in defaults.
     std::vector<std::string> extra_redact_keys;   // appended to built-in pattern
     std::string              redact_replacement;  // default "***"; env FASTEN_REDACT_REPLACEMENT
+
+    // P1-15: audit-store failure handling.
+    //
+    // "queue" (default) — emit() pushes rows onto a bounded in-memory
+    //   queue and returns immediately. A background thread invokes the
+    //   audit sink with exponential backoff on exception.
+    // "raise" — emit() invokes the sink synchronously and rethrows as
+    //   AuditStoreError on exception. Useful for tests / dev mode.
+    //
+    // Empty falls back to env FASTEN_AUDIT_STORE_FAILURE_STRATEGY.
+    std::string              audit_store_failure_strategy;  // "queue" | "raise"
+    std::size_t              queue_capacity        = 100;   // queued + in-flight
+    int                      queue_retry_initial_ms = 100;
+    int                      queue_retry_max_ms     = 60000;
+    bool                     disable_queue_jitter   = false; // false = jitter ON
 };
+
+// Forward declaration — defined below set_audit_sink so it can read
+// the active sink. P1-15.
+inline void install_drainer_(const Config& cfg);
 
 inline void init(Config cfg = {}) {
     using detail_::env_or;
@@ -619,6 +981,15 @@ inline void init(Config cfg = {}) {
     g.redact_cfg.replacement = cfg.redact_replacement.empty()
         ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
+
+    // P1-15: failure-strategy + drainer wiring.
+    std::string strategy = cfg.audit_store_failure_strategy;
+    if (strategy.empty()) strategy = env_or("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", "queue");
+    if (strategy != "queue" && strategy != "raise") {
+        throw InitError("init: audit_store_failure_strategy must be \"queue\" or \"raise\"");
+    }
+    g.failure_strategy = strategy;
+    install_drainer_(cfg);
 }
 
 // Convenience overload — positional args for the common case.
@@ -644,6 +1015,99 @@ inline void set_audit_sink(AuditSink sink) {
     auto& g = detail_::globals();
     std::lock_guard<std::mutex> lk(g.sink_mu);
     g.audit_sink = std::move(sink);
+}
+
+// ── P1-15: drainer install + public surface ────────────────────────────────
+
+namespace detail_ {
+
+inline void drainer_sys_log(const std::string& level,
+                            const std::string& event,
+                            const std::vector<std::pair<std::string, std::string>>& fields) {
+    // Non-recursive: writes a {shape:"sys"} NDJSON line to stdout +
+    // pushes to the sys ring. Never recurses through the sink.
+    auto& g = globals();
+    Fields ring_row;
+    std::string js = "{\"shape\":\"sys\"";
+    js += ",\"level\":"      + json_str(level);
+    js += ",\"event\":"      + json_str(event);
+    js += ",\"request_id\":" + json_str(tl_request_id());
+    js += ",\"service_id\":" + json_str(g.service_id);
+    js += ",\"timestamp\":"  + json_str(now_iso8601());
+    for (const auto& kv : fields) {
+        js += ',' + json_str(kv.first) + ':' + json_str(kv.second);
+        ring_row[kv.first] = kv.second;
+    }
+    js += "}\n";
+    ring_row["level"]      = level;
+    ring_row["event"]      = event;
+    ring_row["request_id"] = tl_request_id();
+    g.syslog_ring.push(std::move(ring_row));
+    std::cout << js << std::flush;
+}
+
+}  // namespace detail_
+
+inline void install_drainer_(const Config& cfg) {
+    auto& g = detail_::globals();
+    std::lock_guard<std::mutex> lk(g.drainer_mu);
+    // Tear down the prior drainer so re-init under load doesn't leak
+    // a thread.
+    if (g.drainer) {
+        g.drainer->flush(std::chrono::seconds(5));
+        g.drainer->shutdown(std::chrono::seconds(2));
+        g.drainer.reset();
+    }
+    if (g.failure_strategy != "queue") return;
+    // Snapshot the currently registered sink — adopters who call
+    // set_audit_sink() AFTER init() should re-init() to swap drainers.
+    std::function<void(const Row&)> sink_copy;
+    {
+        std::lock_guard<std::mutex> sk(g.sink_mu);
+        sink_copy = g.audit_sink;
+    }
+    if (!sink_copy) return;  // no sink to drain into
+    g.drainer = std::make_shared<detail_::AuditQueueDrainer>(
+        std::move(sink_copy),
+        detail_::drainer_sys_log,
+        cfg.queue_capacity,
+        std::chrono::milliseconds(cfg.queue_retry_initial_ms),
+        std::chrono::milliseconds(cfg.queue_retry_max_ms),
+        !cfg.disable_queue_jitter);
+}
+
+// Snapshot of the active drainer, or nullptr in raise mode (no
+// drainer running). Mirrors Python's queue_stats() / Go's
+// GetQueueStats().
+inline std::unique_ptr<QueueStats> queue_stats() {
+    auto& g = detail_::globals();
+    std::lock_guard<std::mutex> lk(g.drainer_mu);
+    if (!g.drainer) return nullptr;
+    return std::unique_ptr<QueueStats>(new QueueStats(g.drainer->stats()));
+}
+
+// Block until pending audit rows drain or the timeout elapses.
+// Returns true iff drained. No-op + true in raise mode.
+inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+    auto& g = detail_::globals();
+    std::shared_ptr<detail_::AuditQueueDrainer> d;
+    {
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        d = g.drainer;
+    }
+    if (!d) return true;
+    return d->flush(timeout);
+}
+
+// Stop and drop the active drainer. Adopter shutdown paths call this
+// before exiting; init() also calls this internally to swap drainers.
+inline void uninstall_drainer() {
+    auto& g = detail_::globals();
+    std::lock_guard<std::mutex> lk(g.drainer_mu);
+    if (g.drainer) {
+        g.drainer->shutdown(std::chrono::seconds(2));
+        g.drainer.reset();
+    }
 }
 
 // ── Correlation ────────────────────────────────────────────────────────────
@@ -807,10 +1271,39 @@ inline Row emit(const std::string& code, Opts&&... opts) {
               << ",\"pii_in_detail\":"  << (row.pii_in_detail ? "true" : "false")
               << "}\n" << std::flush;
 
-    // Invoke adopter-provided audit sink if registered.
+    // P1-15: route through the drainer (queue mode) or invoke the
+    // sink synchronously and wrap exceptions (raise mode).
     {
-        std::lock_guard<std::mutex> lk(g.sink_mu);
-        if (g.audit_sink) g.audit_sink(row);
+        std::shared_ptr<detail_::AuditQueueDrainer> drainer_copy;
+        {
+            std::lock_guard<std::mutex> lk(g.drainer_mu);
+            drainer_copy = g.drainer;
+        }
+        if (drainer_copy && g.failure_strategy == "queue") {
+            drainer_copy->put(row);
+        } else {
+            std::function<void(const Row&)> sink_copy;
+            {
+                std::lock_guard<std::mutex> lk(g.sink_mu);
+                sink_copy = g.audit_sink;
+            }
+            if (sink_copy) {
+                if (g.failure_strategy == "raise") {
+                    try {
+                        sink_copy(row);
+                    } catch (const std::exception& e) {
+                        throw AuditStoreError(e.what());
+                    } catch (...) {
+                        throw AuditStoreError("unknown exception");
+                    }
+                } else {
+                    // Queue strategy but no drainer (sink registered
+                    // after init()) — fall back to sync to avoid
+                    // silently dropping rows.
+                    try { sink_copy(row); } catch (...) { /* swallow */ }
+                }
+            }
+        }
     }
 
     return row;
