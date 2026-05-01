@@ -6,54 +6,65 @@
 Audit + correlation SDK.
 
 Logs, HTTP access trail, and typed audit rows — one `request_id` threads
-all three streams. 5 Ws + H anchors enforced at the type level; bundled
-shims for HTTP, MQTT, and scheduler-fired jobs. One mountable query
-surface. Apache-2.0.
+all three streams. 6 anchors (5 Ws + How) enforced at the type level;
+bundled shims for HTTP, MQTT, and scheduler-fired jobs. One mountable
+query surface. Apache-2.0.
 
-**[Full docs →](https://fasten.sh/docs/)**
+**v1.0.0-beta.** Python is the reference SDK; Go / JS / Rust / C++ are
+beta. Not yet on PyPI / npm / crates.io — install from source.
+
+**[Website →](https://fasten.sh)**
 
 ---
 
-## Install
-
-PyPI and npm packages publish at **v1.0.0-beta.0**. Install from source today:
+## Install (source)
 
 ```bash
-pip install ./python                        # Python (reference)
-go get github.com/nerdapplabs/fasten-go    # Go — works today via module path
-npm install ./js                            # Node / TypeScript
+git clone https://github.com/nerdapplabs/fasten
+cd fasten
+
+pip install ./python                              # Python (reference)
+go get github.com/nerdapplabs/fasten-go          # Go
+npm install ./js                                  # Node / TypeScript
 # C++14: copy cpp/include/fasten.hpp — zero dependencies
-```
-
-Coming with v1.0.0-beta.0:
-
-```bash
-pip install fasten==1.0.0b0
-pip install 'fasten[tui]==1.0.0b0'         # + bundled live TUI
-npm install @nerdapplabs/fasten@1.0.0-beta.0
 ```
 
 ## Quickstart
 
+Verified to run as-is on Python 3.10+:
+
 ```python
+import os
+os.environ["FASTEN_AUDIT_DSN"] = "sqlite:///./fasten-audit.db"
+
 import fasten
 from fasten.codes import register, Meta, Severity, RetentionClass
+from fasten.context import with_request_id
 
-register("user", [
-    ("USER_CREATED", Meta(id="USER_CREATED", domain="user", category="account",
-                          action="create", severity=Severity.INFO,
-                          description="New user account created", emitter="auth-service",
-                          retention_class=RetentionClass.LONG)),
-])
+register("user", {
+    "USER_CREATED": Meta(
+        domain="user", category="account", action="create",
+        severity=Severity.INFO, description="New user account",
+        emitter="auth-service", retention_class=RetentionClass.LONG,
+    ),
+})
 
 fasten.init(service_id="auth-service", node_id="host-01")
 
-fasten.emit(code="USER_CREATED", target="u-42",
-           actor="admin", detail={"email": "alice@example.com"})
-fasten.log.info("signup_complete", user_id="u-42")
+with with_request_id():
+    fasten.emit(code="USER_CREATED", target="u-42",
+                actor="admin", detail={"email": "alice@example.com"})
+    fasten.log.info("signup_complete", user_id="u-42")
+
+fasten.flush()  # block until the audit row reaches fasten-audit.db
 ```
 
-Both lines share the same `request_id` on stdout. That's the join key.
+Both lines emit on stdout under the same `request_id` — that's the join
+key. The audit row is also persisted to `./fasten-audit.db`.
+
+In a real service the HTTP / MQTT / scheduler shim opens the
+`with_request_id()` context for you; the kernel pattern above is what
+the shims wrap.
 
 ---
 
@@ -68,24 +79,21 @@ Both lines share the same `request_id` on stdout. That's the join key.
 
 ---
 
-## Bundled tooling
+## Bundled CLI + TUI (Python)
 
-The Python reference SDK ships a CLI and a live TUI — both run against
-any fasten-mounted service (local SQLite, edge-manager, or fasten Cloud)
-via the standard `/api/v1/logs/{audit,sys,api}` reader.
+Installed as console scripts when you `pip install ./python`. Run against
+any fasten-mounted service via the standard `/api/v1/logs/{audit,sys,api}`
+reader.
 
-| Tool       | Invoke                          | What it does                                     |
-|------------|---------------------------------|--------------------------------------------------|
-| CLI        | `fasten dump`                    | Print registered codes (CI consistency gate)     |
-| CLI        | `fasten tail --stream sys`       | Stream rows from a mounted reader                |
-| CLI        | `fasten doctor`                  | Verify init config + correlation wiring          |
-| **TUI**    | `fasten tui --request-id <id>`   | Live multi-pane audit + sys + API feed (Rich)    |
+| Tool       | Invoke                            | What it does                                  |
+|------------|-----------------------------------|-----------------------------------------------|
+| CLI        | `fasten dump`                     | Print registered codes (CI consistency gate)  |
+| CLI        | `fasten tail --stream sys`        | Stream rows from a mounted reader             |
+| CLI        | `fasten doctor`                   | Verify init config + correlation wiring       |
+| TUI        | `fasten-tui --request-id <id>`    | Live multi-pane audit + sys + API feed (Rich) |
 
 The TUI is SSH-friendly — works on industrial Linux hosts where no GUI
-is permitted. Install with `pip install 'fasten[tui]'`. v0.1 polls; v0.2
-moves to Textual for non-blocking keystrokes (stream toggle, drill-down,
-filter prompt). For the paid hosted aggregator, see
-[`fasten-cloud`](https://github.com/nerdapplabs/fasten-cloud).
+is permitted.
 
 ---
 
@@ -95,31 +103,21 @@ filter prompt). For the paid hosted aggregator, see
 |------------|---------------------------|---------------------------------------------------|
 | Python     | reference                 | [`python/`](python/)                              |
 | Go         | usable                    | [`go/`](go/)                                      |
-| C++14      | single-header             | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)  |
-| Node.js    | beta                      | [`js/`](js/)                                      |
-| TypeScript | ships with JS             | [`js/src/index.d.ts`](js/src/index.d.ts)          |
+| Node.js / TypeScript | beta            | [`js/`](js/)                                      |
 | Rust       | beta                      | [`rust/`](rust/)                                  |
-| Java       | coming soon (placeholder) | [`java/`](java/)                                  |
+| C++14      | single-header             | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)|
+| Java       | placeholder               | [`java/`](java/)                                  |
 
----
-
-## Docs
-
-| Topic                    | Link                                              |
-|--------------------------|---------------------------------------------------|
-| Quickstart + output      | [fasten.sh/docs/#quickstart](https://fasten.sh/docs/#quickstart) |
-| Incident debugging       | [fasten.sh/docs/#incident](https://fasten.sh/docs/#incident) |
-| 7 anchors                | [fasten.sh/docs/#anchors](https://fasten.sh/docs/#anchors) |
-| Operational FAQ          | [fasten.sh/docs/#faq](https://fasten.sh/docs/#faq) |
-| Env-var reference        | [fasten.sh/docs/#envvars](https://fasten.sh/docs/#envvars) |
-| Retention + PII          | [fasten.sh/docs/#retention](https://fasten.sh/docs/#retention) |
-| Code evolution + compat  | [fasten.sh/docs/#evolution](https://fasten.sh/docs/#evolution) |
+Cross-language P1-15 (audit-store failure handling — the queue-mode
+default that keeps emit() off the request path) is shipped in Python;
+Go / JS / Rust / C++ ports are in progress. Until they land, those SDKs
+will surface store errors synchronously on emit().
 
 ---
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy and response SLA.
+See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy.
 
 ## Changelog
 
@@ -127,7 +125,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
-Pre-v1. Apache-2.0, open for contribution once P0-1 / P0-2 land.
+v1.0.0-beta. Apache-2.0, contributions welcome.
 
 ## License
 
