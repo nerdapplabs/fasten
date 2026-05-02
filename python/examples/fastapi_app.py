@@ -23,7 +23,8 @@ Run:
          -H 'content-type: application/json' \\
          -d '{"email":"alice@example.com"}'
     curl http://localhost:8000/users/u-42
-    curl http://localhost:8000/logs/audit
+    # Reader endpoints are gated; pass a Bearer token (default: demo-token):
+    curl -H 'authorization: Bearer demo-token' http://localhost:8000/logs/audit
 """
 from __future__ import annotations
 
@@ -34,7 +35,8 @@ from fasten.codes import register, Meta, Severity, RetentionClass
 from fasten.shim.http import RequestIDMiddleware, APILogger
 from fasten.reader import router as reader_router
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # ── Code catalog (register once at startup) ────────────────────────────────
 
@@ -57,10 +59,27 @@ register("user", {
 
 fasten.init()  # reads FASTEN_SERVICE_ID / FASTEN_NODE_ID / FASTEN_AUDIT_DSN
 
+# ── Auth on the reader router ──────────────────────────────────────────────
+# The reader endpoints (/logs/audit, /sys, /api, /audit/doctor) return audit
+# rows + tenant identity + queue stats. They MUST be gated. Adopters wire
+# whatever auth their app already runs (see docs §"Wire your existing auth").
+# Stub below: replace require_admin with your real auth dependency.
+_bearer = HTTPBearer(auto_error=False)
+def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
+    expected = os.environ.get("DEMO_READER_TOKEN", "demo-token")
+    if creds is None or creds.credentials != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="reader requires Bearer token; set DEMO_READER_TOKEN env",
+        )
+
 app = FastAPI(title="fasten demo")
 app.add_middleware(RequestIDMiddleware)                       # mints / honours X-Request-ID
 app.add_middleware(APILogger, skip={"/health", "/metrics"})   # one api-log row per req
-app.include_router(reader_router(), prefix="/logs")           # /logs/{audit,sys,api}
+app.include_router(
+    reader_router(dependencies=[Depends(require_admin)]),     # gated; honors docs guidance
+    prefix="/logs",
+)
 
 
 @app.post("/users")
