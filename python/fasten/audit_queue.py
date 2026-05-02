@@ -155,7 +155,7 @@ class _AuditQueueDrainer:
     def _free_permits(self) -> int:
         # threading.Semaphore exposes _value (CPython impl detail). Stable
         # across versions and cheaper than tracking a parallel counter.
-        return self._slots._value  # type: ignore[attr-defined]
+        return self._slots._value
 
     def _used_slots(self) -> int:
         return self._capacity - self._free_permits()

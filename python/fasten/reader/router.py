@@ -185,10 +185,10 @@ def router(
         transport_block = {
             "stdout_active": t is not None,
             "syslog_ring_depth": (
-                len(t._syslog._buf) if t is not None else 0  # type: ignore[attr-defined]
+                len(t._syslog._buf) if t is not None else 0
             ),
             "api_ring_depth": (
-                len(t._api._buf) if t is not None else 0  # type: ignore[attr-defined]
+                len(t._api._buf) if t is not None else 0
             ),
         }
 
