@@ -1,0 +1,97 @@
+# fasten — Python
+
+Audit + correlation SDK for Python services. v1.0.0-beta.
+
+## Install
+
+From source today (registry publish lands with the v1.0 GA tag):
+
+```bash
+pip install ./python                # core
+pip install ./python[fastapi]       # + ASGI router for /logs/* reader
+pip install ./python[postgres]      # + Postgres store
+```
+
+## Quickstart
+
+Verified to run as-is on Python 3.10+:
+
+```python
+import os
+os.environ["FASTEN_AUDIT_DSN"] = "sqlite:///./fasten-audit.db"
+
+import fasten
+from fasten.codes import register, Meta, Severity, RetentionClass
+from fasten.context import with_request_id
+
+register("user", {
+    "USER_CREATED": Meta(
+        domain="user", category="account", action="create",
+        severity=Severity.INFO, description="New user account",
+        emitter="auth-service", retention_class=RetentionClass.LONG,
+    ),
+})
+
+fasten.init(service_id="auth-service", node_id="host-01")
+
+with with_request_id():
+    fasten.emit(code="USER_CREATED", target="u-42",
+                actor="admin", detail={"email": "alice@example.com"})
+    fasten.log.info("signup_complete", user_id="u-42")
+
+fasten.flush()  # block until the audit row reaches the store
+```
+
+Both lines stream NDJSON to stdout under the same `request_id`. The audit
+row is also persisted to `./fasten-audit.db`.
+
+## Worked example — FastAPI service
+
+A minimal HTTP service with `X-Request-ID` propagation, an audit row per
+request, and the mountable `/logs/*` reader: see
+[`examples/fastapi_app.py`](examples/fastapi_app.py).
+
+```bash
+pip install ./python[fastapi] uvicorn
+FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=host-01 \
+  FASTEN_AUDIT_DSN=sqlite:///./demo-audit.db \
+  uvicorn examples.fastapi_app:app --port 8000
+
+curl -X POST http://localhost:8000/users -H 'content-type: application/json' \
+     -d '{"email":"alice@example.com"}'
+curl http://localhost:8000/logs/audit
+```
+
+## Bundled CLI + TUI
+
+Console scripts installed by `pip install`:
+
+| Tool        | Invoke                             | What it does                                  |
+|-------------|------------------------------------|-----------------------------------------------|
+| CLI         | `fasten dump`                      | Print registered codes (CI consistency gate)  |
+| CLI         | `fasten doctor`                    | Verify init config + correlation wiring       |
+| CLI         | `fasten tail --stream sys`         | Stream rows from a mounted reader             |
+| TUI         | `fasten-tui --request-id <id>`     | Live multi-pane audit + sys + API feed (Rich) |
+
+## P1-15: audit-store failure handling
+
+`fasten.emit()` defaults to **queue mode** — rows go onto a bounded
+in-memory queue, drained by a background thread with exponential
+backoff (100 ms → 60 s, ±20 % jitter). Store failures stay off the
+request path. See `audit_store_failure_strategy="raise"` to opt into
+synchronous-with-`AuditStoreError` semantics. `fasten.queue_stats()`
+and `fasten.flush()` complete the public surface.
+
+## Tests
+
+```bash
+docker run --rm -v $PWD/python:/work -w /work python:3.11 \
+  sh -c "pip install -e .[fastapi] && pip install pytest httpx pyyaml structlog && python -m pytest -q"
+```
+
+Current: 112 passed.
+
+## Docs + design
+
+Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/) ·
+Design + cross-language design: [README.md](../README.md).

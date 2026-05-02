@@ -14,7 +14,7 @@ Only the latest release receives security fixes. There is no LTS branch before v
 **Do not open a public GitHub issue for security vulnerabilities.**
 
 Report privately via [GitHub Security Advisories](https://github.com/nerdapplabs/fasten/security/advisories/new)
-or email **security@nerdapplabs.com**.
+or email **praveen.garg@nerdapplabs.com**.
 
 Include:
 - Description of the vulnerability and affected component

@@ -224,8 +224,14 @@ public final class Fasten {
         public Emit severity(Severity s) { this.severityOverride = s; return this; }
 
         public Row write() {
-            // TODO: lookup Meta, populate anchors from ctx/config, redact, insert
-            throw new UnsupportedOperationException("TODO");
+            throw new UnsupportedOperationException(
+                "fasten-java is a v1.0-beta placeholder — Emit.write() is not yet "
+                + "implemented. Use the Python, Go, JS, Rust, or C++ SDK in the "
+                + "meantime; their wire format is compatible (one shared "
+                + "spec/row-schema.json across all SDKs). Track progress + "
+                + "implementation milestones at "
+                + "https://github.com/nerdapplabs/fasten/issues."
+            );
         }
     }
 
