@@ -21,7 +21,7 @@ jobs:
         working-directory: cpp
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build deps
         # cmake + libyaml-cpp-dev (required by codes_yaml_smoke; pii smoke is dep-free).

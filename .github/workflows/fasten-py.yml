@@ -21,10 +21,10 @@ jobs:
         working-directory: python
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.0.0
+        uses: astral-sh/setup-uv@v8.1.0
 
       # `uv venv` creates a venv without pip, so pip-audit only scans
       # fasten's actual deps (zero) — no toolchain-CVE noise.
