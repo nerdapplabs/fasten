@@ -1,0 +1,31 @@
+name: Go SDK
+
+on:
+  push:
+    paths:
+      - 'go/**'
+      - '.github/workflows/fasten-go.yml'
+  pull_request:
+    paths:
+      - 'go/**'
+      - '.github/workflows/fasten-go.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22-alpine
+
+    defaults:
+      run:
+        working-directory: go
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        # -race requires CGO which is not available in golang:*-alpine (CGO_ENABLED=0)
+        run: go test -v ./...

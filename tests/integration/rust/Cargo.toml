@@ -1,0 +1,9 @@
+[package]
+name = "fasten-itest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fasten     = { path = "../../../rust" }
+serde_json = "1"

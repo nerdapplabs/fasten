@@ -1,0 +1,9 @@
+{
+  "name": "fasten-itest-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "fasten": "file:../../../js"
+  }
+}

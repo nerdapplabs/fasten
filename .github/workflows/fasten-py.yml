@@ -1,0 +1,49 @@
+name: Python SDK
+
+on:
+  push:
+    paths:
+      - 'python/**'
+      - '.github/workflows/fasten-py.yml'
+  pull_request:
+    paths:
+      - 'python/**'
+      - '.github/workflows/fasten-py.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.10-slim
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      # `uv venv` creates a venv without pip, so pip-audit only scans
+      # fasten's actual deps (zero) — no toolchain-CVE noise.
+      - name: Install dev dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Activate venv for subsequent steps
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Lint (ruff)
+        run: ruff check fasten/
+
+      - name: Type check (mypy)
+        run: mypy fasten/
+
+      - name: Unit tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Audit (pip-audit)
+        run: pip-audit

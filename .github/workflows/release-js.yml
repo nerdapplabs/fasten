@@ -1,0 +1,38 @@
+name: Release JS SDK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write  # required for npm --provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: node:24-alpine
+
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@nerdapplabs/fasten
+
+    defaults:
+      run:
+        working-directory: js
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure npm registry
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm (with provenance)
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

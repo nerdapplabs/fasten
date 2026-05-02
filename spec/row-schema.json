@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fasten.sh/spec/row-schema.json",
+  "title": "AuditRow",
+  "description": "Canonical fasten audit row (NDJSON stdout, shape=audit). This file is the single source of truth for enum vocabulary and redact rules — generated into all language adapters by spec/codegen.py.",
+  "type": "object",
+  "required": [
+    "id", "origin_id", "monotonic_seq", "timestamp",
+    "code", "action", "severity",
+    "service_id", "source_node_id",
+    "actor", "actor_kind",
+    "target", "category", "domain",
+    "method", "request_id", "detail"
+  ],
+  "properties": {
+    "shape":          { "type": "string", "const": "audit" },
+    "id":             { "type": "string", "description": "evt-<20 hex chars>" },
+    "origin_id":      { "type": "string", "description": "Dedup key for replication; equals id on first emission." },
+    "monotonic_seq":  { "type": "integer", "description": "Per-node counter; resolves same-ms ties." },
+    "timestamp":      { "type": "string", "format": "date-time", "description": "UTC ISO-8601 with ms precision." },
+    "code":           { "type": "string", "description": "SCREAMING_SNAKE registered code." },
+    "action":         { "type": "string", "description": "Denormalised from code.Meta." },
+    "severity": {
+      "type": "string",
+      "default": "info",
+      "description": "Ascending severity level.",
+      "enum": ["debug", "info", "warn", "error", "critical"],
+      "x-values": {
+        "debug":    "Low-level diagnostic, filtered in production",
+        "info":     "Normal operational event",
+        "warn":     "Potentially problematic, not yet an error",
+        "error":    "Operation failed, requires attention",
+        "critical": "Severe failure, may impact availability"
+      }
+    },
+    "service_id":     { "type": "string" },
+    "source_node_id": { "type": "string" },
+    "tenant_id":      { "type": ["string", "null"] },
+    "actor":          { "type": "string", "default": "system" },
+    "actor_kind": {
+      "type": "string",
+      "default": "service",
+      "description": "WHO anchor — who initiated the action.",
+      "enum": ["user", "service", "schedule", "agent"],
+      "x-values": {
+        "user":     "Human user (browser, mobile, CLI on behalf of a user)",
+        "service":  "Internal service or daemon",
+        "schedule": "Cron job or task scheduler",
+        "agent":    "AI agent"
+      }
+    },
+    "target":         { "type": "string" },
+    "category":       { "type": "string", "description": "Denormalised from code.Meta." },
+    "domain":         { "type": "string", "description": "Adopter-defined domain, e.g. node, user, billing." },
+    "method": {
+      "type": "string",
+      "default": "sdk",
+      "description": "HOW anchor — how the event was triggered.",
+      "enum": ["http", "mqtt", "cli", "scheduler", "ui", "agent_tool", "sdk"],
+      "x-values": {
+        "http":       "HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)",
+        "mqtt":       "MQTT message (IoT telemetry, device command)",
+        "cli":        "CLI command typed by a human",
+        "scheduler":  "Automated cron or task scheduler",
+        "ui":         "Web or desktop UI action, human-initiated",
+        "agent_tool": "AI agent tool call",
+        "sdk":        "Direct SDK call, no transport shim active. Default."
+      }
+    },
+    "request_id":     { "type": "string", "description": "12-char hex correlation id." },
+    "detail":         { "type": "object", "description": "Arbitrary key-value pairs; secret keys are redacted." },
+    "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "RetentionClass": {
+      "type": "string",
+      "default": "medium",
+      "description": "Row retention bucket — on Meta, not in the wire row itself.",
+      "enum": ["short", "medium", "long"],
+      "x-values": {
+        "short":  "Default 30 days",
+        "medium": "Default 180 days",
+        "long":   "Default 1095 days (3 years)"
+      }
+    }
+  },
+  "x-fasten-redact": {
+    "description": "PII/secret field keys scrubbed from Row.detail before persistence. Keys are preserved; only values are replaced.",
+    "replacement": "***",
+    "match": "case_insensitive_regex_on_keys",
+    "notes": [
+      "Patterns match field keys, not values.",
+      "[_-]? — separator is optional: api_key, api-key, apikey all match.",
+      "Adopters may add keys via init(extra_redact_keys=[...]) but never remove defaults."
+    ],
+    "patterns": [
+      "api[_-]?key",
+      "password",
+      "passwd",
+      "token",
+      "secret",
+      "authorization",
+      "bearer",
+      "m2m[_-]?key",
+      "cert[_-]?private",
+      "private[_-]?key",
+      "access_key",
+      "session_id",
+      "cookie",
+      "credential",
+      "auth"
+    ]
+  }
+}

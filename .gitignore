@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# Rust
+rust/target/
+rust/Cargo.lock
+
+# Node
+node_modules/
+.npm/
+*.log
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local state
+*.db
+*.db-journal
+.env
+.env.local
+
+# Website
+website/dist/

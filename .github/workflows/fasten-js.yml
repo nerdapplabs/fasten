@@ -1,0 +1,32 @@
+name: JS SDK
+
+on:
+  push:
+    paths:
+      - 'js/**'
+      - '.github/workflows/fasten-js.yml'
+  pull_request:
+    paths:
+      - 'js/**'
+      - '.github/workflows/fasten-js.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: node:24-alpine
+
+    defaults:
+      run:
+        working-directory: js
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dev deps
+        # js-yaml is an optional peerDep / devDep — required by codes_yaml tests.
+        run: npm install --no-audit --no-fund
+
+      - name: Unit tests
+        # node --test with no path auto-discovers **/*.test.mjs in cwd
+        run: node --test
