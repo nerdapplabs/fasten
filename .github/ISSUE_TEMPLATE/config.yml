@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/nerdapplabs/fasten/security/advisories/new
+    about: |
+      Do NOT open a public issue. Use GitHub Security Advisories
+      (private) or email praveen.garg@nerdapplabs.com per SECURITY.md.
