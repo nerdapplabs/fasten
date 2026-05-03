@@ -17,9 +17,7 @@ fn main() {
                 description: "New user account created".into(),
                 emitter: "auth-service".into(),
                 retention_class: RetentionClass::Long,
-                high_volume: false,
-                pii_in_detail: false,
-                declared_unused: false,
+                ..Default::default()
             },
         )],
     )
@@ -30,6 +28,7 @@ fn main() {
         node_id: "host-itest".into(),
         tenant_id: None,
         extra_redact_keys: None,
+        ..Default::default()
     })
     .expect("init");
 

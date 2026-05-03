@@ -18,7 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Race detector requires CGO; alpine ships no gcc and CGO_ENABLED=0
+      # by default, so `go test -race` failed every tag push before this.
+      # Pull build-base + flip CGO on so the release smoke actually
+      # exercises race detection. (Regular CI in fasten-go.yml runs
+      # without -race for speed; release uses it as the publish gate.)
+      - name: Install build toolchain (for CGO -race)
+        run: apk add --no-cache build-base
       - name: Vet and test
+        env:
+          CGO_ENABLED: "1"
         run: |
           go vet ./...
           go test -v -race ./...
