@@ -1,5 +1,8 @@
 # Rust integration smoke. Build context = fasten repo root.
-FROM rust:1.82-slim AS build
+# Bumped to 1.85 to match rust/Cargo.toml's `rust-version = "1.85"`;
+# 1.82 (the prior pin) refused to compile the SDK after the Cargo.toml
+# bump, leaving the Rust integration smoke dead in CI.
+FROM rust:1.85-slim AS build
 
 WORKDIR /workspace
 
