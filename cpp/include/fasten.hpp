@@ -422,13 +422,29 @@ class AuditQueueDrainer {
     AuditQueueDrainer& operator=(const AuditQueueDrainer&) = delete;
 
     void put(Row row) {
+        // Drainer-swap race: install_drainer_ may have stopped this
+        // drainer between emit()'s shared_ptr snapshot and our entry.
+        // Surface abandoned rows on the sys stream instead of dropping
+        // silently into a queue whose worker thread has already exited.
+        if (stop_.load()) {
+            sys_log_("error", "audit_drain_abandoned",
+                     {{"reason", "drainer_stopped"}, {"row_id", row.id}});
+            return;
+        }
         // Acquire a slot — blocks if all capacity slots are taken
         // (queued + in-flight retry combined). Released only on
         // successful sink invocation or shutdown abandon.
         {
             std::unique_lock<std::mutex> lk(slot_mu_);
             slot_cv_.wait(lk, [this] { return slots_free_ > 0 || stop_.load(); });
-            if (stop_.load()) return;  // best-effort: drop on shutdown
+            if (stop_.load()) {
+                // Stop fired while we waited for a slot. Same
+                // abandon path — never leave the row on the floor.
+                sys_log_("error", "audit_drain_abandoned",
+                         {{"reason", "drainer_stopped_mid_put"},
+                          {"row_id", row.id}});
+                return;
+            }
             --slots_free_;
         }
         {
@@ -1059,30 +1075,42 @@ inline void drainer_sys_log(const std::string& level,
 
 inline void install_drainer_(const Config& cfg) {
     auto& g = detail_::globals();
-    std::lock_guard<std::mutex> lk(g.drainer_mu);
-    // Tear down the prior drainer so re-init under load doesn't leak
-    // a thread.
-    if (g.drainer) {
-        g.drainer->flush(std::chrono::seconds(5));
-        g.drainer->shutdown(std::chrono::seconds(2));
-        g.drainer.reset();
+    // Race-safe re-init: build the new drainer first, swap the global
+    // under lock, then flush + shutdown the old OUTSIDE the lock.
+    // Holding drainer_mu through a 5 s flush + 2 s shutdown would
+    // block every concurrent emit() on the request path.
+    //
+    // Concurrent emit() that snapshotted the old drainer before the
+    // swap and lands a put() after we shutdown self-aborts via the
+    // put() stop check (audit_drain_abandoned sys event) — no silent
+    // loss into a dead queue.
+    std::shared_ptr<detail_::AuditQueueDrainer> next;
+    if (g.failure_strategy == "queue") {
+        std::function<void(const Row&)> sink_copy;
+        {
+            std::lock_guard<std::mutex> sk(g.sink_mu);
+            sink_copy = g.audit_sink;
+        }
+        if (sink_copy) {
+            next = std::make_shared<detail_::AuditQueueDrainer>(
+                std::move(sink_copy),
+                detail_::drainer_sys_log,
+                cfg.queue_capacity,
+                std::chrono::milliseconds(cfg.queue_retry_initial_ms),
+                std::chrono::milliseconds(cfg.queue_retry_max_ms),
+                !cfg.disable_queue_jitter);
+        }
     }
-    if (g.failure_strategy != "queue") return;
-    // Snapshot the currently registered sink — adopters who call
-    // set_audit_sink() AFTER init() should re-init() to swap drainers.
-    std::function<void(const Row&)> sink_copy;
+    std::shared_ptr<detail_::AuditQueueDrainer> old;
     {
-        std::lock_guard<std::mutex> sk(g.sink_mu);
-        sink_copy = g.audit_sink;
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        old = g.drainer;
+        g.drainer = next;
     }
-    if (!sink_copy) return;  // no sink to drain into
-    g.drainer = std::make_shared<detail_::AuditQueueDrainer>(
-        std::move(sink_copy),
-        detail_::drainer_sys_log,
-        cfg.queue_capacity,
-        std::chrono::milliseconds(cfg.queue_retry_initial_ms),
-        std::chrono::milliseconds(cfg.queue_retry_max_ms),
-        !cfg.disable_queue_jitter);
+    if (old) {
+        old->flush(std::chrono::seconds(5));
+        old->shutdown(std::chrono::seconds(2));
+    }
 }
 
 // Snapshot of the active drainer, or nullptr in raise mode (no
@@ -1112,10 +1140,18 @@ inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(
 // before exiting; init() also calls this internally to swap drainers.
 inline void uninstall_drainer() {
     auto& g = detail_::globals();
-    std::lock_guard<std::mutex> lk(g.drainer_mu);
-    if (g.drainer) {
-        g.drainer->shutdown(std::chrono::seconds(2));
+    // Symmetric with install_drainer_: clear the global FIRST under
+    // the mutex so any new emit() sees no drainer and falls through
+    // to its sync path, instead of racing against a half-shutdown
+    // drainer. Then shut down the old one outside the lock.
+    std::shared_ptr<detail_::AuditQueueDrainer> old;
+    {
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        old = g.drainer;
         g.drainer.reset();
+    }
+    if (old) {
+        old->shutdown(std::chrono::seconds(2));
     }
 }
 

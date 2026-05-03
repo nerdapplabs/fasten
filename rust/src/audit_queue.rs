@@ -156,11 +156,41 @@ impl Drainer {
     }
 
     pub(crate) fn put(&self, row: Row) {
+        // Reject early if the drainer has already been signalled to
+        // stop (re-init swap or shutdown). Without this, shutdown's
+        // release_all() wakes blocked acquirers after stop is set —
+        // they push onto a queue the drainer thread will never drain.
+        if self.inner.stop.load(Ordering::SeqCst) {
+            (self.inner.sys_log)(
+                "error",
+                "audit_drain_abandoned",
+                &serde_json::json!({
+                    "reason": "drainer_stopped",
+                    "row_id": row.id,
+                }),
+            );
+            return;
+        }
         // Acquire slot — blocks until capacity frees. The drainer
         // releases the permit only on successful insert (or shutdown
         // abandon), so submit() blocks while a row is in retry-backoff —
         // capacity covers queued + in-flight retry combined.
         self.inner.slots.acquire();
+        // Re-check after acquire: shutdown may have run release_all()
+        // between our stop-check above and now. Release the slot back
+        // and abandon the row instead of stalling on a dead drainer.
+        if self.inner.stop.load(Ordering::SeqCst) {
+            self.inner.slots.release();
+            (self.inner.sys_log)(
+                "error",
+                "audit_drain_abandoned",
+                &serde_json::json!({
+                    "reason": "drainer_stopped_mid_put",
+                    "row_id": row.id,
+                }),
+            );
+            return;
+        }
         {
             let mut q = self.inner.queue.lock().unwrap();
             q.push_back(row);
@@ -476,12 +506,14 @@ pub(crate) fn install_drainer(
     retry_max: Duration,
     retry_jitter: bool,
 ) -> Arc<Drainer> {
-    let mut slot = drainer_slot().lock().unwrap();
-    if let Some(old) = slot.take() {
-        old.flush(Duration::from_secs(5));
-        old.shutdown(Duration::from_secs(2));
-    }
-    let d = Drainer::new(
+    // Race-safe re-init: build the new drainer FIRST, swap the global
+    // pointer atomically, then flush + shutdown the old one OUTSIDE the
+    // global lock. Concurrent submit()s see either the old drainer (and
+    // any post-stop put() now self-aborts via the stop check) or the
+    // new one — never a stopped-but-still-published one. Holding the
+    // lock through flush/shutdown (the prior shape) blocked every
+    // emit() for ~5 s during re-init.
+    let new = Drainer::new(
         store,
         sys_log,
         capacity,
@@ -489,16 +521,29 @@ pub(crate) fn install_drainer(
         retry_max,
         retry_jitter,
     );
-    *slot = Some(d.clone());
-    d
+    let old = {
+        let mut slot = drainer_slot().lock().unwrap();
+        slot.replace(new.clone())
+    };
+    if let Some(old) = old {
+        old.flush(Duration::from_secs(5));
+        old.shutdown(Duration::from_secs(2));
+    }
+    new
 }
 
 /// Stop and drop the active drainer. Called automatically on next
 /// `init()`; exposed for tests + adopter shutdown paths that want to
 /// drop the drainer without reinitialising fasten.
 pub fn uninstall_drainer() {
-    let mut slot = drainer_slot().lock().unwrap();
-    if let Some(d) = slot.take() {
+    // Symmetric with install_drainer: clear the global FIRST so
+    // concurrent submit() sees no drainer (and falls back to sync /
+    // raise per failure_strategy) instead of racing a half-stopped one.
+    let old = {
+        let mut slot = drainer_slot().lock().unwrap();
+        slot.take()
+    };
+    if let Some(d) = old {
         d.shutdown(Duration::from_secs(2));
     }
 }

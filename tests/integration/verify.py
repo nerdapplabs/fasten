@@ -34,7 +34,7 @@ import sys
 from typing import Any
 
 REQUIRED_AUDIT_FIELDS = {
-    "shape", "id", "monotonic_seq", "timestamp",
+    "shape", "id", "origin_id", "monotonic_seq", "timestamp",
     "code", "action", "severity",
     "service_id", "source_node_id",
     "actor", "actor_kind", "target", "category", "domain",
@@ -43,7 +43,11 @@ REQUIRED_AUDIT_FIELDS = {
 REQUIRED_SYS_FIELDS = {"shape", "level", "event", "request_id", "timestamp"}
 REQUIRED_API_FIELDS = {"shape", "method", "path", "status", "request_id", "timestamp"}
 
-ID_RE = re.compile(r"^evt-[0-9a-f]{16,32}$")
+# Spec says exactly 20 hex chars (spec/row-schema.json id pattern). Earlier
+# the gate accepted 16-32 to be lenient — that masked any SDK silently
+# emitting a different length, which would break dedup keyed on id length
+# downstream. Tightened to spec.
+ID_RE = re.compile(r"^evt-[0-9a-f]{20}$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 

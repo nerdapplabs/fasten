@@ -60,6 +60,18 @@ class AuditQueueDrainer {
     }
 
     put(row) {
+        // Reject early if the drainer has been stopped (re-init swap or
+        // uninstall). Without this the row would land in a queue whose
+        // tick loop has already exited, get GC'd later, no signal —
+        // a silent data-loss bug. emit() callers see the row as
+        // abandoned via the sys stream instead.
+        if (this._stopped) {
+            this._sysLog('error', 'audit_drain_abandoned', {
+                reason: 'drainer_stopped',
+                row_id: row?.id ?? null,
+            });
+            return;
+        }
         this._q.push(row);
         const used = this._q.length + this._inFlight;
         if (used > this._highWater) this._highWater = used;
@@ -208,23 +220,31 @@ export function installDrainer({
     store, sysLog, capacity = 100,
     retryInitialMs = 100, retryMaxMs = 60_000, retryJitter = true,
 }) {
-    if (_drainer) {
-        // Best-effort flush before swap so re-init doesn't lose rows.
-        const old = _drainer;
-        _drainer = null;
-        old.flush(5000).then(() => old.stop());
-    }
-    _drainer = new AuditQueueDrainer({
+    // Race-safe re-init: build new first, swap atomically, then flush +
+    // stop the old asynchronously. Concurrent emit() that grabbed the
+    // old drainer reference before swap and lands a put() after the old
+    // is stopped self-aborts via the put() stop check (audit_drain_
+    // abandoned sys event) — no silent loss into a dead queue.
+    const next = new AuditQueueDrainer({
         store, sysLog, capacity,
         retryInitialMs, retryMaxMs, retryJitter,
     });
-    return _drainer;
+    const old = _drainer;
+    _drainer = next;
+    if (old) {
+        old.flush(5000).then(() => old.stop());
+    }
+    return next;
 }
 
 export function uninstallDrainer() {
-    if (_drainer) {
-        _drainer.stop();
-        _drainer = null;
+    // Symmetric with installDrainer: clear the global FIRST so any new
+    // emit() sees no drainer and falls through to its sync path,
+    // instead of racing against a half-stopped drainer.
+    const old = _drainer;
+    _drainer = null;
+    if (old) {
+        old.stop();
     }
 }
 

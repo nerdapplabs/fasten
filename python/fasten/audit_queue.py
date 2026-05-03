@@ -116,7 +116,19 @@ class _AuditQueueDrainer:
 
     def put(self, row: Any) -> None:
         """Push a row onto the queue. Blocks if all capacity slots are taken
-        (queued + in-flight retry combined)."""
+        (queued + in-flight retry combined). If the drainer has been
+        signalled to stop (re-init swap or shutdown), emit
+        ``audit_drain_abandoned`` and return without enqueueing — the
+        row would otherwise stall on a semaphore the drainer will
+        never service."""
+        if self._stop.is_set():
+            self._sys_log(
+                "error",
+                "audit_drain_abandoned",
+                {"reason": "drainer_stopped",
+                 "row_id": getattr(row, "id", None)},
+            )
+            return
         # Block until a slot frees up. The drainer releases the permit only
         # on successful insert (or shutdown abandon), so emit() blocks while
         # an in-flight row is in retry-backoff — capacity really means
@@ -347,6 +359,9 @@ _drainer: Optional[_AuditQueueDrainer] = None
 _atexit_registered = False
 
 
+_install_lock = threading.Lock()
+
+
 def install(
     *,
     store: Any,
@@ -358,15 +373,16 @@ def install(
 ) -> _AuditQueueDrainer:
     """Replace the active drainer (called from ``init()``).
 
-    Flushes pending rows from the old drainer before stopping it so
-    re-init under load doesn't lose audit rows. Tests + adopters
-    reconfiguring at runtime get the durability guarantee they expect.
+    Race-safe re-init: the new drainer is built and the global pointer
+    swapped under a lock BEFORE the old drainer is flushed and stopped.
+    Concurrent ``emit()`` calls during re-init see either the old or the
+    new drainer — never a stopped-but-still-published one. The old
+    drainer is flushed (so pending rows reach the store) then stopped;
+    if a stale ``put()`` lands on it after stop, it emits
+    ``audit_drain_abandoned`` instead of stalling on the slot semaphore.
     """
     global _drainer, _atexit_registered
-    if _drainer is not None:
-        _drainer.flush(timeout=5.0)
-        _drainer.stop(timeout=2.0)
-    _drainer = _AuditQueueDrainer(
+    new_drainer = _AuditQueueDrainer(
         store=store,
         sys_log=sys_log,
         capacity=capacity,
@@ -374,18 +390,31 @@ def install(
         retry_max_ms=retry_max_ms,
         retry_jitter=retry_jitter,
     )
+    with _install_lock:
+        old = _drainer
+        _drainer = new_drainer
+    if old is not None:
+        old.flush(timeout=5.0)
+        old.stop(timeout=2.0)
     if not _atexit_registered:
         atexit.register(_atexit_flush)
         _atexit_registered = True
-    return _drainer
+    return new_drainer
 
 
 def uninstall() -> None:
-    """Stop the active drainer and clear it (test helper)."""
+    """Stop the active drainer and clear it (test helper).
+
+    Symmetric with ``install``: clear the global pointer BEFORE
+    stopping, so concurrent ``emit()`` sees no drainer (and falls back
+    to the sync path) rather than racing against a half-stopped one.
+    """
     global _drainer
-    if _drainer is not None:
-        _drainer.stop(timeout=2.0)
+    with _install_lock:
+        old = _drainer
         _drainer = None
+    if old is not None:
+        old.stop(timeout=2.0)
 
 
 def active() -> Optional[_AuditQueueDrainer]:
