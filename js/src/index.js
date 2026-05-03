@@ -73,7 +73,6 @@ export const REDACT_PATTERNS = [
   'session_id',
   'cookie',
   'credential',
-  'auth',
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 

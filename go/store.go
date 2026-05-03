@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 )
 
@@ -30,10 +31,28 @@ type SQLiteStore struct {
 	table string
 }
 
+// validIdentifierRe gates tableName against SQL injection. Every Insert /
+// Query / migrate string-substitutes `s.table` into the SQL via fmt.Sprintf
+// (parameterized identifiers aren't supported by SQLite's API), so a
+// hostile or accidentally-attacker-controlled table name would punch
+// through. Multi-tenant adopters who derive a suffix from a JWT claim
+// or env var without their own validation are the realistic blast radius.
+var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
+// tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
+// other value is rejected to prevent SQL injection — see store.go regex
+// note above.
 func NewSQLiteStore(db *sql.DB, tableName string) (*SQLiteStore, error) {
 	if tableName == "" {
 		tableName = "fasten_audit"
+	}
+	if !validIdentifierRe.MatchString(tableName) {
+		return nil, fmt.Errorf(
+			"fasten SQLiteStore: tableName %q is not a valid SQL identifier "+
+				"(must match %s) — table names are string-substituted into SQL "+
+				"because SQLite's API does not parameterize identifiers",
+			tableName, validIdentifierRe.String())
 	}
 	s := &SQLiteStore{db: db, table: tableName}
 	if err := s.migrate(); err != nil {

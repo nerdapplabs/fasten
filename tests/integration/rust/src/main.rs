@@ -40,6 +40,8 @@ fn main() {
     let mut detail: HashMap<String, serde_json::Value> = HashMap::new();
     detail.insert("email".into(), serde_json::json!("alice@acme.com"));
     detail.insert("api_key".into(), serde_json::json!("sk-secret-abc"));
+    // substring match on 'token' — guards against anchored-regex regressions.
+    detail.insert("customer_token".into(), serde_json::json!("tok-substring-test"));
     detail.insert(
         "nested".into(),
         serde_json::json!({"token": "xyz", "preserved": "ok"}),

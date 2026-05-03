@@ -105,6 +105,12 @@ def main() -> None:
         fail("audit.detail.email lost or mutated", detail)
     if detail.get("api_key") != "***":
         fail("audit.detail.api_key was NOT redacted", detail)
+    # Substring match — `customer_token` should redact because `token` matches.
+    # Guards against the C++ anchored-regex regression (REVIEW.md item #1):
+    # Python / JS use `re.search` semantics, so customer_token / user_password /
+    # auth_header_value should all redact in every SDK.
+    if detail.get("customer_token") != "***":
+        fail("audit.detail.customer_token was NOT redacted (substring on 'token')", detail)
     # Nested redaction is checked only where the SDK supports nested detail
     # values (Python / JS / Rust / Go). C++ uses flat Fields and does not
     # carry a 'nested' key — skip silently if absent.

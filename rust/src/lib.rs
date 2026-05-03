@@ -87,7 +87,6 @@ pub const REDACT_PATTERNS: &[&str] = &[
     "session_id",
     "cookie",
     "credential",
-    "auth",
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 

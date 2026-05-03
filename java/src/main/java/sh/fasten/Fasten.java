@@ -88,7 +88,6 @@ public final class Fasten {
         "session_id",
         "cookie",
         "credential",
-        "auth",
     };
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 

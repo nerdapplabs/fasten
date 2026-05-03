@@ -117,7 +117,6 @@ inline const std::vector<std::string>& redact_patterns() {
         "session_id",
         "cookie",
         "credential",
-        "auth",
     };
     return kPatterns;
 }
@@ -288,11 +287,16 @@ inline std::string mint_id_bytes(size_t bytes) {
 // Build combined regex from a list of pattern alternations.
 inline std::string join_patterns(const std::vector<std::string>& v,
                                   const std::vector<std::string>& extra = {}) {
-    std::string out = "^(";
+    // No `^...$` anchors — Python / JS use `re.search` semantics
+    // (substring match on the key), so `customer_token`, `user_password`,
+    // `auth_header_value` all redact in those SDKs. Anchoring the C++
+    // regex would silently leak the same fields. Adopters who genuinely
+    // want whole-key match can pass anchored patterns via extra_redact_keys.
+    std::string out = "(";
     bool first = true;
     for (auto& p : v) { if (!first) out += "|"; out += p; first = false; }
     for (auto& p : extra) { out += "|"; out += p; }
-    out += ")$";
+    out += ")";
     return out;
 }
 

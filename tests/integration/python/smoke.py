@@ -31,6 +31,7 @@ fasten.emit(
     detail={
         "email": "alice@acme.com",
         "api_key": "sk-secret-abc",
+        "customer_token": "tok-substring-test",  # substring match on 'token'
         "nested": {"token": "xyz", "preserved": "ok"},
     },
 )

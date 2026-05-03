@@ -26,6 +26,7 @@ int main() {
         fasten::detail({
             {"email", "alice@acme.com"},
             {"api_key", "sk-secret-abc"},
+            {"customer_token", "tok-substring-test"},  // substring match on 'token'
         }));
 
     return 0;

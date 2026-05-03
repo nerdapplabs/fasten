@@ -37,9 +37,10 @@ func main() {
 		fasten.Target("u-42"),
 		fasten.Actor("admin", "user"),
 		fasten.WithDetail(map[string]any{
-			"email":   "alice@acme.com",
-			"api_key": "sk-secret-abc",
-			"nested":  map[string]any{"token": "xyz", "preserved": "ok"},
+			"email":          "alice@acme.com",
+			"api_key":        "sk-secret-abc",
+			"customer_token": "tok-substring-test", // substring match on 'token'
+			"nested":         map[string]any{"token": "xyz", "preserved": "ok"},
 		}),
 	); err != nil {
 		log.Fatal(err)

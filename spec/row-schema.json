@@ -108,8 +108,7 @@
       "access_key",
       "session_id",
       "cookie",
-      "credential",
-      "auth"
+      "credential"
     ]
   }
 }
