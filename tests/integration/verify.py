@@ -43,10 +43,21 @@ REQUIRED_AUDIT_FIELDS = {
 REQUIRED_SYS_FIELDS = {"shape", "level", "event", "request_id", "timestamp"}
 REQUIRED_API_FIELDS = {"shape", "method", "path", "status", "request_id", "timestamp"}
 
-# Spec says exactly 20 hex chars (spec/row-schema.json id pattern). Earlier
-# the gate accepted 16-32 to be lenient — that masked any SDK silently
-# emitting a different length, which would break dedup keyed on id length
-# downstream. Tightened to spec.
+# Two distinct correlation surfaces — different fields, different formats:
+#
+#   ID_RE      — audit.id and audit.origin_id. Per-event unique ID, format
+#                "evt-<20 hex>". 80 bits of entropy; the dedup key when rows
+#                replicate across nodes. Earlier the gate accepted 16-32 hex
+#                to be lenient — that masked any SDK silently emitting a
+#                different length, which would break dedup downstream.
+#                Tightened to the spec (spec/row-schema.json properties.id
+#                .pattern).
+#   REQ_ID_RE  — request_id on EVERY shape (audit / sys / api). Per-request
+#                correlation ID, 12 hex chars (no prefix). Same value across
+#                all 3 streams for one request, so adopters can `grep $rid`
+#                and pull the full request story out of mixed log streams.
+#                Shorter than ID_RE on purpose: stays readable inline in
+#                log lines.
 ID_RE = re.compile(r"^evt-[0-9a-f]{20}$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 

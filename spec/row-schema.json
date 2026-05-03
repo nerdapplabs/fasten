@@ -67,7 +67,7 @@
         "sdk":        "Direct SDK call, no transport shim active. Default."
       }
     },
-    "request_id":     { "type": "string", "description": "12-char hex correlation id." },
+    "request_id":     { "type": "string", "pattern": "^[0-9a-f]{12}$", "description": "12-char hex correlation id." },
     "detail":         { "type": "object", "description": "Arbitrary key-value pairs; secret keys are redacted." },
     "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." }
   },

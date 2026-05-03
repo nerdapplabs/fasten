@@ -47,7 +47,7 @@ def init(
     audit_store: Any = None,
     api_store: Any = None,
     extra_redact_keys: Optional[list[str]] = None,
-    redact_replacement: str = "***",
+    redact_replacement: Optional[str] = None,
     audit_store_failure_strategy: str = "queue",
     queue_capacity: int = 100,
     queue_retry_initial_ms: int = 100,
@@ -131,6 +131,10 @@ def init(
         os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
         if os.environ.get("FASTEN_REDACT_KEYS") else None
     )
+    # Param default is None (not "***") so the env var is honoured when
+    # init() is called with no kwargs. The earlier truthy default
+    # short-circuited the `or` and silently ignored
+    # FASTEN_REDACT_REPLACEMENT for every adopter using env-only config.
     replacement = redact_replacement or os.environ.get("FASTEN_REDACT_REPLACEMENT", "***")
     _redactor = Redactor(
         extra_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
