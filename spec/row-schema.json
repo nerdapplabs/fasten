@@ -14,8 +14,8 @@
   ],
   "properties": {
     "shape":          { "type": "string", "const": "audit" },
-    "id":             { "type": "string", "description": "evt-<20 hex chars>" },
-    "origin_id":      { "type": "string", "description": "Dedup key for replication; equals id on first emission." },
+    "id":             { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "evt-<20 hex chars>" },
+    "origin_id":      { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "Dedup key for replication; equals id on first emission." },
     "monotonic_seq":  { "type": "integer", "description": "Per-node counter; resolves same-ms ties." },
     "timestamp":      { "type": "string", "format": "date-time", "description": "UTC ISO-8601 with ms precision." },
     "code":           { "type": "string", "description": "SCREAMING_SNAKE registered code." },
