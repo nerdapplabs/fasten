@@ -58,3 +58,33 @@ def test_custom_replacement():
 def test_apikey_no_separator(r):
     assert r.redact({"apikey": "x"})["apikey"] == "***"
     assert r.redact({"api-key": "x"})["api-key"] == "***"
+
+
+def test_init_honours_env_replacement(monkeypatch, mem_store):
+    """FASTEN_REDACT_REPLACEMENT applied when init() is called env-only.
+
+    Regression: the prior signature defaulted ``redact_replacement="***"``
+    so the truthy default short-circuited the env-var read. Adopters
+    setting only the env var saw "***" with no signal that the override
+    was ignored.
+    """
+    monkeypatch.setenv("FASTEN_SERVICE_ID", "svc")
+    monkeypatch.setenv("FASTEN_NODE_ID", "node")
+    monkeypatch.setenv("FASTEN_REDACT_REPLACEMENT", "<HIDDEN>")
+    import fasten
+    fasten.init(audit_store=mem_store, audit_store_failure_strategy="raise")
+    assert fasten.redactor().redact({"password": "x"}) == {"password": "<HIDDEN>"}
+
+
+def test_init_explicit_replacement_overrides_env(monkeypatch, mem_store):
+    """Explicit kwarg wins over env var (standard precedence)."""
+    monkeypatch.setenv("FASTEN_SERVICE_ID", "svc")
+    monkeypatch.setenv("FASTEN_NODE_ID", "node")
+    monkeypatch.setenv("FASTEN_REDACT_REPLACEMENT", "<env>")
+    import fasten
+    fasten.init(
+        audit_store=mem_store,
+        audit_store_failure_strategy="raise",
+        redact_replacement="<kwarg>",
+    )
+    assert fasten.redactor().redact({"password": "x"}) == {"password": "<kwarg>"}

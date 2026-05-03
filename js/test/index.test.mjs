@@ -167,6 +167,27 @@ describe('emit', () => {
         assert.equal(row.method, 'sdk');
     });
 
+    test('row keys are snake_case (matches src/index.d.ts and wire spec)', () => {
+        // Regression guard: TS adopters were reading camelCase fields
+        // (row.serviceId etc.) that always returned undefined because
+        // the runtime emits snake_case. The .d.ts now declares snake
+        // _case to match — this test catches any future drift back.
+        initTestSDK();
+        const row = emit({ code: 'USER_CREATED', target: 'u-42' });
+        const camelKeys = ['serviceId', 'sourceNodeId', 'requestId',
+                           'monotonicSeq', 'actorKind', 'tenantId',
+                           'piiInDetail', 'shippedAt', 'edgeRowId',
+                           'originId'];
+        for (const k of camelKeys) {
+            assert.ok(!(k in row), `row leaked camelCase key '${k}'`);
+        }
+        const requiredSnake = ['service_id', 'source_node_id', 'request_id',
+                               'monotonic_seq', 'actor_kind', 'origin_id'];
+        for (const k of requiredSnake) {
+            assert.ok(k in row, `row missing snake_case key '${k}'`);
+        }
+    });
+
     test('severity override', () => {
         initTestSDK();
         const row = emit({ code: 'USER_CREATED', target: 'u-1', severity: 'warn' });

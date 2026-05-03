@@ -1,15 +1,27 @@
 /**
  * fasten — TypeScript types for the Node.js package.
- * Same shape as Python / Go / Rust / Java references.
+ *
+ * The Row interface uses **snake_case** to match the wire format
+ * defined in spec/row-schema.json (the same shape Python / Go / Rust /
+ * C++ emit). The earlier camelCase declarations contradicted the
+ * runtime: TS adopters reading `row.serviceId` got `undefined` because
+ * the runtime emits `service_id`. The call-site API surface (init,
+ * emit input) stays camelCase because that is what the JS runtime
+ * actually accepts.
  */
 
 // --- Enums ---------------------------------------------------------------
 
-export type Domain = 'node' | 'sync' | 'fleet' | 'agent';
+// Domain is adopter-defined per spec/row-schema.json (e.g. node, user,
+// billing). It is intentionally NOT a closed enum — declaring it as
+// one would silently fail TS adopters whose domain string is valid at
+// runtime but not in the type.
+export type Domain = string;
+
 export type Severity = 'debug' | 'info' | 'warn' | 'error' | 'critical';
 export type RetentionClass = 'short' | 'medium' | 'long';
-export type Method = 'http' | 'mqtt' | 'cli' | 'scheduler' | 'ui' | 'agent_tool';
-export type ActorKind = 'user' | 'service' | 'schedule' | 'agent' | 'system';
+export type Method = 'http' | 'mqtt' | 'cli' | 'scheduler' | 'ui' | 'agent_tool' | 'sdk';
+export type ActorKind = 'user' | 'service' | 'schedule' | 'agent';
 
 // --- Catalog -------------------------------------------------------------
 
@@ -38,27 +50,30 @@ export function dump(): string;
 
 // --- Row -----------------------------------------------------------------
 
+// Wire row — snake_case, matches spec/row-schema.json. Emitted as the
+// `audit` shape on stdout; callers reading rows back from stdout NDJSON
+// or from a store get this exact shape.
 export interface Row {
-    id: string;
-    edgeRowId: string;
-    monotonicSeq: number;
-    timestamp: string;       // ISO-8601 UTC
+    id: string;                                  // evt-<20 hex chars>
+    origin_id: string;                           // dedup key for replication
+    monotonic_seq: number;
+    timestamp: string;                           // ISO-8601 UTC
     code: string;
     action: string;
     severity: Severity;
-    serviceId: string;
-    sourceNodeId: string;
-    siteId?: string | null;
+    service_id: string;
+    source_node_id: string;
+    tenant_id: string | null;
     actor: string;
-    actorKind: ActorKind;
+    actor_kind: ActorKind;
     target: string;
     category: string;
     domain: Domain;
     method: Method;
-    requestId: string;
+    request_id: string;                          // 12-char hex
     detail: Record<string, unknown>;
-    piiInDetail?: boolean;
-    shippedAt?: string | null;
+    pii_in_detail?: boolean;
+    shipped_at?: string | null;
 }
 
 // --- Correlation ---------------------------------------------------------
@@ -72,10 +87,16 @@ export function withRequestID<T>(requestId: string, fn: () => T | Promise<T>): T
 export interface InitOptions {
     serviceId?: string;
     nodeId?: string;
-    siteId?: string | null;
+    tenantId?: string | null;
     auditStore?: AuditRepository | null;
     apiStore?: AuditRepository | null;
     extraRedactKeys?: string[];
+    // P1-15: audit-store failure handling.
+    auditStoreFailureStrategy?: 'queue' | 'raise';
+    queueCapacity?: number;
+    queueRetryInitialMs?: number;
+    queueRetryMaxMs?: number;
+    queueRetryJitter?: boolean;
 }
 
 export function init(opts?: InitOptions): void;
@@ -100,6 +121,30 @@ export interface Logger {
 }
 
 export const log: Logger;
+
+// --- P1-15 audit-store failure handling ----------------------------------
+
+export class AuditStoreError extends Error {
+    constructor(cause: unknown);
+    cause: unknown;
+}
+
+export interface QueueStats {
+    depth: number;
+    capacity: number;
+    high_water: number;
+    drained_total: number;
+    retry_count_active: number;
+    in_backoff_seconds: number;
+    last_error: string | null;
+}
+
+// Returns null in raise mode (no drainer running).
+export function queueStats(): QueueStats | null;
+
+// Block until pending audit rows drain or timeout. Returns true iff
+// drained. No-op + true in raise mode.
+export function flush(timeoutMs?: number): Promise<boolean>;
 
 // --- Store interfaces ----------------------------------------------------
 
@@ -141,5 +186,8 @@ declare const _default: {
     mintID: typeof mintID;
     currentRequestID: typeof currentRequestID;
     withRequestID: typeof withRequestID;
+    queueStats: typeof queueStats;
+    flush: typeof flush;
+    AuditStoreError: typeof AuditStoreError;
 };
 export default _default;
