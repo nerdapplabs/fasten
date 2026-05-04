@@ -7,7 +7,7 @@
 | 1.0.0-beta.x     | Yes       |
 | 0.1.0-alpha      | No (superseded) |
 
-Only the latest release receives security fixes. There is no LTS branch before v1.0.
+Only the latest release receives security fixes. There is no LTS branch before v1.0.0.
 
 ## Reporting a vulnerability
 
@@ -39,29 +39,35 @@ GitHub acts as a CNA; advisories are published to the NVD automatically on relea
 
 ## Supply-chain attestation
 
-**v1.0.0-beta — planned, not yet shipped.** The following land with the
-v1.0 GA tag (tracked in
-[issue P1-2](https://github.com/nerdapplabs/fasten/issues)):
+**No releases have been published to PyPI / npm / crates.io yet.**
+v1.0.0-beta is source-only — clone the repo and build from a pinned
+commit SHA. The first published release will land at the v1.0.0 GA tag.
+
+**Configured, ready to take effect on the first published release:**
+
+- PyPI Trusted Publishing (OIDC, no long-lived tokens) — wired in
+  [`release-python.yml`](.github/workflows/release-python.yml).
+- npm `--provenance` (linked back to source commit) — wired in
+  [`release-js.yml`](.github/workflows/release-js.yml).
+
+**Still planned for the v1.0.0 GA tag:**
 
 - Release artifacts signed with [Sigstore](https://www.sigstore.dev/) cosign;
-  verification instructions on each [release](https://github.com/nerdapplabs/fasten/releases).
-- PyPI packages via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC, no long-lived tokens).
-- npm packages with `--provenance` (linked back to source commit).
+  verification instructions on each
+  [release](https://github.com/nerdapplabs/fasten/releases).
 - SBOM published per-language alongside each release.
-
-For now, build from source and pin the commit SHA.
 
 ## Current scan posture
 
 CI runs three vulnerability scanners on every push against the
 minimum supported language version (Python 3.10-slim, Go 1.22-alpine,
-Node 20-alpine). All three are CLEAN as of the latest commit:
+Node 24-alpine). All three are CLEAN as of the latest commit:
 
 | Language | Scanner          | Status | Notes |
 |----------|------------------|--------|-------|
 | Python   | `pip-audit`      | CLEAN  | Zero runtime deps (`dependencies = []` in `pyproject.toml`). CI uses `uv venv` + `uv pip install`; the resulting venv contains only project + dev deps — no `pip` / `wheel` to flag. |
-| Go       | `govulncheck`    | CLEAN  | Zero external deps (`go.mod` declares no `require` block). Stdlib-only: `crypto/rand`, `database/sql`, `encoding/json`, `sync`, `context`. |
-| JS       | `npm audit`      | CLEAN  | Zero production deps (`package.json` has no `dependencies` block). Uses `node:async_hooks` + `node:crypto` builtins. |
+| Go       | `govulncheck`    | CLEAN  | Two direct deps: `gopkg.in/yaml.v3` (catalog parsing) and `modernc.org/sqlite` (CGO-free SQLite driver, pulls 11 indirect deps from the modernc toolchain). `govulncheck` reports no advisories against the resolved set. Re-run after any `go.mod` change. |
+| JS       | `npm audit`      | CLEAN  | Zero production deps (`package.json` has no `dependencies` block). Uses `node:async_hooks` + `node:crypto` builtins. `js-yaml` is an optional peer dep (catalog parsing only). |
 
 Re-run after adding any dependency: `pip-audit` · `govulncheck ./...` · `npm audit`.
 

@@ -115,10 +115,13 @@ is permitted.
 | C++14      | single-header             | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)|
 | Java       | placeholder               | [`java/`](java/)                                  |
 
-Cross-language P1-15 (audit-store failure handling — the queue-mode
-default that keeps emit() off the request path) is shipped in Python;
-Go / JS / Rust / C++ ports are in progress. Until they land, those SDKs
-will surface store errors synchronously on emit().
+Audit-store failure handling — the queue-mode default that keeps
+`emit()` off the request path — is shipped in all 5 SDKs (Python,
+Go, JS, Rust, C++). A locked / down audit store no longer cascades
+into 5xxs on the request path: rows queue with exponential backoff
+and the drainer self-reports queue health on the sys stream.
+Adopters who want loud failures during config debugging opt in via
+`audit_store_failure_strategy="raise"`.
 
 ---
 

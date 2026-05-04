@@ -151,7 +151,9 @@ status alongside; Java remains a placeholder pending its own beta.
 - JS `package.json` `exports` block — dropped non-existent
   `./shim/*`, `./store/*`, and `./reader` entries (deferred to
   follow-on releases). Core `.` export is unchanged.
-- CI: `astral-sh/setup-uv` pinned to immutable `v8.0.0` tag
+- CI: `astral-sh/setup-uv` upgraded to `v8.1.0`. Note: GitHub action
+  version tags are mutable and can be re-pointed by the action owner;
+  SHA-pinning every `uses:` reference is tracked as a follow-up.
 
 ### Added (since 0.1.0-alpha)
 - Go: built-in `LogInfo/Warn/Error/Debug` for the sys stream + deep

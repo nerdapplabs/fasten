@@ -6,6 +6,9 @@ on:
       - 'v*'
 
 permissions:
+  contents: read   # actions/checkout — without this, declaring any
+                   # other permission silently demotes contents to none
+                   # and the checkout step 404s.
   id-token: write  # required for Trusted Publishing OIDC exchange
 
 jobs:

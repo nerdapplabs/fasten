@@ -10,6 +10,9 @@ on:
       - 'python/**'
       - '.github/workflows/fasten-py.yml'
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

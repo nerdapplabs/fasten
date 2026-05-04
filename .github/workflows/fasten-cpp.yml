@@ -10,6 +10,9 @@ on:
       - 'cpp/**'
       - '.github/workflows/fasten-cpp.yml'
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

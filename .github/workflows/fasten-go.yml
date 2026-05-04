@@ -10,6 +10,9 @@ on:
       - 'go/**'
       - '.github/workflows/fasten-go.yml'
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
