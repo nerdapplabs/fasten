@@ -4,14 +4,14 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>dev.rivet</groupId>
-    <artifactId>rivet</artifactId>
-    <version>0.1.0-alpha</version>
+    <groupId>sh.fasten</groupId>
+    <artifactId>fasten</artifactId>
+    <version>1.0.0-beta</version>
     <packaging>jar</packaging>
 
-    <name>rivet</name>
+    <name>fasten</name>
     <description>Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport</description>
-    <url>https://rivet.dev</url>
+    <url>https://fasten.sh</url>
 
     <licenses>
         <license>
@@ -56,5 +56,23 @@
             <version>42.7.3</version>
             <optional>true</optional>
         </dependency>
+
+        <!-- Test framework -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.0</version>
+            </plugin>
+        </plugins>
+    </build>
 </project>

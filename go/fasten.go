@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -322,15 +323,22 @@ func Init(cfg Config) error {
 	_transport = NewTransport(2000)
 
 	// P1-15: failure strategy + drainer wiring.
-	strategy := firstNonEmpty(
+	// Lowercase before the switch so callers passing "Queue" / "RAISE"
+	// (or env var FASTEN_AUDIT_STORE_FAILURE_STRATEGY="Queue") match
+	// Python's case-insensitive parity contract instead of silently
+	// failing init.
+	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,
 		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
 		"queue",
-	)
+	))
 	switch strategy {
 	case "queue", "raise":
 	default:
-		return errInvalidStrategy
+		return fmt.Errorf(
+			"fasten.Init: AuditStoreFailureStrategy must be %q or %q (got %q)",
+			"queue", "raise", strategy,
+		)
 	}
 	_failureStrategy = strategy
 

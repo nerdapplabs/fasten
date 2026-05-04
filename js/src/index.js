@@ -122,17 +122,32 @@ export function register(domain, codes) {
         if (_registry.has(id)) {
             throw new Error(`register: duplicate code '${id}'`);
         }
-        // P1-5 #1: pii_in_detail forces retention_class='short'.
-        if (meta.piiInDetail && meta.retentionClass && meta.retentionClass !== RetentionClass.SHORT) {
+        // Shallow-clone before mutating: the adopter may reuse the
+        // same Meta literal across register() calls or hold onto the
+        // reference in their own catalog. Earlier code reassigned
+        // `meta.retentionClass` directly, silently changing the
+        // adopter's object.
+        const m = { ...meta };
+        if (m.retentionClass === undefined) {
+            // Default matches Python / C++: medium retention unless
+            // explicitly set. PII force-override below applies AFTER
+            // the default so we always warn before downgrading.
+            m.retentionClass = RetentionClass.MEDIUM;
+        }
+        // pii_in_detail forces retention_class='short'. Mirror Python
+        // (codes.py) + C++ (fasten.hpp) — warn whenever a PII code
+        // arrives with retention != short, INCLUDING the freshly-
+        // defaulted Medium above. Adopters who really want PII +
+        // longer retention should set retentionClass=SHORT explicitly
+        // to silence the warn (i.e., acknowledge the override).
+        if (m.piiInDetail && m.retentionClass !== RetentionClass.SHORT) {
             console.warn(
                 `fasten: code ${id} has piiInDetail=true; ` +
-                `retentionClass forced to SHORT (was ${String(meta.retentionClass).toUpperCase()}).`
+                `retentionClass forced to SHORT (was ${String(m.retentionClass).toUpperCase()}).`
             );
-            meta.retentionClass = RetentionClass.SHORT;
-        } else if (meta.piiInDetail && !meta.retentionClass) {
-            meta.retentionClass = RetentionClass.SHORT;
+            m.retentionClass = RetentionClass.SHORT;
         }
-        _registry.set(id, meta);
+        _registry.set(id, m);
     }
 }
 
@@ -322,10 +337,21 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
             if (d) {
                 d.put(row);
             } else {
-                // Defensive fallback — strategy says queue but drainer
-                // isn't installed (tests bypassed init()). Sync insert
-                // so the row isn't silently dropped.
-                try { config.auditStore.insert(row); } catch { /* ignore */ }
+                // Defensive fallback — strategy says queue but the
+                // drainer isn't installed (e.g. init bypass in tests).
+                // Sync insert so the row isn't silently dropped, and
+                // surface any insert error on the sys stream so an
+                // adopter watching `/logs/sys` (or `queue_stats()`)
+                // sees the failure instead of it vanishing into a
+                // bare catch.
+                try {
+                    config.auditStore.insert(row);
+                } catch (err) {
+                    _drainerSysLog('error', 'audit_sync_fallback_failed', {
+                        error: `${err?.name ?? 'Error'}: ${err?.message ?? err}`,
+                        row_id: row?.id ?? null,
+                    });
+                }
             }
         } else {
             try {

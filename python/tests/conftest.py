@@ -63,17 +63,17 @@ def initialized(mem_store):
 @pytest.fixture(scope="session", autouse=True)
 def register_test_codes():
     """Register codes once for the whole test session."""
-    register("user", [
-        ("USER_CREATED", Meta(
+    register("user", {
+        "USER_CREATED": Meta(
             id="USER_CREATED", domain="user", category="account",
             action="create", severity=Severity.INFO,
             description="Test code", emitter="test",
             retention_class=RetentionClass.SHORT,
-        )),
-        ("USER_DELETED", Meta(
+        ),
+        "USER_DELETED": Meta(
             id="USER_DELETED", domain="user", category="account",
             action="delete", severity=Severity.WARN,
             description="Test delete code", emitter="test",
             retention_class=RetentionClass.LONG,
-        )),
-    ])
+        ),
+    })

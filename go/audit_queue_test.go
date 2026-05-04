@@ -456,3 +456,100 @@ func TestQueueStatsHighWaterMonotonic(t *testing.T) {
 		t.Errorf("high_water regressed: %d → %d", high, got)
 	}
 }
+
+// REVIEW #19: AuditStoreFailureStrategy must accept any case (parity
+// with Python). Earlier the switch matched only lowercase, so "Queue"
+// or "RAISE" silently failed init.
+func TestInit_StrategyCaseInsensitive(t *testing.T) {
+	for _, s := range []string{"Queue", "QUEUE", "Raise", "RAISE", "qUeUe"} {
+		t.Run(s, func(t *testing.T) {
+			resetState()
+			if err := Register("user", map[Code]Meta{
+				"USER_CREATED": {
+					Domain: "user", Category: "account", Action: "create",
+					Severity: SevInfo, Description: "test", Emitter: "test",
+					RetentionClass: RetLong,
+				},
+			}); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			err := Init(Config{
+				ServiceID:                 "svc",
+				NodeID:                    "node",
+				AuditStore:                &recordingStore{},
+				AuditStoreFailureStrategy: s,
+			})
+			if err != nil {
+				t.Fatalf("strategy %q rejected: %v", s, err)
+			}
+			t.Cleanup(resetState)
+		})
+	}
+}
+
+func TestInit_StrategyInvalidValueErrorMentionsValue(t *testing.T) {
+	resetState()
+	defer resetState()
+	if err := Register("user", map[Code]Meta{
+		"USER_CREATED": {
+			Domain: "user", Category: "account", Action: "create",
+			Severity: SevInfo, Description: "test", Emitter: "test",
+			RetentionClass: RetLong,
+		},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	err := Init(Config{
+		ServiceID:                 "svc",
+		NodeID:                    "node",
+		AuditStore:                &recordingStore{},
+		AuditStoreFailureStrategy: "weird",
+	})
+	if err == nil {
+		t.Fatal("init must reject unknown strategy")
+	}
+	// Error must include the offending value so adopters can debug
+	// typos without re-reading the docs.
+	msg := err.Error()
+	if !contains(msg, "\"weird\"") {
+		t.Errorf("error must mention the bad value; got: %q", msg)
+	}
+}
+
+// REVIEW #20: ring buffer used `rb.buf = rb.buf[1:]` to drop the
+// oldest entry, which only advanced the slice header — the original
+// backing array kept growing one element per push past capacity.
+// Now uses a true circular index. Push past 10x capacity must keep
+// the underlying array length bounded at exactly cap.
+func TestRingBuffer_NoUnboundedGrowth(t *testing.T) {
+	rb := newRingBuffer[int](16)
+	for i := 0; i < 16*100; i++ {
+		rb.Push(i)
+	}
+	if got := rb.Len(); got != 16 {
+		t.Errorf("logical Len() want 16; got %d", got)
+	}
+	if got := cap(rb.buf); got != 16 {
+		t.Errorf("backing array cap should stay at the configured size 16; got %d", got)
+	}
+	// Snapshot is newest-first and contains exactly 16 entries.
+	all := rb.All()
+	if len(all) != 16 {
+		t.Fatalf("All() len want 16; got %d", len(all))
+	}
+	if all[0] != 16*100-1 {
+		t.Errorf("newest entry want %d; got %d", 16*100-1, all[0])
+	}
+	if all[15] != 16*100-16 {
+		t.Errorf("oldest of the 16 retained want %d; got %d", 16*100-16, all[15])
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

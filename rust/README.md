@@ -83,9 +83,6 @@ Some("raise".into())` to opt into synchronous semantics with
 `AuditStoreError`. `fasten::queue_stats()` and `fasten::flush(timeout)`
 complete the public surface.
 
-The legacy `EmitBuilder::emit(store)` (taking the store per-call)
-remains for back-compat.
-
 ## Tests
 
 ```bash

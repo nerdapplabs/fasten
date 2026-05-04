@@ -20,14 +20,14 @@ def test_meta_fields():
 
 def test_duplicate_code_raises():
     with pytest.raises(AuditCatalogError, match="duplicate"):
-        register("user", [
-            ("USER_CREATED", Meta(
+        register("user", {
+            "USER_CREATED": Meta(
                 id="USER_CREATED", domain="user", category="account",
                 action="create", severity=Severity.INFO,
                 description="dup", emitter="test",
                 retention_class=RetentionClass.SHORT,
-            )),
-        ])
+            ),
+        })
 
 
 def test_dump_format():

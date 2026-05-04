@@ -12,21 +12,29 @@ import java.util.Optional;
  * (5 Ws + H) + correlation, opt-in shims per transport, pluggable store +
  * transport, mountable reader.
  *
- * <p>See ../README.md for the full design.
+ * <p><b>v1.0-beta status: PLACEHOLDER.</b> Every public method below
+ * throws {@link UnsupportedOperationException} so adopters get a loud
+ * fix-it message at the first call site instead of silently no-op'ing
+ * through {@code register} / {@code init} / {@code metaOf} / {@code dump}
+ * and only failing later at emit time. Use Python, Go, JS, Rust, or C++
+ * SDKs in the meantime; their wire format is the same one defined in
+ * {@code spec/row-schema.json}.
+ *
+ * <p>Type definitions ({@link Row}, {@link Meta}, {@link Filter},
+ * {@link Config}, {@link AuditRepository}, {@link AuditOutboxRepository})
+ * are wire-compatible with the spec — adopters can build adapters
+ * against them today, knowing they will keep their shape when the
+ * runtime lands.
+ *
+ * <p>See {@code ../README.md} for the full design.
  */
 public final class Fasten {
 
-    // ---------------------------------------------------------------------
-    // 6 audit anchors as typed row
-    // ---------------------------------------------------------------------
-
-    public enum Anchor {
-        WHO, WHAT, WHEN, WHERE, WHOM, HOW, CORRELATION
-    }
-
-    public enum Domain {
-        NODE, SYNC, FLEET, AGENT
-    }
+    private static final String NOT_IMPLEMENTED =
+        "fasten-java is a v1.0-beta placeholder; runtime is not implemented. "
+        + "Use the Python, Go, JS, Rust, or C++ SDK in the meantime — their "
+        + "wire format is compatible (one shared spec/row-schema.json across "
+        + "all SDKs). Track progress at https://github.com/nerdapplabs/fasten/issues.";
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
     public enum Severity {
@@ -91,10 +99,19 @@ public final class Fasten {
     };
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
-    /** Canonical audit row. Lossless conversion to CloudEvent + OTel LogRecord. */
+    // ---------------------------------------------------------------------
+    // Wire-compatible type definitions (no runtime impl yet).
+    //
+    // Field names match spec/row-schema.json so adapters built against
+    // these records will not need to be retrofitted when the runtime
+    // lands. Domain is a free string per spec (adopter-defined, e.g.
+    // "user", "billing", "node") — not a closed enum.
+    // ---------------------------------------------------------------------
+
+    /** Canonical audit row — wire shape matches spec/row-schema.json. */
     public record Row(
             String id,
-            String edgeRowId,
+            String originId,
             long monotonicSeq,
             Instant timestamp,
             String code,
@@ -102,22 +119,23 @@ public final class Fasten {
             Severity severity,
             String serviceId,
             String sourceNodeId,
-            Optional<String> siteId,
+            Optional<String> tenantId,
             String actor,
             String actorKind,
             String target,
             String category,
-            Domain domain,
+            String domain,
             String method,
             String requestId,
             Map<String, Object> detail,
+            boolean piiInDetail,
             Optional<Instant> shippedAt
     ) {}
 
     /** Per-code metadata. */
     public record Meta(
             String id,
-            Domain domain,
+            String domain,
             String category,
             String action,
             Severity severity,
@@ -129,120 +147,27 @@ public final class Fasten {
             boolean declaredUnused
     ) {}
 
-    // ---------------------------------------------------------------------
-    // Code catalog
-    // ---------------------------------------------------------------------
+    /** Query filter for reader implementations. */
+    public record Filter(
+            Optional<String> requestId,
+            Optional<String> code,
+            Optional<String> domain,
+            Optional<String> sourceNodeId,
+            Optional<Instant> since,
+            Optional<Instant> until,
+            int limit
+    ) {}
 
-    /** Register a batch of codes under a domain. Called once at startup. */
-    public static void register(Domain domain, Map<String, Meta> codes) {
-        // TODO: thread-safe registry with duplicate-detection
-    }
-
-    public static Optional<Meta> metaOf(String code) {
-        // TODO
-        return Optional.empty();
-    }
-
-    /** `id,domain,severity` sorted — feeds cross-language consistency gate. */
-    public static String dump() {
-        // TODO
-        return "";
-    }
-
-    // ---------------------------------------------------------------------
-    // Correlation context — ThreadLocal/InheritableThreadLocal + ScopedValue for JDK 21+
-    // ---------------------------------------------------------------------
-
-    private static final ThreadLocal<String> REQUEST_ID = new InheritableThreadLocal<>();
-
-    public static String mintId() {
-        return java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-    }
-
-    public static String currentRequestId() {
-        String id = REQUEST_ID.get();
-        return id == null ? "" : id;
-    }
-
-    public static void setRequestId(String id) {
-        REQUEST_ID.set(id);
-    }
-
-    public static void clearRequestId() {
-        REQUEST_ID.remove();
-    }
-
-    /** Run `r` with request_id set; restore previous value on exit. */
-    public static void withRequestId(String id, Runnable r) {
-        String prev = REQUEST_ID.get();
-        REQUEST_ID.set(id);
-        try {
-            r.run();
-        } finally {
-            if (prev == null) REQUEST_ID.remove();
-            else REQUEST_ID.set(prev);
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Init + Emit
-    // ---------------------------------------------------------------------
-
-    /** Config. Most values come from env vars (FASTEN_*). */
+    /** Runtime config. Pass once at init. */
     public record Config(
             String serviceId,
             String nodeId,
-            Optional<String> siteId,
+            Optional<String> tenantId,
             Optional<AuditRepository> auditStore,
             Optional<AuditRepository> apiStore
     ) {}
 
-    /** Initialise fasten. Call once at startup. */
-    public static void init(Config cfg) {
-        // TODO: validate, wire transport, construct stores from FASTEN_*_DSN
-    }
-
-    /** Fluent emit builder. */
-    public static final class Emit {
-        private final String code;
-        private String target = "";
-        private String actor = "system";
-        private String actorKind = "service";
-        private String method = "sdk";
-        private Map<String, Object> detail = Map.of();
-        private Severity severityOverride;
-
-        public Emit(String code, String target) {
-            this.code = code;
-            this.target = target;
-        }
-
-        public Emit actor(String a, String kind) { this.actor = a; this.actorKind = kind; return this; }
-        public Emit method(String m) { this.method = m; return this; }
-        public Emit detail(Map<String, Object> d) { this.detail = d; return this; }
-        public Emit severity(Severity s) { this.severityOverride = s; return this; }
-
-        public Row write() {
-            throw new UnsupportedOperationException(
-                "fasten-java is a v1.0-beta placeholder — Emit.write() is not yet "
-                + "implemented. Use the Python, Go, JS, Rust, or C++ SDK in the "
-                + "meantime; their wire format is compatible (one shared "
-                + "spec/row-schema.json across all SDKs). Track progress + "
-                + "implementation milestones at "
-                + "https://github.com/nerdapplabs/fasten/issues."
-            );
-        }
-    }
-
-    public static Emit emit(String code, String target) {
-        return new Emit(code, target);
-    }
-
-    // ---------------------------------------------------------------------
-    // Store interfaces
-    // ---------------------------------------------------------------------
-
-    /** Long-term audit store — EM, adopter default. */
+    /** Long-term audit store — adopter implements per chosen backend. */
     public interface AuditRepository {
         void insert(Row row);
         List<Row> query(Filter filter);
@@ -260,15 +185,72 @@ public final class Fasten {
         int depth();
     }
 
-    public record Filter(
-            Optional<String> requestId,
-            Optional<String> code,
-            Optional<Domain> domain,
-            Optional<String> sourceNodeId,
-            Optional<Instant> since,
-            Optional<Instant> until,
-            int limit
-    ) {}
+    // ---------------------------------------------------------------------
+    // Public API — every entry point throws until the runtime lands.
+    // ---------------------------------------------------------------------
+
+    /** Initialise fasten. Call once at startup. */
+    public static void init(Config cfg) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    /** Register a batch of codes under a domain. */
+    public static void register(String domain, Map<String, Meta> codes) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    /** Look up registered metadata for a code. */
+    public static Optional<Meta> metaOf(String code) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    /** {@code id,domain,severity} sorted — feeds the cross-language consistency gate. */
+    public static String dump() {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    // ---------------------------------------------------------------------
+    // Correlation context.
+    //
+    // The request-id helpers throw too: a working request_id mint /
+    // get / set surface without a working emit() implies "you can use
+    // it" — exactly the wrong-thing-says-correct trap this placeholder
+    // is meant to avoid. They land together when the runtime lands.
+    // ---------------------------------------------------------------------
+
+    public static String mintId() {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    public static String currentRequestId() {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    public static void setRequestId(String id) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    public static void clearRequestId() {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    /** Run {@code r} with request_id set; restore previous on exit. */
+    public static void withRequestId(String id, Runnable r) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
+
+    // ---------------------------------------------------------------------
+    // Emit factory.
+    //
+    // No fluent {@code Emit} builder is exposed: returning a builder
+    // that can never write() would still let adopters chain configure
+    // calls before failing — exactly the half-implemented experience
+    // this placeholder is meant to avoid.
+    // ---------------------------------------------------------------------
+
+    public static void emit(String code, String target) {
+        throw new UnsupportedOperationException(NOT_IMPLEMENTED);
+    }
 
     private Fasten() {}
 }

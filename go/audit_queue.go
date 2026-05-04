@@ -23,7 +23,6 @@ package fasten
 
 import (
 	"context"
-	"errors"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -435,12 +434,6 @@ func Flush(timeout time.Duration) bool {
 	}
 	return d.flush(timeout)
 }
-
-// errInvalidStrategy is returned by Init when AuditStoreFailureStrategy
-// is set to a value other than "queue" or "raise".
-var errInvalidStrategy = errors.New(
-	"fasten.Init: AuditStoreFailureStrategy must be \"queue\" or \"raise\"",
-)
 
 func roundFloat(f float64, digits int) float64 {
 	pow := 1.0
