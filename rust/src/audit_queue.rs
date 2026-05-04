@@ -14,11 +14,40 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::{AuditStore, Error, Row};
+
+/// Acquire a mutex even if it was poisoned by a previous panic.
+///
+/// The drainer is a long-lived background thread that holds invariant-
+/// preserving short critical sections (no partial-write states); a panic
+/// in adopter code (the store, the sys-log callback) must not kill the
+/// drainer's ability to make progress on every other emit. Mirrors the
+/// `unwrap_or_else(|e| e.into_inner())` pattern already used in
+/// `codes_yaml.rs` test reset and is the canonical "we know better"
+/// recovery on `LockResult`.
+trait LockOrRecover<T: ?Sized> {
+    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Same recovery applied to `Condvar::wait`. Inline at the two call
+/// sites — a trait method on `Condvar` would need to take the guard
+/// by value and the surrounding while-loop reuses the binding.
+fn cv_wait_or_recover<'a, T>(
+    cv: &Condvar,
+    guard: MutexGuard<'a, T>,
+) -> MutexGuard<'a, T> {
+    cv.wait(guard).unwrap_or_else(|e| e.into_inner())
+}
 
 const HW_WARN_PCT: f64 = 0.50;
 const HW_ERR_PCT: f64 = 0.80;
@@ -63,25 +92,25 @@ impl Sem {
         }
     }
     fn acquire(&self) {
-        let mut n = self.state.lock().unwrap();
+        let mut n = self.state.lock_or_recover();
         while *n == 0 {
-            n = self.cv.wait(n).unwrap();
+            n = cv_wait_or_recover(&self.cv, n);
         }
         *n -= 1;
     }
     fn release(&self) {
-        let mut n = self.state.lock().unwrap();
+        let mut n = self.state.lock_or_recover();
         if *n < self.capacity {
             *n += 1;
         }
         self.cv.notify_one();
     }
     fn used(&self) -> usize {
-        self.capacity - *self.state.lock().unwrap()
+        self.capacity - *self.state.lock_or_recover()
     }
     /// Force-release so blocked acquirers can return on shutdown.
     fn release_all(&self) {
-        let mut n = self.state.lock().unwrap();
+        let mut n = self.state.lock_or_recover();
         *n = self.capacity;
         self.cv.notify_all();
     }
@@ -192,12 +221,12 @@ impl Drainer {
             return;
         }
         {
-            let mut q = self.inner.queue.lock().unwrap();
+            let mut q = self.inner.queue.lock_or_recover();
             q.push_back(row);
             self.inner.queue_cv.notify_one();
         }
         let used = self.inner.slots.used();
-        let mut s = self.inner.stats.lock().unwrap();
+        let mut s = self.inner.stats.lock_or_recover();
         if used > s.high_water {
             s.high_water = used;
         }
@@ -235,7 +264,7 @@ impl Drainer {
     }
 
     pub(crate) fn stats(&self) -> QueueStats {
-        let s = self.inner.stats.lock().unwrap();
+        let s = self.inner.stats.lock_or_recover();
         let in_backoff = s
             .in_backoff_until
             .and_then(|t| t.checked_duration_since(Instant::now()))
@@ -277,7 +306,7 @@ impl Drainer {
         // can proceed once shutdown completes.
         self.inner.slots.release_all();
 
-        let handle = self.handle.lock().unwrap().take();
+        let handle = self.handle.lock_or_recover().take();
         if let Some(h) = handle {
             // Best-effort join; we can't actually time-bound a thread
             // join in stable Rust without crossbeam. Detach if it
@@ -305,13 +334,13 @@ impl Drainer {
 fn run(inner: Arc<DrainerInner>) {
     while !inner.stop.load(Ordering::SeqCst) {
         let row = {
-            let q = inner.queue.lock().unwrap();
+            let q = inner.queue.lock_or_recover();
             let (mut q, _wait) = inner
                 .queue_cv
                 .wait_timeout_while(q, Duration::from_millis(100), |q| {
                     q.is_empty() && !inner.stop.load(Ordering::SeqCst)
                 })
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             q.pop_front()
         };
         if let Some(row) = row {
@@ -321,7 +350,7 @@ fn run(inner: Arc<DrainerInner>) {
     // Shutdown drain — best-effort, in_shutdown=true (one attempt only).
     loop {
         let row = {
-            let mut q = inner.queue.lock().unwrap();
+            let mut q = inner.queue.lock_or_recover();
             q.pop_front()
         };
         match row {
@@ -333,7 +362,7 @@ fn run(inner: Arc<DrainerInner>) {
 
 fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
     {
-        let mut s = inner.stats.lock().unwrap();
+        let mut s = inner.stats.lock_or_recover();
         s.in_flight += 1;
     }
     let mut slot_released = false;
@@ -369,7 +398,7 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
         }
     }
     {
-        let mut s = inner.stats.lock().unwrap();
+        let mut s = inner.stats.lock_or_recover();
         s.in_flight -= 1;
     }
     if !slot_released {
@@ -380,7 +409,7 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
 fn on_failure(inner: &Arc<DrainerInner>, err: &Error) {
     let msg = err.to_string();
     let (first, crossed_degraded, rc, bo) = {
-        let mut s = inner.stats.lock().unwrap();
+        let mut s = inner.stats.lock_or_recover();
         let first = s.retry_count == 0;
         if first {
             s.failure_burst_at = Some(Instant::now());
@@ -420,7 +449,7 @@ fn on_failure(inner: &Arc<DrainerInner>, err: &Error) {
 
 fn on_success(inner: &Arc<DrainerInner>) {
     let recovered = {
-        let mut s = inner.stats.lock().unwrap();
+        let mut s = inner.stats.lock_or_recover();
         let r = if s.retry_count > 0 {
             s.failure_burst_at
                 .map(|t| t.elapsed().as_secs_f64())
@@ -446,7 +475,7 @@ fn on_success(inner: &Arc<DrainerInner>) {
 }
 
 fn wait_backoff(inner: &Arc<DrainerInner>) -> bool {
-    let n = inner.stats.lock().unwrap().retry_count;
+    let n = inner.stats.lock_or_recover().retry_count;
     let mut delay = inner.retry_initial;
     for _ in 1..n {
         delay = delay.saturating_mul(2);
@@ -465,7 +494,7 @@ fn wait_backoff(inner: &Arc<DrainerInner>) -> bool {
         let new = (delay.as_secs_f64() + signed).max(0.0);
         delay = Duration::from_secs_f64(new);
     }
-    inner.stats.lock().unwrap().in_backoff_until = Some(Instant::now() + delay);
+    inner.stats.lock_or_recover().in_backoff_until = Some(Instant::now() + delay);
 
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
@@ -522,7 +551,7 @@ pub(crate) fn install_drainer(
         retry_jitter,
     );
     let old = {
-        let mut slot = drainer_slot().lock().unwrap();
+        let mut slot = drainer_slot().lock_or_recover();
         slot.replace(new.clone())
     };
     if let Some(old) = old {
@@ -540,7 +569,7 @@ pub fn uninstall_drainer() {
     // concurrent submit() sees no drainer (and falls back to sync /
     // raise per failure_strategy) instead of racing a half-stopped one.
     let old = {
-        let mut slot = drainer_slot().lock().unwrap();
+        let mut slot = drainer_slot().lock_or_recover();
         slot.take()
     };
     if let Some(d) = old {
@@ -549,7 +578,7 @@ pub fn uninstall_drainer() {
 }
 
 pub(crate) fn active_drainer() -> Option<Arc<Drainer>> {
-    drainer_slot().lock().unwrap().clone()
+    drainer_slot().lock_or_recover().clone()
 }
 
 /// Snapshot of the active drainer, or `None` in `raise` mode.

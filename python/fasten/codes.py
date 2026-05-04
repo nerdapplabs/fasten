@@ -13,7 +13,7 @@ import logging
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Iterable, Mapping, Union
+from typing import Mapping
 
 _logger = logging.getLogger("fasten")
 
@@ -129,22 +129,13 @@ _registry: dict[str, Meta] = {}
 _CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
-def register(
-    domain: Domain,
-    codes: Union[Mapping[str, Meta], Iterable[tuple[str, Meta]]],
-) -> None:
+def register(domain: Domain, codes: Mapping[str, Meta]) -> None:
     """Register a batch of codes for a domain.
 
-    Two accepted shapes:
-
-        register("user", {                       # preferred — dict
+        register("user", {
             "USER_CREATED": Meta(domain="user", action="create", ...),
             "USER_DELETED": Meta(domain="user", action="delete", ...),
         })
-
-        register("user", [                        # legacy — list of tuples
-            ("USER_CREATED", Meta(...)),
-        ])
 
     Validation (raises ``AuditCatalogError`` with a fix-it message):
       - key shape: UPPER_SNAKE_CASE identifier
@@ -152,9 +143,7 @@ def register(
       - ``Meta.domain`` must match ``domain``
       - duplicate code across registrations
     """
-    items = codes.items() if isinstance(codes, Mapping) else codes
-
-    for name, meta in items:
+    for name, meta in codes.items():
         if not _CODE_KEY_RE.match(name):
             raise AuditCatalogError(
                 f"register: code key {name!r} must be UPPER_SNAKE_CASE "

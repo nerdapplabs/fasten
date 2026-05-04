@@ -19,6 +19,10 @@ vendor/
 rust/target/
 rust/Cargo.lock
 
+# Java
+java/target/
+java/.mvn/
+
 # Node
 node_modules/
 .npm/

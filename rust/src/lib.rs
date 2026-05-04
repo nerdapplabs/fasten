@@ -746,68 +746,6 @@ impl EmitBuilder {
         }
     }
 
-    /// Emit synchronously. Mirrors the row to stdout (NDJSON, `shape: audit`)
-    /// and optionally inserts into a store. Returns the canonical Row.
-    pub fn emit(self, store: Option<&dyn AuditStore>) -> Result<Row, Error> {
-        let cfg = current_config()?;
-        let meta = meta_of(&self.code).ok_or_else(|| Error::UnknownCode(self.code.clone()))?;
-
-        let hex = uuid::Uuid::new_v4().simple().to_string();
-        let id = format!("evt-{}", &hex[..20]);
-        let request_id = current_request_id().unwrap_or_else(mint_id);
-
-        // P1-5 #2: PII codes force-redact whole detail. detail_passthrough_keys
-        // are kept and still scrubbed by the secret-key redactor.
-        let detail = if meta.pii_in_detail {
-            let passthrough: std::collections::HashSet<&str> =
-                meta.detail_passthrough_keys.iter().map(String::as_str).collect();
-            let kept: HashMap<String, serde_json::Value> = self
-                .detail
-                .into_iter()
-                .filter(|(k, _)| passthrough.contains(k.as_str()))
-                .collect();
-            let mut out = redact_detail(kept, cfg.extra_redact_keys.as_deref());
-            out.insert("_redacted".into(), serde_json::Value::String(REDACT_REPLACEMENT.into()));
-            out.insert("_pii_in_detail".into(), serde_json::Value::Bool(true));
-            out
-        } else {
-            redact_detail(self.detail, cfg.extra_redact_keys.as_deref())
-        };
-
-        let row = Row {
-            id: id.clone(),
-            origin_id: id,
-            monotonic_seq: seq_next(),
-            timestamp: Utc::now(),
-            code: self.code,
-            action: meta.action,
-            severity: self.severity.unwrap_or(meta.severity),
-            service_id: cfg.service_id,
-            source_node_id: cfg.node_id,
-            tenant_id: cfg.tenant_id,
-            actor: self.actor,
-            actor_kind: self.actor_kind,
-            target: self.target,
-            category: meta.category,
-            domain: meta.domain,
-            method: self.method,
-            request_id,
-            detail,
-            pii_in_detail: meta.pii_in_detail,
-            shipped_at: None,
-        };
-
-        if let Some(s) = store {
-            s.insert(&row)?;
-        }
-
-        let mut payload = serde_json::to_value(&row)?;
-        if let serde_json::Value::Object(map) = &mut payload {
-            map.insert("shape".into(), serde_json::Value::String("audit".into()));
-        }
-        println!("{}", payload);
-        Ok(row)
-    }
 }
 
 // --- Query filter --------------------------------------------------------
@@ -1028,7 +966,7 @@ mod tests {
 
         let row = EmitBuilder::new("P1_5_PII_PARTIAL", "u-42")
             .detail(detail)
-            .emit(None)
+            .submit()
             .expect("emit");
 
         // PII flag mirrored on the row.
@@ -1079,7 +1017,7 @@ mod tests {
 
         let row = EmitBuilder::new("P1_5_PII_PASSTHROUGH_SECRET", "u-42")
             .detail(detail)
-            .emit(None)
+            .submit()
             .expect("emit");
         assert_eq!(row.detail.get("api_key"), Some(&serde_json::json!("***")));
     }
@@ -1117,7 +1055,7 @@ mod tests {
 
         let row = EmitBuilder::new("P1_5_NON_PII_BASIC", "u-42")
             .detail(detail)
-            .emit(None)
+            .submit()
             .expect("emit");
         assert!(!row.pii_in_detail);
         assert_eq!(row.detail.get("city"), Some(&serde_json::json!("Mumbai")));

@@ -447,6 +447,14 @@ class AuditQueueDrainer {
             }
             --slots_free_;
         }
+        // Bump the parallel used counter under stats_mu_ so
+        // emit_high_water_if_crossed() can read `used` and decide
+        // the warn/err flag flip in a SINGLE critical section.
+        // Reading slots_free_ separately (under slot_mu_) and then
+        // making the decision under stats_mu_ leaves a window where
+        // concurrent puts/releases skew the threshold check, causing
+        // duplicate or missed high-water sys events.
+        { std::lock_guard<std::mutex> lk(stats_mu_); ++used_count_; }
         {
             std::lock_guard<std::mutex> lk(q_mu_);
             q_.push(std::move(row));
@@ -458,12 +466,7 @@ class AuditQueueDrainer {
     QueueStats stats() const {
         std::lock_guard<std::mutex> lk(stats_mu_);
         QueueStats s;
-        std::size_t free_now;
-        {
-            std::lock_guard<std::mutex> sl(slot_mu_);
-            free_now = slots_free_;
-        }
-        s.depth              = capacity_ - free_now;
+        s.depth              = used_count_;
         s.capacity           = capacity_;
         s.high_water         = high_water_;
         s.drained_total      = drained_total_;
@@ -492,8 +495,8 @@ class AuditQueueDrainer {
         for (;;) {
             std::size_t used;
             {
-                std::lock_guard<std::mutex> sl(slot_mu_);
-                used = capacity_ - slots_free_;
+                std::lock_guard<std::mutex> lk(stats_mu_);
+                used = used_count_;
             }
             if (used == 0) return true;
             if (std::chrono::steady_clock::now() >= deadline) return false;
@@ -561,18 +564,27 @@ class AuditQueueDrainer {
 
     void release_slot() {
         { std::lock_guard<std::mutex> lk(slot_mu_); if (slots_free_ < capacity_) ++slots_free_; }
+        // Decrement parallel counter under stats_mu_ — see put() for why.
+        { std::lock_guard<std::mutex> lk(stats_mu_); if (used_count_ > 0) --used_count_; }
         slot_cv_.notify_one();
     }
 
     void emit_high_water_if_crossed() {
-        std::size_t used;
-        { std::lock_guard<std::mutex> lk(slot_mu_); used = capacity_ - slots_free_; }
         bool fire_warn = false, fire_err = false;
+        std::size_t used = 0, cap = 0;
         {
+            // Single critical section: read `used` AND make the
+            // flag-flip decision under the same lock so concurrent
+            // puts/releases can't change state between read + decide.
+            // Earlier this read `used` under slot_mu_ then decided
+            // under stats_mu_ — concurrent activity in the gap caused
+            // duplicate / missed warns.
             std::lock_guard<std::mutex> lk(stats_mu_);
+            used = used_count_;
+            cap  = capacity_;
             if (used > high_water_) high_water_ = used;
-            if (capacity_ == 0) return;
-            double pct = static_cast<double>(used) / static_cast<double>(capacity_);
+            if (cap == 0) return;
+            double pct = static_cast<double>(used) / static_cast<double>(cap);
             if (pct >= kHwErrPct && !err_hw_fired_) { err_hw_fired_ = true; fire_err = true; }
             else if (pct >= kHwWarnPct && !warn_hw_fired_) { warn_hw_fired_ = true; fire_warn = true; }
             else if (pct < kHwWarnPct) { warn_hw_fired_ = false; err_hw_fired_ = false; }
@@ -703,6 +715,12 @@ class AuditQueueDrainer {
     std::thread                     thread_;
 
     mutable std::mutex              stats_mu_;
+    // Parallel "used slots" counter — incremented under stats_mu_ in
+    // put() after slot acquired, decremented in release_slot() after
+    // slot released. Used so the high-water threshold check + flag
+    // flip happen in a SINGLE critical section (eliminates the cross-
+    // mutex race that produced duplicate / missed sys events).
+    std::size_t                     used_count_                  = 0;
     std::size_t                     high_water_                  = 0;
     std::size_t                     drained_total_               = 0;
     std::size_t                     retry_count_                 = 0;
@@ -1344,8 +1362,23 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                 } else {
                     // Queue strategy but no drainer (sink registered
                     // after init()) — fall back to sync to avoid
-                    // silently dropping rows.
-                    try { sink_copy(row); } catch (...) { /* swallow */ }
+                    // silently dropping rows. Surface any sink error
+                    // on the sys stream instead of swallowing it; an
+                    // adopter watching `/logs/sys` (or queue_stats())
+                    // sees the failure instead of it vanishing.
+                    try {
+                        sink_copy(row);
+                    } catch (const std::exception& e) {
+                        detail_::drainer_sys_log("error",
+                            "audit_sync_fallback_failed",
+                            {{"error", e.what()},
+                             {"row_id", row.id}});
+                    } catch (...) {
+                        detail_::drainer_sys_log("error",
+                            "audit_sync_fallback_failed",
+                            {{"error", "unknown exception"},
+                             {"row_id", row.id}});
+                    }
                 }
             }
         }

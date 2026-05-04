@@ -10,7 +10,7 @@ use fasten::{
     audit_queue, init, AuditStore, AuditStoreError, Config, EmitBuilder, Error, Meta,
     Row, Severity, RetentionClass, flush, queue_stats,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -167,7 +167,7 @@ fn emit_one() -> Result<Row, AuditStoreError> {
 
 #[test]
 fn queue_mode_drains_within_one_second() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = RecordingStore::new();
     init_queue(store.clone() as Arc<dyn AuditStore>, |_| {});
@@ -180,7 +180,7 @@ fn queue_mode_drains_within_one_second() {
 
 #[test]
 fn queue_mode_emit_returns_immediately_under_slow_store() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = SlowStore::new(Duration::from_millis(50));
     init_queue(store.clone() as Arc<dyn AuditStore>, |_| {});
@@ -203,7 +203,7 @@ fn queue_mode_emit_returns_immediately_under_slow_store() {
 
 #[test]
 fn raise_mode_returns_audit_store_error() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = BrokenStore::new();
     init_raise(store as Arc<dyn AuditStore>);
@@ -216,7 +216,7 @@ fn raise_mode_returns_audit_store_error() {
 
 #[test]
 fn raise_mode_does_not_install_drainer() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = RecordingStore::new();
     init_raise(store as Arc<dyn AuditStore>);
@@ -228,7 +228,7 @@ fn raise_mode_does_not_install_drainer() {
 
 #[test]
 fn outage_then_recovery_drains_pending_rows() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = FlakyStore::new(2);
     init_queue(store.clone() as Arc<dyn AuditStore>, |c| {
@@ -247,7 +247,7 @@ fn outage_then_recovery_drains_pending_rows() {
 
 #[test]
 fn queue_stats_fields() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = RecordingStore::new();
     init_queue(store.clone() as Arc<dyn AuditStore>, |_| {});
@@ -265,7 +265,7 @@ fn queue_stats_fields() {
 
 #[test]
 fn public_flush_no_op_in_raise_mode() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = RecordingStore::new();
     init_raise(store as Arc<dyn AuditStore>);
@@ -276,7 +276,7 @@ fn public_flush_no_op_in_raise_mode() {
 
 #[test]
 fn queue_stats_high_water_monotonic() {
-    let _g = TEST_MU.lock().unwrap();
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
     register_test_code();
     let store = RecordingStore::new();
     init_queue(store.clone() as Arc<dyn AuditStore>, |c| {
@@ -293,3 +293,65 @@ fn queue_stats_high_water_monotonic() {
     audit_queue::uninstall_drainer();
 }
 
+
+// ── REVIEW #21 panic-on-poisoned-lock recovery ────────────────────────────
+
+/// Store whose first insert panics; subsequent inserts succeed.
+/// Used to verify the drainer survives a panic in adopter-supplied
+/// store code instead of poisoning every internal mutex and stalling
+/// every future emit().
+struct PanickingThenOkStore {
+    first: AtomicBool,
+    after: Mutex<Vec<Row>>,
+}
+impl PanickingThenOkStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            first: AtomicBool::new(true),
+            after: Mutex::new(Vec::new()),
+        })
+    }
+    fn count_after(&self) -> usize {
+        self.after.lock().unwrap().len()
+    }
+}
+impl AuditStore for PanickingThenOkStore {
+    fn insert(&self, row: &Row) -> Result<(), Error> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            panic!("synthetic panic from adopter store on first insert");
+        }
+        self.after.lock().unwrap().push(row.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn submit_does_not_panic_after_drainer_thread_dies_on_store_panic() {
+    let _g = TEST_MU.lock().unwrap_or_else(|e| e.into_inner());
+    register_test_code();
+    let store = PanickingThenOkStore::new();
+    init_queue(store as Arc<dyn AuditStore>, |c| {
+        // Tight retry so the drainer reaches the store quickly.
+        c.queue_retry_initial = Some(Duration::from_millis(5));
+        c.queue_retry_max = Some(Duration::from_millis(20));
+        c.disable_queue_jitter = true;
+    });
+    // First submit: panic in the store kills the drainer thread.
+    // Without lock_or_recover, the drainer's internal mutexes (queue,
+    // slots, stats) would be poisoned, and EVERY subsequent submit()
+    // would panic at its first .lock().unwrap() — turning a single
+    // adopter-side bug into a process-wide panic cascade across all
+    // emit threads. With recovery applied, submit() returns Ok and
+    // queue_stats() returns a sane snapshot; the drainer itself stays
+    // dead (catching the panic in the drainer is a larger change,
+    // tracked separately).
+    EmitBuilder::new("USER_CREATED", "u-1").submit().expect("emit");
+    // Give the drainer a moment to pop the row and panic.
+    std::thread::sleep(Duration::from_millis(100));
+    // These calls must NOT panic on the now-poisoned internal mutexes.
+    let r = EmitBuilder::new("USER_CREATED", "u-2").submit();
+    assert!(r.is_ok(), "submit must not propagate poison panic; got {:?}", r);
+    let stats = queue_stats();
+    assert!(stats.is_some(), "queue_stats must remain queryable");
+    audit_queue::uninstall_drainer();
+}

@@ -216,6 +216,94 @@ void test_queue_stats_high_water_monotonic() {
     std::cout << "ok queue_stats_high_water_monotonic\n";
 }
 
+// REVIEW #25: queue strategy with no drainer falls back to a sync
+// sink invocation. That fallback used to swallow exceptions silently
+// — the row would vanish with no signal. Now any sink throw surfaces
+// `audit_sync_fallback_failed` on the sys ring (queryable via
+// query_syslog) so adopters watching `/logs/sys` see it.
+void test_sync_fallback_emits_sys_event_on_sink_failure() {
+    reset_state();
+    register_test_code();
+
+    // Sink that always throws.
+    fasten::set_audit_sink([](const fasten::Row&) {
+        throw std::runtime_error("synthetic sink failure");
+    });
+
+    fasten::Config cfg;
+    cfg.service_id = "svc"; cfg.node_id = "node";
+    cfg.audit_store_failure_strategy = "queue";
+    fasten::init(cfg);
+
+    // Force the "queue strategy but no drainer" branch by uninstalling
+    // the drainer immediately. emit() then takes the sync-fallback path.
+    fasten::uninstall_drainer();
+
+    fasten::emit("USER_CREATED", fasten::target("u"));
+
+    auto syslog = fasten::query_syslog(/*limit=*/100);
+    bool found = false;
+    for (const auto& row : syslog) {
+        auto event_it = row.find("event");
+        if (event_it != row.end() &&
+            event_it->second == "audit_sync_fallback_failed") {
+            found = true;
+            break;
+        }
+    }
+    assert(found);
+    std::cout << "ok sync_fallback_emits_sys_event_on_sink_failure\n";
+}
+
+// REVIEW #11: high-water sys events used to be decided across two
+// mutexes (slot_mu_ then stats_mu_). Concurrent puts/releases in the
+// gap caused duplicate or missed warns. The fix combines the read +
+// flag flip in a single critical section using a parallel used_count_
+// counter. This test hammers the put path from many threads with a
+// slow sink; we read the syslog ring afterwards and assert the
+// high-water + near-full events fire AT MOST once per crossing.
+void test_high_water_no_double_fire_under_contention() {
+    reset_state();
+    register_test_code();
+
+    fasten::set_audit_sink([](const fasten::Row&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    });
+
+    fasten::Config cfg;
+    cfg.service_id = "svc"; cfg.node_id = "node";
+    cfg.queue_capacity = 10;        // 50% = 5, 80% = 8
+    fasten::init(cfg);
+
+    // 8 emits from 8 threads — well past the 80% threshold.
+    std::vector<std::thread> ts;
+    ts.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        ts.emplace_back([] {
+            fasten::emit("USER_CREATED", fasten::target("u"));
+        });
+    }
+    for (auto& t : ts) t.join();
+    assert(fasten::flush(std::chrono::seconds(5)));
+
+    auto syslog = fasten::query_syslog(/*limit=*/100);
+    int warn_count = 0, err_count = 0;
+    for (const auto& row : syslog) {
+        auto event_it = row.find("event");
+        if (event_it == row.end()) continue;
+        const auto& event = event_it->second;
+        if (event == "audit_queue_high_water") ++warn_count;
+        if (event == "audit_queue_near_full")  ++err_count;
+    }
+    // Each threshold crossing fires AT MOST once (debounced). Earlier
+    // race could produce duplicates under concurrent put pressure.
+    assert(warn_count <= 1);
+    assert(err_count  <= 1);
+    fasten::uninstall_drainer();
+    std::cout << "ok high_water_no_double_fire_under_contention "
+              << "(warn=" << warn_count << " err=" << err_count << ")\n";
+}
+
 }  // namespace
 
 int main() {
@@ -226,6 +314,8 @@ int main() {
     test_queue_stats_fields();
     test_public_flush_no_op_in_raise_mode();
     test_queue_stats_high_water_monotonic();
+    test_high_water_no_double_fire_under_contention();
+    test_sync_fallback_emits_sys_event_on_sink_failure();
     std::cout << "\nALL P1-15 C++ TESTS PASSED\n";
     return 0;
 }

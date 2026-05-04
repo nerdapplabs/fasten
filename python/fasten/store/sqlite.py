@@ -156,14 +156,6 @@ class SQLiteStore:
             self._tls.conn = conn
         return conn
 
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        # Backwards-compatible accessor for any caller still reading
-        # store._conn directly (tests, debug code). Routes to the
-        # current thread's cached connection (or the shared one for
-        # `:memory:`).
-        return self._connect()
-
     def _txn(self) -> contextlib.AbstractContextManager[Any]:
         """Lock context for a compound operation.
 

@@ -8,34 +8,44 @@ import (
 
 // RingBuffer is a thread-safe, fixed-capacity buffer. Oldest entries drop
 // when full. Queries return newest-first.
+//
+// Implemented as a true circular buffer over a fixed-capacity slice. The
+// earlier `rb.buf = rb.buf[1:]` pop strategy retained the original
+// backing array and only advanced the slice header, so the underlying
+// memory grew by one element per push past capacity until GC eventually
+// reclaimed it — effectively unbounded heap growth on a hot syslog
+// path. Circular index keeps the backing array exactly `cap` entries.
 type RingBuffer[T any] struct {
-	buf  []T
-	mu   sync.RWMutex
-	cap  int
+	buf   []T
+	mu    sync.RWMutex
+	cap   int
+	head  int  // index of next-write slot in buf
+	count int  // entries currently stored (<= cap)
 }
 
 func newRingBuffer[T any](capacity int) *RingBuffer[T] {
-	return &RingBuffer[T]{cap: capacity}
+	return &RingBuffer[T]{cap: capacity, buf: make([]T, capacity)}
 }
 
 func (rb *RingBuffer[T]) Push(item T) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	if len(rb.buf) >= rb.cap {
-		rb.buf = rb.buf[1:] // drop oldest
+	rb.buf[rb.head] = item
+	rb.head = (rb.head + 1) % rb.cap
+	if rb.count < rb.cap {
+		rb.count++
 	}
-	rb.buf = append(rb.buf, item)
 }
 
 // All returns a snapshot newest-first.
 func (rb *RingBuffer[T]) All() []T {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
-	out := make([]T, len(rb.buf))
-	copy(out, rb.buf)
-	// reverse for newest-first
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+	out := make([]T, rb.count)
+	// Walk backwards from the most recently written slot.
+	for i := 0; i < rb.count; i++ {
+		idx := (rb.head - 1 - i + rb.cap) % rb.cap
+		out[i] = rb.buf[idx]
 	}
 	return out
 }
@@ -43,7 +53,7 @@ func (rb *RingBuffer[T]) All() []T {
 func (rb *RingBuffer[T]) Len() int {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
-	return len(rb.buf)
+	return rb.count
 }
 
 // SyslogRow is a structured syslog entry.

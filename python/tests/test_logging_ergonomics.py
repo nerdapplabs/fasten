@@ -229,16 +229,3 @@ def test_register_invalid_key_shape():
         })
 
 
-def test_register_legacy_tuple_list_still_works():
-    """Backwards-compat: the original Iterable[tuple[str, Meta]] form."""
-    from fasten.codes import register, Meta, Severity, _registry, registry
-
-    code = "P1_10_LEGACY"
-    if code in _registry:
-        del _registry[code]
-
-    register("p1_10d", [
-        (code, Meta(domain="p1_10d", category="x", action="x",
-                    severity=Severity.INFO, description="x", emitter="t")),
-    ])
-    assert registry()[code].id == code
