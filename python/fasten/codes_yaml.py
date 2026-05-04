@@ -60,6 +60,10 @@ _loaded_paths: list[Path] = []
 # Tracked so reload() can distinguish "code removed from yaml" (drop it) from
 # "code only registered programmatically" (keep it).
 _yaml_codes: set[str] = set()
+# code-id → originating yaml path. Used to detect cross-file collisions
+# in load(): the same id loaded from two different files used to silently
+# overwrite the first registration with the second's metadata.
+_yaml_code_origins: dict[str, Path] = {}
 _lock = threading.Lock()
 
 
@@ -131,14 +135,21 @@ def _parse_meta(
     )
 
 
-def _build_registry_from_paths(paths: list[Path]) -> dict[str, Meta]:
-    """Read every yaml + run all validation; return a fresh registry dict.
+def _build_registry_from_paths(
+    paths: list[Path],
+) -> tuple[dict[str, Meta], dict[str, Path]]:
+    """Read every yaml + run all validation; return (registry, origins).
+
+    `origins` maps each code-id to the path it was declared in, so reload()
+    can reset the cross-file collision tracker atomically alongside the
+    registry swap.
 
     Any error raises AuditCatalogError (or yaml.YAMLError) — the caller's
     live registry is never touched until this returns successfully.
     """
     yaml = _yaml_loader()
     fresh: dict[str, Meta] = {}
+    origins: dict[str, Path] = {}
 
     for path in paths:
         text = path.read_text()
@@ -164,11 +175,12 @@ def _build_registry_from_paths(paths: list[Path]) -> dict[str, Meta]:
             if code in fresh:
                 raise AuditCatalogError(
                     f"{path}:{code} — duplicate code "
-                    f"(already declared in {paths[0] if path != paths[0] else path})"
+                    f"(already declared in {origins[code]})"
                 )
             fresh[code] = _parse_meta(str(path), file_domain, file_emitter, str(code), raw)
+            origins[code] = path
 
-    return fresh
+    return fresh, origins
 
 
 def load(path: str | Path) -> None:
@@ -179,20 +191,34 @@ def load(path: str | Path) -> None:
     registry and survive ``reload()`` (yaml-loaded codes overlay).
     """
     p = Path(path)
-    fresh_yaml = _build_registry_from_paths([p])
+    fresh_yaml, _fresh_origins = _build_registry_from_paths([p])
 
     with _lock:
-        # Check duplicates against existing programmatic registrations.
-        # (Codes already loaded from yaml are detected by the per-paths
-        # build above; a duplicate here means a programmatic register()
-        # claimed the same id first.)
+        # Two duplicate-detection passes:
+        # (a) cross-yaml-file: same id was loaded from a *different* path
+        #     earlier. The earlier check inside _build_registry_from_paths
+        #     only catches dupes within a single load() invocation, so it
+        #     would miss `load(a.yaml)` then `load(b.yaml)` with the same
+        #     id. Without this, the second load silently overwrites the
+        #     first registration's metadata.
+        # (b) yaml-vs-programmatic: id was registered in code via
+        #     register() before yaml load. The yaml file is asserting
+        #     ownership it doesn't have.
         for code in fresh_yaml:
+            existing_path = _yaml_code_origins.get(code)
+            if existing_path is not None and existing_path != p:
+                raise AuditCatalogError(
+                    f"{p}:{code} — duplicate code "
+                    f"(already loaded from {existing_path})"
+                )
             if code in _registry and code not in _yaml_codes:
                 raise AuditCatalogError(
                     f"{p}:{code} — duplicate code (already registered programmatically)"
                 )
         _registry.update(fresh_yaml)
         _yaml_codes.update(fresh_yaml.keys())
+        for code in fresh_yaml:
+            _yaml_code_origins[code] = p
         if p not in _loaded_paths:
             _loaded_paths.append(p)
 
@@ -218,7 +244,7 @@ def reload() -> None:
     # Step 1: parse + validate fully. Any error raises here, before we
     # touch the live registry. Fault-tolerant guarantee: previous
     # catalog stays active on failure.
-    fresh_yaml = _build_registry_from_paths(list(_loaded_paths))
+    fresh_yaml, fresh_origins = _build_registry_from_paths(list(_loaded_paths))
 
     # Step 2: take snapshot under the lock to avoid racing with concurrent
     # register() calls, then swap. Programmatic codes (not in _yaml_codes)
@@ -241,3 +267,5 @@ def reload() -> None:
         _registry.update(new_registry)
         _yaml_codes.clear()
         _yaml_codes.update(fresh_yaml.keys())
+        _yaml_code_origins.clear()
+        _yaml_code_origins.update(fresh_origins)

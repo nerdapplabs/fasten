@@ -219,8 +219,8 @@ def test_drainer_first_failure_emits_warn_to_sys():
     # Hook the transport's syslog ring to capture lines synchronously
     t = fasten.transport()
     assert t is not None
-    orig_write = t.write_syslog
-    t.write_syslog = lambda r: (captured.append(r), orig_write(r))[-1]  # type: ignore[assignment,attr-defined]
+    orig_write = t.write_drainer_syslog
+    t.write_drainer_syslog = lambda r: (captured.append(r), orig_write(r))[-1]  # type: ignore[assignment,attr-defined]
 
     fasten.emit(code="USER_CREATED", target="u-1")
     assert _aq.active().flush(timeout=2.0)
@@ -242,8 +242,8 @@ def test_drainer_degraded_after_5_failures():
     )
     t = fasten.transport()
     assert t is not None
-    orig = t.write_syslog
-    t.write_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+    orig = t.write_drainer_syslog
+    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
 
     fasten.emit(code="USER_CREATED", target="u-1")
     # Wait for at least 5 retries (5 * ~20ms ≈ 100ms; allow generous slack)
@@ -270,8 +270,8 @@ def test_queue_high_water_emits_warn_at_50pct():
     )
     t = fasten.transport()
     assert t is not None
-    orig = t.write_syslog
-    t.write_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+    orig = t.write_drainer_syslog
+    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
 
     for i in range(2):
         fasten.emit(code="USER_CREATED", target=f"u-{i}")
@@ -339,6 +339,78 @@ def test_queue_stats_high_water_monotonic():
     fasten.emit(code="USER_CREATED", target="u-x")
     assert _aq.active().flush(timeout=1.0)
     assert fasten.queue_stats()["high_water"] >= high
+
+
+def test_flush_does_not_wait_for_emits_after_call_time():
+    """REVIEW #14: flush() targets rows pending at call time only.
+
+    Previously flush() polled until `used_slots == 0`, so a steady
+    incoming stream at >= drain rate would keep it blocked until
+    timeout even though every row that existed when flush() was called
+    had successfully drained. New semantics: snapshot
+    drained_total + used_slots at call time and wait for drained_total
+    to reach that target — additional concurrent emits don't extend
+    the wait.
+    """
+    store = _RecordingStore()
+    # Slow store so flush() definitely takes long enough that another
+    # thread can land emits before it returns.
+    class _SlowStore(_RecordingStore):
+        def insert(self, row):
+            time.sleep(0.005)
+            super().insert(row)
+
+    _init(_SlowStore(), queue_capacity=200)
+    for i in range(5):
+        fasten.emit(code="USER_CREATED", target=f"u-{i}")
+
+    snapshot_target = fasten.queue_stats()["drained_total"] + fasten.queue_stats()["depth"]
+
+    stop_emitting = threading.Event()
+    emitted = []
+
+    def keep_emitting():
+        while not stop_emitting.is_set():
+            try:
+                fasten.emit(code="USER_CREATED", target=f"bg-{len(emitted)}")
+                emitted.append(1)
+            except Exception:
+                break
+            time.sleep(0.001)
+
+    bg = threading.Thread(target=keep_emitting, daemon=True)
+    bg.start()
+    try:
+        # 2.0s should be PLENTY for 5 rows on a 5ms-per-insert store
+        # (25ms total), even with concurrent emits keeping new rows
+        # arriving. If flush() is racing new emits it would time out.
+        assert fasten.flush(timeout=2.0)
+    finally:
+        stop_emitting.set()
+        bg.join(timeout=1.0)
+    # And the snapshot's worth has actually drained.
+    assert fasten.queue_stats()["drained_total"] >= snapshot_target
+
+
+def test_used_slots_does_not_touch_semaphore_private_attr():
+    """REVIEW #18: drainer must not read threading.Semaphore._value
+    (CPython implementation detail). The fix introduces a parallel
+    counter; this test asserts the counter exists and reports the same
+    answer the public stats expose.
+    """
+    store = _RecordingStore()
+    _init(store, queue_capacity=4)
+    drainer = _aq.active()
+    assert drainer is not None
+    # Counter present and starts at 0.
+    assert hasattr(drainer, "_used_slots_count")
+    assert drainer._used_slots_count == 0
+    # After a few emits + drain, counter is back to 0 in lockstep with stats.
+    for i in range(3):
+        fasten.emit(code="USER_CREATED", target=f"u-{i}")
+    assert drainer.flush(timeout=1.0)
+    assert drainer._used_slots_count == 0
+    assert fasten.queue_stats()["depth"] == 0
 
 
 # ── #7 /logs/audit/doctor endpoint ─────────────────────────────────────────

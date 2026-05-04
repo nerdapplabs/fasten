@@ -40,6 +40,23 @@ class StdoutTransport:
         """Buffer only — no stdout. Used by adopters that own their stdout."""
         self._syslog.push(row)
 
+    def write_drainer_syslog(self, row: dict[str, Any]) -> None:
+        """Drainer self-report path. Buffers + writes to STDERR, never stdout.
+
+        The audit queue drainer cannot share the stdout fd with emit() and
+        application logging: under stdout backpressure (slow Docker log
+        driver, blocked sidecar tail) writing here would block the drainer
+        thread, which would in turn block emit() once the queue fills —
+        a textbook capacity-deadlock with no recovery path. stderr lives on
+        a separate fd so the drainer keeps making progress; the row is
+        also pushed to the in-memory ring so `/logs/sys` and
+        `query_syslog()` continue to return drainer events for adopters
+        who never look at stderr.
+        """
+        self._syslog.push(row)
+        sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
+        sys.stderr.flush()
+
     def query_syslog(
         self,
         *,

@@ -40,10 +40,19 @@ class Redactor:
             self._pattern = re.compile(r"(?i)(" + combined + r")")
 
     def redact(self, value: Any) -> Any:
-        """Deep-redact a value (dict / list / scalar)."""
+        """Deep-redact a value (dict / list / scalar).
+
+        Non-string dict keys (int, tuple, etc.) are tolerated: the
+        pattern only matches against str keys, so non-str keys cannot
+        be flagged as secrets and we just recurse into the value.
+        Without this guard, ``re.search`` would raise TypeError on the
+        first non-str key and the redactor would crash.
+        """
         if isinstance(value, dict):
             return {
-                k: (self._replacement if self._pattern.search(k) else self.redact(v))
+                k: (self._replacement
+                    if isinstance(k, str) and self._pattern.search(k)
+                    else self.redact(v))
                 for k, v in value.items()
             }
         if isinstance(value, list):
@@ -60,7 +69,10 @@ class Redactor:
             for key in list(event_dict.keys()):
                 if key in _STRUCTLOG_SKIP:
                     continue
-                if self._pattern.search(key):
+                # Non-str top-level keys can't match the secret pattern;
+                # still recurse into nested dict/list values so embedded
+                # secrets are scrubbed.
+                if isinstance(key, str) and self._pattern.search(key):
                     event_dict[key] = self._replacement
                 elif isinstance(event_dict[key], (dict, list)):
                     event_dict[key] = self.redact(event_dict[key])

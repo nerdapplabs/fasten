@@ -46,12 +46,14 @@ def clean_yaml_paths():
     """Reset yaml-load state between tests: clear loaded paths AND any
     FLEET_/EXTRA_ codes in the registry (fresh_state in conftest doesn't
     touch the catalog)."""
-    from fasten.codes_yaml import _loaded_paths, _yaml_codes
+    from fasten.codes_yaml import _loaded_paths, _yaml_codes, _yaml_code_origins
     saved_paths = list(_loaded_paths)
     saved_yaml_codes = set(_yaml_codes)
+    saved_origins = dict(_yaml_code_origins)
     saved_registry = dict(_registry)
     _loaded_paths.clear()
     _yaml_codes.clear()
+    _yaml_code_origins.clear()
     for code in list(_registry):
         if code.startswith(("FLEET_", "EXTRA_")):
             del _registry[code]
@@ -60,6 +62,8 @@ def clean_yaml_paths():
     _loaded_paths.extend(saved_paths)
     _yaml_codes.clear()
     _yaml_codes.update(saved_yaml_codes)
+    _yaml_code_origins.clear()
+    _yaml_code_origins.update(saved_origins)
     for code in list(_registry):
         if code.startswith(("FLEET_", "EXTRA_")):
             del _registry[code]
@@ -120,6 +124,38 @@ def test_load_collision_with_programmatic_raises(fasten_yaml, clean_yaml_paths):
         load(str(fasten_yaml))
     # cleanup
     del _registry["FLEET_NODE_REGISTERED"]
+
+
+def test_load_cross_file_collision_raises(fasten_yaml, tmp_path, clean_yaml_paths):
+    """REVIEW #13: same code-id loaded from two different files used to
+    silently overwrite the first registration's metadata."""
+    load(str(fasten_yaml))
+    # Second file also declares FLEET_NODE_REGISTERED with different metadata.
+    p2 = tmp_path / "fleet-v2.codes.yaml"
+    p2.write_text(textwrap.dedent("""\
+        domain: fleet
+        emitter: edge-manager-v2
+        codes:
+          FLEET_NODE_REGISTERED:
+            category: drift.metadata
+            action: registered
+            severity: warn
+            description: Should not silently replace the v1 entry
+    """))
+    with pytest.raises(AuditCatalogError, match="already loaded from"):
+        load(str(p2))
+    # First file's metadata still wins (silent overwrite did not happen).
+    reg = registry()
+    assert reg["FLEET_NODE_REGISTERED"].emitter == "edge-manager"
+    assert reg["FLEET_NODE_REGISTERED"].severity == Severity.INFO
+
+
+def test_load_same_path_twice_is_idempotent(fasten_yaml, clean_yaml_paths):
+    """Loading the same file twice should be a no-op, not a self-collision."""
+    load(str(fasten_yaml))
+    load(str(fasten_yaml))  # must not raise
+    reg = registry()
+    assert "FLEET_NODE_REGISTERED" in reg
 
 
 def test_reload_picks_up_new_codes(fasten_yaml, clean_yaml_paths):

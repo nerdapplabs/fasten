@@ -6,15 +6,34 @@ and uses WAL mode by default.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _utc_iso(dt: datetime) -> str:
+    """Serialise to UTC ISO-8601, treating naive datetimes as UTC.
+
+    SQLite stores timestamps as ISO strings with the +00:00 offset.
+    A naive datetime calling `.isoformat()` would produce a string
+    *without* an offset, so lexicographic ordering against existing
+    rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
+    silently mis-orders. Always normalise to UTC-aware before
+    serialising so query()/since/until are correct under all inputs.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -54,6 +73,25 @@ _PII_INDEX = (
 
 
 class SQLiteStore:
+    """Thread-safe SQLite-backed AuditRepository.
+
+    For file-backed stores: one connection PER THREAD via
+    threading.local. The earlier "single connection shared via
+    check_same_thread=False" pattern only silenced sqlite3's safety
+    assertion — it did not make concurrent drainer + reader access
+    actually safe, and operations on the same connection from multiple
+    threads can interleave statements and corrupt the cursor protocol.
+    WAL mode (the default) is designed around per-thread connections:
+    many readers + one writer can progress in parallel without blocking
+    each other.
+
+    For ``:memory:``: every sqlite3 ``:memory:`` connection is a
+    SEPARATE private database, so per-thread connections would each
+    see an empty schema. We fall back to a single connection guarded
+    by an RLock — the pattern is correct for tests / dev, but file
+    storage is the right choice for any production load.
+    """
+
     def __init__(self, path: str, table: str = "audit_log", wal: bool = True) -> None:
         if not _SAFE_IDENTIFIER.match(table):
             raise ValueError(
@@ -62,23 +100,79 @@ class SQLiteStore:
             )
         self._path = path
         self._table = table
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        if wal:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._wal = wal
+        # `:memory:` databases cannot be shared across connections, so
+        # the per-thread model breaks. Detect once at init and route
+        # subsequent calls accordingly.
+        self._is_memory = path == ":memory:"
+        self._tls = threading.local()
+        self._mem_conn: sqlite3.Connection | None = None
+        self._mem_lock = threading.RLock()
+        # Run the DDL once on the constructor's thread so the table /
+        # indexes / pii migration exist before any other thread opens
+        # its own connection. Subsequent threads see the table already
+        # present and skip straight to insert/query.
+        bootstrap = self._connect()
+        if wal and not self._is_memory:
+            # WAL is meaningless for `:memory:` (no journal file).
+            bootstrap.execute("PRAGMA journal_mode=WAL")
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():
-                self._conn.execute(stmt)
+                bootstrap.execute(stmt)
         # Idempotent migration for existing tables that pre-date pii_in_detail.
-        cur = self._conn.execute(f"PRAGMA table_info({table})")
+        cur = bootstrap.execute(f"PRAGMA table_info({table})")
         cols = {r[1] for r in cur.fetchall()}
         if "pii_in_detail" not in cols:
-            self._conn.execute(
+            bootstrap.execute(
                 f"ALTER TABLE {table} "
                 "ADD COLUMN pii_in_detail INTEGER NOT NULL DEFAULT 0"
             )
         # Index runs after migration so it exists on both fresh + legacy tables.
-        self._conn.execute(_PII_INDEX.format(table=table))
-        self._conn.commit()
+        bootstrap.execute(_PII_INDEX.format(table=table))
+        bootstrap.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Return this thread's sqlite3 connection, opening it on first call.
+
+        For `:memory:` returns the single shared connection (sqlite3
+        cannot share an in-memory database across multiple connections).
+        Callers MUST hold ``self._mem_lock`` for the duration of any
+        compound operation against the in-memory store.
+        """
+        if self._is_memory:
+            if self._mem_conn is None:
+                self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            return self._mem_conn
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            # check_same_thread=True (default) is correct now — every
+            # thread gets its own connection, so the cross-thread guard
+            # never trips and we get the safety assertion for free.
+            conn = sqlite3.connect(self._path)
+            if self._wal:
+                # Each connection sets its own journal_mode pragma.
+                conn.execute("PRAGMA journal_mode=WAL")
+            self._tls.conn = conn
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        # Backwards-compatible accessor for any caller still reading
+        # store._conn directly (tests, debug code). Routes to the
+        # current thread's cached connection (or the shared one for
+        # `:memory:`).
+        return self._connect()
+
+    def _txn(self):
+        """Lock context for a compound operation.
+
+        File-backed: per-thread connection means no inter-thread
+        contention; nullcontext() is correct.
+        In-memory: every thread shares the single connection, so we
+        serialise with the RLock to avoid sqlite3-on-shared-conn
+        statement interleaving.
+        """
+        return self._mem_lock if self._is_memory else contextlib.nullcontext()
 
     @classmethod
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
@@ -97,48 +191,55 @@ class SQLiteStore:
         )
 
     def insert(self, row: AuditRow) -> None:
-        self._conn.execute(
-            f"INSERT OR IGNORE INTO {self._table} VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                row.id, row.origin_id, row.monotonic_seq,
-                row.timestamp.isoformat(),
-                row.code, row.action, row.severity,
-                row.service_id, row.source_node_id, row.tenant_id,
-                row.actor, row.actor_kind,
-                row.target, row.category, row.domain,
-                row.method, row.request_id,
-                json.dumps(row.detail),
-                int(row.pii_in_detail),
-                row.shipped_at.isoformat() if row.shipped_at else None,
-            ),
-        )
-        self._conn.commit()
+        with self._txn():
+            conn = self._connect()
+            conn.execute(
+                f"INSERT OR IGNORE INTO {self._table} VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.id, row.origin_id, row.monotonic_seq,
+                    _utc_iso(row.timestamp),
+                    row.code, row.action, row.severity,
+                    row.service_id, row.source_node_id, row.tenant_id,
+                    row.actor, row.actor_kind,
+                    row.target, row.category, row.domain,
+                    row.method, row.request_id,
+                    json.dumps(row.detail),
+                    int(row.pii_in_detail),
+                    _utc_iso(row.shipped_at) if row.shipped_at else None,
+                ),
+            )
+            conn.commit()
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
-        cur = self._conn.execute(
-            f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-            "ORDER BY monotonic_seq ASC LIMIT ?",
-            (limit,),
-        )
-        return [self._row(r) for r in cur.fetchall()]
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                "ORDER BY monotonic_seq ASC LIMIT ?",
+                (limit,),
+            )
+            return [self._row(r) for r in cur.fetchall()]
 
     def mark_shipped(self, ids: list[str]) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        self._conn.executemany(
-            f"UPDATE {self._table} SET shipped_at=? WHERE id=?",
-            [(now, i) for i in ids],
-        )
-        self._conn.commit()
+        with self._txn():
+            conn = self._connect()
+            now = _utc_iso(datetime.now(timezone.utc))
+            conn.executemany(
+                f"UPDATE {self._table} SET shipped_at=? WHERE id=?",
+                [(now, i) for i in ids],
+            )
+            conn.commit()
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
-        sql = f"DELETE FROM {self._table} WHERE timestamp < ?"
-        params: tuple = (before.isoformat(),)
-        if respect_unshipped:
-            sql += " AND shipped_at IS NOT NULL"
-        cur = self._conn.execute(sql, params)
-        self._conn.commit()
-        return cur.rowcount
+        with self._txn():
+            conn = self._connect()
+            sql = f"DELETE FROM {self._table} WHERE timestamp < ?"
+            params: tuple = (_utc_iso(before),)
+            if respect_unshipped:
+                sql += " AND shipped_at IS NOT NULL"
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
 
     def _build_where(
         self,
@@ -174,10 +275,10 @@ class SQLiteStore:
             params.append(target)
         if since:
             conds.append("timestamp >= ?")
-            params.append(since.isoformat())
+            params.append(_utc_iso(since))
         if until:
             conds.append("timestamp <= ?")
-            params.append(until.isoformat())
+            params.append(_utc_iso(until))
         where = f"WHERE {' AND '.join(conds)}" if conds else ""
         return where, params
 
@@ -200,12 +301,13 @@ class SQLiteStore:
             source_node_id=source_node_id, actor=actor, target=target,
             since=since, until=until,
         )
-        cur = self._conn.execute(
-            f"SELECT * FROM {self._table} {where} "
-            "ORDER BY monotonic_seq DESC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        )
-        return [self._row(r) for r in cur.fetchall()]
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT * FROM {self._table} {where} "
+                "ORDER BY monotonic_seq DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            )
+            return [self._row(r) for r in cur.fetchall()]
 
     def count(
         self,
@@ -224,11 +326,12 @@ class SQLiteStore:
             source_node_id=source_node_id, actor=actor, target=target,
             since=since, until=until,
         )
-        cur = self._conn.execute(
-            f"SELECT COUNT(*) FROM {self._table} {where}",
-            params,
-        )
-        return int(cur.fetchone()[0])
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT COUNT(*) FROM {self._table} {where}",
+                params,
+            )
+            return int(cur.fetchone()[0])
 
     def _row(self, r: tuple) -> AuditRow:
         return AuditRow(
