@@ -12,10 +12,9 @@
 
 Audit + correlation SDK.
 
-Logs, HTTP access trail, and typed audit rows — one `request_id` threads
-all three streams. 6 anchors (5 Ws + How) enforced at the type level;
-bundled shims for HTTP, MQTT, and scheduler-fired jobs. One mountable
-query surface. Apache-2.0.
+Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 6 anchors (5 Ws + How) enforced at the type level; bundled shims for HTTP, MQTT, and scheduler-fired jobs. 
+
+One mountable query (API endpoints) surface.
 
 **v1.0.0-beta.** Python is the reference SDK; Go / JS / Rust / C++ are
 beta. Not yet on PyPI / npm / crates.io — install from source.
