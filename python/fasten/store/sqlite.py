@@ -12,6 +12,7 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
@@ -163,7 +164,7 @@ class SQLiteStore:
         # `:memory:`).
         return self._connect()
 
-    def _txn(self):
+    def _txn(self) -> contextlib.AbstractContextManager[Any]:
         """Lock context for a compound operation.
 
         File-backed: per-thread connection means no inter-thread
