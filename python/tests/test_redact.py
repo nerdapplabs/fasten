@@ -88,3 +88,35 @@ def test_init_explicit_replacement_overrides_env(monkeypatch, mem_store):
         redact_replacement="<kwarg>",
     )
     assert fasten.redactor().redact({"password": "x"}) == {"password": "<kwarg>"}
+
+
+def test_redact_tolerates_non_string_keys(r):
+    """REVIEW #17: int / tuple keys must not crash re.search.
+
+    Adopters occasionally pass dicts whose keys aren't strings (e.g.
+    int-keyed lookup tables placed under detail). Earlier the redactor
+    would TypeError on the first non-str key and abort the whole emit.
+    """
+    detail = {
+        1: "first",
+        (2, 3): "tuple-keyed",
+        "api_key": "should-redact",
+        "nested": {42: "still-fine", "token": "secret"},
+    }
+    out = r.redact(detail)
+    assert out[1] == "first"
+    assert out[(2, 3)] == "tuple-keyed"
+    assert out["api_key"] == "***"
+    assert out["nested"][42] == "still-fine"
+    assert out["nested"]["token"] == "***"
+
+
+def test_structlog_processor_tolerates_non_string_keys():
+    """Same guard for the structlog processor path."""
+    r2 = Redactor()
+    proc = r2.as_structlog_processor()
+    event = {1: "ok", "api_key": "leak", "nested": {"password": "x"}}
+    out = proc(None, "info", dict(event))
+    assert out[1] == "ok"
+    assert out["api_key"] == "***"
+    assert out["nested"]["password"] == "***"

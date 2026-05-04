@@ -1,7 +1,10 @@
 name: JS SDK
 
 on:
+  # Restrict push to main + dev so PR branches don't run the suite
+  # twice (once for push, once for pull_request) on every commit.
   push:
+    branches: [main, dev]
     paths:
       - 'js/**'
       - '.github/workflows/fasten-js.yml'

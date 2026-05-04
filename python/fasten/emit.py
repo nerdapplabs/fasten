@@ -170,8 +170,13 @@ def init(
 def _drainer_sys_log(level: str, event: str, fields: dict[str, Any]) -> None:
     """Bridge from the drainer to the sys stream.
 
-    Non-recursive: writes only to the in-memory ring + stdout via the
-    transport. Never goes through ``emit()`` / the audit store.
+    Routes to ``write_drainer_syslog`` (stderr + ring), NOT
+    ``write_syslog`` (stdout + ring). Sharing stdout with emit() and
+    application logging would deadlock the drainer under stdout
+    backpressure (slow Docker log driver / blocked sidecar tail) → the
+    queue would never drain → emit() would block on capacity → the
+    process would freeze with no recovery path. Non-recursive in either
+    case: never goes through ``emit()`` / the audit store.
     """
     if _stdout is None:
         return
@@ -183,7 +188,7 @@ def _drainer_sys_log(level: str, event: str, fields: dict[str, Any]) -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         **fields,
     }
-    _stdout.write_syslog(payload)
+    _stdout.write_drainer_syslog(payload)
 
 
 def _next_seq() -> int:

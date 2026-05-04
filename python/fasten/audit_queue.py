@@ -88,6 +88,13 @@ class _AuditQueueDrainer:
         # single in-flight row makes "capacity" a lie.
         self._q: queue.Queue[Any] = queue.Queue()
         self._slots = threading.Semaphore(capacity)
+        # Parallel counter for occupied slots — incremented after a slot
+        # is acquired, decremented before it is released. Used by
+        # _used_slots() / stats() / flush() so callers don't have to read
+        # threading.Semaphore._value (a CPython implementation detail).
+        # All access goes through _stats_lock for consistency with the
+        # rest of the stats fields.
+        self._used_slots_count = 0
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
 
@@ -135,9 +142,10 @@ class _AuditQueueDrainer:
         # "max audit work pending", not just "max queued".
         self._slots.acquire()
         self._q.put(row)
-        used = self._used_slots()
         cap = self._capacity
         with self._stats_lock:
+            self._used_slots_count += 1
+            used = self._used_slots_count
             if used > self._high_water:
                 self._high_water = used
         # Threshold sys-log fires AFTER the row is pending so the warn lands
@@ -164,13 +172,24 @@ class _AuditQueueDrainer:
                 self._warn_high_water_emitted = False
                 self._err_high_water_emitted = False
 
-    def _free_permits(self) -> int:
-        # threading.Semaphore exposes _value (CPython impl detail). Stable
-        # across versions and cheaper than tracking a parallel counter.
-        return self._slots._value
-
     def _used_slots(self) -> int:
-        return self._capacity - self._free_permits()
+        # Reads the parallel counter (kept in sync with semaphore
+        # acquire/release) instead of poking at Semaphore._value, which
+        # is a CPython implementation detail.
+        with self._stats_lock:
+            return self._used_slots_count
+
+    def _release_slot(self) -> None:
+        """Release a slot permit + decrement the parallel counter atomically.
+
+        Decrement BEFORE the semaphore release so a put() that wakes up on
+        the freed permit reads a consistent counter. The reverse order
+        leaves a brief window where another emit() acquires a permit but
+        sees the OLD count, briefly over-reporting `used`.
+        """
+        with self._stats_lock:
+            self._used_slots_count -= 1
+        self._slots.release()
 
     def stats(self) -> dict[str, Any]:
         """Snapshot of queue + drainer state. See P1-15 spec for fields.
@@ -182,7 +201,7 @@ class _AuditQueueDrainer:
             now = time.monotonic()
             in_backoff = max(0.0, self._in_backoff_until - now)
             return {
-                "depth": self._used_slots(),
+                "depth": self._used_slots_count,
                 "capacity": self._capacity,
                 "high_water": self._high_water,
                 "drained_total": self._drained_total,
@@ -201,23 +220,32 @@ class _AuditQueueDrainer:
         self._thread.join(timeout=timeout)
 
     def flush(self, timeout: float = 5.0) -> bool:
-        """Block until every pending row reaches the store (or shutdown
-        abandon), or the timeout elapses. Returns True iff drained.
+        """Block until every row pending AT CALL TIME reaches the store
+        (or shutdown abandon), or the timeout elapses. Returns True iff
+        drained.
 
-        Uses the capacity semaphore as the canonical "rows pending"
-        indicator: the slot is acquired by emit() before queue.put and
-        released only after successful insert, so it covers the
-        transient window where a row has been popped from the queue
-        but ``_in_flight`` has not yet been incremented in
-        ``_drain_one``. Checking q + in_flight separately allowed
-        flush() to return prematurely during that gap.
+        Snapshot semantics: flush() targets the rows that exist when
+        flush() is invoked. Concurrent emit() calls during the wait do
+        not extend the flush horizon, otherwise a steady incoming rate
+        ≥ drain rate would keep flush() blocked until timeout even
+        though every row pending at call time was successfully drained.
+
+        Implementation: snapshot `drained_total + used_slots` under the
+        stats lock at call time → that is the value `drained_total` must
+        reach for everything-pending-now to have drained. Any row added
+        after the snapshot only bumps `drained_total` AFTER our target
+        is met, so it cannot block the flush.
         """
+        with self._stats_lock:
+            target = self._drained_total + self._used_slots_count
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._used_slots() == 0:
-                return True
+            with self._stats_lock:
+                if self._drained_total >= target:
+                    return True
             time.sleep(0.01)
-        return self._used_slots() == 0
+        with self._stats_lock:
+            return self._drained_total >= target
 
     # ── Drainer loop ───────────────────────────────────────────────────────
 
@@ -261,18 +289,18 @@ class _AuditQueueDrainer:
                         # is lost (matches best-effort shutdown contract).
                         # Release the slot so any blocked emit() can proceed
                         # before atexit returns.
-                        self._slots.release()
+                        self._release_slot()
                         slot_released = True
                         return
                     if self._wait_backoff():
                         # stop signalled mid-backoff — release slot.
-                        self._slots.release()
+                        self._release_slot()
                         slot_released = True
                         return
                     continue
 
                 self._on_success()
-                self._slots.release()
+                self._release_slot()
                 slot_released = True
                 return
         finally:
@@ -280,7 +308,7 @@ class _AuditQueueDrainer:
                 self._in_flight -= 1
             if not slot_released:
                 # Defensive: guarantee no permit leak under unexpected exits.
-                self._slots.release()
+                self._release_slot()
 
     def _on_failure(self, err: Exception) -> None:
         msg = f"{type(err).__name__}: {err}"
