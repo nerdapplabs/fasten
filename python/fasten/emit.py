@@ -28,6 +28,19 @@ from .redact import Redactor
 _lock = threading.Lock()
 _seq: int = 0
 
+
+def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
+    """Prefer explicit arg (even empty-string); fall back to env; then default.
+
+    Using truthiness (`arg or env`) silently ignores arg="" — the P0 #2 bug
+    that burned us on `redact_replacement`. This helper uses `is not None`
+    so callers can pass an intentional empty string.
+    """
+    if arg is not None:
+        return arg
+    v = os.environ.get(env_name)
+    return v if v is not None else default
+
 # Runtime config — populated by init()
 _service_id: str = ""
 _node_id: str = ""
@@ -53,6 +66,7 @@ def init(
     queue_retry_initial_ms: int = 100,
     queue_retry_max_ms: int = 60_000,
     queue_retry_jitter: bool = True,
+    queue_drain_max_attempts: int = 50,
 ) -> None:
     """
     Initialise fasten. Any argument omitted falls back to the corresponding env var.
@@ -95,9 +109,10 @@ def init(
     global _service_id, _node_id, _tenant_id, _audit_store, _api_store, _stdout, _redactor
     global _failure_strategy
 
-    _service_id = service_id or os.environ.get("FASTEN_SERVICE_ID") or ""
-    _node_id    = node_id    or os.environ.get("FASTEN_NODE_ID")    or ""
-    _tenant_id  = tenant_id  or os.environ.get("FASTEN_TENANT_ID") or None
+    _service_id = _pick(service_id, "FASTEN_SERVICE_ID")
+    _node_id    = _pick(node_id,    "FASTEN_NODE_ID")
+    env_tid     = os.environ.get("FASTEN_TENANT_ID")
+    _tenant_id  = tenant_id if tenant_id is not None else (env_tid or None)
 
     if not _service_id or not _node_id:
         raise RuntimeError(
@@ -119,6 +134,14 @@ def init(
         from .store.sqlite import SQLiteStore
         _audit_store = SQLiteStore.from_dsn(dsn)
 
+    # Seed monotonic_seq from the store so post-restart rows never duplicate
+    # (timestamp, seq) with pre-restart rows on the same node. Falls back to 0
+    # for stores that don't implement max_monotonic_seq().
+    global _seq
+    if _audit_store is not None and hasattr(_audit_store, "max_monotonic_seq"):
+        with _lock:
+            _seq = _audit_store.max_monotonic_seq()
+
     if api_store is not None:
         _api_store = api_store
     else:
@@ -135,7 +158,7 @@ def init(
     # init() is called with no kwargs. The earlier truthy default
     # short-circuited the `or` and silently ignored
     # FASTEN_REDACT_REPLACEMENT for every adopter using env-only config.
-    replacement = redact_replacement or os.environ.get("FASTEN_REDACT_REPLACEMENT", "***")
+    replacement = _pick(redact_replacement, "FASTEN_REDACT_REPLACEMENT", "***")
     _redactor = Redactor(
         extra_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
         replacement=replacement,
@@ -160,6 +183,7 @@ def init(
             retry_initial_ms=queue_retry_initial_ms,
             retry_max_ms=queue_retry_max_ms,
             retry_jitter=queue_retry_jitter,
+            max_attempts=queue_drain_max_attempts,
         )
     else:
         # Raise mode: ensure no stale drainer thread is left running.

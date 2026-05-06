@@ -146,6 +146,7 @@ struct Meta {
 // ── Row ────────────────────────────────────────────────────────────────────
 
 struct Row {
+    std::string wire_version     = "1";  // wire schema version; readers tolerate higher values
     std::string id;                  // evt-<20 hex chars>
     std::string origin_id;           // dedup key for replication
     int64_t     monotonic_seq   = 0;
@@ -155,7 +156,7 @@ struct Row {
     std::string severity;
     std::string service_id;
     std::string source_node_id;
-    std::string tenant_id;
+    std::string tenant_id;           // empty = null on wire
     std::string actor           = "system";
     std::string actor_kind      = "service";
     std::string target;
@@ -385,6 +386,9 @@ struct QueueStats {
     std::size_t retry_count_active   = 0;
     double      in_backoff_seconds   = 0.0;
     std::string last_error;
+    std::size_t dead_lettered_total  = 0;
+    std::size_t dead_letter_depth    = 0;
+    std::string capacity_semantics   = "block";
 };
 
 namespace detail_ {
@@ -404,13 +408,15 @@ class AuditQueueDrainer {
                       std::size_t capacity,
                       std::chrono::milliseconds retry_initial,
                       std::chrono::milliseconds retry_max,
-                      bool retry_jitter)
+                      bool retry_jitter,
+                      std::size_t max_attempts = 50)
         : sink_(std::move(sink)),
           sys_log_(std::move(sys_log)),
           capacity_(capacity),
           retry_initial_(retry_initial),
           retry_max_(retry_max),
           retry_jitter_(retry_jitter),
+          max_attempts_(max_attempts),
           slots_free_(capacity),
           rng_(std::random_device{}()) {
         thread_ = std::thread([this] { run(); });
@@ -466,11 +472,11 @@ class AuditQueueDrainer {
     QueueStats stats() const {
         std::lock_guard<std::mutex> lk(stats_mu_);
         QueueStats s;
-        s.depth              = used_count_;
-        s.capacity           = capacity_;
-        s.high_water         = high_water_;
-        s.drained_total      = drained_total_;
-        s.retry_count_active = retry_count_;
+        s.depth               = used_count_;
+        s.capacity            = capacity_;
+        s.high_water          = high_water_;
+        s.drained_total       = drained_total_;
+        s.retry_count_active  = retry_count_;
         if (in_backoff_until_ms_ > 0) {
             auto now_ms = static_cast<int64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -478,7 +484,10 @@ class AuditQueueDrainer {
             int64_t rem = in_backoff_until_ms_ - now_ms;
             if (rem > 0) s.in_backoff_seconds = static_cast<double>(rem) / 1000.0;
         }
-        s.last_error = last_error_;
+        s.last_error           = last_error_;
+        s.dead_lettered_total  = dead_lettered_total_;
+        s.dead_letter_depth    = dlq_.size();
+        s.capacity_semantics   = "block";
         return s;
     }
 
@@ -542,17 +551,27 @@ class AuditQueueDrainer {
     void drain_one(const Row& row, bool in_shutdown) {
         { std::lock_guard<std::mutex> lk(stats_mu_); ++in_flight_; }
         bool slot_released = false;
+        std::size_t attempt = 0;
         for (;;) {
+            ++attempt;
             try {
                 sink_(row);
                 on_success();
                 release_slot(); slot_released = true;
                 break;
             } catch (const std::exception& e) {
+                if (attempt >= max_attempts_) {
+                    on_dead_letter(row, attempt, e.what());
+                    release_slot(); slot_released = true; break;
+                }
                 on_failure(e.what());
                 if (in_shutdown) { release_slot(); slot_released = true; break; }
                 if (wait_backoff()) { release_slot(); slot_released = true; break; }
             } catch (...) {
+                if (attempt >= max_attempts_) {
+                    on_dead_letter(row, attempt, "unknown exception");
+                    release_slot(); slot_released = true; break;
+                }
                 on_failure("unknown exception");
                 if (in_shutdown) { release_slot(); slot_released = true; break; }
                 if (wait_backoff()) { release_slot(); slot_released = true; break; }
@@ -660,6 +679,21 @@ class AuditQueueDrainer {
         }
     }
 
+    void on_dead_letter(const Row& row, std::size_t attempt, const std::string& msg) {
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            ++dead_lettered_total_;
+            retry_count_ = 0;
+            last_error_  = msg;
+            if (dlq_.size() >= 10) dlq_.pop_front();
+            dlq_.push_back(row);
+        }
+        sys_log_("error", "audit_drain_dead_letter",
+                 {{"row_id", row.id},
+                  {"attempt_count", std::to_string(attempt)},
+                  {"last_error", msg}});
+    }
+
     bool wait_backoff() {
         std::size_t n;
         { std::lock_guard<std::mutex> lk(stats_mu_); n = retry_count_; }
@@ -702,6 +736,7 @@ class AuditQueueDrainer {
     std::chrono::milliseconds       retry_initial_;
     std::chrono::milliseconds       retry_max_;
     bool                            retry_jitter_;
+    std::size_t                     max_attempts_;
 
     std::queue<Row>                 q_;
     mutable std::mutex              q_mu_;
@@ -728,9 +763,11 @@ class AuditQueueDrainer {
     int64_t                         in_backoff_until_ms_         = 0;
     int64_t                         failure_burst_started_at_ms_ = 0;
     std::string                     last_error_;
-    bool                            warn_hw_fired_  = false;
-    bool                            err_hw_fired_   = false;
-    bool                            degraded_fired_ = false;
+    bool                            warn_hw_fired_      = false;
+    bool                            err_hw_fired_       = false;
+    bool                            degraded_fired_     = false;
+    std::size_t                     dead_lettered_total_ = 0;
+    std::deque<Row>                 dlq_;               // bounded ring, max 10
 
     std::mt19937_64                 rng_;
 };
@@ -796,7 +833,8 @@ inline Fields redact(const Fields& f) {
 
 inline std::string Row::to_json() const {
     std::string js = "{";
-    js += "\"id\":"              + detail_::json_str(id);
+    js += "\"wire_version\":"    + detail_::json_str(wire_version);
+    js += ",\"id\":"             + detail_::json_str(id);
     js += ",\"origin_id\":"      + detail_::json_str(origin_id);
     js += ",\"monotonic_seq\":"  + std::to_string(monotonic_seq);
     js += ",\"timestamp\":"      + detail_::json_str(timestamp);
@@ -805,7 +843,7 @@ inline std::string Row::to_json() const {
     js += ",\"severity\":"       + detail_::json_str(severity);
     js += ",\"service_id\":"     + detail_::json_str(service_id);
     js += ",\"source_node_id\":" + detail_::json_str(source_node_id);
-    js += ",\"tenant_id\":"      + detail_::json_str(tenant_id);
+    js += ",\"tenant_id\":"      + (tenant_id.empty() ? "null" : detail_::json_str(tenant_id));
     js += ",\"actor\":"          + detail_::json_str(actor);
     js += ",\"actor_kind\":"     + detail_::json_str(actor_kind);
     js += ",\"target\":"         + detail_::json_str(target);
@@ -1315,6 +1353,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
 
     // NDJSON to stdout — Docker log driver captures and rotates.
     std::cout << "{\"shape\":\"audit\""
+              << ",\"wire_version\":"   << detail_::json_str(row.wire_version)
               << ",\"id\":"             << detail_::json_str(row.id)
               << ",\"origin_id\":"      << detail_::json_str(row.origin_id)
               << ",\"monotonic_seq\":"  << row.monotonic_seq
@@ -1324,7 +1363,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
               << ",\"severity\":"       << detail_::json_str(row.severity)
               << ",\"service_id\":"     << detail_::json_str(row.service_id)
               << ",\"source_node_id\":" << detail_::json_str(row.source_node_id)
-              << ",\"tenant_id\":"      << detail_::json_str(row.tenant_id)
+              << ",\"tenant_id\":"      << (row.tenant_id.empty() ? "null" : detail_::json_str(row.tenant_id))
               << ",\"actor\":"          << detail_::json_str(row.actor)
               << ",\"actor_kind\":"     << detail_::json_str(row.actor_kind)
               << ",\"target\":"         << detail_::json_str(row.target)

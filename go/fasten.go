@@ -109,6 +109,7 @@ const (
 
 // Row is the canonical audit row — lossless conversion to CloudEvent / OTel.
 type Row struct {
+	WireVersion  string         `json:"wire_version"`
 	ID           string         `json:"id"`
 	OriginID     string         `json:"origin_id"`
 	MonotonicSeq int64          `json:"monotonic_seq"`
@@ -118,7 +119,9 @@ type Row struct {
 	Severity     Severity       `json:"severity"`
 	ServiceID    string         `json:"service_id"`
 	SourceNodeID string         `json:"source_node_id"`
-	TenantID     string         `json:"tenant_id,omitempty"`
+	// TenantID is always emitted (null when absent) per the "always emit the
+	// key" convention so readers see a consistent shape across SDKs.
+	TenantID     *string        `json:"tenant_id"`
 	Actor        string         `json:"actor"`
 	ActorKind    string         `json:"actor_kind"`
 	Target       string         `json:"target"`
@@ -127,8 +130,7 @@ type Row struct {
 	Method       string         `json:"method"`
 	RequestID    string         `json:"request_id"`
 	Detail       map[string]any `json:"detail"`
-	// P1-5: stamped true when the code declares PiiInDetail=true. Lets the
-	// retention sweep + compliance reports filter PII rows distinctly.
+	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
 }
@@ -306,6 +308,7 @@ type Config struct {
 	QueueRetryInitial         time.Duration // default 100 * time.Millisecond
 	QueueRetryMax             time.Duration // default 60 * time.Second
 	DisableQueueJitter        bool          // zero (default) = jitter ON
+	QueueDrainMaxAttempts     int           // default 50; row → DLQ after this many failures
 }
 
 // Init configures fasten. Must be called once before Emit.
@@ -320,6 +323,13 @@ func Init(cfg Config) error {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
 	_auditStore = cfg.AuditStore
+	// Seed monotonic_seq so post-restart rows never duplicate (timestamp, seq)
+	// with pre-restart rows on the same node.
+	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
+		if max, err := seeder.MaxMonotonicSeq(context.Background()); err == nil {
+			atomic.StoreInt64(&_seq, max)
+		}
+	}
 	_transport = NewTransport(2000)
 
 	// P1-15: failure strategy + drainer wiring.
@@ -355,6 +365,10 @@ func Init(cfg Config) error {
 		if retryMax <= 0 {
 			retryMax = 60 * time.Second
 		}
+		maxAttempts := cfg.QueueDrainMaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 50
+		}
 		installDrainer(
 			_auditStore,
 			drainerSysLog,
@@ -362,6 +376,7 @@ func Init(cfg Config) error {
 			retryInitial,
 			retryMax,
 			!cfg.DisableQueueJitter,
+			maxAttempts,
 		)
 	} else {
 		// Raise mode (or no store) — no drainer thread.
@@ -428,7 +443,12 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 	seq := atomic.AddInt64(&_seq, 1)
 	id := "evt-" + mintLong()
 
+	var tid *string
+	if _tenantID != "" {
+		tid = &_tenantID
+	}
 	row := Row{
+		WireVersion:  "1",
 		ID:           id,
 		OriginID:     id,
 		MonotonicSeq: seq,
@@ -438,7 +458,7 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 		Severity:     m.Severity,
 		ServiceID:    _serviceID,
 		SourceNodeID: _nodeID,
-		TenantID:     _tenantID,
+		TenantID:     tid,
 		Actor:        "system",
 		ActorKind:    "service",
 		Target:       "",
@@ -573,10 +593,13 @@ func firstNonEmpty(vals ...string) string {
 
 func rowToMap(r Row) map[string]any {
 	d := map[string]any{
+		"wire_version": r.WireVersion,
 		"id": r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
 		"timestamp": r.Timestamp.Format(time.RFC3339Nano),
 		"code": string(r.Code), "action": r.Action, "severity": string(r.Severity),
-		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": r.TenantID,
+		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": func() any {
+			if r.TenantID != nil { return *r.TenantID }; return nil
+		}(),
 		"actor": r.Actor, "actor_kind": r.ActorKind,
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
@@ -589,6 +612,13 @@ func rowToMap(r Row) map[string]any {
 }
 
 // ── AuditRepository interface ─────────────────────────────────────────────
+
+// SeqSeeder is an optional extension of AuditRepository. Stores that implement
+// it allow Init() to seed monotonic_seq from persisted rows so post-restart
+// rows never collide on (timestamp, seq) with pre-restart rows.
+type SeqSeeder interface {
+	MaxMonotonicSeq(ctx context.Context) (int64, error)
+}
 
 // AuditRepository is the durable store contract.
 type AuditRepository interface {

@@ -77,6 +77,9 @@ class AuditRow:
     # retention sweep + compliance reports filter PII rows distinctly.
     pii_in_detail: bool = False
 
+    # wire schema version — readers MUST tolerate higher values on best-effort
+    wire_version: str = "1"
+
     # replication marker (edge only)
     shipped_at: Optional[datetime] = None
 

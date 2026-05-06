@@ -22,6 +22,7 @@ full design + acceptance criteria.
 from __future__ import annotations
 
 import atexit
+import collections
 import queue
 import random
 import threading
@@ -62,6 +63,9 @@ class _AuditQueueDrainer:
     # Drainer reports "degraded" once retry_count crosses this floor.
     _DEGRADED_AFTER = 5
 
+    # Default max insert attempts before a row is dead-lettered.
+    _MAX_ATTEMPTS = 50
+
     def __init__(
         self,
         store: Any,
@@ -71,6 +75,7 @@ class _AuditQueueDrainer:
         retry_initial_ms: int = 100,
         retry_max_ms: int = 60_000,
         retry_jitter: bool = True,
+        max_attempts: int = 50,
     ) -> None:
         self._store = store
         # sys_log(level, event, fields) — non-recursive: writes to ring +
@@ -80,6 +85,7 @@ class _AuditQueueDrainer:
         self._retry_initial_ms = retry_initial_ms
         self._retry_max_ms = retry_max_ms
         self._retry_jitter = retry_jitter
+        self._max_attempts = max_attempts
 
         # Capacity is enforced by a semaphore over (queued + in-flight) rows
         # rather than just queue depth. A row the drainer is currently
@@ -108,6 +114,10 @@ class _AuditQueueDrainer:
         # In-flight = row popped from queue but not yet inserted. Tracked so
         # flush() doesn't return prematurely while a slow insert is mid-call.
         self._in_flight = 0
+        # Dead-letter queue: bounded ring of rows that exceeded max_attempts.
+        # Oldest falls off automatically (maxlen). Access under _stats_lock.
+        self._dlq: collections.deque = collections.deque(maxlen=10)
+        self._dead_lettered_total = 0
 
         # Threshold debouncing — only emit transition once per crossing.
         self._warn_high_water_emitted = False
@@ -208,6 +218,9 @@ class _AuditQueueDrainer:
                 "retry_count_active": self._retry_count,
                 "in_backoff_seconds": round(in_backoff, 3),
                 "last_error": self._last_error,
+                "dead_lettered_total": self._dead_lettered_total,
+                "dead_letter_depth": len(self._dlq),
+                "capacity_semantics": "block",
             }
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -278,17 +291,23 @@ class _AuditQueueDrainer:
         with self._stats_lock:
             self._in_flight += 1
         slot_released = False
+        attempt = 0
         try:
             while True:
+                attempt += 1
                 try:
                     self._store.insert(row)
                 except Exception as e:  # noqa: BLE001 — drainer must catch all
+                    if attempt >= self._max_attempts:
+                        # Row cannot be inserted after max_attempts. Move it to
+                        # the DLQ ring so the pipeline makes progress on others.
+                        self._on_dead_letter(row, attempt, e)
+                        self._release_slot()
+                        slot_released = True
+                        return
                     self._on_failure(e)
                     if in_shutdown:
-                        # Process is exiting; one attempt is enough. The row
-                        # is lost (matches best-effort shutdown contract).
-                        # Release the slot so any blocked emit() can proceed
-                        # before atexit returns.
+                        # Process is exiting; one attempt is enough.
                         self._release_slot()
                         slot_released = True
                         return
@@ -360,6 +379,20 @@ class _AuditQueueDrainer:
                 {"recovery_after_seconds": round(recovered_after, 3)},
             )
 
+    def _on_dead_letter(self, row: Any, attempt: int, err: Exception) -> None:
+        msg = f"{type(err).__name__}: {err}"
+        row_id = getattr(row, "id", None)
+        with self._stats_lock:
+            self._dlq.appendleft(row)
+            self._dead_lettered_total += 1
+            self._retry_count = 0
+            self._last_error = msg
+        self._sys_log("error", "audit_drain_dead_letter", {
+            "row_id": row_id,
+            "attempt_count": attempt,
+            "last_error": msg,
+        })
+
     def _wait_backoff(self) -> bool:
         """Sleep the current backoff window; return True if stop was signalled."""
         with self._stats_lock:
@@ -398,6 +431,7 @@ def install(
     retry_initial_ms: int,
     retry_max_ms: int,
     retry_jitter: bool,
+    max_attempts: int = 50,
 ) -> _AuditQueueDrainer:
     """Replace the active drainer (called from ``init()``).
 
@@ -417,6 +451,7 @@ def install(
         retry_initial_ms=retry_initial_ms,
         retry_max_ms=retry_max_ms,
         retry_jitter=retry_jitter,
+        max_attempts=max_attempts,
     )
     with _install_lock:
         old = _drainer

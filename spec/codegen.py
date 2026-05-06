@@ -336,8 +336,6 @@ ADAPTERS = [
             "//", gen_js),
     Adapter("rust",   ROOT / "rust" / "src" / "lib.rs",
             "//", gen_rust),
-    Adapter("java",   ROOT / "java" / "src" / "main" / "java" / "sh" / "fasten" / "Fasten.java",
-            "//", gen_java),
     Adapter("cpp",    ROOT / "cpp" / "include" / "fasten.hpp",
             "//", gen_cpp),
 ]

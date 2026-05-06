@@ -30,13 +30,14 @@ export class AuditStoreError extends Error {
 }
 
 class AuditQueueDrainer {
-    constructor({ store, sysLog, capacity, retryInitialMs, retryMaxMs, retryJitter }) {
+    constructor({ store, sysLog, capacity, retryInitialMs, retryMaxMs, retryJitter, maxAttempts = 50 }) {
         this._store = store;
         this._sysLog = sysLog;
         this._capacity = capacity;
         this._retryInitialMs = retryInitialMs;
         this._retryMaxMs = retryMaxMs;
         this._retryJitter = retryJitter;
+        this._maxAttempts = maxAttempts;
 
         this._q = [];
         this._inFlight = 0;       // row popped but insert not yet resolved
@@ -49,6 +50,8 @@ class AuditQueueDrainer {
         this._inBackoffUntilMs = 0;
         this._lastError = null;
         this._failureBurstStartedAt = null;
+        this._deadLetteredTotal = 0;
+        this._dlq = [];           // bounded ring, max 10 entries
 
         // Threshold debouncing
         this._warnHWFired = false;
@@ -102,6 +105,9 @@ class AuditQueueDrainer {
             retry_count_active: this._retryCount,
             in_backoff_seconds: remMs > 0 ? Math.round(remMs) / 1000 : 0,
             last_error: this._lastError,
+            dead_lettered_total: this._deadLetteredTotal,
+            dead_letter_depth: this._dlq.length,
+            capacity_semantics: 'warn_only',
         };
     }
 
@@ -137,18 +143,38 @@ class AuditQueueDrainer {
     }
 
     async _drainOne(row) {
+        let attempt = 0;
         for (;;) {
+            attempt++;
             try {
                 await this._store.insert(row);
                 this._onSuccess();
                 return;
             } catch (err) {
+                if (attempt >= this._maxAttempts) {
+                    this._onDeadLetter(row, attempt, err);
+                    return;
+                }
                 this._onFailure(err);
                 if (this._stopped) return;
                 const cont = await this._waitBackoff();
                 if (!cont) return;
             }
         }
+    }
+
+    _onDeadLetter(row, attempt, err) {
+        const msg = `${err?.name ?? 'Error'}: ${err?.message ?? err}`;
+        this._deadLetteredTotal++;
+        this._retryCount = 0;
+        this._lastError = msg;
+        if (this._dlq.length >= 10) this._dlq.shift();
+        this._dlq.push(row);
+        this._sysLog('error', 'audit_drain_dead_letter', {
+            row_id: row?.id ?? null,
+            attempt_count: attempt,
+            last_error: msg,
+        });
     }
 
     _onFailure(err) {
@@ -218,7 +244,7 @@ let _drainer = null;
 
 export function installDrainer({
     store, sysLog, capacity = 100,
-    retryInitialMs = 100, retryMaxMs = 60_000, retryJitter = true,
+    retryInitialMs = 100, retryMaxMs = 60_000, retryJitter = true, maxAttempts = 50,
 }) {
     // Race-safe re-init: build new first, swap atomically, then flush +
     // stop the old asynchronously. Concurrent emit() that grabbed the
@@ -227,7 +253,7 @@ export function installDrainer({
     // abandoned sys event) — no silent loss into a dead queue.
     const next = new AuditQueueDrainer({
         store, sysLog, capacity,
-        retryInitialMs, retryMaxMs, retryJitter,
+        retryInitialMs, retryMaxMs, retryJitter, maxAttempts,
     });
     const old = _drainer;
     _drainer = next;

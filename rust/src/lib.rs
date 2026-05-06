@@ -126,6 +126,8 @@ pub enum Anchor {
 /// Canonical audit row — wire shape matches spec/row-schema.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
+    pub wire_version: String,
+
     pub id: String,
     pub origin_id: String,
     pub monotonic_seq: u64,
@@ -138,7 +140,7 @@ pub struct Row {
 
     pub service_id: String,
     pub source_node_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Always emit the key (null when absent) so readers see a consistent shape.
     pub tenant_id: Option<String>,
 
     pub actor: String,
@@ -480,6 +482,8 @@ pub struct Config {
     pub queue_retry_max: Option<Duration>,
     /// Disable ±20 % jitter (default: jitter ON).
     pub disable_queue_jitter: bool,
+    /// Max insert attempts before a row is dead-lettered. Default: 50.
+    pub queue_drain_max_attempts: Option<usize>,
 }
 
 /// Read env vars; return Config.
@@ -536,6 +540,7 @@ pub fn init(cfg: Config) -> Result<(), Error> {
     let retry_initial = cfg.queue_retry_initial.unwrap_or(Duration::from_millis(100));
     let retry_max = cfg.queue_retry_max.unwrap_or(Duration::from_secs(60));
     let retry_jitter = !cfg.disable_queue_jitter;
+    let max_attempts = cfg.queue_drain_max_attempts.unwrap_or(50);
 
     let mut cfg_to_store = cfg;
     cfg_to_store.audit_store_failure_strategy = Some(strategy.clone());
@@ -551,6 +556,7 @@ pub fn init(cfg: Config) -> Result<(), Error> {
                 retry_initial,
                 retry_max,
                 retry_jitter,
+                max_attempts,
             );
         } else {
             audit_queue::uninstall_drainer();
@@ -715,6 +721,7 @@ impl EmitBuilder {
             redact_detail(self.detail, cfg.extra_redact_keys.as_deref())
         };
         let row = Row {
+            wire_version: "1".into(),
             id: id.clone(),
             origin_id: id,
             monotonic_seq: seq_next(),

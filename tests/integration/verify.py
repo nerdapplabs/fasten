@@ -34,6 +34,7 @@ import sys
 from typing import Any
 
 REQUIRED_AUDIT_FIELDS = {
+    "wire_version",
     "shape", "id", "origin_id", "monotonic_seq", "timestamp",
     "code", "action", "severity",
     "service_id", "source_node_id",
@@ -104,6 +105,8 @@ def main() -> None:
     if missing:
         fail(f"audit row missing fields: {sorted(missing)}", audit)
 
+    if audit.get("wire_version") != "1":
+        fail(f"audit.wire_version must be '1', got {audit.get('wire_version')!r}", audit)
     if not ID_RE.match(audit["id"]):
         fail(f"audit.id does not match evt-<hex>: {audit['id']}")
     if not REQ_ID_RE.match(audit["request_id"]):

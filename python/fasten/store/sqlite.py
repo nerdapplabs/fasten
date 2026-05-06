@@ -326,6 +326,14 @@ class SQLiteStore:
             )
             return int(cur.fetchone()[0])
 
+    def max_monotonic_seq(self) -> int:
+        """Return MAX(monotonic_seq) for seeding _seq at init; 0 if no rows."""
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}"
+            )
+            return int(cur.fetchone()[0])
+
     def _row(self, r: tuple) -> AuditRow:
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],

@@ -252,6 +252,7 @@ export function init(opts = {}) {
             retryInitialMs: opts.queueRetryInitialMs ?? 100,
             retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
             retryJitter: opts.queueRetryJitter ?? true,
+            maxAttempts: opts.queueDrainMaxAttempts ?? 50,
         });
     } else {
         _uninstallDrainer();
@@ -304,6 +305,7 @@ export function emit({ code, target, actor = 'system', actorKind = 'service',
     }
 
     const row = {
+        wire_version: '1',
         id,
         origin_id: id,
         monotonic_seq: ++seq,

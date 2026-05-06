@@ -5,6 +5,7 @@
   "description": "Canonical fasten audit row (NDJSON stdout, shape=audit). This file is the single source of truth for enum vocabulary and redact rules — generated into all language adapters by spec/codegen.py.",
   "type": "object",
   "required": [
+    "wire_version",
     "id", "origin_id", "monotonic_seq", "timestamp",
     "code", "action", "severity",
     "service_id", "source_node_id",
@@ -13,6 +14,7 @@
     "method", "request_id", "detail"
   ],
   "properties": {
+    "wire_version":   { "type": "string", "const": "1", "description": "Schema version; readers MUST tolerate higher values on best-effort." },
     "shape":          { "type": "string", "const": "audit" },
     "id":             { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "evt-<20 hex chars>" },
     "origin_id":      { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "Dedup key for replication; equals id on first emission." },

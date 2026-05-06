@@ -74,6 +74,9 @@ pub struct QueueStats {
     pub retry_count_active: usize,
     pub in_backoff_seconds: f64,
     pub last_error: Option<String>,
+    pub dead_lettered_total: usize,
+    pub dead_letter_depth: usize,
+    pub capacity_semantics: &'static str,
 }
 
 /// Counting semaphore (no `std::sync::Semaphore` in stable yet).
@@ -128,6 +131,8 @@ struct Stats {
     warn_hw_fired: bool,
     err_hw_fired: bool,
     degraded_fired: bool,
+    dead_lettered_total: usize,
+    dlq: VecDeque<Row>,
 }
 
 pub(crate) struct DrainerInner {
@@ -137,6 +142,7 @@ pub(crate) struct DrainerInner {
     retry_initial: Duration,
     retry_max: Duration,
     retry_jitter: bool,
+    max_attempts: usize,
 
     queue: Mutex<VecDeque<Row>>,
     queue_cv: Condvar,
@@ -159,6 +165,7 @@ impl Drainer {
         retry_initial: Duration,
         retry_max: Duration,
         retry_jitter: bool,
+        max_attempts: usize,
     ) -> Arc<Self> {
         let inner = Arc::new(DrainerInner {
             store,
@@ -167,6 +174,7 @@ impl Drainer {
             retry_initial,
             retry_max,
             retry_jitter,
+            max_attempts,
             queue: Mutex::new(VecDeque::with_capacity(capacity)),
             queue_cv: Condvar::new(),
             slots: Sem::new(capacity),
@@ -278,6 +286,9 @@ impl Drainer {
             retry_count_active: s.retry_count,
             in_backoff_seconds: in_backoff,
             last_error: s.last_error.clone(),
+            dead_lettered_total: s.dead_lettered_total,
+            dead_letter_depth: s.dlq.len(),
+            capacity_semantics: "block",
         }
     }
 
@@ -373,7 +384,9 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
         }
     };
 
+    let mut attempt = 0usize;
     loop {
+        attempt += 1;
         match inner.store.insert(&row) {
             Ok(()) => {
                 on_success(inner);
@@ -381,6 +394,11 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
                 break;
             }
             Err(e) => {
+                if attempt >= inner.max_attempts {
+                    on_dead_letter(inner, &row, attempt, &e);
+                    release_slot(&mut slot_released);
+                    break;
+                }
                 on_failure(inner, &e);
                 if in_shutdown {
                     // Shutdown contract: one attempt, abandon on
@@ -404,6 +422,29 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
     if !slot_released {
         inner.slots.release();
     }
+}
+
+fn on_dead_letter(inner: &Arc<DrainerInner>, row: &Row, attempt: usize, err: &Error) {
+    let msg = err.to_string();
+    {
+        let mut s = inner.stats.lock_or_recover();
+        s.dead_lettered_total += 1;
+        s.retry_count = 0;
+        s.last_error = Some(msg.clone());
+        if s.dlq.len() >= 10 {
+            s.dlq.pop_front();
+        }
+        s.dlq.push_back(row.clone());
+    }
+    (inner.sys_log)(
+        "error",
+        "audit_drain_dead_letter",
+        &serde_json::json!({
+            "row_id": row.id,
+            "attempt_count": attempt,
+            "last_error": msg,
+        }),
+    );
 }
 
 fn on_failure(inner: &Arc<DrainerInner>, err: &Error) {
@@ -534,6 +575,7 @@ pub(crate) fn install_drainer(
     retry_initial: Duration,
     retry_max: Duration,
     retry_jitter: bool,
+    max_attempts: usize,
 ) -> Arc<Drainer> {
     // Race-safe re-init: build the new drainer FIRST, swap the global
     // pointer atomically, then flush + shutdown the old one OUTSIDE the
@@ -549,6 +591,7 @@ pub(crate) fn install_drainer(
         retry_initial,
         retry_max,
         retry_jitter,
+        max_attempts,
     );
     let old = {
         let mut slot = drainer_slot().lock_or_recover();
