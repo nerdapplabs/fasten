@@ -3,6 +3,7 @@
 [![Python SDK](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-py.yml/badge.svg)](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-py.yml)
 [![Go SDK](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-go.yml/badge.svg)](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-go.yml)
 [![JS SDK](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-js.yml/badge.svg)](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-js.yml)
+[![Rust SDK](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-rust.yml/badge.svg)](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-rust.yml)
 [![C++ SDK](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-cpp.yml/badge.svg)](https://github.com/nerdapplabs/fasten/actions/workflows/fasten-cpp.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.0.0--beta-teal.svg)](CHANGELOG.md)
@@ -105,14 +106,14 @@ is permitted.
 
 ## Languages
 
-| Language   | Status                    | Location                                          |
-|------------|---------------------------|---------------------------------------------------|
-| Python     | reference                 | [`python/`](python/)                              |
-| Go         | usable                    | [`go/`](go/)                                      |
-| Node.js / TypeScript | beta            | [`js/`](js/)                                      |
-| Rust       | beta                      | [`rust/`](rust/)                                  |
-| C++14      | single-header             | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp)|
-| Java       | placeholder               | [`java/`](java/)                                  |
+| Language             | Status        | Min runtime | Location                                           |
+|----------------------|---------------|-------------|----------------------------------------------------|
+| Python               | reference     | 3.10        | [`python/`](python/)                               |
+| Go                   | usable        | 1.21        | [`go/`](go/)                                       |
+| Node.js / TypeScript | beta          | Node 18     | [`js/`](js/)                                       |
+| Rust                 | beta          | 1.70        | [`rust/`](rust/)                                   |
+| C++                  | single-header | C++14       | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp) |
+| Java                 | placeholder   | —           | [`java/`](java/)                                   |
 
 Audit-store failure handling — the queue-mode default that keeps
 `emit()` off the request path — is shipped in all 5 SDKs (Python,
@@ -121,6 +122,21 @@ into 5xxs on the request path: rows queue with exponential backoff
 and the drainer self-reports queue health on the sys stream.
 Adopters who want loud failures during config debugging opt in via
 `audit_store_failure_strategy="raise"`.
+
+### Wire schema versioning
+
+Every audit row carries `"wire_version": "1"`. This field exists so
+that tools reading fasten output — log ingestors, compliance
+dashboards, replication outboxes — can tell which schema they are
+looking at, even years after the row was written.
+
+The contract is forward-compatible: **readers must accept any
+`wire_version` value higher than what they know about** and process
+the row on a best-effort basis. A reader that hard-rejects unknown
+versions will break silently when fasten releases a future schema
+revision. If fasten ever changes the row shape in a way that could
+break readers (renaming a required field, changing a type), it will
+bump the version number so readers have an explicit signal to act on.
 
 ---
 
