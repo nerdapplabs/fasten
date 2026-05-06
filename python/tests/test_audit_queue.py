@@ -14,7 +14,6 @@ Coverage maps to the spec test plan:
 """
 from __future__ import annotations
 
-import importlib
 import threading
 import time
 
@@ -22,8 +21,6 @@ import pytest
 
 import fasten
 from fasten import audit_queue as _aq
-
-_emit_mod = importlib.import_module("fasten.emit")
 
 
 # ── Stub stores ────────────────────────────────────────────────────────────

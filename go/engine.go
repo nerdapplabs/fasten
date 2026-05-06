@@ -1,0 +1,308 @@
+package fasten
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Engine holds all runtime state for one fasten deployment context.
+//
+// The package-level free functions (Init, Emit, …) delegate to Default.
+// Applications that need multiple isolated fasten configurations in one
+// process — multi-tenant services, test isolation — construct Engine
+// instances directly:
+//
+//	a := &fasten.Engine{}
+//	a.Init(fasten.Config{ServiceID: "tenant-a", AuditStore: storeA})
+//	a.Emit(ctx, "ORDER_PLACED", fasten.Target("order/123"))
+type Engine struct {
+	serviceID       string
+	nodeID          string
+	tenantID        string
+	auditStore      AuditRepository
+	xport           *Transport
+	seq             int64 // accessed via atomic ops
+	failureStrategy string
+
+	drainerMu sync.Mutex
+	drainer   *auditQueueDrainer
+}
+
+// Default is the package-level Engine used by all free-function API calls.
+var Default = &Engine{}
+
+// Init configures this Engine. See the package-level Config docs for details.
+func (e *Engine) Init(cfg Config) error {
+	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
+	e.nodeID    = firstNonEmpty(cfg.NodeID,    envOr("FASTEN_NODE_ID", ""))
+	e.tenantID  = firstNonEmpty(cfg.TenantID,  envOr("FASTEN_TENANT_ID", ""))
+
+	if e.serviceID == "" || e.nodeID == "" {
+		return errors.New("fasten.Init: ServiceID and NodeID are required")
+	}
+	e.auditStore = cfg.AuditStore
+	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
+		if max, err := seeder.MaxMonotonicSeq(context.Background()); err == nil {
+			atomic.StoreInt64(&e.seq, max)
+		}
+	}
+	e.xport = NewTransport(2000)
+
+	strategy := strings.ToLower(firstNonEmpty(
+		cfg.AuditStoreFailureStrategy,
+		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
+		"queue",
+	))
+	switch strategy {
+	case "queue", "raise":
+	default:
+		return fmt.Errorf(
+			"fasten.Init: AuditStoreFailureStrategy must be %q or %q (got %q)",
+			"queue", "raise", strategy,
+		)
+	}
+	e.failureStrategy = strategy
+
+	if strategy == "queue" && e.auditStore != nil {
+		capacity := cfg.QueueCapacity
+		if capacity <= 0 {
+			capacity = 100
+		}
+		retryInitial := cfg.QueueRetryInitial
+		if retryInitial <= 0 {
+			retryInitial = 100 * time.Millisecond
+		}
+		retryMax := cfg.QueueRetryMax
+		if retryMax <= 0 {
+			retryMax = 60 * time.Second
+		}
+		maxAttempts := cfg.QueueDrainMaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 50
+		}
+		e.installDrainer(
+			e.auditStore, e.drainerSysLog,
+			capacity, retryInitial, retryMax, !cfg.DisableQueueJitter, maxAttempts,
+		)
+	} else {
+		e.uninstallDrainer()
+	}
+	return nil
+}
+
+// Emit produces an audit row for a registered code.
+func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
+	if e.serviceID == "" {
+		return Row{}, errors.New("fasten.Init() must be called before Emit()")
+	}
+	m, ok := metaOf(code)
+	if !ok {
+		return Row{}, fmt.Errorf("fasten: unknown audit code %q — call Register() first", code)
+	}
+
+	rid := RequestIDFromContext(ctx)
+	if rid == "" {
+		rid = MintID()
+	}
+
+	seq := atomic.AddInt64(&e.seq, 1)
+	id := "evt-" + mintLong()
+
+	var tid *string
+	if e.tenantID != "" {
+		tid = &e.tenantID
+	}
+	row := Row{
+		WireVersion:  "1",
+		ID:           id,
+		OriginID:     id,
+		MonotonicSeq: seq,
+		Timestamp:    time.Now().UTC(),
+		Code:         code,
+		Action:       m.Action,
+		Severity:     m.Severity,
+		ServiceID:    e.serviceID,
+		SourceNodeID: e.nodeID,
+		TenantID:     tid,
+		Actor:        "system",
+		ActorKind:    "service",
+		Target:       "",
+		Category:     m.Category,
+		Domain:       m.Domain,
+		Method:       "sdk",
+		RequestID:    rid,
+		Detail:       map[string]any{},
+		PiiInDetail:  m.PiiInDetail,
+	}
+	for _, opt := range opts {
+		opt(&row)
+	}
+
+	if m.PiiInDetail {
+		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
+		for _, k := range m.DetailPassthroughKeys {
+			passthrough[k] = true
+		}
+		kept := map[string]any{}
+		for k, v := range row.Detail {
+			if passthrough[k] {
+				kept[k] = v
+			}
+		}
+		kept = RedactDetail(kept)
+		kept["_redacted"] = "***"
+		kept["_pii_in_detail"] = true
+		row.Detail = kept
+	} else {
+		row.Detail = RedactDetail(row.Detail)
+	}
+
+	if e.xport != nil {
+		e.xport.WriteAudit(rowToMap(row))
+	}
+
+	if e.auditStore != nil {
+		if e.failureStrategy == "queue" {
+			d := e.activeDrainer()
+			if d != nil {
+				d.put(row)
+			} else {
+				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
+					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
+						"error":  ferr.Error(),
+						"row_id": row.ID,
+					})
+				}
+			}
+		} else {
+			if err := e.auditStore.Insert(ctx, row); err != nil {
+				return row, &AuditStoreError{Err: err}
+			}
+		}
+	}
+	return row, nil
+}
+
+// GetTransport returns the active Transport (ring buffers + stdout). Nil before Init.
+func (e *Engine) GetTransport() *Transport { return e.xport }
+
+// GetQueueStats returns a snapshot of the drainer state, or nil in raise mode.
+func (e *Engine) GetQueueStats() *QueueStats {
+	d := e.activeDrainer()
+	if d == nil {
+		return nil
+	}
+	s := d.stats()
+	return &s
+}
+
+// Flush blocks until pending audit rows drain, or timeout elapses.
+func (e *Engine) Flush(timeout time.Duration) bool {
+	d := e.activeDrainer()
+	if d == nil {
+		return true
+	}
+	return d.flush(timeout)
+}
+
+// LogSys writes a structured {shape:"sys"} line via this Engine.
+func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
+	row := SyslogRow{
+		"level":      level,
+		"event":      event,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"request_id": RequestIDFromContext(ctx),
+		"service_id": e.serviceID,
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		k, ok := kv[i].(string)
+		if !ok {
+			continue
+		}
+		row[k] = kv[i+1]
+	}
+	if e.xport != nil {
+		e.xport.PushSyslog(row)
+	}
+	row["shape"] = "sys"
+	if b, err := json.Marshal(row); err == nil {
+		fmt.Println(string(b))
+	}
+}
+
+// ResetForTests resets all runtime state to pre-Init defaults.
+// Only for test fixtures — do not call in production code.
+func (e *Engine) ResetForTests() {
+	e.uninstallDrainer()
+	e.serviceID = ""
+	e.nodeID = ""
+	e.tenantID = ""
+	e.auditStore = nil
+	e.xport = nil
+	atomic.StoreInt64(&e.seq, 0)
+	e.failureStrategy = ""
+}
+
+// ── Drainer management (per-Engine) ──────────────────────────────────────────
+
+func (e *Engine) installDrainer(
+	store AuditRepository,
+	sysLog func(string, string, map[string]any),
+	capacity int,
+	retryInitial, retryMax time.Duration,
+	retryJitter bool,
+	maxAttempts int,
+) {
+	e.drainerMu.Lock()
+	old := e.drainer
+	e.drainer = newAuditDrainer(store, sysLog, capacity, retryInitial, retryMax, retryJitter, maxAttempts)
+	e.drainerMu.Unlock()
+	if old != nil {
+		old.flush(5 * time.Second)
+		old.shutdown(2 * time.Second)
+	}
+}
+
+func (e *Engine) uninstallDrainer() {
+	e.drainerMu.Lock()
+	old := e.drainer
+	e.drainer = nil
+	e.drainerMu.Unlock()
+	if old != nil {
+		old.shutdown(2 * time.Second)
+	}
+}
+
+func (e *Engine) activeDrainer() *auditQueueDrainer {
+	e.drainerMu.Lock()
+	defer e.drainerMu.Unlock()
+	return e.drainer
+}
+
+// drainerSysLog bridges drainer events to the sys stream via stderr.
+func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
+	row := SyslogRow{
+		"level":      level,
+		"event":      event,
+		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"request_id": "",
+		"service_id": e.serviceID,
+	}
+	for k, v := range fields {
+		row[k] = v
+	}
+	if e.xport != nil {
+		e.xport.PushSyslog(row)
+	}
+	row["shape"] = "sys"
+	if b, err := json.Marshal(row); err == nil {
+		fmt.Fprintln(os.Stderr, string(b))
+	}
+}

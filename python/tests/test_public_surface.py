@@ -8,30 +8,26 @@ Covers:
   #8 — actor / target filters + offset / total on /audit
   #9 — fasten.init() docstring lists FASTEN_AUDIT_DSN
 """
-import importlib
-
 import pytest
 
 import fasten  # noqa: F401  (used by fixtures)
 from fasten.codes import Meta, Severity, RetentionClass, register
+from fasten.emit import _default
 from fasten.redact import Redactor
 from fasten.store.sqlite import SQLiteStore
 from fasten.transport.stdout import StdoutTransport
-
-_emit_mod = importlib.import_module("fasten.emit")
 
 
 # ── #1 transport() ────────────────────────────────────────────────────────
 
 def test_transport_returns_active_stdout(initialized):
     t = fasten.transport()
-    assert t is _emit_mod._stdout
+    assert t is _default._stdout
     assert isinstance(t, StdoutTransport)
 
 
 def test_transport_pre_init_returns_none():
-    # fresh_state fixture clears _stdout, so this runs in a non-initialised SDK.
-    _emit_mod._stdout = None
+    # fresh_state resets the engine, so _stdout is None pre-init.
     assert fasten.transport() is None
 
 
@@ -39,7 +35,7 @@ def test_transport_pre_init_returns_none():
 
 def test_redactor_returns_active_instance(initialized):
     r = fasten.redactor()
-    assert r is _emit_mod._redactor
+    assert r is _default._redactor
     assert isinstance(r, Redactor)
 
 

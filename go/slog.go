@@ -25,7 +25,7 @@ type SlogHandler struct {
 // NewSlogHandler wraps next and pushes to the global fasten transport.
 // If fasten is not yet initialised, the handler degrades to next-only.
 func NewSlogHandler(next slog.Handler) *SlogHandler {
-	return &SlogHandler{next: next, transport: _transport}
+	return &SlogHandler{next: next, transport: Default.xport}
 }
 
 func (h *SlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -39,7 +39,7 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 			"event":      r.Message,
 			"timestamp":  r.Time.UTC().Format(time.RFC3339Nano),
 			"request_id": RequestIDFromContext(ctx),
-			"service_id": _serviceID,
+			"service_id": Default.serviceID,
 		}
 		// pre-attached attrs (WithAttrs)
 		for _, a := range h.preAttrs {

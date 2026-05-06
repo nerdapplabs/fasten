@@ -58,8 +58,8 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w}
 			next.ServeHTTP(rec, r)
-			if _transport != nil {
-				_transport.PushAPI(APIRow{
+			if Default.xport != nil {
+				Default.xport.PushAPI(APIRow{
 					"method":      r.Method,
 					"path":        r.URL.Path,
 					"status":      rec.Status(),
@@ -91,13 +91,13 @@ func NewReader() http.Handler {
 }
 
 func handleSys(w http.ResponseWriter, r *http.Request) {
-	if _transport == nil {
+	if Default.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := _transport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	rows := Default.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
@@ -105,13 +105,13 @@ func handleSys(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAPI(w http.ResponseWriter, r *http.Request) {
-	if _transport == nil {
+	if Default.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := _transport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	rows := Default.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
 	if rows == nil {
 		rows = []APIRow{}
 	}
@@ -119,7 +119,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
-	if _auditStore == nil {
+	if Default.auditStore == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "audit store not configured"})
 		return
 	}
@@ -137,7 +137,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 	if u := q.Get("until"); u != "" {
 		f.Until, _ = time.Parse(time.RFC3339, u)
 	}
-	rows, err := _auditStore.Query(r.Context(), f)
+	rows, err := Default.auditStore.Query(r.Context(), f)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -90,17 +90,10 @@ func (s *flakyStore) Purge(_ context.Context, _ time.Time, _ bool) (int, error) 
 // ── Test helpers ───────────────────────────────────────────────────────────
 
 func resetState() {
-	uninstallDrainer()
+	Default.ResetForTests()
 	regMu.Lock()
 	_registry = map[Code]Meta{}
 	regMu.Unlock()
-	_serviceID = ""
-	_nodeID = ""
-	_tenantID = ""
-	_auditStore = nil
-	_transport = nil
-	_failureStrategy = ""
-	_seq = 0
 }
 
 func setupQueueMode(t *testing.T, store AuditRepository, opts ...func(*Config)) {
@@ -222,7 +215,7 @@ func TestRaiseModeReturnsAuditStoreError(t *testing.T) {
 func TestRaiseModeDoesNotInstallDrainer(t *testing.T) {
 	store := &recordingStore{}
 	setupRaiseMode(t, store)
-	if activeDrainer() != nil {
+	if Default.activeDrainer() != nil {
 		t.Fatal("raise mode must not install a drainer")
 	}
 	if GetQueueStats() != nil {
@@ -286,7 +279,7 @@ func TestQueueFullBlocksEmitDoesNotSilentlyDrop(t *testing.T) {
 	}
 
 	// Stopping the drainer pops rows + releases slots → unblocks emit.
-	uninstallDrainer()
+	Default.uninstallDrainer()
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
@@ -309,7 +302,7 @@ func TestDrainerFirstFailureEmitsWarnToSys(t *testing.T) {
 	if !Flush(2 * time.Second) {
 		t.Fatal("flush timed out")
 	}
-	rows := _transport.QuerySyslog(100, "", "", "")
+	rows := Default.xport.QuerySyslog(100, "", "", "")
 	events := map[string]bool{}
 	for _, r := range rows {
 		if e, ok := r["event"].(string); ok {
@@ -336,7 +329,7 @@ func TestDrainerDegradedAfter5Failures(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		rows := _transport.QuerySyslog(100, "", "", "")
+		rows := Default.xport.QuerySyslog(100, "", "", "")
 		for _, r := range rows {
 			if r["event"] == "audit_drain_degraded" {
 				return
@@ -360,7 +353,7 @@ func TestQueueHighWaterEmitsWarnAt50pct(t *testing.T) {
 		}
 	}
 	time.Sleep(100 * time.Millisecond)
-	rows := _transport.QuerySyslog(100, "", "", "")
+	rows := Default.xport.QuerySyslog(100, "", "", "")
 	events := map[string]bool{}
 	for _, r := range rows {
 		if e, ok := r["event"].(string); ok {
@@ -574,7 +567,7 @@ func TestDrainerSurvivesStorePanic(t *testing.T) {
 	// Allow time for the drainer goroutine to run and recover.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		rows := _transport.QuerySyslog(100, "", "", "")
+		rows := Default.xport.QuerySyslog(100, "", "", "")
 		for _, r := range rows {
 			if r["event"] == "audit_drain_recovered_from_panic" {
 				// Drainer survived. Verify subsequent calls don't hang or panic.

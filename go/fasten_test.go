@@ -3,20 +3,14 @@ package fasten
 import (
 	"context"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
-// resetGlobals restores module-level state after each test.
+// resetGlobals restores Default engine state after each test.
 func resetGlobals(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		_serviceID = ""
-		_nodeID = ""
-		_tenantID = ""
-		_auditStore = nil
-		_transport = nil
-		atomic.StoreInt64(&_seq, 0)
+		Default.ResetForTests()
 	})
 }
 

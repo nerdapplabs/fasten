@@ -21,7 +21,6 @@ full design + acceptance criteria.
 """
 from __future__ import annotations
 
-import atexit
 import collections
 import queue
 import random
@@ -414,13 +413,17 @@ class _AuditQueueDrainer:
         return self._stop.wait(timeout=delay_s)
 
 
-# ── Module-level singleton wired by emit.init() ─────────────────────────────
+# ── Backward-compat shims ─────────────────────────────────────────────────────
+#
+# The module-level singleton (``_drainer``, ``install``, ``uninstall``, …)
+# has been replaced by ``Engine`` (see ``fasten/engine.py``).  These shims
+# delegate to the default Engine so existing call sites (tests, reader,
+# conftest) continue to work without modification.
 
-_drainer: Optional[_AuditQueueDrainer] = None
-_atexit_registered = False
 
-
-_install_lock = threading.Lock()
+def _default_engine():
+    from .emit import _default
+    return _default
 
 
 def install(
@@ -433,93 +436,42 @@ def install(
     retry_jitter: bool,
     max_attempts: int = 50,
 ) -> _AuditQueueDrainer:
-    """Replace the active drainer (called from ``init()``).
-
-    Race-safe re-init: the new drainer is built and the global pointer
-    swapped under a lock BEFORE the old drainer is flushed and stopped.
-    Concurrent ``emit()`` calls during re-init see either the old or the
-    new drainer — never a stopped-but-still-published one. The old
-    drainer is flushed (so pending rows reach the store) then stopped;
-    if a stale ``put()`` lands on it after stop, it emits
-    ``audit_drain_abandoned`` instead of stalling on the slot semaphore.
-    """
-    global _drainer, _atexit_registered
-    new_drainer = _AuditQueueDrainer(
+    eng = _default_engine()
+    eng._install_drainer(
         store=store,
-        sys_log=sys_log,
         capacity=capacity,
         retry_initial_ms=retry_initial_ms,
         retry_max_ms=retry_max_ms,
         retry_jitter=retry_jitter,
         max_attempts=max_attempts,
     )
-    with _install_lock:
-        old = _drainer
-        _drainer = new_drainer
-    if old is not None:
-        old.flush(timeout=5.0)
-        old.stop(timeout=2.0)
-    if not _atexit_registered:
-        atexit.register(_atexit_flush)
-        _atexit_registered = True
-    return new_drainer
+    return eng._drainer  # type: ignore[return-value]
 
 
 def uninstall() -> None:
-    """Stop the active drainer and clear it (test helper).
-
-    Symmetric with ``install``: clear the global pointer BEFORE
-    stopping, so concurrent ``emit()`` sees no drainer (and falls back
-    to the sync path) rather than racing against a half-stopped one.
-    """
-    global _drainer
-    with _install_lock:
-        old = _drainer
-        _drainer = None
-    if old is not None:
-        old.stop(timeout=2.0)
+    """Stop the default Engine's drainer (test helper)."""
+    _default_engine()._uninstall_drainer()
 
 
 def active() -> Optional[_AuditQueueDrainer]:
-    """Return the active drainer, if any."""
-    return _drainer
+    """Return the default Engine's active drainer, if any."""
+    return _default_engine()._drainer
 
 
 def queue_stats() -> Optional[dict[str, Any]]:
-    """Snapshot of queue + drainer state. None when ``raise`` mode is active."""
-    if _drainer is None:
-        return None
-    return _drainer.stats()
+    """Snapshot of queue + drainer state. None when raise mode is active."""
+    return _default_engine().queue_stats()
 
 
 def flush(timeout: float = 5.0) -> bool:
-    """Block until pending audit rows are drained, or ``timeout`` elapses.
-
-    Returns True iff every queued row reached the store. Useful for
-    deterministic shutdown paths (k8s preStop hook, CLI subcommand
-    completion, test setup/teardown). No-op + returns True in ``raise``
-    mode (no queue to drain).
-    """
-    if _drainer is None:
-        return True
-    return _drainer.flush(timeout=timeout)
-
-
-def _atexit_flush() -> None:
-    if _drainer is not None:
-        _drainer.flush(timeout=5.0)
-        _drainer.stop(timeout=2.0)
-
-
-# Marker-checker for whoever needs to know what was last initialised. Filled
-# by emit.init() so the doctor endpoint can report it without re-reading env.
-_last_init_at: Optional[datetime] = None
+    """Block until pending rows drain. Delegates to the default Engine."""
+    return _default_engine().flush(timeout=timeout)
 
 
 def _mark_init() -> None:
-    global _last_init_at
-    _last_init_at = datetime.now(timezone.utc)
+    pass  # last_init_at now lives on Engine; call is a no-op here.
 
 
-def last_init_at() -> Optional[datetime]:
-    return _last_init_at
+def last_init_at():
+    from datetime import datetime
+    return _default_engine().last_init_at()

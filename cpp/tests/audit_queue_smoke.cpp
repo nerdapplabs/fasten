@@ -24,25 +24,18 @@
 namespace {
 
 void reset_state() {
-    fasten::uninstall_drainer();
-    auto& g = fasten::detail_::globals();
+    auto& eng = fasten::default_engine();
+    eng.reset_for_tests();
+    // Also clear the test-specific registry entries so each test
+    // registers a fresh code. The registry is not touched by
+    // reset_for_tests() — codes survive across tests by design.
     {
-        std::lock_guard<std::mutex> lk(g.reg_mu);
-        for (auto it = g.registry.begin(); it != g.registry.end(); ) {
-            const auto& k = it->first;
-            if (k.rfind("USER_CREATED", 0) == 0) it = g.registry.erase(it);
+        std::lock_guard<std::mutex> lk(eng.reg_mu);
+        for (auto it = eng.registry.begin(); it != eng.registry.end(); ) {
+            if (it->first.rfind("USER_CREATED", 0) == 0) it = eng.registry.erase(it);
             else ++it;
         }
     }
-    {
-        std::lock_guard<std::mutex> lk(g.sink_mu);
-        g.audit_sink = nullptr;
-    }
-    g.service_id.clear();
-    g.node_id.clear();
-    g.tenant_id.clear();
-    g.seq = 0;
-    g.failure_strategy = "queue";
 }
 
 void register_test_code() {

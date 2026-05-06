@@ -416,69 +416,9 @@ func (d *auditQueueDrainer) waitBackoff() bool {
 	}
 }
 
-// ── Module-level singleton ─────────────────────────────────────────────────
-
-var (
-	_drainer   *auditQueueDrainer
-	_drainerMu sync.Mutex
-)
-
-func installDrainer(
-	store AuditRepository,
-	sysLog func(string, string, map[string]any),
-	capacity int,
-	retryInitial, retryMax time.Duration,
-	retryJitter bool,
-	maxAttempts int,
-) *auditQueueDrainer {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	if _drainer != nil {
-		_drainer.flush(5 * time.Second)
-		_drainer.shutdown(2 * time.Second)
-	}
-	_drainer = newAuditDrainer(store, sysLog, capacity, retryInitial, retryMax, retryJitter, maxAttempts)
-	return _drainer
-}
-
-func uninstallDrainer() {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	if _drainer != nil {
-		_drainer.shutdown(2 * time.Second)
-		_drainer = nil
-	}
-}
-
-func activeDrainer() *auditQueueDrainer {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	return _drainer
-}
-
-// GetQueueStats returns a snapshot of the active drainer, or nil in
-// raise mode (no drainer running). Mirrors the existing GetTransport
-// accessor naming.
-func GetQueueStats() *QueueStats {
-	d := activeDrainer()
-	if d == nil {
-		return nil
-	}
-	s := d.stats()
-	return &s
-}
-
-// Flush blocks until pending audit rows are drained, or timeout
-// elapses. Returns true iff every queued row reached the store. Useful
-// for k8s preStop hooks, CLI subcommand exit paths, and tests. No-op +
-// returns true in raise mode (no queue to drain).
-func Flush(timeout time.Duration) bool {
-	d := activeDrainer()
-	if d == nil {
-		return true
-	}
-	return d.flush(timeout)
-}
+// The drainer singleton and free-function management have moved into Engine
+// (see engine.go). audit_queue.go now contains only the drainer type and
+// its methods.
 
 func roundFloat(f float64, digits int) float64 {
 	pow := 1.0

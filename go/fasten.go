@@ -18,14 +18,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"regexp"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -269,17 +265,7 @@ func RequestIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// ── Init + globals ────────────────────────────────────────────────────────
-
-var (
-	_serviceID        string
-	_nodeID           string
-	_tenantID         string
-	_auditStore       AuditRepository
-	_transport        *Transport
-	_seq              int64
-	_failureStrategy  string // "queue" (P1-15 default) | "raise"
-)
+// ── Init + free-function wrappers ─────────────────────────────────────────
 
 // Config for Init. AuditStore nil → audit rows are written to stdout only.
 //
@@ -311,229 +297,30 @@ type Config struct {
 	QueueDrainMaxAttempts     int           // default 50; row → DLQ after this many failures
 }
 
-// Init configures fasten. Must be called once before Emit.
-// Falls back to env vars FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_TENANT_ID,
-// and FASTEN_AUDIT_STORE_FAILURE_STRATEGY.
-func Init(cfg Config) error {
-	_serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
-	_nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
-	_tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
+// Init configures fasten. Delegates to Default.Init.
+func Init(cfg Config) error { return Default.Init(cfg) }
 
-	if _serviceID == "" || _nodeID == "" {
-		return errors.New("fasten.Init: ServiceID and NodeID are required")
-	}
-	_auditStore = cfg.AuditStore
-	// Seed monotonic_seq so post-restart rows never duplicate (timestamp, seq)
-	// with pre-restart rows on the same node.
-	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
-		if max, err := seeder.MaxMonotonicSeq(context.Background()); err == nil {
-			atomic.StoreInt64(&_seq, max)
-		}
-	}
-	_transport = NewTransport(2000)
+// GetTransport returns the active transport of the Default engine.
+func GetTransport() *Transport { return Default.GetTransport() }
 
-	// P1-15: failure strategy + drainer wiring.
-	// Lowercase before the switch so callers passing "Queue" / "RAISE"
-	// (or env var FASTEN_AUDIT_STORE_FAILURE_STRATEGY="Queue") match
-	// Python's case-insensitive parity contract instead of silently
-	// failing init.
-	strategy := strings.ToLower(firstNonEmpty(
-		cfg.AuditStoreFailureStrategy,
-		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
-		"queue",
-	))
-	switch strategy {
-	case "queue", "raise":
-	default:
-		return fmt.Errorf(
-			"fasten.Init: AuditStoreFailureStrategy must be %q or %q (got %q)",
-			"queue", "raise", strategy,
-		)
-	}
-	_failureStrategy = strategy
+// Flush blocks until the Default engine's pending rows drain.
+func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
 
-	if strategy == "queue" && _auditStore != nil {
-		capacity := cfg.QueueCapacity
-		if capacity <= 0 {
-			capacity = 100
-		}
-		retryInitial := cfg.QueueRetryInitial
-		if retryInitial <= 0 {
-			retryInitial = 100 * time.Millisecond
-		}
-		retryMax := cfg.QueueRetryMax
-		if retryMax <= 0 {
-			retryMax = 60 * time.Second
-		}
-		maxAttempts := cfg.QueueDrainMaxAttempts
-		if maxAttempts <= 0 {
-			maxAttempts = 50
-		}
-		installDrainer(
-			_auditStore,
-			drainerSysLog,
-			capacity,
-			retryInitial,
-			retryMax,
-			!cfg.DisableQueueJitter,
-			maxAttempts,
-		)
-	} else {
-		// Raise mode (or no store) — no drainer thread.
-		uninstallDrainer()
-	}
-	return nil
-}
-
-// drainerSysLog bridges the drainer to the sys stream. Non-recursive:
-// writes to the in-memory ring + stderr, never through Emit or stdout.
-// stderr is mandatory: a slow stdout consumer stalls the drainer goroutine
-// if drainer self-reports share the wire stream (stdout backpressure deadlock).
-func drainerSysLog(level, event string, fields map[string]any) {
-	row := SyslogRow{
-		"level":      level,
-		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"request_id": "",
-		"service_id": _serviceID,
-	}
-	for k, v := range fields {
-		row[k] = v
-	}
-	if _transport != nil {
-		_transport.PushSyslog(row)
-	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
-		fmt.Fprintln(os.Stderr, string(b))
-	}
-}
-
-// Transport returns the active transport (ring buffers + stdout).
-// Returns nil before Init is called.
-func GetTransport() *Transport { return _transport }
+// GetQueueStats returns the Default engine's drainer snapshot.
+func GetQueueStats() *QueueStats { return Default.GetQueueStats() }
 
 // ── Emit options ──────────────────────────────────────────────────────────
 
 type EmitOption func(*Row)
 
-func Target(t string) EmitOption        { return func(r *Row) { r.Target = t } }
-func Actor(a, kind string) EmitOption   { return func(r *Row) { r.Actor = a; r.ActorKind = kind } }
+func Target(t string) EmitOption             { return func(r *Row) { r.Target = t } }
+func Actor(a, kind string) EmitOption        { return func(r *Row) { r.Actor = a; r.ActorKind = kind } }
 func WithDetail(d map[string]any) EmitOption { return func(r *Row) { r.Detail = d } }
-func WithMethod(m string) EmitOption    { return func(r *Row) { r.Method = m } }
+func WithMethod(m string) EmitOption         { return func(r *Row) { r.Method = m } }
 
-// ── Emit ──────────────────────────────────────────────────────────────────
-
-// Emit produces an audit row for a registered code.
-// Returns an error if Init has not been called or the code is not registered.
+// Emit produces an audit row via the Default engine.
 func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
-	if _serviceID == "" {
-		return Row{}, errors.New("fasten.Init() must be called before Emit()")
-	}
-	m, ok := metaOf(code)
-	if !ok {
-		return Row{}, fmt.Errorf("fasten: unknown audit code %q — call Register() first", code)
-	}
-
-	rid := RequestIDFromContext(ctx)
-	if rid == "" {
-		rid = MintID()
-	}
-
-	seq := atomic.AddInt64(&_seq, 1)
-	id := "evt-" + mintLong()
-
-	var tid *string
-	if _tenantID != "" {
-		tid = &_tenantID
-	}
-	row := Row{
-		WireVersion:  "1",
-		ID:           id,
-		OriginID:     id,
-		MonotonicSeq: seq,
-		Timestamp:    time.Now().UTC(),
-		Code:         code,
-		Action:       m.Action,
-		Severity:     m.Severity,
-		ServiceID:    _serviceID,
-		SourceNodeID: _nodeID,
-		TenantID:     tid,
-		Actor:        "system",
-		ActorKind:    "service",
-		Target:       "",
-		Category:     m.Category,
-		Domain:       m.Domain,
-		Method:       "sdk",
-		RequestID:    rid,
-		Detail:       map[string]any{},
-		PiiInDetail:  m.PiiInDetail,
-	}
-	for _, opt := range opts {
-		opt(&row)
-	}
-
-	// P1-5 #2: PiiInDetail force-redacts the entire detail map regardless
-	// of key names. Adopters who genuinely need fields preserved declare
-	// them in Meta.DetailPassthroughKeys.
-	if m.PiiInDetail {
-		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
-		for _, k := range m.DetailPassthroughKeys {
-			passthrough[k] = true
-		}
-		kept := map[string]any{}
-		for k, v := range row.Detail {
-			if passthrough[k] {
-				kept[k] = v
-			}
-		}
-		// Run the secret-key redactor on the kept subset (api_key etc.
-		// is scrubbed even when in passthrough).
-		kept = RedactDetail(kept)
-		kept["_redacted"] = "***"
-		kept["_pii_in_detail"] = true
-		row.Detail = kept
-	} else {
-		row.Detail = RedactDetail(row.Detail)
-	}
-
-	// Stdout write happens BEFORE any store routing. Two reasons:
-	//   1. Under sustained queue-full outage, drainer.put() blocks. If
-	//      stdout came after, even Docker / journald log capture stalls
-	//      — adopters lose the recoverable audit trail at the worst
-	//      possible moment.
-	//   2. In raise mode, the row should still reach stdout even if the
-	//      sync insert errors — preserves the "stdout is always honest"
-	//      contract.
-	if _transport != nil {
-		_transport.WriteAudit(rowToMap(row))
-	}
-
-	// P1-15: route store insert through the drainer (queue mode) or
-	// call synchronously and wrap the store error (raise mode).
-	if _auditStore != nil {
-		if _failureStrategy == "queue" {
-			d := activeDrainer()
-			if d != nil {
-				d.put(row)
-			} else {
-				// Defensive fallback — strategy says queue but drainer
-				// isn't installed (e.g. tests bypassed Init). Sync insert
-				// so the row isn't silently dropped; emit sys event on failure.
-				if ferr := _auditStore.Insert(ctx, row); ferr != nil {
-					drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
-						"error":  ferr.Error(),
-						"row_id": row.ID,
-					})
-				}
-			}
-		} else {
-			if err := _auditStore.Insert(ctx, row); err != nil {
-				return row, &AuditStoreError{Err: err}
-			}
-		}
-	}
-	return row, nil
+	return Default.Emit(ctx, code, opts...)
 }
 
 // ── Built-in structured log (sys stream) ─────────────────────────────────
@@ -543,36 +330,12 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 // For a slog handler integration that still chains to your existing slog
 // pipeline, see NewSlogHandler in slog.go.
 
-// LogInfo writes a {shape:"sys"} NDJSON line to stdout.
+// LogInfo / LogWarn / LogError / LogDebug write {shape:"sys"} NDJSON lines.
 // Pairs come as key1, value1, key2, value2, ... (slog-style).
-func LogInfo(ctx context.Context, event string, kv ...any)  { logSys(ctx, "info", event, kv) }
-func LogWarn(ctx context.Context, event string, kv ...any)  { logSys(ctx, "warn", event, kv) }
-func LogError(ctx context.Context, event string, kv ...any) { logSys(ctx, "error", event, kv) }
-func LogDebug(ctx context.Context, event string, kv ...any) { logSys(ctx, "debug", event, kv) }
-
-func logSys(ctx context.Context, level, event string, kv []any) {
-	row := SyslogRow{
-		"level":      level,
-		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"request_id": RequestIDFromContext(ctx),
-		"service_id": _serviceID,
-	}
-	for i := 0; i+1 < len(kv); i += 2 {
-		k, ok := kv[i].(string)
-		if !ok {
-			continue
-		}
-		row[k] = kv[i+1]
-	}
-	if _transport != nil {
-		_transport.PushSyslog(row)
-	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
-		fmt.Println(string(b))
-	}
-}
+func LogInfo(ctx context.Context, event string, kv ...any)  { Default.LogSys(ctx, "info", event, kv) }
+func LogWarn(ctx context.Context, event string, kv ...any)  { Default.LogSys(ctx, "warn", event, kv) }
+func LogError(ctx context.Context, event string, kv ...any) { Default.LogSys(ctx, "error", event, kv) }
+func LogDebug(ctx context.Context, event string, kv ...any) { Default.LogSys(ctx, "debug", event, kv) }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 

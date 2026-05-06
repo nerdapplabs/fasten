@@ -17,6 +17,9 @@ use std::time::Duration;
 pub mod audit_queue;
 pub use audit_queue::{flush, queue_stats, AuditStoreError, QueueStats};
 
+pub mod engine;
+pub use engine::{Engine, DEFAULT};
+
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -339,34 +342,10 @@ where
 // the active config. Falls back to bare line if init() not yet called.
 
 pub mod log {
-    use super::current_request_id;
     use serde::Serialize;
-    use serde_json::json;
 
     fn write(level: &str, event: &str, fields: serde_json::Value) {
-        let cfg = super::CONFIG
-            .get()
-            .and_then(|slot| slot.read().ok().and_then(|g| g.clone()));
-        let service_id = cfg.as_ref().map(|c| c.service_id.clone()).unwrap_or_default();
-
-        let mut payload = json!({
-            "shape": "sys",
-            "level": level,
-            "event": event,
-            "request_id": current_request_id().unwrap_or_default(),
-            "service_id": service_id,
-            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        });
-
-        if let serde_json::Value::Object(merge_into) = &mut payload {
-            if let serde_json::Value::Object(extra) = fields {
-                for (k, v) in extra {
-                    merge_into.insert(k, v);
-                }
-            }
-        }
-
-        println!("{}", payload);
+        super::DEFAULT.log_sys(level, event, fields);
     }
 
     /// Convenience: pass key-value fields as a `serde_json::Value::Object`.
@@ -508,104 +487,12 @@ pub fn config_from_env() -> Result<Config, Error> {
     })
 }
 
-static CONFIG: OnceLock<RwLock<Option<Config>>> = OnceLock::new();
-static SEQ: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-
-fn seq_next() -> u64 {
-    SEQ.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1
-}
-
 /// Initialise fasten with a Config. Required before `emit()`.
 ///
 /// When `cfg.audit_store` is provided and `cfg.audit_store_failure_strategy`
 /// is `"queue"` (default), this installs a background drainer thread; see
 /// the `audit_queue` module for the full P1-15 contract.
-pub fn init(cfg: Config) -> Result<(), Error> {
-    if cfg.service_id.is_empty() || cfg.node_id.is_empty() {
-        return Err(Error::NotInitialised);
-    }
-    let strategy = cfg
-        .audit_store_failure_strategy
-        .clone()
-        .or_else(|| std::env::var("FASTEN_AUDIT_STORE_FAILURE_STRATEGY").ok())
-        .unwrap_or_else(|| "queue".into())
-        .to_lowercase();
-    if strategy != "queue" && strategy != "raise" {
-        return Err(Error::InvalidStrategy(strategy));
-    }
-    let store = cfg.audit_store.clone();
-    let capacity = cfg.queue_capacity.unwrap_or(100);
-    let retry_initial = cfg.queue_retry_initial.unwrap_or(Duration::from_millis(100));
-    let retry_max = cfg.queue_retry_max.unwrap_or(Duration::from_secs(60));
-    let retry_jitter = !cfg.disable_queue_jitter;
-    let max_attempts = cfg.queue_drain_max_attempts.unwrap_or(50);
-
-    let mut cfg_to_store = cfg;
-    cfg_to_store.audit_store_failure_strategy = Some(strategy.clone());
-    let slot = CONFIG.get_or_init(|| RwLock::new(None));
-    *slot.write().expect("config poisoned") = Some(cfg_to_store);
-
-    if strategy == "queue" {
-        if let Some(s) = store {
-            audit_queue::install_drainer(
-                s,
-                Box::new(drainer_sys_log),
-                capacity,
-                retry_initial,
-                retry_max,
-                retry_jitter,
-                max_attempts,
-            );
-        } else {
-            audit_queue::uninstall_drainer();
-        }
-    } else {
-        audit_queue::uninstall_drainer();
-    }
-    Ok(())
-}
-
-/// Bridge from drainer to sys stream — non-recursive: writes a
-/// `{shape:"sys"}` NDJSON line to **stderr**, never through `submit()` or
-/// the audit store. stderr is mandatory: a slow stdout consumer stalls the
-/// drainer thread if self-reports share the wire stream (stdout backpressure
-/// deadlock).
-fn drainer_sys_log(level: &str, event: &str, fields: &serde_json::Value) {
-    let mut payload = serde_json::Map::new();
-    payload.insert("shape".into(), serde_json::Value::String("sys".into()));
-    payload.insert("level".into(), serde_json::Value::String(level.into()));
-    payload.insert("event".into(), serde_json::Value::String(event.into()));
-    if let Some(rid) = current_request_id() {
-        payload.insert("request_id".into(), serde_json::Value::String(rid));
-    } else {
-        payload.insert("request_id".into(), serde_json::Value::Null);
-    }
-    if let Ok(cfg) = current_config() {
-        payload.insert(
-            "service_id".into(),
-            serde_json::Value::String(cfg.service_id),
-        );
-    }
-    payload.insert(
-        "timestamp".into(),
-        serde_json::Value::String(Utc::now().to_rfc3339()),
-    );
-    if let serde_json::Value::Object(extras) = fields {
-        for (k, v) in extras {
-            payload.insert(k.clone(), v.clone());
-        }
-    }
-    eprintln!("{}", serde_json::Value::Object(payload));
-}
-
-fn current_config() -> Result<Config, Error> {
-    CONFIG
-        .get()
-        .and_then(|slot| slot.read().ok().and_then(|g| g.clone()))
-        .ok_or(Error::NotInitialised)
-}
+pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
 
 /// Fluent-style Emit builder. Caller supplies `code`, `target`, optional
 /// `actor` / `method` / `detail`. Anchors auto-fill from Meta + ctx + config.
@@ -661,7 +548,7 @@ impl EmitBuilder {
     /// Mirrors the row to stdout (`{"shape":"audit",...}`) regardless
     /// of mode so adopters always see the audit on the log stream.
     pub fn submit(self) -> Result<Row, AuditStoreError> {
-        let cfg = current_config().map_err(|e| AuditStoreError { source: e })?;
+        let cfg = DEFAULT.current_config().map_err(|e| AuditStoreError { source: e })?;
         let row = self
             .build_row(&cfg)
             .map_err(|e| AuditStoreError { source: e })?;
@@ -681,7 +568,7 @@ impl EmitBuilder {
             .as_deref()
             .unwrap_or("queue");
         if strategy == "queue" {
-            if let Some(d) = audit_queue::active_drainer() {
+            if let Some(d) = DEFAULT.active_drainer() {
                 d.put(row.clone());
             } else if let Some(s) = cfg.audit_store.as_ref() {
                 // Defensive fallback — strategy says queue but drainer
@@ -724,7 +611,7 @@ impl EmitBuilder {
             wire_version: "1".into(),
             id: id.clone(),
             origin_id: id,
-            monotonic_seq: seq_next(),
+            monotonic_seq: DEFAULT.seq_next(),
             timestamp: Utc::now(),
             code: self.code,
             action: meta.action,

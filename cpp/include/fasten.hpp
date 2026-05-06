@@ -363,6 +363,11 @@ struct RingBuffer {
         std::lock_guard<std::mutex> lk(mu_);
         return buf_.size();
     }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        buf_.clear();
+    }
 };
 
 }  // namespace detail_
@@ -800,6 +805,33 @@ struct Globals {
 
     // Redactor config — built by init(), defaults to built-in pattern + "***".
     RedactConfig redact_cfg;
+
+    /// Reset all runtime state for test isolation.
+    ///
+    /// Stops the active drainer (best-effort), clears service config, resets
+    /// seq, clears the audit sink and in-process log rings. Does NOT clear the
+    /// code registry — codes are registered once at startup.
+    ///
+    /// Mirrors `reset_for_tests()` / `ResetForTests()` / `resetForTests()` in
+    /// Python / Go / JS / Rust.
+    void reset_for_tests() {
+        {
+            std::lock_guard<std::mutex> lk(drainer_mu);
+            if (drainer) {
+                drainer->shutdown(std::chrono::seconds(2));
+                drainer.reset();
+            }
+        }
+        service_id.clear();
+        node_id.clear();
+        tenant_id.clear();
+        { std::lock_guard<std::mutex> lk(seq_mu); seq = 0; }
+        failure_strategy = "queue";
+        { std::lock_guard<std::mutex> lk(sink_mu); audit_sink = nullptr; }
+        redact_cfg = RedactConfig{};
+        syslog_ring.clear();
+        api_ring.clear();
+    }
 };
 
 inline Globals& globals() {
@@ -1005,6 +1037,23 @@ inline std::string dump() {
     if (!out.empty()) out.pop_back(); // strip trailing newline
     return out;
 }
+
+// ── Engine ─────────────────────────────────────────────────────────────────
+//
+// Engine holds all mutable runtime state for one fasten deployment context.
+// The free-function API (init, emit, ...) delegates to the default_engine()
+// singleton. Applications needing multiple isolated fasten contexts in one
+// process can create additional Engine instances.
+//
+// For test isolation, call:
+//   fasten::default_engine().reset_for_tests();
+//
+// The code registry (register_codes) is global and is NOT reset by
+// reset_for_tests() — mirrors Python / Go / JS / Rust behaviour.
+
+using Engine = detail_::Globals;
+
+inline Engine& default_engine() { return detail_::globals(); }
 
 // ── Init ───────────────────────────────────────────────────────────────────
 

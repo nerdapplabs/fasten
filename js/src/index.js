@@ -190,205 +190,232 @@ function buildExtraRe(keys) {
     return new RegExp('(' + escaped + ')', 'i');
 }
 
-// --- Init + Emit ----------------------------------------------------------
+// --- Engine ---------------------------------------------------------------
 //
-// auditStore is opt-in: pass `init({auditStore: yourStore})` for SQL
-// persistence. JS does not yet construct a store from FASTEN_AUDIT_DSN —
-// the Python reference handles that. Until it does, every emit() still
-// mirrors to stdout (NDJSON), which Docker / journald captures.
+// Engine holds all runtime state for one fasten deployment context.
+// The module-level free functions (init, emit, …) delegate to `defaultEngine`.
+// Applications that need multiple isolated fasten configurations in one
+// process construct Engine instances directly:
+//
+//   import { Engine } from 'fasten';
+//   const eng = new Engine();
+//   eng.init({ serviceId: 'tenant-a', auditStore: storeA });
+//   eng.emit({ code: 'ORDER_PLACED', target: 'order/1' });
 
 import {
     AuditStoreError,
-    installDrainer as _installDrainer,
-    uninstallDrainer as _uninstallDrainer,
-    activeDrainer as _activeDrainer,
-    queueStats as _queueStats,
-    flush as _flush,
+    AuditQueueDrainer,
+    _setDefaultEngine,
 } from './audit_queue.js';
 
-let config = {
-    serviceId: '', nodeId: '', tenantId: null,
-    auditStore: null, apiStore: null,
-    extraRedactRe: null,
-    failureStrategy: 'queue', // P1-15 default
-};
-let seq = 0;
+export { AuditStoreError };
 
-export function init(opts = {}) {
-    const envExtra = (process.env.FASTEN_REDACT_KEYS ?? '')
-        .split(',').map(s => s.trim()).filter(Boolean);
-    const extraKeys = opts.extraRedactKeys ?? (envExtra.length ? envExtra : null);
-
-    const strategy = (
-        opts.auditStoreFailureStrategy ??
-        process.env.FASTEN_AUDIT_STORE_FAILURE_STRATEGY ??
-        'queue'
-    ).toLowerCase();
-    if (strategy !== 'queue' && strategy !== 'raise') {
-        throw new Error(
-            `fasten.init: auditStoreFailureStrategy must be 'queue' or 'raise' (got '${strategy}')`
-        );
-    }
-
-    config = {
-        serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? '',
-        nodeId:    opts.nodeId    ?? process.env.FASTEN_NODE_ID    ?? '',
-        tenantId:  opts.tenantId  ?? process.env.FASTEN_TENANT_ID  ?? null,
-        auditStore: opts.auditStore ?? null,
-        apiStore:   opts.apiStore   ?? null,
-        extraRedactRe: buildExtraRe(extraKeys),
-        failureStrategy: strategy,
+export class Engine {
+    #config = {
+        serviceId: '', nodeId: '', tenantId: null,
+        auditStore: null, apiStore: null,
+        extraRedactRe: null,
+        failureStrategy: 'queue',
     };
-    if (!config.serviceId || !config.nodeId) {
-        throw new Error('fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required');
-    }
+    #seq = 0;
+    _drainer = null; // accessible by audit_queue.js shims via _setDefaultEngine
 
-    // P1-15 wiring.
-    if (strategy === 'queue' && config.auditStore) {
-        _installDrainer({
-            store: config.auditStore,
-            sysLog: _drainerSysLog,
-            capacity: opts.queueCapacity ?? 100,
-            retryInitialMs: opts.queueRetryInitialMs ?? 100,
-            retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
-            retryJitter: opts.queueRetryJitter ?? true,
-            maxAttempts: opts.queueDrainMaxAttempts ?? 50,
-        });
-    } else {
-        _uninstallDrainer();
-    }
-}
+    init(opts = {}) {
+        const envExtra = (process.env.FASTEN_REDACT_KEYS ?? '')
+            .split(',').map(s => s.trim()).filter(Boolean);
+        const extraKeys = opts.extraRedactKeys ?? (envExtra.length ? envExtra : null);
 
-// Bridge from drainer to sys stream. Non-recursive: writes only to stderr
-// as a {shape:"sys"} NDJSON line, never through emit(). stderr is mandatory:
-// a slow stdout consumer stalls the drainer thread if self-reports share the
-// wire stream (stdout backpressure deadlock).
-function _drainerSysLog(level, event, fields) {
-    const line = {
-        shape: 'sys',
-        level,
-        event,
-        request_id: currentRequestID(),
-        service_id: config.serviceId || undefined,
-        timestamp: new Date().toISOString(),
-        ...fields,
-    };
-    process.stderr.write(JSON.stringify(line) + '\n');
-}
-
-export function emit({ code, target, actor = 'system', actorKind = 'service',
-                       detail = {}, severity, method = 'sdk' }) {
-    if (!config.serviceId) throw new Error('fasten.init() must be called before emit()');
-    const meta = _registry.get(code);
-    if (!meta) throw new Error(`unknown audit code: ${code}`);
-
-    const id = `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    // Wire format is snake_case per spec/row-schema.json — match Python /
-    // Go / Rust / C++ adapters. JS keeps camelCase only at the call-site
-    // API surface (emit options).
-    // P1-5 #2: PII codes force-redact whole detail. detailPassthroughKeys
-    // are kept and still scrubbed by the secret-key redactor.
-    let outDetail;
-    if (meta.piiInDetail) {
-        const passthrough = new Set(meta.detailPassthroughKeys ?? []);
-        const kept = {};
-        for (const [k, v] of Object.entries(detail)) {
-            if (passthrough.has(k)) kept[k] = v;
+        const strategy = (
+            opts.auditStoreFailureStrategy ??
+            process.env.FASTEN_AUDIT_STORE_FAILURE_STRATEGY ??
+            'queue'
+        ).toLowerCase();
+        if (strategy !== 'queue' && strategy !== 'raise') {
+            throw new Error(
+                `fasten.init: auditStoreFailureStrategy must be 'queue' or 'raise' (got '${strategy}')`
+            );
         }
-        outDetail = {
-            _redacted: REDACT_REPLACEMENT,
-            _pii_in_detail: true,
-            ...redact(kept, config.extraRedactRe),
+
+        this.#config = {
+            serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? '',
+            nodeId:    opts.nodeId    ?? process.env.FASTEN_NODE_ID    ?? '',
+            tenantId:  opts.tenantId  ?? process.env.FASTEN_TENANT_ID  ?? null,
+            auditStore: opts.auditStore ?? null,
+            apiStore:   opts.apiStore   ?? null,
+            extraRedactRe: buildExtraRe(extraKeys),
+            failureStrategy: strategy,
         };
-    } else {
-        outDetail = redact(detail, config.extraRedactRe);
+        if (!this.#config.serviceId || !this.#config.nodeId) {
+            throw new Error('fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required');
+        }
+
+        if (strategy === 'queue' && this.#config.auditStore) {
+            this._installDrainer({
+                store: this.#config.auditStore,
+                sysLog: (l, e, f) => this._drainerSysLog(l, e, f),
+                capacity: opts.queueCapacity ?? 100,
+                retryInitialMs: opts.queueRetryInitialMs ?? 100,
+                retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
+                retryJitter: opts.queueRetryJitter ?? true,
+                maxAttempts: opts.queueDrainMaxAttempts ?? 50,
+            });
+        } else {
+            this._uninstallDrainer();
+        }
     }
 
-    const row = {
-        wire_version: '1',
-        id,
-        origin_id: id,
-        monotonic_seq: ++seq,
-        timestamp: new Date().toISOString(),
-        code,
-        action: meta.action,
-        severity: severity ?? meta.severity,
-        service_id: config.serviceId,
-        source_node_id: config.nodeId,
-        tenant_id: config.tenantId,
-        actor,
-        actor_kind: actorKind,
-        target,
-        category: meta.category,
-        domain: meta.domain,
-        method,
-        request_id: currentRequestID() ?? mintID(),
-        detail: outDetail,
-        pii_in_detail: !!meta.piiInDetail,
-    };
-    // Stdout write happens BEFORE any store routing — preserves the
-    // "stdout is always honest" contract. In raise mode the row still
-    // reaches the log stream even if the sync insert throws; in queue
-    // mode the row is captured even when the drainer / store is
-    // backlogged. Adopters can always replay from stdout NDJSON.
-    process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
+    emit({ code, target, actor = 'system', actorKind = 'service',
+           detail = {}, severity, method = 'sdk' }) {
+        const cfg = this.#config;
+        if (!cfg.serviceId) throw new Error('fasten.init() must be called before emit()');
+        const meta = _registry.get(code);
+        if (!meta) throw new Error(`unknown audit code: ${code}`);
 
-    // P1-15: route store insert through the drainer (queue mode) or
-    // call synchronously and wrap any store error (raise mode).
-    if (config.auditStore) {
-        if (config.failureStrategy === 'queue') {
-            const d = _activeDrainer();
-            if (d) {
-                d.put(row);
+        const id = `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+        let outDetail;
+        if (meta.piiInDetail) {
+            const passthrough = new Set(meta.detailPassthroughKeys ?? []);
+            const kept = {};
+            for (const [k, v] of Object.entries(detail)) {
+                if (passthrough.has(k)) kept[k] = v;
+            }
+            outDetail = {
+                _redacted: REDACT_REPLACEMENT,
+                _pii_in_detail: true,
+                ...redact(kept, cfg.extraRedactRe),
+            };
+        } else {
+            outDetail = redact(detail, cfg.extraRedactRe);
+        }
+
+        const row = {
+            wire_version: '1',
+            id,
+            origin_id: id,
+            monotonic_seq: ++this.#seq,
+            timestamp: new Date().toISOString(),
+            code,
+            action: meta.action,
+            severity: severity ?? meta.severity,
+            service_id: cfg.serviceId,
+            source_node_id: cfg.nodeId,
+            tenant_id: cfg.tenantId,
+            actor,
+            actor_kind: actorKind,
+            target,
+            category: meta.category,
+            domain: meta.domain,
+            method,
+            request_id: currentRequestID() ?? mintID(),
+            detail: outDetail,
+            pii_in_detail: !!meta.piiInDetail,
+        };
+        process.stdout.write(JSON.stringify({ shape: 'audit', ...row }) + '\n');
+
+        if (cfg.auditStore) {
+            if (cfg.failureStrategy === 'queue') {
+                const d = this._drainer;
+                if (d) {
+                    d.put(row);
+                } else {
+                    try {
+                        cfg.auditStore.insert(row);
+                    } catch (err) {
+                        this._drainerSysLog('error', 'audit_sync_fallback_failed', {
+                            error: `${err?.name ?? 'Error'}: ${err?.message ?? err}`,
+                            row_id: row?.id ?? null,
+                        });
+                    }
+                }
             } else {
-                // Defensive fallback — strategy says queue but the
-                // drainer isn't installed (e.g. init bypass in tests).
-                // Sync insert so the row isn't silently dropped, and
-                // surface any insert error on the sys stream so an
-                // adopter watching `/logs/sys` (or `queue_stats()`)
-                // sees the failure instead of it vanishing into a
-                // bare catch.
                 try {
-                    config.auditStore.insert(row);
+                    cfg.auditStore.insert(row);
                 } catch (err) {
-                    _drainerSysLog('error', 'audit_sync_fallback_failed', {
-                        error: `${err?.name ?? 'Error'}: ${err?.message ?? err}`,
-                        row_id: row?.id ?? null,
-                    });
+                    throw new AuditStoreError(err);
                 }
             }
-        } else {
-            try {
-                config.auditStore.insert(row);
-            } catch (err) {
-                throw new AuditStoreError(err);
-            }
+        }
+        return row;
+    }
+
+    queueStats() { return this._drainer ? this._drainer.stats() : null; }
+
+    async flush(timeoutMs = 5000) {
+        if (!this._drainer) return true;
+        return this._drainer.flush(timeoutMs);
+    }
+
+    resetForTests() {
+        this._uninstallDrainer();
+        this.#config = {
+            serviceId: '', nodeId: '', tenantId: null,
+            auditStore: null, apiStore: null,
+            extraRedactRe: null,
+            failureStrategy: 'queue',
+        };
+        this.#seq = 0;
+    }
+
+    // ── Internal ────────────────────────────────────────────────────────────
+
+    _installDrainer(opts) {
+        const next = new AuditQueueDrainer(opts);
+        const old = this._drainer;
+        this._drainer = next;
+        if (old) {
+            old.flush(5000).then(() => old.stop());
         }
     }
-    return row;
-}
 
-// Re-export P1-15 surface so adopters import it from the package root.
-export { AuditStoreError, _queueStats as queueStats, _flush as flush };
+    _uninstallDrainer() {
+        const old = this._drainer;
+        this._drainer = null;
+        if (old) old.stop();
+    }
 
-export const log = {
-    _emit(level, event, fields = {}) {
+    _drainerSysLog(level, event, fields) {
         const line = {
-            shape: 'sys',
-            level,
-            event,
+            shape: 'sys', level, event,
             request_id: currentRequestID(),
-            service_id: config.serviceId || undefined,
+            service_id: this.#config.serviceId || undefined,
             timestamp: new Date().toISOString(),
             ...fields,
         };
-        process.stdout.write(JSON.stringify(line) + '\n');
-    },
-    info(event, fields)  { this._emit('info',  event, fields); },
-    warn(event, fields)  { this._emit('warn',  event, fields); },
-    error(event, fields) { this._emit('error', event, fields); },
-    debug(event, fields) { this._emit('debug', event, fields); },
-};
+        process.stderr.write(JSON.stringify(line) + '\n');
+    }
+
+    get log() {
+        const self = this;
+        return {
+            _emit(level, event, fields = {}) {
+                const line = {
+                    shape: 'sys', level, event,
+                    request_id: currentRequestID(),
+                    service_id: self.#config.serviceId || undefined,
+                    timestamp: new Date().toISOString(),
+                    ...fields,
+                };
+                process.stdout.write(JSON.stringify(line) + '\n');
+            },
+            info(event, fields)  { this._emit('info',  event, fields); },
+            warn(event, fields)  { this._emit('warn',  event, fields); },
+            error(event, fields) { this._emit('error', event, fields); },
+            debug(event, fields) { this._emit('debug', event, fields); },
+        };
+    }
+}
+
+// ── Default Engine + free-function API ────────────────────────────────────
+
+export const defaultEngine = new Engine();
+_setDefaultEngine(defaultEngine); // wire up audit_queue.js shims
+
+export function init(opts)  { return defaultEngine.init(opts); }
+export function emit(opts)  { return defaultEngine.emit(opts); }
+export function queueStats() { return defaultEngine.queueStats(); }
+export async function flush(timeoutMs = 5000) { return defaultEngine.flush(timeoutMs); }
+
+export const log = defaultEngine.log;
 
 // ── Catalog yaml (P1-11) ──────────────────────────────────────────────────
 // Lazy: js-yaml is only imported when load() / reload() runs. Adopters
@@ -408,6 +435,7 @@ export const codes = {
 export default { init, emit, log, register, metaOf, dump,
                  mintID, currentRequestID, withRequestID,
                  codes,
+                 Engine, defaultEngine,
                  // P1-15
-                 AuditStoreError, queueStats: _queueStats, flush: _flush,
+                 AuditStoreError, queueStats, flush,
                  Domain, Severity, RetentionClass, ActorKind, Method };

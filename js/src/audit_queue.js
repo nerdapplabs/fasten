@@ -238,57 +238,28 @@ class AuditQueueDrainer {
     }
 }
 
-// ── Module-level singleton ─────────────────────────────────────────────────
+// ── Backward-compat shims ─────────────────────────────────────────────────
+//
+// Module-level singleton replaced by Engine (see index.js). These shims
+// delegate to the default Engine so existing call sites (tests, etc.)
+// continue to work. Call _setDefaultEngine(engine) at module init time.
 
-let _drainer = null;
+export { AuditQueueDrainer };
 
-export function installDrainer({
-    store, sysLog, capacity = 100,
-    retryInitialMs = 100, retryMaxMs = 60_000, retryJitter = true, maxAttempts = 50,
-}) {
-    // Race-safe re-init: build new first, swap atomically, then flush +
-    // stop the old asynchronously. Concurrent emit() that grabbed the
-    // old drainer reference before swap and lands a put() after the old
-    // is stopped self-aborts via the put() stop check (audit_drain_
-    // abandoned sys event) — no silent loss into a dead queue.
-    const next = new AuditQueueDrainer({
-        store, sysLog, capacity,
-        retryInitialMs, retryMaxMs, retryJitter, maxAttempts,
-    });
-    const old = _drainer;
-    _drainer = next;
-    if (old) {
-        old.flush(5000).then(() => old.stop());
-    }
-    return next;
+let _defaultEngine = null;
+export function _setDefaultEngine(engine) { _defaultEngine = engine; }
+
+export function installDrainer(opts) {
+    _defaultEngine?._installDrainer(opts);
+    return _defaultEngine?._drainer ?? null;
 }
 
-export function uninstallDrainer() {
-    // Symmetric with installDrainer: clear the global FIRST so any new
-    // emit() sees no drainer and falls through to its sync path,
-    // instead of racing against a half-stopped drainer.
-    const old = _drainer;
-    _drainer = null;
-    if (old) {
-        old.stop();
-    }
-}
+export function uninstallDrainer() { _defaultEngine?._uninstallDrainer(); }
 
-export function activeDrainer() { return _drainer; }
+export function activeDrainer() { return _defaultEngine?._drainer ?? null; }
 
-/**
- * queueStats — snapshot of queue + drainer state. Returns null in raise
- * mode (no drainer running).
- */
-export function queueStats() {
-    return _drainer ? _drainer.stats() : null;
-}
+export function queueStats() { return _defaultEngine?.queueStats() ?? null; }
 
-/**
- * flush — block (await) until pending audit rows drain or timeout.
- * Returns true iff drained. No-op + true in raise mode.
- */
 export async function flush(timeoutMs = 5000) {
-    if (!_drainer) return true;
-    return _drainer.flush(timeoutMs);
+    return _defaultEngine ? _defaultEngine.flush(timeoutMs) : true;
 }
