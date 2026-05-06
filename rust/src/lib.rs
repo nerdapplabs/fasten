@@ -562,8 +562,10 @@ pub fn init(cfg: Config) -> Result<(), Error> {
 }
 
 /// Bridge from drainer to sys stream — non-recursive: writes a
-/// `{shape:"sys"}` NDJSON line to stdout, never through `submit()` or
-/// the audit store.
+/// `{shape:"sys"}` NDJSON line to **stderr**, never through `submit()` or
+/// the audit store. stderr is mandatory: a slow stdout consumer stalls the
+/// drainer thread if self-reports share the wire stream (stdout backpressure
+/// deadlock).
 fn drainer_sys_log(level: &str, event: &str, fields: &serde_json::Value) {
     let mut payload = serde_json::Map::new();
     payload.insert("shape".into(), serde_json::Value::String("sys".into()));
@@ -589,7 +591,7 @@ fn drainer_sys_log(level: &str, event: &str, fields: &serde_json::Value) {
             payload.insert(k.clone(), v.clone());
         }
     }
-    println!("{}", serde_json::Value::Object(payload));
+    eprintln!("{}", serde_json::Value::Object(payload));
 }
 
 fn current_config() -> Result<Config, Error> {

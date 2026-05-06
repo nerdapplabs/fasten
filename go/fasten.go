@@ -371,7 +371,9 @@ func Init(cfg Config) error {
 }
 
 // drainerSysLog bridges the drainer to the sys stream. Non-recursive:
-// writes to the in-memory ring + stdout only, never through Emit.
+// writes to the in-memory ring + stderr, never through Emit or stdout.
+// stderr is mandatory: a slow stdout consumer stalls the drainer goroutine
+// if drainer self-reports share the wire stream (stdout backpressure deadlock).
 func drainerSysLog(level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,
@@ -388,7 +390,7 @@ func drainerSysLog(level, event string, fields map[string]any) {
 	}
 	row["shape"] = "sys"
 	if b, err := json.Marshal(row); err == nil {
-		fmt.Println(string(b))
+		fmt.Fprintln(os.Stderr, string(b))
 	}
 }
 
@@ -496,9 +498,14 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 				d.put(row)
 			} else {
 				// Defensive fallback — strategy says queue but drainer
-				// isn't installed (e.g. tests bypassed Init). Sync
-				// insert so the row isn't silently dropped.
-				_ = _auditStore.Insert(ctx, row)
+				// isn't installed (e.g. tests bypassed Init). Sync insert
+				// so the row isn't silently dropped; emit sys event on failure.
+				if ferr := _auditStore.Insert(ctx, row); ferr != nil {
+					drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
+						"error":  ferr.Error(),
+						"row_id": row.ID,
+					})
+				}
 			}
 		} else {
 			if err := _auditStore.Insert(ctx, row); err != nil {

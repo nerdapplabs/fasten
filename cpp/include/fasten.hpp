@@ -1067,8 +1067,10 @@ namespace detail_ {
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields) {
-    // Non-recursive: writes a {shape:"sys"} NDJSON line to stdout +
+    // Non-recursive: writes a {shape:"sys"} NDJSON line to stderr +
     // pushes to the sys ring. Never recurses through the sink.
+    // stderr is mandatory: a slow stdout consumer stalls the drainer thread
+    // if self-reports share the wire stream (stdout backpressure deadlock).
     auto& g = globals();
     Fields ring_row;
     std::string js = "{\"shape\":\"sys\"";
@@ -1086,7 +1088,7 @@ inline void drainer_sys_log(const std::string& level,
     ring_row["event"]      = event;
     ring_row["request_id"] = tl_request_id();
     g.syslog_ring.push(std::move(ring_row));
-    std::cout << js << std::flush;
+    std::cerr << js << std::flush;
 }
 
 }  // namespace detail_

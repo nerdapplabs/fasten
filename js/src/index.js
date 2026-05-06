@@ -258,8 +258,10 @@ export function init(opts = {}) {
     }
 }
 
-// Bridge from drainer to sys stream. Non-recursive: writes only to stdout
-// as a {shape:"sys"} NDJSON line, never through emit().
+// Bridge from drainer to sys stream. Non-recursive: writes only to stderr
+// as a {shape:"sys"} NDJSON line, never through emit(). stderr is mandatory:
+// a slow stdout consumer stalls the drainer thread if self-reports share the
+// wire stream (stdout backpressure deadlock).
 function _drainerSysLog(level, event, fields) {
     const line = {
         shape: 'sys',
@@ -270,7 +272,7 @@ function _drainerSysLog(level, event, fields) {
         timestamp: new Date().toISOString(),
         ...fields,
     };
-    process.stdout.write(JSON.stringify(line) + '\n');
+    process.stderr.write(JSON.stringify(line) + '\n');
 }
 
 export function emit({ code, target, actor = 'system', actorKind = 'service',

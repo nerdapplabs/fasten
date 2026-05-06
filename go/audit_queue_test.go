@@ -545,6 +545,49 @@ func TestRingBuffer_NoUnboundedGrowth(t *testing.T) {
 	}
 }
 
+// ── P1-22: Go drainer panic-recovery ─────────────────────────────────────
+
+type panicStore struct{}
+
+func (s *panicStore) Insert(_ context.Context, _ Row) error  { panic("store exploded") }
+func (s *panicStore) Query(_ context.Context, _ Filter) ([]Row, error) { return nil, nil }
+func (s *panicStore) ListUnshipped(_ context.Context, _ int) ([]Row, error) {
+	return nil, nil
+}
+func (s *panicStore) MarkShipped(_ context.Context, _ []string) error    { return nil }
+func (s *panicStore) Purge(_ context.Context, _ time.Time, _ bool) (int, error) { return 0, nil }
+
+// TestDrainerSurvivesStorePanic asserts that a panicking store.Insert emits
+// audit_drain_recovered_from_panic to the sys stream and that subsequent
+// Emit + QueueStats calls do not panic or hang.
+func TestDrainerSurvivesStorePanic(t *testing.T) {
+	setupQueueMode(t, &panicStore{}, func(c *Config) {
+		c.QueueRetryInitial = 5 * time.Millisecond
+		c.QueueRetryMax = 20 * time.Millisecond
+		c.DisableQueueJitter = true
+	})
+
+	if _, err := Emit(context.Background(), "USER_CREATED", Target("u-1")); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	// Allow time for the drainer goroutine to run and recover.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rows := _transport.QuerySyslog(100, "", "", "")
+		for _, r := range rows {
+			if r["event"] == "audit_drain_recovered_from_panic" {
+				// Drainer survived. Verify subsequent calls don't hang or panic.
+				_, _ = Emit(context.Background(), "USER_CREATED", Target("u-2"))
+				_ = GetQueueStats()
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("audit_drain_recovered_from_panic sys event never fired after store panic")
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

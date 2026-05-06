@@ -285,8 +285,14 @@ def emit(
             else:
                 # Defensive fallback — strategy says queue but drainer isn't
                 # installed (e.g. tests bypassed init()). Synchronous insert
-                # so the row isn't silently dropped.
-                _audit_store.insert(row)
+                # so the row isn't silently dropped; emit sys event on failure.
+                try:
+                    _audit_store.insert(row)
+                except Exception as e:  # noqa: BLE001
+                    _drainer_sys_log("error", "audit_sync_fallback_failed", {
+                        "error": f"{type(e).__name__}: {e}",
+                        "row_id": row.id,
+                    })
         else:
             try:
                 _audit_store.insert(row)

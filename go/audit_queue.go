@@ -23,6 +23,7 @@ package fasten
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -249,9 +250,19 @@ func (d *auditQueueDrainer) drainOne(row Row, inShutdown bool) {
 		d.inFlight--
 		d.mu.Unlock()
 		if !slotReleased {
-			// Defensive: never leak a permit even if a panic unwinds
-			// drainOne.
 			<-d.slots
+		}
+	}()
+	// Panic-recovery: a panicking store.Insert kills the goroutine and hangs
+	// every subsequent emit on the buffered channel forever with no signal.
+	// Python's BLE001 catch and Rust's lock_or_recover both prevent this;
+	// defer recover() is the Go equivalent.
+	defer func() {
+		if r := recover(); r != nil {
+			d.sysLog("error", "audit_drain_recovered_from_panic", map[string]any{
+				"error":  fmt.Sprintf("%v", r),
+				"row_id": row.ID,
+			})
 		}
 	}()
 
