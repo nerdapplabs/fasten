@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .audit_queue import AuditStoreError  # re-exported for back-compat
+from .audit_queue import AuditStoreError  # noqa: F401 — re-exported for back-compat
 from .engine import Engine
 
 # Module-level default instance — all free functions delegate here.

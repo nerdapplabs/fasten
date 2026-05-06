@@ -26,7 +26,7 @@ import queue
 import random
 import threading
 import time
-from datetime import datetime, timezone
+
 from typing import Any, Callable, Optional
 
 
@@ -473,5 +473,4 @@ def _mark_init() -> None:
 
 
 def last_init_at():
-    from datetime import datetime
     return _default_engine().last_init_at()
