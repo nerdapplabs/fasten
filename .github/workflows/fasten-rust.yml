@@ -1,0 +1,31 @@
+name: Rust SDK
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/fasten-rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/fasten-rust.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.85
+
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Unit tests
+        run: cargo test --quiet
