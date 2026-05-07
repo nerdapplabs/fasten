@@ -75,6 +75,32 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_substring_smoke COMMAND redact_substring_smoke)
 
+    # sqlite_store_smoke needs sqlite3 at link time.
+    find_package(SQLite3)
+    if(SQLite3_FOUND)
+        add_executable(sqlite_store_smoke tests/sqlite_store_smoke.cpp)
+        target_link_libraries(sqlite_store_smoke PRIVATE fasten SQLite3::SQLite3)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(sqlite_store_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
+    else()
+        message(STATUS "SQLite3 not found — skipping sqlite_store_smoke")
+    endif()
+
+    # postgres_store_smoke needs libpq at link time.
+    find_package(PostgreSQL)
+    if(PostgreSQL_FOUND)
+        add_executable(postgres_store_smoke tests/postgres_store_smoke.cpp)
+        target_link_libraries(postgres_store_smoke PRIVATE fasten PostgreSQL::PostgreSQL)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(postgres_store_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME postgres_store_smoke COMMAND postgres_store_smoke)
+    else()
+        message(STATUS "PostgreSQL not found — skipping postgres_store_smoke")
+    endif()
+
     # codes_yaml smoke needs libyaml-cpp at link time — guard so the build
     # doesn't fail on systems without it. CI installs libyaml-cpp-dev.
     find_library(YAMLCPP_LIB yaml-cpp)
