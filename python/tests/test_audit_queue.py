@@ -391,22 +391,22 @@ def test_flush_does_not_wait_for_emits_after_call_time():
 
 def test_used_slots_does_not_touch_semaphore_private_attr():
     """REVIEW #18: drainer must not read threading.Semaphore._value
-    (CPython implementation detail). The fix introduces a parallel
-    counter; this test asserts the counter exists and reports the same
-    answer the public stats expose.
+    (CPython implementation detail). Capacity is tracked by a single
+    _permits counter under a Condition; _used_slots() derives depth
+    from it without touching any private implementation detail.
     """
     store = _RecordingStore()
     _init(store, queue_capacity=4)
     drainer = _aq.active()
     assert drainer is not None
-    # Counter present and starts at 0.
-    assert hasattr(drainer, "_used_slots_count")
-    assert drainer._used_slots_count == 0
-    # After a few emits + drain, counter is back to 0 in lockstep with stats.
+    # No semaphore — only _permits counter.
+    assert not hasattr(drainer, "_slots")
+    assert drainer._used_slots() == 0
+    # After a few emits + drain, depth is back to 0 in lockstep with stats.
     for i in range(3):
         fasten.emit(code="USER_CREATED", target=f"u-{i}")
     assert drainer.flush(timeout=1.0)
-    assert drainer._used_slots_count == 0
+    assert drainer._used_slots() == 0
     assert fasten.queue_stats()["depth"] == 0
 
 
@@ -487,13 +487,13 @@ def test_put_after_drainer_stopped_emits_abandoned():
     assert "audit_drain_abandoned" in events
 
 
-def test_used_slots_method_matches_count():
-    """_used_slots() must return the same value as _used_slots_count."""
+def test_used_slots_method_matches_permits():
+    """_used_slots() must equal capacity - _permits (always 0 when idle)."""
     store = _RecordingStore()
     _init(store)
     drainer = _aq.active()
     assert drainer is not None
-    assert drainer._used_slots() == drainer._used_slots_count == 0
+    assert drainer._used_slots() == drainer._capacity - drainer._permits == 0
 
 
 def test_dead_letter_after_max_attempts():
@@ -562,7 +562,7 @@ def test_in_shutdown_single_attempt_on_broken_store():
     assert drainer is not None
     # stop() drains remaining rows in_shutdown=True mode (one attempt, no retry)
     drainer.stop(timeout=2.0)
-    assert drainer._used_slots_count == 0  # slot must be released even on failure
+    assert drainer._used_slots() == 0  # slot must be released even on failure
 
 
 # ── #9 backward-compat shims ──────────────────────────────────────────────

@@ -51,5 +51,9 @@ package-lock.json
 .env
 .env.local
 
+# Swift
+swift/.build/
+swift/Package.resolved
+
 # Website
 website/dist/

@@ -10,7 +10,7 @@ import logging
 import pytest
 
 import fasten
-from fasten.emit import _default
+from fasten.emitter import _default
 from fasten.store.sqlite import SQLiteStore
 
 
@@ -190,7 +190,7 @@ def test_log_falls_back_to_stdlib_before_init(caplog):
 def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
     """Queue mode + drainer uninstalled → emit() falls back to sync insert.
     A sink failure must emit audit_sync_fallback_failed via drainer syslog."""
-    from fasten.emit import _default as eng
+    from fasten.emitter import _default as eng
 
     class _BrokenStore:
         def insert(self, row) -> None:

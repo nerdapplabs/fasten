@@ -52,9 +52,15 @@ CREATE TABLE IF NOT EXISTS {table} (
     method           TEXT NOT NULL,
     request_id       TEXT NOT NULL,
     detail           TEXT NOT NULL,
-    pii_in_detail    SMALLINT NOT NULL DEFAULT 0,
-    shipped_at       TEXT
+    shipped_at       TEXT,
+    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
+    hash             TEXT NOT NULL DEFAULT ''
 )
+"""
+
+_MIGRATION_HASH_CHAIN = """
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
 """
 
 _INDEXES = [
@@ -64,7 +70,6 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_{p}_pii       ON {t}(pii_in_detail) WHERE pii_in_detail = 1",
 ]
 
 
@@ -97,6 +102,10 @@ class PostgresStore:
             cur.execute(_DDL.format(table=self._table))
             for sql in _INDEXES:
                 cur.execute(sql.format(t=self._table, p=self._idx_prefix))
+            # Migration: add hash chain columns to pre-existing tables (no-op on new tables).
+            for stmt in _MIGRATION_HASH_CHAIN.format(table=self._table).strip().split(";"):
+                if stmt.strip():
+                    cur.execute(stmt)
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -111,6 +120,29 @@ class PostgresStore:
             conn = psycopg.connect(self._dsn)
             self._tls.conn = conn
         return conn
+
+    def _connect_fresh(self) -> Any:
+        """Force-close the current thread connection and open a new one."""
+        import psycopg
+
+        old = getattr(self._tls, "conn", None)
+        if old and not old.closed:
+            try:
+                old.close()
+            except Exception:
+                pass
+        conn = psycopg.connect(self._dsn)
+        self._tls.conn = conn
+        return conn
+
+    def _execute_with_retry(self, fn):
+        """Run fn(conn) once; on stale-connection error reconnect and retry once."""
+        import psycopg
+
+        try:
+            return fn(self._connect())
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            return fn(self._connect_fresh())
 
     def close(self) -> None:
         """Close the calling thread's connection."""
@@ -141,58 +173,74 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     def insert(self, row: AuditRow) -> None:
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"INSERT INTO {self._table} VALUES "
-                "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (id) DO NOTHING",
-                (
-                    row.id, row.origin_id, row.monotonic_seq,
-                    _utc_iso(row.timestamp),
-                    row.code, row.action, row.severity,
-                    row.service_id, row.source_node_id, row.tenant_id,
-                    row.actor, row.actor_kind,
-                    row.target, row.category, row.domain,
-                    row.method, row.request_id,
-                    json.dumps(row.detail),
-                    int(row.pii_in_detail),
-                    _utc_iso(row.shipped_at) if row.shipped_at else None,
-                ),
-            )
-        conn.commit()
+        params = (
+            row.id, row.origin_id, row.monotonic_seq,
+            _utc_iso(row.timestamp),
+            row.code, row.action, row.severity,
+            row.service_id, row.source_node_id, row.tenant_id,
+            row.actor, row.actor_kind,
+            row.target, row.category, row.domain,
+            row.method, row.request_id,
+            json.dumps(row.detail),
+            _utc_iso(row.shipped_at) if row.shipped_at else None,
+            row.prev_hash,
+            row.hash,
+        )
+        sql = (
+            f"INSERT INTO {self._table} "
+            "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+            "service_id,source_node_id,tenant_id,actor,actor_kind,"
+            "target,category,domain,method,request_id,detail,shipped_at,"
+            "prev_hash,hash) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (id) DO NOTHING"
+        )
+
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+
+        self._execute_with_retry(_run)
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-                "ORDER BY monotonic_seq ASC LIMIT %s",
-                (limit,),
-            )
-            return [self._row(r) for r in cur.fetchall()]
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                    "ORDER BY monotonic_seq ASC LIMIT %s",
+                    (limit,),
+                )
+                return [self._row(r) for r in cur.fetchall()]
+        return self._execute_with_retry(_run)
 
     def mark_shipped(self, ids: list[str]) -> None:
         now = _utc_iso(datetime.now(timezone.utc))
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.executemany(
-                f"UPDATE {self._table} SET shipped_at=%s WHERE id=%s",
-                [(now, i) for i in ids],
-            )
-        conn.commit()
+
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"UPDATE {self._table} SET shipped_at=%s WHERE id=%s",
+                    [(now, i) for i in ids],
+                )
+            conn.commit()
+
+        self._execute_with_retry(_run)
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"
         params: list[Any] = [_utc_iso(before)]
         if respect_unshipped:
             sql += " AND shipped_at IS NOT NULL"
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            deleted = cur.rowcount
-        conn.commit()
-        return deleted
+
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                deleted = cur.rowcount
+            conn.commit()
+            return deleted
+
+        return self._execute_with_retry(_run)
 
     def _build_where(
         self,
@@ -201,6 +249,7 @@ class PostgresStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -220,6 +269,9 @@ class PostgresStore:
         if source_node_id:
             conds.append("source_node_id = %s")
             params.append(source_node_id)
+        if tenant_id:
+            conds.append("tenant_id = %s")
+            params.append(tenant_id)
         if actor:
             conds.append("actor = %s")
             params.append(actor)
@@ -242,6 +294,7 @@ class PostgresStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -251,17 +304,21 @@ class PostgresStore:
     ) -> list[AuditRow]:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
-            source_node_id=source_node_id, actor=actor, target=target,
+            source_node_id=source_node_id, tenant_id=tenant_id,
+            actor=actor, target=target,
             since=since, until=until,
         )
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT * FROM {self._table} {where} "
-                "ORDER BY monotonic_seq DESC LIMIT %s OFFSET %s",
-                (*params, limit, offset),
-            )
-            return [self._row(r) for r in cur.fetchall()]
+
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {self._table} {where} "
+                    "ORDER BY monotonic_seq DESC LIMIT %s OFFSET %s",
+                    (*params, limit, offset),
+                )
+                return [self._row(r) for r in cur.fetchall()]
+
+        return self._execute_with_retry(_run)
 
     def count(
         self,
@@ -270,6 +327,7 @@ class PostgresStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -277,20 +335,25 @@ class PostgresStore:
     ) -> int:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
-            source_node_id=source_node_id, actor=actor, target=target,
+            source_node_id=source_node_id, tenant_id=tenant_id,
+            actor=actor, target=target,
             since=since, until=until,
         )
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {self._table} {where}", params)
-            return int(cur.fetchone()[0])
+
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self._table} {where}", params)
+                return int(cur.fetchone()[0])
+
+        return self._execute_with_retry(_run)
 
     def max_monotonic_seq(self) -> int:
         """Return MAX(monotonic_seq); 0 if no rows."""
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
-            return int(cur.fetchone()[0])
+        def _run(conn):
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
+                return int(cur.fetchone()[0])
+        return self._execute_with_retry(_run)
 
     # ------------------------------------------------------------------
     # Row deserialisation
@@ -306,6 +369,7 @@ class PostgresStore:
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            pii_in_detail=bool(r[18]),
-            shipped_at=datetime.fromisoformat(r[19]) if r[19] else None,
+            shipped_at=datetime.fromisoformat(r[18]) if r[18] else None,
+            prev_hash=r[19] if len(r) > 19 else "genesis",
+            hash=r[20] if len(r) > 20 else "",
         )

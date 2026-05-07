@@ -365,10 +365,15 @@ pub mod log {
 
 // --- Redaction -----------------------------------------------------------
 //
-// Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). For v0.1
-// we avoid the regex crate dep: lower-case + strip `_` and `-` from both
-// key and pattern, then substring-match. Behaviour matches Python's
-// case-insensitive search for all patterns in the spec.
+// Two passes before emit.
+//   Pass 1 — key-pattern: keys matching REDACT_PATTERNS → REDACT_REPLACEMENT.
+//     Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). We
+//     avoid the regex crate dep: lower-case + strip `_` and `-` from both key
+//     and pattern, then substring-match. Equivalent to case-insensitive search
+//     for all current spec patterns.
+//   Pass 2 — value-shape: string scalars matching known secret shapes (JWT,
+//     PEM private key, AWS/GH tokens, Stripe, OpenAI, CC/Luhn) → type-hinting
+//     token. Also implemented without the regex crate via direct byte scanning.
 
 fn norm_key(s: &str) -> String {
     s.to_ascii_lowercase().replace(['_', '-'], "")
@@ -397,9 +402,170 @@ fn key_is_secret(key: &str, extra: Option<&[String]>) -> bool {
     false
 }
 
+// ── Value-shape helpers ──────────────────────────────────────────────────────
+
+fn luhn_valid(digits: &[u8]) -> bool {
+    let mut total: u32 = 0;
+    for (i, &b) in digits.iter().rev().enumerate() {
+        let mut n = (b - b'0') as u32;
+        if i % 2 == 1 {
+            n *= 2;
+            if n > 9 { n -= 9; }
+        }
+        total += n;
+    }
+    total % 10 == 0
+}
+
+fn is_base64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn is_upper_alnum(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit()
+}
+
+fn is_word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Return a redaction token if `s` matches a known secret value shape, else None.
+/// No regex crate — all matching is done via direct byte scanning.
+fn check_value_shape(s: &str) -> Option<&'static str> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    // JWT: eyJ<base64url>.eyJ<base64url>.<base64url>
+    let mut pos = 0;
+    while let Some(off) = s[pos..].find("eyJ") {
+        let start = pos + off;
+        // first segment: from start until first '.'
+        let seg1_end = bytes[start..].iter().position(|&b| b == b'.').map(|p| start + p);
+        if let Some(dot1) = seg1_end {
+            if bytes[start..dot1].iter().all(|&b| is_base64url(b)) {
+                let after_dot1 = dot1 + 1;
+                // second segment must start with eyJ
+                if bytes.get(after_dot1..after_dot1 + 3) == Some(b"eyJ") {
+                    let seg2_end = bytes[after_dot1..].iter().position(|&b| b == b'.').map(|p| after_dot1 + p);
+                    if let Some(dot2) = seg2_end {
+                        if bytes[after_dot1..dot2].iter().all(|&b| is_base64url(b)) {
+                            let after_dot2 = dot2 + 1;
+                            let seg3_len = bytes[after_dot2..].iter().take_while(|&&b| is_base64url(b)).count();
+                            if seg3_len > 0 {
+                                return Some("***JWT***");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = start + 3;
+    }
+
+    // PEM private key block
+    if s.contains("-----BEGIN") && s.contains("PRIVATE KEY-----") {
+        return Some("***PRIVATE_KEY***");
+    }
+
+    // AWS access key: (AKIA|ASIA) followed by exactly 16 uppercase alphanums
+    for prefix in [b"AKIA" as &[u8], b"ASIA"] {
+        let mut i = 0;
+        while i + prefix.len() <= len {
+            if bytes[i..].starts_with(prefix) {
+                let rest = &bytes[i + prefix.len()..];
+                let n = rest.iter().take(16).filter(|&&b| is_upper_alnum(b)).count();
+                if n == 16 && rest.get(16).map_or(true, |&b| !is_upper_alnum(b)) {
+                    return Some("***AWS_KEY***");
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // GitHub token: ghp_|gho_|ghu_|ghs_|ghr_ + 36 alphanums
+    for prefix in [b"ghp_" as &[u8], b"gho_", b"ghu_", b"ghs_", b"ghr_"] {
+        let mut i = 0;
+        while i + prefix.len() <= len {
+            if bytes[i..].starts_with(prefix) {
+                let rest = &bytes[i + prefix.len()..];
+                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric()).count();
+                if n >= 36 {
+                    return Some("***GH_TOKEN***");
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Stripe live secret: sk_live_ + 24+ alphanums
+    {
+        let prefix = b"sk_live_";
+        let mut i = 0;
+        while i + prefix.len() <= len {
+            if bytes[i..].starts_with(prefix) {
+                let rest = &bytes[i + prefix.len()..];
+                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric()).count();
+                if n >= 24 {
+                    return Some("***STRIPE_KEY***");
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // OpenAI key: sk- optionally followed by proj-, then 32+ [A-Za-z0-9_-]
+    {
+        let prefix = b"sk-";
+        let mut i = 0;
+        while i + prefix.len() <= len {
+            if bytes[i..].starts_with(prefix) {
+                let after = &bytes[i + prefix.len()..];
+                let rest = if after.starts_with(b"proj-") { &after[5..] } else { after };
+                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-').count();
+                if n >= 32 {
+                    return Some("***OPENAI_KEY***");
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Credit card: word-boundary-anchored digit sequence (opt. spaces/dashes),
+    // 13-19 digits total, passing Luhn checksum.
+    {
+        let mut i = 0;
+        while i < len {
+            if bytes[i].is_ascii_digit() && (i == 0 || !is_word_char(bytes[i - 1])) {
+                let start = i;
+                let mut digit_buf: Vec<u8> = Vec::with_capacity(19);
+                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b' ' || bytes[i] == b'-') {
+                    if bytes[i].is_ascii_digit() { digit_buf.push(bytes[i]); }
+                    i += 1;
+                }
+                let end_ok = i >= len || !is_word_char(bytes[i]);
+                let _ = start;
+                if end_ok && digit_buf.len() >= 13 && digit_buf.len() <= 19 && luhn_valid(&digit_buf) {
+                    return Some("***CC***");
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    None
+}
+
 fn redact_value(v: &serde_json::Value, extra: Option<&[String]>) -> serde_json::Value {
     use serde_json::Value;
     match v {
+        Value::String(s) => {
+            if let Some(shaped) = check_value_shape(s) {
+                Value::String(shaped.into())
+            } else {
+                v.clone()
+            }
+        }
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, vv) in map {

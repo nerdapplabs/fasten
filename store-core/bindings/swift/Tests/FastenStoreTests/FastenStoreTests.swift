@@ -22,6 +22,8 @@ func makeRow(_ id: String, code: String = "TEST") -> [String: Any] {
         "method":         "sdk",
         "request_id":     "req-001",
         "detail":         ["key": "value"],
+        "prev_hash":      "genesis",
+        "hash":           "",
     ]
 }
 
@@ -67,13 +69,6 @@ final class SQLiteTests: XCTestCase {
         var row = makeRow("evt-swift-null-001")
         row["tenant_id"]  = "tenant-abc"
         row["shipped_at"] = "2026-05-07T01:00:00.000Z"
-        XCTAssertNoThrow(try store.insert(row))
-    }
-
-    func testPiiInDetail() throws {
-        let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
-        var row = makeRow("evt-swift-pii-001")
-        row["pii_in_detail"] = true
         XCTAssertNoThrow(try store.insert(row))
     }
 

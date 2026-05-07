@@ -845,16 +845,68 @@ inline std::string& tl_request_id() {
     return rid;
 }
 
+// ── Value-shape redaction ─────────────────────────────────────────────────
+// Pass 2: string values matching known secret shapes are replaced with a
+// type-hinting token. Compiled once via function-local statics.
+
+inline bool luhn_valid(const std::string& digits) {
+    int total = 0;
+    int n = static_cast<int>(digits.size());
+    for (int i = 0; i < n; ++i) {
+        int d = digits[n - 1 - i] - '0';
+        if (i % 2 == 1) { d *= 2; if (d > 9) d -= 9; }
+        total += d;
+    }
+    return total % 10 == 0;
+}
+
+inline const std::string& check_value_shape(const std::string& s) {
+    static const std::string kEmpty;
+    static const std::string kCC = "***CC***";
+    struct VP { std::regex re; std::string repl; };
+    static const std::vector<VP> kPatterns = {
+        { std::regex(R"(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"), "***JWT***" },
+        { std::regex(R"(-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----)"),    "***PRIVATE_KEY***" },
+        { std::regex(R"((?:AKIA|ASIA)[A-Z0-9]{16})"),                                 "***AWS_KEY***" },
+        { std::regex(R"((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36})"),                 "***GH_TOKEN***" },
+        { std::regex(R"(sk_live_[A-Za-z0-9]{24,})"),                                  "***STRIPE_KEY***" },
+        { std::regex(R"(sk-(?:proj-)?[A-Za-z0-9_\-]{32,})"),                          "***OPENAI_KEY***" },
+    };
+    static const std::regex kCCRe(R"(\b\d[\d \-]{11,17}\d\b)");
+
+    // Credit card: digit group (opt. spaces/dashes), 13-19 digits, Luhn-valid.
+    std::smatch m;
+    if (std::regex_search(s, m, kCCRe)) {
+        std::string digits;
+        for (char c : m.str()) {
+            if (std::isdigit(static_cast<unsigned char>(c))) digits += c;
+        }
+        if (digits.size() >= 13 && digits.size() <= 19 && luhn_valid(digits))
+            return kCC;
+    }
+    for (auto& p : kPatterns) {
+        if (std::regex_search(s, p.re))
+            return p.repl;
+    }
+    return kEmpty;
+}
+
 // Redact sensitive keys in a Fields map using the process-wide config.
-// Keys matching the pattern have their values replaced; keys are preserved.
+// Pass 1 — key-pattern: keys matching the pattern have their values replaced.
+// Pass 2 — value-shape: remaining string values matching known secret shapes
+//   (JWT, PEM key, AWS/GH tokens, Stripe, OpenAI, CC) are replaced with a
+//   type-hinting token.
 inline Fields redact(const Fields& f) {
     auto& cfg = globals().redact_cfg;
     Fields out;
     out.reserve(f.size());
     for (auto& kv : f) {
-        out[kv.first] = std::regex_search(kv.first, cfg.pattern)
-            ? cfg.replacement
-            : kv.second;
+        if (std::regex_search(kv.first, cfg.pattern)) {
+            out[kv.first] = cfg.replacement;
+        } else {
+            const std::string& shaped = check_value_shape(kv.second);
+            out[kv.first] = shaped.empty() ? kv.second : shaped;
+        }
     }
     return out;
 }

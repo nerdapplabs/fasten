@@ -6,6 +6,49 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Value-shape redaction (P1-24, all SDKs)
+
+- JS, Go, Rust, C++ now match Python and Swift: string values matching
+  known secret shapes are replaced with a type-hinting token before the
+  row is written. Covered patterns: JWT (`***JWT***`), PEM private key
+  (`***PRIVATE_KEY***`), AWS access key (`***AWS_KEY***`), GitHub token
+  (`***GH_TOKEN***`), Stripe live secret (`***STRIPE_KEY***`), OpenAI
+  key (`***OPENAI_KEY***`), credit-card numbers passing Luhn checksum
+  (`***CC***`). Applies after key-pattern redaction so already-redacted
+  values are never double-processed.
+- JS: also fixes a syntax bug where `REDACT_REPLACEMENT` was assigned
+  as `` x"***" `` (invalid JS literal) — corrected to `"***"`.
+
+### Added — C++ logger bridges (P1-12)
+
+Three opt-in, header-only shims in `cpp/include/fasten/shim/`:
+
+- `fasten/shim/spdlog.hpp` — `spdlog_sink_mt` / `spdlog_sink_st`:
+  push onto an spdlog logger's sink list; each `LOG()` call mirrors
+  a syslog row into fasten's `/logs/sys` ring.
+- `fasten/shim/glog.hpp` — call `fasten::shim::glog::install()` once;
+  every `LOG(INFO/WARNING/ERROR/FATAL)` also writes to the ring.
+  `install()` is idempotent; `uninstall()` provided for tests.
+- `fasten/shim/boost_log.hpp` — `sink_mt` backend; add to
+  `boost::log::core::get()` to mirror `BOOST_LOG_TRIVIAL` records.
+
+All three shims apply key-pattern + value-shape redaction on the log
+message before pushing to the ring, and carry a per-thread recursion
+guard to prevent re-entry from fasten's own internal log writes.
+Per-shim integration tests added: `shim_spdlog_smoke` and
+`shim_glog_smoke` use stub headers (no install required); 
+`shim_boost_log_smoke` is guarded by `find_package(Boost COMPONENTS log)`.
+
+### Added — Go `/logs/audit/doctor` health endpoint (P1-15 parity)
+
+- `GET /api/v1/logs/audit/doctor` now available in Go via `NewReader()`.
+  Returns the same `store` / `queue` / `transport` / `init` JSON shape
+  as Python's reader, enabling k8s liveness probes and compliance
+  health checks without a Python dependency.
+- `Transport.SyslogDepth()` / `APIDepth()` ring-depth accessors added.
+- `SQLiteStore.Count(ctx)` added; used by the doctor endpoint for
+  store reachability + row-count probe.
+
 ### Changed — Audit-store failure handling (P1-15, Python) — DEFAULT BEHAVIOR
 
 - `fasten.emit()` is now **asynchronous by default**: rows are pushed

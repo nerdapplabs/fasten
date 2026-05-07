@@ -20,8 +20,8 @@ from .attrs import Anchor, AuditRow
 from .audit_queue import AuditStoreError
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
-from .emit import audit_store, emit, flush, init, log, queue_stats, redactor, transport
-from .engine import Engine
+from .emitter import audit_store, emit, flush, init, init_config, log, queue_stats, redactor, start, transport, verify_chain
+from .engine import ChainVerifyResult, Engine, FastenConfig
 from .store.repo import AuditRepository
 
 __all__ = [
@@ -40,6 +40,11 @@ __all__ = [
     "AuditRepository",
     # multi-tenant / isolated engine
     "Engine",
+    # config dataclass
+    "FastenConfig",
+    # hash chain verification
+    "ChainVerifyResult",
+    "verify_chain",
     # audit-store failure handling
     "AuditStoreError",
     "flush",
@@ -51,6 +56,8 @@ __all__ = [
     # core
     "emit",
     "init",
+    "init_config",
+    "start",
     "log",
     # adopter hooks
     "audit_store",

@@ -90,7 +90,7 @@ class Meta:
     dict key. Setting ``id`` explicitly is allowed but must match the key
     (raises on mismatch — that's a typo, never a feature).
 
-    ``pii_in_detail=True`` carries three enforced runtime effects (P1-5):
+    ``pii_in_detail=True`` carries two enforced runtime effects (P1-5):
 
     1. ``retention_class`` is forced to :attr:`RetentionClass.SHORT` at
        register-time. A WARNING is logged if the adopter declared anything
@@ -99,9 +99,8 @@ class Meta:
        key names: by default the whole map becomes
        ``{"_redacted": "***", "_pii_in_detail": True}``. Adopters who
        genuinely need fields preserved declare them in
-       :attr:`detail_passthrough_keys`.
-    3. Audit rows carry a ``pii_in_detail`` column so retention sweeps
-       and compliance reports can filter PII rows distinctly.
+       :attr:`detail_passthrough_keys`. The force-SHORT and force-redact
+       rules apply at emit time; no separate wire column is written.
     """
 
     domain: str               # adopter-defined, e.g. "user", "billing", "node"

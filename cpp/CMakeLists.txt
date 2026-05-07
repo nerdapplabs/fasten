@@ -114,6 +114,41 @@ if(FASTEN_BUILD_TESTS)
     else()
         message(STATUS "yaml-cpp not found — skipping codes_yaml_smoke")
     endif()
+
+    # P1-12: logger-shim smoke tests.
+    # spdlog + glog use stub headers in tests/shim_stubs/ — no install required.
+    # boost_log requires Boost.Log headers — guarded with find_package.
+
+    add_executable(shim_spdlog_smoke tests/shim_spdlog_smoke.cpp)
+    target_include_directories(shim_spdlog_smoke BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/shim_stubs)
+    target_link_libraries(shim_spdlog_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(shim_spdlog_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME shim_spdlog_smoke COMMAND shim_spdlog_smoke)
+
+    add_executable(shim_glog_smoke tests/shim_glog_smoke.cpp)
+    target_include_directories(shim_glog_smoke BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/shim_stubs)
+    target_link_libraries(shim_glog_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(shim_glog_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME shim_glog_smoke COMMAND shim_glog_smoke)
+
+    find_package(Boost COMPONENTS log log_setup)
+    if(Boost_LOG_FOUND)
+        add_executable(shim_boost_log_smoke tests/shim_boost_log_smoke.cpp)
+        target_link_libraries(shim_boost_log_smoke PRIVATE fasten
+            Boost::log Boost::log_setup)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(shim_boost_log_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME shim_boost_log_smoke COMMAND shim_boost_log_smoke)
+    else()
+        message(STATUS "Boost.Log not found — skipping shim_boost_log_smoke")
+    endif()
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────

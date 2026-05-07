@@ -119,13 +119,6 @@ def test_round_trip_detail_json(store):
     assert back.detail == detail
 
 
-def test_pii_in_detail_round_trips(store):
-    row = make_row(pii_in_detail=True)
-    store.insert(row)
-    back = store.query()[0]
-    assert back.pii_in_detail is True
-
-
 # ---------------------------------------------------------------------------
 # COUNT
 # ---------------------------------------------------------------------------

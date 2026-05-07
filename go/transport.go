@@ -83,6 +83,12 @@ func (t *Transport) PushSyslog(row SyslogRow) { t.Syslog.Push(row) }
 // PushAPI buffers an API request row. No stdout write — middleware owns logging.
 func (t *Transport) PushAPI(row APIRow) { t.API.Push(row) }
 
+// SyslogDepth returns the current number of syslog rows in the ring buffer.
+func (t *Transport) SyslogDepth() int { return t.Syslog.Len() }
+
+// APIDepth returns the current number of API-log rows in the ring buffer.
+func (t *Transport) APIDepth() int { return t.API.Len() }
+
 // WriteAudit writes an audit row to stdout as {"shape":"audit",...} JSON.
 func (t *Transport) WriteAudit(row map[string]any) {
 	row["shape"] = "audit"

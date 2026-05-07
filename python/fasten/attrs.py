@@ -73,15 +73,18 @@ class AuditRow:
     # payload
     detail: dict[str, Any] = field(default_factory=dict)
 
-    # P1-5: stamped True when the code declares pii_in_detail=True. Lets the
-    # retention sweep + compliance reports filter PII rows distinctly.
-    pii_in_detail: bool = False
-
     # wire schema version — readers MUST tolerate higher values on best-effort
     wire_version: str = "1"
 
     # replication marker (edge only)
     shipped_at: Optional[datetime] = None
+
+    # P1-23: tamper-evidence hash chain.
+    # prev_hash: hex sha256 of the preceding row in this (service_id, source_node_id) chain,
+    #            or the sentinel "genesis" for the first row.
+    # hash:      hex sha256 of canonical JSON of this row (all fields except `hash` itself).
+    prev_hash: str = "genesis"
+    hash: str = ""
 
     def __post_init__(self) -> None:
         if not self.code:

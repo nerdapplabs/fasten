@@ -85,3 +85,22 @@ def redactor() -> Redactor:
 def audit_store() -> Any:
     """Active AuditRepository of the default Engine."""
     return _default.audit_store()
+
+
+def init_config(*args, **kwargs):
+    """Resolve init parameters to a FastenConfig without starting runtime."""
+    return _default.init_config(*args, **kwargs)
+
+
+def start(cfg) -> None:
+    """Wire runtime from a FastenConfig. Delegates to the default Engine."""
+    _default.start(cfg)
+
+
+def verify_chain(rows: "list[Any]") -> "Any":
+    """Verify the hash chain of a list of AuditRow objects.
+
+    Returns a ChainVerifyResult with ok, total_rows, first_break_at, reason.
+    """
+    from .engine import verify_chain as _verify_chain
+    return _verify_chain(rows)
