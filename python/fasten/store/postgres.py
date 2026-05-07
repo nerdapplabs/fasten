@@ -1,0 +1,311 @@
+"""
+PostgreSQL implementation of AuditRepository (psycopg v3).
+
+Parses ``postgres[ql]://user:pass@host/db?table=X`` DSN, strips the
+``table`` query-param before handing the DSN to psycopg (libpq rejects
+unknown params), and creates the table on first use.
+
+Install the optional dep:  pip install "fasten[postgres]"
+"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+from ..attrs import AuditRow
+
+# Bare name ("audit_log") or schema-qualified ("fasten.audit_log").
+_SAFE_IDENTIFIER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$"
+)
+
+
+def _utc_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+    id               TEXT PRIMARY KEY,
+    origin_id        TEXT NOT NULL,
+    monotonic_seq    BIGINT NOT NULL,
+    timestamp        TEXT NOT NULL,
+    code             TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    severity         TEXT NOT NULL,
+    service_id       TEXT NOT NULL,
+    source_node_id   TEXT NOT NULL,
+    tenant_id        TEXT,
+    actor            TEXT NOT NULL,
+    actor_kind       TEXT NOT NULL,
+    target           TEXT NOT NULL,
+    category         TEXT NOT NULL,
+    domain           TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    detail           TEXT NOT NULL,
+    pii_in_detail    SMALLINT NOT NULL DEFAULT 0,
+    shipped_at       TEXT
+)
+"""
+
+_INDEXES = [
+    # {p} = bare table name used for the index identifier (no dots allowed).
+    # {t} = fully-qualified table name used in ON clause (may be schema.table).
+    "CREATE INDEX IF NOT EXISTS idx_{p}_req       ON {t}(request_id)",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_pii       ON {t}(pii_in_detail) WHERE pii_in_detail = 1",
+]
+
+
+class PostgresStore:
+    """Thread-safe PostgreSQL-backed AuditRepository (psycopg v3).
+
+    Opens one connection per thread via threading.local. Each connection
+    is independent; Postgres serialises concurrent writers at the server
+    level, so no additional locking is needed here.
+    """
+
+    def __init__(self, dsn: str, table: str = "audit_log") -> None:
+        if not _SAFE_IDENTIFIER.match(table):
+            raise ValueError(
+                f"fasten PostgresStore: table name {table!r} is not a valid SQL identifier. "
+                "Use only letters, digits, underscores, and an optional 'schema.' prefix."
+            )
+        self._dsn = dsn
+        self._table = table  # full ref used in SQL (may be "schema.table")
+        # Bare table name for index identifiers — dots are not allowed there.
+        self._idx_prefix = table.split(".")[-1]
+        self._schema = table.split(".")[0] if "." in table else None
+        self._tls = threading.local()
+        # Bootstrap DDL once on the calling thread; every other thread that
+        # subsequently opens its own connection will see the table already present.
+        conn = self._connect()
+        with conn.cursor() as cur:
+            if self._schema:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
+            cur.execute(_DDL.format(table=self._table))
+            for sql in _INDEXES:
+                cur.execute(sql.format(t=self._table, p=self._idx_prefix))
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> Any:
+        import psycopg
+
+        conn = getattr(self._tls, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg.connect(self._dsn)
+            self._tls.conn = conn
+        return conn
+
+    def close(self) -> None:
+        """Close the calling thread's connection."""
+        conn = getattr(self._tls, "conn", None)
+        if conn and not conn.closed:
+            conn.close()
+        self._tls.conn = None
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_dsn(cls, dsn: str) -> "PostgresStore":
+        """Parse a ``postgres[ql]://...?table=X`` DSN.
+
+        Strips the fasten-specific ``table`` param before handing the DSN
+        to psycopg — libpq raises an error on unrecognised parameters.
+        """
+        u = urlparse(dsn)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        table = q.pop("table", "audit_log")
+        pg_dsn = urlunparse(u._replace(query=urlencode(q)))
+        return cls(dsn=pg_dsn, table=table)
+
+    # ------------------------------------------------------------------
+    # AuditRepository protocol
+    # ------------------------------------------------------------------
+
+    def insert(self, row: AuditRow) -> None:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self._table} VALUES "
+                "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (
+                    row.id, row.origin_id, row.monotonic_seq,
+                    _utc_iso(row.timestamp),
+                    row.code, row.action, row.severity,
+                    row.service_id, row.source_node_id, row.tenant_id,
+                    row.actor, row.actor_kind,
+                    row.target, row.category, row.domain,
+                    row.method, row.request_id,
+                    json.dumps(row.detail),
+                    int(row.pii_in_detail),
+                    _utc_iso(row.shipped_at) if row.shipped_at else None,
+                ),
+            )
+        conn.commit()
+
+    def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                "ORDER BY monotonic_seq ASC LIMIT %s",
+                (limit,),
+            )
+            return [self._row(r) for r in cur.fetchall()]
+
+    def mark_shipped(self, ids: list[str]) -> None:
+        now = _utc_iso(datetime.now(timezone.utc))
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"UPDATE {self._table} SET shipped_at=%s WHERE id=%s",
+                [(now, i) for i in ids],
+            )
+        conn.commit()
+
+    def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
+        sql = f"DELETE FROM {self._table} WHERE timestamp < %s"
+        params: list[Any] = [_utc_iso(before)]
+        if respect_unshipped:
+            sql += " AND shipped_at IS NOT NULL"
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+
+    def _build_where(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> tuple[str, list[Any]]:
+        conds: list[str] = []
+        params: list[Any] = []
+        if request_id:
+            conds.append("request_id = %s")
+            params.append(request_id)
+        if code:
+            conds.append("code = %s")
+            params.append(code)
+        if domain:
+            conds.append("domain = %s")
+            params.append(domain)
+        if source_node_id:
+            conds.append("source_node_id = %s")
+            params.append(source_node_id)
+        if actor:
+            conds.append("actor = %s")
+            params.append(actor)
+        if target:
+            conds.append("target = %s")
+            params.append(target)
+        if since:
+            conds.append("timestamp >= %s")
+            params.append(_utc_iso(since))
+        if until:
+            conds.append("timestamp <= %s")
+            params.append(_utc_iso(until))
+        where = f"WHERE {' AND '.join(conds)}" if conds else ""
+        return where, params
+
+    def query(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[AuditRow]:
+        where, params = self._build_where(
+            request_id=request_id, code=code, domain=domain,
+            source_node_id=source_node_id, actor=actor, target=target,
+            since=since, until=until,
+        )
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM {self._table} {where} "
+                "ORDER BY monotonic_seq DESC LIMIT %s OFFSET %s",
+                (*params, limit, offset),
+            )
+            return [self._row(r) for r in cur.fetchall()]
+
+    def count(
+        self,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        domain: str | None = None,
+        source_node_id: str | None = None,
+        actor: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> int:
+        where, params = self._build_where(
+            request_id=request_id, code=code, domain=domain,
+            source_node_id=source_node_id, actor=actor, target=target,
+            since=since, until=until,
+        )
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self._table} {where}", params)
+            return int(cur.fetchone()[0])
+
+    def max_monotonic_seq(self) -> int:
+        """Return MAX(monotonic_seq); 0 if no rows."""
+        conn = self._connect()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
+            return int(cur.fetchone()[0])
+
+    # ------------------------------------------------------------------
+    # Row deserialisation
+    # ------------------------------------------------------------------
+
+    def _row(self, r: tuple) -> AuditRow:
+        return AuditRow(
+            id=r[0], origin_id=r[1], monotonic_seq=r[2],
+            timestamp=datetime.fromisoformat(r[3]),
+            code=r[4], action=r[5], severity=r[6],
+            service_id=r[7], source_node_id=r[8], tenant_id=r[9],
+            actor=r[10], actor_kind=r[11],
+            target=r[12], category=r[13], domain=r[14],
+            method=r[15], request_id=r[16],
+            detail=json.loads(r[17]),
+            pii_in_detail=bool(r[18]),
+            shipped_at=datetime.fromisoformat(r[19]) if r[19] else None,
+        )

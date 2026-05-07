@@ -41,6 +41,15 @@ def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
     return v if v is not None else default
 
 
+def _store_from_dsn(dsn: str) -> Any:
+    """Return the correct store implementation for a given DSN."""
+    if dsn.startswith(("postgres://", "postgresql://")):
+        from .store.postgres import PostgresStore
+        return PostgresStore.from_dsn(dsn)
+    from .store.sqlite import SQLiteStore
+    return SQLiteStore.from_dsn(dsn)
+
+
 class Engine:
     """
     A single fasten runtime instance.
@@ -117,8 +126,7 @@ class Engine:
                     "For tests, construct a store directly and pass via "
                     "init(audit_store=...)."
                 )
-            from .store.sqlite import SQLiteStore
-            self._audit_store = SQLiteStore.from_dsn(dsn)
+            self._audit_store = _store_from_dsn(dsn)
 
         # Seed monotonic_seq from the store so post-restart rows never
         # duplicate (timestamp, seq) with pre-restart rows on the same node.
@@ -131,8 +139,7 @@ class Engine:
         else:
             dsn = os.environ.get("FASTEN_API_DSN")
             if dsn:
-                from .store.sqlite import SQLiteStore
-                self._api_store = SQLiteStore.from_dsn(dsn)
+                self._api_store = _store_from_dsn(dsn)
 
         raw_keys = extra_redact_keys or (
             os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
