@@ -1,3 +1,14 @@
+# C++ build artifacts
+cpp/audit_queue_smoke
+cpp/pii_smoke
+cpp/redact_smoke
+
+# Coverage outputs
+python/.coverage
+python/coverage.xml
+js/coverage/
+rust/coverage.lcov
+
 # Python
 __pycache__/
 *.py[cod]
