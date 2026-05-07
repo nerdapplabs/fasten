@@ -10,6 +10,9 @@
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
+    },
+    "./store/postgres": {
+      "default": "./src/store/postgres.js"
     }
   },
   "engines": {
