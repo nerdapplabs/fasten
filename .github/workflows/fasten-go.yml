@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # required by codecov OIDC upload (tokenless for public repos)
 
 jobs:
   test:
@@ -34,4 +35,14 @@ jobs:
 
       - name: Unit tests
         # -race requires CGO which is not available in golang:*-alpine (CGO_ENABLED=0)
-        run: go test -v ./...
+        run: go test -v -count=1 -coverprofile=coverage.out ./...
+
+      - name: Install Codecov runtime deps
+        run: apk add --no-cache git curl gpg
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: go/coverage.out
+          flags: go
+          fail_ci_if_error: false

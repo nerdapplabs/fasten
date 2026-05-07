@@ -98,10 +98,12 @@ pub const REDACT_PATTERNS: &[&str] = &[
 // Codegen output has no Default derives; impl them here so Meta { ..Default::default() }
 // works for adopters who only set a few fields. Sensible defaults: INFO + MEDIUM.
 
+#[allow(clippy::derivable_impls)]
 impl Default for Severity {
     fn default() -> Self { Severity::Info }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for RetentionClass {
     fn default() -> Self { RetentionClass::Medium }
 }

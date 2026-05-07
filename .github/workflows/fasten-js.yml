@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # required by codecov OIDC upload (tokenless for public repos)
 
 jobs:
   test:
@@ -33,6 +34,18 @@ jobs:
         # js-yaml is an optional peerDep / devDep — required by codes_yaml tests.
         run: npm install --no-audit --no-fund
 
-      - name: Unit tests
-        # node --test with no path auto-discovers **/*.test.mjs in cwd
-        run: node --test
+      - name: Lint (biome)
+        run: npx biome check src/
+
+      - name: Unit tests with coverage
+        run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
+
+      - name: Install Codecov runtime deps
+        run: apk add --no-cache git curl gpg
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: js/coverage/lcov.info
+          flags: js
+          fail_ci_if_error: false

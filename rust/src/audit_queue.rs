@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::{engine::LockOrRecover, AuditStore, Error, Row};
+use crate::{engine::{DrainerConfig, LockOrRecover, SysLogFn}, AuditStore, Error, Row};
 
 /// Same recovery applied to `Condvar::wait`. Inline at the two call
 /// sites — a trait method on `Condvar` would need to take the guard
@@ -118,7 +118,7 @@ struct Stats {
 
 pub(crate) struct DrainerInner {
     store: Arc<dyn AuditStore>,
-    sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
+    sys_log: SysLogFn,
     capacity: usize,
     retry_initial: Duration,
     retry_max: Duration,
@@ -141,24 +141,20 @@ pub(crate) struct Drainer {
 impl Drainer {
     pub(crate) fn new(
         store: Arc<dyn AuditStore>,
-        sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
-        capacity: usize,
-        retry_initial: Duration,
-        retry_max: Duration,
-        retry_jitter: bool,
-        max_attempts: usize,
+        sys_log: SysLogFn,
+        cfg: DrainerConfig,
     ) -> Arc<Self> {
         let inner = Arc::new(DrainerInner {
             store,
             sys_log,
-            capacity,
-            retry_initial,
-            retry_max,
-            retry_jitter,
-            max_attempts,
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: cfg.capacity,
+            retry_initial: cfg.retry_initial,
+            retry_max: cfg.retry_max,
+            retry_jitter: cfg.retry_jitter,
+            max_attempts: cfg.max_attempts,
+            queue: Mutex::new(VecDeque::with_capacity(cfg.capacity)),
             queue_cv: Condvar::new(),
-            slots: Sem::new(capacity),
+            slots: Sem::new(cfg.capacity),
             stop: AtomicBool::new(false),
             stats: Mutex::new(Stats::default()),
         });

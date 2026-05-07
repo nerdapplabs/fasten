@@ -21,6 +21,20 @@ use crate::{
     current_request_id, AuditStore, Config, Error,
 };
 
+/// Type alias for the drainer's sys-log callback, avoiding repetition of the
+/// verbose bound across engine and audit_queue call sites.
+pub(crate) type SysLogFn = Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>;
+
+/// Drainer tuning parameters, grouped to keep `install_drainer` below
+/// clippy's argument-count threshold and to make re-init call sites readable.
+pub(crate) struct DrainerConfig {
+    pub(crate) capacity: usize,
+    pub(crate) retry_initial: Duration,
+    pub(crate) retry_max: Duration,
+    pub(crate) retry_jitter: bool,
+    pub(crate) max_attempts: usize,
+}
+
 pub(crate) use self::lock_ext::LockOrRecover;
 
 mod lock_ext {
@@ -91,10 +105,12 @@ impl Engine {
 
         if strategy == "queue" {
             if let Some(s) = store {
-                let sys_log = Box::new(move |level: &str, event: &str, fields: &serde_json::Value| {
+                let sys_log: SysLogFn = Box::new(move |level: &str, event: &str, fields: &serde_json::Value| {
                     Self::emit_sys_stderr(level, event, fields, &svc_id_for_log);
                 });
-                self.install_drainer(s, sys_log, capacity, retry_initial, retry_max, retry_jitter, max_attempts);
+                self.install_drainer(s, sys_log, DrainerConfig {
+                    capacity, retry_initial, retry_max, retry_jitter, max_attempts,
+                });
             } else {
                 self.uninstall_drainer();
             }
@@ -122,24 +138,12 @@ impl Engine {
     pub(crate) fn install_drainer(
         &self,
         store: Arc<dyn AuditStore>,
-        sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
-        capacity: usize,
-        retry_initial: Duration,
-        retry_max: Duration,
-        retry_jitter: bool,
-        max_attempts: usize,
+        sys_log: SysLogFn,
+        cfg: DrainerConfig,
     ) {
         // Race-safe re-init: build the new drainer FIRST, swap the slot
         // atomically, then flush + shutdown the old one OUTSIDE the lock.
-        let new = Drainer::new(
-            store,
-            sys_log,
-            capacity,
-            retry_initial,
-            retry_max,
-            retry_jitter,
-            max_attempts,
-        );
+        let new = Drainer::new(store, sys_log, cfg);
         let old = {
             let mut slot = self.drainer.lock_or_recover();
             slot.replace(new)
@@ -230,6 +234,10 @@ impl Engine {
         }
         eprintln!("{}", serde_json::Value::Object(payload));
     }
+}
+
+impl Default for Engine {
+    fn default() -> Self { Self::new() }
 }
 
 /// The default engine used by all free-function API calls (`init`, `emit`, …).
