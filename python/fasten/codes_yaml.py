@@ -70,7 +70,7 @@ _lock = threading.Lock()
 def _yaml_loader() -> Any:
     """Lazy import of pyyaml — paid only when load() / reload() is called."""
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml
     except ImportError as e:
         raise RuntimeError(
             "fasten.codes.load() requires pyyaml; install with: pip install pyyaml"

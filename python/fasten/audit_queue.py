@@ -421,7 +421,7 @@ class _AuditQueueDrainer:
 # conftest) continue to work without modification.
 
 
-def _default_engine():
+def _default_engine() -> Any:
     from .emit import _default
     return _default
 
@@ -445,7 +445,7 @@ def install(
         retry_jitter=retry_jitter,
         max_attempts=max_attempts,
     )
-    return eng._drainer  # type: ignore[return-value]
+    return eng._drainer
 
 
 def uninstall() -> None:
@@ -472,5 +472,5 @@ def _mark_init() -> None:
     pass  # last_init_at now lives on Engine; call is a no-op here.
 
 
-def last_init_at():
+def last_init_at() -> Optional[Any]:
     return _default_engine().last_init_at()

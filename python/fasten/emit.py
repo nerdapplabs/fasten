@@ -15,8 +15,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .attrs import AuditRow
 from .audit_queue import AuditStoreError  # noqa: F401 — re-exported for back-compat
 from .engine import Engine
+from .redact import Redactor
+from .transport.stdout import StdoutTransport
 
 # Module-level default instance — all free functions delegate here.
 _default: Engine = Engine()
@@ -46,7 +49,7 @@ def emit(
     detail: Optional[dict[str, Any]] = None,
     severity: Optional[str] = None,
     method: Optional[str] = None,
-):
+) -> AuditRow:
     """Emit an audit row via the default Engine."""
     return _default.emit(
         code=code,
@@ -69,16 +72,16 @@ def queue_stats() -> Optional[dict[str, Any]]:
     return _default.queue_stats()
 
 
-def transport():
+def transport() -> Optional[StdoutTransport]:
     """Active StdoutTransport of the default Engine."""
     return _default.transport()
 
 
-def redactor():
+def redactor() -> Redactor:
     """Active Redactor of the default Engine."""
     return _default.redactor()
 
 
-def audit_store():
+def audit_store() -> Any:
     """Active AuditRepository of the default Engine."""
     return _default.audit_store()

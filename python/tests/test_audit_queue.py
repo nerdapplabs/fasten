@@ -462,3 +462,143 @@ def test_doctor_endpoint_raise_mode_queue_is_null():
     body = client.get("/logs/audit/doctor").json()
     assert body["queue"] is None
     assert body["init"]["failure_strategy"] == "raise"
+
+
+# ── #8 drainer coverage gaps ───────────────────────────────────────────────
+
+
+def test_put_after_drainer_stopped_emits_abandoned():
+    """put() after stop() emits audit_drain_abandoned (not silently drops)."""
+    store = _RecordingStore()
+    captured: list = []
+    _init(store, queue_retry_initial_ms=5, queue_retry_max_ms=20, queue_retry_jitter=False)
+
+    t = fasten.transport()
+    assert t is not None
+    orig = t.write_drainer_syslog
+    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+
+    drainer = _aq.active()
+    assert drainer is not None
+    drainer._stop.set()  # simulate shutdown without teardown
+    drainer.put(object())  # must not block; must emit abandoned
+
+    events = [r.get("event") for r in captured]
+    assert "audit_drain_abandoned" in events
+
+
+def test_used_slots_method_matches_count():
+    """_used_slots() must return the same value as _used_slots_count."""
+    store = _RecordingStore()
+    _init(store)
+    drainer = _aq.active()
+    assert drainer is not None
+    assert drainer._used_slots() == drainer._used_slots_count == 0
+
+
+def test_dead_letter_after_max_attempts():
+    """A row that exceeds max_attempts must be dead-lettered; slot is released."""
+    store = _BrokenStore()
+    captured: list = []
+
+    _init(
+        store,
+        queue_retry_initial_ms=1,
+        queue_retry_max_ms=2,
+        queue_retry_jitter=False,
+        queue_drain_max_attempts=3,
+    )
+    t = fasten.transport()
+    assert t is not None
+    orig = t.write_drainer_syslog
+    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+
+    fasten.emit(code="USER_CREATED", target="u-dlq")
+    # Allow time for 3 attempts + dead-letter
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if any(r.get("event") == "audit_drain_dead_letter" for r in captured):
+            break
+        time.sleep(0.02)
+
+    events = [r.get("event") for r in captured]
+    assert "audit_drain_dead_letter" in events
+
+    s = fasten.queue_stats()
+    assert s is not None
+    assert s["dead_lettered_total"] >= 1
+    assert s["depth"] == 0  # slot released after dead-letter
+
+
+def test_flush_returns_false_on_timeout():
+    """flush() must return False when the timeout elapses before draining."""
+    store = _BrokenStore()
+    _init(store, queue_retry_initial_ms=500, queue_retry_max_ms=500, queue_retry_jitter=False)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    result = _aq.active().flush(timeout=0.05)
+    assert result is False
+
+
+def test_backoff_jitter_does_not_raise():
+    """jitter=True path must not raise and still eventually drain."""
+    store = _FlakyStore(fail_first=2)
+    _init(
+        store,
+        queue_retry_initial_ms=5,
+        queue_retry_max_ms=50,
+        queue_retry_jitter=True,  # explicitly enable jitter
+    )
+    fasten.emit(code="USER_CREATED", target="u-jitter")
+    assert fasten.flush(timeout=3.0)
+    assert store.success == 1
+
+
+def test_in_shutdown_single_attempt_on_broken_store():
+    """Drainer must release the slot on a broken store during shutdown."""
+    store = _BrokenStore()
+    _init(store, queue_retry_initial_ms=500, queue_retry_max_ms=500, queue_retry_jitter=False)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    drainer = _aq.active()
+    assert drainer is not None
+    # stop() drains remaining rows in_shutdown=True mode (one attempt, no retry)
+    drainer.stop(timeout=2.0)
+    assert drainer._used_slots_count == 0  # slot must be released even on failure
+
+
+# ── #9 backward-compat shims ──────────────────────────────────────────────
+
+
+def test_shim_install_and_active():
+    """install() shim wires the default engine's drainer; active() returns it."""
+    store = _RecordingStore()
+    captured_logs: list = []
+
+    drainer = _aq.install(
+        store=store,
+        sys_log=lambda level, event, fields: captured_logs.append({"event": event}),
+        capacity=10,
+        retry_initial_ms=5,
+        retry_max_ms=20,
+        retry_jitter=False,
+    )
+    assert drainer is not None
+    assert _aq.active() is drainer
+
+
+def test_shim_flush_delegates_to_engine(mem_store):
+    _init(mem_store)
+    assert _aq.flush(timeout=1.0) is True
+
+
+def test_shim_mark_init_is_noop():
+    _aq._mark_init()  # must not raise
+
+
+def test_shim_last_init_at_before_init_returns_none():
+    assert _aq.last_init_at() is None
+
+
+def test_shim_last_init_at_after_init(mem_store):
+    _init(mem_store)
+    ts = _aq.last_init_at()
+    assert ts is not None
