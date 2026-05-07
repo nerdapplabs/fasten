@@ -76,8 +76,10 @@ if(FASTEN_BUILD_TESTS)
     add_test(NAME redact_substring_smoke COMMAND redact_substring_smoke)
 
     # sqlite_store_smoke needs sqlite3 at link time.
-    find_package(SQLite3)
-    if(SQLite3_FOUND)
+    # Guard with TARGET check: some cmake/platform combos set SQLite3_FOUND but
+    # fail to create the SQLite3::SQLite3 IMPORTED target (cmake bug on older 3.x).
+    find_package(SQLite3 QUIET)
+    if(TARGET SQLite3::SQLite3)
         add_executable(sqlite_store_smoke tests/sqlite_store_smoke.cpp)
         target_link_libraries(sqlite_store_smoke PRIVATE fasten SQLite3::SQLite3)
         if(UNIX AND NOT APPLE)
@@ -85,12 +87,12 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
     else()
-        message(STATUS "SQLite3 not found — skipping sqlite_store_smoke")
+        message(STATUS "SQLite3::SQLite3 target unavailable — skipping sqlite_store_smoke")
     endif()
 
     # postgres_store_smoke needs libpq at link time.
-    find_package(PostgreSQL)
-    if(PostgreSQL_FOUND)
+    find_package(PostgreSQL QUIET)
+    if(TARGET PostgreSQL::PostgreSQL)
         add_executable(postgres_store_smoke tests/postgres_store_smoke.cpp)
         target_link_libraries(postgres_store_smoke PRIVATE fasten PostgreSQL::PostgreSQL)
         if(UNIX AND NOT APPLE)
@@ -98,7 +100,7 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME postgres_store_smoke COMMAND postgres_store_smoke)
     else()
-        message(STATUS "PostgreSQL not found — skipping postgres_store_smoke")
+        message(STATUS "PostgreSQL::PostgreSQL target unavailable — skipping postgres_store_smoke")
     endif()
 
     # codes_yaml smoke needs libyaml-cpp at link time — guard so the build

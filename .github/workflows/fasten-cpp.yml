@@ -30,10 +30,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install build deps
-        # cmake + libyaml-cpp-dev (required by codes_yaml_smoke; pii smoke is dep-free).
+        # cmake + libyaml-cpp-dev (codes_yaml_smoke) + libsqlite3-dev (sqlite_store_smoke).
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends cmake libyaml-cpp-dev
+          apt-get install -y --no-install-recommends cmake libyaml-cpp-dev libsqlite3-dev
 
       - name: Configure
         run: cmake -S . -B build -DFASTEN_BUILD_TESTS=ON -DFASTEN_BUILD_EXAMPLES=ON

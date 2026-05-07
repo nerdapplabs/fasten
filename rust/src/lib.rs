@@ -474,7 +474,7 @@ fn check_value_shape(s: &str) -> Option<&'static str> {
             if bytes[i..].starts_with(prefix) {
                 let rest = &bytes[i + prefix.len()..];
                 let n = rest.iter().take(16).filter(|&&b| is_upper_alnum(b)).count();
-                if n == 16 && rest.get(16).map_or(true, |&b| !is_upper_alnum(b)) {
+                if n == 16 && rest.get(16).is_none_or(|&b| !is_upper_alnum(b)) {
                     return Some("***AWS_KEY***");
                 }
             }

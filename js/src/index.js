@@ -54,27 +54,50 @@ export function _resetRegistryForReload(newRegistry, newYamlCodes) {
 export const Domain = {}; // kept for import compatibility; intentionally empty
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
-export const Severity = Object.freeze({ DEBUG: "debug", INFO: "info", WARN: "warn", ERROR: "error", CRITICAL: "critical" });
-export const RetentionClass = Object.freeze({ SHORT: "short", MEDIUM: "medium", LONG: "long" });
-export const ActorKind = Object.freeze({ USER: "user", SERVICE: "service", SCHEDULE: "schedule", AGENT: "agent" });
-export const Method = Object.freeze({ HTTP: "http", MQTT: "mqtt", CLI: "cli", SCHEDULER: "scheduler", UI: "ui", AGENT_TOOL: "agent_tool", SDK: "sdk" });
+export const Severity = Object.freeze({
+	DEBUG: "debug",
+	INFO: "info",
+	WARN: "warn",
+	ERROR: "error",
+	CRITICAL: "critical",
+});
+export const RetentionClass = Object.freeze({
+	SHORT: "short",
+	MEDIUM: "medium",
+	LONG: "long",
+});
+export const ActorKind = Object.freeze({
+	USER: "user",
+	SERVICE: "service",
+	SCHEDULE: "schedule",
+	AGENT: "agent",
+});
+export const Method = Object.freeze({
+	HTTP: "http",
+	MQTT: "mqtt",
+	CLI: "cli",
+	SCHEDULER: "scheduler",
+	UI: "ui",
+	AGENT_TOOL: "agent_tool",
+	SDK: "sdk",
+});
 
 export const REDACT_REPLACEMENT = "***";
 export const REDACT_PATTERNS = [
-  "api[_-]?key",
-  "password",
-  "passwd",
-  "token",
-  "secret",
-  "authorization",
-  "bearer",
-  "m2m[_-]?key",
-  "cert[_-]?private",
-  "private[_-]?key",
-  "access_key",
-  "session_id",
-  "cookie",
-  "credential",
+	"api[_-]?key",
+	"password",
+	"passwd",
+	"token",
+	"secret",
+	"authorization",
+	"bearer",
+	"m2m[_-]?key",
+	"cert[_-]?private",
+	"private[_-]?key",
+	"access_key",
+	"session_id",
+	"cookie",
+	"credential",
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
@@ -175,12 +198,16 @@ const REDACT_RE = new RegExp(`(${REDACT_PATTERNS.join("|")})`, "i");
 
 // Value-shape patterns: [name, regex, replacement].
 const _VALUE_PATTERNS = [
-	["JWT",        /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "***JWT***"],
-	["PRIVATE_KEY", /-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----/,  "***PRIVATE_KEY***"],
-	["AWS_KEY",    /(?:AKIA|ASIA)[A-Z0-9]{16}/,                               "***AWS_KEY***"],
-	["GH_TOKEN",   /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/,               "***GH_TOKEN***"],
-	["STRIPE_KEY", /sk_live_[A-Za-z0-9]{24,}/,                                "***STRIPE_KEY***"],
-	["OPENAI_KEY", /sk-(?:proj-)?[A-Za-z0-9_-]{32,}/,                        "***OPENAI_KEY***"],
+	["JWT", /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "***JWT***"],
+	[
+		"PRIVATE_KEY",
+		/-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----/,
+		"***PRIVATE_KEY***",
+	],
+	["AWS_KEY", /(?:AKIA|ASIA)[A-Z0-9]{16}/, "***AWS_KEY***"],
+	["GH_TOKEN", /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/, "***GH_TOKEN***"],
+	["STRIPE_KEY", /sk_live_[A-Za-z0-9]{24,}/, "***STRIPE_KEY***"],
+	["OPENAI_KEY", /sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
 ];
 
 const _CC_DIGIT_RE = /\b\d[\d\s\-]{11,17}\d\b/;
@@ -188,8 +215,11 @@ const _CC_DIGIT_RE = /\b\d[\d\s\-]{11,17}\d\b/;
 function _luhnValid(digits) {
 	let total = 0;
 	for (let i = 0; i < digits.length; i++) {
-		let n = parseInt(digits[digits.length - 1 - i], 10);
-		if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9; }
+		let n = Number.parseInt(digits[digits.length - 1 - i], 10);
+		if (i % 2 === 1) {
+			n *= 2;
+			if (n > 9) n -= 9;
+		}
 		total += n;
 	}
 	return total % 10 === 0;
@@ -199,7 +229,8 @@ function _checkValueShape(s) {
 	const ccMatch = _CC_DIGIT_RE.exec(s);
 	if (ccMatch) {
 		const digits = ccMatch[0].replace(/[\s\-]/g, "");
-		if (digits.length >= 13 && digits.length <= 19 && _luhnValid(digits)) return "***CC***";
+		if (digits.length >= 13 && digits.length <= 19 && _luhnValid(digits))
+			return "***CC***";
 	}
 	for (const [, re, repl] of _VALUE_PATTERNS) {
 		if (re.test(s)) return repl;
