@@ -1,0 +1,5 @@
+module CFastenStoreCore [system] {
+    umbrella header "fasten_store_core.h"
+    link "fasten_store_core"
+    export *
+}
