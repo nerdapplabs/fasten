@@ -5,7 +5,8 @@ use rusqlite::Connection;
 use crate::{
     error::Error,
     row::Row,
-    validate::{split_table, validate_table_name},
+    store::Filter,
+    validate::validate_table_name,
 };
 
 use super::Store;
@@ -16,6 +17,12 @@ pub struct SqliteStore {
     conn: Mutex<Connection>,
     table: String,
     insert_sql: String,
+}
+
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteStore").field("table", &self.table).finish_non_exhaustive()
+    }
 }
 
 impl SqliteStore {
@@ -124,9 +131,129 @@ impl Store for SqliteStore {
         guard.execute_batch("SELECT 1")?;
         Ok(())
     }
+
+    fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
+        let (where_clause, params_owned) = build_filter_where(filter);
+        // LIMIT / OFFSET are integers, interpolated directly — no injection risk.
+        let mut sql = format!(
+            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
+             code,action,severity,service_id,source_node_id,tenant_id,\
+             actor,actor_kind,target,category,domain,method,\
+             request_id,detail,pii_in_detail,shipped_at \
+             FROM {} {} ORDER BY monotonic_seq ASC",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            sql.push_str(&format!(" LIMIT {}", filter.limit));
+            if filter.offset > 0 {
+                sql.push_str(&format!(" OFFSET {}", filter.offset));
+            }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_owned.iter().map(|p| p.as_ref()).collect();
+
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&sql)?;
+        let rows: Vec<Row> = stmt
+            .query_map(params_refs.as_slice(), row_from_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn count(&self, filter: &Filter) -> Result<u64, Error> {
+        let (where_clause, params_owned) = build_filter_where(filter);
+        let sql = format!("SELECT COUNT(*) FROM {} {}", self.table, where_clause);
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_owned.iter().map(|p| p.as_ref()).collect();
+
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&sql)?;
+        let n: i64 = stmt.query_row(params_refs.as_slice(), |r| r.get(0))?;
+        Ok(n.unsigned_abs())
+    }
+
+    fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
+        // Always emit LIMIT; use i64::MAX when the caller passes 0.
+        let effective: i64 = if limit == 0 {
+            i64::MAX
+        } else {
+            i64::from(limit)
+        };
+        let sql = format!(
+            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
+             code,action,severity,service_id,source_node_id,tenant_id,\
+             actor,actor_kind,target,category,domain,method,\
+             request_id,detail,pii_in_detail,shipped_at \
+             FROM {} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1",
+            self.table
+        );
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare_cached(&sql)?;
+        let rows: Vec<Row> = stmt
+            .query_map(rusqlite::params![effective], row_from_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        // ?1 = shipped_at timestamp; ?2 .. ?N = IDs.
+        let placeholders: String = (2..=ids.len() + 1)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE {} SET shipped_at = ?1 WHERE id IN ({})",
+            self.table, placeholders
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        params.push(Box::new(now));
+        for id in ids {
+            params.push(Box::new(id.clone()));
+        }
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        guard.execute(&sql, params_refs.as_slice())?;
+        Ok(())
+    }
+
+    fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
+        let sql = if respect_unshipped {
+            format!(
+                "DELETE FROM {} WHERE timestamp < ?1 AND shipped_at IS NOT NULL",
+                self.table
+            )
+        } else {
+            format!("DELETE FROM {} WHERE timestamp < ?1", self.table)
+        };
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n = guard.execute(&sql, rusqlite::params![before])?;
+        Ok(n as u64)
+    }
+
+    fn max_monotonic_seq(&self) -> Result<u64, Error> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(monotonic_seq), 0) FROM {}",
+            self.table
+        );
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare_cached(&sql)?;
+        let seq: i64 = stmt.query_row([], |r| r.get(0))?;
+        Ok(seq.unsigned_abs())
+    }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── SQL helpers ───────────────────────────────────────────────────────────────
 
 fn build_insert_sql(table: &str) -> String {
     format!(
@@ -139,11 +266,77 @@ fn build_insert_sql(table: &str) -> String {
     )
 }
 
-// SQLite schema doesn't support `schema.table`, so `split_table` is exposed
-// only for the callers who need the bare name for index naming. The store
-// itself validates that `table` is a plain identifier (no dot).
-#[allow(dead_code)]
-pub(crate) use crate::validate::split_table as _split;
+/// Build `" WHERE col = ? AND ..."` and the matching positional params.
+/// Unnamed `?` binds are added in the same order as the conditions.
+fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(ref v) = f.request_id {
+        parts.push("request_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(ref v) = f.code {
+        parts.push("code = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(ref v) = f.domain {
+        parts.push("domain = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(ref v) = f.source_node_id {
+        parts.push("source_node_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(ref v) = f.since {
+        parts.push("timestamp >= ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(ref v) = f.until {
+        parts.push("timestamp <= ?");
+        params.push(Box::new(v.clone()));
+    }
+
+    let clause = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", parts.join(" AND "))
+    };
+    (clause, params)
+}
+
+// ── Row mapper ────────────────────────────────────────────────────────────────
+
+/// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.
+fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
+    let detail_str: String = r.get(18)?;
+    let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
+    let pii: i64 = r.get(19)?;
+    let seq: i64 = r.get(3)?;
+    Ok(Row {
+        id:             r.get(0)?,
+        wire_version:   r.get(1)?,
+        origin_id:      r.get(2)?,
+        monotonic_seq:  seq.unsigned_abs(),
+        timestamp:      r.get(4)?,
+        code:           r.get(5)?,
+        action:         r.get(6)?,
+        severity:       r.get(7)?,
+        service_id:     r.get(8)?,
+        source_node_id: r.get(9)?,
+        tenant_id:      r.get(10)?,
+        actor:          r.get(11)?,
+        actor_kind:     r.get(12)?,
+        target:         r.get(13)?,
+        category:       r.get(14)?,
+        domain:         r.get(15)?,
+        method:         r.get(16)?,
+        request_id:     r.get(17)?,
+        detail,
+        pii_in_detail:  pii != 0,
+        shipped_at:     r.get(20)?,
+    })
+}
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
@@ -226,5 +419,61 @@ mod tests {
     fn custom_table_name() {
         let store = SqliteStore::open(":memory:", "fasten_audit", false).unwrap();
         store.insert(&make_row("evt-custom-001", "TEST")).unwrap();
+    }
+
+    #[test]
+    fn query_with_code_filter() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&make_row("evt-q-001", "MATCH")).unwrap();
+        store.insert(&make_row("evt-q-002", "OTHER")).unwrap();
+        let rows = store
+            .query(&Filter { code: Some("MATCH".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].code, "MATCH");
+    }
+
+    #[test]
+    fn count_all_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&make_row("evt-c-001", "TEST")).unwrap();
+        store.insert(&make_row("evt-c-002", "TEST")).unwrap();
+        assert_eq!(store.count(&Filter::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn list_unshipped_and_mark_shipped() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&make_row("evt-ship-001", "TEST")).unwrap();
+        store.insert(&make_row("evt-ship-002", "TEST")).unwrap();
+
+        let unshipped = store.list_unshipped(0).unwrap();
+        assert_eq!(unshipped.len(), 2);
+
+        store.mark_shipped(&["evt-ship-001".into()]).unwrap();
+
+        let after = store.list_unshipped(0).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, "evt-ship-002");
+    }
+
+    #[test]
+    fn purge_removes_old_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut old = make_row("evt-purge-001", "TEST");
+        old.timestamp = "2020-01-01T00:00:00.000Z".into();
+        store.insert(&old).unwrap();
+        store.insert(&make_row("evt-purge-002", "TEST")).unwrap(); // 2026 timestamp
+        let deleted = store.purge("2021-01-01T00:00:00.000Z", false).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    #[test]
+    fn max_monotonic_seq_empty_and_after_insert() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        assert_eq!(store.max_monotonic_seq().unwrap(), 0);
+        store.insert(&make_row("evt-seq-001", "TEST")).unwrap(); // monotonic_seq = 1
+        assert_eq!(store.max_monotonic_seq().unwrap(), 1);
     }
 }

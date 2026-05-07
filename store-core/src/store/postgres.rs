@@ -5,6 +5,7 @@ use pg::types::ToSql;
 use crate::{
     error::Error,
     row::Row,
+    store::Filter,
     validate::{split_table, validate_table_name},
 };
 
@@ -46,6 +47,12 @@ pub struct PostgresStore {
     insert_sql: String,    // retained for re-prepare after reconnect
 }
 
+impl std::fmt::Debug for PostgresStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresStore").field("table", &self.table).finish_non_exhaustive()
+    }
+}
+
 impl PostgresStore {
     /// Connect to PostgreSQL at `dsn`, auto-create the schema (if schema-
     /// qualified), create the audit table + indexes, and prepare the INSERT
@@ -83,7 +90,22 @@ impl PostgresStore {
         })
     }
 
-    /// Attempt an insert; on a closed connection, reconnect once and retry.
+    /// Run `f` against the live connection; reconnect once on a closed
+    /// connection and retry.  Removes the per-method reconnect boilerplate.
+    fn with_reconnect<F, R>(&self, f: F) -> Result<R, Error>
+    where
+        F: Fn(&mut Inner) -> Result<R, Error>,
+    {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match f(&mut *guard) {
+            Err(Error::Postgres(ref e)) if e.is_closed() => {
+                *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
+                f(&mut *guard)
+            }
+            other => other,
+        }
+    }
+
     fn insert_with_reconnect(&self, row: &Row) -> Result<(), Error> {
         let detail_str = serde_json::to_string(&row.detail)?;
         let seq: i64 = row.monotonic_seq as i64;
@@ -115,19 +137,13 @@ impl PostgresStore {
             &shipped,            // $21 shipped_at    (NULL when None)
         ];
 
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        match guard.client.execute(&guard.stmt, params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.is_closed() => {
-                // Connection lost (DB restart, network partition). Reconnect
-                // and retry once. A second failure is a hard error.
-                *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
-                guard.client.execute(&guard.stmt, params).map(|_| ())?;
-                Ok(())
-            }
-            Err(e) => Err(Error::Postgres(e)),
-        }
+        self.with_reconnect(|inner| {
+            inner
+                .client
+                .execute(&inner.stmt, params)
+                .map(|_| ())
+                .map_err(Error::Postgres)
+        })
     }
 }
 
@@ -137,13 +153,147 @@ impl Store for PostgresStore {
     }
 
     fn ping(&self) -> Result<(), Error> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // Reconnect if needed before the health check.
-        if guard.client.is_closed() {
-            *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
+        self.with_reconnect(|inner| {
+            inner
+                .client
+                .execute("SELECT 1", &[])
+                .map(|_| ())
+                .map_err(Error::Postgres)
+        })
+    }
+
+    fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
+        let (where_clause, mut all_params) = build_filter_where(filter);
+        let mut sql = format!(
+            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
+             code,action,severity,service_id,source_node_id,tenant_id,\
+             actor,actor_kind,target,category,domain,method,\
+             request_id,detail,pii_in_detail,shipped_at \
+             FROM {}{} ORDER BY monotonic_seq ASC",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            let n = all_params.len() + 1;
+            sql.push_str(&format!(" LIMIT ${n}"));
+            all_params.push(Box::new(i64::from(filter.limit)));
+            if filter.offset > 0 {
+                let n = all_params.len() + 1;
+                sql.push_str(&format!(" OFFSET ${n}"));
+                all_params.push(Box::new(i64::from(filter.offset)));
+            }
         }
-        guard.client.execute("SELECT 1", &[]).map(|_| ())?;
-        Ok(())
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+
+        self.with_reconnect(|inner| {
+            let rows = inner
+                .client
+                .query(sql.as_str(), &params_refs)
+                .map_err(Error::Postgres)?;
+            Ok(rows.iter().map(row_from_pg).collect())
+        })
+    }
+
+    fn count(&self, filter: &Filter) -> Result<u64, Error> {
+        let (where_clause, all_params) = build_filter_where(filter);
+        let sql = format!("SELECT COUNT(*) FROM {}{}", self.table, where_clause);
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+
+        self.with_reconnect(|inner| {
+            let rows = inner
+                .client
+                .query(sql.as_str(), &params_refs)
+                .map_err(Error::Postgres)?;
+            let n: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
+            Ok(n.unsigned_abs())
+        })
+    }
+
+    fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
+        let effective: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let sql = format!(
+            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
+             code,action,severity,service_id,source_node_id,tenant_id,\
+             actor,actor_kind,target,category,domain,method,\
+             request_id,detail,pii_in_detail,shipped_at \
+             FROM {} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1",
+            self.table
+        );
+        self.with_reconnect(|inner| {
+            let rows = inner
+                .client
+                .query(sql.as_str(), &[&effective as &(dyn ToSql + Sync)])
+                .map_err(Error::Postgres)?;
+            Ok(rows.iter().map(row_from_pg).collect())
+        })
+    }
+
+    fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        // $1 = shipped_at; $2 .. $N = IDs.
+        let placeholders: String = (2..=ids.len() + 1)
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE {} SET shipped_at = $1 WHERE id IN ({})",
+            self.table, placeholders
+        );
+
+        let mut all_params: Vec<Box<(dyn ToSql + Sync)>> = Vec::with_capacity(ids.len() + 1);
+        all_params.push(Box::new(now));
+        for id in ids {
+            all_params.push(Box::new(id.clone()));
+        }
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+
+        self.with_reconnect(|inner| {
+            inner
+                .client
+                .execute(sql.as_str(), &params_refs)
+                .map(|_| ())
+                .map_err(Error::Postgres)
+        })
+    }
+
+    fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
+        let sql = if respect_unshipped {
+            format!(
+                "DELETE FROM {} WHERE timestamp < $1 AND shipped_at IS NOT NULL",
+                self.table
+            )
+        } else {
+            format!("DELETE FROM {} WHERE timestamp < $1", self.table)
+        };
+        self.with_reconnect(|inner| {
+            inner
+                .client
+                .execute(sql.as_str(), &[&before as &(dyn ToSql + Sync)])
+                .map_err(Error::Postgres)
+        })
+    }
+
+    fn max_monotonic_seq(&self) -> Result<u64, Error> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(monotonic_seq), 0) FROM {}",
+            self.table
+        );
+        self.with_reconnect(|inner| {
+            let rows = inner
+                .client
+                .query(sql.as_str(), &[])
+                .map_err(Error::Postgres)?;
+            let seq: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
+            Ok(seq.unsigned_abs())
+        })
     }
 }
 
@@ -205,7 +355,7 @@ fn migrate(
     Ok(())
 }
 
-// ── SQL builder ───────────────────────────────────────────────────────────────
+// ── SQL builders ──────────────────────────────────────────────────────────────
 
 fn build_insert_sql(table: &str) -> String {
     format!(
@@ -218,6 +368,85 @@ fn build_insert_sql(table: &str) -> String {
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
          ON CONFLICT (id) DO NOTHING"
     )
+}
+
+/// Build `" WHERE col = $1 AND ..."` and matching params for the Postgres
+/// extended-query protocol.  Params are assigned `$N` starting at 1.
+fn build_filter_where(f: &Filter) -> (String, Vec<Box<(dyn ToSql + Sync)>>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut params: Vec<Box<(dyn ToSql + Sync)>> = Vec::new();
+    let mut n: u32 = 1;
+
+    if let Some(ref v) = f.request_id {
+        parts.push(format!("request_id = ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    if let Some(ref v) = f.code {
+        parts.push(format!("code = ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    if let Some(ref v) = f.domain {
+        parts.push(format!("domain = ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    if let Some(ref v) = f.source_node_id {
+        parts.push(format!("source_node_id = ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    if let Some(ref v) = f.since {
+        parts.push(format!("timestamp >= ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    if let Some(ref v) = f.until {
+        parts.push(format!("timestamp <= ${n}"));
+        params.push(Box::new(v.clone()));
+        n += 1;
+    }
+    let _ = n;
+
+    let clause = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", parts.join(" AND "))
+    };
+    (clause, params)
+}
+
+// ── Row mapper ────────────────────────────────────────────────────────────────
+
+fn row_from_pg(r: &pg::Row) -> Row {
+    let detail_str: String = r.get(18);
+    let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
+    let pii: i16 = r.get(19);
+    let seq: i64 = r.get(3);
+    Row {
+        id:             r.get(0),
+        wire_version:   r.get(1),
+        origin_id:      r.get(2),
+        monotonic_seq:  seq.unsigned_abs(),
+        timestamp:      r.get(4),
+        code:           r.get(5),
+        action:         r.get(6),
+        severity:       r.get(7),
+        service_id:     r.get(8),
+        source_node_id: r.get(9),
+        tenant_id:      r.get(10),
+        actor:          r.get(11),
+        actor_kind:     r.get(12),
+        target:         r.get(13),
+        category:       r.get(14),
+        domain:         r.get(15),
+        method:         r.get(16),
+        request_id:     r.get(17),
+        detail,
+        pii_in_detail:  pii != 0,
+        shipped_at:     r.get(20),
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -293,5 +522,36 @@ mod tests {
         let Some(dsn) = dsn() else { return };
         let store = PostgresStore::connect(&dsn, "fasten_sc_pg_test").unwrap();
         store.ping().unwrap();
+    }
+
+    #[test]
+    fn query_with_code_filter() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_qtest").unwrap();
+        store.insert(&make_row("evt-pgq-001", "MATCH")).unwrap();
+        store.insert(&make_row("evt-pgq-002", "OTHER")).unwrap();
+        let rows = store
+            .query(&Filter { code: Some("MATCH".into()), ..Default::default() })
+            .unwrap();
+        assert!(rows.iter().any(|r| r.code == "MATCH"));
+    }
+
+    #[test]
+    fn list_unshipped_and_mark_shipped() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_shiptest").unwrap();
+        store.insert(&make_row("evt-pgship-001", "TEST")).unwrap();
+        store.mark_shipped(&["evt-pgship-001".into()]).unwrap();
+        // After marking, it should not appear in list_unshipped.
+        let unshipped = store.list_unshipped(100).unwrap();
+        assert!(!unshipped.iter().any(|r| r.id == "evt-pgship-001"));
+    }
+
+    #[test]
+    fn max_monotonic_seq_is_positive() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_seqtest").unwrap();
+        store.insert(&make_row("evt-pgseq-001", "TEST")).unwrap();
+        assert!(store.max_monotonic_seq().unwrap() >= 42);
     }
 }

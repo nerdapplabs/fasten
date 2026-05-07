@@ -64,9 +64,9 @@ pub mod validate;
 pub(crate) mod ffi;
 
 // Re-export the most used types at crate root for Rust callers.
-pub use error::Error;
+pub use error::{Error, FastenErrorCode};
 pub use row::Row;
-pub use store::Store;
+pub use store::{Filter, Store};
 
 #[cfg(feature = "sqlite")]
 pub use store::sqlite::SqliteStore;

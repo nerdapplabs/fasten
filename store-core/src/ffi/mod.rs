@@ -4,8 +4,8 @@
 //!   1. validates all pointer arguments before dereferencing them,
 //!   2. wraps the body in `std::panic::catch_unwind` so a Rust panic can never
 //!      unwind across the FFI boundary (which is undefined behaviour), and
-//!   3. maps errors to a caller-owned `*mut c_char` error string freed via
-//!      `fasten_store_free_str`.
+//!   3. maps errors to a typed `FastenErrorCode` + a caller-owned `*mut c_char`
+//!      error string freed via `fasten_store_free_str`.
 //!
 //! No Rust panics, no use-after-free, no double-free when the C caller follows
 //! the documented ownership rules in `include/fasten_store_core.h`.
@@ -16,7 +16,11 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::panic;
 
-use crate::{error::Error, row::Row, store::Store};
+use crate::{
+    error::{Error, FastenErrorCode},
+    row::Row,
+    store::{Filter, Store},
+};
 use util::{read_str, set_error};
 
 // ── Opaque handle ─────────────────────────────────────────────────────────────
@@ -28,31 +32,37 @@ pub struct FastenStoreHandle {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Run `f`; catch any Rust panic; map the result to `Ok(R)` / `Err(String)`.
-fn guarded<F, R>(f: F) -> Result<R, String>
+/// Run `f`; catch any Rust panic; return `Ok(R)` or `Err((code, message))`.
+fn guarded<F, R>(f: F) -> Result<R, (FastenErrorCode, String)>
 where
     F: FnOnce() -> Result<R, Error>,
 {
     match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
         Ok(Ok(r)) => Ok(r),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("fasten-store-core: internal panic".into()),
+        Ok(Err(e)) => {
+            let code = FastenErrorCode::from(&e);
+            Err((code, e.to_string()))
+        }
+        Err(_) => Err((
+            FastenErrorCode::ErrUnknown,
+            "fasten-store-core: internal panic".into(),
+        )),
     }
 }
 
-/// Convert a guarded result to a C return code; write the error string.
+/// Write the error string and return the error code.
 ///
 /// # Safety
 /// `out_err` must be null or point to a writable `*mut c_char` slot.
 unsafe fn result_to_rc(
-    result: Result<(), String>,
+    result: Result<(), (FastenErrorCode, String)>,
     out_err: *mut *mut c_char,
-) -> c_int {
+) -> FastenErrorCode {
     match result {
-        Ok(()) => 0,
-        Err(msg) => {
+        Ok(()) => FastenErrorCode::Ok,
+        Err((code, msg)) => {
             set_error(out_err, &msg);
-            1
+            code
         }
     }
 }
@@ -100,7 +110,7 @@ pub unsafe extern "C" fn fasten_store_open(
 
     match result {
         Ok(ptr) => ptr,
-        Err(msg) => {
+        Err((_code, msg)) => {
             set_error(out_err, &msg);
             std::ptr::null_mut()
         }
@@ -113,13 +123,13 @@ pub unsafe extern "C" fn fasten_store_open(
 /// `row_json` — UTF-8 JSON object matching the fasten wire schema.
 /// `out_err`  — set on error; may be NULL.
 ///
-/// Returns 0 on success, 1 on error.
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_insert(
     handle: *mut FastenStoreHandle,
     row_json: *const c_char,
     out_err: *mut *mut c_char,
-) -> c_int {
+) -> FastenErrorCode {
     let r = guarded(|| {
         if handle.is_null() {
             return Err(Error::NullArg);
@@ -136,12 +146,12 @@ pub unsafe extern "C" fn fasten_store_insert(
 
 /// Verify the backend is reachable (lightweight `SELECT 1`).
 ///
-/// Returns 0 on success, 1 on error.
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_ping(
     handle: *mut FastenStoreHandle,
     out_err: *mut *mut c_char,
-) -> c_int {
+) -> FastenErrorCode {
     let r = guarded(|| {
         if handle.is_null() {
             return Err(Error::NullArg);
@@ -150,6 +160,215 @@ pub unsafe extern "C" fn fasten_store_ping(
         Ok(())
     });
     result_to_rc(r, out_err)
+}
+
+/// Query rows matching an optional JSON filter object.
+///
+/// `filter_json` — nullable; when NULL all rows are returned.
+///                 JSON object with optional fields: `request_id`, `code`,
+///                 `domain`, `source_node_id`, `since`, `until`, `limit`,
+///                 `offset`.
+/// `out_rows_json` — on success, set to a heap-allocated UTF-8 JSON array of
+///                   row objects.  Free with `fasten_store_free_str`.
+///                   May be NULL if the caller doesn't need the rows.
+/// `out_err`     — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_query(
+    handle: *mut FastenStoreHandle,
+    filter_json: *const c_char,
+    out_rows_json: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let filter: Filter = match read_str(filter_json) {
+            Some(json) => serde_json::from_str(json)?,
+            None => Filter::default(),
+        };
+        (*handle).store.query(&filter)
+    });
+    match r {
+        Ok(rows) => {
+            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+            set_error(out_rows_json, &json);
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Count rows matching an optional JSON filter object.
+///
+/// `filter_json` — nullable; when NULL counts all rows.
+/// `out_count`   — set to the row count on success; must be non-null.
+/// `out_err`     — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_count(
+    handle: *mut FastenStoreHandle,
+    filter_json: *const c_char,
+    out_count: *mut u64,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let filter: Filter = match read_str(filter_json) {
+            Some(json) => serde_json::from_str(json)?,
+            None => Filter::default(),
+        };
+        (*handle).store.count(&filter)
+    });
+    match r {
+        Ok(n) => {
+            if !out_count.is_null() {
+                *out_count = n;
+            }
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// List unshipped rows (those with `shipped_at IS NULL`).
+///
+/// `limit`         — maximum rows to return; 0 = all unshipped rows.
+/// `out_rows_json` — on success, set to a heap-allocated UTF-8 JSON array.
+///                   Free with `fasten_store_free_str`.
+/// `out_err`       — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_list_unshipped(
+    handle: *mut FastenStoreHandle,
+    limit: u32,
+    out_rows_json: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        (*handle).store.list_unshipped(limit)
+    });
+    match r {
+        Ok(rows) => {
+            let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+            set_error(out_rows_json, &json);
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Mark rows as shipped by setting `shipped_at` to the current UTC time.
+///
+/// `ids_json` — UTF-8 JSON array of ID strings, e.g. `["id1","id2"]`.
+///              IDs that do not exist are silently ignored.
+/// `out_err`  — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_mark_shipped(
+    handle: *mut FastenStoreHandle,
+    ids_json: *const c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let json_str = read_str(ids_json).ok_or(Error::NullArg)?;
+        let ids: Vec<String> = serde_json::from_str(json_str)?;
+        (*handle).store.mark_shipped(&ids)?;
+        Ok(())
+    });
+    result_to_rc(r, out_err)
+}
+
+/// Delete rows whose `timestamp` is before `before_iso8601`.
+///
+/// `before_iso8601`    — ISO-8601 UTC upper bound; rows strictly older are
+///                       deleted.
+/// `respect_unshipped` — non-zero: skip rows with `shipped_at IS NULL`.
+/// `out_deleted`       — set to the count of deleted rows; may be NULL.
+/// `out_err`           — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_purge(
+    handle: *mut FastenStoreHandle,
+    before_iso8601: *const c_char,
+    respect_unshipped: c_int,
+    out_deleted: *mut u64,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
+        (*handle).store.purge(before, respect_unshipped != 0)
+    });
+    match r {
+        Ok(n) => {
+            if !out_deleted.is_null() {
+                *out_deleted = n;
+            }
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Return the maximum `monotonic_seq` across all stored rows, or 0 if empty.
+///
+/// `out_seq` — set to the maximum sequence number on success; must be non-null.
+/// `out_err` — set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
+    handle: *mut FastenStoreHandle,
+    out_seq: *mut u64,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        (*handle).store.max_monotonic_seq()
+    });
+    match r {
+        Ok(seq) => {
+            if !out_seq.is_null() {
+                *out_seq = seq;
+            }
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
 }
 
 /// Close the store and release all resources.
@@ -164,7 +383,7 @@ pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
     }
 }
 
-/// Free an error string returned by this library.
+/// Free an error string (or JSON output string) returned by this library.
 ///
 /// Safe to call with NULL.
 #[no_mangle]
