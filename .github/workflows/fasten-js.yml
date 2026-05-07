@@ -41,7 +41,7 @@ jobs:
         run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
 
       - name: Install Codecov runtime deps
-        run: apk add --no-cache git curl gpg
+        run: apk add --no-cache bash git curl gpg
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
