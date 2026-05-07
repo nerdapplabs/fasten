@@ -963,6 +963,11 @@ mod tests {
     }
 }
 
+#[cfg(feature = "store-postgres")]
+pub mod postgres_store;
+#[cfg(feature = "store-postgres")]
+pub use postgres_store::PostgresStore;
+
 // ── Catalog yaml (P1-11) ─────────────────────────────────────────────────
 //
 // Optional feature, gated behind the `codes-yaml` cargo feature so adopters
