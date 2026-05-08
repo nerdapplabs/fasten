@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::os::raw::c_char;
 
-use super::util::{read_str, set_error};
+use super::util::{read_str, set_error, write_to_buf, write_err_to_buf};
 use super::guarded;
 use crate::{
     catalog::{Meta, GLOBAL_REGISTRY},
@@ -113,6 +113,70 @@ pub unsafe extern "C" fn fasten_registry_dump(
             set_error(out_err, &msg);
             code
         }
+    }
+}
+
+// ── Buffer-based variants (no heap allocation) ────────────────────────────────
+
+/// Buffer-based variant of `fasten_register_codes`.
+///
+/// Writes NUL-terminated error message to `out_err_buf` on failure.
+/// Returns `FASTEN_OK` (0) on success, positive `FastenErrorCode` on error.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_register_codes_buf(
+    domain:      *const c_char,
+    codes_json:  *const c_char,
+    out_err_buf: *mut u8,
+    err_buf_len: u32,
+) -> i32 {
+    let r = guarded(|| {
+        let domain_str = read_str(domain).ok_or(Error::NullArg)?;
+        let json_str   = read_str(codes_json).ok_or(Error::NullArg)?;
+        let codes: HashMap<String, Meta> = serde_json::from_str(json_str)?;
+        GLOBAL_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(domain_str, codes)?;
+        Ok(())
+    });
+    match r {
+        Ok(())        => 0,
+        // Return positive error code (same convention as fasten_register_codes).
+        // write_err_to_buf returns negative; negate to get positive.
+        Err((c, msg)) => -write_err_to_buf(out_err_buf, err_buf_len as usize, &msg, c),
+    }
+}
+
+/// Buffer-based variant of `fasten_meta_of`.
+///
+/// Writes NUL-terminated UTF-8 JSON Meta to `out_buf` on success.
+/// Returns bytes written (exclusive of NUL) on success, 0 if the code is not
+/// found, or `-(FastenErrorCode as i32)` on error.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_meta_of_buf(
+    code:        *const c_char,
+    out_buf:     *mut u8,
+    buf_len:     u32,
+    out_err_buf: *mut u8,
+    err_buf_len: u32,
+) -> i32 {
+    let r = guarded(|| {
+        let code_str = read_str(code).ok_or(Error::NullArg)?;
+        let reg = GLOBAL_REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(match reg.meta_of(code_str) {
+            Some(meta) => Some(serde_json::to_string(meta)?),
+            None => None,
+        })
+    });
+    match r {
+        Ok(Some(json)) => write_to_buf(out_buf, buf_len as usize, &json),
+        Ok(None)       => {
+            if !out_buf.is_null() && buf_len > 0 {
+                *out_buf = 0;
+            }
+            0
+        }
+        Err((c, msg))  => write_err_to_buf(out_err_buf, err_buf_len as usize, &msg, c),
     }
 }
 

@@ -1,6 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
+use crate::error::FastenErrorCode;
+
 /// Convert a raw C string pointer to a Rust `&str`.
 ///
 /// # Safety
@@ -38,4 +40,51 @@ pub(crate) unsafe fn set_error(out_err: *mut *mut c_char, msg: &str) {
             }
         }
     }
+}
+
+// ── Buffer-based output helpers (no heap allocation, for FFI callers like Node.js) ──
+
+/// Write `s` into a caller-provided `[u8; buf_len]` buffer (NUL-terminated).
+///
+/// Returns bytes written (exclusive of NUL) on success.
+/// Returns `-(ErrUnknown as i32)` if `buf` is null, `buf_len` is 0, or the
+/// buffer is too small; writes a truncated NUL-terminated string in that case.
+///
+/// # Safety
+/// `buf`, if non-null, must point to at least `buf_len` writable bytes.
+pub(crate) unsafe fn write_to_buf(buf: *mut u8, buf_len: usize, s: &str) -> i32 {
+    if buf.is_null() || buf_len == 0 {
+        return -(FastenErrorCode::ErrUnknown as i32);
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() + 1 > buf_len {
+        // Truncate to fit — caller can detect via return value vs buf_len.
+        let n = buf_len - 1;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+        *buf.add(n) = 0;
+        return -(FastenErrorCode::ErrUnknown as i32);
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+    *buf.add(bytes.len()) = 0;
+    bytes.len() as i32
+}
+
+/// Write an error message into `buf` (NUL-terminated, truncated to fit) and
+/// return `-(code as i32)`.
+///
+/// # Safety
+/// `buf`, if non-null, must point to at least `buf_len` writable bytes.
+pub(crate) unsafe fn write_err_to_buf(
+    buf:     *mut u8,
+    buf_len: usize,
+    msg:     &str,
+    code:    FastenErrorCode,
+) -> i32 {
+    if !buf.is_null() && buf_len > 0 {
+        let bytes = msg.as_bytes();
+        let n = bytes.len().min(buf_len - 1);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
+        *buf.add(n) = 0;
+    }
+    -(code as i32)
 }

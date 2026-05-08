@@ -11,7 +11,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush,
+    AuditStoreError, queueStats, flush, _clearRustRegistry,
 } from '../src/index.js';
 import { uninstallDrainer } from '../src/audit_queue.js';
 
@@ -65,6 +65,7 @@ const TEST_META = {
 
 beforeEach(() => {
     uninstallDrainer();
+    _clearRustRegistry();
     _reg().clear();
     register('user', TEST_META);
 });

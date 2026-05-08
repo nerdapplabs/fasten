@@ -404,6 +404,77 @@ FastenErrorCode fasten_registry_dump(
  */
 void fasten_registry_clear(void);
 
+/* ── Buffer-based variants (no heap allocation) ───────────────────────────── */
+
+/**
+ * Buffer-based variant of fasten_redact.  No heap allocation; the caller
+ * supplies pre-allocated output and error buffers.
+ *
+ * @param in_json     NUL-terminated UTF-8 JSON.
+ * @param out_buf     Caller-supplied buffer for the redacted JSON (NUL-terminated).
+ * @param buf_len     Size of out_buf in bytes.
+ * @param out_err_buf Caller-supplied buffer for the error message (NUL-terminated).
+ * @param err_buf_len Size of out_err_buf in bytes.
+ *
+ * @return Bytes written (exclusive of NUL) on success.
+ *         -(FastenErrorCode) on error (error message in out_err_buf).
+ */
+int32_t fasten_redact_buf(
+    const char* in_json,
+    uint8_t*    out_buf,
+    uint32_t    buf_len,
+    uint8_t*    out_err_buf,
+    uint32_t    err_buf_len
+);
+
+/**
+ * Buffer-based variant of fasten_redact_full.
+ *
+ * extra_keys_json and extra_value_patterns_json must be valid JSON arrays
+ * (use "[]" for empty rather than NULL).
+ * replacement may be empty string to use the default "***".
+ *
+ * @return Bytes written (exclusive of NUL) on success.
+ *         -(FastenErrorCode) on error.
+ */
+int32_t fasten_redact_full_buf(
+    const char* in_json,
+    const char* extra_keys_json,
+    const char* replacement,
+    const char* extra_value_patterns_json,
+    uint8_t*    out_buf,
+    uint32_t    buf_len,
+    uint8_t*    out_err_buf,
+    uint32_t    err_buf_len
+);
+
+/**
+ * Buffer-based variant of fasten_register_codes.
+ *
+ * @return FASTEN_OK (0) on success, positive FastenErrorCode on error
+ *         (error message in out_err_buf).
+ */
+int32_t fasten_register_codes_buf(
+    const char* domain,
+    const char* codes_json,
+    uint8_t*    out_err_buf,
+    uint32_t    err_buf_len
+);
+
+/**
+ * Buffer-based variant of fasten_meta_of.
+ *
+ * @return Bytes written (exclusive of NUL) on success (0 = code not found).
+ *         -(FastenErrorCode) on error.
+ */
+int32_t fasten_meta_of_buf(
+    const char* code,
+    uint8_t*    out_buf,
+    uint32_t    buf_len,
+    uint8_t*    out_err_buf,
+    uint32_t    err_buf_len
+);
+
 /* ── Additional error codes (catalog) ─────────────────────────────────────── */
 
 /* These values extend the FastenErrorCode enum defined above. */
