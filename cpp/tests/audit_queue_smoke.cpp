@@ -26,15 +26,11 @@ namespace {
 void reset_state() {
     auto& eng = fasten::default_engine();
     eng.reset_for_tests();
-    // Also clear the test-specific registry entries so each test
-    // registers a fresh code. The registry is not touched by
-    // reset_for_tests() — codes survive across tests by design.
+    // Clear registry so each test can register fresh codes.
+    fasten_registry_clear();
     {
         std::lock_guard<std::mutex> lk(eng.reg_mu);
-        for (auto it = eng.registry.begin(); it != eng.registry.end(); ) {
-            if (it->first.rfind("USER_CREATED", 0) == 0) it = eng.registry.erase(it);
-            else ++it;
-        }
+        eng.registry.clear();
     }
 }
 

@@ -5,12 +5,28 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── Interface library — header-only, zero link deps ───────────────────────
+# ── libfasten_store_core (Rust shared library) ────────────────────────────
+# Build store-core before configuring this project:
+#   cd ../store-core && cargo build --release --features all
+# Then set FASTEN_CORE_LIB_DIR to the release output dir, or let CMake
+# look in the default location relative to this file.
+if(NOT FASTEN_CORE_LIB_DIR)
+    set(FASTEN_CORE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../store-core/target/release")
+endif()
+
+find_library(FASTEN_CORE_LIB
+    NAMES fasten_store_core
+    HINTS ${FASTEN_CORE_LIB_DIR}
+    REQUIRED
+)
+
+# ── Interface library ─────────────────────────────────────────────────────
 add_library(fasten INTERFACE)
 target_include_directories(fasten INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_link_libraries(fasten INTERFACE ${FASTEN_CORE_LIB})
 
 # Warn on common pitfalls; treat warnings as errors in CI.
 target_compile_options(fasten INTERFACE

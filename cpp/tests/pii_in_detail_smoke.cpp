@@ -19,16 +19,9 @@
 namespace {
 
 void reset_state() {
+    fasten_registry_clear();
     auto& g = fasten::detail_::globals();
-    auto& reg = g.registry;
-    for (auto it = reg.begin(); it != reg.end(); ) {
-        const auto& k = it->first;
-        if (k.rfind("PII_", 0) == 0 || k.rfind("NON_PII_", 0) == 0) {
-            it = reg.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    g.registry.clear();
     g.seq = 0;
 }
 
