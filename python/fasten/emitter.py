@@ -87,12 +87,12 @@ def audit_store() -> Any:
     return _default.audit_store()
 
 
-def init_config(*args, **kwargs):
+def init_config(*args: Any, **kwargs: Any) -> Any:
     """Resolve init parameters to a FastenConfig without starting runtime."""
     return _default.init_config(*args, **kwargs)
 
 
-def start(cfg) -> None:
+def start(cfg: Any) -> None:
     """Wire runtime from a FastenConfig. Delegates to the default Engine."""
     _default.start(cfg)
 

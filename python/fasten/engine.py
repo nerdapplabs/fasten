@@ -283,14 +283,20 @@ class Engine:
 
     def init(
         self,
-        service_id=None, node_id=None, tenant_id=None,
-        audit_store=None, api_store=None,
-        extra_redact_keys=None, redact_replacement=None,
-        extra_value_redact_patterns=None,
-        audit_store_failure_strategy="queue",
-        queue_capacity=100, queue_retry_initial_ms=100,
-        queue_retry_max_ms=60_000, queue_retry_jitter=True,
-        queue_drain_max_attempts=50,
+        service_id: str | None = None,
+        node_id: str | None = None,
+        tenant_id: str | None = None,
+        audit_store: Any | None = None,
+        api_store: Any | None = None,
+        extra_redact_keys: list[str] | None = None,
+        redact_replacement: str | None = None,
+        extra_value_redact_patterns: list[Any] | None = None,
+        audit_store_failure_strategy: str = "queue",
+        queue_capacity: int = 100,
+        queue_retry_initial_ms: int = 100,
+        queue_retry_max_ms: int = 60_000,
+        queue_retry_jitter: bool = True,
+        queue_drain_max_attempts: int = 50,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(

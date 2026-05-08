@@ -80,7 +80,7 @@ def _key_reader(key_q: "queue.Queue[bytes]", stop: threading.Event) -> None:
         while not stop.is_set():
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
             if r:
-                ch = sys.stdin.buffer.read1(4)  # type: ignore[attr-defined]
+                ch = sys.stdin.buffer.read1(4)  # type: ignore[union-attr]
                 if ch:
                     key_q.put(ch)
     except Exception:
@@ -168,7 +168,7 @@ def _run_picker(
                 r, _, _ = select.select([sys.stdin], [], [], 0.05)
                 if not r:
                     continue
-                ch = sys.stdin.buffer.read1(4)  # type: ignore[attr-defined]
+                ch = sys.stdin.buffer.read1(4)  # type: ignore[union-attr]
                 if not ch:
                     continue
 

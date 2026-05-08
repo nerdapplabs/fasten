@@ -13,7 +13,7 @@ import json
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
@@ -135,7 +135,7 @@ class PostgresStore:
         self._tls.conn = conn
         return conn
 
-    def _execute_with_retry(self, fn):
+    def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
         """Run fn(conn) once; on stale-connection error reconnect and retry once."""
         import psycopg
 
@@ -196,7 +196,7 @@ class PostgresStore:
             "ON CONFLICT (id) DO NOTHING"
         )
 
-        def _run(conn):
+        def _run(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
             conn.commit()
@@ -204,7 +204,7 @@ class PostgresStore:
         self._execute_with_retry(_run)
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
-        def _run(conn):
+        def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
@@ -217,7 +217,7 @@ class PostgresStore:
     def mark_shipped(self, ids: list[str]) -> None:
         now = _utc_iso(datetime.now(timezone.utc))
 
-        def _run(conn):
+        def _run(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.executemany(
                     f"UPDATE {self._table} SET shipped_at=%s WHERE id=%s",
@@ -233,7 +233,7 @@ class PostgresStore:
         if respect_unshipped:
             sql += " AND shipped_at IS NOT NULL"
 
-        def _run(conn):
+        def _run(conn: Any) -> int:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 deleted = cur.rowcount
@@ -309,7 +309,7 @@ class PostgresStore:
             since=since, until=until,
         )
 
-        def _run(conn):
+        def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT * FROM {self._table} {where} "
@@ -340,7 +340,7 @@ class PostgresStore:
             since=since, until=until,
         )
 
-        def _run(conn):
+        def _run(conn: Any) -> int:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self._table} {where}", params)
                 return int(cur.fetchone()[0])
@@ -349,7 +349,7 @@ class PostgresStore:
 
     def max_monotonic_seq(self) -> int:
         """Return MAX(monotonic_seq); 0 if no rows."""
-        def _run(conn):
+        def _run(conn: Any) -> int:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
                 return int(cur.fetchone()[0])
