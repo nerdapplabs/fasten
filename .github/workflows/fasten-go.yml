@@ -1,16 +1,16 @@
 name: Go SDK
 
 on:
-  # Restrict push to main + dev so PR branches don't run the suite
-  # twice (once for push, once for pull_request) on every commit.
   push:
     branches: [main, dev]
     paths:
       - 'go/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-go.yml'
   pull_request:
     paths:
       - 'go/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-go.yml'
 
 permissions:
@@ -20,25 +20,36 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: golang:1.22-alpine
-
-    defaults:
-      run:
-        working-directory: go
 
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
       - name: Vet
+        working-directory: go
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ github.workspace }}/store-core/target/release
         run: go vet ./...
 
       - name: Unit tests
-        # -race requires CGO which is not available in golang:*-alpine (CGO_ENABLED=0)
+        working-directory: go
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ github.workspace }}/store-core/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
         run: go test -v -count=1 -coverprofile=coverage.out ./...
-
-      - name: Install Codecov runtime deps
-        run: apk add --no-cache bash git curl gpg
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

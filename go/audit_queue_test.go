@@ -91,9 +91,7 @@ func (s *flakyStore) Purge(_ context.Context, _ time.Time, _ bool) (int, error) 
 
 func resetState() {
 	Default.ResetForTests()
-	regMu.Lock()
-	_registry = map[Code]Meta{}
-	regMu.Unlock()
+	clearBothRegistries()
 }
 
 func setupQueueMode(t *testing.T, store AuditRepository, opts ...func(*Config)) {

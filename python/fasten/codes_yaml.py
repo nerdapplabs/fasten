@@ -40,6 +40,7 @@ removed code remain readable (the wire ``code`` field is a free string).
 """
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -49,9 +50,11 @@ from .codes import (
     Meta,
     RetentionClass,
     Severity,
-    _CODE_KEY_RE,
     _registry,
 )
+
+# UPPER_SNAKE_CASE key validator (mirrors Rust catalog.rs CODE_KEY_RE).
+_CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 # Paths previously passed to load(); reload() re-reads all of them.

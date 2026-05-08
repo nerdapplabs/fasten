@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 from .audit_queue import _AuditQueueDrainer, AuditStoreError
 from .attrs import AuditRow
-from .codes import Severity, registry
+from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
@@ -331,7 +331,7 @@ class Engine:
         if not self._service_id:
             raise RuntimeError("fasten.init() must be called before emit()")
 
-        meta = registry().get(code)
+        meta = meta_of(code)
         if meta is None:
             raise ValueError(f"unknown audit code: {code!r}")
 

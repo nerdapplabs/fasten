@@ -282,6 +282,136 @@ void fasten_store_free_str(char* s);
  */
 const char* fasten_store_version(void);
 
+/* ── Redaction ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Redact a JSON value using the global default key-pattern + value-shape rules.
+ *
+ * Default key patterns (case-insensitive): api_key, password, token, secret,
+ * authorization, bearer, m2m_key, private_key, access_key, session_id,
+ * cookie, credential, and variants.
+ *
+ * Default value shapes: JWT, PEM private key, AWS key, GitHub token,
+ * Stripe live key, OpenAI key, credit-card (Luhn-validated).
+ *
+ * @param in_json   NUL-terminated UTF-8 JSON (object, array, or scalar).
+ * @param out_json  On success: set to heap-allocated redacted JSON.
+ *                  Free with fasten_store_free_str(). May be NULL.
+ * @param out_err   Set on error; may be NULL.
+ *
+ * @return FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_redact(
+    const char* in_json,
+    char**      out_json,
+    char**      out_err
+);
+
+/**
+ * Redact a JSON value with fully-custom key patterns, replacement token, and
+ * extra value-shape patterns.  Use this when fasten.init() is called with
+ * extra_redact_keys or extra_value_redact_patterns.
+ *
+ * @param in_json                   NUL-terminated UTF-8 JSON.
+ * @param extra_keys_json           Optional: JSON array of plain key strings,
+ *                                  e.g. ["my_field","other_field"]. NULL = none.
+ * @param replacement               Optional: replacement token. NULL = "***".
+ * @param extra_value_patterns_json Optional: JSON array of objects:
+ *                                  [{"pattern":"<regex>","replacement":"***X***"},...]
+ *                                  Appended after built-in value patterns. NULL = none.
+ * @param out_json                  On success: heap-allocated redacted JSON.
+ *                                  Free with fasten_store_free_str(). May be NULL.
+ * @param out_err                   Set on error; may be NULL.
+ *
+ * @return FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_redact_full(
+    const char* in_json,
+    const char* extra_keys_json,
+    const char* replacement,
+    const char* extra_value_patterns_json,
+    char**      out_json,
+    char**      out_err
+);
+
+/* ── Code catalog ──────────────────────────────────────────────────────────── */
+
+/**
+ * Register a batch of audit codes for a domain.
+ *
+ * @param domain     NUL-terminated domain string (e.g. "user", "billing").
+ * @param codes_json NUL-terminated UTF-8 JSON object:
+ *   {
+ *     "USER_CREATED": {
+ *       "domain":"user","category":"auth","action":"create",
+ *       "severity":"info","description":"...","emitter":"auth-svc"
+ *     }
+ *   }
+ *   Optional fields: retention_class ("short"|"medium"|"long", default "medium"),
+ *   high_volume (bool), pii_in_detail (bool, forces retention_class="short"),
+ *   declared_unused (bool), detail_passthrough_keys ([str]).
+ * @param out_err    Set on error; may be NULL.
+ *
+ * Error codes:
+ *   FASTEN_ERR_INVALID_KEY    — code key is not UPPER_SNAKE_CASE
+ *   FASTEN_ERR_ID_MISMATCH    — Meta.id disagrees with the dict key
+ *   FASTEN_ERR_DOMAIN_MISMATCH — Meta.domain disagrees with domain argument
+ *   FASTEN_ERR_DUPLICATE_CODE — code was already registered
+ *
+ * @return FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_register_codes(
+    const char* domain,
+    const char* codes_json,
+    char**      out_err
+);
+
+/**
+ * Look up a single code in the global registry.
+ *
+ * @param code      NUL-terminated code key (e.g. "USER_CREATED").
+ * @param out_json  On success: heap-allocated UTF-8 JSON Meta object, or
+ *                  "{}" if the code is not registered.
+ *                  Free with fasten_store_free_str(). May be NULL.
+ * @param out_err   Set on error; may be NULL.
+ *
+ * @return FASTEN_OK on success, error code otherwise.
+ */
+FastenErrorCode fasten_meta_of(
+    const char* code,
+    char**      out_json,
+    char**      out_err
+);
+
+/**
+ * Dump the entire registry as sorted `id,domain,severity` CSV, one code
+ * per line.  Identical to the Python `fasten.codes.dump()` output.
+ *
+ * @param out_csv  On success: heap-allocated UTF-8 CSV string.
+ *                 Free with fasten_store_free_str(). May be NULL.
+ * @param out_err  Set on error; may be NULL.
+ *
+ * @return FASTEN_OK on success, error code otherwise.
+ */
+FastenErrorCode fasten_registry_dump(
+    char** out_csv,
+    char** out_err
+);
+
+/**
+ * Clear the global registry.  Intended for test teardown and re-init.
+ * Thread-safe.
+ */
+void fasten_registry_clear(void);
+
+/* ── Additional error codes (catalog) ─────────────────────────────────────── */
+
+/* These values extend the FastenErrorCode enum defined above. */
+#define FASTEN_ERR_INVALID_KEY     6  /**< Code key not UPPER_SNAKE_CASE.           */
+#define FASTEN_ERR_ID_MISMATCH     7  /**< Meta.id disagrees with dict key.         */
+#define FASTEN_ERR_DOMAIN_MISMATCH 8  /**< Meta.domain disagrees with domain arg.   */
+#define FASTEN_ERR_DUPLICATE_CODE  9  /**< Code already registered.                 */
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,24 +1,29 @@
 """
 Audit code catalog — typed constants + per-code metadata.
 
-Adopter registers their own domain with `register(domain, codes)`; library
-enforces no duplicates, valid severity/retention_class, etc.
+Public API (unchanged from pre-FFI):
+  register(domain, codes)  — validate + store via fasten-core Rust engine
+  registry()               — return a copy of the current catalog (Python-side cache)
+  dump()                   — sorted `id,domain,severity` CSV via Rust
+  meta_of(code)            — single-code lookup
+  load(path)               — load a catalog yaml file
+  reload()                 — re-read previously-loaded yaml paths
 
-`fasten dump` CLI prints `id,domain,severity` sorted — feeds the cross-language
-consistency gate.
+All validation logic (UPPER_SNAKE_CASE, duplicate detection, domain checks,
+pii_in_detail → retention SHORT enforcement) lives in fasten-core.
 """
 from __future__ import annotations
 
+import json
 import logging
-import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Mapping
+from typing import Mapping, Optional
+
+from . import core_ffi
 
 _logger = logging.getLogger("fasten")
 
-# Domain is a plain string — adopters define their own vocabulary.
-# Examples: "user", "billing", "device", "order" — fasten has no opinions.
 Domain = str
 
 
@@ -84,38 +89,19 @@ _REDACT_PATTERNS = (
 
 @dataclass(frozen=True, slots=True)
 class Meta:
-    """Per-code metadata declared alongside every audit code.
+    """Per-code metadata declared alongside every audit code."""
 
-    ``id`` is optional in user code — ``register()`` fills it from the
-    dict key. Setting ``id`` explicitly is allowed but must match the key
-    (raises on mismatch — that's a typo, never a feature).
-
-    ``pii_in_detail=True`` carries two enforced runtime effects (P1-5):
-
-    1. ``retention_class`` is forced to :attr:`RetentionClass.SHORT` at
-       register-time. A WARNING is logged if the adopter declared anything
-       else — they almost certainly didn't mean for PII to live for years.
-    2. The ``detail`` payload is force-redacted on emit, regardless of
-       key names: by default the whole map becomes
-       ``{"_redacted": "***", "_pii_in_detail": True}``. Adopters who
-       genuinely need fields preserved declare them in
-       :attr:`detail_passthrough_keys`. The force-SHORT and force-redact
-       rules apply at emit time; no separate wire column is written.
-    """
-
-    domain: str               # adopter-defined, e.g. "user", "billing", "node"
+    domain: str
     category: str
     action: str
     severity: Severity
     description: str
     emitter: str
-    id: str = ""              # filled from the dict key by register()
+    id: str = ""
     retention_class: RetentionClass = RetentionClass.MEDIUM
     high_volume: bool = False
     pii_in_detail: bool = False
     declared_unused: bool = False
-    # When pii_in_detail=True, only these keys (if any) survive emit.
-    # Everything else is replaced. Empty tuple = scrub everything.
     detail_passthrough_keys: tuple[str, ...] = ()
 
 
@@ -123,60 +109,80 @@ class AuditCatalogError(Exception):
     """Raised at registration time for duplicate codes or bad metadata."""
 
 
+# ── Python-side cache (populated through Rust validation) ────────────────────
+
 _registry: dict[str, Meta] = {}
 
-_CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+def _meta_to_dict(name: str, meta: Meta) -> dict:
+    """Convert a Meta object to a JSON-serialisable dict for fasten_register_codes."""
+    return {
+        "domain":                 meta.domain,
+        "category":               meta.category,
+        "action":                 meta.action,
+        "severity":               str(meta.severity),
+        "description":            meta.description,
+        "emitter":                meta.emitter,
+        "id":                     meta.id or name,
+        "retention_class":        str(meta.retention_class),
+        "high_volume":            meta.high_volume,
+        "pii_in_detail":          meta.pii_in_detail,
+        "declared_unused":        meta.declared_unused,
+        "detail_passthrough_keys": list(meta.detail_passthrough_keys),
+    }
+
+
+def _dict_to_meta(d: dict) -> Meta:
+    """Reconstruct a Python Meta from a Rust JSON dict."""
+    return Meta(
+        domain=d["domain"],
+        category=d["category"],
+        action=d["action"],
+        severity=Severity(d["severity"]),
+        description=d["description"],
+        emitter=d["emitter"],
+        id=d.get("id", ""),
+        retention_class=RetentionClass(d.get("retention_class", "medium")),
+        high_volume=bool(d.get("high_volume", False)),
+        pii_in_detail=bool(d.get("pii_in_detail", False)),
+        declared_unused=bool(d.get("declared_unused", False)),
+        detail_passthrough_keys=tuple(d.get("detail_passthrough_keys", [])),
+    )
 
 
 def register(domain: Domain, codes: Mapping[str, Meta]) -> None:
     """Register a batch of codes for a domain.
 
-        register("user", {
-            "USER_CREATED": Meta(domain="user", action="create", ...),
-            "USER_DELETED": Meta(domain="user", action="delete", ...),
-        })
-
-    Validation (raises ``AuditCatalogError`` with a fix-it message):
-      - key shape: UPPER_SNAKE_CASE identifier
-      - ``Meta.id`` empty → fill from key; set → must match key
-      - ``Meta.domain`` must match ``domain``
+    Validation is delegated to fasten-core (Rust):
+      - key shape: UPPER_SNAKE_CASE
+      - Meta.id empty → filled from key; set → must match key
+      - Meta.domain must match domain
       - duplicate code across registrations
+      - pii_in_detail=True forces retention_class=SHORT
+
+    Raises AuditCatalogError on any violation.
     """
+    # Emit the pii_in_detail warning in Python before Rust silently forces SHORT.
     for name, meta in codes.items():
-        if not _CODE_KEY_RE.match(name):
-            raise AuditCatalogError(
-                f"register: code key {name!r} must be UPPER_SNAKE_CASE "
-                f"(letters, digits, underscores; starts with a letter). "
-                f"Got {name!r}."
-            )
-
-        if not meta.id:
-            meta = replace(meta, id=name)
-        elif meta.id != name:
-            raise AuditCatalogError(
-                f"register: dict key {name!r} disagrees with Meta.id={meta.id!r}. "
-                f"Drop Meta.id (it fills from the key) or fix the mismatch."
-            )
-
-        if meta.domain != domain:
-            raise AuditCatalogError(
-                f"register: code {name!r} declares domain={meta.domain!r} "
-                f"but registered under {domain!r}."
-            )
-
-        # P1-5 #1: pii_in_detail forces RetentionClass.SHORT.
         if meta.pii_in_detail and meta.retention_class is not RetentionClass.SHORT:
             _logger.warning(
                 "fasten: code %s has pii_in_detail=True; "
                 "retention_class forced to SHORT (was %s).",
                 name, meta.retention_class.value.upper(),
             )
-            meta = replace(meta, retention_class=RetentionClass.SHORT)
+    codes_dict = {name: _meta_to_dict(name, meta) for name, meta in codes.items()}
+    # Raises AuditCatalogError on validation failure (mapped from Rust error codes).
+    core_ffi.register_codes(domain, json.dumps(codes_dict))
+    # Populate Python cache from the Rust-validated state.
+    for name in codes:
+        meta_json = core_ffi.meta_of_json(name)
+        if meta_json and meta_json != "{}":
+            _registry[name] = _dict_to_meta(json.loads(meta_json))
 
-        if name in _registry:
-            raise AuditCatalogError(f"register: duplicate code {name!r}")
 
-        _registry[name] = meta
+def meta_of(code: str) -> Optional[Meta]:
+    """Return the Meta for `code`, or None if not registered."""
+    return _registry.get(code)
 
 
 def registry() -> dict[str, Meta]:
@@ -194,23 +200,14 @@ def dump() -> str:
 
 # ── Optional yaml catalog (P1-11) ─────────────────────────────────────────
 # Re-export lazy: pyyaml is only imported when load() / reload() runs.
-# Adopters who stay on programmatic register() never pay the dep.
 
 def load(path: str) -> None:
-    """Load a catalog yaml file (see ``fasten/codes_yaml.py`` for full docs).
-
-    Lazy import — pyyaml is loaded only when this is called. Errors raise
-    loudly (startup, restart-safe).
-    """
+    """Load a catalog yaml file (see ``fasten/codes_yaml.py`` for full docs)."""
     from .codes_yaml import load as _load
     _load(path)
 
 
 def reload() -> None:
-    """Re-read all previously-loaded yaml paths and atomically swap the registry.
-
-    Fault-tolerant — if parsing or validation fails, the previous catalog
-    stays active and the error is raised. No partial state.
-    """
+    """Re-read all previously-loaded yaml paths and atomically swap the registry."""
     from .codes_yaml import reload as _reload
     _reload()

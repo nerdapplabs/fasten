@@ -56,7 +56,9 @@
     clippy::must_use_candidate       // FFI return values are inherently ignored
 )]
 
+pub mod catalog;
 pub mod error;
+pub mod redact;
 pub mod row;
 pub mod store;
 pub mod validate;
@@ -64,7 +66,9 @@ pub mod validate;
 pub(crate) mod ffi;
 
 // Re-export the most used types at crate root for Rust callers.
+pub use catalog::{CodeRegistry, Meta, GLOBAL_REGISTRY};
 pub use error::{Error, FastenErrorCode};
+pub use redact::{Redactor, REDACTOR};
 pub use row::Row;
 pub use store::{Filter, Store};
 

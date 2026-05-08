@@ -11,6 +11,8 @@
 //! the documented ownership rules in `include/fasten_store_core.h`.
 
 mod util;
+pub(crate) mod catalog;
+pub(crate) mod redact;
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
@@ -23,17 +25,12 @@ use crate::{
 };
 use util::{read_str, set_error};
 
-// ── Opaque handle ─────────────────────────────────────────────────────────────
-
-/// Heap-allocated, type-erased store. C sees only `FastenStore*`.
-pub struct FastenStoreHandle {
-    store: Box<dyn Store>,
-}
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── Shared helper ─────────────────────────────────────────────────────────────
+// Re-exported so the redact and catalog submodules can use it without
+// duplicating the catch_unwind boilerplate.
 
 /// Run `f`; catch any Rust panic; return `Ok(R)` or `Err((code, message))`.
-fn guarded<F, R>(f: F) -> Result<R, (FastenErrorCode, String)>
+pub(crate) fn guarded<F, R>(f: F) -> Result<R, (FastenErrorCode, String)>
 where
     F: FnOnce() -> Result<R, Error>,
 {
@@ -48,6 +45,13 @@ where
             "fasten-store-core: internal panic".into(),
         )),
     }
+}
+
+// ── Opaque handle ─────────────────────────────────────────────────────────────
+
+/// Heap-allocated, type-erased store. C sees only `FastenStore*`.
+pub struct FastenStoreHandle {
+    store: Box<dyn Store>,
 }
 
 /// Write the error string and return the error code.

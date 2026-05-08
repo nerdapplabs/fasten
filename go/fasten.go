@@ -18,15 +18,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"os"
-	"regexp"
 	"sync"
 	"time"
 )
-
-// codeKeyRe validates audit-code identifiers — UPPER_SNAKE_CASE.
-var codeKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 type Severity string
@@ -171,17 +167,91 @@ type Meta struct {
 }
 
 var (
-	regMu      sync.RWMutex
-	_registry  = map[Code]Meta{}
+	regMu     sync.RWMutex
+	_registry = map[Code]Meta{}
 )
+
+// rustMeta is the JSON shape the Rust catalog engine expects and returns.
+type rustMeta struct {
+	Domain                string   `json:"domain"`
+	Category              string   `json:"category"`
+	Action                string   `json:"action"`
+	Severity              string   `json:"severity"`
+	Description           string   `json:"description"`
+	Emitter               string   `json:"emitter"`
+	ID                    string   `json:"id"`
+	RetentionClass        string   `json:"retention_class"`
+	HighVolume            bool     `json:"high_volume"`
+	PiiInDetail           bool     `json:"pii_in_detail"`
+	DetailPassthroughKeys []string `json:"detail_passthrough_keys"`
+}
+
+func marshalCodesForRust(domain string, codes map[Code]Meta) (string, error) {
+	m := make(map[string]rustMeta, len(codes))
+	for k, meta := range codes {
+		rc := string(meta.RetentionClass)
+		if rc == "" {
+			rc = "medium"
+		}
+		passthrough := meta.DetailPassthroughKeys
+		if passthrough == nil {
+			passthrough = []string{}
+		}
+		m[string(k)] = rustMeta{
+			Domain:                string(meta.Domain),
+			Category:              meta.Category,
+			Action:                meta.Action,
+			Severity:              string(meta.Severity),
+			Description:           meta.Description,
+			Emitter:               meta.Emitter,
+			ID:                    string(meta.ID),
+			RetentionClass:        rc,
+			HighVolume:            meta.HighVolume,
+			PiiInDetail:           meta.PiiInDetail,
+			DetailPassthroughKeys: passthrough,
+		}
+	}
+	b, err := json.Marshal(m)
+	return string(b), err
+}
+
+func unmarshalMetaJSON(s string) (Meta, bool) {
+	var rm rustMeta
+	if err := json.Unmarshal([]byte(s), &rm); err != nil {
+		return Meta{}, false
+	}
+	return Meta{
+		ID:                    Code(rm.ID),
+		Domain:                Domain(rm.Domain),
+		Category:              rm.Category,
+		Action:                rm.Action,
+		Severity:              Severity(rm.Severity),
+		Description:           rm.Description,
+		Emitter:               rm.Emitter,
+		RetentionClass:        RetentionClass(rm.RetentionClass),
+		HighVolume:            rm.HighVolume,
+		PiiInDetail:           rm.PiiInDetail,
+		DetailPassthroughKeys: rm.DetailPassthroughKeys,
+	}, true
+}
+
+// clearBothRegistries clears the Go-side cache and the Rust global registry.
+// For test teardown only — do not call in production code.
+func clearBothRegistries() {
+	regMu.Lock()
+	for k := range _registry {
+		delete(_registry, k)
+	}
+	regMu.Unlock()
+	coreRegistryClear()
+}
 
 // Register adds a batch of codes for a domain.
 //
-// Validation runs in this order; first failure returns an error:
-//   - key shape: UPPER_SNAKE_CASE identifier
-//   - Meta.ID empty → fill from map key; set → must match key
-//   - Meta.Domain must match domain
-//   - duplicate code across registrations
+// All validation (UPPER_SNAKE_CASE key shape, Meta.ID fill/mismatch,
+// domain match, duplicate detection, pii_in_detail→RetShort) is delegated
+// to fasten-core (Rust) so the logic is canonical across all SDKs.
+// On success the Go-side cache is populated from the Rust-validated state.
 //
 // Drop Meta.ID in new code; the map key is the single source of truth:
 //
@@ -189,38 +259,22 @@ var (
 //	    "USER_CREATED": {Domain: "user", Action: "create", Severity: fasten.SevInfo, ...},
 //	})
 func Register(domain Domain, codes map[Code]Meta) error {
+	codesJSON, err := marshalCodesForRust(string(domain), codes)
+	if err != nil {
+		return fmt.Errorf("fasten.Register: %w", err)
+	}
+	if err := coreRegisterCodes(string(domain), codesJSON); err != nil {
+		return err // already prefixed with "fasten.Register: "
+	}
 	regMu.Lock()
 	defer regMu.Unlock()
-	for c, m := range codes {
-		if !codeKeyRe.MatchString(string(c)) {
-			return fmt.Errorf("fasten.Register: code key %q must be UPPER_SNAKE_CASE", c)
+	for name := range codes {
+		metaJSON, _ := coreMetaOfJSON(string(name))
+		if metaJSON != "" && metaJSON != "{}" {
+			if m, ok := unmarshalMetaJSON(metaJSON); ok {
+				_registry[name] = m
+			}
 		}
-		if m.ID == "" {
-			m.ID = c
-		} else if m.ID != c {
-			return fmt.Errorf(
-				"fasten.Register: map key %q disagrees with Meta.ID=%q. "+
-					"Drop Meta.ID (it fills from the key) or fix the mismatch.",
-				c, m.ID,
-			)
-		}
-		if m.Domain != domain {
-			return fmt.Errorf("fasten.Register: code %q declares domain %q but registered under %q", c, m.Domain, domain)
-		}
-
-		// P1-5 #1: PiiInDetail forces RetentionClass=RetShort.
-		if m.PiiInDetail && m.RetentionClass != RetShort && m.RetentionClass != "" {
-			fmt.Fprintf(os.Stderr,
-				"fasten: code %s has PiiInDetail=true; "+
-					"RetentionClass forced to short (was %s).\n",
-				c, m.RetentionClass)
-			m.RetentionClass = RetShort
-		}
-
-		if _, exists := _registry[c]; exists {
-			return fmt.Errorf("fasten.Register: duplicate code %q", c)
-		}
-		_registry[c] = m
 	}
 	return nil
 }
