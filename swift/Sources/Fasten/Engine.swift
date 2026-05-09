@@ -130,6 +130,7 @@ final class Engine: @unchecked Sendable {
 
     func reset() {
         queue?.stop()
+        CodeRegistry.shared.clear()
         lock.withLock {
             serviceID = ""; nodeID = ""; tenantID = nil
             store = nil; queue = nil

@@ -35,7 +35,7 @@ public enum Fasten {
 
     /// Register audit codes.  Call once per domain at process start.
     public static func register(_ domain: String, codes: [Code: Meta]) {
-        CodeRegistry.shared.register(codes)
+        CodeRegistry.shared.register(domain, codes)
     }
 
     /// Configure fasten.  Must be called before `emit()`.

@@ -5,10 +5,12 @@ on:
     branches: [main, dev]
     paths:
       - 'swift/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-swift.yml'
   pull_request:
     paths:
       - 'swift/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-swift.yml'
 
 permissions:
@@ -27,11 +29,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install SQLite3 dev headers
-        run: apt-get update -qq && apt-get install -y --no-install-recommends libsqlite3-dev
+      - name: Install system deps
+        run: apt-get update -qq && apt-get install -y --no-install-recommends libsqlite3-dev curl ca-certificates
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
 
       - name: Build
-        run: swift build
+        env:
+          FASTEN_LIB: ${{ github.workspace }}/store-core/target/release
+        run: swift build -Xlinker -L$FASTEN_LIB
 
       - name: Test
-        run: swift test
+        env:
+          FASTEN_LIB: ${{ github.workspace }}/store-core/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
+        run: swift test -Xlinker -L$FASTEN_LIB
