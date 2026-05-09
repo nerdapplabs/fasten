@@ -74,7 +74,7 @@ pub const METHOD_UI: &str = "ui";  // Web or desktop UI action, human-initiated
 pub const METHOD_AGENT_TOOL: &str = "agent_tool";  // AI agent tool call
 pub const METHOD_SDK: &str = "sdk";  // Direct SDK call, no transport shim active. Default.
 
-pub const REDACT_REPLACEMENT: &str = "***";
+pub use fasten_store_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;
 pub const REDACT_PATTERNS: &[&str] = &[
     "api[_-]?key",
     "password",
@@ -226,52 +226,38 @@ pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub(crate) fn is_upper_snake(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_uppercase() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Register a batch of codes for a domain.
 ///
-/// Validation runs in this order; first failure returns an error:
-///   - key shape: UPPER_SNAKE_CASE identifier
-///   - `Meta.id` empty → fill from key; set → must match key
-///   - `Meta.domain` must match `domain`
-///   - duplicate code across registrations
+/// Validation (key shape, id-match, domain-match, pii_in_detail forcing) is
+/// delegated to a fresh `fasten_store_core::catalog::CodeRegistry` so the
+/// rules stay in one place.  The validated codes are then committed to the
+/// SDK's own typed registry.
 ///
 /// Drop `Meta.id` in new code; the tuple key is the single source of truth.
 pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
 {
+    use fasten_store_core::catalog::CodeRegistry as CoreReg;
+    let codes: Vec<(String, Meta)> = codes.into_iter().collect();
+
+    // Validate via a throw-away store-core registry — handles all rules
+    // without touching the global singleton (safe to call from tests).
+    let core_map: HashMap<String, fasten_store_core::catalog::Meta> =
+        codes.iter().map(|(id, m)| (id.clone(), to_core_meta(m))).collect();
+    CoreReg::new().register(&domain, core_map).map_err(map_core_catalog_err)?;
+
+    // Cross-batch duplicate check against the already-registered SDK codes.
     let mut guard = registry().write().expect("registry poisoned");
+    for (id, _) in &codes {
+        if guard.contains_key(id.as_str()) {
+            return Err(Error::DuplicateCode(id.clone()));
+        }
+    }
+
+    // Commit with filled/normalised fields.
     for (id, mut meta) in codes {
-        if !is_upper_snake(&id) {
-            return Err(Error::InvalidKey(id));
-        }
-        if meta.id.is_empty() {
-            meta.id = id.clone();
-        } else if meta.id != id {
-            return Err(Error::IdMismatch {
-                key: id,
-                got: meta.id,
-            });
-        }
-        if meta.domain != domain {
-            return Err(Error::DomainMismatch {
-                code: id,
-                got: meta.domain,
-                want: domain,
-            });
-        }
-        if guard.contains_key(&id) {
-            return Err(Error::DuplicateCode(id));
-        }
-        // P1-5 #1: pii_in_detail forces retention_class=Short.
+        if meta.id.is_empty() { meta.id = id.clone(); }
         if meta.pii_in_detail && meta.retention_class != RetentionClass::Short {
             eprintln!(
                 "fasten: code {} has pii_in_detail=true; retention_class forced to SHORT (was {}).",
@@ -282,6 +268,35 @@ where
         guard.insert(id, meta);
     }
     Ok(())
+}
+
+fn to_core_meta(m: &Meta) -> fasten_store_core::catalog::Meta {
+    fasten_store_core::catalog::Meta {
+        id:                      m.id.clone(),
+        domain:                  m.domain.clone(),
+        category:                m.category.clone(),
+        action:                  m.action.clone(),
+        severity:                m.severity.to_string(),
+        description:             m.description.clone(),
+        emitter:                 m.emitter.clone(),
+        retention_class:         m.retention_class.to_string(),
+        high_volume:             m.high_volume,
+        pii_in_detail:           m.pii_in_detail,
+        declared_unused:         m.declared_unused,
+        detail_passthrough_keys: m.detail_passthrough_keys.clone(),
+    }
+}
+
+fn map_core_catalog_err(e: fasten_store_core::error::Error) -> Error {
+    use fasten_store_core::error::Error as CE;
+    match e {
+        CE::InvalidKey(k) => Error::InvalidKey(k),
+        CE::IdMismatch { key, id } => Error::IdMismatch { key, got: id },
+        CE::DomainMismatch { key, declared, registered } =>
+            Error::DomainMismatch { code: key, got: declared, want: registered },
+        CE::DuplicateCode(k) => Error::DuplicateCode(k),
+        other => Error::YamlInvalid(other.to_string()),
+    }
 }
 
 /// Look up Meta by code.
@@ -364,239 +379,24 @@ pub mod log {
 }
 
 // --- Redaction -----------------------------------------------------------
-//
-// Two passes before emit.
-//   Pass 1 — key-pattern: keys matching REDACT_PATTERNS → REDACT_REPLACEMENT.
-//     Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). We
-//     avoid the regex crate dep: lower-case + strip `_` and `-` from both key
-//     and pattern, then substring-match. Equivalent to case-insensitive search
-//     for all current spec patterns.
-//   Pass 2 — value-shape: string scalars matching known secret shapes (JWT,
-//     PEM private key, AWS/GH tokens, Stripe, OpenAI, CC/Luhn) → type-hinting
-//     token. Also implemented without the regex crate via direct byte scanning.
-
-fn norm_key(s: &str) -> String {
-    s.to_ascii_lowercase().replace(['_', '-'], "")
-}
-
-fn pattern_words() -> &'static [String] {
-    static WORDS: OnceLock<Vec<String>> = OnceLock::new();
-    WORDS.get_or_init(|| {
-        REDACT_PATTERNS
-            .iter()
-            .map(|p| p.replace("[_-]?", "").replace(['_', '-'], "").to_ascii_lowercase())
-            .collect()
-    })
-}
-
-fn key_is_secret(key: &str, extra: Option<&[String]>) -> bool {
-    let k = norm_key(key);
-    if pattern_words().iter().any(|p| k.contains(p)) {
-        return true;
-    }
-    if let Some(ex) = extra {
-        if ex.iter().any(|p| k.contains(&norm_key(p))) {
-            return true;
-        }
-    }
-    false
-}
-
-// ── Value-shape helpers ──────────────────────────────────────────────────────
-
-fn luhn_valid(digits: &[u8]) -> bool {
-    let mut total: u32 = 0;
-    for (i, &b) in digits.iter().rev().enumerate() {
-        let mut n = (b - b'0') as u32;
-        if i % 2 == 1 {
-            n *= 2;
-            if n > 9 { n -= 9; }
-        }
-        total += n;
-    }
-    total % 10 == 0
-}
-
-fn is_base64url(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-}
-
-fn is_upper_alnum(b: u8) -> bool {
-    b.is_ascii_uppercase() || b.is_ascii_digit()
-}
-
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Return a redaction token if `s` matches a known secret value shape, else None.
-/// No regex crate — all matching is done via direct byte scanning.
-fn check_value_shape(s: &str) -> Option<&'static str> {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-
-    // JWT: eyJ<base64url>.eyJ<base64url>.<base64url>
-    let mut pos = 0;
-    while let Some(off) = s[pos..].find("eyJ") {
-        let start = pos + off;
-        // first segment: from start until first '.'
-        let seg1_end = bytes[start..].iter().position(|&b| b == b'.').map(|p| start + p);
-        if let Some(dot1) = seg1_end {
-            if bytes[start..dot1].iter().all(|&b| is_base64url(b)) {
-                let after_dot1 = dot1 + 1;
-                // second segment must start with eyJ
-                if bytes.get(after_dot1..after_dot1 + 3) == Some(b"eyJ") {
-                    let seg2_end = bytes[after_dot1..].iter().position(|&b| b == b'.').map(|p| after_dot1 + p);
-                    if let Some(dot2) = seg2_end {
-                        if bytes[after_dot1..dot2].iter().all(|&b| is_base64url(b)) {
-                            let after_dot2 = dot2 + 1;
-                            let seg3_len = bytes[after_dot2..].iter().take_while(|&&b| is_base64url(b)).count();
-                            if seg3_len > 0 {
-                                return Some("***JWT***");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        pos = start + 3;
-    }
-
-    // PEM private key block
-    if s.contains("-----BEGIN") && s.contains("PRIVATE KEY-----") {
-        return Some("***PRIVATE_KEY***");
-    }
-
-    // AWS access key: (AKIA|ASIA) followed by exactly 16 uppercase alphanums
-    for prefix in [b"AKIA" as &[u8], b"ASIA"] {
-        let mut i = 0;
-        while i + prefix.len() <= len {
-            if bytes[i..].starts_with(prefix) {
-                let rest = &bytes[i + prefix.len()..];
-                let n = rest.iter().take(16).filter(|&&b| is_upper_alnum(b)).count();
-                if n == 16 && rest.get(16).is_none_or(|&b| !is_upper_alnum(b)) {
-                    return Some("***AWS_KEY***");
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // GitHub token: ghp_|gho_|ghu_|ghs_|ghr_ + 36 alphanums
-    for prefix in [b"ghp_" as &[u8], b"gho_", b"ghu_", b"ghs_", b"ghr_"] {
-        let mut i = 0;
-        while i + prefix.len() <= len {
-            if bytes[i..].starts_with(prefix) {
-                let rest = &bytes[i + prefix.len()..];
-                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric()).count();
-                if n >= 36 {
-                    return Some("***GH_TOKEN***");
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // Stripe live secret: sk_live_ + 24+ alphanums
-    {
-        let prefix = b"sk_live_";
-        let mut i = 0;
-        while i + prefix.len() <= len {
-            if bytes[i..].starts_with(prefix) {
-                let rest = &bytes[i + prefix.len()..];
-                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric()).count();
-                if n >= 24 {
-                    return Some("***STRIPE_KEY***");
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // OpenAI key: sk- optionally followed by proj-, then 32+ [A-Za-z0-9_-]
-    {
-        let prefix = b"sk-";
-        let mut i = 0;
-        while i + prefix.len() <= len {
-            if bytes[i..].starts_with(prefix) {
-                let after = &bytes[i + prefix.len()..];
-                let rest = if after.starts_with(b"proj-") { &after[5..] } else { after };
-                let n = rest.iter().take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-').count();
-                if n >= 32 {
-                    return Some("***OPENAI_KEY***");
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // Credit card: word-boundary-anchored digit sequence (opt. spaces/dashes),
-    // 13-19 digits total, passing Luhn checksum.
-    {
-        let mut i = 0;
-        while i < len {
-            if bytes[i].is_ascii_digit() && (i == 0 || !is_word_char(bytes[i - 1])) {
-                let start = i;
-                let mut digit_buf: Vec<u8> = Vec::with_capacity(19);
-                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b' ' || bytes[i] == b'-') {
-                    if bytes[i].is_ascii_digit() { digit_buf.push(bytes[i]); }
-                    i += 1;
-                }
-                let end_ok = i >= len || !is_word_char(bytes[i]);
-                let _ = start;
-                if end_ok && digit_buf.len() >= 13 && digit_buf.len() <= 19 && luhn_valid(&digit_buf) {
-                    return Some("***CC***");
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    None
-}
-
-fn redact_value(v: &serde_json::Value, extra: Option<&[String]>) -> serde_json::Value {
-    use serde_json::Value;
-    match v {
-        Value::String(s) => {
-            if let Some(shaped) = check_value_shape(s) {
-                Value::String(shaped.into())
-            } else {
-                v.clone()
-            }
-        }
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, vv) in map {
-                if key_is_secret(k, extra) {
-                    out.insert(k.clone(), Value::String(REDACT_REPLACEMENT.into()));
-                } else {
-                    out.insert(k.clone(), redact_value(vv, extra));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(|x| redact_value(x, extra)).collect()),
-        _ => v.clone(),
-    }
-}
 
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
 ) -> HashMap<String, serde_json::Value> {
-    detail
-        .into_iter()
-        .map(|(k, v)| {
-            let nv = if key_is_secret(&k, extra) {
-                serde_json::Value::String(REDACT_REPLACEMENT.into())
-            } else {
-                redact_value(&v, extra)
-            };
-            (k, nv)
-        })
-        .collect()
+    use fasten_store_core::redact::{Redactor, REDACTOR};
+    let v = serde_json::Value::Object(detail.into_iter().collect());
+    let redacted = match extra {
+        Some(keys) if !keys.is_empty() => {
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            Redactor::new(&refs, "", &[]).redact_value(&v)
+        }
+        _ => REDACTOR.redact_value(&v),
+    };
+    match redacted {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => unreachable!("redact_value on Object always returns Object"),
+    }
 }
 
 // --- Init + Emit ---------------------------------------------------------
