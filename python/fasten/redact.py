@@ -66,7 +66,7 @@ class Redactor:
     def _check_str_value(self, s: str) -> str:
         """Run value-shape redaction on a single string via Rust core."""
         out = json.loads(core_ffi.redact_json(json.dumps({"_": s})))
-        return out["_"]  # type: ignore[no-any-return]
+        return out["_"]
 
     def _redact_native(self, value: Any) -> Any:
         """Python fallback for values that cannot be JSON-serialised (non-string dict keys).
