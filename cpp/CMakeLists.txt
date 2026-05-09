@@ -5,12 +5,28 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── Interface library — header-only, zero link deps ───────────────────────
+# ── libfasten_store_core (Rust shared library) ────────────────────────────
+# Build store-core before configuring this project:
+#   cd ../store-core && cargo build --release --features all
+# Then set FASTEN_CORE_LIB_DIR to the release output dir, or let CMake
+# look in the default location relative to this file.
+if(NOT FASTEN_CORE_LIB_DIR)
+    set(FASTEN_CORE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../store-core/target/release")
+endif()
+
+find_library(FASTEN_CORE_LIB
+    NAMES fasten_store_core
+    HINTS ${FASTEN_CORE_LIB_DIR}
+    REQUIRED
+)
+
+# ── Interface library ─────────────────────────────────────────────────────
 add_library(fasten INTERFACE)
 target_include_directories(fasten INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_link_libraries(fasten INTERFACE ${FASTEN_CORE_LIB})
 
 # Warn on common pitfalls; treat warnings as errors in CI.
 target_compile_options(fasten INTERFACE
@@ -76,8 +92,10 @@ if(FASTEN_BUILD_TESTS)
     add_test(NAME redact_substring_smoke COMMAND redact_substring_smoke)
 
     # sqlite_store_smoke needs sqlite3 at link time.
-    find_package(SQLite3)
-    if(SQLite3_FOUND)
+    # Guard with TARGET check: some cmake/platform combos set SQLite3_FOUND but
+    # fail to create the SQLite3::SQLite3 IMPORTED target (cmake bug on older 3.x).
+    find_package(SQLite3 QUIET)
+    if(TARGET SQLite3::SQLite3)
         add_executable(sqlite_store_smoke tests/sqlite_store_smoke.cpp)
         target_link_libraries(sqlite_store_smoke PRIVATE fasten SQLite3::SQLite3)
         if(UNIX AND NOT APPLE)
@@ -85,12 +103,12 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
     else()
-        message(STATUS "SQLite3 not found — skipping sqlite_store_smoke")
+        message(STATUS "SQLite3::SQLite3 target unavailable — skipping sqlite_store_smoke")
     endif()
 
     # postgres_store_smoke needs libpq at link time.
-    find_package(PostgreSQL)
-    if(PostgreSQL_FOUND)
+    find_package(PostgreSQL QUIET)
+    if(TARGET PostgreSQL::PostgreSQL)
         add_executable(postgres_store_smoke tests/postgres_store_smoke.cpp)
         target_link_libraries(postgres_store_smoke PRIVATE fasten PostgreSQL::PostgreSQL)
         if(UNIX AND NOT APPLE)
@@ -98,7 +116,7 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME postgres_store_smoke COMMAND postgres_store_smoke)
     else()
-        message(STATUS "PostgreSQL not found — skipping postgres_store_smoke")
+        message(STATUS "PostgreSQL::PostgreSQL target unavailable — skipping postgres_store_smoke")
     endif()
 
     # codes_yaml smoke needs libyaml-cpp at link time — guard so the build
@@ -113,6 +131,41 @@ if(FASTEN_BUILD_TESTS)
         add_test(NAME codes_yaml_smoke COMMAND codes_yaml_smoke)
     else()
         message(STATUS "yaml-cpp not found — skipping codes_yaml_smoke")
+    endif()
+
+    # P1-12: logger-shim smoke tests.
+    # spdlog + glog use stub headers in tests/shim_stubs/ — no install required.
+    # boost_log requires Boost.Log headers — guarded with find_package.
+
+    add_executable(shim_spdlog_smoke tests/shim_spdlog_smoke.cpp)
+    target_include_directories(shim_spdlog_smoke BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/shim_stubs)
+    target_link_libraries(shim_spdlog_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(shim_spdlog_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME shim_spdlog_smoke COMMAND shim_spdlog_smoke)
+
+    add_executable(shim_glog_smoke tests/shim_glog_smoke.cpp)
+    target_include_directories(shim_glog_smoke BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/shim_stubs)
+    target_link_libraries(shim_glog_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(shim_glog_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME shim_glog_smoke COMMAND shim_glog_smoke)
+
+    find_package(Boost COMPONENTS log log_setup)
+    if(Boost_LOG_FOUND)
+        add_executable(shim_boost_log_smoke tests/shim_boost_log_smoke.cpp)
+        target_link_libraries(shim_boost_log_smoke PRIVATE fasten
+            Boost::log Boost::log_setup)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(shim_boost_log_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME shim_boost_log_smoke COMMAND shim_boost_log_smoke)
+    else()
+        message(STATUS "Boost.Log not found — skipping shim_boost_log_smoke")
     endif()
 endif()
 

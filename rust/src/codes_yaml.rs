@@ -30,8 +30,17 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use super::{
-    is_upper_snake, registry, Domain, Error, Meta, RetentionClass, Severity,
+    registry, Domain, Error, Meta, RetentionClass, Severity,
 };
+
+fn is_upper_snake(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
 
 static LOADED_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static YAML_CODES: Mutex<Option<HashSet<String>>> = Mutex::new(None);

@@ -225,6 +225,14 @@ func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnship
 	return int(n), nil
 }
 
+// Count returns the total number of rows in the audit table. Used by the
+// /audit/doctor health endpoint to confirm store reachability.
+func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, s.table)).Scan(&n)
+	return n, err
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 func filterToSQL(f Filter) (string, []any) {

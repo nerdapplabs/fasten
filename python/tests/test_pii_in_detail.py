@@ -1,11 +1,11 @@
 """P1-5: pii_in_detail enforcement tests.
 
-Three runtime behaviours, all verified here:
+Two runtime behaviours, all verified here:
 
 1. Force ``RetentionClass.SHORT`` at registration; WARN if adopter set otherwise
 2. Force-redact ``detail`` on emit unless adopter declared
-   ``detail_passthrough_keys``
-3. Stamp ``pii_in_detail`` on the audit row; SQLite store has the column
+   ``detail_passthrough_keys``; PII rows carry ``_pii_in_detail: True`` marker
+   in detail payload
 """
 import logging
 
@@ -169,9 +169,10 @@ def test_emit_non_pii_redacts_only_secret_keys(initialized):
     assert "_pii_in_detail" not in row.detail
 
 
-# ── #3 row column + SQLite schema ────────────────────────────────────────
+# ── #3 detail payload markers (no wire column) ───────────────────────────
 
-def test_row_carries_pii_flag_for_pii_code(initialized):
+def test_pii_detail_marker_present_in_detail(initialized):
+    """PII rows carry _pii_in_detail: True in the detail payload."""
     _clear("PII_FLAG_ROW")
     register("pii", {
         "PII_FLAG_ROW": _meta(
@@ -180,20 +181,22 @@ def test_row_carries_pii_flag_for_pii_code(initialized):
         ),
     })
     row = fasten.emit(code="PII_FLAG_ROW", target="t", actor="a")
-    assert row.pii_in_detail is True
+    assert row.detail.get("_pii_in_detail") is True
+    assert row.detail.get("_redacted") == "***"
 
 
-def test_row_pii_flag_default_false(initialized):
+def test_non_pii_row_has_no_pii_marker_in_detail(initialized):
+    """Non-PII rows do NOT have _pii_in_detail in their detail payload."""
     _clear("NORMAL_ROW")
     register("nonpii", {
         "NORMAL_ROW": _meta(domain="nonpii"),
     })
     row = fasten.emit(code="NORMAL_ROW", target="t", actor="a")
-    assert row.pii_in_detail is False
+    assert "_pii_in_detail" not in row.detail
 
 
-def test_sqlite_persists_pii_column(mem_store):
-    """End-to-end: emit → SQLite insert → query → pii_in_detail survives the round-trip."""
+def test_sqlite_round_trip_preserves_pii_detail_marker(mem_store):
+    """End-to-end: emit → SQLite insert → query → _pii_in_detail marker in detail survives."""
     from fasten.attrs import AuditRow
     from datetime import datetime, timezone
     from fasten.codes import Severity as S
@@ -210,17 +213,16 @@ def test_sqlite_persists_pii_column(mem_store):
         target="t", category="c", domain="d",
         method="sdk", request_id="abc123",
         detail={"_redacted": "***", "_pii_in_detail": True},
-        pii_in_detail=True,
     )
     mem_store.insert(pii_row)
     fetched = mem_store.query(request_id="abc123")
     assert len(fetched) == 1
-    assert fetched[0].pii_in_detail is True
+    assert fetched[0].detail.get("_pii_in_detail") is True
 
 
-def test_sqlite_idempotent_migration_on_legacy_table(tmp_path):
-    """Adopter upgrades fasten on a populated table that pre-dates pii_in_detail.
-    The migration must add the column without losing rows."""
+def test_sqlite_legacy_table_rows_still_queryable(tmp_path):
+    """Adopter opens a pre-existing SQLite table without pii_in_detail column.
+    Existing rows are still queryable by the store."""
     import sqlite3
     from fasten.store.sqlite import SQLiteStore
 
@@ -258,10 +260,7 @@ def test_sqlite_idempotent_migration_on_legacy_table(tmp_path):
     legacy.commit()
     legacy.close()
 
-    # Open via SQLiteStore — should run idempotent migration.
+    # Open via SQLiteStore — existing rows should be queryable.
     store = SQLiteStore(str(db))
-
-    # Pre-existing row still queryable + new pii_in_detail column populates False
     rows = store.query(code="OLD_CODE")
     assert len(rows) == 1
-    assert rows[0].pii_in_detail is False

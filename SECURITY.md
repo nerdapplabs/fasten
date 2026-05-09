@@ -1,5 +1,7 @@
 # Security Policy
 
+See [docs/security.md](docs/security.md) for the full threat model — trust boundaries, attack surfaces, mitigations in place, and what is explicitly out of scope.
+
 ## Supported versions
 
 | Version          | Supported |

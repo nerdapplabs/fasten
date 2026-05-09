@@ -43,6 +43,16 @@ inline std::set<std::string>& yaml_codes() {
     static std::set<std::string> s; return s;
 }
 
+inline bool is_upper_snake(const std::string& s) {
+    if (s.empty() || !(s[0] >= 'A' && s[0] <= 'Z')) return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    }
+    return true;
+}
+
 inline Sev parse_severity(const std::string& s) {
     if (s.empty() || s == "info") return Sev::Info;
     if (s == "debug")    return Sev::Debug;
@@ -104,7 +114,7 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
 
         for (const auto& kv : codes_node) {
             const auto code = kv.first.as<std::string>();
-            if (!::fasten::detail_::is_upper_snake(code)) {
+            if (!is_upper_snake(code)) {
                 throw AuditCatalogError(
                     "fasten: " + path + ":" + code +
                     " — code key must be UPPER_SNAKE_CASE");

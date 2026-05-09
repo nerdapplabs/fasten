@@ -74,7 +74,7 @@ pub const METHOD_UI: &str = "ui";  // Web or desktop UI action, human-initiated
 pub const METHOD_AGENT_TOOL: &str = "agent_tool";  // AI agent tool call
 pub const METHOD_SDK: &str = "sdk";  // Direct SDK call, no transport shim active. Default.
 
-pub const REDACT_REPLACEMENT: &str = "***";
+pub use fasten_store_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;
 pub const REDACT_PATTERNS: &[&str] = &[
     "api[_-]?key",
     "password",
@@ -226,52 +226,38 @@ pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub(crate) fn is_upper_snake(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_uppercase() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Register a batch of codes for a domain.
 ///
-/// Validation runs in this order; first failure returns an error:
-///   - key shape: UPPER_SNAKE_CASE identifier
-///   - `Meta.id` empty → fill from key; set → must match key
-///   - `Meta.domain` must match `domain`
-///   - duplicate code across registrations
+/// Validation (key shape, id-match, domain-match, pii_in_detail forcing) is
+/// delegated to a fresh `fasten_store_core::catalog::CodeRegistry` so the
+/// rules stay in one place.  The validated codes are then committed to the
+/// SDK's own typed registry.
 ///
 /// Drop `Meta.id` in new code; the tuple key is the single source of truth.
 pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
 {
+    use fasten_store_core::catalog::CodeRegistry as CoreReg;
+    let codes: Vec<(String, Meta)> = codes.into_iter().collect();
+
+    // Validate via a throw-away store-core registry — handles all rules
+    // without touching the global singleton (safe to call from tests).
+    let core_map: HashMap<String, fasten_store_core::catalog::Meta> =
+        codes.iter().map(|(id, m)| (id.clone(), to_core_meta(m))).collect();
+    CoreReg::new().register(&domain, core_map).map_err(map_core_catalog_err)?;
+
+    // Cross-batch duplicate check against the already-registered SDK codes.
     let mut guard = registry().write().expect("registry poisoned");
+    for (id, _) in &codes {
+        if guard.contains_key(id.as_str()) {
+            return Err(Error::DuplicateCode(id.clone()));
+        }
+    }
+
+    // Commit with filled/normalised fields.
     for (id, mut meta) in codes {
-        if !is_upper_snake(&id) {
-            return Err(Error::InvalidKey(id));
-        }
-        if meta.id.is_empty() {
-            meta.id = id.clone();
-        } else if meta.id != id {
-            return Err(Error::IdMismatch {
-                key: id,
-                got: meta.id,
-            });
-        }
-        if meta.domain != domain {
-            return Err(Error::DomainMismatch {
-                code: id,
-                got: meta.domain,
-                want: domain,
-            });
-        }
-        if guard.contains_key(&id) {
-            return Err(Error::DuplicateCode(id));
-        }
-        // P1-5 #1: pii_in_detail forces retention_class=Short.
+        if meta.id.is_empty() { meta.id = id.clone(); }
         if meta.pii_in_detail && meta.retention_class != RetentionClass::Short {
             eprintln!(
                 "fasten: code {} has pii_in_detail=true; retention_class forced to SHORT (was {}).",
@@ -282,6 +268,35 @@ where
         guard.insert(id, meta);
     }
     Ok(())
+}
+
+fn to_core_meta(m: &Meta) -> fasten_store_core::catalog::Meta {
+    fasten_store_core::catalog::Meta {
+        id:                      m.id.clone(),
+        domain:                  m.domain.clone(),
+        category:                m.category.clone(),
+        action:                  m.action.clone(),
+        severity:                m.severity.to_string(),
+        description:             m.description.clone(),
+        emitter:                 m.emitter.clone(),
+        retention_class:         m.retention_class.to_string(),
+        high_volume:             m.high_volume,
+        pii_in_detail:           m.pii_in_detail,
+        declared_unused:         m.declared_unused,
+        detail_passthrough_keys: m.detail_passthrough_keys.clone(),
+    }
+}
+
+fn map_core_catalog_err(e: fasten_store_core::error::Error) -> Error {
+    use fasten_store_core::error::Error as CE;
+    match e {
+        CE::InvalidKey(k) => Error::InvalidKey(k),
+        CE::IdMismatch { key, id } => Error::IdMismatch { key, got: id },
+        CE::DomainMismatch { key, declared, registered } =>
+            Error::DomainMismatch { code: key, got: declared, want: registered },
+        CE::DuplicateCode(k) => Error::DuplicateCode(k),
+        other => Error::YamlInvalid(other.to_string()),
+    }
 }
 
 /// Look up Meta by code.
@@ -364,73 +379,24 @@ pub mod log {
 }
 
 // --- Redaction -----------------------------------------------------------
-//
-// Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). For v0.1
-// we avoid the regex crate dep: lower-case + strip `_` and `-` from both
-// key and pattern, then substring-match. Behaviour matches Python's
-// case-insensitive search for all patterns in the spec.
-
-fn norm_key(s: &str) -> String {
-    s.to_ascii_lowercase().replace(['_', '-'], "")
-}
-
-fn pattern_words() -> &'static [String] {
-    static WORDS: OnceLock<Vec<String>> = OnceLock::new();
-    WORDS.get_or_init(|| {
-        REDACT_PATTERNS
-            .iter()
-            .map(|p| p.replace("[_-]?", "").replace(['_', '-'], "").to_ascii_lowercase())
-            .collect()
-    })
-}
-
-fn key_is_secret(key: &str, extra: Option<&[String]>) -> bool {
-    let k = norm_key(key);
-    if pattern_words().iter().any(|p| k.contains(p)) {
-        return true;
-    }
-    if let Some(ex) = extra {
-        if ex.iter().any(|p| k.contains(&norm_key(p))) {
-            return true;
-        }
-    }
-    false
-}
-
-fn redact_value(v: &serde_json::Value, extra: Option<&[String]>) -> serde_json::Value {
-    use serde_json::Value;
-    match v {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, vv) in map {
-                if key_is_secret(k, extra) {
-                    out.insert(k.clone(), Value::String(REDACT_REPLACEMENT.into()));
-                } else {
-                    out.insert(k.clone(), redact_value(vv, extra));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(|x| redact_value(x, extra)).collect()),
-        _ => v.clone(),
-    }
-}
 
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
 ) -> HashMap<String, serde_json::Value> {
-    detail
-        .into_iter()
-        .map(|(k, v)| {
-            let nv = if key_is_secret(&k, extra) {
-                serde_json::Value::String(REDACT_REPLACEMENT.into())
-            } else {
-                redact_value(&v, extra)
-            };
-            (k, nv)
-        })
-        .collect()
+    use fasten_store_core::redact::{Redactor, REDACTOR};
+    let v = serde_json::Value::Object(detail.into_iter().collect());
+    let redacted = match extra {
+        Some(keys) if !keys.is_empty() => {
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            Redactor::new(&refs, "", &[]).redact_value(&v)
+        }
+        _ => REDACTOR.redact_value(&v),
+    };
+    match redacted {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => unreachable!("redact_value on Object always returns Object"),
+    }
 }
 
 // --- Init + Emit ---------------------------------------------------------

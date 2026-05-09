@@ -30,7 +30,7 @@ import (
 	"syscall"
 	"time"
 
-	fasten "github.com/nerdapplabs/fasten-go"
+	fasten "github.com/nerdapplabs/fasten/go"
 	_ "modernc.org/sqlite"
 )
 

@@ -102,7 +102,7 @@ class APILogger:
             await self.app(scope, receive, send_wrapper)
         finally:
             duration_ms = int((time.monotonic() - start) * 1000)
-            from ..emit import transport as _transport
+            from ..emitter import transport as _transport
             t = _transport()
             if t is None:
                 return

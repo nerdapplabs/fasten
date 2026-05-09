@@ -5,7 +5,7 @@ Audit + correlation SDK for Go services. v1.0.0-beta.
 ## Install
 
 ```bash
-go get github.com/nerdapplabs/fasten-go
+go get github.com/nerdapplabs/fasten/go
 ```
 
 ## Quickstart
@@ -20,7 +20,7 @@ import (
     "database/sql"
     "time"
 
-    fasten "github.com/nerdapplabs/fasten-go"
+    fasten "github.com/nerdapplabs/fasten/go"
     _ "modernc.org/sqlite" // pure-Go SQLite driver; CGO_ENABLED=0 friendly
 )
 

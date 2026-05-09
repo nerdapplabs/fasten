@@ -3,24 +3,15 @@ package fasten
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"testing"
 
-	// Pure-Go SQLite driver — no CGO required so this test runs under
-	// CGO_ENABLED=0 CI (e.g. GitHub Actions default).
 	_ "modernc.org/sqlite"
 )
 
 // resetForPII clears state set by other tests in this package.
 func resetForPII(t *testing.T) {
 	t.Helper()
-	regMu.Lock()
-	for k := range _registry {
-		if strings.HasPrefix(string(k), "PII_") || strings.HasPrefix(string(k), "NON_PII_") {
-			delete(_registry, k)
-		}
-	}
-	regMu.Unlock()
+	clearBothRegistries()
 }
 
 // ── #1 force RetShort at registration ────────────────────────────────────
