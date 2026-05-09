@@ -29,6 +29,7 @@ vendor/
 # Rust
 rust/target/
 rust/Cargo.lock
+store-core/target/
 
 # Java
 java/target/

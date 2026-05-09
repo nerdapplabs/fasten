@@ -19,8 +19,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: swift:5.10
 
     defaults:
       run:
@@ -29,11 +27,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install system deps
-        run: apt-get update -qq && apt-get install -y --no-install-recommends libsqlite3-dev curl ca-certificates
+      - name: Set up Swift 5.10
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
 
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@1.85
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libsqlite3-dev
 
       - name: Build fasten-core (.so)
         working-directory: store-core
