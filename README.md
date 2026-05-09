@@ -14,11 +14,11 @@
 
 Audit + correlation SDK.
 
-Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 6 anchors (5 Ws + How) enforced at the type level; bundled shims for HTTP, MQTT, and scheduler-fired jobs. 
+Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level; bundled shims for HTTP, MQTT, and scheduler-fired jobs.
 
 One mountable query (API endpoints) surface.
 
-**v1.0.0-beta.** Python is the reference SDK; Go / JS / Rust / C++ are
+**v1.0.0-beta.** Python is the reference SDK; Go / JS / Rust / C++ / Swift are
 beta. Not yet on PyPI / npm / crates.io — install from source.
 
 **[Website →](https://fasten.sh)**
@@ -32,8 +32,9 @@ git clone https://github.com/nerdapplabs/fasten
 cd fasten
 
 pip install ./python                              # Python (reference)
-go get github.com/nerdapplabs/fasten-go          # Go
+go get github.com/nerdapplabs/fasten/go           # Go
 npm install ./js                                  # Node / TypeScript
+# Swift (SPM): add .package(url: "…/fasten", from: "1.0.0") to Package.swift
 # C++14: copy cpp/include/fasten.hpp — zero dependencies
 ```
 
@@ -98,7 +99,18 @@ reader.
 | CLI        | `fasten dump`                     | Print registered codes (CI consistency gate)  |
 | CLI        | `fasten tail --stream sys`        | Stream rows from a mounted reader             |
 | CLI        | `fasten doctor`                   | Verify init config + correlation wiring       |
-| TUI        | `fasten-tui --request-id <id>`    | Live multi-pane audit + sys + API feed (Rich) |
+| TUI        | `fasten-tui [--request-id <id>]`  | Live three-pane audit + sys + API feed (Rich) |
+
+**TUI interactive controls** (no mouse; works over SSH):
+
+| Key         | Action                                                     |
+|-------------|------------------------------------------------------------|
+| `L` / space | Toggle live polling on/off (default: **on** ●)            |
+| `/`         | Open request_id picker — fuzzy search, ↑↓ cursor, Enter to select, Esc to clear |
+| Tab         | Rotate primary pane: audit → sys → api → audit            |
+| `q` / Ctrl-C | Quit                                                      |
+
+If `--request-id <id>` is given, the TUI pre-selects it; `/` still lets you change it from inside the live view.
 
 The TUI is SSH-friendly — works on industrial Linux hosts where no GUI
 is permitted.
@@ -110,19 +122,37 @@ is permitted.
 | Language             | Status        | Min runtime | Location                                           |
 |----------------------|---------------|-------------|----------------------------------------------------|
 | Python               | reference     | 3.10        | [`python/`](python/)                               |
-| Go                   | usable        | 1.21        | [`go/`](go/)                                       |
+| Go                   | beta          | 1.21        | [`go/`](go/)                                       |
 | Node.js / TypeScript | beta          | Node 18     | [`js/`](js/)                                       |
 | Rust                 | beta          | 1.70        | [`rust/`](rust/)                                   |
 | C++                  | single-header | C++14       | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp) |
+| Swift                | beta          | macOS 13 / iOS 16 / Linux | [`swift/`](swift/)                   |
 | Java                 | placeholder   | —           | [`java/`](java/)                                   |
 
 Audit-store failure handling — the queue-mode default that keeps
-`emit()` off the request path — is shipped in all 5 SDKs (Python,
-Go, JS, Rust, C++). A locked / down audit store no longer cascades
-into 5xxs on the request path: rows queue with exponential backoff
-and the drainer self-reports queue health on the sys stream.
-Adopters who want loud failures during config debugging opt in via
-`audit_store_failure_strategy="raise"`.
+`emit()` off the request path — is shipped in all 6 production SDKs
+(Python, Go, JS, Rust, C++, Swift). A locked / down audit store no
+longer cascades into 5xxs on the request path: rows queue with
+exponential backoff and the drainer self-reports queue health on the sys
+stream. Adopters who want loud failures during config debugging opt in via
+`audit_store_failure_strategy="raise"` (Python/Go/JS/Rust/C++) or
+`strategy: .raise` (Swift).
+
+### C++ logger bridges (P1-12)
+
+Three opt-in, header-only shims bridge popular C++ logging libraries into
+fasten's `/logs/sys` ring — no call-site changes required:
+
+| Library | Shim header | Usage |
+|---------|------------|-------|
+| **spdlog** | `fasten/shim/spdlog.hpp` | Push `fasten::shim::spdlog_sink_mt` onto your logger's sink list |
+| **glog** | `fasten/shim/glog.hpp` | Call `fasten::shim::glog::install()` once after `fasten::init()` |
+| **Boost.Log** | `fasten/shim/boost_log.hpp` | Add `fasten::shim::boost_log::sink_mt` to `boost::log::core` |
+
+Each shim applies the same key-pattern and value-shape redaction as
+`fasten::emit()`, so secrets in log messages are scrubbed before they
+reach the ring. A per-thread recursion guard prevents infinite re-entry
+if fasten's own internal log writes use the same logger.
 
 ### Wire schema versioning
 

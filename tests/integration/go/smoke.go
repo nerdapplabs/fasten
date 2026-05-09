@@ -5,7 +5,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/nerdapplabs/fasten-go/fasten"
+	fasten "github.com/nerdapplabs/fasten/go"
 )
 
 func main() {

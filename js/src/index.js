@@ -8,6 +8,13 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import {
+	coreMetaOf,
+	coreRedact,
+	coreRedactFull,
+	coreRegisterCodes,
+	coreRegistryClear,
+} from "./core_ffi.js";
 
 // --- Correlation context --------------------------------------------------
 
@@ -50,7 +57,6 @@ export function _resetRegistryForReload(newRegistry, newYamlCodes) {
 }
 
 // Domain is a plain string — adopters define their own vocabulary.
-// fasten ships no built-in domain constants; use string literals in your codes module.
 export const Domain = {}; // kept for import compatibility; intentionally empty
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
@@ -81,28 +87,46 @@ export const Method = Object.freeze({
 	AGENT_TOOL: "agent_tool",
 	SDK: "sdk",
 });
-
-export const REDACT_REPLACEMENT = "***";
-export const REDACT_PATTERNS = [
-	"api[_-]?key",
-	"password",
-	"passwd",
-	"token",
-	"secret",
-	"authorization",
-	"bearer",
-	"m2m[_-]?key",
-	"cert[_-]?private",
-	"private[_-]?key",
-	"access_key",
-	"session_id",
-	"cookie",
-	"credential",
-];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
-// UPPER_SNAKE_CASE — letters/digits/underscores; starts with a letter.
-const CODE_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
+export const REDACT_REPLACEMENT = "***";
+
+// Catalog error codes — numeric like HTTP status codes.
+// Values mirror fasten_store_core.h FASTEN_ERR_* constants.
+export const CATALOG_ERR = Object.freeze({
+	BACKEND: 1,
+	BAD_JSON: 3,
+	INVALID_KEY: 6, // key is not UPPER_SNAKE_CASE
+	ID_MISMATCH: 7, // Meta.id set but disagrees with the dict key
+	DOMAIN_MISMATCH: 8, // code domain disagrees with registration domain
+	DUPLICATE_CODE: 9, // code already registered
+});
+
+export class AuditCatalogError extends Error {
+	constructor(message, code = 0) {
+		super(message);
+		this.name = "AuditCatalogError";
+		this.code = code;
+	}
+}
+
+// Convert Rust snake_case meta JSON → JS camelCase meta object.
+function _rustMetaToJs(rm) {
+	return {
+		id: rm.id,
+		domain: rm.domain,
+		category: rm.category ?? "",
+		action: rm.action ?? "",
+		severity: rm.severity ?? "info",
+		description: rm.description ?? "",
+		emitter: rm.emitter ?? "",
+		retentionClass: rm.retention_class ?? "medium",
+		highVolume: !!rm.high_volume,
+		piiInDetail: !!rm.pii_in_detail,
+		declaredUnused: !!rm.declared_unused,
+		detailPassthroughKeys: rm.detail_passthrough_keys ?? [],
+	};
+}
 
 /**
  * Register a batch of codes for a domain.
@@ -116,61 +140,59 @@ const CODE_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
  *                         severity: 'info', ... },
  *     });
  *
- * Validation order — first failure throws:
- *   - key shape: UPPER_SNAKE_CASE
- *   - meta.id empty → fill from key; set → must match key
- *   - meta.domain must equal domain
- *   - duplicate code across registrations
+ * Validation (UPPER_SNAKE_CASE, id-mismatch, domain-mismatch, duplicate)
+ * is delegated to fasten-core (Rust) so the logic is canonical across all
+ * SDKs. Throws AuditCatalogError with a numeric .code on violation.
  */
 export function register(domain, codes) {
+	const codesObj = {};
 	for (const [id, meta] of Object.entries(codes)) {
-		if (!CODE_KEY_RE.test(id)) {
-			throw new Error(
-				`register: code key '${id}' must be UPPER_SNAKE_CASE (letters, digits, underscores; starts with a letter).`,
-			);
-		}
-		if (!meta.id) {
-			meta.id = id;
-		} else if (meta.id !== id) {
-			throw new Error(
-				`register: dict key '${id}' disagrees with meta.id='${meta.id}'. Drop meta.id (it fills from the key) or fix the mismatch.`,
-			);
-		}
-		if (meta.domain !== domain) {
-			throw new Error(
-				`register: code '${id}' declares domain='${meta.domain}' ` +
-					`but registered under '${domain}'.`,
-			);
-		}
-		if (_registry.has(id)) {
-			throw new Error(`register: duplicate code '${id}'`);
-		}
-		// Shallow-clone before mutating: the adopter may reuse the
-		// same Meta literal across register() calls or hold onto the
-		// reference in their own catalog. Earlier code reassigned
-		// `meta.retentionClass` directly, silently changing the
-		// adopter's object.
-		const m = { ...meta };
-		if (m.retentionClass === undefined) {
-			// Default matches Python / C++: medium retention unless
-			// explicitly set. PII force-override below applies AFTER
-			// the default so we always warn before downgrading.
-			m.retentionClass = RetentionClass.MEDIUM;
-		}
-		// pii_in_detail forces retention_class='short'. Mirror Python
-		// (codes.py) + C++ (fasten.hpp) — warn whenever a PII code
-		// arrives with retention != short, INCLUDING the freshly-
-		// defaulted Medium above. Adopters who really want PII +
-		// longer retention should set retentionClass=SHORT explicitly
-		// to silence the warn (i.e., acknowledge the override).
-		if (m.piiInDetail && m.retentionClass !== RetentionClass.SHORT) {
+		// Normalize retention class — accept both camelCase and snake_case input.
+		const rc =
+			meta.retentionClass ?? meta.retention_class ?? RetentionClass.MEDIUM;
+		const pii = !!(meta.piiInDetail ?? meta.pii_in_detail);
+		// Emit pii_in_detail warning in JS before Rust silently forces SHORT.
+		if (pii && rc !== RetentionClass.SHORT) {
 			console.warn(
 				`fasten: code ${id} has piiInDetail=true; ` +
-					`retentionClass forced to SHORT (was ${String(m.retentionClass).toUpperCase()}).`,
+					`retentionClass forced to SHORT (was ${String(rc).toUpperCase()}).`,
 			);
-			m.retentionClass = RetentionClass.SHORT;
 		}
-		_registry.set(id, m);
+		// Fast-path JS duplicate check before calling Rust.
+		if (_registry.has(id)) {
+			throw new AuditCatalogError(
+				`register: duplicate code '${id}'`,
+				CATALOG_ERR.DUPLICATE_CODE,
+			);
+		}
+		codesObj[id] = {
+			id: meta.id || id,
+			domain: meta.domain || domain,
+			category: meta.category ?? "",
+			action: meta.action ?? "",
+			severity: meta.severity ?? "info",
+			description: meta.description ?? "",
+			emitter: meta.emitter ?? "",
+			retention_class: rc,
+			high_volume: !!(meta.highVolume ?? meta.high_volume),
+			pii_in_detail: pii,
+			declared_unused: !!(meta.declaredUnused ?? meta.declared_unused),
+			detail_passthrough_keys:
+				meta.detailPassthroughKeys ?? meta.detail_passthrough_keys ?? [],
+		};
+	}
+	// Delegate UPPER_SNAKE_CASE, id-mismatch, domain-mismatch, duplicate to Rust.
+	try {
+		coreRegisterCodes(domain, JSON.stringify(codesObj));
+	} catch (e) {
+		throw new AuditCatalogError(e.message, e.rustCode ?? 0);
+	}
+	// Populate JS registry from Rust-validated canonical state.
+	for (const id of Object.keys(codes)) {
+		const metaJson = coreMetaOf(id);
+		if (metaJson && metaJson !== "{}") {
+			_registry.set(id, _rustMetaToJs(JSON.parse(metaJson)));
+		}
 	}
 }
 
@@ -186,46 +208,12 @@ export function dump() {
 		.join("\n");
 }
 
-// --- Redaction ------------------------------------------------------------
-//
-// Deep redact: dict values whose keys match REDACT_PATTERNS get replaced
-// with REDACT_REPLACEMENT. Arrays + nested dicts are recursed. Patterns
-// come from spec/row-schema.json (single source of truth).
-
-const REDACT_RE = new RegExp(`(${REDACT_PATTERNS.join("|")})`, "i");
-
-function redact(value, extraRe) {
-	if (Array.isArray(value)) return value.map((v) => redact(v, extraRe));
-	if (value !== null && typeof value === "object") {
-		const out = {};
-		for (const [k, v] of Object.entries(value)) {
-			const hit = REDACT_RE.test(k) || extraRe?.test(k);
-			out[k] = hit ? REDACT_REPLACEMENT : redact(v, extraRe);
-		}
-		return out;
-	}
-	return value;
-}
-
-function buildExtraRe(keys) {
-	if (!keys || keys.length === 0) return null;
-	const escaped = keys
-		.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-		.join("|");
-	return new RegExp(`(${escaped})`, "i");
+// Clear both registries — for test teardown only.
+export function _clearRustRegistry() {
+	coreRegistryClear();
 }
 
 // --- Engine ---------------------------------------------------------------
-//
-// Engine holds all runtime state for one fasten deployment context.
-// The module-level free functions (init, emit, …) delegate to `defaultEngine`.
-// Applications that need multiple isolated fasten configurations in one
-// process construct Engine instances directly:
-//
-//   import { Engine } from 'fasten';
-//   const eng = new Engine();
-//   eng.init({ serviceId: 'tenant-a', auditStore: storeA });
-//   eng.emit({ code: 'ORDER_PLACED', target: 'order/1' });
 
 import {
 	AuditQueueDrainer,
@@ -242,7 +230,7 @@ export class Engine {
 		tenantId: null,
 		auditStore: null,
 		apiStore: null,
-		extraRedactRe: null,
+		extraRedactKeys: [],
 		failureStrategy: "queue",
 	};
 	#seq = 0;
@@ -273,7 +261,7 @@ export class Engine {
 			tenantId: opts.tenantId ?? process.env.FASTEN_TENANT_ID ?? null,
 			auditStore: opts.auditStore ?? null,
 			apiStore: opts.apiStore ?? null,
-			extraRedactRe: buildExtraRe(extraKeys),
+			extraRedactKeys: extraKeys ?? [],
 			failureStrategy: strategy,
 		};
 		if (!this.#config.serviceId || !this.#config.nodeId) {
@@ -313,6 +301,7 @@ export class Engine {
 		if (!meta) throw new Error(`unknown audit code: ${code}`);
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+		const extraKeys = cfg.extraRedactKeys;
 		let outDetail;
 		if (meta.piiInDetail) {
 			const passthrough = new Set(meta.detailPassthroughKeys ?? []);
@@ -320,13 +309,21 @@ export class Engine {
 			for (const [k, v] of Object.entries(detail)) {
 				if (passthrough.has(k)) kept[k] = v;
 			}
+			const keptJson = JSON.stringify(kept);
+			const redactedJson = extraKeys.length
+				? coreRedactFull(keptJson, JSON.stringify(extraKeys), null)
+				: coreRedact(keptJson);
 			outDetail = {
 				_redacted: REDACT_REPLACEMENT,
 				_pii_in_detail: true,
-				...redact(kept, cfg.extraRedactRe),
+				...JSON.parse(redactedJson),
 			};
 		} else {
-			outDetail = redact(detail, cfg.extraRedactRe);
+			const detailJson = JSON.stringify(detail);
+			const redactedJson = extraKeys.length
+				? coreRedactFull(detailJson, JSON.stringify(extraKeys), null)
+				: coreRedact(detailJson);
+			outDetail = JSON.parse(redactedJson);
 		}
 
 		const row = {
@@ -396,7 +393,7 @@ export class Engine {
 			tenantId: null,
 			auditStore: null,
 			apiStore: null,
-			extraRedactRe: null,
+			extraRedactKeys: [],
 			failureStrategy: "queue",
 		};
 		this.#seq = 0;
@@ -484,8 +481,6 @@ export async function flush(timeoutMs = 5000) {
 export const log = defaultEngine.log;
 
 // ── Catalog yaml (P1-11) ──────────────────────────────────────────────────
-// Lazy: js-yaml is only imported when load() / reload() runs. Adopters
-// who stay on programmatic register() never pay the dep.
 export const codes = {
 	register,
 	async load(path) {
@@ -520,4 +515,7 @@ export default {
 	RetentionClass,
 	ActorKind,
 	Method,
+	// P0-7: catalog error codes
+	AuditCatalogError,
+	CATALOG_ERR,
 };

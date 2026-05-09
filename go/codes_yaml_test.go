@@ -31,25 +31,13 @@ func resetYAMLState(t *testing.T) {
 	yamlPaths = nil
 	yamlCodes = map[Code]bool{}
 	yamlMu.Unlock()
-	regMu.Lock()
-	for k := range _registry {
-		if strings.HasPrefix(string(k), "FLEET_") || strings.HasPrefix(string(k), "EXTRA_") {
-			delete(_registry, k)
-		}
-	}
-	regMu.Unlock()
+	clearBothRegistries()
 	t.Cleanup(func() {
 		yamlMu.Lock()
 		yamlPaths = nil
 		yamlCodes = map[Code]bool{}
 		yamlMu.Unlock()
-		regMu.Lock()
-		for k := range _registry {
-			if strings.HasPrefix(string(k), "FLEET_") || strings.HasPrefix(string(k), "EXTRA_") {
-				delete(_registry, k)
-			}
-		}
-		regMu.Unlock()
+		clearBothRegistries()
 	})
 }
 

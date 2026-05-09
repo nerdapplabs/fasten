@@ -1,16 +1,16 @@
 name: Python SDK
 
 on:
-  # Restrict push to main + dev so PR branches don't run the suite
-  # twice (once for push, once for pull_request) on every commit.
   push:
     branches: [main, dev]
     paths:
       - 'python/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-py.yml'
   pull_request:
     paths:
       - 'python/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-py.yml'
 
 permissions:
@@ -20,8 +20,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: python:3.10-slim
 
     defaults:
       run:
@@ -30,11 +28,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
+
+      - name: Set FASTEN_CORE_LIB
+        run: |
+          echo "FASTEN_CORE_LIB=$GITHUB_WORKSPACE/store-core/target/release/libfasten_store_core.so" \
+            >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
-      # `uv venv` creates a venv without pip, so pip-audit only scans
-      # fasten's actual deps (zero) — no toolchain-CVE noise.
       - name: Install dev dependencies
         run: |
           uv venv
@@ -50,10 +62,9 @@ jobs:
         run: mypy fasten/
 
       - name: Unit tests
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
         run: pytest tests/ -v --tb=short --cov=fasten --cov-report=xml --cov-report=term-missing
-
-      - name: Install Codecov runtime deps
-        run: apt-get update -qq && apt-get install -y --no-install-recommends git curl gpg
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

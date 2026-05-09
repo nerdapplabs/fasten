@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -28,10 +29,87 @@ from typing import Any, Optional
 
 from .audit_queue import _AuditQueueDrainer, AuditStoreError
 from .attrs import AuditRow
-from .codes import Severity, registry
+from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
+
+
+@dataclasses.dataclass
+class FastenConfig:
+    """Resolved fasten runtime configuration. Build via init_config(); apply via Engine.start()."""
+    service_id: str
+    node_id: str
+    tenant_id: Optional[str]
+    audit_store: Any
+    api_store: Any
+    redact_replacement: str
+    extra_redact_keys: Optional[list[str]]
+    extra_value_redact_patterns: Optional[list[tuple[str, str, str]]]
+    audit_store_failure_strategy: str
+    queue_capacity: int
+    queue_retry_initial_ms: int
+    queue_retry_max_ms: int
+    queue_retry_jitter: bool
+    queue_drain_max_attempts: int
+
+
+def _canonical_json(d: dict[str, Any]) -> bytes:
+    """Canonical JSON for hash chain: sorted keys, no whitespace, None→null."""
+    return json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
+
+
+def _row_hash(row_dict: dict[str, Any]) -> str:
+    """SHA256 of canonical JSON of the row, excluding the 'hash' field."""
+    d = {k: v for k, v in row_dict.items() if k != "hash"}
+    return hashlib.sha256(_canonical_json(d)).hexdigest()
+
+
+@dataclasses.dataclass
+class ChainVerifyResult:
+    """Result of fasten.verify_chain()."""
+    ok: bool
+    total_rows: int
+    first_break_at: Optional[int]   # monotonic_seq of first tampered row
+    reason: Optional[str]
+
+
+def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
+    """Walk the per-row hash chain and return a verification result.
+
+    Detects field tampering, row insertion, deletion, and reorder.
+    Does NOT detect tail truncation — that requires an external tip-anchor
+    (see P1-23 for the documented limitation).
+
+    Rows with an empty ``hash`` field (written before hash-chain support
+    was enabled) are skipped silently — the chain is verified only for
+    the portion that carries hashes.
+    """
+    if not rows:
+        return ChainVerifyResult(ok=True, total_rows=0, first_break_at=None, reason=None)
+
+    sorted_rows = sorted(rows, key=lambda r: r.monotonic_seq)
+    for i, row in enumerate(sorted_rows):
+        if not row.hash:
+            continue  # pre-upgrade row; skip
+        expected = _row_hash(row.to_dict())
+        if expected != row.hash:
+            return ChainVerifyResult(
+                ok=False,
+                total_rows=len(rows),
+                first_break_at=row.monotonic_seq,
+                reason=f"row {row.id}: hash mismatch",
+            )
+        if i > 0:
+            prev = sorted_rows[i - 1]
+            if prev.hash and row.prev_hash != prev.hash:
+                return ChainVerifyResult(
+                    ok=False,
+                    total_rows=len(rows),
+                    first_break_at=row.monotonic_seq,
+                    reason=f"row {row.id}: prev_hash does not match preceding row {prev.id}",
+                )
+    return ChainVerifyResult(ok=True, total_rows=len(rows), first_break_at=None, reason=None)
 
 
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
@@ -39,6 +117,15 @@ def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
         return arg
     v = os.environ.get(env_name)
     return v if v is not None else default
+
+
+def _store_from_dsn(dsn: str) -> Any:
+    """Return the correct store implementation for a given DSN."""
+    if dsn.startswith(("postgres://", "postgresql://")):
+        from .store.postgres import PostgresStore
+        return PostgresStore.from_dsn(dsn)
+    from .store.sqlite import SQLiteStore
+    return SQLiteStore.from_dsn(dsn)
 
 
 class Engine:
@@ -52,6 +139,7 @@ class Engine:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._seq: int = 0
+        self._prev_hash: str = "genesis"  # P1-23: hash chain
 
         self._service_id: str = ""
         self._node_id: str = ""
@@ -72,7 +160,7 @@ class Engine:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
-    def init(
+    def init_config(
         self,
         service_id: Optional[str] = None,
         node_id: Optional[str] = None,
@@ -81,6 +169,128 @@ class Engine:
         api_store: Any = None,
         extra_redact_keys: Optional[list[str]] = None,
         redact_replacement: Optional[str] = None,
+        extra_value_redact_patterns: Optional[list[tuple[str, str, str]]] = None,
+        audit_store_failure_strategy: str = "queue",
+        queue_capacity: int = 100,
+        queue_retry_initial_ms: int = 100,
+        queue_retry_max_ms: int = 60_000,
+        queue_retry_jitter: bool = True,
+        queue_drain_max_attempts: int = 50,
+    ) -> FastenConfig:
+        """Resolve all parameters and environment variables into a FastenConfig.
+
+        Does NOT start any runtime (no thread, no store connection). Safe to
+        call from config-loading code that runs before the event loop starts.
+        """
+        svc = _pick(service_id, "FASTEN_SERVICE_ID")
+        node = _pick(node_id, "FASTEN_NODE_ID")
+        if not svc or not node:
+            raise RuntimeError("fasten.init_config: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required")
+
+        env_tid = os.environ.get("FASTEN_TENANT_ID")
+        tid = tenant_id if tenant_id is not None else (env_tid or None)
+
+        resolved_store = audit_store
+        if resolved_store is None:
+            dsn = os.environ.get("FASTEN_AUDIT_DSN")
+            if not dsn:
+                raise RuntimeError(
+                    "fasten.init_config: FASTEN_AUDIT_DSN is required. "
+                    "Set FASTEN_AUDIT_DSN to a sqlite:// or postgres:// URL."
+                )
+            resolved_store = _store_from_dsn(dsn)
+
+        resolved_api_store = api_store
+        if resolved_api_store is None:
+            dsn = os.environ.get("FASTEN_API_DSN")
+            if dsn:
+                resolved_api_store = _store_from_dsn(dsn)
+
+        raw_keys = extra_redact_keys or (
+            os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
+            if os.environ.get("FASTEN_REDACT_KEYS") else None
+        )
+        replacement = _pick(redact_replacement, "FASTEN_REDACT_REPLACEMENT", "***")
+
+        env_strategy = os.environ.get("FASTEN_AUDIT_STORE_FAILURE_STRATEGY")
+        strategy = (env_strategy or audit_store_failure_strategy or "queue").lower()
+        if strategy not in ("queue", "raise"):
+            raise RuntimeError(
+                f"fasten.init_config: audit_store_failure_strategy must be 'queue' or 'raise' "
+                f"(got {strategy!r})"
+            )
+
+        return FastenConfig(
+            service_id=svc,
+            node_id=node,
+            tenant_id=tid,
+            audit_store=resolved_store,
+            api_store=resolved_api_store,
+            redact_replacement=replacement,
+            extra_redact_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
+            extra_value_redact_patterns=extra_value_redact_patterns,
+            audit_store_failure_strategy=strategy,
+            queue_capacity=queue_capacity,
+            queue_retry_initial_ms=queue_retry_initial_ms,
+            queue_retry_max_ms=queue_retry_max_ms,
+            queue_retry_jitter=queue_retry_jitter,
+            queue_drain_max_attempts=queue_drain_max_attempts,
+        )
+
+    def start(self, cfg: FastenConfig) -> None:
+        """Wire runtime from a resolved FastenConfig. Idempotent — safe to call
+        on re-configuration; flushes and stops the previous drainer first."""
+        self._service_id = cfg.service_id
+        self._node_id    = cfg.node_id
+        self._tenant_id  = cfg.tenant_id
+        self._audit_store = cfg.audit_store
+        self._api_store   = cfg.api_store
+
+        if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
+            with self._lock:
+                self._seq = self._audit_store.max_monotonic_seq()
+            # Seed prev_hash for the hash chain from the latest stored row.
+            try:
+                latest = self._audit_store.query(
+                    source_node_id=cfg.node_id, limit=1,
+                )
+                seed = latest[0].hash if latest and latest[0].hash else "genesis"
+            except Exception:
+                seed = "genesis"
+            with self._lock:
+                self._prev_hash = seed
+
+        self._redactor = Redactor(
+            extra_keys=cfg.extra_redact_keys,
+            replacement=cfg.redact_replacement,
+            extra_value_patterns=cfg.extra_value_redact_patterns,
+        )
+        self._stdout = StdoutTransport()
+        self._failure_strategy = cfg.audit_store_failure_strategy
+
+        if cfg.audit_store_failure_strategy == "queue":
+            self._install_drainer(
+                store=self._audit_store,
+                capacity=cfg.queue_capacity,
+                retry_initial_ms=cfg.queue_retry_initial_ms,
+                retry_max_ms=cfg.queue_retry_max_ms,
+                retry_jitter=cfg.queue_retry_jitter,
+                max_attempts=cfg.queue_drain_max_attempts,
+            )
+        else:
+            self._uninstall_drainer()
+        self._last_init_at = datetime.now(timezone.utc)
+
+    def init(
+        self,
+        service_id: str | None = None,
+        node_id: str | None = None,
+        tenant_id: str | None = None,
+        audit_store: Any | None = None,
+        api_store: Any | None = None,
+        extra_redact_keys: list[str] | None = None,
+        redact_replacement: str | None = None,
+        extra_value_redact_patterns: list[Any] | None = None,
         audit_store_failure_strategy: str = "queue",
         queue_capacity: int = 100,
         queue_retry_initial_ms: int = 100,
@@ -88,84 +298,17 @@ class Engine:
         queue_retry_jitter: bool = True,
         queue_drain_max_attempts: int = 50,
     ) -> None:
-        """
-        Initialise this Engine. See ``fasten.init`` module docs for full
-        parameter reference. Any argument omitted falls back to the
-        corresponding environment variable.
-        """
-        self._service_id = _pick(service_id, "FASTEN_SERVICE_ID")
-        self._node_id    = _pick(node_id,    "FASTEN_NODE_ID")
-        env_tid          = os.environ.get("FASTEN_TENANT_ID")
-        self._tenant_id  = tenant_id if tenant_id is not None else (env_tid or None)
-
-        if not self._service_id or not self._node_id:
-            raise RuntimeError(
-                "fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required"
-            )
-
-        if audit_store is not None:
-            self._audit_store = audit_store
-        else:
-            dsn = os.environ.get("FASTEN_AUDIT_DSN")
-            if not dsn:
-                raise RuntimeError(
-                    "fasten.init: FASTEN_AUDIT_DSN is required. "
-                    "Audit rows must go to durable storage — fasten does not "
-                    "provide in-memory fallback. "
-                    "Set FASTEN_AUDIT_DSN to a sqlite:// or postgres:// URL "
-                    "(e.g., 'sqlite:///./fasten-audit.db'). "
-                    "For tests, construct a store directly and pass via "
-                    "init(audit_store=...)."
-                )
-            from .store.sqlite import SQLiteStore
-            self._audit_store = SQLiteStore.from_dsn(dsn)
-
-        # Seed monotonic_seq from the store so post-restart rows never
-        # duplicate (timestamp, seq) with pre-restart rows on the same node.
-        if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
-            with self._lock:
-                self._seq = self._audit_store.max_monotonic_seq()
-
-        if api_store is not None:
-            self._api_store = api_store
-        else:
-            dsn = os.environ.get("FASTEN_API_DSN")
-            if dsn:
-                from .store.sqlite import SQLiteStore
-                self._api_store = SQLiteStore.from_dsn(dsn)
-
-        raw_keys = extra_redact_keys or (
-            os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
-            if os.environ.get("FASTEN_REDACT_KEYS") else None
-        )
-        replacement = _pick(redact_replacement, "FASTEN_REDACT_REPLACEMENT", "***")
-        self._redactor = Redactor(
-            extra_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
-            replacement=replacement,
-        )
-
-        self._stdout = StdoutTransport()
-
-        env_strategy = os.environ.get("FASTEN_AUDIT_STORE_FAILURE_STRATEGY")
-        strategy = (env_strategy or audit_store_failure_strategy or "queue").lower()
-        if strategy not in ("queue", "raise"):
-            raise RuntimeError(
-                f"fasten.init: audit_store_failure_strategy must be 'queue' or 'raise' "
-                f"(got {strategy!r})"
-            )
-        self._failure_strategy = strategy
-        if strategy == "queue":
-            self._install_drainer(
-                store=self._audit_store,
-                capacity=queue_capacity,
-                retry_initial_ms=queue_retry_initial_ms,
-                retry_max_ms=queue_retry_max_ms,
-                retry_jitter=queue_retry_jitter,
-                max_attempts=queue_drain_max_attempts,
-            )
-        else:
-            self._uninstall_drainer()
-        self._last_init_at = datetime.now(timezone.utc)
+        """Initialise this Engine. Equivalent to start(init_config(...))."""
+        self.start(self.init_config(
+            service_id=service_id, node_id=node_id, tenant_id=tenant_id,
+            audit_store=audit_store, api_store=api_store,
+            extra_redact_keys=extra_redact_keys, redact_replacement=redact_replacement,
+            extra_value_redact_patterns=extra_value_redact_patterns,
+            audit_store_failure_strategy=audit_store_failure_strategy,
+            queue_capacity=queue_capacity, queue_retry_initial_ms=queue_retry_initial_ms,
+            queue_retry_max_ms=queue_retry_max_ms, queue_retry_jitter=queue_retry_jitter,
+            queue_drain_max_attempts=queue_drain_max_attempts,
+        ))
 
     # ── Emit ──────────────────────────────────────────────────────────────
 
@@ -188,7 +331,7 @@ class Engine:
         if not self._service_id:
             raise RuntimeError("fasten.init() must be called before emit()")
 
-        meta = registry().get(code)
+        meta = meta_of(code)
         if meta is None:
             raise ValueError(f"unknown audit code: {code!r}")
 
@@ -206,10 +349,13 @@ class Engine:
         else:
             detail = self._redactor.redact(detail)
 
+        # Build the row with a placeholder seq; hash chain fields are assigned
+        # atomically under _lock below so concurrent emit() calls can't
+        # interleave their prev_hash references.
         row = AuditRow(
             id=f"evt-{uuid.uuid4().hex[:20]}",
             origin_id="",
-            monotonic_seq=self._next_seq(),
+            monotonic_seq=0,  # placeholder — replaced under lock
             timestamp=datetime.now(timezone.utc),
             code=code,
             action=meta.action,
@@ -224,10 +370,20 @@ class Engine:
             domain=meta.domain,
             method=method or "sdk",
             request_id=request_id,
-            pii_in_detail=meta.pii_in_detail,
             detail=detail,
         )
         row = dataclasses.replace(row, origin_id=row.id)
+
+        # Atomically: assign monotonic_seq + compute hash chain.
+        with self._lock:
+            self._seq += 1
+            row = dataclasses.replace(row,
+                monotonic_seq=self._seq,
+                prev_hash=self._prev_hash,
+            )
+            h = _row_hash(row.to_dict())
+            row = dataclasses.replace(row, hash=h)
+            self._prev_hash = h
 
         # Stdout write before store routing: row reaches the log stream even
         # if the store path blocks or raises.
@@ -295,6 +451,7 @@ class Engine:
         self._uninstall_drainer()
         with self._lock:
             self._seq = 0
+            self._prev_hash = "genesis"
         self._service_id = ""
         self._node_id = ""
         self._tenant_id = None

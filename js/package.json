@@ -10,6 +10,9 @@
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
+    },
+    "./store/postgres": {
+      "default": "./src/store/postgres.js"
     }
   },
   "engines": {
@@ -19,13 +22,20 @@
     "test": "node --test 'test/**/*.test.mjs'",
     "lint": "biome check src/"
   },
+  "dependencies": {
+    "koffi": "^2"
+  },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "c8": "^10.1.3",
     "js-yaml": "^4.1.0"
   },
+  "peerDependencies": {
+    "pg": "^8"
+  },
   "peerDependenciesMeta": {
-    "js-yaml": { "optional": true }
+    "js-yaml": { "optional": true },
+    "pg": { "optional": true }
   },
   "keywords": [
     "audit",

@@ -1,0 +1,20 @@
+{
+  "note": "Baseline populated on first passing run via: python run_all.py --update-baseline",
+  "scenarios": {
+    "concurrent_writers_single": {
+      "passed": true,
+      "p99_ms_max": 15.0
+    },
+    "concurrent_writers_multitenant": {
+      "passed": true,
+      "p99_ms_max": 20.0
+    },
+    "vacuum_concurrency": {
+      "passed": true,
+      "p99_ms": 25.0
+    },
+    "stale_conn_recovery_idle": {
+      "passed": true
+    }
+  }
+}

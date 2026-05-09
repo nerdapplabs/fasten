@@ -12,6 +12,7 @@ import os from 'node:os';
 
 import {
     register, metaOf, registry, codes, _yamlCodes, _resetRegistryForReload,
+    _clearRustRegistry,
 } from '../src/index.js';
 import { _loadedPaths } from '../src/codes_yaml.js';
 
@@ -45,12 +46,8 @@ async function writeFile(name, contents) {
 }
 
 function resetState() {
-    const reg = registry();
-    for (const key of [...reg.keys()]) {
-        if (key.startsWith('FLEET_') || key.startsWith('EXTRA_')) {
-            reg.delete(key);
-        }
-    }
+    _clearRustRegistry();
+    registry().clear();
     _yamlCodes.clear();
     _loadedPaths.length = 0;
 }

@@ -7,7 +7,7 @@ from fasten.codes import register, Meta, Severity, RetentionClass
 @pytest.fixture(autouse=True)
 def fresh_state():
     """Reset the default Engine to pre-init state before and after each test."""
-    from fasten.emit import _default
+    from fasten.emitter import _default
     _default.reset_for_tests()
     yield
     _default.reset_for_tests()

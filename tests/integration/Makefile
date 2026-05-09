@@ -37,5 +37,13 @@ $(addprefix test-,$(LANGS)): test-%: build-%
 	@echo "==> Running fasten-itest-$*"
 	docker run --rm fasten-itest-$* | $(VERIFY)
 
+# Python is the only SDK that currently emits api rows; gate the api-stream
+# assertion via FASTEN_VERIFY_REQUIRE_API=1 (P1-20). This explicit target
+# overrides the pattern rule above for python only.
+test-python: build-python
+	@echo ""
+	@echo "==> Running fasten-itest-python"
+	docker run --rm fasten-itest-python | env FASTEN_VERIFY_REQUIRE_API=1 $(VERIFY)
+
 clean:
 	-docker rmi $(addprefix fasten-itest-,$(LANGS)) 2>/dev/null || true

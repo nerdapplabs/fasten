@@ -1,16 +1,16 @@
 name: C++ SDK
 
 on:
-  # Restrict push to main + dev so PR branches don't run the suite
-  # twice (once for push, once for pull_request) on every commit.
   push:
     branches: [main, dev]
     paths:
       - 'cpp/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-cpp.yml'
   pull_request:
     paths:
       - 'cpp/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-cpp.yml'
 
 permissions:
@@ -19,27 +19,37 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: gcc:14-bookworm
-
-    defaults:
-      run:
-        working-directory: cpp
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install build deps
-        # cmake + libyaml-cpp-dev (required by codes_yaml_smoke; pii smoke is dep-free).
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
+
+      - name: Install C++ build deps
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends cmake libyaml-cpp-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libyaml-cpp-dev libsqlite3-dev
 
       - name: Configure
-        run: cmake -S . -B build -DFASTEN_BUILD_TESTS=ON -DFASTEN_BUILD_EXAMPLES=ON
+        working-directory: cpp
+        run: >
+          cmake -S . -B build
+          -DFASTEN_BUILD_TESTS=ON
+          -DFASTEN_BUILD_EXAMPLES=ON
+          -DFASTEN_CORE_LIB_DIR=${{ github.workspace }}/store-core/target/release
 
       - name: Build
+        working-directory: cpp
         run: cmake --build build --parallel
 
       - name: Run tests
+        working-directory: cpp
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
         run: ctest --test-dir build --output-on-failure

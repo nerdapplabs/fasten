@@ -56,21 +56,15 @@ CREATE TABLE IF NOT EXISTS {table} (
     method           TEXT NOT NULL,
     request_id       TEXT NOT NULL,
     detail           TEXT NOT NULL,
-    pii_in_detail    INTEGER NOT NULL DEFAULT 0,
-    shipped_at       TEXT
+    shipped_at       TEXT,
+    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
+    hash             TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
 CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
 CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
 """
-
-# Index on pii_in_detail is created after the migration step (legacy tables
-# don't have the column when the DDL above runs).
-_PII_INDEX = (
-    "CREATE INDEX IF NOT EXISTS idx_{table}_pii "
-    "ON {table}(pii_in_detail) WHERE pii_in_detail = 1"
-)
 
 
 class SQLiteStore:
@@ -120,17 +114,18 @@ class SQLiteStore:
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():
                 bootstrap.execute(stmt)
-        # Idempotent migration for existing tables that pre-date pii_in_detail.
-        cur = bootstrap.execute(f"PRAGMA table_info({table})")
-        cols = {r[1] for r in cur.fetchall()}
-        if "pii_in_detail" not in cols:
-            bootstrap.execute(
-                f"ALTER TABLE {table} "
-                "ADD COLUMN pii_in_detail INTEGER NOT NULL DEFAULT 0"
-            )
-        # Index runs after migration so it exists on both fresh + legacy tables.
-        bootstrap.execute(_PII_INDEX.format(table=table))
         bootstrap.commit()
+        # Migration: add hash chain columns to pre-existing tables.
+        try:
+            bootstrap.execute(f"SELECT prev_hash FROM {table} LIMIT 0")
+        except sqlite3.OperationalError:
+            bootstrap.execute(
+                f"ALTER TABLE {table} ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'genesis'"
+            )
+            bootstrap.execute(
+                f"ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"
+            )
+            bootstrap.commit()
 
     def _connect(self) -> sqlite3.Connection:
         """Return this thread's sqlite3 connection, opening it on first call.
@@ -143,6 +138,7 @@ class SQLiteStore:
         if self._is_memory:
             if self._mem_conn is None:
                 self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._mem_conn.row_factory = sqlite3.Row
             return self._mem_conn
         conn = getattr(self._tls, "conn", None)
         if conn is None:
@@ -150,6 +146,7 @@ class SQLiteStore:
             # thread gets its own connection, so the cross-thread guard
             # never trips and we get the safety assertion for free.
             conn = sqlite3.connect(self._path)
+            conn.row_factory = sqlite3.Row
             if self._wal:
                 # Each connection sets its own journal_mode pragma.
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -187,8 +184,12 @@ class SQLiteStore:
         with self._txn():
             conn = self._connect()
             conn.execute(
-                f"INSERT OR IGNORE INTO {self._table} VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT OR IGNORE INTO {self._table} "
+                "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+                "service_id,source_node_id,tenant_id,actor,actor_kind,"
+                "target,category,domain,method,request_id,detail,shipped_at,"
+                "prev_hash,hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.id, row.origin_id, row.monotonic_seq,
                     _utc_iso(row.timestamp),
@@ -198,8 +199,9 @@ class SQLiteStore:
                     row.target, row.category, row.domain,
                     row.method, row.request_id,
                     json.dumps(row.detail),
-                    int(row.pii_in_detail),
                     _utc_iso(row.shipped_at) if row.shipped_at else None,
+                    row.prev_hash,
+                    row.hash,
                 ),
             )
             conn.commit()
@@ -241,6 +243,7 @@ class SQLiteStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -260,6 +263,9 @@ class SQLiteStore:
         if source_node_id:
             conds.append("source_node_id = ?")
             params.append(source_node_id)
+        if tenant_id:
+            conds.append("tenant_id = ?")
+            params.append(tenant_id)
         if actor:
             conds.append("actor = ?")
             params.append(actor)
@@ -282,6 +288,7 @@ class SQLiteStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -291,7 +298,8 @@ class SQLiteStore:
     ) -> list[AuditRow]:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
-            source_node_id=source_node_id, actor=actor, target=target,
+            source_node_id=source_node_id, tenant_id=tenant_id,
+            actor=actor, target=target,
             since=since, until=until,
         )
         with self._txn():
@@ -309,6 +317,7 @@ class SQLiteStore:
         code: str | None = None,
         domain: str | None = None,
         source_node_id: str | None = None,
+        tenant_id: str | None = None,
         actor: str | None = None,
         target: str | None = None,
         since: datetime | None = None,
@@ -316,7 +325,8 @@ class SQLiteStore:
     ) -> int:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
-            source_node_id=source_node_id, actor=actor, target=target,
+            source_node_id=source_node_id, tenant_id=tenant_id,
+            actor=actor, target=target,
             since=since, until=until,
         )
         with self._txn():
@@ -334,16 +344,19 @@ class SQLiteStore:
             )
             return int(cur.fetchone()[0])
 
-    def _row(self, r: tuple) -> AuditRow:
+    def _row(self, r: sqlite3.Row) -> AuditRow:
+        keys = r.keys()
         return AuditRow(
-            id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            timestamp=datetime.fromisoformat(r[3]),
-            code=r[4], action=r[5], severity=r[6],
-            service_id=r[7], source_node_id=r[8], tenant_id=r[9],
-            actor=r[10], actor_kind=r[11],
-            target=r[12], category=r[13], domain=r[14],
-            method=r[15], request_id=r[16],
-            detail=json.loads(r[17]),
-            pii_in_detail=bool(r[18]),
-            shipped_at=datetime.fromisoformat(r[19]) if r[19] else None,
+            id=r["id"], origin_id=r["origin_id"], monotonic_seq=r["monotonic_seq"],
+            timestamp=datetime.fromisoformat(r["timestamp"]),
+            code=r["code"], action=r["action"], severity=r["severity"],
+            service_id=r["service_id"], source_node_id=r["source_node_id"],
+            tenant_id=r["tenant_id"],
+            actor=r["actor"], actor_kind=r["actor_kind"],
+            target=r["target"], category=r["category"], domain=r["domain"],
+            method=r["method"], request_id=r["request_id"],
+            detail=json.loads(r["detail"]),
+            shipped_at=datetime.fromisoformat(r["shipped_at"]) if r["shipped_at"] else None,
+            prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
+            hash=r["hash"] if "hash" in keys else "",
         )

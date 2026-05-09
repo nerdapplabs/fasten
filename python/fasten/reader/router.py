@@ -32,7 +32,8 @@ WARNING: This router has no built-in authentication. /sys, /api, and
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .. import audit_queue as _audit_queue
@@ -114,6 +115,7 @@ def router(
         code: Optional[str] = Query(default=None),
         domain: Optional[str] = Query(default=None),
         source_node_id: Optional[str] = Query(default=None),
+        tenant_id: Optional[str] = Query(default=None),
         actor: Optional[str] = Query(default=None),
         target: Optional[str] = Query(default=None),
         since: Optional[datetime] = Query(default=None),
@@ -130,7 +132,8 @@ def router(
             }
         filters = dict(
             request_id=request_id, code=code, domain=domain,
-            source_node_id=source_node_id, actor=actor, target=target,
+            source_node_id=source_node_id, tenant_id=tenant_id,
+            actor=actor, target=target,
             since=since, until=until,
         )
         rows = s.query(limit=limit, offset=offset, **filters)
@@ -152,11 +155,7 @@ def router(
         - k8s liveness: parse ``store.reachable && queue.retry_count_active``.
         - Status page: red/yellow/green tiles from this single payload.
         """
-        # ``fasten.emit`` resolves to the function (re-exported in
-        # __init__) rather than the module, so go through sys.modules to
-        # read init() module-globals like ``_service_id``.
-        import sys
-        _emit_mod = sys.modules["fasten.emit"]
+        from ..emitter import _default as _default_engine
 
         s = _store()
         store_block: dict[str, Any] = {
@@ -199,11 +198,39 @@ def router(
         }
 
         init_block = {
-            "service_id": _emit_mod._service_id or None,
-            "node_id": _emit_mod._node_id or None,
-            "tenant_id": _emit_mod._tenant_id,
-            "failure_strategy": _emit_mod._failure_strategy,
+            "service_id": _default_engine._service_id or None,
+            "node_id": _default_engine._node_id or None,
+            "tenant_id": _default_engine._tenant_id,
+            "failure_strategy": _default_engine._failure_strategy,
+            # P1-19: multi-worker awareness — callers can confirm which
+            # OS process they are hitting (relevant under uvicorn --workers N).
+            "worker_pid": os.getpid(),
         }
+
+        # P1-23: hash chain verification — spot-check latest 50 rows.
+        chain_block: dict[str, Any] = {
+            "verified": None,
+            "breaks": 0,
+            "last_verified_at": None,
+        }
+        if s is not None and hasattr(s, "query"):
+            try:
+                from ..engine import verify_chain
+                recent = s.query(
+                    source_node_id=_default_engine._node_id or None,
+                    limit=50,
+                )
+                if recent:
+                    result = verify_chain(recent)
+                    chain_block = {
+                        "verified": result.ok,
+                        "breaks": 0 if result.ok else 1,
+                        "last_verified_at": datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
 
         return {
             "store": store_block,
@@ -211,6 +238,7 @@ def router(
             "transport": transport_block,
             "redactor": redactor_block,
             "init": init_block,
+            "chain": chain_block,
         }
 
     return r

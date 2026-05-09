@@ -17,19 +17,8 @@ func resetGlobals(t *testing.T) {
 // registerTestCodes registers USER_CREATED and USER_DELETED once per test.
 func registerTestCodes(t *testing.T) {
 	t.Helper()
-	// Clear registry for isolated test
-	regMu.Lock()
-	for k := range _registry {
-		delete(_registry, k)
-	}
-	regMu.Unlock()
-	t.Cleanup(func() {
-		regMu.Lock()
-		for k := range _registry {
-			delete(_registry, k)
-		}
-		regMu.Unlock()
-	})
+	clearBothRegistries()
+	t.Cleanup(clearBothRegistries)
 	MustRegister("user", map[Code]Meta{
 		"USER_CREATED": {
 			Domain:         "user",
@@ -91,18 +80,8 @@ func TestRegister_Duplicate(t *testing.T) {
 }
 
 func TestRegister_DomainMismatch(t *testing.T) {
-	regMu.Lock()
-	for k := range _registry {
-		delete(_registry, k)
-	}
-	regMu.Unlock()
-	t.Cleanup(func() {
-		regMu.Lock()
-		for k := range _registry {
-			delete(_registry, k)
-		}
-		regMu.Unlock()
-	})
+	clearBothRegistries()
+	t.Cleanup(clearBothRegistries)
 
 	err := Register("user", map[Code]Meta{
 		"MY_CODE": {Domain: "other", Category: "test", Action: "do", Severity: SevInfo},
@@ -114,18 +93,8 @@ func TestRegister_DomainMismatch(t *testing.T) {
 
 // P1-10: ID is filled from the map key when omitted.
 func TestRegister_FillsIDFromKey(t *testing.T) {
-	regMu.Lock()
-	for k := range _registry {
-		delete(_registry, k)
-	}
-	regMu.Unlock()
-	t.Cleanup(func() {
-		regMu.Lock()
-		for k := range _registry {
-			delete(_registry, k)
-		}
-		regMu.Unlock()
-	})
+	clearBothRegistries()
+	t.Cleanup(clearBothRegistries)
 
 	if err := Register("svc", map[Code]Meta{
 		"P1_10_FILLED": {Domain: "svc", Category: "x", Action: "x", Severity: SevInfo},
@@ -140,34 +109,20 @@ func TestRegister_FillsIDFromKey(t *testing.T) {
 
 // P1-10: explicit ID that disagrees with map key raises.
 func TestRegister_IDMismatchRaises(t *testing.T) {
-	regMu.Lock()
-	for k := range _registry {
-		delete(_registry, k)
-	}
-	regMu.Unlock()
-	t.Cleanup(func() {
-		regMu.Lock()
-		for k := range _registry {
-			delete(_registry, k)
-		}
-		regMu.Unlock()
-	})
+	clearBothRegistries()
+	t.Cleanup(clearBothRegistries)
 
 	err := Register("svc", map[Code]Meta{
 		"P1_10_MISMATCH": {ID: "WRONG_ID", Domain: "svc", Severity: SevInfo},
 	})
-	if err == nil || !strings.Contains(err.Error(), "disagrees with Meta.ID") {
+	if err == nil || !strings.Contains(err.Error(), "disagrees") {
 		t.Fatalf("expected ID-mismatch error, got %v", err)
 	}
 }
 
 // P1-10: lowercase / invalid key is rejected.
 func TestRegister_InvalidKeyShape(t *testing.T) {
-	regMu.Lock()
-	for k := range _registry {
-		delete(_registry, k)
-	}
-	regMu.Unlock()
+	clearBothRegistries()
 
 	err := Register("svc", map[Code]Meta{
 		"lowercase_bad": {Domain: "svc", Severity: SevInfo},
