@@ -23,7 +23,7 @@ dependencies = []
 [project.optional-dependencies]
 sqlite = []                                   # uses stdlib sqlite3
 postgres = ["psycopg[binary]>=3.3.4"]
-fastapi = ["fastapi>=0.100", "starlette>=0.27"]
+fastapi = ["fastapi>=0.136.1", "starlette>=0.27"]
 mqtt = ["paho-mqtt>=2.1.0"]
 tui = ["rich>=13"]
 structlog = ["structlog>=25.5.0"]
