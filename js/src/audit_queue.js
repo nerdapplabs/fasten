@@ -17,252 +17,276 @@
  * exactly.
  */
 
-const HW_WARN_PCT = 0.50;
-const HW_ERR_PCT = 0.80;
+const HW_WARN_PCT = 0.5;
+const HW_ERR_PCT = 0.8;
 const DEGRADED_AFTER = 5;
 
 export class AuditStoreError extends Error {
-    constructor(cause) {
-        super(`fasten audit store: ${cause?.message ?? cause}`);
-        this.name = 'AuditStoreError';
-        this.cause = cause;
-    }
+	constructor(cause) {
+		super(`fasten audit store: ${cause?.message ?? cause}`);
+		this.name = "AuditStoreError";
+		this.cause = cause;
+	}
 }
 
 class AuditQueueDrainer {
-    constructor({ store, sysLog, capacity, retryInitialMs, retryMaxMs, retryJitter }) {
-        this._store = store;
-        this._sysLog = sysLog;
-        this._capacity = capacity;
-        this._retryInitialMs = retryInitialMs;
-        this._retryMaxMs = retryMaxMs;
-        this._retryJitter = retryJitter;
+	constructor({
+		store,
+		sysLog,
+		capacity,
+		retryInitialMs,
+		retryMaxMs,
+		retryJitter,
+		maxAttempts = 50,
+	}) {
+		this._store = store;
+		this._sysLog = sysLog;
+		this._capacity = capacity;
+		this._retryInitialMs = retryInitialMs;
+		this._retryMaxMs = retryMaxMs;
+		this._retryJitter = retryJitter;
+		this._maxAttempts = maxAttempts;
 
-        this._q = [];
-        this._inFlight = 0;       // row popped but insert not yet resolved
-        this._stopped = false;
+		this._q = [];
+		this._inFlight = 0; // row popped but insert not yet resolved
+		this._stopped = false;
 
-        // Stats
-        this._highWater = 0;
-        this._drainedTotal = 0;
-        this._retryCount = 0;
-        this._inBackoffUntilMs = 0;
-        this._lastError = null;
-        this._failureBurstStartedAt = null;
+		// Stats
+		this._highWater = 0;
+		this._drainedTotal = 0;
+		this._retryCount = 0;
+		this._inBackoffUntilMs = 0;
+		this._lastError = null;
+		this._failureBurstStartedAt = null;
+		this._deadLetteredTotal = 0;
+		this._dlq = []; // bounded ring, max 10 entries
 
-        // Threshold debouncing
-        this._warnHWFired = false;
-        this._errHWFired = false;
-        this._degradedFired = false;
+		// Threshold debouncing
+		this._warnHWFired = false;
+		this._errHWFired = false;
+		this._degradedFired = false;
 
-        // Kick the drainer loop.
-        setImmediate(() => this._tick());
-    }
+		// Kick the drainer loop.
+		setImmediate(() => this._tick());
+	}
 
-    put(row) {
-        // Reject early if the drainer has been stopped (re-init swap or
-        // uninstall). Without this the row would land in a queue whose
-        // tick loop has already exited, get GC'd later, no signal —
-        // a silent data-loss bug. emit() callers see the row as
-        // abandoned via the sys stream instead.
-        if (this._stopped) {
-            this._sysLog('error', 'audit_drain_abandoned', {
-                reason: 'drainer_stopped',
-                row_id: row?.id ?? null,
-            });
-            return;
-        }
-        this._q.push(row);
-        const used = this._q.length + this._inFlight;
-        if (used > this._highWater) this._highWater = used;
-        if (this._capacity > 0) {
-            const pct = used / this._capacity;
-            if (pct >= HW_ERR_PCT && !this._errHWFired) {
-                this._errHWFired = true;
-                this._sysLog('error', 'audit_queue_near_full',
-                    { depth: used, capacity: this._capacity });
-            } else if (pct >= HW_WARN_PCT && !this._warnHWFired) {
-                this._warnHWFired = true;
-                this._sysLog('warn', 'audit_queue_high_water',
-                    { depth: used, capacity: this._capacity });
-            } else if (pct < HW_WARN_PCT) {
-                this._warnHWFired = false;
-                this._errHWFired = false;
-            }
-        }
-    }
+	put(row) {
+		// Reject early if the drainer has been stopped (re-init swap or
+		// uninstall). Without this the row would land in a queue whose
+		// tick loop has already exited, get GC'd later, no signal —
+		// a silent data-loss bug. emit() callers see the row as
+		// abandoned via the sys stream instead.
+		if (this._stopped) {
+			this._sysLog("error", "audit_drain_abandoned", {
+				reason: "drainer_stopped",
+				row_id: row?.id ?? null,
+			});
+			return;
+		}
+		this._q.push(row);
+		const used = this._q.length + this._inFlight;
+		if (used > this._highWater) this._highWater = used;
+		if (this._capacity > 0) {
+			const pct = used / this._capacity;
+			if (pct >= HW_ERR_PCT && !this._errHWFired) {
+				this._errHWFired = true;
+				this._sysLog("error", "audit_queue_near_full", {
+					depth: used,
+					capacity: this._capacity,
+				});
+			} else if (pct >= HW_WARN_PCT && !this._warnHWFired) {
+				this._warnHWFired = true;
+				this._sysLog("warn", "audit_queue_high_water", {
+					depth: used,
+					capacity: this._capacity,
+				});
+			} else if (pct < HW_WARN_PCT) {
+				this._warnHWFired = false;
+				this._errHWFired = false;
+			}
+		}
+	}
 
-    stats() {
-        const remMs = this._inBackoffUntilMs - Date.now();
-        return {
-            depth: this._q.length + this._inFlight,
-            capacity: this._capacity,
-            high_water: this._highWater,
-            drained_total: this._drainedTotal,
-            retry_count_active: this._retryCount,
-            in_backoff_seconds: remMs > 0 ? Math.round(remMs) / 1000 : 0,
-            last_error: this._lastError,
-        };
-    }
+	stats() {
+		const remMs = this._inBackoffUntilMs - Date.now();
+		return {
+			depth: this._q.length + this._inFlight,
+			capacity: this._capacity,
+			high_water: this._highWater,
+			drained_total: this._drainedTotal,
+			retry_count_active: this._retryCount,
+			in_backoff_seconds: remMs > 0 ? Math.round(remMs) / 1000 : 0,
+			last_error: this._lastError,
+			dead_lettered_total: this._deadLetteredTotal,
+			dead_letter_depth: this._dlq.length,
+			capacity_semantics: "warn_only",
+		};
+	}
 
-    async flush(timeoutMs = 5000) {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-            if (this._q.length === 0 && this._retryCount === 0 && this._inFlight === 0) {
-                return true;
-            }
-            await new Promise(r => setTimeout(r, 10));
-        }
-        return this._q.length === 0 && this._inFlight === 0;
-    }
+	async flush(timeoutMs = 5000) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (
+				this._q.length === 0 &&
+				this._retryCount === 0 &&
+				this._inFlight === 0
+			) {
+				return true;
+			}
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		return this._q.length === 0 && this._inFlight === 0;
+	}
 
-    stop() {
-        this._stopped = true;
-    }
+	stop() {
+		this._stopped = true;
+	}
 
-    async _tick() {
-        while (!this._stopped) {
-            if (this._q.length === 0) {
-                await new Promise(r => setImmediate(r));
-                continue;
-            }
-            const row = this._q.shift();
-            this._inFlight++;
-            try {
-                await this._drainOne(row);
-            } finally {
-                this._inFlight--;
-            }
-        }
-    }
+	async _tick() {
+		while (!this._stopped) {
+			if (this._q.length === 0) {
+				await new Promise((r) => setImmediate(r));
+				continue;
+			}
+			const row = this._q.shift();
+			this._inFlight++;
+			try {
+				await this._drainOne(row);
+			} finally {
+				this._inFlight--;
+			}
+		}
+	}
 
-    async _drainOne(row) {
-        for (;;) {
-            try {
-                await this._store.insert(row);
-                this._onSuccess();
-                return;
-            } catch (err) {
-                this._onFailure(err);
-                if (this._stopped) return;
-                const cont = await this._waitBackoff();
-                if (!cont) return;
-            }
-        }
-    }
+	async _drainOne(row) {
+		let attempt = 0;
+		for (;;) {
+			attempt++;
+			try {
+				await this._store.insert(row);
+				this._onSuccess();
+				return;
+			} catch (err) {
+				if (attempt >= this._maxAttempts) {
+					this._onDeadLetter(row, attempt, err);
+					return;
+				}
+				this._onFailure(err);
+				if (this._stopped) return;
+				const cont = await this._waitBackoff();
+				if (!cont) return;
+			}
+		}
+	}
 
-    _onFailure(err) {
-        const msg = `${err?.name ?? 'Error'}: ${err?.message ?? err}`;
-        const first = this._retryCount === 0;
-        if (first) this._failureBurstStartedAt = Date.now();
-        this._retryCount++;
-        this._lastError = msg;
-        const crossedDegraded =
-            this._retryCount >= DEGRADED_AFTER && !this._degradedFired;
-        if (crossedDegraded) this._degradedFired = true;
+	_onDeadLetter(row, attempt, err) {
+		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		this._deadLetteredTotal++;
+		this._retryCount = 0;
+		this._lastError = msg;
+		if (this._dlq.length >= 10) this._dlq.shift();
+		this._dlq.push(row);
+		this._sysLog("error", "audit_drain_dead_letter", {
+			row_id: row?.id ?? null,
+			attempt_count: attempt,
+			last_error: msg,
+		});
+	}
 
-        if (first) {
-            this._sysLog('warn', 'audit_drain_failed', { error: msg });
-        }
-        if (crossedDegraded) {
-            const remMs = this._inBackoffUntilMs - Date.now();
-            this._sysLog('error', 'audit_drain_degraded', {
-                retry_count: this._retryCount,
-                in_backoff_seconds: remMs > 0 ? Math.round(remMs) / 1000 : 0,
-                last_error: msg,
-            });
-        }
-    }
+	_onFailure(err) {
+		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		const first = this._retryCount === 0;
+		if (first) this._failureBurstStartedAt = Date.now();
+		this._retryCount++;
+		this._lastError = msg;
+		const crossedDegraded =
+			this._retryCount >= DEGRADED_AFTER && !this._degradedFired;
+		if (crossedDegraded) this._degradedFired = true;
 
-    _onSuccess() {
-        let recoveredAfter = null;
-        if (this._retryCount > 0 && this._failureBurstStartedAt !== null) {
-            recoveredAfter = (Date.now() - this._failureBurstStartedAt) / 1000;
-        }
-        this._retryCount = 0;
-        this._inBackoffUntilMs = 0;
-        this._failureBurstStartedAt = null;
-        this._lastError = null;
-        this._degradedFired = false;
-        this._drainedTotal++;
-        if (recoveredAfter !== null) {
-            this._sysLog('info', 'audit_drain_recovered',
-                { recovery_after_seconds: Math.round(recoveredAfter * 1000) / 1000 });
-        }
-    }
+		if (first) {
+			this._sysLog("warn", "audit_drain_failed", { error: msg });
+		}
+		if (crossedDegraded) {
+			const remMs = this._inBackoffUntilMs - Date.now();
+			this._sysLog("error", "audit_drain_degraded", {
+				retry_count: this._retryCount,
+				in_backoff_seconds: remMs > 0 ? Math.round(remMs) / 1000 : 0,
+				last_error: msg,
+			});
+		}
+	}
 
-    async _waitBackoff() {
-        const n = this._retryCount;
-        let delay = this._retryInitialMs * Math.pow(2, Math.max(0, n - 1));
-        if (delay > this._retryMaxMs) delay = this._retryMaxMs;
-        if (this._retryJitter) {
-            const j = delay * 0.2;
-            delay += (Math.random() * 2 - 1) * j;
-            if (delay < 0) delay = 0;
-        }
-        this._inBackoffUntilMs = Date.now() + delay;
-        // Sleep, but check _stopped frequently so shutdown is prompt.
-        const stepMs = Math.min(delay, 50);
-        const end = Date.now() + delay;
-        while (Date.now() < end) {
-            if (this._stopped) return false;
-            await new Promise(r => setTimeout(r, Math.min(stepMs, end - Date.now())));
-        }
-        return !this._stopped;
-    }
+	_onSuccess() {
+		let recoveredAfter = null;
+		if (this._retryCount > 0 && this._failureBurstStartedAt !== null) {
+			recoveredAfter = (Date.now() - this._failureBurstStartedAt) / 1000;
+		}
+		this._retryCount = 0;
+		this._inBackoffUntilMs = 0;
+		this._failureBurstStartedAt = null;
+		this._lastError = null;
+		this._degradedFired = false;
+		this._drainedTotal++;
+		if (recoveredAfter !== null) {
+			this._sysLog("info", "audit_drain_recovered", {
+				recovery_after_seconds: Math.round(recoveredAfter * 1000) / 1000,
+			});
+		}
+	}
+
+	async _waitBackoff() {
+		const n = this._retryCount;
+		let delay = this._retryInitialMs * 2 ** Math.max(0, n - 1);
+		if (delay > this._retryMaxMs) delay = this._retryMaxMs;
+		if (this._retryJitter) {
+			const j = delay * 0.2;
+			delay += (Math.random() * 2 - 1) * j;
+			if (delay < 0) delay = 0;
+		}
+		this._inBackoffUntilMs = Date.now() + delay;
+		// Sleep, but check _stopped frequently so shutdown is prompt.
+		const stepMs = Math.min(delay, 50);
+		const end = Date.now() + delay;
+		while (Date.now() < end) {
+			if (this._stopped) return false;
+			await new Promise((r) =>
+				setTimeout(r, Math.min(stepMs, end - Date.now())),
+			);
+		}
+		return !this._stopped;
+	}
 }
 
-// ── Module-level singleton ─────────────────────────────────────────────────
+// ── Backward-compat shims ─────────────────────────────────────────────────
+//
+// Module-level singleton replaced by Engine (see index.js). These shims
+// delegate to the default Engine so existing call sites (tests, etc.)
+// continue to work. Call _setDefaultEngine(engine) at module init time.
 
-let _drainer = null;
+export { AuditQueueDrainer };
 
-export function installDrainer({
-    store, sysLog, capacity = 100,
-    retryInitialMs = 100, retryMaxMs = 60_000, retryJitter = true,
-}) {
-    // Race-safe re-init: build new first, swap atomically, then flush +
-    // stop the old asynchronously. Concurrent emit() that grabbed the
-    // old drainer reference before swap and lands a put() after the old
-    // is stopped self-aborts via the put() stop check (audit_drain_
-    // abandoned sys event) — no silent loss into a dead queue.
-    const next = new AuditQueueDrainer({
-        store, sysLog, capacity,
-        retryInitialMs, retryMaxMs, retryJitter,
-    });
-    const old = _drainer;
-    _drainer = next;
-    if (old) {
-        old.flush(5000).then(() => old.stop());
-    }
-    return next;
+let _defaultEngine = null;
+export function _setDefaultEngine(engine) {
+	_defaultEngine = engine;
+}
+
+export function installDrainer(opts) {
+	_defaultEngine?._installDrainer(opts);
+	return _defaultEngine?._drainer ?? null;
 }
 
 export function uninstallDrainer() {
-    // Symmetric with installDrainer: clear the global FIRST so any new
-    // emit() sees no drainer and falls through to its sync path,
-    // instead of racing against a half-stopped drainer.
-    const old = _drainer;
-    _drainer = null;
-    if (old) {
-        old.stop();
-    }
+	_defaultEngine?._uninstallDrainer();
 }
 
-export function activeDrainer() { return _drainer; }
+export function activeDrainer() {
+	return _defaultEngine?._drainer ?? null;
+}
 
-/**
- * queueStats — snapshot of queue + drainer state. Returns null in raise
- * mode (no drainer running).
- */
 export function queueStats() {
-    return _drainer ? _drainer.stats() : null;
+	return _defaultEngine?.queueStats() ?? null;
 }
 
-/**
- * flush — block (await) until pending audit rows drain or timeout.
- * Returns true iff drained. No-op + true in raise mode.
- */
 export async function flush(timeoutMs = 5000) {
-    if (!_drainer) return true;
-    return _drainer.flush(timeoutMs);
+	return _defaultEngine ? _defaultEngine.flush(timeoutMs) : true;
 }

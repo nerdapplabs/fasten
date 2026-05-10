@@ -12,6 +12,7 @@ keywords = ["audit", "logging", "correlation", "observability", "compliance"]
 categories = ["development-tools::debugging", "asynchronous"]
 
 [dependencies]
+fasten-store-core = { path = "../store-core", default-features = false }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "1"
@@ -19,14 +20,19 @@ chrono      = { version = "0.4", features = ["serde"] }
 uuid        = { version = "1", features = ["v4"] }
 tokio       = { version = "1", features = ["rt", "macros", "sync"], optional = true }
 tracing     = { version = "0.1", optional = true }
-sqlx        = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "chrono"], optional = true }
+sqlx        = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"], optional = true }
+# `postgres` (sync client, MIT) is the right choice for `store-postgres`:
+# `AuditStore` is a sync trait; sqlx is async-only and block_on() panics when
+# called from inside an existing tokio runtime. `postgres` 0.19 is pure-sync,
+# does not require openssl when using NoTls, and has no GPL/LGPL transitive deps.
+pg          = { package = "postgres", version = "0.19", optional = true }
 serde_yaml  = { version = "0.9", optional = true }
 
 [features]
 default = []
 async = ["tokio"]
 store-sqlite = ["sqlx"]
-store-postgres = ["sqlx"]
+store-postgres = ["dep:pg"]
 shim-tracing = ["tracing"]
 codes-yaml = ["serde_yaml"]
 

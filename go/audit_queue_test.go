@@ -90,17 +90,8 @@ func (s *flakyStore) Purge(_ context.Context, _ time.Time, _ bool) (int, error) 
 // ── Test helpers ───────────────────────────────────────────────────────────
 
 func resetState() {
-	uninstallDrainer()
-	regMu.Lock()
-	_registry = map[Code]Meta{}
-	regMu.Unlock()
-	_serviceID = ""
-	_nodeID = ""
-	_tenantID = ""
-	_auditStore = nil
-	_transport = nil
-	_failureStrategy = ""
-	_seq = 0
+	Default.ResetForTests()
+	clearBothRegistries()
 }
 
 func setupQueueMode(t *testing.T, store AuditRepository, opts ...func(*Config)) {
@@ -222,7 +213,7 @@ func TestRaiseModeReturnsAuditStoreError(t *testing.T) {
 func TestRaiseModeDoesNotInstallDrainer(t *testing.T) {
 	store := &recordingStore{}
 	setupRaiseMode(t, store)
-	if activeDrainer() != nil {
+	if Default.activeDrainer() != nil {
 		t.Fatal("raise mode must not install a drainer")
 	}
 	if GetQueueStats() != nil {
@@ -286,7 +277,7 @@ func TestQueueFullBlocksEmitDoesNotSilentlyDrop(t *testing.T) {
 	}
 
 	// Stopping the drainer pops rows + releases slots → unblocks emit.
-	uninstallDrainer()
+	Default.uninstallDrainer()
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
@@ -309,7 +300,7 @@ func TestDrainerFirstFailureEmitsWarnToSys(t *testing.T) {
 	if !Flush(2 * time.Second) {
 		t.Fatal("flush timed out")
 	}
-	rows := _transport.QuerySyslog(100, "", "", "")
+	rows := Default.xport.QuerySyslog(100, "", "", "")
 	events := map[string]bool{}
 	for _, r := range rows {
 		if e, ok := r["event"].(string); ok {
@@ -336,7 +327,7 @@ func TestDrainerDegradedAfter5Failures(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		rows := _transport.QuerySyslog(100, "", "", "")
+		rows := Default.xport.QuerySyslog(100, "", "", "")
 		for _, r := range rows {
 			if r["event"] == "audit_drain_degraded" {
 				return
@@ -360,7 +351,7 @@ func TestQueueHighWaterEmitsWarnAt50pct(t *testing.T) {
 		}
 	}
 	time.Sleep(100 * time.Millisecond)
-	rows := _transport.QuerySyslog(100, "", "", "")
+	rows := Default.xport.QuerySyslog(100, "", "", "")
 	events := map[string]bool{}
 	for _, r := range rows {
 		if e, ok := r["event"].(string); ok {
@@ -543,6 +534,49 @@ func TestRingBuffer_NoUnboundedGrowth(t *testing.T) {
 	if all[15] != 16*100-16 {
 		t.Errorf("oldest of the 16 retained want %d; got %d", 16*100-16, all[15])
 	}
+}
+
+// ── P1-22: Go drainer panic-recovery ─────────────────────────────────────
+
+type panicStore struct{}
+
+func (s *panicStore) Insert(_ context.Context, _ Row) error  { panic("store exploded") }
+func (s *panicStore) Query(_ context.Context, _ Filter) ([]Row, error) { return nil, nil }
+func (s *panicStore) ListUnshipped(_ context.Context, _ int) ([]Row, error) {
+	return nil, nil
+}
+func (s *panicStore) MarkShipped(_ context.Context, _ []string) error    { return nil }
+func (s *panicStore) Purge(_ context.Context, _ time.Time, _ bool) (int, error) { return 0, nil }
+
+// TestDrainerSurvivesStorePanic asserts that a panicking store.Insert emits
+// audit_drain_recovered_from_panic to the sys stream and that subsequent
+// Emit + QueueStats calls do not panic or hang.
+func TestDrainerSurvivesStorePanic(t *testing.T) {
+	setupQueueMode(t, &panicStore{}, func(c *Config) {
+		c.QueueRetryInitial = 5 * time.Millisecond
+		c.QueueRetryMax = 20 * time.Millisecond
+		c.DisableQueueJitter = true
+	})
+
+	if _, err := Emit(context.Background(), "USER_CREATED", Target("u-1")); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	// Allow time for the drainer goroutine to run and recover.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rows := Default.xport.QuerySyslog(100, "", "", "")
+		for _, r := range rows {
+			if r["event"] == "audit_drain_recovered_from_panic" {
+				// Drainer survived. Verify subsequent calls don't hang or panic.
+				_, _ = Emit(context.Background(), "USER_CREATED", Target("u-2"))
+				_ = GetQueueStats()
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("audit_drain_recovered_from_panic sys event never fired after store panic")
 }
 
 func contains(s, sub string) bool {

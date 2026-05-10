@@ -23,6 +23,7 @@ package fasten
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -47,13 +48,16 @@ func (e *AuditStoreError) Unwrap() error { return e.Err }
 // occupied capacity (queued + in-flight retry) — the value that
 // determines whether the next Emit() blocks.
 type QueueStats struct {
-	Depth            int     `json:"depth"`
-	Capacity         int     `json:"capacity"`
-	HighWater        int     `json:"high_water"`
-	DrainedTotal     int     `json:"drained_total"`
-	RetryCountActive int     `json:"retry_count_active"`
-	InBackoffSeconds float64 `json:"in_backoff_seconds"`
-	LastError        string  `json:"last_error"`
+	Depth              int     `json:"depth"`
+	Capacity           int     `json:"capacity"`
+	HighWater          int     `json:"high_water"`
+	DrainedTotal       int     `json:"drained_total"`
+	RetryCountActive   int     `json:"retry_count_active"`
+	InBackoffSeconds   float64 `json:"in_backoff_seconds"`
+	LastError          string  `json:"last_error"`
+	DeadLetteredTotal  int     `json:"dead_lettered_total"`
+	DeadLetterDepth    int     `json:"dead_letter_depth"`
+	CapacitySemantics  string  `json:"capacity_semantics"`
 }
 
 // auditQueueDrainer — single bounded queue + single drainer goroutine.
@@ -64,23 +68,26 @@ type auditQueueDrainer struct {
 	retryInitial time.Duration
 	retryMax     time.Duration
 	retryJitter  bool
+	maxAttempts  int
 
 	q     chan Row
 	slots chan struct{} // counting semaphore — capacity slots
 	stop  chan struct{}
 	wg    sync.WaitGroup
 
-	mu             sync.Mutex
-	highWater      int
-	drainedTotal   int
-	retryCount     int
-	inBackoffUntil time.Time
-	lastError      string
-	failureBurstAt time.Time
-	inFlight       int
-	warnHWFired    bool
-	errHWFired     bool
-	degradedFired  bool
+	mu                sync.Mutex
+	highWater         int
+	drainedTotal      int
+	retryCount        int
+	inBackoffUntil    time.Time
+	lastError         string
+	failureBurstAt    time.Time
+	inFlight          int
+	warnHWFired       bool
+	errHWFired        bool
+	degradedFired     bool
+	deadLetteredTotal int
+	dlq               []Row // bounded ring; newest prepended, cap 10
 }
 
 const (
@@ -95,6 +102,7 @@ func newAuditDrainer(
 	capacity int,
 	retryInitial, retryMax time.Duration,
 	retryJitter bool,
+	maxAttempts int,
 ) *auditQueueDrainer {
 	d := &auditQueueDrainer{
 		store:        store,
@@ -103,6 +111,7 @@ func newAuditDrainer(
 		retryInitial: retryInitial,
 		retryMax:     retryMax,
 		retryJitter:  retryJitter,
+		maxAttempts:  maxAttempts,
 		q:            make(chan Row, capacity),
 		slots:        make(chan struct{}, capacity),
 		stop:         make(chan struct{}),
@@ -165,13 +174,16 @@ func (d *auditQueueDrainer) stats() QueueStats {
 		bo = rem.Seconds()
 	}
 	return QueueStats{
-		Depth:            len(d.slots),
-		Capacity:         d.capacity,
-		HighWater:        d.highWater,
-		DrainedTotal:     d.drainedTotal,
-		RetryCountActive: d.retryCount,
-		InBackoffSeconds: roundFloat(bo, 3),
-		LastError:        d.lastError,
+		Depth:             len(d.slots),
+		Capacity:          d.capacity,
+		HighWater:         d.highWater,
+		DrainedTotal:      d.drainedTotal,
+		RetryCountActive:  d.retryCount,
+		InBackoffSeconds:  roundFloat(bo, 3),
+		LastError:         d.lastError,
+		DeadLetteredTotal: d.deadLetteredTotal,
+		DeadLetterDepth:   len(d.dlq),
+		CapacitySemantics: "block",
 	}
 }
 
@@ -249,13 +261,25 @@ func (d *auditQueueDrainer) drainOne(row Row, inShutdown bool) {
 		d.inFlight--
 		d.mu.Unlock()
 		if !slotReleased {
-			// Defensive: never leak a permit even if a panic unwinds
-			// drainOne.
 			<-d.slots
 		}
 	}()
+	// Panic-recovery: a panicking store.Insert kills the goroutine and hangs
+	// every subsequent emit on the buffered channel forever with no signal.
+	// Python's BLE001 catch and Rust's lock_or_recover both prevent this;
+	// defer recover() is the Go equivalent.
+	defer func() {
+		if r := recover(); r != nil {
+			d.sysLog("error", "audit_drain_recovered_from_panic", map[string]any{
+				"error":  fmt.Sprintf("%v", r),
+				"row_id": row.ID,
+			})
+		}
+	}()
 
+	attempt := 0
 	for {
+		attempt++
 		err := d.store.Insert(context.Background(), row)
 		if err == nil {
 			d.onSuccess()
@@ -263,22 +287,42 @@ func (d *auditQueueDrainer) drainOne(row Row, inShutdown bool) {
 			slotReleased = true
 			return
 		}
+		if attempt >= d.maxAttempts {
+			d.onDeadLetter(row, attempt, err)
+			<-d.slots
+			slotReleased = true
+			return
+		}
 		d.onFailure(err)
 		if inShutdown {
-			// Process is exiting; one attempt is enough. The row is
-			// lost (matches best-effort shutdown contract — adopters
-			// who need durability under crash use raise mode).
 			<-d.slots
 			slotReleased = true
 			return
 		}
 		if d.waitBackoff() {
-			// stop signalled mid-backoff
 			<-d.slots
 			slotReleased = true
 			return
 		}
 	}
+}
+
+func (d *auditQueueDrainer) onDeadLetter(row Row, attempt int, err error) {
+	msg := err.Error()
+	d.mu.Lock()
+	d.deadLetteredTotal++
+	d.retryCount = 0
+	d.lastError = msg
+	if len(d.dlq) >= 10 {
+		d.dlq = d.dlq[1:] // drop oldest
+	}
+	d.dlq = append(d.dlq, row)
+	d.mu.Unlock()
+	d.sysLog("error", "audit_drain_dead_letter", map[string]any{
+		"row_id":        row.ID,
+		"attempt_count": attempt,
+		"last_error":    msg,
+	})
 }
 
 func (d *auditQueueDrainer) onFailure(err error) {
@@ -372,68 +416,9 @@ func (d *auditQueueDrainer) waitBackoff() bool {
 	}
 }
 
-// ── Module-level singleton ─────────────────────────────────────────────────
-
-var (
-	_drainer   *auditQueueDrainer
-	_drainerMu sync.Mutex
-)
-
-func installDrainer(
-	store AuditRepository,
-	sysLog func(string, string, map[string]any),
-	capacity int,
-	retryInitial, retryMax time.Duration,
-	retryJitter bool,
-) *auditQueueDrainer {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	if _drainer != nil {
-		_drainer.flush(5 * time.Second)
-		_drainer.shutdown(2 * time.Second)
-	}
-	_drainer = newAuditDrainer(store, sysLog, capacity, retryInitial, retryMax, retryJitter)
-	return _drainer
-}
-
-func uninstallDrainer() {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	if _drainer != nil {
-		_drainer.shutdown(2 * time.Second)
-		_drainer = nil
-	}
-}
-
-func activeDrainer() *auditQueueDrainer {
-	_drainerMu.Lock()
-	defer _drainerMu.Unlock()
-	return _drainer
-}
-
-// GetQueueStats returns a snapshot of the active drainer, or nil in
-// raise mode (no drainer running). Mirrors the existing GetTransport
-// accessor naming.
-func GetQueueStats() *QueueStats {
-	d := activeDrainer()
-	if d == nil {
-		return nil
-	}
-	s := d.stats()
-	return &s
-}
-
-// Flush blocks until pending audit rows are drained, or timeout
-// elapses. Returns true iff every queued row reached the store. Useful
-// for k8s preStop hooks, CLI subcommand exit paths, and tests. No-op +
-// returns true in raise mode (no queue to drain).
-func Flush(timeout time.Duration) bool {
-	d := activeDrainer()
-	if d == nil {
-		return true
-	}
-	return d.flush(timeout)
-}
+// The drainer singleton and free-function management have moved into Engine
+// (see engine.go). audit_queue.go now contains only the drainer type and
+// its methods.
 
 func roundFloat(f float64, digits int) float64 {
 	pow := 1.0

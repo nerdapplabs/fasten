@@ -7,10 +7,16 @@ Single source of truth: spec/row-schema.json
 Usage:
     python spec/codegen.py --write   update adapter files in place
     python spec/codegen.py --check   exit 1 if any adapter is out of date (CI gate)
+
+Scope: enum constants + redact patterns only. Row struct generation and
+wire-shape serializers are deferred to a post-1.0 tooling pass — the
+enum vocabulary changes rarely and the current output is sufficient for
+v1.0. Expanding scope is tracked in ARCHITECTURE-REVIEW.md.
 """
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import pathlib
 import sys
@@ -19,8 +25,8 @@ from typing import Callable
 ROOT   = pathlib.Path(__file__).parent.parent
 SCHEMA = ROOT / "spec" / "row-schema.json"
 
-MARK_B = "FASTEN GENERATED"
-MARK_E = "END FASTEN GENERATED"
+MARK_B = "── FASTEN GENERATED"
+MARK_E = "── END FASTEN GENERATED"
 
 # ── Spec helpers ──────────────────────────────────────────────────────────────
 
@@ -86,7 +92,7 @@ def gen_python(spec: dict) -> str:
         L.append(f'    """{doc}"""')
         for v, dv in vs:
             suffix = f"  # {dv}" if dv else ""
-            L.append(f'    {upper(v).ljust(pad)} = "{v}"{suffix}')
+            L.append(f'    {upper(v).ljust(pad)} = {json.dumps(v)}{suffix}')
         L.append("")
         L.append("    def __str__(self) -> str: return self.value")
         L.append("")
@@ -158,15 +164,15 @@ def gen_js(spec: dict) -> str:
         ("method",          "Method"),
     ]:
         d = enum_def(spec, field)
-        items = ", ".join(f"{upper(v)}: '{v}'" for v, _ in vals(d))
+        items = ", ".join(f"{upper(v)}: {dquote(v)}" for v, _ in vals(d))
         L.append(f"export const {name} = Object.freeze({{ {items} }});")
 
     L.append("")
     r = redact(spec)
-    L.append(f"export const REDACT_REPLACEMENT = '{r['replacement']}';")
+    L.append(f"export const REDACT_REPLACEMENT = {dquote(r['replacement'])};")
     L.append("export const REDACT_PATTERNS = [")
     for p in r["patterns"]:
-        L.append(f"  '{p}',")
+        L.append(f"  {dquote(p)},")
     L.append("];")
     return "\n".join(L)
 
@@ -336,8 +342,6 @@ ADAPTERS = [
             "//", gen_js),
     Adapter("rust",   ROOT / "rust" / "src" / "lib.rs",
             "//", gen_rust),
-    Adapter("java",   ROOT / "java" / "src" / "main" / "java" / "sh" / "fasten" / "Fasten.java",
-            "//", gen_java),
     Adapter("cpp",    ROOT / "cpp" / "include" / "fasten.hpp",
             "//", gen_cpp),
 ]
@@ -345,9 +349,12 @@ ADAPTERS = [
 
 def _find_marker(text: str, marker: str) -> tuple[int, int]:
     """Return (line_start, line_end_exclusive) for the line containing marker."""
-    idx = text.find(marker)
-    if idx == -1:
+    count = text.count(marker)
+    if count == 0:
         return -1, -1
+    if count > 1:
+        raise ValueError(f"marker {marker!r} appears {count} times (expected exactly 1)")
+    idx   = text.find(marker)
     start = text.rfind("\n", 0, idx) + 1
     end   = text.find("\n", idx)
     end   = end + 1 if end != -1 else len(text)
@@ -378,6 +385,13 @@ def process(adapter: Adapter, spec: dict, check: bool) -> bool:
 
     if check:
         print(f"  ✗ {adapter.lang}: out of date — run: python spec/codegen.py --write")
+        diff = difflib.unified_diff(
+            current_block.splitlines(keepends=True),
+            new_block.splitlines(keepends=True),
+            fromfile=f"{adapter.lang} (current)",
+            tofile=f"{adapter.lang} (generated)",
+        )
+        sys.stdout.writelines(diff)
         return True
 
     new_text = text[:b_start] + new_block + text[e_end:]

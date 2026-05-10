@@ -3,10 +3,15 @@ package fasten
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 )
+
+// codeKeyRe validates audit-code identifiers — UPPER_SNAKE_CASE.
+// Used by the YAML loader; programmatic Register() delegates to the Rust core.
+var codeKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // Catalog YAML loader (P1-11).
 //

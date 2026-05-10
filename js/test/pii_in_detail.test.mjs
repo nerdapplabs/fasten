@@ -10,12 +10,12 @@ import assert from 'node:assert/strict';
 import {
     init, emit, register, metaOf,
     REDACT_REPLACEMENT, RetentionClass,
-    registry,
+    registry, _clearRustRegistry,
 } from '../src/index.js';
 
-function clear(...codes) {
-    const r = registry();
-    for (const c of codes) r.delete(c);
+function clear() {
+    _clearRustRegistry();
+    registry().clear();
 }
 
 // Capture console.warn calls.
@@ -30,7 +30,7 @@ function captureWarn(fn) {
 // ── #1 force SHORT at registration ────────────────────────────────────────
 
 describe('P1-5 register: piiInDetail forces SHORT', () => {
-    beforeEach(() => clear('PII_LONG_OVERRIDE', 'PII_ALREADY_SHORT', 'NON_PII_LONG'));
+    beforeEach(clear);
 
     test('forces SHORT and warns when adopter set LONG', () => {
         const warnings = captureWarn(() => {
@@ -84,7 +84,7 @@ describe('P1-5 register: piiInDetail forces SHORT', () => {
 
 describe('P1-5 emit: force-redact + passthrough', () => {
     beforeEach(() => {
-        clear('PII_FULL_REDACT', 'PII_PARTIAL', 'PII_PASSTHROUGH_SECRET', 'NON_PII_BASIC');
+        clear();
         init({ serviceId: 'svc', nodeId: 'node' });
     });
 

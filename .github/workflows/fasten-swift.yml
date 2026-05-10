@@ -1,0 +1,54 @@
+name: Swift SDK
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'swift/**'
+      - 'store-core/**'
+      - '.github/workflows/fasten-swift.yml'
+  pull_request:
+    paths:
+      - 'swift/**'
+      - 'store-core/**'
+      - '.github/workflows/fasten-swift.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: swift
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Swift 5.10
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
+
+      - name: Build
+        env:
+          FASTEN_LIB: ${{ github.workspace }}/store-core/target/release
+        run: swift build -Xlinker -L$FASTEN_LIB
+
+      - name: Test
+        env:
+          FASTEN_LIB: ${{ github.workspace }}/store-core/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
+        run: swift test -Xlinker -L$FASTEN_LIB

@@ -17,6 +17,9 @@ use std::time::Duration;
 pub mod audit_queue;
 pub use audit_queue::{flush, queue_stats, AuditStoreError, QueueStats};
 
+pub mod engine;
+pub use engine::{Engine, DEFAULT};
+
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Severity {
@@ -71,7 +74,7 @@ pub const METHOD_UI: &str = "ui";  // Web or desktop UI action, human-initiated
 pub const METHOD_AGENT_TOOL: &str = "agent_tool";  // AI agent tool call
 pub const METHOD_SDK: &str = "sdk";  // Direct SDK call, no transport shim active. Default.
 
-pub const REDACT_REPLACEMENT: &str = "***";
+pub use fasten_store_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;
 pub const REDACT_PATTERNS: &[&str] = &[
     "api[_-]?key",
     "password",
@@ -95,10 +98,12 @@ pub const REDACT_PATTERNS: &[&str] = &[
 // Codegen output has no Default derives; impl them here so Meta { ..Default::default() }
 // works for adopters who only set a few fields. Sensible defaults: INFO + MEDIUM.
 
+#[allow(clippy::derivable_impls)]
 impl Default for Severity {
     fn default() -> Self { Severity::Info }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for RetentionClass {
     fn default() -> Self { RetentionClass::Medium }
 }
@@ -126,6 +131,8 @@ pub enum Anchor {
 /// Canonical audit row — wire shape matches spec/row-schema.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
+    pub wire_version: String,
+
     pub id: String,
     pub origin_id: String,
     pub monotonic_seq: u64,
@@ -138,7 +145,7 @@ pub struct Row {
 
     pub service_id: String,
     pub source_node_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Always emit the key (null when absent) so readers see a consistent shape.
     pub tenant_id: Option<String>,
 
     pub actor: String,
@@ -219,52 +226,38 @@ pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub(crate) fn is_upper_snake(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_uppercase() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Register a batch of codes for a domain.
 ///
-/// Validation runs in this order; first failure returns an error:
-///   - key shape: UPPER_SNAKE_CASE identifier
-///   - `Meta.id` empty → fill from key; set → must match key
-///   - `Meta.domain` must match `domain`
-///   - duplicate code across registrations
+/// Validation (key shape, id-match, domain-match, pii_in_detail forcing) is
+/// delegated to a fresh `fasten_store_core::catalog::CodeRegistry` so the
+/// rules stay in one place.  The validated codes are then committed to the
+/// SDK's own typed registry.
 ///
 /// Drop `Meta.id` in new code; the tuple key is the single source of truth.
 pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
 {
+    use fasten_store_core::catalog::CodeRegistry as CoreReg;
+    let codes: Vec<(String, Meta)> = codes.into_iter().collect();
+
+    // Validate via a throw-away store-core registry — handles all rules
+    // without touching the global singleton (safe to call from tests).
+    let core_map: HashMap<String, fasten_store_core::catalog::Meta> =
+        codes.iter().map(|(id, m)| (id.clone(), to_core_meta(m))).collect();
+    CoreReg::new().register(&domain, core_map).map_err(map_core_catalog_err)?;
+
+    // Cross-batch duplicate check against the already-registered SDK codes.
     let mut guard = registry().write().expect("registry poisoned");
+    for (id, _) in &codes {
+        if guard.contains_key(id.as_str()) {
+            return Err(Error::DuplicateCode(id.clone()));
+        }
+    }
+
+    // Commit with filled/normalised fields.
     for (id, mut meta) in codes {
-        if !is_upper_snake(&id) {
-            return Err(Error::InvalidKey(id));
-        }
-        if meta.id.is_empty() {
-            meta.id = id.clone();
-        } else if meta.id != id {
-            return Err(Error::IdMismatch {
-                key: id,
-                got: meta.id,
-            });
-        }
-        if meta.domain != domain {
-            return Err(Error::DomainMismatch {
-                code: id,
-                got: meta.domain,
-                want: domain,
-            });
-        }
-        if guard.contains_key(&id) {
-            return Err(Error::DuplicateCode(id));
-        }
-        // P1-5 #1: pii_in_detail forces retention_class=Short.
+        if meta.id.is_empty() { meta.id = id.clone(); }
         if meta.pii_in_detail && meta.retention_class != RetentionClass::Short {
             eprintln!(
                 "fasten: code {} has pii_in_detail=true; retention_class forced to SHORT (was {}).",
@@ -275,6 +268,35 @@ where
         guard.insert(id, meta);
     }
     Ok(())
+}
+
+fn to_core_meta(m: &Meta) -> fasten_store_core::catalog::Meta {
+    fasten_store_core::catalog::Meta {
+        id:                      m.id.clone(),
+        domain:                  m.domain.clone(),
+        category:                m.category.clone(),
+        action:                  m.action.clone(),
+        severity:                m.severity.to_string(),
+        description:             m.description.clone(),
+        emitter:                 m.emitter.clone(),
+        retention_class:         m.retention_class.to_string(),
+        high_volume:             m.high_volume,
+        pii_in_detail:           m.pii_in_detail,
+        declared_unused:         m.declared_unused,
+        detail_passthrough_keys: m.detail_passthrough_keys.clone(),
+    }
+}
+
+fn map_core_catalog_err(e: fasten_store_core::error::Error) -> Error {
+    use fasten_store_core::error::Error as CE;
+    match e {
+        CE::InvalidKey(k) => Error::InvalidKey(k),
+        CE::IdMismatch { key, id } => Error::IdMismatch { key, got: id },
+        CE::DomainMismatch { key, declared, registered } =>
+            Error::DomainMismatch { code: key, got: declared, want: registered },
+        CE::DuplicateCode(k) => Error::DuplicateCode(k),
+        other => Error::YamlInvalid(other.to_string()),
+    }
 }
 
 /// Look up Meta by code.
@@ -337,34 +359,10 @@ where
 // the active config. Falls back to bare line if init() not yet called.
 
 pub mod log {
-    use super::current_request_id;
     use serde::Serialize;
-    use serde_json::json;
 
     fn write(level: &str, event: &str, fields: serde_json::Value) {
-        let cfg = super::CONFIG
-            .get()
-            .and_then(|slot| slot.read().ok().and_then(|g| g.clone()));
-        let service_id = cfg.as_ref().map(|c| c.service_id.clone()).unwrap_or_default();
-
-        let mut payload = json!({
-            "shape": "sys",
-            "level": level,
-            "event": event,
-            "request_id": current_request_id().unwrap_or_default(),
-            "service_id": service_id,
-            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        });
-
-        if let serde_json::Value::Object(merge_into) = &mut payload {
-            if let serde_json::Value::Object(extra) = fields {
-                for (k, v) in extra {
-                    merge_into.insert(k, v);
-                }
-            }
-        }
-
-        println!("{}", payload);
+        super::DEFAULT.log_sys(level, event, fields);
     }
 
     /// Convenience: pass key-value fields as a `serde_json::Value::Object`.
@@ -381,73 +379,24 @@ pub mod log {
 }
 
 // --- Redaction -----------------------------------------------------------
-//
-// Spec patterns are simple regex-like strings (e.g. `api[_-]?key`). For v0.1
-// we avoid the regex crate dep: lower-case + strip `_` and `-` from both
-// key and pattern, then substring-match. Behaviour matches Python's
-// case-insensitive search for all patterns in the spec.
-
-fn norm_key(s: &str) -> String {
-    s.to_ascii_lowercase().replace(['_', '-'], "")
-}
-
-fn pattern_words() -> &'static [String] {
-    static WORDS: OnceLock<Vec<String>> = OnceLock::new();
-    WORDS.get_or_init(|| {
-        REDACT_PATTERNS
-            .iter()
-            .map(|p| p.replace("[_-]?", "").replace(['_', '-'], "").to_ascii_lowercase())
-            .collect()
-    })
-}
-
-fn key_is_secret(key: &str, extra: Option<&[String]>) -> bool {
-    let k = norm_key(key);
-    if pattern_words().iter().any(|p| k.contains(p)) {
-        return true;
-    }
-    if let Some(ex) = extra {
-        if ex.iter().any(|p| k.contains(&norm_key(p))) {
-            return true;
-        }
-    }
-    false
-}
-
-fn redact_value(v: &serde_json::Value, extra: Option<&[String]>) -> serde_json::Value {
-    use serde_json::Value;
-    match v {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, vv) in map {
-                if key_is_secret(k, extra) {
-                    out.insert(k.clone(), Value::String(REDACT_REPLACEMENT.into()));
-                } else {
-                    out.insert(k.clone(), redact_value(vv, extra));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(|x| redact_value(x, extra)).collect()),
-        _ => v.clone(),
-    }
-}
 
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
 ) -> HashMap<String, serde_json::Value> {
-    detail
-        .into_iter()
-        .map(|(k, v)| {
-            let nv = if key_is_secret(&k, extra) {
-                serde_json::Value::String(REDACT_REPLACEMENT.into())
-            } else {
-                redact_value(&v, extra)
-            };
-            (k, nv)
-        })
-        .collect()
+    use fasten_store_core::redact::{Redactor, REDACTOR};
+    let v = serde_json::Value::Object(detail.into_iter().collect());
+    let redacted = match extra {
+        Some(keys) if !keys.is_empty() => {
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            Redactor::new(&refs, "", &[]).redact_value(&v)
+        }
+        _ => REDACTOR.redact_value(&v),
+    };
+    match redacted {
+        serde_json::Value::Object(map) => map.into_iter().collect(),
+        _ => unreachable!("redact_value on Object always returns Object"),
+    }
 }
 
 // --- Init + Emit ---------------------------------------------------------
@@ -480,6 +429,8 @@ pub struct Config {
     pub queue_retry_max: Option<Duration>,
     /// Disable ±20 % jitter (default: jitter ON).
     pub disable_queue_jitter: bool,
+    /// Max insert attempts before a row is dead-lettered. Default: 50.
+    pub queue_drain_max_attempts: Option<usize>,
 }
 
 /// Read env vars; return Config.
@@ -504,100 +455,12 @@ pub fn config_from_env() -> Result<Config, Error> {
     })
 }
 
-static CONFIG: OnceLock<RwLock<Option<Config>>> = OnceLock::new();
-static SEQ: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
-
-fn seq_next() -> u64 {
-    SEQ.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1
-}
-
 /// Initialise fasten with a Config. Required before `emit()`.
 ///
 /// When `cfg.audit_store` is provided and `cfg.audit_store_failure_strategy`
 /// is `"queue"` (default), this installs a background drainer thread; see
 /// the `audit_queue` module for the full P1-15 contract.
-pub fn init(cfg: Config) -> Result<(), Error> {
-    if cfg.service_id.is_empty() || cfg.node_id.is_empty() {
-        return Err(Error::NotInitialised);
-    }
-    let strategy = cfg
-        .audit_store_failure_strategy
-        .clone()
-        .or_else(|| std::env::var("FASTEN_AUDIT_STORE_FAILURE_STRATEGY").ok())
-        .unwrap_or_else(|| "queue".into())
-        .to_lowercase();
-    if strategy != "queue" && strategy != "raise" {
-        return Err(Error::InvalidStrategy(strategy));
-    }
-    let store = cfg.audit_store.clone();
-    let capacity = cfg.queue_capacity.unwrap_or(100);
-    let retry_initial = cfg.queue_retry_initial.unwrap_or(Duration::from_millis(100));
-    let retry_max = cfg.queue_retry_max.unwrap_or(Duration::from_secs(60));
-    let retry_jitter = !cfg.disable_queue_jitter;
-
-    let mut cfg_to_store = cfg;
-    cfg_to_store.audit_store_failure_strategy = Some(strategy.clone());
-    let slot = CONFIG.get_or_init(|| RwLock::new(None));
-    *slot.write().expect("config poisoned") = Some(cfg_to_store);
-
-    if strategy == "queue" {
-        if let Some(s) = store {
-            audit_queue::install_drainer(
-                s,
-                Box::new(drainer_sys_log),
-                capacity,
-                retry_initial,
-                retry_max,
-                retry_jitter,
-            );
-        } else {
-            audit_queue::uninstall_drainer();
-        }
-    } else {
-        audit_queue::uninstall_drainer();
-    }
-    Ok(())
-}
-
-/// Bridge from drainer to sys stream — non-recursive: writes a
-/// `{shape:"sys"}` NDJSON line to stdout, never through `submit()` or
-/// the audit store.
-fn drainer_sys_log(level: &str, event: &str, fields: &serde_json::Value) {
-    let mut payload = serde_json::Map::new();
-    payload.insert("shape".into(), serde_json::Value::String("sys".into()));
-    payload.insert("level".into(), serde_json::Value::String(level.into()));
-    payload.insert("event".into(), serde_json::Value::String(event.into()));
-    if let Some(rid) = current_request_id() {
-        payload.insert("request_id".into(), serde_json::Value::String(rid));
-    } else {
-        payload.insert("request_id".into(), serde_json::Value::Null);
-    }
-    if let Ok(cfg) = current_config() {
-        payload.insert(
-            "service_id".into(),
-            serde_json::Value::String(cfg.service_id),
-        );
-    }
-    payload.insert(
-        "timestamp".into(),
-        serde_json::Value::String(Utc::now().to_rfc3339()),
-    );
-    if let serde_json::Value::Object(extras) = fields {
-        for (k, v) in extras {
-            payload.insert(k.clone(), v.clone());
-        }
-    }
-    println!("{}", serde_json::Value::Object(payload));
-}
-
-fn current_config() -> Result<Config, Error> {
-    CONFIG
-        .get()
-        .and_then(|slot| slot.read().ok().and_then(|g| g.clone()))
-        .ok_or(Error::NotInitialised)
-}
+pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
 
 /// Fluent-style Emit builder. Caller supplies `code`, `target`, optional
 /// `actor` / `method` / `detail`. Anchors auto-fill from Meta + ctx + config.
@@ -653,7 +516,7 @@ impl EmitBuilder {
     /// Mirrors the row to stdout (`{"shape":"audit",...}`) regardless
     /// of mode so adopters always see the audit on the log stream.
     pub fn submit(self) -> Result<Row, AuditStoreError> {
-        let cfg = current_config().map_err(|e| AuditStoreError { source: e })?;
+        let cfg = DEFAULT.current_config().map_err(|e| AuditStoreError { source: e })?;
         let row = self
             .build_row(&cfg)
             .map_err(|e| AuditStoreError { source: e })?;
@@ -673,7 +536,7 @@ impl EmitBuilder {
             .as_deref()
             .unwrap_or("queue");
         if strategy == "queue" {
-            if let Some(d) = audit_queue::active_drainer() {
+            if let Some(d) = DEFAULT.active_drainer() {
                 d.put(row.clone());
             } else if let Some(s) = cfg.audit_store.as_ref() {
                 // Defensive fallback — strategy says queue but drainer
@@ -713,9 +576,10 @@ impl EmitBuilder {
             redact_detail(self.detail, cfg.extra_redact_keys.as_deref())
         };
         let row = Row {
+            wire_version: "1".into(),
             id: id.clone(),
             origin_id: id,
-            monotonic_seq: seq_next(),
+            monotonic_seq: DEFAULT.seq_next(),
             timestamp: Utc::now(),
             code: self.code,
             action: meta.action,
@@ -1064,6 +928,11 @@ mod tests {
         assert!(!row.detail.contains_key("_pii_in_detail"));
     }
 }
+
+#[cfg(feature = "store-postgres")]
+pub mod postgres_store;
+#[cfg(feature = "store-postgres")]
+pub use postgres_store::PostgresStore;
 
 // ── Catalog yaml (P1-11) ─────────────────────────────────────────────────
 //

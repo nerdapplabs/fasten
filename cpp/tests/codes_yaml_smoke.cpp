@@ -42,16 +42,9 @@ std::string write_yaml(const std::string& contents, const std::string& name) {
 }
 
 void reset_state() {
+    fasten_registry_clear();
     auto& g = fasten::detail_::globals();
-    auto& reg = g.registry;
-    for (auto it = reg.begin(); it != reg.end(); ) {
-        const auto& k = it->first;
-        if (k.rfind("FLEET_", 0) == 0 || k.rfind("EXTRA_", 0) == 0) {
-            it = reg.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    g.registry.clear();
     fasten::codes::detail_yaml::yaml_codes().clear();
     fasten::codes::detail_yaml::loaded_paths().clear();
 }

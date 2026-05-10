@@ -120,3 +120,138 @@ def test_structlog_processor_tolerates_non_string_keys():
     assert out[1] == "ok"
     assert out["api_key"] == "***"
     assert out["nested"]["password"] == "***"
+
+
+# ── P1-24: value-shape redaction ─────────────────────────────────────────────
+
+def test_jwt_in_value_redacted(r):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"
+    assert r.redact({"notes": jwt}) == {"notes": "***JWT***"}
+
+
+def test_jwt_in_nested_value_redacted(r):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"
+    out = r.redact({"meta": {"comment": jwt}})
+    assert out["meta"]["comment"] == "***JWT***"
+
+
+def test_pem_private_key_redacted(r):
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
+    assert r.redact({"paste": pem}) == {"paste": "***PRIVATE_KEY***"}
+
+
+def test_ec_private_key_redacted(r):
+    pem = "-----BEGIN EC PRIVATE KEY-----\ndata\n-----END EC PRIVATE KEY-----"
+    assert r.redact({"key_data": pem}) == {"key_data": "***PRIVATE_KEY***"}
+
+
+def test_aws_access_key_redacted(r):
+    assert r.redact({"meta": "AKIAIOSFODNN7EXAMPLE"}) == {"meta": "***AWS_KEY***"}
+
+
+def test_aws_asia_key_redacted(r):
+    assert r.redact({"meta": "ASIAIOSFODNN7EXAMPLE"}) == {"meta": "***AWS_KEY***"}
+
+
+def test_gh_token_redacted(r):
+    tok = "ghp_" + "A" * 36
+    # "token_data" contains "token" → key-pattern fires; use neutral key for value-shape test
+    assert r.redact({"raw_value": tok}) == {"raw_value": "***GH_TOKEN***"}
+
+
+def test_cc_luhn_valid_redacted(r):
+    # Visa test card — passes Luhn
+    assert r.redact({"notes": "4111111111111111"}) == {"notes": "***CC***"}
+
+
+def test_cc_luhn_invalid_not_redacted(r):
+    # Same length but fails Luhn — must NOT be treated as a CC
+    assert r.redact({"notes": "4111111111111112"}) == {"notes": "4111111111111112"}
+
+
+def test_random_order_number_not_redacted(r):
+    # 16-digit order number that fails Luhn should not be redacted
+    assert r.redact({"order_id": "1234567890123456"}) == {"order_id": "1234567890123456"}
+
+
+def test_key_pattern_still_wins(r):
+    # A field named `api_key` whose VALUE is a JWT — key redactor fires first,
+    # value is replaced with *** (not ***JWT***).
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.sig"
+    assert r.redact({"api_key": jwt}) == {"api_key": "***"}
+
+
+def test_extra_value_pattern(r):
+    r2 = Redactor(extra_value_patterns=[("MY_SECRET", r"MY_SECRET_[A-Z0-9]{8}", "***MY***")])
+    assert r2.redact({"info": "see MY_SECRET_ABCD1234 here"}) == {"info": "***MY***"}
+
+
+def test_structlog_processor_redacts_jwt_value():
+    r2 = Redactor()
+    proc = r2.as_structlog_processor()
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"
+    out = proc(None, "info", {"event": "test", "comment": jwt})
+    assert out["comment"] == "***JWT***"
+    assert out["event"] == "test"  # structlog internal not touched
+
+
+def test_value_redact_list_of_strings(r):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc"
+    # "tokens" contains "token" → key-pattern fires on the whole list; use a neutral key
+    out = r.redact({"messages": [jwt, "safe-string"]})
+    assert out["messages"][0] == "***JWT***"
+    assert out["messages"][1] == "safe-string"
+
+
+# ── P1-3: adversarial key-name + value-shape tests ───────────────────────────
+
+def test_three_level_deep_nesting_redacted(r):
+    detail = {"l1": {"l2": {"l3": {"token": "deep-secret", "ok": "visible"}}}}
+    out = r.redact(detail)
+    assert out["l1"]["l2"]["l3"]["token"] == "***"
+    assert out["l1"]["l2"]["l3"]["ok"] == "visible"
+
+
+def test_authorization_header_redacted(r):
+    assert r.redact({"authorization": "Bearer tok-xyz"}) == {"authorization": "***"}
+
+
+def test_user_password_wrapper_key_redacted(r):
+    assert r.redact({"user_password": "hunter2"}) == {"user_password": "***"}
+
+
+def test_mixed_case_api_key_variants(r):
+    assert r.redact({"ApiKey": "x"})["ApiKey"] == "***"
+    assert r.redact({"API_KEY": "x"})["API_KEY"] == "***"
+    assert r.redact({"api-key": "x"})["api-key"] == "***"
+
+
+def test_secret_key_substring_in_stacktrace_not_matched(r):
+    trace = "RuntimeError: timeout at module.py:42\n  File 'web.py' line 7"
+    out = r.redact({"stacktrace": trace})
+    assert out["stacktrace"] == trace  # safe key → not redacted by key-pattern
+
+
+def test_stripe_live_key_redacted(r):
+    key = "sk_live_" + "A" * 24
+    assert r.redact({"payment_ref": key}) == {"payment_ref": "***STRIPE_KEY***"}
+
+
+def test_openai_key_redacted(r):
+    key = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"
+    assert r.redact({"llm_ref": key}) == {"llm_ref": "***OPENAI_KEY***"}
+
+
+def test_openai_org_key_redacted(r):
+    key = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklm"
+    assert r.redact({"llm_ref": key}) == {"llm_ref": "***OPENAI_KEY***"}
+
+
+def test_stripe_key_pattern_wins_if_key_also_matches(r):
+    key = "sk_live_" + "B" * 24
+    # "secret" is in _REDACT_PATTERNS so "sk_live..." key would match; use neutral key
+    assert r.redact({"payment": key}) == {"payment": "***STRIPE_KEY***"}
+
+
+def test_safe_16digit_non_luhn_not_cc(r):
+    assert r.redact({"order": "1234567890123456"}) == {"order": "1234567890123456"}

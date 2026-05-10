@@ -34,6 +34,7 @@ import sys
 from typing import Any
 
 REQUIRED_AUDIT_FIELDS = {
+    "wire_version",
     "shape", "id", "origin_id", "monotonic_seq", "timestamp",
     "code", "action", "severity",
     "service_id", "source_node_id",
@@ -70,6 +71,11 @@ def fail(msg: str, ctx: Any = None) -> None:
 
 
 def main() -> None:
+    # Set by the Python smoke only. Other SDKs don't emit api rows today
+    # (api stream is Python-only until HTTP shims stabilise — see README
+    # tests/integration/README.md §api-stream and P1-20).
+    require_api = os.environ.get("FASTEN_VERIFY_REQUIRE_API", "0") == "1"
+
     audit_rows: list[dict] = []
     sys_rows: list[dict] = []
     api_rows: list[dict] = []
@@ -104,6 +110,8 @@ def main() -> None:
     if missing:
         fail(f"audit row missing fields: {sorted(missing)}", audit)
 
+    if audit.get("wire_version") != "1":
+        fail(f"audit.wire_version must be '1', got {audit.get('wire_version')!r}", audit)
     if not ID_RE.match(audit["id"]):
         fail(f"audit.id does not match evt-<hex>: {audit['id']}")
     if not REQ_ID_RE.match(audit["request_id"]):
@@ -145,21 +153,27 @@ def main() -> None:
         fail(f"sys.event expected startup_ok, got {sys_row['event']}")
 
     # --- Api checks ---
-    if not api_rows:
+    # api rows are Python-only today; non-Python smokes are not required to
+    # emit them (FASTEN_VERIFY_REQUIRE_API=1 is set only for the Python target
+    # in tests/integration/Makefile).
+    if require_api and not api_rows:
         fail("no {shape: 'api'} row produced")
-    api = api_rows[0]
-    missing = REQUIRED_API_FIELDS - set(api.keys())
-    if missing:
-        fail(f"api row missing fields: {sorted(missing)}", api)
-    if not REQ_ID_RE.match(api["request_id"]):
-        fail(f"api.request_id is not 12 hex chars: {api['request_id']}")
-    if api["method"].upper() != "POST":
-        fail(f"api.method expected POST, got {api['method']}")
-    if api["status"] != 201:
-        fail(f"api.status expected 201, got {api['status']}")
+    if api_rows:
+        api = api_rows[0]
+        missing = REQUIRED_API_FIELDS - set(api.keys())
+        if missing:
+            fail(f"api row missing fields: {sorted(missing)}", api)
+        if not REQ_ID_RE.match(api["request_id"]):
+            fail(f"api.request_id is not 12 hex chars: {api['request_id']}")
+        if api["method"].upper() != "POST":
+            fail(f"api.method expected POST, got {api['method']}")
+        if api["status"] != 201:
+            fail(f"api.status expected 201, got {api['status']}")
 
+    api_note = (f"{len(api_rows)} api row(s)" if api_rows
+                else "api rows: none (not required for this SDK)")
     print(f"OK — {len(audit_rows)} audit row(s), {len(sys_rows)} sys row(s), "
-          f"{len(api_rows)} api row(s) — contract holds")
+          f"{api_note} — contract holds")
 
 
 if __name__ == "__main__":

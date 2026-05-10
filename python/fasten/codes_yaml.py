@@ -40,6 +40,7 @@ removed code remain readable (the wire ``code`` field is a free string).
 """
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -49,9 +50,11 @@ from .codes import (
     Meta,
     RetentionClass,
     Severity,
-    _CODE_KEY_RE,
     _registry,
 )
+
+# UPPER_SNAKE_CASE key validator (mirrors Rust catalog.rs CODE_KEY_RE).
+_CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 # Paths previously passed to load(); reload() re-reads all of them.
@@ -70,7 +73,7 @@ _lock = threading.Lock()
 def _yaml_loader() -> Any:
     """Lazy import of pyyaml — paid only when load() / reload() is called."""
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml
     except ImportError as e:
         raise RuntimeError(
             "fasten.codes.load() requires pyyaml; install with: pip install pyyaml"

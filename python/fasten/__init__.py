@@ -17,10 +17,11 @@ See README.md for the full design.
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
-from .audit_queue import AuditStoreError, flush, queue_stats
+from .audit_queue import AuditStoreError
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
-from .emit import audit_store, emit, init, log, redactor, transport
+from .emitter import audit_store, emit, flush, init, init_config, log, queue_stats, redactor, start, transport, verify_chain
+from .engine import ChainVerifyResult, Engine, FastenConfig
 from .store.repo import AuditRepository
 
 __all__ = [
@@ -37,7 +38,14 @@ __all__ = [
     "registry",
     # storage protocol
     "AuditRepository",
-    # P1-15: audit-store failure handling
+    # multi-tenant / isolated engine
+    "Engine",
+    # config dataclass
+    "FastenConfig",
+    # hash chain verification
+    "ChainVerifyResult",
+    "verify_chain",
+    # audit-store failure handling
     "AuditStoreError",
     "flush",
     "queue_stats",
@@ -48,6 +56,8 @@ __all__ = [
     # core
     "emit",
     "init",
+    "init_config",
+    "start",
     "log",
     # adopter hooks
     "audit_store",

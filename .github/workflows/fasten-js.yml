@@ -1,26 +1,25 @@
 name: JS SDK
 
 on:
-  # Restrict push to main + dev so PR branches don't run the suite
-  # twice (once for push, once for pull_request) on every commit.
   push:
     branches: [main, dev]
     paths:
       - 'js/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-js.yml'
   pull_request:
     paths:
       - 'js/**'
+      - 'store-core/**'
       - '.github/workflows/fasten-js.yml'
 
 permissions:
   contents: read
+  id-token: write   # required by codecov OIDC upload (tokenless for public repos)
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: node:24-alpine
 
     defaults:
       run:
@@ -29,10 +28,32 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install dev deps
-        # js-yaml is an optional peerDep / devDep — required by codes_yaml tests.
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build fasten-core (.so)
+        working-directory: store-core
+        run: cargo build --release --features all
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Unit tests
-        # node --test with no path auto-discovers **/*.test.mjs in cwd
-        run: node --test
+      - name: Lint (biome)
+        run: npx biome check src/
+
+      - name: Unit tests with coverage
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
+        run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: js/coverage/lcov.info
+          flags: js
+          fail_ci_if_error: false

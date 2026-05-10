@@ -14,30 +14,11 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::{AuditStore, Error, Row};
-
-/// Acquire a mutex even if it was poisoned by a previous panic.
-///
-/// The drainer is a long-lived background thread that holds invariant-
-/// preserving short critical sections (no partial-write states); a panic
-/// in adopter code (the store, the sys-log callback) must not kill the
-/// drainer's ability to make progress on every other emit. Mirrors the
-/// `unwrap_or_else(|e| e.into_inner())` pattern already used in
-/// `codes_yaml.rs` test reset and is the canonical "we know better"
-/// recovery on `LockResult`.
-trait LockOrRecover<T: ?Sized> {
-    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
-}
-
-impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
-    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
+use crate::{engine::{DrainerConfig, LockOrRecover, SysLogFn}, AuditStore, Error, Row};
 
 /// Same recovery applied to `Condvar::wait`. Inline at the two call
 /// sites — a trait method on `Condvar` would need to take the guard
@@ -74,6 +55,9 @@ pub struct QueueStats {
     pub retry_count_active: usize,
     pub in_backoff_seconds: f64,
     pub last_error: Option<String>,
+    pub dead_lettered_total: usize,
+    pub dead_letter_depth: usize,
+    pub capacity_semantics: &'static str,
 }
 
 /// Counting semaphore (no `std::sync::Semaphore` in stable yet).
@@ -128,15 +112,18 @@ struct Stats {
     warn_hw_fired: bool,
     err_hw_fired: bool,
     degraded_fired: bool,
+    dead_lettered_total: usize,
+    dlq: VecDeque<Row>,
 }
 
 pub(crate) struct DrainerInner {
     store: Arc<dyn AuditStore>,
-    sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
+    sys_log: SysLogFn,
     capacity: usize,
     retry_initial: Duration,
     retry_max: Duration,
     retry_jitter: bool,
+    max_attempts: usize,
 
     queue: Mutex<VecDeque<Row>>,
     queue_cv: Condvar,
@@ -154,22 +141,20 @@ pub(crate) struct Drainer {
 impl Drainer {
     pub(crate) fn new(
         store: Arc<dyn AuditStore>,
-        sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
-        capacity: usize,
-        retry_initial: Duration,
-        retry_max: Duration,
-        retry_jitter: bool,
+        sys_log: SysLogFn,
+        cfg: DrainerConfig,
     ) -> Arc<Self> {
         let inner = Arc::new(DrainerInner {
             store,
             sys_log,
-            capacity,
-            retry_initial,
-            retry_max,
-            retry_jitter,
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: cfg.capacity,
+            retry_initial: cfg.retry_initial,
+            retry_max: cfg.retry_max,
+            retry_jitter: cfg.retry_jitter,
+            max_attempts: cfg.max_attempts,
+            queue: Mutex::new(VecDeque::with_capacity(cfg.capacity)),
             queue_cv: Condvar::new(),
-            slots: Sem::new(capacity),
+            slots: Sem::new(cfg.capacity),
             stop: AtomicBool::new(false),
             stats: Mutex::new(Stats::default()),
         });
@@ -278,6 +263,9 @@ impl Drainer {
             retry_count_active: s.retry_count,
             in_backoff_seconds: in_backoff,
             last_error: s.last_error.clone(),
+            dead_lettered_total: s.dead_lettered_total,
+            dead_letter_depth: s.dlq.len(),
+            capacity_semantics: "block",
         }
     }
 
@@ -373,7 +361,9 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
         }
     };
 
+    let mut attempt = 0usize;
     loop {
+        attempt += 1;
         match inner.store.insert(&row) {
             Ok(()) => {
                 on_success(inner);
@@ -381,6 +371,11 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
                 break;
             }
             Err(e) => {
+                if attempt >= inner.max_attempts {
+                    on_dead_letter(inner, &row, attempt, &e);
+                    release_slot(&mut slot_released);
+                    break;
+                }
                 on_failure(inner, &e);
                 if in_shutdown {
                     // Shutdown contract: one attempt, abandon on
@@ -404,6 +399,29 @@ fn drain_one(inner: &Arc<DrainerInner>, row: Row, in_shutdown: bool) {
     if !slot_released {
         inner.slots.release();
     }
+}
+
+fn on_dead_letter(inner: &Arc<DrainerInner>, row: &Row, attempt: usize, err: &Error) {
+    let msg = err.to_string();
+    {
+        let mut s = inner.stats.lock_or_recover();
+        s.dead_lettered_total += 1;
+        s.retry_count = 0;
+        s.last_error = Some(msg.clone());
+        if s.dlq.len() >= 10 {
+            s.dlq.pop_front();
+        }
+        s.dlq.push_back(row.clone());
+    }
+    (inner.sys_log)(
+        "error",
+        "audit_drain_dead_letter",
+        &serde_json::json!({
+            "row_id": row.id,
+            "attempt_count": attempt,
+            "last_error": msg,
+        }),
+    );
 }
 
 fn on_failure(inner: &Arc<DrainerInner>, err: &Error) {
@@ -519,79 +537,18 @@ fn simple_random() -> f64 {
     ((v >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
-// ── Module-level singleton ─────────────────────────────────────────────────
+// ── Backward-compat shims ─────────────────────────────────────────────────
+//
+// The drainer singleton is now owned by `Engine`; see `engine.rs`.
+// These free functions delegate to `DEFAULT` so existing call sites
+// (tests, adopter shutdown paths) continue to work unchanged.
 
-static DRAINER: OnceLock<Mutex<Option<Arc<Drainer>>>> = OnceLock::new();
-
-fn drainer_slot() -> &'static Mutex<Option<Arc<Drainer>>> {
-    DRAINER.get_or_init(|| Mutex::new(None))
-}
-
-pub(crate) fn install_drainer(
-    store: Arc<dyn AuditStore>,
-    sys_log: Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
-    capacity: usize,
-    retry_initial: Duration,
-    retry_max: Duration,
-    retry_jitter: bool,
-) -> Arc<Drainer> {
-    // Race-safe re-init: build the new drainer FIRST, swap the global
-    // pointer atomically, then flush + shutdown the old one OUTSIDE the
-    // global lock. Concurrent submit()s see either the old drainer (and
-    // any post-stop put() now self-aborts via the stop check) or the
-    // new one — never a stopped-but-still-published one. Holding the
-    // lock through flush/shutdown (the prior shape) blocked every
-    // emit() for ~5 s during re-init.
-    let new = Drainer::new(
-        store,
-        sys_log,
-        capacity,
-        retry_initial,
-        retry_max,
-        retry_jitter,
-    );
-    let old = {
-        let mut slot = drainer_slot().lock_or_recover();
-        slot.replace(new.clone())
-    };
-    if let Some(old) = old {
-        old.flush(Duration::from_secs(5));
-        old.shutdown(Duration::from_secs(2));
-    }
-    new
-}
-
-/// Stop and drop the active drainer. Called automatically on next
-/// `init()`; exposed for tests + adopter shutdown paths that want to
-/// drop the drainer without reinitialising fasten.
-pub fn uninstall_drainer() {
-    // Symmetric with install_drainer: clear the global FIRST so
-    // concurrent submit() sees no drainer (and falls back to sync /
-    // raise per failure_strategy) instead of racing a half-stopped one.
-    let old = {
-        let mut slot = drainer_slot().lock_or_recover();
-        slot.take()
-    };
-    if let Some(d) = old {
-        d.shutdown(Duration::from_secs(2));
-    }
-}
-
-pub(crate) fn active_drainer() -> Option<Arc<Drainer>> {
-    drainer_slot().lock_or_recover().clone()
-}
+/// Stop and drop the active drainer.
+pub fn uninstall_drainer() { crate::DEFAULT.uninstall_drainer(); }
 
 /// Snapshot of the active drainer, or `None` in `raise` mode.
-pub fn queue_stats() -> Option<QueueStats> {
-    active_drainer().map(|d| d.stats())
-}
+pub fn queue_stats() -> Option<QueueStats> { crate::DEFAULT.queue_stats() }
 
-/// Block until pending audit rows drain, or `timeout` elapses. Returns
-/// true iff every queued row reached the store. Useful for k8s preStop
-/// hooks, CLI exit paths, and tests. No-op + true in `raise` mode.
-pub fn flush(timeout: Duration) -> bool {
-    match active_drainer() {
-        Some(d) => d.flush(timeout),
-        None => true,
-    }
-}
+/// Block until pending audit rows drain, or `timeout` elapses.
+/// No-op + true in `raise` mode.
+pub fn flush(timeout: Duration) -> bool { crate::DEFAULT.flush(timeout) }

@@ -27,7 +27,7 @@ fastapi = ["fastapi>=0.100", "starlette>=0.27"]
 mqtt = ["paho-mqtt>=2.1.0"]
 tui = ["rich>=13"]
 structlog = ["structlog>=25.5.0"]
-dev = ["pytest>=7", "ruff>=0.4", "mypy>=1.20.2", "pip-audit>=2.10.0"]
+dev = ["pytest>=7", "pytest-cov>=5", "ruff>=0.4", "mypy>=1.20.2", "types-PyYAML>=6", "pip-audit>=2.10.0"]
 
 [project.scripts]
 fasten     = "fasten.cli:main"
@@ -51,3 +51,21 @@ ignore_missing_imports = true
 disallow_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[tool.coverage.run]
+source = ["fasten"]
+omit = [
+  "fasten/cli/*",
+  "fasten/tui/*",
+  "fasten/shim/*",
+  "fasten/codes_yaml.py",
+  "fasten/reader/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
+
+[tool.coverage.xml]
+output = "coverage.xml"

@@ -116,7 +116,7 @@ describe('register', () => {
                                   severity: 'info', description: 'x',
                                   category: 'x', action: 'x', emitter: 't' },
             }),
-            /disagrees with meta\.id/,
+            /disagrees/,
         );
     });
 

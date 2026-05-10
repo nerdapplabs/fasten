@@ -11,7 +11,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush,
+    AuditStoreError, queueStats, flush, _clearRustRegistry,
 } from '../src/index.js';
 import { uninstallDrainer } from '../src/audit_queue.js';
 
@@ -65,6 +65,7 @@ const TEST_META = {
 
 beforeEach(() => {
     uninstallDrainer();
+    _clearRustRegistry();
     _reg().clear();
     register('user', TEST_META);
 });
@@ -149,11 +150,11 @@ test('outage then recovery drains pending rows', async () => {
 
 // ── #5 sys self-report ────────────────────────────────────────────────────
 
-test('drainer first failure emits warn to sys (captured via stdout)', async () => {
+test('drainer first failure emits warn to sys (captured via stderr)', async () => {
     const store = new FlakyStore(1);
     const captured = [];
-    const origWrite = process.stdout.write.bind(process.stdout);
-    process.stdout.write = (chunk, ...rest) => {
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
         try {
             const obj = JSON.parse(String(chunk).trim());
             if (obj.shape === 'sys') captured.push(obj);
@@ -169,7 +170,7 @@ test('drainer first failure emits warn to sys (captured via stdout)', async () =
         emit({ code: 'USER_CREATED', target: 'u-1' });
         assert.equal(await flush(2000), true);
     } finally {
-        process.stdout.write = origWrite;
+        process.stderr.write = origWrite;
     }
     const events = captured.map(r => r.event);
     assert.ok(events.includes('audit_drain_failed'),
@@ -181,8 +182,8 @@ test('drainer first failure emits warn to sys (captured via stdout)', async () =
 test('drainer degraded after 5 failures', async () => {
     const store = new BrokenStore();
     const captured = [];
-    const origWrite = process.stdout.write.bind(process.stdout);
-    process.stdout.write = (chunk, ...rest) => {
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
         try {
             const obj = JSON.parse(String(chunk).trim());
             if (obj.shape === 'sys') captured.push(obj);
@@ -202,7 +203,7 @@ test('drainer degraded after 5 failures', async () => {
             await new Promise(r => setTimeout(r, 50));
         }
     } finally {
-        process.stdout.write = origWrite;
+        process.stderr.write = origWrite;
     }
     assert.ok(
         captured.some(r => r.event === 'audit_drain_degraded'),
@@ -213,8 +214,8 @@ test('drainer degraded after 5 failures', async () => {
 test('queue high water emits warn at 50%', async () => {
     const store = new BrokenStore();
     const captured = [];
-    const origWrite = process.stdout.write.bind(process.stdout);
-    process.stdout.write = (chunk, ...rest) => {
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
         try {
             const obj = JSON.parse(String(chunk).trim());
             if (obj.shape === 'sys') captured.push(obj);
@@ -230,7 +231,7 @@ test('queue high water emits warn at 50%', async () => {
         for (let i = 0; i < 2; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
         await new Promise(r => setTimeout(r, 100));
     } finally {
-        process.stdout.write = origWrite;
+        process.stderr.write = origWrite;
     }
     assert.ok(
         captured.some(r => r.event === 'audit_queue_high_water'),

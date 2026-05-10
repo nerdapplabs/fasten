@@ -1,0 +1,57 @@
+name: Rust SDK
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/fasten-rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/fasten-rust.yml'
+
+permissions:
+  contents: read
+  id-token: write   # required by codecov OIDC upload (tokenless for public repos)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.85
+
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clippy
+        run: rustup component add clippy
+
+      - name: Lint (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --quiet
+
+      - name: Install llvm-tools for coverage
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage
+        run: cargo llvm-cov --lcov --output-path coverage.lcov
+
+      - name: Install Codecov runtime deps
+        run: apt-get update -qq && apt-get install -y --no-install-recommends gpg
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: rust/coverage.lcov
+          flags: rust
+          fail_ci_if_error: false

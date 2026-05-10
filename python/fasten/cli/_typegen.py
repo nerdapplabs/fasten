@@ -23,7 +23,7 @@ from typing import Any
 
 def _yaml_loader() -> Any:
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml
     except ImportError as e:
         raise RuntimeError(
             "fasten codes typegen requires pyyaml; install with: pip install pyyaml"

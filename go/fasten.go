@@ -19,18 +19,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"regexp"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
-
-// codeKeyRe validates audit-code identifiers — UPPER_SNAKE_CASE.
-var codeKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 type Severity string
@@ -109,6 +101,7 @@ const (
 
 // Row is the canonical audit row — lossless conversion to CloudEvent / OTel.
 type Row struct {
+	WireVersion  string         `json:"wire_version"`
 	ID           string         `json:"id"`
 	OriginID     string         `json:"origin_id"`
 	MonotonicSeq int64          `json:"monotonic_seq"`
@@ -118,7 +111,9 @@ type Row struct {
 	Severity     Severity       `json:"severity"`
 	ServiceID    string         `json:"service_id"`
 	SourceNodeID string         `json:"source_node_id"`
-	TenantID     string         `json:"tenant_id,omitempty"`
+	// TenantID is always emitted (null when absent) per the "always emit the
+	// key" convention so readers see a consistent shape across SDKs.
+	TenantID     *string        `json:"tenant_id"`
 	Actor        string         `json:"actor"`
 	ActorKind    string         `json:"actor_kind"`
 	Target       string         `json:"target"`
@@ -127,8 +122,7 @@ type Row struct {
 	Method       string         `json:"method"`
 	RequestID    string         `json:"request_id"`
 	Detail       map[string]any `json:"detail"`
-	// P1-5: stamped true when the code declares PiiInDetail=true. Lets the
-	// retention sweep + compliance reports filter PII rows distinctly.
+	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
 }
@@ -173,17 +167,91 @@ type Meta struct {
 }
 
 var (
-	regMu      sync.RWMutex
-	_registry  = map[Code]Meta{}
+	regMu     sync.RWMutex
+	_registry = map[Code]Meta{}
 )
+
+// rustMeta is the JSON shape the Rust catalog engine expects and returns.
+type rustMeta struct {
+	Domain                string   `json:"domain"`
+	Category              string   `json:"category"`
+	Action                string   `json:"action"`
+	Severity              string   `json:"severity"`
+	Description           string   `json:"description"`
+	Emitter               string   `json:"emitter"`
+	ID                    string   `json:"id"`
+	RetentionClass        string   `json:"retention_class"`
+	HighVolume            bool     `json:"high_volume"`
+	PiiInDetail           bool     `json:"pii_in_detail"`
+	DetailPassthroughKeys []string `json:"detail_passthrough_keys"`
+}
+
+func marshalCodesForRust(domain string, codes map[Code]Meta) (string, error) {
+	m := make(map[string]rustMeta, len(codes))
+	for k, meta := range codes {
+		rc := string(meta.RetentionClass)
+		if rc == "" {
+			rc = "medium"
+		}
+		passthrough := meta.DetailPassthroughKeys
+		if passthrough == nil {
+			passthrough = []string{}
+		}
+		m[string(k)] = rustMeta{
+			Domain:                string(meta.Domain),
+			Category:              meta.Category,
+			Action:                meta.Action,
+			Severity:              string(meta.Severity),
+			Description:           meta.Description,
+			Emitter:               meta.Emitter,
+			ID:                    string(meta.ID),
+			RetentionClass:        rc,
+			HighVolume:            meta.HighVolume,
+			PiiInDetail:           meta.PiiInDetail,
+			DetailPassthroughKeys: passthrough,
+		}
+	}
+	b, err := json.Marshal(m)
+	return string(b), err
+}
+
+func unmarshalMetaJSON(s string) (Meta, bool) {
+	var rm rustMeta
+	if err := json.Unmarshal([]byte(s), &rm); err != nil {
+		return Meta{}, false
+	}
+	return Meta{
+		ID:                    Code(rm.ID),
+		Domain:                Domain(rm.Domain),
+		Category:              rm.Category,
+		Action:                rm.Action,
+		Severity:              Severity(rm.Severity),
+		Description:           rm.Description,
+		Emitter:               rm.Emitter,
+		RetentionClass:        RetentionClass(rm.RetentionClass),
+		HighVolume:            rm.HighVolume,
+		PiiInDetail:           rm.PiiInDetail,
+		DetailPassthroughKeys: rm.DetailPassthroughKeys,
+	}, true
+}
+
+// clearBothRegistries clears the Go-side cache and the Rust global registry.
+// For test teardown only — do not call in production code.
+func clearBothRegistries() {
+	regMu.Lock()
+	for k := range _registry {
+		delete(_registry, k)
+	}
+	regMu.Unlock()
+	coreRegistryClear()
+}
 
 // Register adds a batch of codes for a domain.
 //
-// Validation runs in this order; first failure returns an error:
-//   - key shape: UPPER_SNAKE_CASE identifier
-//   - Meta.ID empty → fill from map key; set → must match key
-//   - Meta.Domain must match domain
-//   - duplicate code across registrations
+// All validation (UPPER_SNAKE_CASE key shape, Meta.ID fill/mismatch,
+// domain match, duplicate detection, pii_in_detail→RetShort) is delegated
+// to fasten-core (Rust) so the logic is canonical across all SDKs.
+// On success the Go-side cache is populated from the Rust-validated state.
 //
 // Drop Meta.ID in new code; the map key is the single source of truth:
 //
@@ -191,38 +259,22 @@ var (
 //	    "USER_CREATED": {Domain: "user", Action: "create", Severity: fasten.SevInfo, ...},
 //	})
 func Register(domain Domain, codes map[Code]Meta) error {
+	codesJSON, err := marshalCodesForRust(string(domain), codes)
+	if err != nil {
+		return fmt.Errorf("fasten.Register: %w", err)
+	}
+	if err := coreRegisterCodes(string(domain), codesJSON); err != nil {
+		return err // already prefixed with "fasten.Register: "
+	}
 	regMu.Lock()
 	defer regMu.Unlock()
-	for c, m := range codes {
-		if !codeKeyRe.MatchString(string(c)) {
-			return fmt.Errorf("fasten.Register: code key %q must be UPPER_SNAKE_CASE", c)
+	for name := range codes {
+		metaJSON, _ := coreMetaOfJSON(string(name))
+		if metaJSON != "" && metaJSON != "{}" {
+			if m, ok := unmarshalMetaJSON(metaJSON); ok {
+				_registry[name] = m
+			}
 		}
-		if m.ID == "" {
-			m.ID = c
-		} else if m.ID != c {
-			return fmt.Errorf(
-				"fasten.Register: map key %q disagrees with Meta.ID=%q. "+
-					"Drop Meta.ID (it fills from the key) or fix the mismatch.",
-				c, m.ID,
-			)
-		}
-		if m.Domain != domain {
-			return fmt.Errorf("fasten.Register: code %q declares domain %q but registered under %q", c, m.Domain, domain)
-		}
-
-		// P1-5 #1: PiiInDetail forces RetentionClass=RetShort.
-		if m.PiiInDetail && m.RetentionClass != RetShort && m.RetentionClass != "" {
-			fmt.Fprintf(os.Stderr,
-				"fasten: code %s has PiiInDetail=true; "+
-					"RetentionClass forced to short (was %s).\n",
-				c, m.RetentionClass)
-			m.RetentionClass = RetShort
-		}
-
-		if _, exists := _registry[c]; exists {
-			return fmt.Errorf("fasten.Register: duplicate code %q", c)
-		}
-		_registry[c] = m
 	}
 	return nil
 }
@@ -267,17 +319,7 @@ func RequestIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// ── Init + globals ────────────────────────────────────────────────────────
-
-var (
-	_serviceID        string
-	_nodeID           string
-	_tenantID         string
-	_auditStore       AuditRepository
-	_transport        *Transport
-	_seq              int64
-	_failureStrategy  string // "queue" (P1-15 default) | "raise"
-)
+// ── Init + free-function wrappers ─────────────────────────────────────────
 
 // Config for Init. AuditStore nil → audit rows are written to stdout only.
 //
@@ -306,207 +348,33 @@ type Config struct {
 	QueueRetryInitial         time.Duration // default 100 * time.Millisecond
 	QueueRetryMax             time.Duration // default 60 * time.Second
 	DisableQueueJitter        bool          // zero (default) = jitter ON
+	QueueDrainMaxAttempts     int           // default 50; row → DLQ after this many failures
 }
 
-// Init configures fasten. Must be called once before Emit.
-// Falls back to env vars FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_TENANT_ID,
-// and FASTEN_AUDIT_STORE_FAILURE_STRATEGY.
-func Init(cfg Config) error {
-	_serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
-	_nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
-	_tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
+// Init configures fasten. Delegates to Default.Init.
+func Init(cfg Config) error { return Default.Init(cfg) }
 
-	if _serviceID == "" || _nodeID == "" {
-		return errors.New("fasten.Init: ServiceID and NodeID are required")
-	}
-	_auditStore = cfg.AuditStore
-	_transport = NewTransport(2000)
+// GetTransport returns the active transport of the Default engine.
+func GetTransport() *Transport { return Default.GetTransport() }
 
-	// P1-15: failure strategy + drainer wiring.
-	// Lowercase before the switch so callers passing "Queue" / "RAISE"
-	// (or env var FASTEN_AUDIT_STORE_FAILURE_STRATEGY="Queue") match
-	// Python's case-insensitive parity contract instead of silently
-	// failing init.
-	strategy := strings.ToLower(firstNonEmpty(
-		cfg.AuditStoreFailureStrategy,
-		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
-		"queue",
-	))
-	switch strategy {
-	case "queue", "raise":
-	default:
-		return fmt.Errorf(
-			"fasten.Init: AuditStoreFailureStrategy must be %q or %q (got %q)",
-			"queue", "raise", strategy,
-		)
-	}
-	_failureStrategy = strategy
+// Flush blocks until the Default engine's pending rows drain.
+func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
 
-	if strategy == "queue" && _auditStore != nil {
-		capacity := cfg.QueueCapacity
-		if capacity <= 0 {
-			capacity = 100
-		}
-		retryInitial := cfg.QueueRetryInitial
-		if retryInitial <= 0 {
-			retryInitial = 100 * time.Millisecond
-		}
-		retryMax := cfg.QueueRetryMax
-		if retryMax <= 0 {
-			retryMax = 60 * time.Second
-		}
-		installDrainer(
-			_auditStore,
-			drainerSysLog,
-			capacity,
-			retryInitial,
-			retryMax,
-			!cfg.DisableQueueJitter,
-		)
-	} else {
-		// Raise mode (or no store) — no drainer thread.
-		uninstallDrainer()
-	}
-	return nil
-}
-
-// drainerSysLog bridges the drainer to the sys stream. Non-recursive:
-// writes to the in-memory ring + stdout only, never through Emit.
-func drainerSysLog(level, event string, fields map[string]any) {
-	row := SyslogRow{
-		"level":      level,
-		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"request_id": "",
-		"service_id": _serviceID,
-	}
-	for k, v := range fields {
-		row[k] = v
-	}
-	if _transport != nil {
-		_transport.PushSyslog(row)
-	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
-		fmt.Println(string(b))
-	}
-}
-
-// Transport returns the active transport (ring buffers + stdout).
-// Returns nil before Init is called.
-func GetTransport() *Transport { return _transport }
+// GetQueueStats returns the Default engine's drainer snapshot.
+func GetQueueStats() *QueueStats { return Default.GetQueueStats() }
 
 // ── Emit options ──────────────────────────────────────────────────────────
 
 type EmitOption func(*Row)
 
-func Target(t string) EmitOption        { return func(r *Row) { r.Target = t } }
-func Actor(a, kind string) EmitOption   { return func(r *Row) { r.Actor = a; r.ActorKind = kind } }
+func Target(t string) EmitOption             { return func(r *Row) { r.Target = t } }
+func Actor(a, kind string) EmitOption        { return func(r *Row) { r.Actor = a; r.ActorKind = kind } }
 func WithDetail(d map[string]any) EmitOption { return func(r *Row) { r.Detail = d } }
-func WithMethod(m string) EmitOption    { return func(r *Row) { r.Method = m } }
+func WithMethod(m string) EmitOption         { return func(r *Row) { r.Method = m } }
 
-// ── Emit ──────────────────────────────────────────────────────────────────
-
-// Emit produces an audit row for a registered code.
-// Returns an error if Init has not been called or the code is not registered.
+// Emit produces an audit row via the Default engine.
 func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
-	if _serviceID == "" {
-		return Row{}, errors.New("fasten.Init() must be called before Emit()")
-	}
-	m, ok := metaOf(code)
-	if !ok {
-		return Row{}, fmt.Errorf("fasten: unknown audit code %q — call Register() first", code)
-	}
-
-	rid := RequestIDFromContext(ctx)
-	if rid == "" {
-		rid = MintID()
-	}
-
-	seq := atomic.AddInt64(&_seq, 1)
-	id := "evt-" + mintLong()
-
-	row := Row{
-		ID:           id,
-		OriginID:     id,
-		MonotonicSeq: seq,
-		Timestamp:    time.Now().UTC(),
-		Code:         code,
-		Action:       m.Action,
-		Severity:     m.Severity,
-		ServiceID:    _serviceID,
-		SourceNodeID: _nodeID,
-		TenantID:     _tenantID,
-		Actor:        "system",
-		ActorKind:    "service",
-		Target:       "",
-		Category:     m.Category,
-		Domain:       m.Domain,
-		Method:       "sdk",
-		RequestID:    rid,
-		Detail:       map[string]any{},
-		PiiInDetail:  m.PiiInDetail,
-	}
-	for _, opt := range opts {
-		opt(&row)
-	}
-
-	// P1-5 #2: PiiInDetail force-redacts the entire detail map regardless
-	// of key names. Adopters who genuinely need fields preserved declare
-	// them in Meta.DetailPassthroughKeys.
-	if m.PiiInDetail {
-		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
-		for _, k := range m.DetailPassthroughKeys {
-			passthrough[k] = true
-		}
-		kept := map[string]any{}
-		for k, v := range row.Detail {
-			if passthrough[k] {
-				kept[k] = v
-			}
-		}
-		// Run the secret-key redactor on the kept subset (api_key etc.
-		// is scrubbed even when in passthrough).
-		kept = RedactDetail(kept)
-		kept["_redacted"] = "***"
-		kept["_pii_in_detail"] = true
-		row.Detail = kept
-	} else {
-		row.Detail = RedactDetail(row.Detail)
-	}
-
-	// Stdout write happens BEFORE any store routing. Two reasons:
-	//   1. Under sustained queue-full outage, drainer.put() blocks. If
-	//      stdout came after, even Docker / journald log capture stalls
-	//      — adopters lose the recoverable audit trail at the worst
-	//      possible moment.
-	//   2. In raise mode, the row should still reach stdout even if the
-	//      sync insert errors — preserves the "stdout is always honest"
-	//      contract.
-	if _transport != nil {
-		_transport.WriteAudit(rowToMap(row))
-	}
-
-	// P1-15: route store insert through the drainer (queue mode) or
-	// call synchronously and wrap the store error (raise mode).
-	if _auditStore != nil {
-		if _failureStrategy == "queue" {
-			d := activeDrainer()
-			if d != nil {
-				d.put(row)
-			} else {
-				// Defensive fallback — strategy says queue but drainer
-				// isn't installed (e.g. tests bypassed Init). Sync
-				// insert so the row isn't silently dropped.
-				_ = _auditStore.Insert(ctx, row)
-			}
-		} else {
-			if err := _auditStore.Insert(ctx, row); err != nil {
-				return row, &AuditStoreError{Err: err}
-			}
-		}
-	}
-	return row, nil
+	return Default.Emit(ctx, code, opts...)
 }
 
 // ── Built-in structured log (sys stream) ─────────────────────────────────
@@ -516,36 +384,12 @@ func Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
 // For a slog handler integration that still chains to your existing slog
 // pipeline, see NewSlogHandler in slog.go.
 
-// LogInfo writes a {shape:"sys"} NDJSON line to stdout.
+// LogInfo / LogWarn / LogError / LogDebug write {shape:"sys"} NDJSON lines.
 // Pairs come as key1, value1, key2, value2, ... (slog-style).
-func LogInfo(ctx context.Context, event string, kv ...any)  { logSys(ctx, "info", event, kv) }
-func LogWarn(ctx context.Context, event string, kv ...any)  { logSys(ctx, "warn", event, kv) }
-func LogError(ctx context.Context, event string, kv ...any) { logSys(ctx, "error", event, kv) }
-func LogDebug(ctx context.Context, event string, kv ...any) { logSys(ctx, "debug", event, kv) }
-
-func logSys(ctx context.Context, level, event string, kv []any) {
-	row := SyslogRow{
-		"level":      level,
-		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"request_id": RequestIDFromContext(ctx),
-		"service_id": _serviceID,
-	}
-	for i := 0; i+1 < len(kv); i += 2 {
-		k, ok := kv[i].(string)
-		if !ok {
-			continue
-		}
-		row[k] = kv[i+1]
-	}
-	if _transport != nil {
-		_transport.PushSyslog(row)
-	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
-		fmt.Println(string(b))
-	}
-}
+func LogInfo(ctx context.Context, event string, kv ...any)  { Default.LogSys(ctx, "info", event, kv) }
+func LogWarn(ctx context.Context, event string, kv ...any)  { Default.LogSys(ctx, "warn", event, kv) }
+func LogError(ctx context.Context, event string, kv ...any) { Default.LogSys(ctx, "error", event, kv) }
+func LogDebug(ctx context.Context, event string, kv ...any) { Default.LogSys(ctx, "debug", event, kv) }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -566,10 +410,13 @@ func firstNonEmpty(vals ...string) string {
 
 func rowToMap(r Row) map[string]any {
 	d := map[string]any{
+		"wire_version": r.WireVersion,
 		"id": r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
 		"timestamp": r.Timestamp.Format(time.RFC3339Nano),
 		"code": string(r.Code), "action": r.Action, "severity": string(r.Severity),
-		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": r.TenantID,
+		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": func() any {
+			if r.TenantID != nil { return *r.TenantID }; return nil
+		}(),
 		"actor": r.Actor, "actor_kind": r.ActorKind,
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
@@ -582,6 +429,13 @@ func rowToMap(r Row) map[string]any {
 }
 
 // ── AuditRepository interface ─────────────────────────────────────────────
+
+// SeqSeeder is an optional extension of AuditRepository. Stores that implement
+// it allow Init() to seed monotonic_seq from persisted rows so post-restart
+// rows never collide on (timestamp, seq) with pre-restart rows.
+type SeqSeeder interface {
+	MaxMonotonicSeq(ctx context.Context) (int64, error)
+}
 
 // AuditRepository is the durable store contract.
 type AuditRepository interface {

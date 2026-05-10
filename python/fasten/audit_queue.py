@@ -21,12 +21,11 @@ full design + acceptance criteria.
 """
 from __future__ import annotations
 
-import atexit
-import queue
+import collections
 import random
 import threading
 import time
-from datetime import datetime, timezone
+
 from typing import Any, Callable, Optional
 
 
@@ -62,6 +61,9 @@ class _AuditQueueDrainer:
     # Drainer reports "degraded" once retry_count crosses this floor.
     _DEGRADED_AFTER = 5
 
+    # Default max insert attempts before a row is dead-lettered.
+    _MAX_ATTEMPTS = 50
+
     def __init__(
         self,
         store: Any,
@@ -71,6 +73,7 @@ class _AuditQueueDrainer:
         retry_initial_ms: int = 100,
         retry_max_ms: int = 60_000,
         retry_jitter: bool = True,
+        max_attempts: int = 50,
     ) -> None:
         self._store = store
         # sys_log(level, event, fields) — non-recursive: writes to ring +
@@ -80,23 +83,15 @@ class _AuditQueueDrainer:
         self._retry_initial_ms = retry_initial_ms
         self._retry_max_ms = retry_max_ms
         self._retry_jitter = retry_jitter
+        self._max_attempts = max_attempts
 
-        # Capacity is enforced by a semaphore over (queued + in-flight) rows
-        # rather than just queue depth. A row the drainer is currently
-        # retrying still occupies an audit-pipeline slot — emit() must
-        # block until that retry succeeds, otherwise an outage with even a
-        # single in-flight row makes "capacity" a lie.
-        self._q: queue.Queue[Any] = queue.Queue()
-        self._slots = threading.Semaphore(capacity)
-        # Parallel counter for occupied slots — incremented after a slot
-        # is acquired, decremented before it is released. Used by
-        # _used_slots() / stats() / flush() so callers don't have to read
-        # threading.Semaphore._value (a CPython implementation detail).
-        # All access goes through _stats_lock for consistency with the
-        # rest of the stats fields.
-        self._used_slots_count = 0
+        self._q: collections.deque = collections.deque()
         self._stop = threading.Event()
         self._stats_lock = threading.Lock()
+        # _cond wraps _stats_lock so `with self._cond` ≡ `with self._stats_lock`.
+        # _permits counts free capacity slots; decremented on put, incremented on release.
+        self._cond = threading.Condition(self._stats_lock)
+        self._permits: int = capacity
 
         # Stats — readable via queue_stats()
         self._high_water = 0
@@ -105,9 +100,10 @@ class _AuditQueueDrainer:
         self._in_backoff_until = 0.0  # monotonic ts; 0 = not in backoff
         self._last_error: Optional[str] = None
         self._failure_burst_started_at: Optional[float] = None
-        # In-flight = row popped from queue but not yet inserted. Tracked so
-        # flush() doesn't return prematurely while a slow insert is mid-call.
-        self._in_flight = 0
+        # Dead-letter queue: bounded ring of rows that exceeded max_attempts.
+        # Oldest falls off automatically (maxlen). Access under _stats_lock.
+        self._dlq: collections.deque = collections.deque(maxlen=10)
+        self._dead_lettered_total = 0
 
         # Threshold debouncing — only emit transition once per crossing.
         self._warn_high_water_emitted = False
@@ -122,74 +118,51 @@ class _AuditQueueDrainer:
     # ── Public API ─────────────────────────────────────────────────────────
 
     def put(self, row: Any) -> None:
-        """Push a row onto the queue. Blocks if all capacity slots are taken
-        (queued + in-flight retry combined). If the drainer has been
-        signalled to stop (re-init swap or shutdown), emit
-        ``audit_drain_abandoned`` and return without enqueueing — the
-        row would otherwise stall on a semaphore the drainer will
-        never service."""
+        """Push a row onto the queue. Blocks if all capacity slots are taken.
+        If the drainer has been signalled to stop (re-init swap or shutdown),
+        emit ``audit_drain_abandoned`` and return without enqueueing."""
         if self._stop.is_set():
-            self._sys_log(
-                "error",
-                "audit_drain_abandoned",
-                {"reason": "drainer_stopped",
-                 "row_id": getattr(row, "id", None)},
-            )
+            self._sys_log("error", "audit_drain_abandoned", {"reason": "drainer_stopped", "row_id": getattr(row, "id", None)})
             return
-        # Block until a slot frees up. The drainer releases the permit only
-        # on successful insert (or shutdown abandon), so emit() blocks while
-        # an in-flight row is in retry-backoff — capacity really means
-        # "max audit work pending", not just "max queued".
-        self._slots.acquire()
-        self._q.put(row)
-        cap = self._capacity
-        with self._stats_lock:
-            self._used_slots_count += 1
-            used = self._used_slots_count
+        with self._cond:
+            while self._permits == 0 and not self._stop.is_set():
+                self._cond.wait(timeout=0.1)
+            if self._stop.is_set():
+                self._sys_log("error", "audit_drain_abandoned", {"reason": "drainer_stopped", "row_id": getattr(row, "id", None)})
+                return
+            self._permits -= 1
+            self._q.append(row)
+            used = self._capacity - self._permits
             if used > self._high_water:
                 self._high_water = used
-        # Threshold sys-log fires AFTER the row is pending so the warn lands
-        # the moment used capacity crosses 50 % / 80 %, not the emit-after.
-        if cap > 0:
-            pct = used / cap
-            if pct >= self._HIGH_WATER_ERR_PCT and not self._err_high_water_emitted:
-                self._err_high_water_emitted = True
-                self._sys_log(
-                    "error",
-                    "audit_queue_near_full",
-                    {"depth": used, "capacity": cap},
-                )
-            elif pct >= self._HIGH_WATER_WARN_PCT and not self._warn_high_water_emitted:
-                self._warn_high_water_emitted = True
-                self._sys_log(
-                    "warn",
-                    "audit_queue_high_water",
-                    {"depth": used, "capacity": cap},
-                )
-            elif pct < self._HIGH_WATER_WARN_PCT:
-                # Reset watermarks once depth recovers below 50 % so a new
-                # surge re-emits the leading-indicator warn.
-                self._warn_high_water_emitted = False
-                self._err_high_water_emitted = False
+            fire_near_full = False
+            fire_high_water = False
+            if self._capacity > 0:
+                pct = used / self._capacity
+                if pct >= self._HIGH_WATER_ERR_PCT and not self._err_high_water_emitted:
+                    self._err_high_water_emitted = True
+                    fire_near_full = True
+                elif pct >= self._HIGH_WATER_WARN_PCT and not self._warn_high_water_emitted:
+                    self._warn_high_water_emitted = True
+                    fire_high_water = True
+                elif pct < self._HIGH_WATER_WARN_PCT:
+                    self._warn_high_water_emitted = False
+                    self._err_high_water_emitted = False
+            self._cond.notify()
+        # Fire sys_log outside the lock (sys_log must not re-acquire it)
+        if fire_near_full:
+            self._sys_log("error", "audit_queue_near_full", {"depth": used, "capacity": self._capacity})
+        elif fire_high_water:
+            self._sys_log("warn", "audit_queue_high_water", {"depth": used, "capacity": self._capacity})
 
     def _used_slots(self) -> int:
-        # Reads the parallel counter (kept in sync with semaphore
-        # acquire/release) instead of poking at Semaphore._value, which
-        # is a CPython implementation detail.
         with self._stats_lock:
-            return self._used_slots_count
+            return self._capacity - self._permits
 
     def _release_slot(self) -> None:
-        """Release a slot permit + decrement the parallel counter atomically.
-
-        Decrement BEFORE the semaphore release so a put() that wakes up on
-        the freed permit reads a consistent counter. The reverse order
-        leaves a brief window where another emit() acquires a permit but
-        sees the OLD count, briefly over-reporting `used`.
-        """
-        with self._stats_lock:
-            self._used_slots_count -= 1
-        self._slots.release()
+        with self._cond:
+            self._permits += 1
+            self._cond.notify_all()
 
     def stats(self) -> dict[str, Any]:
         """Snapshot of queue + drainer state. See P1-15 spec for fields.
@@ -198,16 +171,20 @@ class _AuditQueueDrainer:
         because that is what determines whether the next emit() blocks.
         """
         with self._stats_lock:
+            depth = self._capacity - self._permits
             now = time.monotonic()
             in_backoff = max(0.0, self._in_backoff_until - now)
             return {
-                "depth": self._used_slots_count,
+                "depth": depth,
                 "capacity": self._capacity,
                 "high_water": self._high_water,
                 "drained_total": self._drained_total,
                 "retry_count_active": self._retry_count,
                 "in_backoff_seconds": round(in_backoff, 3),
                 "last_error": self._last_error,
+                "dead_lettered_total": self._dead_lettered_total,
+                "dead_letter_depth": len(self._dlq),
+                "capacity_semantics": "block",
             }
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -229,15 +206,10 @@ class _AuditQueueDrainer:
         not extend the flush horizon, otherwise a steady incoming rate
         ≥ drain rate would keep flush() blocked until timeout even
         though every row pending at call time was successfully drained.
-
-        Implementation: snapshot `drained_total + used_slots` under the
-        stats lock at call time → that is the value `drained_total` must
-        reach for everything-pending-now to have drained. Any row added
-        after the snapshot only bumps `drained_total` AFTER our target
-        is met, so it cannot block the flush.
         """
         with self._stats_lock:
-            target = self._drained_total + self._used_slots_count
+            depth = self._capacity - self._permits
+            target = self._drained_total + depth
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._stats_lock:
@@ -250,45 +222,44 @@ class _AuditQueueDrainer:
     # ── Drainer loop ───────────────────────────────────────────────────────
 
     def _run(self) -> None:
-        # The drainer always honours the stop event. Even when the queue is
-        # empty we use a short get-with-timeout so stop() returns promptly.
         while not self._stop.is_set():
-            try:
-                row = self._q.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            with self._cond:
+                while not self._q and not self._stop.is_set():
+                    self._cond.wait(timeout=0.1)
+                if not self._q:
+                    continue
+                row = self._q.popleft()
             self._drain_one(row)
 
         # Stop signalled — best-effort drain of remaining rows so atexit
         # doesn't lose them. We honour backoff but skip the long sleep so
         # process shutdown isn't held up by a 60 s wait.
         while True:
-            try:
-                row = self._q.get_nowait()
-            except queue.Empty:
-                return
+            with self._cond:
+                if not self._q:
+                    return
+                row = self._q.popleft()
             self._drain_one(row, in_shutdown=True)
 
     def _drain_one(self, row: Any, *, in_shutdown: bool = False) -> None:
-        # in_flight tracks "popped from queue but not yet inserted" so flush()
-        # can't return prematurely while a slow insert is mid-call. The
-        # capacity semaphore permit travels with the row from emit() →
-        # queue → drainer; we release it only on successful insert (or
-        # shutdown abandonment), so emit() blocks while a row is in retry.
-        with self._stats_lock:
-            self._in_flight += 1
         slot_released = False
+        attempt = 0
         try:
             while True:
+                attempt += 1
                 try:
                     self._store.insert(row)
                 except Exception as e:  # noqa: BLE001 — drainer must catch all
+                    if attempt >= self._max_attempts:
+                        # Row cannot be inserted after max_attempts. Move it to
+                        # the DLQ ring so the pipeline makes progress on others.
+                        self._on_dead_letter(row, attempt, e)
+                        self._release_slot()
+                        slot_released = True
+                        return
                     self._on_failure(e)
                     if in_shutdown:
-                        # Process is exiting; one attempt is enough. The row
-                        # is lost (matches best-effort shutdown contract).
-                        # Release the slot so any blocked emit() can proceed
-                        # before atexit returns.
+                        # Process is exiting; one attempt is enough.
                         self._release_slot()
                         slot_released = True
                         return
@@ -304,8 +275,6 @@ class _AuditQueueDrainer:
                 slot_released = True
                 return
         finally:
-            with self._stats_lock:
-                self._in_flight -= 1
             if not slot_released:
                 # Defensive: guarantee no permit leak under unexpected exits.
                 self._release_slot()
@@ -360,6 +329,20 @@ class _AuditQueueDrainer:
                 {"recovery_after_seconds": round(recovered_after, 3)},
             )
 
+    def _on_dead_letter(self, row: Any, attempt: int, err: Exception) -> None:
+        msg = f"{type(err).__name__}: {err}"
+        row_id = getattr(row, "id", None)
+        with self._stats_lock:
+            self._dlq.appendleft(row)
+            self._dead_lettered_total += 1
+            self._retry_count = 0
+            self._last_error = msg
+        self._sys_log("error", "audit_drain_dead_letter", {
+            "row_id": row_id,
+            "attempt_count": attempt,
+            "last_error": msg,
+        })
+
     def _wait_backoff(self) -> bool:
         """Sleep the current backoff window; return True if stop was signalled."""
         with self._stats_lock:
@@ -381,13 +364,17 @@ class _AuditQueueDrainer:
         return self._stop.wait(timeout=delay_s)
 
 
-# ── Module-level singleton wired by emit.init() ─────────────────────────────
+# ── Backward-compat shims ─────────────────────────────────────────────────────
+#
+# The module-level singleton (``_drainer``, ``install``, ``uninstall``, …)
+# has been replaced by ``Engine`` (see ``fasten/engine.py``).  These shims
+# delegate to the default Engine so existing call sites (tests, reader,
+# conftest) continue to work without modification.
 
-_drainer: Optional[_AuditQueueDrainer] = None
-_atexit_registered = False
 
-
-_install_lock = threading.Lock()
+def _default_engine() -> Any:
+    from .emitter import _default
+    return _default
 
 
 def install(
@@ -398,93 +385,43 @@ def install(
     retry_initial_ms: int,
     retry_max_ms: int,
     retry_jitter: bool,
+    max_attempts: int = 50,
 ) -> _AuditQueueDrainer:
-    """Replace the active drainer (called from ``init()``).
-
-    Race-safe re-init: the new drainer is built and the global pointer
-    swapped under a lock BEFORE the old drainer is flushed and stopped.
-    Concurrent ``emit()`` calls during re-init see either the old or the
-    new drainer — never a stopped-but-still-published one. The old
-    drainer is flushed (so pending rows reach the store) then stopped;
-    if a stale ``put()`` lands on it after stop, it emits
-    ``audit_drain_abandoned`` instead of stalling on the slot semaphore.
-    """
-    global _drainer, _atexit_registered
-    new_drainer = _AuditQueueDrainer(
+    eng = _default_engine()
+    eng._install_drainer(
         store=store,
-        sys_log=sys_log,
         capacity=capacity,
         retry_initial_ms=retry_initial_ms,
         retry_max_ms=retry_max_ms,
         retry_jitter=retry_jitter,
+        max_attempts=max_attempts,
     )
-    with _install_lock:
-        old = _drainer
-        _drainer = new_drainer
-    if old is not None:
-        old.flush(timeout=5.0)
-        old.stop(timeout=2.0)
-    if not _atexit_registered:
-        atexit.register(_atexit_flush)
-        _atexit_registered = True
-    return new_drainer
+    return eng._drainer
 
 
 def uninstall() -> None:
-    """Stop the active drainer and clear it (test helper).
-
-    Symmetric with ``install``: clear the global pointer BEFORE
-    stopping, so concurrent ``emit()`` sees no drainer (and falls back
-    to the sync path) rather than racing against a half-stopped one.
-    """
-    global _drainer
-    with _install_lock:
-        old = _drainer
-        _drainer = None
-    if old is not None:
-        old.stop(timeout=2.0)
+    """Stop the default Engine's drainer (test helper)."""
+    _default_engine()._uninstall_drainer()
 
 
 def active() -> Optional[_AuditQueueDrainer]:
-    """Return the active drainer, if any."""
-    return _drainer
+    """Return the default Engine's active drainer, if any."""
+    return _default_engine()._drainer
 
 
 def queue_stats() -> Optional[dict[str, Any]]:
-    """Snapshot of queue + drainer state. None when ``raise`` mode is active."""
-    if _drainer is None:
-        return None
-    return _drainer.stats()
+    """Snapshot of queue + drainer state. None when raise mode is active."""
+    return _default_engine().queue_stats()
 
 
 def flush(timeout: float = 5.0) -> bool:
-    """Block until pending audit rows are drained, or ``timeout`` elapses.
-
-    Returns True iff every queued row reached the store. Useful for
-    deterministic shutdown paths (k8s preStop hook, CLI subcommand
-    completion, test setup/teardown). No-op + returns True in ``raise``
-    mode (no queue to drain).
-    """
-    if _drainer is None:
-        return True
-    return _drainer.flush(timeout=timeout)
-
-
-def _atexit_flush() -> None:
-    if _drainer is not None:
-        _drainer.flush(timeout=5.0)
-        _drainer.stop(timeout=2.0)
-
-
-# Marker-checker for whoever needs to know what was last initialised. Filled
-# by emit.init() so the doctor endpoint can report it without re-reading env.
-_last_init_at: Optional[datetime] = None
+    """Block until pending rows drain. Delegates to the default Engine."""
+    return _default_engine().flush(timeout=timeout)
 
 
 def _mark_init() -> None:
-    global _last_init_at
-    _last_init_at = datetime.now(timezone.utc)
+    pass  # last_init_at now lives on Engine; call is a no-op here.
 
 
-def last_init_at() -> Optional[datetime]:
-    return _last_init_at
+def last_init_at() -> Optional[Any]:
+    return _default_engine().last_init_at()
