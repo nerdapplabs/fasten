@@ -5,12 +5,12 @@ on:
     branches: [main, dev]
     paths:
       - 'cpp/**'
-      - 'store-core/**'
+      - 'fasten-core/**'
       - '.github/workflows/fasten-cpp.yml'
   pull_request:
     paths:
       - 'cpp/**'
-      - 'store-core/**'
+      - 'fasten-core/**'
       - '.github/workflows/fasten-cpp.yml'
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.85
 
       - name: Build fasten-core (.so)
-        working-directory: store-core
+        working-directory: fasten-core
         run: cargo build --release --features all
 
       - name: Install C++ build deps
@@ -42,7 +42,7 @@ jobs:
           cmake -S . -B build
           -DFASTEN_BUILD_TESTS=ON
           -DFASTEN_BUILD_EXAMPLES=ON
-          -DFASTEN_CORE_LIB_DIR=${{ github.workspace }}/store-core/target/release
+          -DFASTEN_CORE_LIB_DIR=${{ github.workspace }}/fasten-core/target/release
 
       - name: Build
         working-directory: cpp
@@ -51,5 +51,5 @@ jobs:
       - name: Run tests
         working-directory: cpp
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
         run: ctest --test-dir build --output-on-failure

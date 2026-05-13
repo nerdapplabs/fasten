@@ -5,12 +5,12 @@ on:
     branches: [main, dev]
     paths:
       - 'js/**'
-      - 'store-core/**'
+      - 'fasten-core/**'
       - '.github/workflows/fasten-js.yml'
   pull_request:
     paths:
       - 'js/**'
-      - 'store-core/**'
+      - 'fasten-core/**'
       - '.github/workflows/fasten-js.yml'
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.85
 
       - name: Build fasten-core (.so)
-        working-directory: store-core
+        working-directory: fasten-core
         run: cargo build --release --features all
 
       - name: Install Node.js 24
@@ -48,7 +48,7 @@ jobs:
 
       - name: Unit tests with coverage
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/store-core/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
         run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
 
       - name: Upload coverage to Codecov

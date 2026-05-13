@@ -27,12 +27,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .audit_queue import _AuditQueueDrainer, AuditStoreError
 from .attrs import AuditRow
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
+from . import core_ffi as _ffi
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
+
+
+class AuditStoreError(RuntimeError):
+    """Raised by ``emit()`` in ``raise`` mode when the store insert fails."""
 
 
 @dataclasses.dataclass
@@ -151,7 +155,8 @@ class Engine:
         self._failure_strategy: str = "queue"
         self._stdlib_logger = logging.getLogger("fasten")
 
-        self._drainer: Optional[_AuditQueueDrainer] = None
+        self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
+        self._drainer_callback: Any = None        # keep ctypes callback alive (GC guard)
         self._drainer_lock = threading.Lock()
         self._atexit_registered = False
         self._last_init_at: Optional[datetime] = None
@@ -392,9 +397,10 @@ class Engine:
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":
-                drainer = self._drainer
-                if drainer is not None:
-                    drainer.put(row)
+                handle = self._drainer_handle
+                if handle is not None:
+                    row_json = json.dumps(row.to_dict(), default=str)
+                    _ffi.drainer_enqueue(handle, row_json)
                 else:
                     try:
                         self._audit_store.insert(row)
@@ -414,15 +420,20 @@ class Engine:
 
     def flush(self, timeout: float = 5.0) -> bool:
         """Block until pending audit rows drain (or timeout). Returns True iff drained."""
-        if self._drainer is None:
+        handle = self._drainer_handle
+        if handle is None:
             return True
-        return self._drainer.flush(timeout=timeout)
+        return _ffi.drainer_flush(handle, int(timeout * 1000))
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
         """Drainer health snapshot. Returns None in raise mode."""
-        if self._drainer is None:
+        handle = self._drainer_handle
+        if handle is None:
             return None
-        return self._drainer.stats()
+        raw = _ffi.drainer_stats_json(handle)
+        if raw is None:
+            return None
+        return json.loads(raw)
 
     # ── Public accessors ──────────────────────────────────────────────────
 
@@ -446,21 +457,21 @@ class Engine:
         """Reset all runtime state to pre-init defaults.
 
         Intended for test fixtures that need a clean Engine without
-        constructing a new one.  Do not call in production code.
+        constructing a new one. Do not call in production code.
         """
         self._uninstall_drainer()
         with self._lock:
             self._seq = 0
             self._prev_hash = "genesis"
-        self._service_id = ""
-        self._node_id = ""
-        self._tenant_id = None
-        self._audit_store = None
-        self._api_store = None
-        self._stdout = None
-        self._redactor = Redactor()
+        self._service_id    = ""
+        self._node_id       = ""
+        self._tenant_id     = None
+        self._audit_store   = None
+        self._api_store     = None
+        self._stdout        = None
+        self._redactor      = Redactor()
         self._failure_strategy = "queue"
-        self._last_init_at = None
+        self._last_init_at  = None
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -493,9 +504,20 @@ class Engine:
         retry_jitter: bool,
         max_attempts: int,
     ) -> None:
-        new_drainer = _AuditQueueDrainer(
-            store=store,
-            sys_log=self._drainer_sys_log,
+        # Build an insert callback that delegates to the Python store.
+        def _insert_cb(row_json: bytes, _userdata: int) -> int:  # type: ignore[return]
+            try:
+                row_dict = json.loads(row_json.decode("utf-8"))
+                row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
+                store.insert(row)
+                return 0
+            except Exception:  # noqa: BLE001
+                return 1
+
+        cb = _ffi.InsertCallbackFn(_insert_cb)
+        new_handle = _ffi.store_from_callback(cb)
+        _ffi.drainer_install(
+            new_handle,
             capacity=capacity,
             retry_initial_ms=retry_initial_ms,
             retry_max_ms=retry_max_ms,
@@ -503,26 +525,42 @@ class Engine:
             max_attempts=max_attempts,
         )
         with self._drainer_lock:
-            old = self._drainer
-            self._drainer = new_drainer
-        if old is not None:
-            old.flush(timeout=5.0)
-            old.stop(timeout=2.0)
+            old_handle    = self._drainer_handle
+            old_callback  = self._drainer_callback
+            self._drainer_handle   = new_handle
+            self._drainer_callback = cb   # keep callback alive
+        if old_handle is not None:
+            _ffi.drainer_flush(old_handle, 5_000)
+            _ffi.drainer_close(old_handle)
+            _ffi.store_close(old_handle)
+        _ = old_callback  # referenced to prevent premature GC
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
             self._atexit_registered = True
 
     def _uninstall_drainer(self) -> None:
         with self._drainer_lock:
-            old = self._drainer
-            self._drainer = None
-        if old is not None:
-            old.stop(timeout=2.0)
+            old_handle   = self._drainer_handle
+            old_callback = self._drainer_callback
+            self._drainer_handle   = None
+            self._drainer_callback = None
+        if old_handle is not None:
+            # Keep old_callback alive until after drainer_close() returns.
+            # The drainer's background thread may still call the Python
+            # callback (CInsertFn) while we wait for it to stop; releasing
+            # the ctypes closure before the thread exits would be a
+            # use-after-free and causes a SIGSEGV.
+            try:
+                _ffi.drainer_close(old_handle)
+                _ffi.store_close(old_handle)
+            finally:
+                del old_callback  # safe to release once thread has stopped
 
     def _atexit_flush(self) -> None:
-        if self._drainer is not None:
-            self._drainer.flush(timeout=5.0)
-            self._drainer.stop(timeout=2.0)
+        handle = self._drainer_handle
+        if handle is not None:
+            _ffi.drainer_flush(handle, 5_000)
+        self._uninstall_drainer()
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────

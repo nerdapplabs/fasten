@@ -36,7 +36,6 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .. import audit_queue as _audit_queue
 from .. import audit_store as _active_audit_store
 from .. import redactor as _active_redactor
 from .. import transport as _active_transport
@@ -178,7 +177,7 @@ def router(
                 store_block["reachable"] = False
                 store_block["last_error"] = f"{type(e).__name__}: {e}"
 
-        queue_block: Optional[dict[str, Any]] = _audit_queue.queue_stats()
+        queue_block: Optional[dict[str, Any]] = _default_engine.queue_stats()
 
         t = _transport()
         transport_block = {

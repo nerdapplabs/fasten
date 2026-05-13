@@ -22,20 +22,20 @@ let package = Package(
             publicHeadersPath: "include",
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),
-        // Wraps the buffer-based redact + catalog ABI from libfasten_store_core.
-        // At build time supply: -Xlinker -L<dir_containing_libfasten_store_core>
+        // Wraps the buffer-based redact + catalog ABI from libfasten_core.
+        // At build time supply: -Xlinker -L<dir_containing_libfasten_core>
         .target(
-            name: "CFastenStoreCore",
-            path: "Sources/CFastenStoreCore",
+            name: "CFastenCore",
+            path: "Sources/CFastenCore",
             publicHeadersPath: "include",
-            linkerSettings: [.linkedLibrary("fasten_store_core")]
+            linkerSettings: [.linkedLibrary("fasten_core")]
         ),
         .target(
             name: "Fasten",
             dependencies: [
                 .product(name: "Crypto", package: "swift-crypto"),
                 .target(name: "CSQLite3", condition: .when(platforms: [.linux])),
-                .target(name: "CFastenStoreCore"),
+                .target(name: "CFastenCore"),
             ],
             path: "Sources/Fasten"
         ),

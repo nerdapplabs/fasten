@@ -90,7 +90,7 @@ docker run --rm -v $PWD/cpp:/work gcc:14-bookworm sh -c \
    cmake /work -DFASTEN_BUILD_TESTS=ON && cmake --build . && ctest"
 ```
 
-Current: 3/3 ctest suites pass (pii_in_detail, audit_queue, codes_yaml).
+Current: 3/3 ctest suites pass (pii_in_detail, redact_substring, codes_yaml).
 
 ## Docs + design
 

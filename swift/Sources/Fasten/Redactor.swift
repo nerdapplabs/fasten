@@ -1,7 +1,7 @@
 import Foundation
-import CFastenStoreCore
+import CFastenCore
 
-/// PII / secret redactor — delegates to libfasten_store_core for a single
+/// PII / secret redactor — delegates to libfasten_core for a single
 /// canonical implementation shared across all language SDKs.
 ///
 /// The public API is identical to the previous NSRegularExpression-based

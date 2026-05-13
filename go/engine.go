@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+
 // Engine holds all runtime state for one fasten deployment context.
 //
 // The package-level free functions (Init, Emit, …) delegate to Default.
@@ -32,7 +33,7 @@ type Engine struct {
 	failureStrategy string
 
 	drainerMu sync.Mutex
-	drainer   *auditQueueDrainer
+	drainer   *cFastenDrainer
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -75,21 +76,21 @@ func (e *Engine) Init(cfg Config) error {
 		if capacity <= 0 {
 			capacity = 100
 		}
-		retryInitial := cfg.QueueRetryInitial
-		if retryInitial <= 0 {
-			retryInitial = 100 * time.Millisecond
+		retryInitialMs := cfg.QueueRetryInitial.Milliseconds()
+		if retryInitialMs <= 0 {
+			retryInitialMs = 100
 		}
-		retryMax := cfg.QueueRetryMax
-		if retryMax <= 0 {
-			retryMax = 60 * time.Second
+		retryMaxMs := cfg.QueueRetryMax.Milliseconds()
+		if retryMaxMs <= 0 {
+			retryMaxMs = 60_000
 		}
 		maxAttempts := cfg.QueueDrainMaxAttempts
 		if maxAttempts <= 0 {
 			maxAttempts = 50
 		}
 		e.installDrainer(
-			e.auditStore, e.drainerSysLog,
-			capacity, retryInitial, retryMax, !cfg.DisableQueueJitter, maxAttempts,
+			e.auditStore,
+			capacity, retryInitialMs, retryMaxMs, !cfg.DisableQueueJitter, maxAttempts,
 		)
 	} else {
 		e.uninstallDrainer()
@@ -172,7 +173,7 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 		if e.failureStrategy == "queue" {
 			d := e.activeDrainer()
 			if d != nil {
-				d.put(row)
+				d.enqueue(row)
 			} else {
 				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
@@ -199,7 +200,14 @@ func (e *Engine) GetQueueStats() *QueueStats {
 	if d == nil {
 		return nil
 	}
-	s := d.stats()
+	raw := d.statsJSON()
+	if raw == "null" || raw == "" {
+		return nil
+	}
+	var s QueueStats
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return nil
+	}
 	return &s
 }
 
@@ -254,19 +262,25 @@ func (e *Engine) ResetForTests() {
 
 func (e *Engine) installDrainer(
 	store AuditRepository,
-	sysLog func(string, string, map[string]any),
 	capacity int,
-	retryInitial, retryMax time.Duration,
+	retryInitialMs, retryMaxMs int64,
 	retryJitter bool,
 	maxAttempts int,
 ) {
+	d, err := newCFastenDrainer(
+		store, capacity, retryInitialMs, retryMaxMs, retryJitter, uint32(maxAttempts),
+	)
+	if err != nil {
+		e.drainerSysLog("error", "audit_drainer_install_failed", map[string]any{"error": err.Error()})
+		return
+	}
 	e.drainerMu.Lock()
 	old := e.drainer
-	e.drainer = newAuditDrainer(store, sysLog, capacity, retryInitial, retryMax, retryJitter, maxAttempts)
+	e.drainer = d
 	e.drainerMu.Unlock()
 	if old != nil {
 		old.flush(5 * time.Second)
-		old.shutdown(2 * time.Second)
+		old.close()
 	}
 }
 
@@ -276,11 +290,11 @@ func (e *Engine) uninstallDrainer() {
 	e.drainer = nil
 	e.drainerMu.Unlock()
 	if old != nil {
-		old.shutdown(2 * time.Second)
+		old.close()
 	}
 }
 
-func (e *Engine) activeDrainer() *auditQueueDrainer {
+func (e *Engine) activeDrainer() *cFastenDrainer {
 	e.drainerMu.Lock()
 	defer e.drainerMu.Unlock()
 	return e.drainer

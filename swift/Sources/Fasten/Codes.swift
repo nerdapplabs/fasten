@@ -1,5 +1,5 @@
 import Foundation
-import CFastenStoreCore
+import CFastenCore
 
 public typealias Code = String
 

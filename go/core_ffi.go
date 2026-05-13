@@ -1,9 +1,9 @@
 package fasten
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../store-core/include
-#cgo LDFLAGS: -L${SRCDIR}/../store-core/target/release -lfasten_store_core
-#include "fasten_store_core.h"
+#cgo CFLAGS: -I${SRCDIR}/../fasten-core/include
+#cgo LDFLAGS: -L${SRCDIR}/../fasten-core/target/release -lfasten_core
+#include "fasten_core.h"
 #include <stdlib.h>
 */
 import "C"

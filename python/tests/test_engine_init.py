@@ -91,13 +91,13 @@ def test_audit_store_accessor_returns_store(initialized, mem_store):
 
 
 def test_last_init_at_is_none_before_init():
-    from fasten import audit_queue as _aq
-    assert _aq.last_init_at() is None
+    from fasten.emitter import last_init_at
+    assert last_init_at() is None
 
 
 def test_last_init_at_is_set_after_init(initialized):
-    from fasten import audit_queue as _aq
-    ts = _aq.last_init_at()
+    from fasten.emitter import last_init_at
+    ts = last_init_at()
     assert ts is not None
 
 
