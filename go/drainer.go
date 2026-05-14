@@ -24,6 +24,10 @@ import (
 // the shared fasten-core drainer to a Go AuditRepository.
 // The store is passed via userdata as a cgo.Handle (uintptr).
 //
+// Each insert crosses the CGo boundary twice (Go → Rust drainer → C callback → Go store).
+// The ~100 ns/call CGo overhead is acceptable at audit volumes but rules out
+// high-frequency non-audit use of this path.
+//
 //export goInsertCallback
 func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) C.int32_t {
 	h := cgo.Handle(uintptr(userdata))

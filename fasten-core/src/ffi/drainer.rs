@@ -112,7 +112,7 @@ pub unsafe extern "C" fn fasten_drainer_enqueue(
 
 /// Block until all currently-queued rows have drained, or `timeout_ms` elapses.
 ///
-/// `timeout_ms`       — 0 = wait indefinitely.
+/// `timeout_ms`       — 0 = no-timeout (practical ceiling: 30 days).
 /// `out_fully_drained`— set to 1 if fully drained, 0 if timed out. May be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_flush(
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn fasten_drainer_flush(
             None => true, // no drainer = raise mode = trivially drained
             Some(d) => {
                 let timeout = if timeout_ms == 0 {
-                    Duration::from_secs(3600)
+                    Duration::from_secs(30 * 24 * 3600) // 30-day practical ceiling
                 } else {
                     Duration::from_millis(timeout_ms)
                 };

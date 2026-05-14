@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -277,27 +278,7 @@ impl Drainer {
 
     /// Snapshot queue stats as a JSON string.
     pub fn stats_json(&self) -> String {
-        let st = lock_or_recover(&self.inner.stats);
-        let depth = self.inner.slots.used();
-        let in_backoff = st.in_backoff_until
-            .and_then(|t| {
-                let rem = t.saturating_duration_since(Instant::now());
-                if rem.is_zero() { None } else { Some(rem.as_secs_f64()) }
-            })
-            .unwrap_or(0.0);
-        let stats = QueueStats {
-            depth,
-            capacity: self.inner.cfg.capacity,
-            high_water: st.high_water,
-            drained_total: st.drained_total,
-            retry_count_active: st.retry_count,
-            in_backoff_seconds: (in_backoff * 1000.0).round() / 1000.0,
-            last_error: st.last_error.clone(),
-            dead_lettered_total: st.dead_lettered_total,
-            dead_letter_depth: st.dlq.len(),
-            capacity_semantics: "block",
-        };
-        serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string(&self.stats()).unwrap_or_else(|_| "{}".into())
     }
 
     /// Stop the drainer: signal the background thread to exit, then join.
@@ -345,7 +326,15 @@ fn drain_loop(inner: Arc<DrainerInner>) {
         let in_shutdown = inner.stop.load(Ordering::Relaxed);
 
         loop {
-            let result = inner.store.insert(&row);
+            // catch_unwind guards against a panicking Store impl killing the thread.
+            let call = panic::catch_unwind(panic::AssertUnwindSafe(|| inner.store.insert(&row)));
+            let result = match call {
+                Ok(r) => r,
+                Err(_) => {
+                    on_dead_letter(&inner, &row, attempt + 1, "store.insert panicked");
+                    break;
+                }
+            };
             match result {
                 Ok(()) => {
                     on_success(&inner);
