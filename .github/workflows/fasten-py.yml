@@ -40,7 +40,7 @@ jobs:
           echo "FASTEN_CORE_LIB=$GITHUB_WORKSPACE/fasten-core/target/release/libfasten_core.so" \
             >> "$GITHUB_ENV"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
