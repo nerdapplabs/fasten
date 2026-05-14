@@ -1,126 +1,149 @@
-// core_ffi.js — thin JS wrapper over libfasten_store_core via koffi.
-//
-// Uses buffer-based ABI variants (fasten_*_buf) — caller-supplied Buffers,
-// no heap allocation on the Rust side, no char** ownership issues with koffi.
-//
-// Set FASTEN_CORE_LIB to the full path of the .so/.dylib/.dll, or ensure the
-// default relative path (../../store-core/target/release/) is populated
-// (run `cargo build --release --features all` in store-core/).
+/**
+ * core_ffi.js — pure JS implementation of the fasten-core surface.
+ *
+ * Replaces the previous koffi/Rust FFI shim. No native dependencies,
+ * no Rust toolchain required, no FASTEN_CORE_LIB env var needed.
+ *
+ * Implements:
+ *   - Key-pattern redaction (mirrors spec/row-schema.json x-fasten-redact)
+ *   - Code catalog validation (UPPER_SNAKE_CASE, id-mismatch, domain-mismatch,
+ *     duplicate) with the same error codes as the Rust ABI
+ */
 
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import koffi from "koffi";
+// ── Redaction ─────────────────────────────────────────────────────────────
 
-const _dir = dirname(fileURLToPath(import.meta.url));
+const REDACT_REPLACEMENT = "***";
 
-function _findLib() {
-	const env = process.env.FASTEN_CORE_LIB;
-	if (env && existsSync(env)) return env;
-	const ext =
-		process.platform === "darwin"
-			? ".dylib"
-			: process.platform === "win32"
-				? ".dll"
-				: ".so";
-	const name = `libfasten_store_core${ext}`;
-	for (const base of [
-		join(_dir, "../../store-core/target/release"),
-		join(process.cwd(), "store-core/target/release"),
-	]) {
-		const p = join(base, name);
-		if (existsSync(p)) return p;
+// Patterns from spec/row-schema.json x-fasten-redact.patterns — case-insensitive
+// match on object keys (not values). Keep in sync with the spec.
+const _DEFAULT_PATTERNS = [
+	/api[_-]?key/i,
+	/^password$/i,
+	/^passwd$/i,
+	/token/i,
+	/secret/i,
+	/authorization/i,
+	/bearer/i,
+	/m2m[_-]?key/i,
+	/cert[_-]?private/i,
+	/private[_-]?key/i,
+	/access_key/i,
+	/session_id/i,
+	/^cookie$/i,
+	/credential/i,
+];
+
+function _matchesAny(key, patterns) {
+	return patterns.some((p) => p.test(key));
+}
+
+function _redactObj(val, patterns, replacement) {
+	if (val === null || typeof val !== "object") return val;
+	if (Array.isArray(val)) {
+		return val.map((item) => _redactObj(item, patterns, replacement));
 	}
-	throw new Error(
-		"fasten: libfasten_store_core not found. " +
-			"Build: cd store-core && cargo build --release --features all. " +
-			"Or set FASTEN_CORE_LIB to the library path.",
-	);
+	const out = {};
+	for (const [k, v] of Object.entries(val)) {
+		out[k] = _matchesAny(k, patterns)
+			? replacement
+			: _redactObj(v, patterns, replacement);
+	}
+	return out;
 }
 
-const _lib = koffi.load(_findLib());
-
-// Buffer-based functions — uint8_t* params work cleanly with Node.js Buffers.
-// Return convention:
-//   fasten_redact_buf / fasten_redact_full_buf / fasten_meta_of_buf:
-//     >= 0 → bytes written; < 0 → -(FastenErrorCode), error in _ERR_BUF
-//   fasten_register_codes_buf:
-//     0 → OK; > 0 → FastenErrorCode, error in _ERR_BUF
-const _redactBuf = _lib.func(
-	"int32_t fasten_redact_buf(string in_json, uint8_t *out_buf, uint32_t buf_len, uint8_t *out_err_buf, uint32_t err_buf_len)",
-);
-const _redactFullBuf = _lib.func(
-	"int32_t fasten_redact_full_buf(string in_json, string extra_keys_json, string replacement, string extra_value_patterns_json, uint8_t *out_buf, uint32_t buf_len, uint8_t *out_err_buf, uint32_t err_buf_len)",
-);
-const _registerBuf = _lib.func(
-	"int32_t fasten_register_codes_buf(string domain, string codes_json, uint8_t *out_err_buf, uint32_t err_buf_len)",
-);
-const _metaOfBuf = _lib.func(
-	"int32_t fasten_meta_of_buf(string code, uint8_t *out_buf, uint32_t buf_len, uint8_t *out_err_buf, uint32_t err_buf_len)",
-);
-const _regClear = _lib.func("void fasten_registry_clear()");
-
-// Pre-allocated reusable buffers. Safe because Node.js/V8 is single-threaded.
-const _OUT_BUF = Buffer.alloc(1 * 1024 * 1024); // 1 MB — ample for any JSON response
-const _ERR_BUF = Buffer.alloc(4096);
-
-function _readErr() {
-	const nul = _ERR_BUF.indexOf(0);
-	return nul > 0 ? _ERR_BUF.toString("utf8", 0, nul) : null;
-}
-
+/**
+ * Redact a JSON string using the default key-pattern list.
+ * Returns a JSON string with matching key values replaced by "***".
+ */
 export function coreRedact(inJson) {
-	_ERR_BUF[0] = 0;
-	const n = _redactBuf(
-		inJson,
-		_OUT_BUF,
-		_OUT_BUF.length,
-		_ERR_BUF,
-		_ERR_BUF.length,
-	);
-	if (n < 0) throw new Error(_readErr() ?? "fasten_redact failed");
-	return _OUT_BUF.toString("utf8", 0, n);
+	const obj = JSON.parse(inJson);
+	return JSON.stringify(_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT));
 }
 
+/**
+ * Redact with optional extra key patterns and a custom replacement string.
+ * extraKeysJson: JSON array of regex strings (e.g. '["my_secret","ssn"]')
+ * replacement:   string to substitute (null → "***")
+ */
 export function coreRedactFull(inJson, extraKeysJson, replacement) {
-	_ERR_BUF[0] = 0;
-	const n = _redactFullBuf(
-		inJson,
-		extraKeysJson ?? "[]",
-		replacement ?? "",
-		"[]",
-		_OUT_BUF,
-		_OUT_BUF.length,
-		_ERR_BUF,
-		_ERR_BUF.length,
-	);
-	if (n < 0) throw new Error(_readErr() ?? "fasten_redact_full failed");
-	return _OUT_BUF.toString("utf8", 0, n);
+	const rep = replacement ?? REDACT_REPLACEMENT;
+	let extra = [];
+	if (extraKeysJson) {
+		try {
+			extra = JSON.parse(extraKeysJson).map((k) => new RegExp(k, "i"));
+		} catch {
+			/* ignore malformed extra keys */
+		}
+	}
+	const patterns = [..._DEFAULT_PATTERNS, ...extra];
+	const obj = JSON.parse(inJson);
+	return JSON.stringify(_redactObj(obj, patterns, rep));
 }
 
+// ── Catalog registry + validation ─────────────────────────────────────────
+
+const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9_]*$/;
+
+// Error codes mirror the Rust ABI constants (fasten_store_core.h FASTEN_ERR_*).
+const ERR = {
+	INVALID_KEY:     6,
+	ID_MISMATCH:     7,
+	DOMAIN_MISMATCH: 8,
+	DUPLICATE_CODE:  9,
+};
+
+// In-process canonical registry used by coreMetaOf / coreRegistryClear.
+// index.js maintains its own _registry populated from this via coreMetaOf.
+const _coreRegistry = new Map();
+
+function _err(msg, code) {
+	const e = new Error(msg);
+	e.rustCode = code;
+	return e;
+}
+
+/**
+ * Validate and register a batch of codes for a domain.
+ * Throws with .rustCode set on violation — same error contract as the Rust ABI.
+ * Normalization applied: id filled from key; retention_class forced to "short"
+ * when pii_in_detail=true.
+ */
 export function coreRegisterCodes(domain, codesJson) {
-	_ERR_BUF[0] = 0;
-	const rc = _registerBuf(domain, codesJson, _ERR_BUF, _ERR_BUF.length);
-	if (rc !== 0) {
-		const e = new Error(_readErr() ?? "fasten_register_codes failed");
-		e.rustCode = rc;
-		throw e;
+	const codes = JSON.parse(codesJson);
+	// Full validation pass before any mutation.
+	for (const [id, meta] of Object.entries(codes)) {
+		if (!UPPER_SNAKE_RE.test(id))
+			throw _err(`code key "${id}" must be UPPER_SNAKE_CASE`, ERR.INVALID_KEY);
+		if (meta.id && meta.id !== id)
+			throw _err(`code key "${id}" disagrees with Meta.id="${meta.id}"`, ERR.ID_MISMATCH);
+		if (meta.domain && meta.domain !== domain)
+			throw _err(
+				`code ${id} declares domain="${meta.domain}" but registered under "${domain}"`,
+				ERR.DOMAIN_MISMATCH,
+			);
+		if (_coreRegistry.has(id))
+			throw _err(`duplicate code: "${id}"`, ERR.DUPLICATE_CODE);
+	}
+	// Commit with normalization (all validation passed).
+	for (const [id, meta] of Object.entries(codes)) {
+		const pii = !!meta.pii_in_detail;
+		_coreRegistry.set(id, {
+			...meta,
+			id,
+			domain: meta.domain || domain,
+			retention_class: pii ? "short" : (meta.retention_class || "medium"),
+			detail_passthrough_keys: meta.detail_passthrough_keys ?? [],
+		});
 	}
 }
 
+/** Return canonical JSON for a registered code, or null if not found. */
 export function coreMetaOf(code) {
-	_ERR_BUF[0] = 0;
-	const n = _metaOfBuf(
-		code,
-		_OUT_BUF,
-		_OUT_BUF.length,
-		_ERR_BUF,
-		_ERR_BUF.length,
-	);
-	if (n <= 0) return null; // not found (0) or error (< 0)
-	return _OUT_BUF.toString("utf8", 0, n);
+	const m = _coreRegistry.get(code);
+	return m ? JSON.stringify(m) : null;
 }
 
+/** Wipe the registry — for test teardown only. */
 export function coreRegistryClear() {
-	_regClear();
+	_coreRegistry.clear();
 }
