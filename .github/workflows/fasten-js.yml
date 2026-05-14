@@ -52,7 +52,7 @@ jobs:
         run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: js/coverage/lcov.info
           flags: js

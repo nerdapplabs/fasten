@@ -52,7 +52,7 @@ jobs:
         run: go test -v -count=1 -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: go/coverage.out
           flags: go
