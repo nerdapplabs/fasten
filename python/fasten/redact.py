@@ -11,7 +11,7 @@ Python fallback path: key-pattern matching uses a compiled Python regex (built
 from the same `_REDACT_PATTERNS` constants that the Rust core uses), while
 per-string value-shape checking still delegates to the Rust core.
 
-Two-pass algorithm (canonical implementation in store-core/src/redact.rs):
+Two-pass algorithm (canonical implementation in fasten-core/src/redact.rs):
   1. Key-pattern — keys matching REDACT_PATTERNS → replacement token.
   2. Value-shape — string values matching known secret shapes → typed token.
 """

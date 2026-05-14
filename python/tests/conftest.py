@@ -24,8 +24,7 @@ def initialized(mem_store):
 
     Uses ``raise`` failure strategy so the legacy "emit then read store"
     test pattern stays synchronous. Tests that need to exercise the
-    default ``queue`` drainer set the strategy explicitly (see
-    ``test_audit_queue.py``).
+    default ``queue`` drainer set the strategy explicitly.
     """
     import os
     os.environ["FASTEN_SERVICE_ID"] = "test-svc"

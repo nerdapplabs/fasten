@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .attrs import AuditRow
-from .audit_queue import AuditStoreError  # noqa: F401 — re-exported for back-compat
+from .engine import AuditStoreError  # noqa: F401 — re-exported
 from .engine import Engine
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
@@ -95,6 +95,11 @@ def init_config(*args: Any, **kwargs: Any) -> Any:
 def start(cfg: Any) -> None:
     """Wire runtime from a FastenConfig. Delegates to the default Engine."""
     _default.start(cfg)
+
+
+def last_init_at() -> "Any":
+    """Timestamp of the most recent init() call on the default Engine, or None."""
+    return _default.last_init_at()
 
 
 def verify_chain(rows: "list[Any]") -> "Any":

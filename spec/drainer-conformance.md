@@ -1,17 +1,23 @@
 # Drainer conformance spec
 
-**Version:** 1.0  
-**Date:** 2026-05-07  
+**Version:** 1.1  
+**Date:** 2026-05-14  
 **Status:** Normative — all SDK drainer implementations MUST conform.
 
 ---
 
 ## Purpose
 
-Five SDKs (Python, Go, JS, Rust, C++) each contain a drainer that
-implements the same bounded-queue / exponential-backoff / sys-event
-state machine.  This document is the single source of truth for that
-state machine.  When an SDK deviates from it, the spec wins.
+All SDKs expose the same bounded-queue / exponential-backoff / sys-event
+drainer surface to adopters.  The drainer implementation is provided by
+the shared `fasten-core` C ABI (`libfasten_core.so` / `.dylib`).
+Python, Go, Swift, and C++ bind to it via FFI (ctypes / cgo / Swift's
+C interop / `extern "C"`); Rust implements it natively as the
+authoritative reference.  JS still runs its own in-process drainer loop
+(migration tracked in P1-26).
+
+This document is the single source of truth for the externally visible
+drainer contract.  When an SDK deviates from it, the spec wins.
 
 Each SDK's test suite SHOULD include the test vectors in §7 to prevent
 silent re-divergence.

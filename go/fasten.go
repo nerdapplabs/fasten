@@ -319,6 +319,39 @@ func RequestIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// ── Audit-store failure handling ──────────────────────────────────────────
+
+// AuditStoreError wraps an underlying store error for the "raise"
+// strategy. Use errors.As to recover the cause:
+//
+//	var aerr *AuditStoreError
+//	if errors.As(err, &aerr) { /* aerr.Err = sqlite3 / postgres err */ }
+type AuditStoreError struct{ Err error }
+
+func (e *AuditStoreError) Error() string {
+	if e.Err == nil {
+		return "fasten audit store: <nil>"
+	}
+	return "fasten audit store: " + e.Err.Error()
+}
+func (e *AuditStoreError) Unwrap() error { return e.Err }
+
+// QueueStats is the snapshot returned by GetQueueStats(). Depth is total
+// occupied capacity (queued + in-flight retry) — the value that
+// determines whether the next Emit() blocks.
+type QueueStats struct {
+	Depth             int     `json:"depth"`
+	Capacity          int     `json:"capacity"`
+	HighWater         int     `json:"high_water"`
+	DrainedTotal      int     `json:"drained_total"`
+	RetryCountActive  int     `json:"retry_count_active"`
+	InBackoffSeconds  float64 `json:"in_backoff_seconds"`
+	LastError         string  `json:"last_error"`
+	DeadLetteredTotal int     `json:"dead_lettered_total"`
+	DeadLetterDepth   int     `json:"dead_letter_depth"`
+	CapacitySemantics string  `json:"capacity_semantics"`
+}
+
 // ── Init + free-function wrappers ─────────────────────────────────────────
 
 // Config for Init. AuditStore nil → audit rows are written to stdout only.

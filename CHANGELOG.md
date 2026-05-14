@@ -6,6 +6,21 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Shared drainer unification (P0-7, Python / Go / Swift / C++)
+
+- All per-language drainer implementations replaced by FFI bindings to
+  the shared `fasten-core` C ABI drainer (`fasten_store_from_callback` +
+  `fasten_drainer_install/enqueue/flush/stats_json/close`).
+  - **Python** — `ctypes` binding in `fasten/drainer.py`; `audit_queue.py` deleted (427 lines)
+  - **Go** — `cgo` binding in `go/drainer.go`; `audit_queue.go` deleted (429 lines)
+  - **Swift** — `CFastenDrainer.swift` via Swift's C interop; `AuditQueue.swift` deleted (123 lines)
+  - **C++** — `CFastenDrainer` class in `fasten.hpp` replaces `AuditQueueDrainer`; `audit_queue_smoke.cpp` deleted (310 lines)
+  - **Rust** — remains the authoritative reference implementation inside `fasten-core`
+  - **JS** — still uses its own in-process drainer loop; migration tracked in P1-26
+- Net reduction: ~3,200 lines of duplicated drainer code eliminated.
+- Drainer conformance spec (`spec/drainer-conformance.md`) updated to
+  reflect the shared-ABI architecture (v1.1).
+
 ### Added — Value-shape redaction (P1-24, all SDKs)
 
 - JS, Go, Rust, C++ now match Python and Swift: string values matching

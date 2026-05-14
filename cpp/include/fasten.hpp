@@ -47,9 +47,9 @@
 #include <unordered_map>
 #include <vector>
 
-// ── libfasten_store_core C ABI ─────────────────────────────────────────────
+// ── libfasten_core C ABI ─────────────────────────────────────────────
 // Forward-declare the Rust shared library functions so fasten.hpp stays
-// self-contained. Link with -lfasten_store_core at build time.
+// self-contained. Link with -lfasten_core at build time.
 extern "C" {
     // All catalog + redaction functions return int32_t (0 = OK).
     int32_t fasten_redact(
@@ -66,6 +66,25 @@ extern "C" {
         const char* code, char** out_json, char** out_err);
     void fasten_registry_clear(void);
     void fasten_store_free_str(char* s);
+
+    // Opaque store + drainer handle (shared fasten-core C ABI)
+    typedef int32_t (*FastenInsertCallbackFn)(const char* row_json, void* userdata);
+    struct FastenStore;
+    struct FastenStore* fasten_store_from_callback(
+        FastenInsertCallbackFn fn, void* userdata, char** out_err);
+    void fasten_store_close(struct FastenStore* store);
+    int32_t fasten_drainer_install(
+        struct FastenStore* store, uint64_t capacity,
+        uint64_t retry_initial_ms, uint64_t retry_max_ms,
+        int retry_jitter, uint32_t max_attempts, char** out_err);
+    int32_t fasten_drainer_enqueue(
+        struct FastenStore* store, const char* row_json, char** out_err);
+    int32_t fasten_drainer_flush(
+        struct FastenStore* store, uint64_t timeout_ms,
+        int* out_fully_drained, char** out_err);
+    int32_t fasten_drainer_stats_json(
+        struct FastenStore* store, char** out_json, char** out_err);
+    void fasten_drainer_close(struct FastenStore* store);
 }
 
 namespace fasten {
@@ -285,7 +304,7 @@ inline std::string mint_id_bytes(size_t bytes) {
 }
 
 // Per-process redactor config — stored in Globals, configured by init().
-// Redaction logic lives in libfasten_store_core; we only cache config here.
+// Redaction logic lives in libfasten_core; we only cache config here.
 struct RedactConfig {
     std::vector<std::string> extra_keys;
     std::string              replacement { fasten::kRedactReplacement };
@@ -546,379 +565,224 @@ using SysLog = std::function<void(const std::string&,
                                   const std::string&,
                                   const std::vector<std::pair<std::string, std::string>>&)>;
 
-class AuditQueueDrainer {
-  public:
-    static constexpr double      kHwWarnPct     = 0.50;
-    static constexpr double      kHwErrPct      = 0.80;
-    static constexpr std::size_t kDegradedAfter = 5;
+// ── JSON extraction helpers (used by CFastenDrainer::bridge_) ─────────────
 
-    AuditQueueDrainer(std::function<void(const Row&)> sink,
-                      SysLog sys_log,
-                      std::size_t capacity,
-                      std::chrono::milliseconds retry_initial,
-                      std::chrono::milliseconds retry_max,
-                      bool retry_jitter,
-                      std::size_t max_attempts = 50)
-        : sink_(std::move(sink)),
-          sys_log_(std::move(sys_log)),
-          capacity_(capacity),
-          retry_initial_(retry_initial),
-          retry_max_(retry_max),
-          retry_jitter_(retry_jitter),
-          max_attempts_(max_attempts),
-          slots_free_(capacity),
-          rng_(std::random_device{}()) {
-        thread_ = std::thread([this] { run(); });
+inline std::string json_extract_str_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":\"";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return "";
+    pos += needle.size();
+    std::string val;
+    while (pos < j.size() && j[pos] != '"') {
+        if (j[pos] == '\\' && pos + 1 < j.size()) {
+            ++pos;
+            switch (j[pos]) {
+                case '"':  val += '"';  break;
+                case '\\': val += '\\'; break;
+                case 'n':  val += '\n'; break;
+                case 'r':  val += '\r'; break;
+                case 't':  val += '\t'; break;
+                default:   val += j[pos]; break;
+            }
+        } else { val += j[pos]; }
+        ++pos;
+    }
+    return val;
+}
+
+inline int64_t json_extract_int_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return 0;
+    pos += needle.size();
+    while (pos < j.size() && j[pos] == ' ') ++pos;
+    if (pos >= j.size() || j[pos] == '"') return 0;
+    std::string num;
+    if (j[pos] == '-') { num += '-'; ++pos; }
+    while (pos < j.size() && j[pos] >= '0' && j[pos] <= '9') num += j[pos++];
+    if (num.empty() || num == "-") return 0;
+    return std::stoll(num);
+}
+
+inline double json_extract_double_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return 0.0;
+    pos += needle.size();
+    while (pos < j.size() && j[pos] == ' ') ++pos;
+    if (pos >= j.size()) return 0.0;
+    std::string num;
+    if (j[pos] == '-') { num += '-'; ++pos; }
+    while (pos < j.size() && ((j[pos] >= '0' && j[pos] <= '9') || j[pos] == '.'))
+        num += j[pos++];
+    if (num.empty()) return 0.0;
+    try { return std::stod(num); } catch (...) { return 0.0; }
+}
+
+inline bool json_extract_bool_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < j.size() && j[pos] == ' ') ++pos;
+    return pos + 4 <= j.size() && j.substr(pos, 4) == "true";
+}
+
+inline Fields json_extract_detail_(const std::string& j) {
+    std::string needle = "\"detail\":";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return {};
+    pos += needle.size();
+    while (pos < j.size() && (j[pos] == ' ' || j[pos] == '\t')) ++pos;
+    if (pos >= j.size() || j[pos] != '{') return {};
+    int depth = 0;
+    size_t start = pos, end_pos = pos;
+    while (pos < j.size()) {
+        if      (j[pos] == '{') ++depth;
+        else if (j[pos] == '}') { --depth; if (depth == 0) { end_pos = pos + 1; break; } }
+        ++pos;
+    }
+    return parse_flat_json_fields(j.substr(start, end_pos - start));
+}
+
+inline Row row_from_json_(const std::string& j) {
+    Row r;
+    r.wire_version   = json_extract_str_(j, "wire_version");
+    r.id             = json_extract_str_(j, "id");
+    r.origin_id      = json_extract_str_(j, "origin_id");
+    r.monotonic_seq  = json_extract_int_(j, "monotonic_seq");
+    r.timestamp      = json_extract_str_(j, "timestamp");
+    r.code           = json_extract_str_(j, "code");
+    r.action         = json_extract_str_(j, "action");
+    r.severity       = json_extract_str_(j, "severity");
+    r.service_id     = json_extract_str_(j, "service_id");
+    r.source_node_id = json_extract_str_(j, "source_node_id");
+    r.tenant_id      = json_extract_str_(j, "tenant_id");
+    r.actor          = json_extract_str_(j, "actor");
+    r.actor_kind     = json_extract_str_(j, "actor_kind");
+    r.target         = json_extract_str_(j, "target");
+    r.category       = json_extract_str_(j, "category");
+    r.domain         = json_extract_str_(j, "domain");
+    r.method         = json_extract_str_(j, "method");
+    r.request_id     = json_extract_str_(j, "request_id");
+    r.detail         = json_extract_detail_(j);
+    r.pii_in_detail  = json_extract_bool_(j, "pii_in_detail");
+    r.shipped_at     = json_extract_str_(j, "shipped_at");
+    return r;
+}
+
+// ── SinkRef: keeps the AuditSink alive while the drainer thread runs ──────
+
+struct SinkRef {
+    std::function<void(const Row&)> sink;
+};
+
+// ── CFastenDrainer: wraps the shared fasten-core C ABI drainer ────────────
+//
+// Same public surface as the retired AuditQueueDrainer so all call sites
+// outside this class require no changes.
+
+class CFastenDrainer {
+  public:
+    CFastenDrainer(std::function<void(const Row&)> sink,
+                   std::size_t               capacity,
+                   std::chrono::milliseconds retry_initial,
+                   std::chrono::milliseconds retry_max,
+                   bool                      retry_jitter,
+                   std::size_t               max_attempts = 50) {
+        auto* ref = new SinkRef{std::move(sink)};
+        char* err = nullptr;
+        store_ = fasten_store_from_callback(&CFastenDrainer::bridge_, ref, &err);
+        if (!store_) {
+            delete ref;
+            std::string msg = err ? err : "fasten_store_from_callback failed";
+            if (err) fasten_store_free_str(err);
+            throw std::runtime_error(msg);
+        }
+        sink_ref_ = ref;
+        int jitter = retry_jitter ? 1 : 0;
+        int32_t rc = fasten_drainer_install(
+            store_,
+            static_cast<uint64_t>(capacity),
+            static_cast<uint64_t>(retry_initial.count()),
+            static_cast<uint64_t>(retry_max.count()),
+            jitter,
+            static_cast<uint32_t>(max_attempts),
+            &err
+        );
+        if (rc != 0) {
+            std::string msg = err ? err : "fasten_drainer_install failed";
+            if (err) fasten_store_free_str(err);
+            fasten_store_close(store_);
+            delete sink_ref_;
+            store_ = nullptr; sink_ref_ = nullptr;
+            throw std::runtime_error(msg);
+        }
     }
 
-    ~AuditQueueDrainer() { shutdown(std::chrono::seconds(2)); }
+    ~CFastenDrainer() { shutdown(std::chrono::seconds(2)); }
 
-    AuditQueueDrainer(const AuditQueueDrainer&)            = delete;
-    AuditQueueDrainer& operator=(const AuditQueueDrainer&) = delete;
+    CFastenDrainer(const CFastenDrainer&)            = delete;
+    CFastenDrainer& operator=(const CFastenDrainer&) = delete;
 
-    void put(Row row) {
-        // Drainer-swap race: install_drainer_ may have stopped this
-        // drainer between emit()'s shared_ptr snapshot and our entry.
-        // Surface abandoned rows on the sys stream instead of dropping
-        // silently into a queue whose worker thread has already exited.
-        if (stop_.load()) {
-            sys_log_("error", "audit_drain_abandoned",
-                     {{"reason", "drainer_stopped"}, {"row_id", row.id}});
-            return;
-        }
-        // Acquire a slot — blocks if all capacity slots are taken
-        // (queued + in-flight retry combined). Released only on
-        // successful sink invocation or shutdown abandon.
-        {
-            std::unique_lock<std::mutex> lk(slot_mu_);
-            slot_cv_.wait(lk, [this] { return slots_free_ > 0 || stop_.load(); });
-            if (stop_.load()) {
-                // Stop fired while we waited for a slot. Same
-                // abandon path — never leave the row on the floor.
-                sys_log_("error", "audit_drain_abandoned",
-                         {{"reason", "drainer_stopped_mid_put"},
-                          {"row_id", row.id}});
-                return;
-            }
-            --slots_free_;
-        }
-        // Bump the parallel used counter under stats_mu_ so
-        // emit_high_water_if_crossed() can read `used` and decide
-        // the warn/err flag flip in a SINGLE critical section.
-        // Reading slots_free_ separately (under slot_mu_) and then
-        // making the decision under stats_mu_ leaves a window where
-        // concurrent puts/releases skew the threshold check, causing
-        // duplicate or missed high-water sys events.
-        { std::lock_guard<std::mutex> lk(stats_mu_); ++used_count_; }
-        {
-            std::lock_guard<std::mutex> lk(q_mu_);
-            q_.push(std::move(row));
-        }
-        q_cv_.notify_one();
-        emit_high_water_if_crossed();
+    void put(const Row& row) {
+        if (stopped_.load()) return;
+        std::string json = row.to_json();
+        char* err = nullptr;
+        fasten_drainer_enqueue(store_, json.c_str(), &err);
+        if (err) fasten_store_free_str(err);
     }
 
     QueueStats stats() const {
-        std::lock_guard<std::mutex> lk(stats_mu_);
+        char* out_json = nullptr;
+        char* err      = nullptr;
+        fasten_drainer_stats_json(store_, &out_json, &err);
+        if (err) fasten_store_free_str(err);
         QueueStats s;
-        s.depth               = used_count_;
-        s.capacity            = capacity_;
-        s.high_water          = high_water_;
-        s.drained_total       = drained_total_;
-        s.retry_count_active  = retry_count_;
-        if (in_backoff_until_ms_ > 0) {
-            auto now_ms = static_cast<int64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            int64_t rem = in_backoff_until_ms_ - now_ms;
-            if (rem > 0) s.in_backoff_seconds = static_cast<double>(rem) / 1000.0;
+        if (out_json) {
+            std::string j(out_json);
+            fasten_store_free_str(out_json);
+            s.depth               = static_cast<std::size_t>(json_extract_int_(j, "depth"));
+            s.capacity            = static_cast<std::size_t>(json_extract_int_(j, "capacity"));
+            s.high_water          = static_cast<std::size_t>(json_extract_int_(j, "high_water"));
+            s.drained_total       = static_cast<std::size_t>(json_extract_int_(j, "drained_total"));
+            s.retry_count_active  = static_cast<std::size_t>(json_extract_int_(j, "retry_count_active"));
+            s.in_backoff_seconds  = json_extract_double_(j, "in_backoff_seconds");
+            s.last_error          = json_extract_str_(j, "last_error");
+            s.dead_lettered_total = static_cast<std::size_t>(json_extract_int_(j, "dead_lettered_total"));
+            s.dead_letter_depth   = static_cast<std::size_t>(json_extract_int_(j, "dead_letter_depth"));
+            s.capacity_semantics  = json_extract_str_(j, "capacity_semantics");
         }
-        s.last_error           = last_error_;
-        s.dead_lettered_total  = dead_lettered_total_;
-        s.dead_letter_depth    = dlq_.size();
-        s.capacity_semantics   = "block";
         return s;
     }
 
     bool flush(std::chrono::milliseconds timeout) {
-        // Use the slot semaphore as the canonical "rows pending"
-        // signal: slots_free_ is decremented by put() before pushing
-        // onto the queue and incremented only after successful sink
-        // invocation, so it covers the transient window where a row
-        // has been popped from q_ but in_flight_ has not yet been
-        // incremented in drain_one. Checking q_ + in_flight_
-        // separately allowed flush() to return prematurely during
-        // that gap.
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        for (;;) {
-            std::size_t used;
-            {
-                std::lock_guard<std::mutex> lk(stats_mu_);
-                used = used_count_;
-            }
-            if (used == 0) return true;
-            if (std::chrono::steady_clock::now() >= deadline) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        int drained = 0;
+        fasten_drainer_flush(store_,
+            static_cast<uint64_t>(timeout.count()), &drained, nullptr);
+        return drained != 0;
     }
 
     void shutdown(std::chrono::milliseconds /*timeout*/) {
-        if (stop_.exchange(true)) return;
-        q_cv_.notify_all();
-        slot_cv_.notify_all();
-        if (thread_.joinable()) thread_.join();
+        if (stopped_.exchange(true)) return;
+        fasten_drainer_close(store_);
+        delete sink_ref_; sink_ref_ = nullptr;
+        fasten_store_close(store_); store_ = nullptr;
     }
 
   private:
-    void run() {
-        while (!stop_.load()) {
-            Row row;
-            bool got;
-            {
-                std::unique_lock<std::mutex> lk(q_mu_);
-                q_cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
-                    return !q_.empty() || stop_.load();
-                });
-                got = !q_.empty();
-                if (got) { row = std::move(q_.front()); q_.pop(); }
-            }
-            if (got) drain_one(row, /*in_shutdown=*/false);
-        }
-        for (;;) {
-            Row row;
-            bool got;
-            {
-                std::lock_guard<std::mutex> lk(q_mu_);
-                got = !q_.empty();
-                if (got) { row = std::move(q_.front()); q_.pop(); }
-            }
-            if (!got) break;
-            drain_one(row, /*in_shutdown=*/true);
-        }
+    static int32_t bridge_(const char* row_json, void* userdata) {
+        auto* ref = static_cast<SinkRef*>(userdata);
+        if (!ref || !row_json) return 1;
+        try {
+            ref->sink(row_from_json_(std::string(row_json)));
+            return 0;
+        } catch (...) { return 1; }
     }
 
-    void drain_one(const Row& row, bool in_shutdown) {
-        { std::lock_guard<std::mutex> lk(stats_mu_); ++in_flight_; }
-        bool slot_released = false;
-        std::size_t attempt = 0;
-        for (;;) {
-            ++attempt;
-            try {
-                sink_(row);
-                on_success();
-                release_slot(); slot_released = true;
-                break;
-            } catch (const std::exception& e) {
-                if (attempt >= max_attempts_) {
-                    on_dead_letter(row, attempt, e.what());
-                    release_slot(); slot_released = true; break;
-                }
-                on_failure(e.what());
-                if (in_shutdown) { release_slot(); slot_released = true; break; }
-                if (wait_backoff()) { release_slot(); slot_released = true; break; }
-            } catch (...) {
-                if (attempt >= max_attempts_) {
-                    on_dead_letter(row, attempt, "unknown exception");
-                    release_slot(); slot_released = true; break;
-                }
-                on_failure("unknown exception");
-                if (in_shutdown) { release_slot(); slot_released = true; break; }
-                if (wait_backoff()) { release_slot(); slot_released = true; break; }
-            }
-        }
-        { std::lock_guard<std::mutex> lk(stats_mu_); --in_flight_; }
-        if (!slot_released) release_slot();
-    }
-
-    void release_slot() {
-        { std::lock_guard<std::mutex> lk(slot_mu_); if (slots_free_ < capacity_) ++slots_free_; }
-        // Decrement parallel counter under stats_mu_ — see put() for why.
-        { std::lock_guard<std::mutex> lk(stats_mu_); if (used_count_ > 0) --used_count_; }
-        slot_cv_.notify_one();
-    }
-
-    void emit_high_water_if_crossed() {
-        bool fire_warn = false, fire_err = false;
-        std::size_t used = 0, cap = 0;
-        {
-            // Single critical section: read `used` AND make the
-            // flag-flip decision under the same lock so concurrent
-            // puts/releases can't change state between read + decide.
-            // Earlier this read `used` under slot_mu_ then decided
-            // under stats_mu_ — concurrent activity in the gap caused
-            // duplicate / missed warns.
-            std::lock_guard<std::mutex> lk(stats_mu_);
-            used = used_count_;
-            cap  = capacity_;
-            if (used > high_water_) high_water_ = used;
-            if (cap == 0) return;
-            double pct = static_cast<double>(used) / static_cast<double>(cap);
-            if (pct >= kHwErrPct && !err_hw_fired_) { err_hw_fired_ = true; fire_err = true; }
-            else if (pct >= kHwWarnPct && !warn_hw_fired_) { warn_hw_fired_ = true; fire_warn = true; }
-            else if (pct < kHwWarnPct) { warn_hw_fired_ = false; err_hw_fired_ = false; }
-        }
-        if (fire_err) {
-            sys_log_("error", "audit_queue_near_full",
-                     {{"depth", std::to_string(used)}, {"capacity", std::to_string(capacity_)}});
-        } else if (fire_warn) {
-            sys_log_("warn", "audit_queue_high_water",
-                     {{"depth", std::to_string(used)}, {"capacity", std::to_string(capacity_)}});
-        }
-    }
-
-    void on_failure(const std::string& msg) {
-        bool first = false, crossed = false;
-        std::size_t rc = 0;
-        double bo = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(stats_mu_);
-            first = retry_count_ == 0;
-            if (first) {
-                failure_burst_started_at_ms_ = static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
-            }
-            ++retry_count_;
-            last_error_ = msg;
-            rc = retry_count_;
-            if (in_backoff_until_ms_ > 0) {
-                auto now_ms = static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
-                int64_t rem = in_backoff_until_ms_ - now_ms;
-                if (rem > 0) bo = static_cast<double>(rem) / 1000.0;
-            }
-            if (retry_count_ >= kDegradedAfter && !degraded_fired_) {
-                degraded_fired_ = true; crossed = true;
-            }
-        }
-        if (first) sys_log_("warn", "audit_drain_failed", {{"error", msg}});
-        if (crossed) {
-            sys_log_("error", "audit_drain_degraded",
-                     {{"retry_count", std::to_string(rc)},
-                      {"in_backoff_seconds", std::to_string(bo)},
-                      {"last_error", msg}});
-        }
-    }
-
-    void on_success() {
-        bool emit_recovered = false;
-        double recovery_seconds = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(stats_mu_);
-            if (retry_count_ > 0 && failure_burst_started_at_ms_ != 0) {
-                auto now_ms = static_cast<int64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
-                recovery_seconds =
-                    static_cast<double>(now_ms - failure_burst_started_at_ms_) / 1000.0;
-                emit_recovered = true;
-            }
-            retry_count_                 = 0;
-            in_backoff_until_ms_         = 0;
-            failure_burst_started_at_ms_ = 0;
-            last_error_.clear();
-            degraded_fired_              = false;
-            ++drained_total_;
-        }
-        if (emit_recovered) {
-            double r = std::round(recovery_seconds * 1000.0) / 1000.0;
-            sys_log_("info", "audit_drain_recovered",
-                     {{"recovery_after_seconds", std::to_string(r)}});
-        }
-    }
-
-    void on_dead_letter(const Row& row, std::size_t attempt, const std::string& msg) {
-        {
-            std::lock_guard<std::mutex> lk(stats_mu_);
-            ++dead_lettered_total_;
-            retry_count_ = 0;
-            last_error_  = msg;
-            if (dlq_.size() >= 10) dlq_.pop_front();
-            dlq_.push_back(row);
-        }
-        sys_log_("error", "audit_drain_dead_letter",
-                 {{"row_id", row.id},
-                  {"attempt_count", std::to_string(attempt)},
-                  {"last_error", msg}});
-    }
-
-    bool wait_backoff() {
-        std::size_t n;
-        { std::lock_guard<std::mutex> lk(stats_mu_); n = retry_count_; }
-        auto delay = retry_initial_;
-        for (std::size_t i = 1; i < n; ++i) {
-            delay *= 2;
-            if (delay >= retry_max_) { delay = retry_max_; break; }
-        }
-        if (delay > retry_max_) delay = retry_max_;
-        if (retry_jitter_) {
-            std::uniform_real_distribution<double> dist(-0.2, 0.2);
-            double r = dist(rng_);
-            auto adj = std::chrono::milliseconds(static_cast<int64_t>(delay.count() * r));
-            delay += adj;
-            if (delay.count() < 0) delay = std::chrono::milliseconds(0);
-        }
-        {
-            std::lock_guard<std::mutex> lk(stats_mu_);
-            auto now_ms = static_cast<int64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            in_backoff_until_ms_ = now_ms + delay.count();
-        }
-        auto deadline = std::chrono::steady_clock::now() + delay;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (stop_.load()) return true;
-            auto rem = deadline - std::chrono::steady_clock::now();
-            auto step = std::min(
-                std::chrono::duration_cast<std::chrono::milliseconds>(rem),
-                std::chrono::milliseconds(50));
-            if (step.count() <= 0) break;
-            std::this_thread::sleep_for(step);
-        }
-        return stop_.load();
-    }
-
-    std::function<void(const Row&)> sink_;
-    SysLog                          sys_log_;
-    std::size_t                     capacity_;
-    std::chrono::milliseconds       retry_initial_;
-    std::chrono::milliseconds       retry_max_;
-    bool                            retry_jitter_;
-    std::size_t                     max_attempts_;
-
-    std::queue<Row>                 q_;
-    mutable std::mutex              q_mu_;
-    std::condition_variable         q_cv_;
-
-    mutable std::mutex              slot_mu_;
-    std::condition_variable         slot_cv_;
-    std::size_t                     slots_free_;
-
-    std::atomic<bool>               stop_{false};
-    std::thread                     thread_;
-
-    mutable std::mutex              stats_mu_;
-    // Parallel "used slots" counter — incremented under stats_mu_ in
-    // put() after slot acquired, decremented in release_slot() after
-    // slot released. Used so the high-water threshold check + flag
-    // flip happen in a SINGLE critical section (eliminates the cross-
-    // mutex race that produced duplicate / missed sys events).
-    std::size_t                     used_count_                  = 0;
-    std::size_t                     high_water_                  = 0;
-    std::size_t                     drained_total_               = 0;
-    std::size_t                     retry_count_                 = 0;
-    std::size_t                     in_flight_                   = 0;
-    int64_t                         in_backoff_until_ms_         = 0;
-    int64_t                         failure_burst_started_at_ms_ = 0;
-    std::string                     last_error_;
-    bool                            warn_hw_fired_      = false;
-    bool                            err_hw_fired_       = false;
-    bool                            degraded_fired_     = false;
-    std::size_t                     dead_lettered_total_ = 0;
-    std::deque<Row>                 dlq_;               // bounded ring, max 10
-
-    std::mt19937_64                 rng_;
+    struct FastenStore*  store_    = nullptr;
+    SinkRef*             sink_ref_ = nullptr;
+    std::atomic<bool>    stopped_{false};
 };
 
 // All mutable global state lives in one Meyers-singleton struct.
@@ -944,7 +808,7 @@ struct Globals {
 
     // P1-15: failure-strategy + drainer ownership.
     std::string                                 failure_strategy{"queue"};
-    std::shared_ptr<AuditQueueDrainer>          drainer;
+    std::shared_ptr<CFastenDrainer>          drainer;
     std::mutex                                  drainer_mu;
 
     // Redactor config — built by init(), defaults to built-in pattern + "***".
@@ -989,7 +853,7 @@ inline std::string& tl_request_id() {
     return rid;
 }
 
-// ── Redaction via libfasten_store_core ────────────────────────────────────
+// ── Redaction via libfasten_core ────────────────────────────────────
 // Delegates all key-pattern + value-shape logic to the shared Rust engine.
 inline Fields redact(const Fields& f) {
     if (f.empty()) return f;
@@ -1343,7 +1207,7 @@ inline void install_drainer_(const Config& cfg) {
     // swap and lands a put() after we shutdown self-aborts via the
     // put() stop check (audit_drain_abandoned sys event) — no silent
     // loss into a dead queue.
-    std::shared_ptr<detail_::AuditQueueDrainer> next;
+    std::shared_ptr<detail_::CFastenDrainer> next;
     if (g.failure_strategy == "queue") {
         std::function<void(const Row&)> sink_copy;
         {
@@ -1351,16 +1215,15 @@ inline void install_drainer_(const Config& cfg) {
             sink_copy = g.audit_sink;
         }
         if (sink_copy) {
-            next = std::make_shared<detail_::AuditQueueDrainer>(
+            next = std::make_shared<detail_::CFastenDrainer>(
                 std::move(sink_copy),
-                detail_::drainer_sys_log,
                 cfg.queue_capacity,
                 std::chrono::milliseconds(cfg.queue_retry_initial_ms),
                 std::chrono::milliseconds(cfg.queue_retry_max_ms),
                 !cfg.disable_queue_jitter);
         }
     }
-    std::shared_ptr<detail_::AuditQueueDrainer> old;
+    std::shared_ptr<detail_::CFastenDrainer> old;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         old = g.drainer;
@@ -1386,7 +1249,7 @@ inline std::unique_ptr<QueueStats> queue_stats() {
 // Returns true iff drained. No-op + true in raise mode.
 inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     auto& g = detail_::globals();
-    std::shared_ptr<detail_::AuditQueueDrainer> d;
+    std::shared_ptr<detail_::CFastenDrainer> d;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         d = g.drainer;
@@ -1403,7 +1266,7 @@ inline void uninstall_drainer() {
     // the mutex so any new emit() sees no drainer and falls through
     // to its sync path, instead of racing against a half-shutdown
     // drainer. Then shut down the old one outside the lock.
-    std::shared_ptr<detail_::AuditQueueDrainer> old;
+    std::shared_ptr<detail_::CFastenDrainer> old;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         old = g.drainer;
@@ -1579,7 +1442,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     // P1-15: route through the drainer (queue mode) or invoke the
     // sink synchronously and wrap exceptions (raise mode).
     {
-        std::shared_ptr<detail_::AuditQueueDrainer> drainer_copy;
+        std::shared_ptr<detail_::CFastenDrainer> drainer_copy;
         {
             std::lock_guard<std::mutex> lk(g.drainer_mu);
             drainer_copy = g.drainer;

@@ -1,5 +1,5 @@
 """
-ctypes binding to libfasten_store_core — the shared Rust engine.
+ctypes binding to libfasten_core — the shared Rust engine.
 
 Loads the compiled .so / .dylib / .dll and exposes thin Python wrappers around:
   - fasten_redact / fasten_redact_full  — secret redaction
@@ -12,9 +12,9 @@ Loads the compiled .so / .dylib / .dll and exposes thin Python wrappers around:
 Library location (tried in order):
   1. FASTEN_CORE_LIB env var — explicit path for CI / custom installs.
   2. Adjacent to this file — when the .so is bundled in the wheel.
-  3. ctypes.util.find_library("fasten_store_core") — system-installed.
+  3. ctypes.util.find_library("fasten_core") — system-installed.
   4. Development path relative to this file:
-       ../../store-core/target/release/libfasten_store_core.{so,dylib}
+       ../../fasten-core/target/release/libfasten_core.{so,dylib}
 """
 from __future__ import annotations
 
@@ -36,29 +36,34 @@ def _find_lib() -> str:
     # 2. Bundled alongside this file (wheel layout)
     here = Path(__file__).parent
     suffix = ".dylib" if sys.platform == "darwin" else ".dll" if sys.platform == "win32" else ".so"
-    bundled = here / f"libfasten_store_core{suffix}"
+    bundled = here / f"libfasten_core{suffix}"
     if bundled.exists():
         return str(bundled)
 
     # 3. System linker path
-    if (found := ctypes.util.find_library("fasten_store_core")):
+    if (found := ctypes.util.find_library("fasten_core")):
         return found
 
-    # 4. Development path (monorepo: python/fasten/ → store-core/target/release/)
-    dev = here.parent.parent / "store-core" / "target" / "release" / f"libfasten_store_core{suffix}"
+    # 4. Development path (monorepo: python/fasten/ → fasten-core/target/release/)
+    dev = here.parent.parent / "fasten-core" / "target" / "release" / f"libfasten_core{suffix}"
     if dev.exists():
         return str(dev)
 
     raise OSError(
-        "libfasten_store_core not found. "
-        "Build it with `cargo build --release --features all` in store-core/, "
-        "then set FASTEN_CORE_LIB=/path/to/libfasten_store_core.so."
+        "libfasten_core not found. "
+        "Build it with `cargo build --release --features all` in fasten-core/, "
+        "then set FASTEN_CORE_LIB=/path/to/libfasten_core.so."
     )
+
+
+# Declared here so _configure() can reference it at library-load time.
+InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
 
 
 def _configure(lib: ctypes.CDLL) -> None:
     c_char_p = ctypes.c_char_p
     c_int    = ctypes.c_int
+    vp       = ctypes.c_void_p
 
     lib.fasten_redact.restype  = c_int
     lib.fasten_redact.argtypes = [c_char_p, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
@@ -83,6 +88,32 @@ def _configure(lib: ctypes.CDLL) -> None:
 
     lib.fasten_store_free_str.restype  = None
     lib.fasten_store_free_str.argtypes = [c_char_p]
+
+    lib.fasten_store_from_callback.restype  = vp
+    lib.fasten_store_from_callback.argtypes = [InsertCallbackFn, vp, ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_install.restype  = c_int
+    lib.fasten_drainer_install.argtypes = [
+        vp, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
+        c_int, ctypes.c_uint32, ctypes.POINTER(c_char_p),
+    ]
+
+    lib.fasten_drainer_enqueue.restype  = c_int
+    lib.fasten_drainer_enqueue.argtypes = [vp, c_char_p, ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_flush.restype  = c_int
+    lib.fasten_drainer_flush.argtypes = [
+        vp, ctypes.c_uint64, ctypes.POINTER(c_int), ctypes.POINTER(c_char_p),
+    ]
+
+    lib.fasten_drainer_stats_json.restype  = c_int
+    lib.fasten_drainer_stats_json.argtypes = [vp, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_close.restype  = None
+    lib.fasten_drainer_close.argtypes = [vp]
+
+    lib.fasten_store_close.restype  = None
+    lib.fasten_store_close.argtypes = [vp]
 
 
 _lib: Optional[ctypes.CDLL] = None
@@ -191,3 +222,80 @@ def registry_dump() -> str:
 def registry_clear() -> None:
     """Clear the global Rust registry (for tests / re-init)."""
     get_lib().fasten_registry_clear()
+
+
+# ── Drainer C ABI ─────────────────────────────────────────────────────────────
+
+def store_from_callback(cb: InsertCallbackFn) -> ctypes.c_void_p:
+    """Create a FastenStore* backed by a Python insert callback."""
+    lib = get_lib()
+    err = ctypes.c_char_p(None)
+    ptr = lib.fasten_store_from_callback(cb, None, ctypes.byref(err))
+    if ptr is None:
+        msg = err.value.decode("utf-8", errors="replace") if err.value else "unknown"
+        raise RuntimeError(f"fasten_store_from_callback: {msg}")
+    return ptr
+
+
+def drainer_install(
+    handle: ctypes.c_void_p,
+    capacity: int,
+    retry_initial_ms: int,
+    retry_max_ms: int,
+    retry_jitter: bool,
+    max_attempts: int,
+) -> None:
+    lib = get_lib()
+    err = ctypes.c_char_p(None)
+    rc  = lib.fasten_drainer_install(
+        handle, capacity, retry_initial_ms, retry_max_ms,
+        int(retry_jitter), max_attempts, ctypes.byref(err),
+    )
+    if rc != 0:
+        msg = err.value.decode("utf-8", errors="replace") if err.value else f"rc={rc}"
+        raise RuntimeError(f"fasten_drainer_install: {msg}")
+
+
+def drainer_enqueue(handle: ctypes.c_void_p, row_json: str) -> None:
+    lib = get_lib()
+    err = ctypes.c_char_p(None)
+    rc  = lib.fasten_drainer_enqueue(handle, row_json.encode("utf-8"), ctypes.byref(err))
+    if rc != 0:
+        msg = err.value.decode("utf-8", errors="replace") if err.value else f"rc={rc}"
+        if err.value:
+            lib.fasten_store_free_str(err)
+        raise RuntimeError(f"fasten_drainer_enqueue: {msg}")
+    if err.value:
+        lib.fasten_store_free_str(err)
+
+
+def drainer_flush(handle: ctypes.c_void_p, timeout_ms: int) -> bool:
+    lib = get_lib()
+    drained = ctypes.c_int(0)
+    err     = ctypes.c_char_p(None)
+    lib.fasten_drainer_flush(handle, timeout_ms, ctypes.byref(drained), ctypes.byref(err))
+    if err.value:
+        lib.fasten_store_free_str(err)
+    return bool(drained.value)
+
+
+def drainer_stats_json(handle: ctypes.c_void_p) -> Optional[str]:
+    lib  = get_lib()
+    out  = ctypes.c_char_p(None)
+    err  = ctypes.c_char_p(None)
+    rc   = lib.fasten_drainer_stats_json(handle, ctypes.byref(out), ctypes.byref(err))
+    if err.value:
+        lib.fasten_store_free_str(err)
+    if rc != 0 or out.value is None:
+        return None
+    result = out.value.decode("utf-8")
+    lib.fasten_store_free_str(out)
+    return result
+
+
+def drainer_close(handle: ctypes.c_void_p) -> None:
+    get_lib().fasten_drainer_close(handle)
+
+
+def store_close(handle: ctypes.c_void_p) -> None:
+    get_lib().fasten_store_close(handle)

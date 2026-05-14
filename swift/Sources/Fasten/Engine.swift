@@ -11,7 +11,8 @@ final class Engine: @unchecked Sendable {
     private(set) var store:     (any AuditStore)?
     private(set) var transport: StdoutTransport = StdoutTransport()
     private(set) var redactor:  Redactor = Redactor()
-    private(set) var queue:     AuditQueue?
+    private var drainer:        CFastenDrainer?
+    private var strategy:       FailureStrategy = .queue
 
     private var seq:        Int = 0
     private var prevHash:   String = "genesis"
@@ -27,19 +28,31 @@ final class Engine: @unchecked Sendable {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
-        queue?.stop()
+        // Flush + stop old drainer before reconfiguring so in-flight rows are not dropped.
+        if let old = drainer {
+            old.flush(timeout: 5.0)
+            old.close()
+            drainer = nil
+        }
         lock.withLock {
             self.serviceID = serviceID
             self.nodeID    = nodeID
             self.tenantID  = tenantID
             self.store     = store
+            self.strategy  = strategy
             self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement)
             self.seq       = store?.maxMonotonicSeq() ?? 0
             self.prevHash  = "genesis"
         }
-        if let s = store {
-            self.queue = AuditQueue(store: s, transport: transport,
-                                    capacity: queueCapacity, strategy: strategy)
+        if strategy == .queue, let s = store {
+            drainer = try? CFastenDrainer(
+                store:          s,
+                capacity:       UInt64(queueCapacity),
+                retryInitialMs: 100,
+                retryMaxMs:     60_000,
+                retryJitter:    true,
+                maxAttempts:    50
+            )
         }
     }
 
@@ -109,8 +122,12 @@ final class Engine: @unchecked Sendable {
             hash:         rowHash
         )
 
-        if let q = queue {
-            try q.enqueue(row)
+        if let d = drainer {
+            transport.emit(row)
+            d.enqueue(row)
+        } else if strategy == .raise, let s = store {
+            try s.insert(row)
+            transport.emit(row)
         } else {
             transport.emit(row)
         }
@@ -125,15 +142,18 @@ final class Engine: @unchecked Sendable {
     }
 
     func flush(timeout: TimeInterval) -> Bool {
-        queue?.flush(timeout: timeout) ?? true
+        drainer?.flush(timeout: timeout) ?? true
     }
 
     func reset() {
-        queue?.stop()
+        if let d = drainer {
+            d.close()
+            drainer = nil
+        }
         CodeRegistry.shared.clear()
         lock.withLock {
             serviceID = ""; nodeID = ""; tenantID = nil
-            store = nil; queue = nil
+            store = nil; strategy = .queue
             seq = 0; prevHash = "genesis"
             redactor = Redactor()
         }

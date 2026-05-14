@@ -14,11 +14,28 @@ use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-pub mod audit_queue;
-pub use audit_queue::{flush, queue_stats, AuditStoreError, QueueStats};
-
 pub mod engine;
 pub use engine::{Engine, DEFAULT};
+
+// ── P1-15 drainer public surface ─────────────────────────────────────────────
+
+/// Snapshot of the active drainer state. Re-exported from fasten-core.
+pub use fasten_core::drainer::QueueStats;
+
+/// Raised by `EmitBuilder::submit()` in `raise` mode when the store insert fails.
+#[derive(Debug, thiserror::Error)]
+#[error("fasten audit store: {source}")]
+pub struct AuditStoreError {
+    #[source]
+    pub source: Error,
+}
+
+/// Block until pending audit rows drain (or `timeout` elapses).
+/// No-op + returns `true` in `raise` mode.
+pub fn flush(timeout: std::time::Duration) -> bool { DEFAULT.flush(timeout) }
+
+/// Snapshot of the active drainer, or `None` in `raise` mode.
+pub fn queue_stats() -> Option<QueueStats> { DEFAULT.queue_stats() }
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +91,7 @@ pub const METHOD_UI: &str = "ui";  // Web or desktop UI action, human-initiated
 pub const METHOD_AGENT_TOOL: &str = "agent_tool";  // AI agent tool call
 pub const METHOD_SDK: &str = "sdk";  // Direct SDK call, no transport shim active. Default.
 
-pub use fasten_store_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;
+pub use fasten_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;
 pub const REDACT_PATTERNS: &[&str] = &[
     "api[_-]?key",
     "password",
@@ -229,7 +246,7 @@ pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
 /// Register a batch of codes for a domain.
 ///
 /// Validation (key shape, id-match, domain-match, pii_in_detail forcing) is
-/// delegated to a fresh `fasten_store_core::catalog::CodeRegistry` so the
+/// delegated to a fresh `fasten_core::catalog::CodeRegistry` so the
 /// rules stay in one place.  The validated codes are then committed to the
 /// SDK's own typed registry.
 ///
@@ -238,12 +255,12 @@ pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
 {
-    use fasten_store_core::catalog::CodeRegistry as CoreReg;
+    use fasten_core::catalog::CodeRegistry as CoreReg;
     let codes: Vec<(String, Meta)> = codes.into_iter().collect();
 
-    // Validate via a throw-away store-core registry — handles all rules
+    // Validate via a throw-away fasten-core registry — handles all rules
     // without touching the global singleton (safe to call from tests).
-    let core_map: HashMap<String, fasten_store_core::catalog::Meta> =
+    let core_map: HashMap<String, fasten_core::catalog::Meta> =
         codes.iter().map(|(id, m)| (id.clone(), to_core_meta(m))).collect();
     CoreReg::new().register(&domain, core_map).map_err(map_core_catalog_err)?;
 
@@ -270,8 +287,8 @@ where
     Ok(())
 }
 
-fn to_core_meta(m: &Meta) -> fasten_store_core::catalog::Meta {
-    fasten_store_core::catalog::Meta {
+fn to_core_meta(m: &Meta) -> fasten_core::catalog::Meta {
+    fasten_core::catalog::Meta {
         id:                      m.id.clone(),
         domain:                  m.domain.clone(),
         category:                m.category.clone(),
@@ -287,8 +304,8 @@ fn to_core_meta(m: &Meta) -> fasten_store_core::catalog::Meta {
     }
 }
 
-fn map_core_catalog_err(e: fasten_store_core::error::Error) -> Error {
-    use fasten_store_core::error::Error as CE;
+fn map_core_catalog_err(e: fasten_core::error::Error) -> Error {
+    use fasten_core::error::Error as CE;
     match e {
         CE::InvalidKey(k) => Error::InvalidKey(k),
         CE::IdMismatch { key, id } => Error::IdMismatch { key, got: id },
@@ -384,7 +401,7 @@ fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
 ) -> HashMap<String, serde_json::Value> {
-    use fasten_store_core::redact::{Redactor, REDACTOR};
+    use fasten_core::redact::{Redactor, REDACTOR};
     let v = serde_json::Value::Object(detail.into_iter().collect());
     let redacted = match extra {
         Some(keys) if !keys.is_empty() => {
@@ -458,8 +475,8 @@ pub fn config_from_env() -> Result<Config, Error> {
 /// Initialise fasten with a Config. Required before `emit()`.
 ///
 /// When `cfg.audit_store` is provided and `cfg.audit_store_failure_strategy`
-/// is `"queue"` (default), this installs a background drainer thread; see
-/// the `audit_queue` module for the full P1-15 contract.
+/// is `"queue"` (default), this installs the shared fasten-core background
+/// drainer thread (see `fasten_core::drainer` for the full P1-15 contract).
 pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
 
 /// Fluent-style Emit builder. Caller supplies `code`, `target`, optional
@@ -537,12 +554,11 @@ impl EmitBuilder {
             .unwrap_or("queue");
         if strategy == "queue" {
             if let Some(d) = DEFAULT.active_drainer() {
-                d.put(row.clone());
+                let core_row = crate::engine::sdk_row_to_core(&row);
+                d.enqueue(core_row);
             } else if let Some(s) = cfg.audit_store.as_ref() {
                 // Defensive fallback — strategy says queue but drainer
-                // isn't installed (init was called with no strategy
-                // setup, or store-only path). Sync insert so the row
-                // isn't silently dropped.
+                // isn't installed. Sync insert so the row isn't dropped.
                 if let Err(e) = s.insert(&row) {
                     return Err(AuditStoreError { source: e });
                 }

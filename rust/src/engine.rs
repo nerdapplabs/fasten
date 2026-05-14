@@ -3,73 +3,131 @@
 //! The module-level free functions (`init`, `flush`, …) in `lib.rs` delegate
 //! to [`DEFAULT`]. Applications needing multiple isolated fasten deployments
 //! can construct `Engine` instances directly.
-//!
-//! **Drainer lifetime note**: The `sys_log` callback passed to the drainer
-//! requires `'static` bounds. `Engine::init()` satisfies this by capturing
-//! `service_id` by value rather than holding a reference to `self`, so the
-//! callback remains valid for the drainer thread's lifetime regardless of
-//! how the `Engine` instance is stored.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 
-use crate::{
-    audit_queue::{Drainer, QueueStats},
-    current_request_id, AuditStore, Config, Error,
-};
+use fasten_core::drainer::{Drainer, DrainerConfig};
 
-/// Type alias for the drainer's sys-log callback, avoiding repetition of the
-/// verbose bound across engine and audit_queue call sites.
-pub(crate) type SysLogFn = Box<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>;
+use crate::{current_request_id, AuditStore, Config, Error};
 
-/// Drainer tuning parameters, grouped to keep `install_drainer` below
-/// clippy's argument-count threshold and to make re-init call sites readable.
-pub(crate) struct DrainerConfig {
-    pub(crate) capacity: usize,
-    pub(crate) retry_initial: Duration,
-    pub(crate) retry_max: Duration,
-    pub(crate) retry_jitter: bool,
-    pub(crate) max_attempts: usize,
+// ── Poison-recovery helper ────────────────────────────────────────────────────
+
+trait LockOrRecover<T: ?Sized> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
 }
-
-pub(crate) use self::lock_ext::LockOrRecover;
-
-mod lock_ext {
-    use std::sync::{Mutex, MutexGuard};
-
-    /// Acquire a mutex even if it was poisoned by a previous panic.
-    ///
-    /// A panic in adopter code (store insert, sys-log callback) must not
-    /// prevent the drainer or any caller from making progress on every
-    /// subsequent operation. Using this pattern instead of `.unwrap()` ensures
-    /// poison never propagates out of Mutex::lock.
-    pub(crate) trait LockOrRecover<T: ?Sized> {
-        fn lock_or_recover(&self) -> MutexGuard<'_, T>;
-    }
-
-    impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
-        fn lock_or_recover(&self) -> MutexGuard<'_, T> {
-            self.lock().unwrap_or_else(|e| e.into_inner())
-        }
+impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-// ── Engine ───────────────────────────────────────────────────────────────────
+// ── Row conversion: SDK Row ↔ fasten_core::Row ────────────────────────────────
+
+pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
+    fasten_core::Row {
+        wire_version:   r.wire_version.clone(),
+        id:             r.id.clone(),
+        origin_id:      r.origin_id.clone(),
+        monotonic_seq:  r.monotonic_seq,
+        timestamp:      r.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+        code:           r.code.clone(),
+        action:         r.action.clone(),
+        severity:       r.severity.to_string(), // Display impl → lowercase
+        service_id:     r.service_id.clone(),
+        source_node_id: r.source_node_id.clone(),
+        tenant_id:      r.tenant_id.clone(),
+        actor:          r.actor.clone(),
+        actor_kind:     r.actor_kind.clone(),
+        target:         r.target.clone(),
+        category:       r.category.clone(),
+        domain:         r.domain.clone(),
+        method:         r.method.clone(),
+        request_id:     r.request_id.clone(),
+        detail:         serde_json::Value::Object(r.detail.clone().into_iter().collect()),
+        pii_in_detail:  r.pii_in_detail,
+        shipped_at:     r.shipped_at
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        ..Default::default()
+    }
+}
+
+fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
+    let severity = match r.severity.as_str() {
+        "debug"    => crate::Severity::Debug,
+        "warn"     => crate::Severity::Warn,
+        "error"    => crate::Severity::Error,
+        "critical" => crate::Severity::Critical,
+        _          => crate::Severity::Info,
+    };
+    let detail: HashMap<String, serde_json::Value> = match &r.detail {
+        serde_json::Value::Object(m) => m.clone().into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    crate::Row {
+        wire_version:   r.wire_version.clone(),
+        id:             r.id.clone(),
+        origin_id:      r.origin_id.clone(),
+        monotonic_seq:  r.monotonic_seq,
+        timestamp:      r.timestamp.parse().unwrap_or_else(|_| Utc::now()),
+        code:           r.code.clone(),
+        action:         r.action.clone(),
+        severity,
+        service_id:     r.service_id.clone(),
+        source_node_id: r.source_node_id.clone(),
+        tenant_id:      r.tenant_id.clone(),
+        actor:          r.actor.clone(),
+        actor_kind:     r.actor_kind.clone(),
+        target:         r.target.clone(),
+        category:       r.category.clone(),
+        domain:         r.domain.clone(),
+        method:         r.method.clone(),
+        request_id:     r.request_id.clone(),
+        detail,
+        pii_in_detail:  r.pii_in_detail,
+        shipped_at:     r.shipped_at.as_deref().and_then(|s| s.parse().ok()),
+    }
+}
+
+// ── SdkStoreAdapter: bridges Arc<dyn AuditStore> → fasten_core::Store ─────────
+
+struct SdkStoreAdapter(Arc<dyn AuditStore>);
+
+impl fasten_core::store::Store for SdkStoreAdapter {
+    fn insert(&self, row: &fasten_core::Row) -> Result<(), fasten_core::Error> {
+        let sdk_row = core_to_sdk_row(row);
+        self.0.insert(&sdk_row)
+            .map_err(|e| fasten_core::Error::InvalidTableName(e.to_string()))
+    }
+    fn ping(&self) -> Result<(), fasten_core::Error> { Ok(()) }
+    fn query(&self, _: &fasten_core::store::Filter)
+        -> Result<Vec<fasten_core::Row>, fasten_core::Error> { Ok(vec![]) }
+    fn count(&self, _: &fasten_core::store::Filter)
+        -> Result<u64, fasten_core::Error> { Ok(0) }
+    fn list_unshipped(&self, _: u32)
+        -> Result<Vec<fasten_core::Row>, fasten_core::Error> { Ok(vec![]) }
+    fn mark_shipped(&self, _: &[String]) -> Result<(), fasten_core::Error> { Ok(()) }
+    fn purge(&self, _: &str, _: bool) -> Result<u64, fasten_core::Error> { Ok(0) }
+    fn max_monotonic_seq(&self) -> Result<u64, fasten_core::Error> { Ok(0) }
+}
+
+// ── Engine ���───────────────────────────────────────────────────────────────────
 
 pub struct Engine {
-    pub(crate) config: Mutex<Option<Config>>,
-    pub(crate) seq: AtomicU64,
+    pub(crate) config:  Mutex<Option<Config>>,
+    pub(crate) seq:     AtomicU64,
     pub(crate) drainer: Mutex<Option<Arc<Drainer>>>,
 }
 
 impl Engine {
     pub const fn new() -> Self {
         Self {
-            config: Mutex::new(None),
-            seq: AtomicU64::new(0),
+            config:  Mutex::new(None),
+            seq:     AtomicU64::new(0),
             drainer: Mutex::new(None),
         }
     }
@@ -89,15 +147,11 @@ impl Engine {
         }
 
         let store = cfg.audit_store.clone();
-        let capacity = cfg.queue_capacity.unwrap_or(100);
+        let capacity     = cfg.queue_capacity.unwrap_or(100);
         let retry_initial = cfg.queue_retry_initial.unwrap_or(Duration::from_millis(100));
-        let retry_max = cfg.queue_retry_max.unwrap_or(Duration::from_secs(60));
-        let retry_jitter = !cfg.disable_queue_jitter;
-        let max_attempts = cfg.queue_drain_max_attempts.unwrap_or(50);
-
-        // Capture service_id for the drainer sys_log closure. Capturing by
-        // value (not &self) satisfies the 'static bound on the callback.
-        let svc_id_for_log = cfg.service_id.clone();
+        let retry_max     = cfg.queue_retry_max.unwrap_or(Duration::from_secs(60));
+        let retry_jitter  = !cfg.disable_queue_jitter;
+        let max_attempts  = cfg.queue_drain_max_attempts.unwrap_or(50);
 
         let mut cfg_stored = cfg;
         cfg_stored.audit_store_failure_strategy = Some(strategy.clone());
@@ -105,10 +159,7 @@ impl Engine {
 
         if strategy == "queue" {
             if let Some(s) = store {
-                let sys_log: SysLogFn = Box::new(move |level: &str, event: &str, fields: &serde_json::Value| {
-                    Self::emit_sys_stderr(level, event, fields, &svc_id_for_log);
-                });
-                self.install_drainer(s, sys_log, DrainerConfig {
+                self.install_drainer(s, DrainerConfig {
                     capacity, retry_initial, retry_max, retry_jitter, max_attempts,
                 });
             } else {
@@ -121,10 +172,7 @@ impl Engine {
     }
 
     pub fn current_config(&self) -> Result<Config, Error> {
-        self.config
-            .lock_or_recover()
-            .clone()
-            .ok_or(Error::NotInitialised)
+        self.config.lock_or_recover().clone().ok_or(Error::NotInitialised)
     }
 
     pub fn seq_next(&self) -> u64 {
@@ -135,104 +183,55 @@ impl Engine {
         self.drainer.lock_or_recover().clone()
     }
 
-    pub(crate) fn install_drainer(
-        &self,
-        store: Arc<dyn AuditStore>,
-        sys_log: SysLogFn,
-        cfg: DrainerConfig,
-    ) {
-        // Race-safe re-init: build the new drainer FIRST, swap the slot
-        // atomically, then flush + shutdown the old one OUTSIDE the lock.
-        let new = Drainer::new(store, sys_log, cfg);
-        let old = {
-            let mut slot = self.drainer.lock_or_recover();
-            slot.replace(new)
-        };
+    pub(crate) fn install_drainer(&self, store: Arc<dyn AuditStore>, cfg: DrainerConfig) {
+        let new = Drainer::new(Box::new(SdkStoreAdapter(store)), cfg);
+        let old = { let mut slot = self.drainer.lock_or_recover(); slot.replace(new) };
         if let Some(old) = old {
             old.flush(Duration::from_secs(5));
-            old.shutdown(Duration::from_secs(2));
+            old.stop(Duration::from_secs(2));
         }
     }
 
     pub fn uninstall_drainer(&self) {
-        let old = {
-            let mut slot = self.drainer.lock_or_recover();
-            slot.take()
-        };
+        let old = { let mut slot = self.drainer.lock_or_recover(); slot.take() };
         if let Some(d) = old {
-            d.shutdown(Duration::from_secs(2));
+            d.stop(Duration::from_secs(2));
         }
     }
 
-    pub fn queue_stats(&self) -> Option<QueueStats> {
-        self.active_drainer().map(|d| d.stats())
+    pub fn queue_stats(&self) -> Option<fasten_core::drainer::QueueStats> {
+        Some(self.active_drainer()?.stats())
     }
 
     pub fn flush(&self, timeout: Duration) -> bool {
         match self.active_drainer() {
             Some(d) => d.flush(timeout),
-            None => true,
+            None    => true,
         }
     }
 
-    /// Reset all runtime state for test isolation.
-    ///
-    /// Stops the active drainer (best-effort flush), clears config, and resets
-    /// the monotonic sequence counter. Mirrors `reset_for_tests()` / `ResetForTests()`
-    /// / `resetForTests()` in Python / Go / JS.
     pub fn reset_for_tests(&self) {
         self.uninstall_drainer();
         *self.config.lock_or_recover() = None;
         self.seq.store(0, Ordering::SeqCst);
     }
 
-    /// Structured log line to stdout (shape: sys). Used by the `log` module.
     pub fn log_sys(&self, level: &str, event: &str, fields: serde_json::Value) {
-        let service_id = self.current_config()
-            .map(|c| c.service_id)
-            .unwrap_or_default();
+        let service_id = self.current_config().map(|c| c.service_id).unwrap_or_default();
         let mut payload = serde_json::json!({
             "shape": "sys",
             "level": level,
             "event": event,
             "request_id": current_request_id().unwrap_or_default(),
             "service_id": service_id,
-            "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
         if let serde_json::Value::Object(merge_into) = &mut payload {
             if let serde_json::Value::Object(extra) = fields {
-                for (k, v) in extra {
-                    merge_into.insert(k, v);
-                }
+                for (k, v) in extra { merge_into.insert(k, v); }
             }
         }
-        println!("{}", payload);
-    }
-
-    /// Write a {shape:sys} line to stderr. Used as the drainer callback;
-    /// stderr is mandatory — stdout backpressure would stall the drainer.
-    fn emit_sys_stderr(level: &str, event: &str, fields: &serde_json::Value, service_id: &str) {
-        let mut payload = serde_json::Map::new();
-        payload.insert("shape".into(), serde_json::Value::String("sys".into()));
-        payload.insert("level".into(), serde_json::Value::String(level.into()));
-        payload.insert("event".into(), serde_json::Value::String(event.into()));
-        payload.insert(
-            "request_id".into(),
-            current_request_id()
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null),
-        );
-        payload.insert("service_id".into(), serde_json::Value::String(service_id.into()));
-        payload.insert(
-            "timestamp".into(),
-            serde_json::Value::String(Utc::now().to_rfc3339()),
-        );
-        if let serde_json::Value::Object(extras) = fields {
-            for (k, v) in extras {
-                payload.insert(k.clone(), v.clone());
-            }
-        }
-        eprintln!("{}", serde_json::Value::Object(payload));
+        println!("{payload}");
     }
 }
 

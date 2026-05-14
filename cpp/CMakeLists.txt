@@ -5,17 +5,17 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── libfasten_store_core (Rust shared library) ────────────────────────────
-# Build store-core before configuring this project:
-#   cd ../store-core && cargo build --release --features all
+# ── libfasten_core (Rust shared library) ────────────────────────────
+# Build fasten-core before configuring this project:
+#   cd ../fasten-core && cargo build --release --features all
 # Then set FASTEN_CORE_LIB_DIR to the release output dir, or let CMake
 # look in the default location relative to this file.
 if(NOT FASTEN_CORE_LIB_DIR)
-    set(FASTEN_CORE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../store-core/target/release")
+    set(FASTEN_CORE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fasten-core/target/release")
 endif()
 
 find_library(FASTEN_CORE_LIB
-    NAMES fasten_store_core
+    NAMES fasten_core
     HINTS ${FASTEN_CORE_LIB_DIR}
     REQUIRED
 )
@@ -74,14 +74,6 @@ if(FASTEN_BUILD_TESTS)
         target_link_libraries(pii_in_detail_smoke PRIVATE pthread)
     endif()
     add_test(NAME pii_in_detail_smoke COMMAND pii_in_detail_smoke)
-
-    # P1-15: audit-store failure handling smoke
-    add_executable(audit_queue_smoke tests/audit_queue_smoke.cpp)
-    target_link_libraries(audit_queue_smoke PRIVATE fasten)
-    if(UNIX AND NOT APPLE)
-        target_link_libraries(audit_queue_smoke PRIVATE pthread)
-    endif()
-    add_test(NAME audit_queue_smoke COMMAND audit_queue_smoke)
 
     # REVIEW.md item #1: substring-redact regression guard
     add_executable(redact_substring_smoke tests/redact_substring_smoke.cpp)
