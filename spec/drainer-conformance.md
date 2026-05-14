@@ -11,10 +11,10 @@
 All SDKs expose the same bounded-queue / exponential-backoff / sys-event
 drainer surface to adopters.  The drainer implementation is provided by
 the shared `fasten-core` C ABI (`libfasten_core.so` / `.dylib`).
-Python, Go, Swift, and C++ bind to it via FFI (ctypes / cgo / Swift's
-C interop / `extern "C"`); Rust implements it natively as the
-authoritative reference.  JS still runs its own in-process drainer loop
-(migration tracked in P1-26).
+Python, Go, and C++ bind to it via FFI (ctypes / cgo / `extern "C"`);
+Rust implements it natively as the authoritative reference.
+JS and Swift run spec-conformant pure-language in-process drainer loops
+(zero Rust dependency; P1-25 complete, P1-26 closed).
 
 This document is the single source of truth for the externally visible
 drainer contract.  When an SDK deviates from it, the spec wins.

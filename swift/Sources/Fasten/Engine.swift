@@ -11,7 +11,7 @@ final class Engine: @unchecked Sendable {
     private(set) var store:     (any AuditStore)?
     private(set) var transport: StdoutTransport = StdoutTransport()
     private(set) var redactor:  Redactor = Redactor()
-    private var drainer:        CFastenDrainer?
+    private var drainer:        QueueDrainer?
     private var strategy:       FailureStrategy = .queue
 
     private var seq:        Int = 0
@@ -45,9 +45,9 @@ final class Engine: @unchecked Sendable {
             self.prevHash  = "genesis"
         }
         if strategy == .queue, let s = store {
-            drainer = try? CFastenDrainer(
+            drainer = QueueDrainer(
                 store:          s,
-                capacity:       UInt64(queueCapacity),
+                capacity:       queueCapacity,
                 retryInitialMs: 100,
                 retryMaxMs:     60_000,
                 retryJitter:    true,
