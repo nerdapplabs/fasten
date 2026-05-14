@@ -342,6 +342,84 @@ fn flush_targets_rows_at_call_time_not_later_emits() {
     *stop_bg.lock().unwrap() = true;
 }
 
+// ── §9a audit_drain_recovered state transition ────────────────────────────────
+// Verifies the stats reset that accompanies the audit_drain_recovered sys event.
+// The event itself is written to stderr; this test confirms the state machine
+// transition: retry_count_active → 0 and last_error → null after recovery.
+
+#[test]
+fn recovery_resets_retry_stats() {
+    let store = FlakyStore::new(3);
+    let d = Drainer::new(Box::new(store), DrainerConfig {
+        retry_initial: Duration::from_millis(5),
+        retry_max: Duration::from_millis(20),
+        retry_jitter: false,
+        ..DrainerConfig::default()
+    });
+    d.enqueue(make_row("r-recover"));
+    assert!(d.flush(Duration::from_secs(5)));
+
+    let stats: serde_json::Value = serde_json::from_str(&d.stats_json()).unwrap();
+    assert_eq!(stats["retry_count_active"], 0, "retry counter must reset after recovery");
+    assert!(stats["last_error"].is_null(), "last_error must clear after recovery");
+    assert_eq!(stats["drained_total"], 1);
+}
+
+// ── §9b panicking store does not kill the drainer thread ─────────────────────
+
+#[test]
+fn panicking_store_dead_letters_and_continues() {
+    struct PanicStore {
+        calls: Arc<Mutex<usize>>,
+        panic_until: usize,
+        inner: RecordingStore,
+    }
+    impl Store for PanicStore {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            let n = *c;
+            drop(c);
+            if n <= self.panic_until {
+                panic!("injected store panic on call {n}");
+            }
+            self.inner.insert(row)
+        }
+        fn ping(&self) -> Result<(), Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+    }
+
+    let good = RecordingStore::default();
+    let rows_ref = Arc::clone(&good.rows);
+    let store = PanicStore {
+        calls: Arc::new(Mutex::new(0)),
+        panic_until: 1,
+        inner: good,
+    };
+    let d = Drainer::new(Box::new(store), DrainerConfig {
+        retry_initial: Duration::from_millis(5),
+        retry_max: Duration::from_millis(20),
+        retry_jitter: false,
+        max_attempts: 50,
+        ..DrainerConfig::default()
+    });
+
+    // First row panics → dead-lettered; second row succeeds → drainer still alive.
+    d.enqueue(make_row("r-panic"));
+    d.enqueue(make_row("r-ok"));
+    assert!(d.flush(Duration::from_secs(5)));
+
+    let stats: serde_json::Value = serde_json::from_str(&d.stats_json()).unwrap();
+    assert_eq!(stats["dead_lettered_total"], 1, "panicking row must be dead-lettered");
+    assert_eq!(rows_ref.lock().unwrap().len(), 1, "second row must drain normally");
+    assert_eq!(stats["depth"], 0, "queue must be empty after flush");
+}
+
 // ── §9 backoff jitter does not panic ─────────────────────────────────────────
 
 #[test]

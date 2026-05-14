@@ -56,9 +56,14 @@ def _find_lib() -> str:
     )
 
 
+# Declared here so _configure() can reference it at library-load time.
+InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
+
+
 def _configure(lib: ctypes.CDLL) -> None:
     c_char_p = ctypes.c_char_p
     c_int    = ctypes.c_int
+    vp       = ctypes.c_void_p
 
     lib.fasten_redact.restype  = c_int
     lib.fasten_redact.argtypes = [c_char_p, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
@@ -83,6 +88,32 @@ def _configure(lib: ctypes.CDLL) -> None:
 
     lib.fasten_store_free_str.restype  = None
     lib.fasten_store_free_str.argtypes = [c_char_p]
+
+    lib.fasten_store_from_callback.restype  = vp
+    lib.fasten_store_from_callback.argtypes = [InsertCallbackFn, vp, ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_install.restype  = c_int
+    lib.fasten_drainer_install.argtypes = [
+        vp, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
+        c_int, ctypes.c_uint32, ctypes.POINTER(c_char_p),
+    ]
+
+    lib.fasten_drainer_enqueue.restype  = c_int
+    lib.fasten_drainer_enqueue.argtypes = [vp, c_char_p, ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_flush.restype  = c_int
+    lib.fasten_drainer_flush.argtypes = [
+        vp, ctypes.c_uint64, ctypes.POINTER(c_int), ctypes.POINTER(c_char_p),
+    ]
+
+    lib.fasten_drainer_stats_json.restype  = c_int
+    lib.fasten_drainer_stats_json.argtypes = [vp, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_close.restype  = None
+    lib.fasten_drainer_close.argtypes = [vp]
+
+    lib.fasten_store_close.restype  = None
+    lib.fasten_store_close.argtypes = [vp]
 
 
 _lib: Optional[ctypes.CDLL] = None
@@ -195,60 +226,9 @@ def registry_clear() -> None:
 
 # ── Drainer C ABI ─────────────────────────────────────────────────────────────
 
-# Callback type: fn(row_json: bytes, userdata: c_void_p) -> c_int32
-InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
-
-
-def _configure_drainer(lib: ctypes.CDLL) -> None:
-    vp = ctypes.c_void_p
-
-    lib.fasten_store_from_callback.restype  = vp
-    lib.fasten_store_from_callback.argtypes = [InsertCallbackFn, vp, ctypes.POINTER(ctypes.c_char_p)]
-
-    lib.fasten_drainer_install.restype  = ctypes.c_int32
-    lib.fasten_drainer_install.argtypes = [
-        vp,                   # store handle
-        ctypes.c_uint64,      # capacity
-        ctypes.c_uint64,      # retry_initial_ms
-        ctypes.c_uint64,      # retry_max_ms
-        ctypes.c_int,         # retry_jitter
-        ctypes.c_uint32,      # max_attempts
-        ctypes.POINTER(ctypes.c_char_p),  # out_err
-    ]
-
-    lib.fasten_drainer_enqueue.restype  = ctypes.c_int32
-    lib.fasten_drainer_enqueue.argtypes = [vp, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-
-    lib.fasten_drainer_flush.restype  = ctypes.c_int32
-    lib.fasten_drainer_flush.argtypes = [
-        vp, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_char_p),
-    ]
-
-    lib.fasten_drainer_stats_json.restype  = ctypes.c_int32
-    lib.fasten_drainer_stats_json.argtypes = [vp, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)]
-
-    lib.fasten_drainer_close.restype  = None
-    lib.fasten_drainer_close.argtypes = [vp]
-
-    lib.fasten_store_close.restype  = None
-    lib.fasten_store_close.argtypes = [vp]
-
-
-# Lazily configure drainer bindings the first time they're needed.
-_drainer_configured = False
-
-
-def _ensure_drainer(lib: ctypes.CDLL) -> None:
-    global _drainer_configured
-    if not _drainer_configured:
-        _configure_drainer(lib)
-        _drainer_configured = True
-
-
 def store_from_callback(cb: InsertCallbackFn) -> ctypes.c_void_p:
     """Create a FastenStore* backed by a Python insert callback."""
     lib = get_lib()
-    _ensure_drainer(lib)
     err = ctypes.c_char_p(None)
     ptr = lib.fasten_store_from_callback(cb, None, ctypes.byref(err))
     if ptr is None:
@@ -266,7 +246,6 @@ def drainer_install(
     max_attempts: int,
 ) -> None:
     lib = get_lib()
-    _ensure_drainer(lib)
     err = ctypes.c_char_p(None)
     rc  = lib.fasten_drainer_install(
         handle, capacity, retry_initial_ms, retry_max_ms,
