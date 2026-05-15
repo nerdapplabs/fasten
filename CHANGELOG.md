@@ -6,6 +6,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Redact conformance corpus (P0-7 Step 1)
+
+- `spec/redact-conformance.json` — 50-case cross-language test corpus covering all 14 key
+  patterns, 7 value-shape rules (JWT/PEM/AWS/GH/Stripe/OpenAI/CC-Luhn), priority ordering
+  (key-pattern wins over value-shape), nested dicts, arrays, and safe-value pass-through.
+  All five SDKs run it: Python (`test_redact_conformance.py`), Go (`redact_conformance_test.go`),
+  JS (`redact_conformance.test.mjs`), Swift (`RedactConformanceTests.swift`),
+  C++ (`redact_conformance_smoke.cpp`).
+- **JS `core_ffi.js`** — value-shape redaction added (was key-pattern only): JWT, PEM private key,
+  AWS AKIA/ASIA, GitHub ghp/gho/ghu/ghs/ghr tokens, Stripe live key, OpenAI legacy/proj keys,
+  CC/Luhn. Patterns and Luhn algorithm mirror `fasten-core/src/redact.rs` exactly.
+  Also fixed `password`, `passwd`, `cookie` key patterns: removed incorrect `^...$` anchors so they
+  match substrings (e.g. `user_password`) consistently with Rust/Python/Go.
+- **Swift `Redactor.swift`** — value-shape patterns aligned with Rust canonical: removed `^...$`
+  anchors (substring matching), added ASIA variant for AWS, added gho/ghu/ghr GitHub token types,
+  updated OpenAI pattern to include `sk-proj-...` and 32-char threshold, restricted Stripe to
+  `sk_live_` only (matches Rust), extended CC range to 13–19 digits (was 13–16).
+
 ### Changed — Shared drainer unification (P0-7, Python / Go / C++) + Pure-language ports (P1-25, JS / Swift)
 
 - Python, Go, and C++ drainer implementations replaced by FFI bindings to

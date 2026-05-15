@@ -24,14 +24,22 @@ public final class Redactor: @unchecked Sendable {
     }()
 
     // Built-in value-shape rules (P1-24); applied to string values regardless of key.
+    // Patterns mirror the canonical Rust implementation in fasten-core/src/redact.rs.
+    // No anchors — a secret embedded anywhere in a string value is detected.
     private static let valueShapeRules: [(NSRegularExpression, String)] = {
         let defs: [(String, String)] = [
-            (#"^eyJ[A-Za-z0-9_=+/\-]+\.[A-Za-z0-9_=+/\-]+\.[A-Za-z0-9_=+/\-]*$"#, "***JWT***"),
-            (#"-----BEGIN [A-Z ]+PRIVATE KEY-----"#,                                  "***PRIVATE_KEY***"),
-            (#"^AKIA[0-9A-Z]{16}$"#,                                                  "***AWS_KEY***"),
-            (#"^gh[a-z]_[A-Za-z0-9]{36,}$"#,                                         "***GH_TOKEN***"),
-            (#"^sk_(live|test)_[A-Za-z0-9]{24,}$"#,                                  "***STRIPE_KEY***"),
-            (#"^sk-[A-Za-z0-9]{48,}$"#,                                               "***OPENAI_KEY***"),
+            // JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)
+            (#"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"#,           "***JWT***"),
+            // PEM private key block header (RSA, EC, DSA, OPENSSH, or generic)
+            (#"-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----"#,              "***PRIVATE_KEY***"),
+            // AWS access key: permanent AKIA or short-lived ASIA
+            (#"(?:AKIA|ASIA)[A-Z0-9]{16}"#,                                           "***AWS_KEY***"),
+            // GitHub token: ghp/gho/ghu/ghs/ghr, exactly 36 alphanumeric chars
+            (#"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}"#,                            "***GH_TOKEN***"),
+            // Stripe live secret key (24+ chars after prefix)
+            (#"sk_live_[A-Za-z0-9]{24,}"#,                                            "***STRIPE_KEY***"),
+            // OpenAI API key (legacy sk-... and org sk-proj-... formats, 32+ suffix chars)
+            (#"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#,                                   "***OPENAI_KEY***"),
         ]
         return defs.compactMap { (pat, repl) in
             guard let re = try? NSRegularExpression(pattern: pat) else { return nil }
@@ -97,7 +105,7 @@ public final class Redactor: @unchecked Sendable {
     }
 
     private func _looksLikeCC(_ s: String) -> Bool {
-        guard s.count >= 13 && s.count <= 16 && s.allSatisfy(\.isNumber) else { return false }
+        guard s.count >= 13 && s.count <= 19 && s.allSatisfy(\.isNumber) else { return false }
         return _luhn(s)
     }
 

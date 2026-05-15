@@ -1,0 +1,295 @@
+{
+  "version": "1",
+  "description": "Cross-language redaction conformance corpus. Every SDK MUST pass every case. The Rust implementation in fasten-core/src/redact.rs is canonical. Input and expected are JSON-serialisable objects. Value-shape tests use the neutral key 'note' so key-pattern redaction does not interfere. NOTE: The Stripe live-key case (sk_live_[A-Za-z0-9]{24,}) is intentionally absent — JSON cannot use string concatenation so the literal would trigger GitHub push protection. Each SDK covers it via a runtime-constructed test in its own test suite.",
+  "replacement": "***",
+  "cases": [
+    {
+      "name": "key_password",
+      "group": "key_pattern",
+      "input":    {"password": "hunter2"},
+      "expected": {"password": "***"}
+    },
+    {
+      "name": "key_passwd",
+      "group": "key_pattern",
+      "input":    {"passwd": "hunter2"},
+      "expected": {"passwd": "***"}
+    },
+    {
+      "name": "key_api_key_underscore",
+      "group": "key_pattern",
+      "input":    {"api_key": "abc123"},
+      "expected": {"api_key": "***"}
+    },
+    {
+      "name": "key_api_key_dash",
+      "group": "key_pattern",
+      "input":    {"api-key": "abc123"},
+      "expected": {"api-key": "***"}
+    },
+    {
+      "name": "key_apikey_no_separator",
+      "group": "key_pattern",
+      "input":    {"apikey": "abc123"},
+      "expected": {"apikey": "***"}
+    },
+    {
+      "name": "key_token",
+      "group": "key_pattern",
+      "input":    {"token": "tok-abc"},
+      "expected": {"token": "***"}
+    },
+    {
+      "name": "key_secret",
+      "group": "key_pattern",
+      "input":    {"secret": "s3cr3t"},
+      "expected": {"secret": "***"}
+    },
+    {
+      "name": "key_authorization",
+      "group": "key_pattern",
+      "input":    {"authorization": "Bearer xxx"},
+      "expected": {"authorization": "***"}
+    },
+    {
+      "name": "key_bearer",
+      "group": "key_pattern",
+      "input":    {"bearer": "xxx"},
+      "expected": {"bearer": "***"}
+    },
+    {
+      "name": "key_m2m_key_underscore",
+      "group": "key_pattern",
+      "input":    {"m2m_key": "xxx"},
+      "expected": {"m2m_key": "***"}
+    },
+    {
+      "name": "key_private_key",
+      "group": "key_pattern",
+      "input":    {"private_key": "xxx"},
+      "expected": {"private_key": "***"}
+    },
+    {
+      "name": "key_access_key",
+      "group": "key_pattern",
+      "input":    {"access_key": "xxx"},
+      "expected": {"access_key": "***"}
+    },
+    {
+      "name": "key_session_id",
+      "group": "key_pattern",
+      "input":    {"session_id": "xxx"},
+      "expected": {"session_id": "***"}
+    },
+    {
+      "name": "key_cookie",
+      "group": "key_pattern",
+      "input":    {"cookie": "xxx"},
+      "expected": {"cookie": "***"}
+    },
+    {
+      "name": "key_credential",
+      "group": "key_pattern",
+      "input":    {"credential": "xxx"},
+      "expected": {"credential": "***"}
+    },
+    {
+      "name": "key_substring_customer_token",
+      "group": "key_pattern",
+      "input":    {"customer_token": "tok-abc"},
+      "expected": {"customer_token": "***"}
+    },
+    {
+      "name": "key_substring_user_password",
+      "group": "key_pattern",
+      "input":    {"user_password": "pw"},
+      "expected": {"user_password": "***"}
+    },
+    {
+      "name": "key_substring_oauth_bearer_token",
+      "group": "key_pattern",
+      "input":    {"oauth_bearer_token": "tok-deep"},
+      "expected": {"oauth_bearer_token": "***"}
+    },
+    {
+      "name": "key_case_insensitive_upper",
+      "group": "key_pattern",
+      "input":    {"API_KEY": "x"},
+      "expected": {"API_KEY": "***"}
+    },
+    {
+      "name": "key_case_insensitive_mixed",
+      "group": "key_pattern",
+      "input":    {"Password": "x"},
+      "expected": {"Password": "***"}
+    },
+    {
+      "name": "safe_user_id",
+      "group": "safe",
+      "input":    {"user_id": "u-42"},
+      "expected": {"user_id": "u-42"}
+    },
+    {
+      "name": "safe_email",
+      "group": "safe",
+      "input":    {"email": "alice@example.com"},
+      "expected": {"email": "alice@example.com"}
+    },
+    {
+      "name": "safe_number",
+      "group": "safe",
+      "input":    {"count": 42},
+      "expected": {"count": 42}
+    },
+    {
+      "name": "value_jwt",
+      "group": "value_shape",
+      "input":    {"note": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"},
+      "expected": {"note": "***JWT***"}
+    },
+    {
+      "name": "value_pem_rsa",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_pem_ec",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEEIBkg..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_pem_openssh",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_pem_generic",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBAD..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_aws_akia",
+      "group": "value_shape",
+      "input":    {"note": "AKIAIOSFODNN7EXAMPLE"},
+      "expected": {"note": "***AWS_KEY***"}
+    },
+    {
+      "name": "value_aws_asia",
+      "group": "value_shape",
+      "input":    {"note": "ASIAIOSFODNN7EXAMPLE"},
+      "expected": {"note": "***AWS_KEY***"}
+    },
+    {
+      "name": "value_aws_as_substring",
+      "group": "value_shape",
+      "input":    {"note": "key=AKIAIOSFODNN7EXAMPLE"},
+      "expected": {"note": "***AWS_KEY***"}
+    },
+    {
+      "name": "value_gh_ghp",
+      "group": "value_shape",
+      "input":    {"note": "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      "expected": {"note": "***GH_TOKEN***"}
+    },
+    {
+      "name": "value_gh_ghs",
+      "group": "value_shape",
+      "input":    {"note": "ghs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"},
+      "expected": {"note": "***GH_TOKEN***"}
+    },
+    {
+      "name": "value_gh_gho",
+      "group": "value_shape",
+      "input":    {"note": "gho_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"},
+      "expected": {"note": "***GH_TOKEN***"}
+    },
+    {
+      "name": "value_openai_legacy",
+      "group": "value_shape",
+      "input":    {"note": "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"},
+      "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_openai_proj",
+      "group": "value_shape",
+      "input":    {"note": "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef"},
+      "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_cc_luhn_valid_visa",
+      "group": "value_shape",
+      "input":    {"note": "4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_luhn_valid_visa_test2",
+      "group": "value_shape",
+      "input":    {"note": "4539578763621486"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_luhn_invalid",
+      "group": "safe",
+      "input":    {"note": "4111111111111112"},
+      "expected": {"note": "4111111111111112"}
+    },
+    {
+      "name": "value_order_number_not_cc",
+      "group": "safe",
+      "input":    {"note": "1234567890123456"},
+      "expected": {"note": "1234567890123456"}
+    },
+    {
+      "name": "priority_key_wins_over_jwt",
+      "group": "priority",
+      "input":    {"api_key": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.sig"},
+      "expected": {"api_key": "***"}
+    },
+    {
+      "name": "priority_key_wins_over_aws",
+      "group": "priority",
+      "input":    {"access_key": "AKIAIOSFODNN7EXAMPLE"},
+      "expected": {"access_key": "***"}
+    },
+    {
+      "name": "nested_2level_key_pattern",
+      "group": "nested",
+      "input":    {"user": {"password": "abc", "name": "Alice"}},
+      "expected": {"user": {"password": "***", "name": "Alice"}}
+    },
+    {
+      "name": "nested_2level_value_shape",
+      "group": "nested",
+      "input":    {"meta": {"note": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"}},
+      "expected": {"meta": {"note": "***JWT***"}}
+    },
+    {
+      "name": "nested_3level_key_pattern",
+      "group": "nested",
+      "input":    {"l1": {"l2": {"l3": {"token": "x", "ok": "visible"}}}},
+      "expected": {"l1": {"l2": {"l3": {"token": "***", "ok": "visible"}}}}
+    },
+    {
+      "name": "nested_array_of_dicts",
+      "group": "nested",
+      "input":    {"items": [{"api_key": "x"}, {"name": "y"}]},
+      "expected": {"items": [{"api_key": "***"}, {"name": "y"}]}
+    },
+    {
+      "name": "nested_list_of_strings_jwt",
+      "group": "nested",
+      "input":    {"messages": ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123", "safe-string"]},
+      "expected": {"messages": ["***JWT***", "safe-string"]}
+    },
+    {
+      "name": "mixed_safe_and_redacted_keys",
+      "group": "nested",
+      "input":    {"name": "Alice", "token": "tok-abc", "email": "a@b.com"},
+      "expected": {"name": "Alice", "token": "***", "email": "a@b.com"}
+    }
+  ]
+}
