@@ -23,7 +23,7 @@
     "lint": "biome check src/"
   },
   "dependencies": {
-    "koffi": "^2"
+    "koffi": "^3"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
