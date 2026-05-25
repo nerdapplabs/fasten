@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
 
-import { coreRedact } from '../src/core_ffi.js';
+import { coreRedact } from '../src/core.js';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const specPath = join(__dir, '../../spec/redact-conformance.json');

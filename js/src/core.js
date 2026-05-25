@@ -1,8 +1,6 @@
 /**
- * core_ffi.js — pure JS implementation of the fasten-core surface.
- *
- * Replaces the previous koffi/Rust FFI shim. No native dependencies,
- * no Rust toolchain required, no FASTEN_CORE_LIB env var needed.
+ * core.js — the pure-JS fasten-core surface. No native dependencies,
+ * no Rust toolchain, no FASTEN_CORE_LIB env var.
  *
  * Implements:
  *   - Key-pattern redaction (mirrors spec/row-schema.json x-fasten-redact)
