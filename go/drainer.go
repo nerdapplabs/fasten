@@ -5,10 +5,19 @@ package fasten
 #cgo LDFLAGS: -L${SRCDIR}/../fasten-core/target/release -lfasten_core
 #include "fasten_core.h"
 #include <stdlib.h>
+#include <stdint.h>
 
 // Forward declaration so CGo can resolve C.goInsertCallback below.
 // Note: CGo generates char* (not const char*) for *C.char parameters.
 extern int32_t goInsertCallback(char* row_json, void* userdata);
+
+// Pass a cgo.Handle (a uintptr) as the void* userdata. The uintptr->void*
+// cast happens here in C, so the Go side never does unsafe.Pointer(uintptr(...))
+// — which `go vet` flags as a possible misuse of unsafe.Pointer.
+static inline FastenStore* fasten_store_from_handle(
+    FastenInsertCallbackFn fn, uintptr_t h, char** out_err) {
+    return fasten_store_from_callback(fn, (void*)h, out_err);
+}
 */
 import "C"
 import (
@@ -65,9 +74,9 @@ func newCFastenDrainer(
 	h := cgo.NewHandle(store)
 
 	var errStr *C.char
-	storePtr := C.fasten_store_from_callback(
+	storePtr := C.fasten_store_from_handle(
 		C.FastenInsertCallbackFn(C.goInsertCallback),
-		unsafe.Pointer(uintptr(h)),
+		C.uintptr_t(h),
 		&errStr,
 	)
 	if storePtr == nil {

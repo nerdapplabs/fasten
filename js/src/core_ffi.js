@@ -40,7 +40,10 @@ const _VALUE_SHAPE_RULES = [
 	// JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)
 	[/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "***JWT***"],
 	// PEM private key block header (RSA, EC, DSA, OPENSSH, or generic)
-	[/-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----/, "***PRIVATE_KEY***"],
+	[
+		/-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----/,
+		"***PRIVATE_KEY***",
+	],
 	// AWS access key: permanent AKIA or short-lived ASIA
 	[/(?:AKIA|ASIA)[A-Z0-9]{16}/, "***AWS_KEY***"],
 	// GitHub token: ghp (personal) / gho (OAuth) / ghu (user-to-server) / ghs (server-to-server) / ghr (refresh)
@@ -58,8 +61,11 @@ function _luhn(digits) {
 	const len = digits.length;
 	let sum = 0;
 	for (let i = 0; i < len; i++) {
-		let n = parseInt(digits[len - 1 - i], 10);
-		if (i % 2 === 1) { n *= 2; if (n > 9) n -= 9; }
+		let n = Number.parseInt(digits[len - 1 - i], 10);
+		if (i % 2 === 1) {
+			n *= 2;
+			if (n > 9) n -= 9;
+		}
 		sum += n;
 	}
 	return sum % 10 === 0;
@@ -137,10 +143,10 @@ const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9_]*$/;
 
 // Error codes mirror the Rust ABI constants (fasten_store_core.h FASTEN_ERR_*).
 const ERR = {
-	INVALID_KEY:     6,
-	ID_MISMATCH:     7,
+	INVALID_KEY: 6,
+	ID_MISMATCH: 7,
 	DOMAIN_MISMATCH: 8,
-	DUPLICATE_CODE:  9,
+	DUPLICATE_CODE: 9,
 };
 
 // In-process canonical registry used by coreMetaOf / coreRegistryClear.
@@ -166,7 +172,10 @@ export function coreRegisterCodes(domain, codesJson) {
 		if (!UPPER_SNAKE_RE.test(id))
 			throw _err(`code key "${id}" must be UPPER_SNAKE_CASE`, ERR.INVALID_KEY);
 		if (meta.id && meta.id !== id)
-			throw _err(`code key "${id}" disagrees with Meta.id="${meta.id}"`, ERR.ID_MISMATCH);
+			throw _err(
+				`code key "${id}" disagrees with Meta.id="${meta.id}"`,
+				ERR.ID_MISMATCH,
+			);
 		if (meta.domain && meta.domain !== domain)
 			throw _err(
 				`code ${id} declares domain="${meta.domain}" but registered under "${domain}"`,
@@ -182,7 +191,7 @@ export function coreRegisterCodes(domain, codesJson) {
 			...meta,
 			id,
 			domain: meta.domain || domain,
-			retention_class: pii ? "short" : (meta.retention_class || "medium"),
+			retention_class: pii ? "short" : meta.retention_class || "medium",
 			detail_passthrough_keys: meta.detail_passthrough_keys ?? [],
 		});
 	}

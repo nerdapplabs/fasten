@@ -1,5 +1,9 @@
 import Foundation
 
+/// What the engine does when the audit store rejects a write.
+/// (Previously defined in CFastenDrainer.swift, removed in the pure-Swift port.)
+public enum FailureStrategy { case queue, raise }
+
 private let DEGRADED_AFTER = 5
 
 /// Pure Swift bounded-queue drainer — spec-conformant (drainer-conformance.md v1.1).

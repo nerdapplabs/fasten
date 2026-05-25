@@ -505,7 +505,7 @@ class Engine:
         max_attempts: int,
     ) -> None:
         # Build an insert callback that delegates to the Python store.
-        def _insert_cb(row_json: bytes, _userdata: int) -> int:  # type: ignore[return]
+        def _insert_cb(row_json: bytes, _userdata: int) -> int:
             try:
                 row_dict = json.loads(row_json.decode("utf-8"))
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
