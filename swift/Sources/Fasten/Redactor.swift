@@ -1,70 +1,121 @@
 import Foundation
-import CFastenCore
 
-/// PII / secret redactor — delegates to libfasten_core for a single
-/// canonical implementation shared across all language SDKs.
+/// PII / secret redactor — pure Swift, no native dependencies.
 ///
-/// The public API is identical to the previous NSRegularExpression-based
-/// implementation; the only behavioural difference is that redaction is now
-/// performed by the same Rust engine used by Python, Go, C++, and JS.
+/// Applies two redaction passes in order:
+///   1. Key-pattern: keys matching spec/row-schema.json x-fasten-redact patterns → replace with `replacement`
+///   2. Value-shape: string values matching known secret shapes (P1-24) → replace with type token
+///
+/// Recursively walks nested `[String: Any]` dictionaries and arrays.
 public final class Redactor: @unchecked Sendable {
 
-    private let extraKeysJson: String   // serialised JSON array, never empty
-    private let replacement: String     // empty → Rust uses default "***"
-    private let extraVpJson: String     // serialised JSON array of {pattern,replacement}
+    private let keyPatterns:       [NSRegularExpression]
+    private let replacement:       String
+    private let extraValueRules:   [(NSRegularExpression, String)]
+
+    // Patterns from spec/row-schema.json x-fasten-redact.patterns — case-insensitive substring match on keys.
+    private static let defaultKeyPatterns: [NSRegularExpression] = {
+        let specs = [
+            "api[_-]?key", "password", "passwd", "token", "secret",
+            "authorization", "bearer", "m2m[_-]?key", "cert[_-]?private",
+            "private[_-]?key", "access_key", "session_id", "cookie", "credential",
+        ]
+        return specs.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
+    }()
+
+    // Built-in value-shape rules (P1-24); applied to string values regardless of key.
+    // Patterns mirror the canonical Rust implementation in fasten-core/src/redact.rs.
+    // No anchors — a secret embedded anywhere in a string value is detected.
+    private static let valueShapeRules: [(NSRegularExpression, String)] = {
+        let defs: [(String, String)] = [
+            // JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)
+            (#"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"#,           "***JWT***"),
+            // PEM private key block header (RSA, EC, DSA, OPENSSH, or generic)
+            (#"-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----"#,              "***PRIVATE_KEY***"),
+            // AWS access key: permanent AKIA or short-lived ASIA
+            (#"(?:AKIA|ASIA)[A-Z0-9]{16}"#,                                           "***AWS_KEY***"),
+            // GitHub token: ghp/gho/ghu/ghs/ghr, exactly 36 alphanumeric chars
+            (#"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}"#,                            "***GH_TOKEN***"),
+            // Stripe live secret key (24+ chars after prefix)
+            (#"sk_live_[A-Za-z0-9]{24,}"#,                                            "***STRIPE_KEY***"),
+            // OpenAI API key (legacy sk-... and org sk-proj-... formats, 32+ suffix chars)
+            (#"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#,                                   "***OPENAI_KEY***"),
+        ]
+        return defs.compactMap { (pat, repl) in
+            guard let re = try? NSRegularExpression(pattern: pat) else { return nil }
+            return (re, repl)
+        }
+    }()
 
     public init(
-        extraKeys: [String] = [],
-        replacement: String = "***",
-        extraValuePatterns: [(String, String, String)] = []
+        extraKeys:           [String]                  = [],
+        replacement:         String                    = "***",
+        extraValuePatterns:  [(String, String, String)] = []
     ) {
-        self.replacement = replacement == "***" ? "" : replacement
-        self.extraKeysJson = (try? JSONEncoder().encode(extraKeys))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        let vps = extraValuePatterns.map { (_, pat, repl) in
-            ["pattern": pat, "replacement": repl]
+        self.replacement = replacement
+        let extraKeyREs = extraKeys.compactMap {
+            try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: $0),
+                                     options: .caseInsensitive)
         }
-        self.extraVpJson = (try? JSONEncoder().encode(vps))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        self.keyPatterns = Redactor.defaultKeyPatterns + extraKeyREs
+        self.extraValueRules = extraValuePatterns.compactMap { (_, pat, repl) in
+            guard let re = try? NSRegularExpression(pattern: pat) else { return nil }
+            return (re, repl)
+        }
     }
 
     public func redact(_ dict: [String: Any]) -> [String: Any] {
-        guard !dict.isEmpty,
-              let inData = try? JSONSerialization.data(withJSONObject: dict),
-              let inJson = String(data: inData, encoding: .utf8)
-        else { return dict }
+        _redactDict(dict)
+    }
 
-        let outSize = max(4096, inData.count * 2 + 1024)
-        var outBuf  = [UInt8](repeating: 0, count: outSize)
-        var errBuf  = [UInt8](repeating: 0, count: 4096)
-
-        let useDefault = extraKeysJson == "[]" && replacement.isEmpty && extraVpJson == "[]"
-        let n: Int32 = outBuf.withUnsafeMutableBufferPointer { outPtr in
-            errBuf.withUnsafeMutableBufferPointer { errPtr in
-                if useDefault {
-                    return fasten_redact_buf(
-                        inJson,
-                        outPtr.baseAddress, UInt32(outPtr.count),
-                        errPtr.baseAddress, UInt32(errPtr.count)
-                    )
-                } else {
-                    return fasten_redact_full_buf(
-                        inJson,
-                        extraKeysJson,
-                        replacement,
-                        extraVpJson,
-                        outPtr.baseAddress, UInt32(outPtr.count),
-                        errPtr.baseAddress, UInt32(errPtr.count)
-                    )
-                }
-            }
+    private func _redactDict(_ dict: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for (key, val) in dict {
+            out[key] = _keyMatches(key) ? replacement : _redactValue(val)
         }
+        return out
+    }
 
-        guard n > 0,
-              let outData = String(bytes: outBuf[0..<Int(n)], encoding: .utf8).map({ Data($0.utf8) }),
-              let result = try? JSONSerialization.jsonObject(with: outData) as? [String: Any]
-        else { return dict }
+    private func _redactValue(_ val: Any) -> Any {
+        if let s = val as? String {
+            return _redactString(s)
+        } else if let d = val as? [String: Any] {
+            return _redactDict(d)
+        } else if let a = val as? [Any] {
+            return a.map { _redactValue($0) }
+        }
+        return val
+    }
 
-        return result
+    private func _redactString(_ s: String) -> Any {
+        let range = NSRange(s.startIndex..., in: s)
+        for (re, token) in Redactor.valueShapeRules {
+            if re.firstMatch(in: s, range: range) != nil { return token }
+        }
+        if _looksLikeCC(s) { return "***CC***" }
+        for (re, token) in extraValueRules {
+            if re.firstMatch(in: s, range: range) != nil { return token }
+        }
+        return s
+    }
+
+    private func _keyMatches(_ key: String) -> Bool {
+        let range = NSRange(key.startIndex..., in: key)
+        return keyPatterns.contains { $0.firstMatch(in: key, range: range) != nil }
+    }
+
+    private func _looksLikeCC(_ s: String) -> Bool {
+        guard s.count >= 13 && s.count <= 19 && s.allSatisfy(\.isNumber) else { return false }
+        return _luhn(s)
+    }
+
+    private func _luhn(_ s: String) -> Bool {
+        let digits = s.compactMap { $0.wholeNumberValue }
+        var sum = 0
+        for (i, d) in digits.reversed().enumerated() {
+            if i % 2 == 1 { let v = d * 2; sum += v > 9 ? v - 9 : v }
+            else           { sum += d }
+        }
+        return sum % 10 == 0
     }
 }

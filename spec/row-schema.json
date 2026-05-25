@@ -71,7 +71,9 @@
     },
     "request_id":     { "type": "string", "pattern": "^[0-9a-f]{12}$", "description": "12-char hex correlation id." },
     "detail":         { "type": "object", "description": "Arbitrary key-value pairs; secret keys are redacted." },
-    "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." }
+    "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." },
+    "prev_hash":      { "type": "string", "description": "P1-23: hex SHA-256 of the preceding row in the (service_id, source_node_id) chain, or the sentinel 'genesis' for the first row. Empty string on rows written before hash-chain support." },
+    "hash":           { "type": "string", "description": "P1-23: hex SHA-256 of canonical JSON of this row with the 'hash' key excluded. Empty string on rows written before hash-chain support." }
   },
   "additionalProperties": false,
   "$defs": {

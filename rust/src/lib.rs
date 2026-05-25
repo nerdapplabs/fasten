@@ -338,9 +338,23 @@ pub fn dump() -> String {
 
 // --- Correlation context -------------------------------------------------
 //
-// Thread-local for sync + same-task async use. Across-task async correlation
-// (where context shouldn't leak between tasks) is a v0.2 concern — opt in
-// via the "async" feature once we wire tokio task_local.
+// Thread-local for sync + same-task async use.
+//
+// ⚠️  ASYNC FOOTGUN: `with_request_id` uses a `thread_local!` which does NOT
+// propagate across `tokio::spawn` task boundaries. Code like this silently
+// loses the correlation id:
+//
+//     with_request_id("abc".into(), || {
+//         tokio::spawn(async move {
+//             // current_request_id() returns None here — wrong thread-local slot
+//             fasten::emit().submit().unwrap();
+//         });
+//     });
+//
+// Workaround: capture the id before spawn and call `with_request_id` again
+// inside the spawned task, or pass it explicitly via the builder (.detail).
+// Cross-task propagation via `tokio::task_local!` is tracked for a future
+// "async" feature flag.
 
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };

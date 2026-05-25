@@ -6,18 +6,36 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed — Shared drainer unification (P0-7, Python / Go / Swift / C++)
+### Added — Redact conformance corpus (P0-7 Step 1)
 
-- All per-language drainer implementations replaced by FFI bindings to
+- `spec/redact-conformance.json` — 50-case cross-language test corpus covering all 14 key
+  patterns, 7 value-shape rules (JWT/PEM/AWS/GH/Stripe/OpenAI/CC-Luhn), priority ordering
+  (key-pattern wins over value-shape), nested dicts, arrays, and safe-value pass-through.
+  All five SDKs run it: Python (`test_redact_conformance.py`), Go (`redact_conformance_test.go`),
+  JS (`redact_conformance.test.mjs`), Swift (`RedactConformanceTests.swift`),
+  C++ (`redact_conformance_smoke.cpp`).
+- **JS `core_ffi.js`** — value-shape redaction added (was key-pattern only): JWT, PEM private key,
+  AWS AKIA/ASIA, GitHub ghp/gho/ghu/ghs/ghr tokens, Stripe live key, OpenAI legacy/proj keys,
+  CC/Luhn. Patterns and Luhn algorithm mirror `fasten-core/src/redact.rs` exactly.
+  Also fixed `password`, `passwd`, `cookie` key patterns: removed incorrect `^...$` anchors so they
+  match substrings (e.g. `user_password`) consistently with Rust/Python/Go.
+- **Swift `Redactor.swift`** — value-shape patterns aligned with Rust canonical: removed `^...$`
+  anchors (substring matching), added ASIA variant for AWS, added gho/ghu/ghr GitHub token types,
+  updated OpenAI pattern to include `sk-proj-...` and 32-char threshold, restricted Stripe to
+  `sk_live_` only (matches Rust), extended CC range to 13–19 digits (was 13–16).
+
+### Changed — Shared drainer unification (P0-7, Python / Go / C++) + Pure-language ports (P1-25, JS / Swift)
+
+- Python, Go, and C++ drainer implementations replaced by FFI bindings to
   the shared `fasten-core` C ABI drainer (`fasten_store_from_callback` +
   `fasten_drainer_install/enqueue/flush/stats_json/close`).
   - **Python** — `ctypes` binding in `fasten/drainer.py`; `audit_queue.py` deleted (427 lines)
   - **Go** — `cgo` binding in `go/drainer.go`; `audit_queue.go` deleted (429 lines)
-  - **Swift** — `CFastenDrainer.swift` via Swift's C interop; `AuditQueue.swift` deleted (123 lines)
   - **C++** — `CFastenDrainer` class in `fasten.hpp` replaces `AuditQueueDrainer`; `audit_queue_smoke.cpp` deleted (310 lines)
   - **Rust** — remains the authoritative reference implementation inside `fasten-core`
-  - **JS** — still uses its own in-process drainer loop; migration tracked in P1-26
-- Net reduction: ~3,200 lines of duplicated drainer code eliminated.
+  - **JS** — spec-conformant pure JS in-process drainer loop; `koffi` and all native deps removed (P1-25)
+  - **Swift** — spec-conformant pure Swift in-process drainer loop (`QueueDrainer.swift`); `CFastenDrainer.swift` and `libfasten_core` dependency removed (P1-25)
+- Net reduction: ~3,200 lines of duplicated drainer code eliminated (Python/Go/C++).
 - Drainer conformance spec (`spec/drainer-conformance.md`) updated to
   reflect the shared-ABI architecture (v1.1).
 

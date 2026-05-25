@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,14 @@ type SQLiteStore struct {
 // through. Multi-tenant adopters who derive a suffix from a JWT claim
 // or env var without their own validation are the realistic blast radius.
 var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// auditCols is the canonical column order used in all SELECT and INSERT
+// statements. Explicit list decouples scanRows from table physical layout;
+// adding columns never breaks existing scans.
+const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
+	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
+	` target, category, domain, method, request_id, detail,` +
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
@@ -84,13 +93,18 @@ CREATE TABLE IF NOT EXISTS %s (
     request_id    TEXT NOT NULL,
     detail        TEXT NOT NULL,
     pii_in_detail INTEGER NOT NULL DEFAULT 0,
-    shipped_at    TEXT
+    shipped_at    TEXT,
+    wire_version  TEXT NOT NULL DEFAULT '1',
+    hash          TEXT NOT NULL DEFAULT '',
+    prev_hash     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
+CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 `, s.table,
+		s.table, s.table,
 		s.table, s.table,
 		s.table, s.table,
 		s.table, s.table,
@@ -99,42 +113,62 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
 	}
-	// P1-5: idempotent migration for legacy tables that pre-date pii_in_detail.
-	// PRAGMA table_info returns one row per column.
-	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", s.table))
+
+	// Idempotent column migrations for tables predating a given column.
+	existing, err := s.existingColumns()
 	if err != nil {
 		return err
 	}
-	hasCol := false
+	type colDef struct {
+		name string
+		ddl  string
+	}
+	for _, col := range []colDef{
+		{"pii_in_detail", "INTEGER NOT NULL DEFAULT 0"},
+		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
+		{"hash", "TEXT NOT NULL DEFAULT ''"},
+		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if !existing[col.name] {
+			if _, err := s.db.Exec(fmt.Sprintf(
+				"ALTER TABLE %s ADD COLUMN %s %s", s.table, col.name, col.ddl,
+			)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Partial indexes created outside CREATE TABLE so they work on both fresh
+	// and legacy-migrated tables.
+	for _, idx := range []string{
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1", s.table, s.table),
+	} {
+		if _, err := s.db.Exec(idx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// existingColumns returns a set of column names present in the table.
+func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", s.table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
 	for rows.Next() {
 		var cid int
 		var name, ctype string
 		var notnull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
+			return nil, err
 		}
-		if name == "pii_in_detail" {
-			hasCol = true
-		}
+		cols[name] = true
 	}
-	rows.Close()
-	if !hasCol {
-		if _, err := s.db.Exec(fmt.Sprintf(
-			"ALTER TABLE %s ADD COLUMN pii_in_detail INTEGER NOT NULL DEFAULT 0",
-			s.table,
-		)); err != nil {
-			return err
-		}
-	}
-	// Partial index sits outside the CREATE TABLE so it works on both fresh
-	// and legacy-migrated tables.
-	_, err = s.db.Exec(fmt.Sprintf(
-		"CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1",
-		s.table, s.table,
-	))
-	return err
+	return cols, rows.Err()
 }
 
 func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
@@ -151,8 +185,12 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 	if row.PiiInDetail {
 		piiFlag = 1
 	}
+	wv := row.WireVersion
+	if wv == "" {
+		wv = "1"
+	}
 	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table),
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.Format(time.RFC3339Nano),
 		string(row.Code), row.Action, string(row.Severity),
@@ -163,6 +201,7 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 		string(detail),
 		piiFlag,
 		shippedAt,
+		wv, row.Hash, row.PrevHash,
 	)
 	return err
 }
@@ -174,7 +213,7 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT * FROM %s %s ORDER BY monotonic_seq DESC LIMIT ?`, s.table, where),
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY monotonic_seq DESC LIMIT ?`, auditCols, s.table, where),
 		append(args, limit)...,
 	)
 	if err != nil {
@@ -189,7 +228,7 @@ func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, erro
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT * FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?`, s.table),
+		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?`, auditCols, s.table),
 		limit,
 	)
 	if err != nil {
@@ -200,15 +239,23 @@ func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, erro
 }
 
 func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	for _, id := range ids {
-		if _, err := s.db.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE %s SET shipped_at=? WHERE id=?`, s.table), now, id,
-		); err != nil {
-			return err
-		}
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, now)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	q := fmt.Sprintf(
+		`UPDATE %s SET shipped_at=? WHERE id IN (%s)`,
+		s.table, strings.Join(placeholders, ","),
+	)
+	_, err := s.db.ExecContext(ctx, q, args...)
+	return err
 }
 
 func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
@@ -231,6 +278,16 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, s.table)).Scan(&n)
 	return n, err
+}
+
+// MaxMonotonicSeq returns the maximum monotonic_seq stored, for seq seeding on restart.
+func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context) (int64, error) {
+	var n sql.NullInt64
+	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s`, s.table)).Scan(&n)
+	if err != nil || !n.Valid {
+		return 0, err
+	}
+	return n.Int64, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -256,13 +313,13 @@ func filterToSQL(f Filter) (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, "timestamp <= ?"); args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
 	}
+	if f.AfterSeq > 0 {
+		conds = append(conds, "monotonic_seq > ?"); args = append(args, f.AfterSeq)
+	}
 	if len(conds) == 0 {
 		return "", args
 	}
-	where := "WHERE " + conds[0]
-	for _, c := range conds[1:] {
-		where += " AND " + c
-	}
+	where := "WHERE " + strings.Join(conds, " AND ")
 	return where, args
 }
 
@@ -274,6 +331,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		var detail string
 		var piiFlag int
 		var shippedAt *string
+		var wv, hash, prevHash string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&ts, &code, &r.Action, &sev,
@@ -281,6 +339,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
+			&wv, &hash, &prevHash,
 		); err != nil {
 			return nil, err
 		}
@@ -294,6 +353,13 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			t, _ := time.Parse(time.RFC3339Nano, *shippedAt)
 			r.ShippedAt = &t
 		}
+		if wv != "" {
+			r.WireVersion = wv
+		} else {
+			r.WireVersion = "1"
+		}
+		r.Hash = hash
+		r.PrevHash = prevHash
 		out = append(out, r)
 	}
 	return out, rows.Err()

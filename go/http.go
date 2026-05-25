@@ -75,54 +75,62 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 
 // ── Reader ────────────────────────────────────────────────────────────────
 
-// NewReader returns an http.Handler serving:
+// NewReader returns an http.Handler bound to this Engine serving:
 //
-//	GET /sys           — syslog ring buffer
-//	GET /api           — api-log ring buffer
-//	GET /audit         — audit SQLite store
-//	GET /audit/doctor  — audit pipeline health (P1-15)
+//	GET /sys               — syslog ring buffer
+//	GET /api               — api-log ring buffer
+//	GET /audit             — audit store query (?request_id=, ?code=, ?domain=,
+//	                         ?since=, ?until=, ?limit=, ?after=<monotonic_seq>)
+//	GET /audit/doctor      — audit pipeline health
+//
+// SECURITY: these endpoints expose internal state (queue stats, init config,
+// raw audit rows). Mount them behind authentication middleware or restrict
+// them to internal network interfaces before exposing to untrusted callers.
 //
 // Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
 // Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
-func NewReader() http.Handler {
+func (e *Engine) NewReader() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /sys", handleSys)
-	mux.HandleFunc("GET /api", handleAPI)
-	mux.HandleFunc("GET /audit/doctor", handleAuditDoctor)
-	mux.HandleFunc("GET /audit", handleAudit)
+	mux.HandleFunc("GET /sys", e.handleSys)
+	mux.HandleFunc("GET /api", e.handleAPI)
+	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
+	mux.HandleFunc("GET /audit", e.handleAudit)
 	return mux
 }
 
-func handleSys(w http.ResponseWriter, r *http.Request) {
-	if Default.xport == nil {
+// NewReader is a package-level shorthand for Default.NewReader().
+func NewReader() http.Handler { return Default.NewReader() }
+
+func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
+	if e.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := Default.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	rows := e.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
 	writeJSON(w, map[string]any{"rows": rows})
 }
 
-func handleAPI(w http.ResponseWriter, r *http.Request) {
-	if Default.xport == nil {
+func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
+	if e.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := Default.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	rows := e.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
 	if rows == nil {
 		rows = []APIRow{}
 	}
 	writeJSON(w, map[string]any{"rows": rows})
 }
 
-func handleAudit(w http.ResponseWriter, r *http.Request) {
-	if Default.auditStore == nil {
+func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if e.auditStore == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "error": "audit store not configured"})
 		return
 	}
@@ -140,7 +148,14 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 	if u := q.Get("until"); u != "" {
 		f.Until, _ = time.Parse(time.RFC3339, u)
 	}
-	rows, err := Default.auditStore.Query(r.Context(), f)
+	// Cursor-based pagination: ?after=<monotonic_seq> returns the next page.
+	// Use the lowest MonotonicSeq from the previous response as the cursor.
+	if a := q.Get("after"); a != "" {
+		if n, err := strconv.ParseInt(a, 10, 64); err == nil && n > 0 {
+			f.AfterSeq = n
+		}
+	}
+	rows, err := e.auditStore.Query(r.Context(), f)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -150,11 +165,19 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		out = append(out, rowToMap(row))
 	}
-	writeJSON(w, map[string]any{"rows": out})
+	// Return next_after cursor: the smallest monotonic_seq in this page so
+	// the caller can pass ?after=<next_after> for the preceding page.
+	// (Results are newest-first, so the last row has the smallest seq.)
+	var nextAfter *int64
+	if len(rows) > 0 {
+		v := rows[len(rows)-1].MonotonicSeq
+		nextAfter = &v
+	}
+	writeJSON(w, map[string]any{"rows": out, "next_after": nextAfter})
 }
 
-func handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
-	store := Default.auditStore
+func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
+	store := e.auditStore
 	storeBlock := map[string]any{
 		"kind":           nil,
 		"reachable":      false,
@@ -185,25 +208,25 @@ func handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var queueBlock any
-	if qs := Default.GetQueueStats(); qs != nil {
+	if qs := e.GetQueueStats(); qs != nil {
 		queueBlock = qs
 	}
 
 	xportBlock := map[string]any{
-		"stdout_active":    Default.xport != nil,
+		"stdout_active":     e.xport != nil,
 		"syslog_ring_depth": 0,
 		"api_ring_depth":    0,
 	}
-	if Default.xport != nil {
-		xportBlock["syslog_ring_depth"] = Default.xport.SyslogDepth()
-		xportBlock["api_ring_depth"] = Default.xport.APIDepth()
+	if e.xport != nil {
+		xportBlock["syslog_ring_depth"] = e.xport.SyslogDepth()
+		xportBlock["api_ring_depth"] = e.xport.APIDepth()
 	}
 
 	initBlock := map[string]any{
-		"service_id":       Default.serviceID,
-		"node_id":          Default.nodeID,
-		"tenant_id":        Default.tenantID,
-		"failure_strategy": Default.failureStrategy,
+		"service_id":       e.serviceID,
+		"node_id":          e.nodeID,
+		"tenant_id":        e.tenantID,
+		"failure_strategy": e.failureStrategy,
 	}
 
 	writeJSON(w, map[string]any{

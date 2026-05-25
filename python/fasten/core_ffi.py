@@ -226,7 +226,7 @@ def registry_clear() -> None:
 
 # ── Drainer C ABI ─────────────────────────────────────────────────────────────
 
-def store_from_callback(cb: InsertCallbackFn) -> ctypes.c_void_p:
+def store_from_callback(cb: "ctypes._FuncPointer") -> ctypes.c_void_p:
     """Create a FastenStore* backed by a Python insert callback."""
     lib = get_lib()
     err = ctypes.c_char_p(None)

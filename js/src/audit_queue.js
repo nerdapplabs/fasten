@@ -124,18 +124,17 @@ class AuditQueueDrainer {
 	}
 
 	async flush(timeoutMs = 5000) {
+		// Snapshot semantics (spec §6): capture the target drain count at call
+		// time so a steady incoming rate cannot keep flush() blocked indefinitely.
+		// target = rows already drained + rows currently in the pipeline.
+		const target = this._drainedTotal + this._q.length + this._inFlight;
+		if (this._drainedTotal >= target) return true;
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			if (
-				this._q.length === 0 &&
-				this._retryCount === 0 &&
-				this._inFlight === 0
-			) {
-				return true;
-			}
+			if (this._drainedTotal >= target) return true;
 			await new Promise((r) => setTimeout(r, 10));
 		}
-		return this._q.length === 0 && this._inFlight === 0;
+		return this._drainedTotal >= target;
 	}
 
 	stop() {

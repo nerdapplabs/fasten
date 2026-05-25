@@ -14,7 +14,7 @@ import {
 	coreRedactFull,
 	coreRegisterCodes,
 	coreRegistryClear,
-} from "./core_ffi.js";
+} from "./core.js";
 
 // --- Correlation context --------------------------------------------------
 

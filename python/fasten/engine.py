@@ -198,12 +198,12 @@ class Engine:
         resolved_store = audit_store
         if resolved_store is None:
             dsn = os.environ.get("FASTEN_AUDIT_DSN")
-            if not dsn:
-                raise RuntimeError(
-                    "fasten.init_config: FASTEN_AUDIT_DSN is required. "
-                    "Set FASTEN_AUDIT_DSN to a sqlite:// or postgres:// URL."
-                )
-            resolved_store = _store_from_dsn(dsn)
+            if dsn:
+                resolved_store = _store_from_dsn(dsn)
+            # No store and no DSN → stdout-only mode. Rows are written to stdout
+            # but not persisted. Matches Go/JS/Rust behaviour where AuditStore is
+            # optional. Adopters who need persistence must supply audit_store= or
+            # set FASTEN_AUDIT_DSN.
 
         resolved_api_store = api_store
         if resolved_api_store is None:
@@ -505,7 +505,7 @@ class Engine:
         max_attempts: int,
     ) -> None:
         # Build an insert callback that delegates to the Python store.
-        def _insert_cb(row_json: bytes, _userdata: int) -> int:  # type: ignore[return]
+        def _insert_cb(row_json: bytes, _userdata: int) -> int:
             try:
                 row_dict = json.loads(row_json.decode("utf-8"))
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})

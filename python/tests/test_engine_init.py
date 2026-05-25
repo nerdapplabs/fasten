@@ -27,10 +27,12 @@ def test_init_raises_when_node_id_missing(mem_store):
         fasten.init(service_id="svc", node_id="", audit_store=mem_store)
 
 
-def test_init_raises_when_no_audit_store_and_no_dsn(monkeypatch):
+def test_init_stdout_only_when_no_audit_store_and_no_dsn(monkeypatch):
+    """No store and no DSN → stdout-only mode: init() succeeds without persisting.
+    AuditStore is optional here, matching Go/JS/Rust."""
     monkeypatch.delenv("FASTEN_AUDIT_DSN", raising=False)
-    with pytest.raises(RuntimeError, match="FASTEN_AUDIT_DSN"):
-        fasten.init(service_id="svc", node_id="n")
+    fasten.init(service_id="svc", node_id="n")
+    assert _default._audit_store is None
 
 
 def test_init_raises_on_invalid_strategy(mem_store):

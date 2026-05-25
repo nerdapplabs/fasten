@@ -83,6 +83,14 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_substring_smoke COMMAND redact_substring_smoke)
 
+    # spec/redact-conformance.json cross-language conformance
+    add_executable(redact_conformance_smoke tests/redact_conformance_smoke.cpp)
+    target_link_libraries(redact_conformance_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(redact_conformance_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME redact_conformance_smoke COMMAND redact_conformance_smoke)
+
     # sqlite_store_smoke needs sqlite3 at link time.
     # Guard with TARGET check: some cmake/platform combos set SQLite3_FOUND but
     # fail to create the SQLite3::SQLite3 IMPORTED target (cmake bug on older 3.x).

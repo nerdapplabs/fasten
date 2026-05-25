@@ -2,6 +2,8 @@ package fasten
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,11 @@ type Engine struct {
 	seq             int64 // accessed via atomic ops
 	failureStrategy string
 
+	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
+	// assignment so concurrent Emit calls produce a consistent, gapless chain.
+	hashMu   sync.Mutex
+	prevHash string // "genesis" until first Emit
+
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
 }
@@ -49,11 +56,21 @@ func (e *Engine) Init(cfg Config) error {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
 	e.auditStore = cfg.AuditStore
+
+	// Seed monotonic_seq from the store if it supports it, so post-restart
+	// rows never collide with pre-restart rows on (timestamp, seq).
 	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
 		if max, err := seeder.MaxMonotonicSeq(context.Background()); err == nil {
 			atomic.StoreInt64(&e.seq, max)
 		}
 	}
+
+	// P1-23: initialise hash chain. "genesis" is the sentinel for the first
+	// row in a chain. Cross-restart continuity requires seeding from the store;
+	// absent a HashSeeder interface, we restart cleanly from "genesis".
+	e.hashMu.Lock()
+	e.prevHash = "genesis"
+	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
 
 	strategy := strings.ToLower(firstNonEmpty(
@@ -113,7 +130,6 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 		rid = MintID()
 	}
 
-	seq := atomic.AddInt64(&e.seq, 1)
 	id := "evt-" + mintLong()
 
 	var tid *string
@@ -124,7 +140,7 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 		WireVersion:  "1",
 		ID:           id,
 		OriginID:     id,
-		MonotonicSeq: seq,
+		MonotonicSeq: 0, // assigned under hashMu below
 		Timestamp:    time.Now().UTC(),
 		Code:         code,
 		Action:       m.Action,
@@ -145,6 +161,22 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 	for _, opt := range opts {
 		opt(&row)
 	}
+
+	// P1-23: assign seq + compute hash chain atomically so concurrent Emit
+	// calls produce a gapless, correctly-ordered chain. seq is incremented here
+	// (not via atomic.AddInt64 earlier) to keep seq and prevHash in lock-step.
+	e.hashMu.Lock()
+	atomic.AddInt64(&e.seq, 1)
+	row.MonotonicSeq = atomic.LoadInt64(&e.seq)
+	row.PrevHash = e.prevHash
+	m2 := rowToMap(row) // build map before hash is set so "hash" key is absent
+	delete(m2, "hash")
+	if b, err := json.Marshal(m2); err == nil {
+		sum := sha256.Sum256(b)
+		row.Hash = hex.EncodeToString(sum[:])
+	}
+	e.prevHash = row.Hash
+	e.hashMu.Unlock()
 
 	if m.PiiInDetail {
 		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
@@ -256,6 +288,9 @@ func (e *Engine) ResetForTests() {
 	e.xport = nil
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
+	e.hashMu.Lock()
+	e.prevHash = ""
+	e.hashMu.Unlock()
 }
 
 // ── Drainer management (per-Engine) ──────────────────────────────────────────

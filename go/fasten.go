@@ -125,6 +125,13 @@ type Row struct {
 	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
+	// P1-23: tamper-evidence hash chain. PrevHash is the hex SHA-256 of the
+	// preceding row in the (service_id, source_node_id) sequence, or "genesis"
+	// for the first row. Hash is SHA-256 of canonical JSON of this row with
+	// the "hash" key excluded. Rows written before hash-chain support have
+	// empty strings; verify_chain skips them.
+	PrevHash string `json:"prev_hash,omitempty"`
+	Hash     string `json:"hash,omitempty"`
 }
 
 // ── Code catalog ──────────────────────────────────────────────────────────
@@ -454,9 +461,13 @@ func rowToMap(r Row) map[string]any {
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
 		"pii_in_detail": r.PiiInDetail,
+		"prev_hash": r.PrevHash,
 	}
 	if r.ShippedAt != nil {
 		d["shipped_at"] = r.ShippedAt.Format(time.RFC3339Nano)
+	}
+	if r.Hash != "" {
+		d["hash"] = r.Hash
 	}
 	return d
 }
@@ -488,4 +499,7 @@ type Filter struct {
 	Since        time.Time
 	Until        time.Time
 	Limit        int
+	// AfterSeq is a cursor: only return rows with monotonic_seq > AfterSeq.
+	// Set to the last row's MonotonicSeq from the previous page to paginate.
+	AfterSeq int64
 }
