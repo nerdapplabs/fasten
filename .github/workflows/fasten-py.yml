@@ -21,6 +21,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: python
@@ -50,7 +65,7 @@ jobs:
       - name: Install dev dependencies
         run: |
           uv venv
-          uv pip install -e ".[dev]"
+          uv pip install -e ".[dev,postgres]"
 
       - name: Activate venv for subsequent steps
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
@@ -64,6 +79,7 @@ jobs:
       - name: Unit tests
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
+          FASTEN_TEST_POSTGRES_DSN: postgresql://fasten:fasten@localhost:5432/fasten_test
         run: pytest tests/ -v --tb=short --cov=fasten --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage to Codecov
