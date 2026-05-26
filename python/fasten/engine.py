@@ -518,7 +518,7 @@ class Engine:
                 for fld in ("timestamp", "shipped_at"):
                     v = row_dict.get(fld)
                     if isinstance(v, str):
-                        row_dict[fld] = datetime.fromisoformat(v)
+                        row_dict[fld] = datetime.fromisoformat(v.replace("Z", "+00:00"))
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
                 store.insert(row)
                 return 0
