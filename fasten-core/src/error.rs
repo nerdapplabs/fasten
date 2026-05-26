@@ -65,6 +65,14 @@ pub enum Error {
     /// `fasten_drainer_enqueue` called with no drainer installed.
     #[error("no drainer installed; call fasten_drainer_install first")]
     DrainerNotInstalled,
+
+    /// A host-language insert callback (installed via
+    /// `fasten_store_open_callback`) returned a non-zero rc. The actual
+    /// exception lives on the host side; this variant carries only the
+    /// rc so log lines aren't misattributed (issue #36 — previously
+    /// reported as `InvalidTableName("insert callback rc=1")`).
+    #[error("insert callback returned non-zero rc={0}")]
+    CallbackFailed(i32),
 }
 
 // When neither sqlite nor postgres feature is active, the #[from] impls above
@@ -107,6 +115,7 @@ impl From<&Error> for FastenErrorCode {
             Error::DomainMismatch { .. } => FastenErrorCode::ErrDomainMismatch,
             Error::DuplicateCode(_)    => FastenErrorCode::ErrDuplicateCode,
             Error::DrainerNotInstalled => FastenErrorCode::ErrNullArg,
+            Error::CallbackFailed(_)   => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

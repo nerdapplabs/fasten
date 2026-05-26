@@ -395,7 +395,7 @@ impl Store for CallbackStore {
         let json = serde_json::to_string(row)?;
         let cs = CString::new(json).map_err(|_| Error::NullArg)?;
         let rc = unsafe { (self.fn_ptr)(cs.as_ptr(), self.ud.0) };
-        if rc != 0 { Err(Error::InvalidTableName(format!("insert callback rc={rc}"))) }
+        if rc != 0 { Err(Error::CallbackFailed(rc)) }
         else { Ok(()) }
     }
     fn ping(&self) -> Result<(), Error> { Ok(()) }
@@ -460,4 +460,59 @@ pub extern "C" fn fasten_store_version() -> *const c_char {
             CString::new(env!("CARGO_PKG_VERSION")).expect("version is NUL-free")
         })
         .as_ptr()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::row::Row;
+    use crate::store::Store;
+
+    /// Regression for issue #36 — Bug 2: when a host-language insert
+    /// callback returns non-zero, CallbackStore must report
+    /// `CallbackFailed(rc)`, not `InvalidTableName("insert callback rc=N")`.
+    /// The old wording ran an SQL-identifier validation regex against
+    /// what was actually a free-form error message, masking the real
+    /// host-side exception (compounded with Bug 1 — see python's
+    /// _insert_cb test for the round-trip half).
+    #[test]
+    fn callback_store_failure_reports_callback_failed_variant() {
+        // Returns a non-zero rc to simulate a host-side callback that
+        // caught its own exception and surfaced an error code.
+        extern "C" fn failing_cb(
+            _json: *const c_char,
+            _ud: *mut std::ffi::c_void,
+        ) -> i32 {
+            7  // arbitrary non-zero
+        }
+        let store = CallbackStore {
+            fn_ptr: failing_cb,
+            ud: SendRawPtr(std::ptr::null_mut()),
+        };
+        let row = Row::default();
+        let err = store.insert(&row).expect_err("non-zero rc must error");
+        assert!(
+            matches!(err, Error::CallbackFailed(7)),
+            "expected CallbackFailed(7); got {err:?} \
+             (formatted: {err})",
+        );
+        // And the human-readable form is what an adopter actually sees
+        // in their `audit_drain_failed` log line — no "table name" noise.
+        assert_eq!(err.to_string(), "insert callback returned non-zero rc=7");
+    }
+
+    #[test]
+    fn callback_store_success_returns_ok() {
+        extern "C" fn ok_cb(
+            _json: *const c_char,
+            _ud: *mut std::ffi::c_void,
+        ) -> i32 {
+            0
+        }
+        let store = CallbackStore {
+            fn_ptr: ok_cb,
+            ud: SendRawPtr(std::ptr::null_mut()),
+        };
+        assert!(store.insert(&Row::default()).is_ok());
+    }
 }
