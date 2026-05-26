@@ -186,6 +186,62 @@ def test_log_falls_back_to_stdlib_before_init(caplog):
     assert any("startup_probe" in r.message for r in caplog.records)
 
 
+# ── issue #36: datetime round-trip through the drainer ───────────────────
+
+
+def test_issue_36_drainer_reconstructs_datetime_from_json_roundtrip():
+    """Regression for #36.
+
+    fasten.emit -> JSON -> Rust queue -> Python _insert_cb is the
+    audit row's round-trip through the drainer. After json.loads(),
+    ``timestamp`` arrives as an ISO string, not a ``datetime``. Any
+    store implementation that calls ``_utc_iso(row.timestamp)`` (both
+    PostgresStore and SQLiteStore do) then crashes on
+    ``AttributeError: 'str' has no attribute 'tzinfo'`` — and because
+    ``_insert_cb`` swallows exceptions and returns 1, the row is
+    silently dead-lettered after retry-exhaustion.
+
+    The fix reconstructs the two datetime fields in ``_insert_cb``
+    before constructing ``AuditRow``. This test exercises the
+    queue-mode path end-to-end and asserts the store receives the
+    row with a real datetime instance (not a str).
+    """
+    from datetime import datetime as _datetime
+
+    received: list = []
+
+    class _CapturingStore:
+        def insert(self, row) -> None:
+            received.append(row)
+        def count(self, **_) -> int:
+            return len(received)
+        def max_monotonic_seq(self) -> int:
+            return 0
+
+    fasten.init(
+        service_id="svc", node_id="n",
+        audit_store=_CapturingStore(),
+        audit_store_failure_strategy="queue",
+    )
+    fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=2.0), "flush should drain the row"
+
+    assert len(received) == 1, (
+        "row should land via the drainer's _insert_cb; if zero, the "
+        "drainer dead-lettered the row after exception (the #36 bug)"
+    )
+    row = received[0]
+    assert isinstance(row.timestamp, _datetime), (
+        f"row.timestamp must be a datetime after the drainer round-trip "
+        f"(got {type(row.timestamp).__name__!r}); downstream "
+        "_utc_iso(row.timestamp) reads .tzinfo and crashes on a str"
+    )
+    assert row.timestamp.tzinfo is not None, (
+        "reconstructed timestamp must be tz-aware so PostgresStore / "
+        "SQLiteStore can serialise it without a naive-datetime detour"
+    )
+
+
 # ── sync fallback with no drainer ─────────────────────────────────────────
 
 

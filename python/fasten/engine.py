@@ -505,13 +505,27 @@ class Engine:
         max_attempts: int,
     ) -> None:
         # Build an insert callback that delegates to the Python store.
+        # The row crosses Python → JSON → Rust queue → Python here, so
+        # `timestamp` / `shipped_at` arrive as ISO strings and have to
+        # be parsed back to `datetime` before the store's `_utc_iso`
+        # tries to read `.tzinfo` (issue #36).
+        cb_logger = logging.getLogger("fasten")
+
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
+            row_dict: dict[str, Any] = {}
             try:
                 row_dict = json.loads(row_json.decode("utf-8"))
+                for fld in ("timestamp", "shipped_at"):
+                    v = row_dict.get(fld)
+                    if isinstance(v, str):
+                        row_dict[fld] = datetime.fromisoformat(v.replace("Z", "+00:00"))
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
                 store.insert(row)
                 return 0
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
+                cb_logger.exception(
+                    "insert_cb failed for row %s", row_dict.get("id", "<unparsed>"),
+                )
                 return 1
 
         cb = _ffi.InsertCallbackFn(_insert_cb)
