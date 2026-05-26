@@ -144,6 +144,36 @@ def router(
             "offset": offset,
         }
 
+    @r.get("/topology")
+    def get_topology(
+        since: Optional[datetime] = Query(default=None),
+        until: Optional[datetime] = Query(default=None),
+    ) -> dict[str, Any]:
+        """Fleet topology — who is emitting into this store.
+
+        Groups the audit rows by ``(source_node_id, service_id,
+        tenant_id)`` and returns the per-source row counts and
+        first/last-seen timestamps, plus distinct node/service/tenant
+        counts. No separate topology table: the fleet view falls out of
+        the rows already recorded, so it can never drift from reality.
+
+        Same auth as ``/audit`` (router-level dependencies). Optional
+        ``since``/``until`` window the aggregation.
+        """
+        empty = {"sources": [], "nodes": 0, "services": 0, "tenants": 0}
+        s = _store()
+        if s is None:
+            return {**empty, "error": "audit store not initialised — call fasten.init() first"}
+        if not hasattr(s, "sources"):
+            return {**empty, "error": "store does not support topology aggregation"}
+        sources = s.sources(since=since, until=until)
+        return {
+            "sources": sources,
+            "nodes": len({x["source_node_id"] for x in sources}),
+            "services": len({x["service_id"] for x in sources}),
+            "tenants": len({x["tenant_id"] for x in sources if x["tenant_id"]}),
+        }
+
     @r.get("/audit/doctor")
     def get_audit_doctor() -> dict[str, Any]:
         """P1-15: read-side audit-pipeline health snapshot.

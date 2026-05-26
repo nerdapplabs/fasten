@@ -336,6 +336,44 @@ class SQLiteStore:
             )
             return int(cur.fetchone()[0])
 
+    def sources(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fleet topology, aggregated from the rows already recorded.
+
+        Groups by ``(source_node_id, service_id, tenant_id)`` and returns
+        one entry per distinct emitting source with its row count and
+        first/last-seen timestamps. There is no separate topology table —
+        this is the honest "what nodes/services/tenants are represented in
+        this store" view, derived from the audit rows themselves. Ordered
+        by row count, busiest first.
+        """
+        where, params = self._build_where(since=since, until=until)
+        with self._txn():
+            cur = self._connect().execute(
+                "SELECT source_node_id, service_id, tenant_id, "
+                "COUNT(*) AS n, MIN(timestamp) AS first_seen, "
+                "MAX(timestamp) AS last_seen "
+                f"FROM {self._table} {where} "
+                "GROUP BY source_node_id, service_id, tenant_id "
+                "ORDER BY n DESC",
+                params,
+            )
+            return [
+                {
+                    "source_node_id": r["source_node_id"],
+                    "service_id": r["service_id"],
+                    "tenant_id": r["tenant_id"],
+                    "rows": int(r["n"]),
+                    "first_seen": r["first_seen"],
+                    "last_seen": r["last_seen"],
+                }
+                for r in cur.fetchall()
+            ]
+
     def max_monotonic_seq(self) -> int:
         """Return MAX(monotonic_seq) for seeding _seq at init; 0 if no rows."""
         with self._txn():
