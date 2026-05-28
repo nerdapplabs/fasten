@@ -347,6 +347,47 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
+    def sources(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fleet topology, aggregated from the rows already recorded.
+
+        Groups by ``(source_node_id, service_id, tenant_id)`` and returns
+        one entry per distinct emitting source with its row count and
+        first/last-seen timestamps. Mirrors ``SQLiteStore.sources``; see
+        that method for the rationale.
+        """
+        where, params = self._build_where(since=since, until=until)
+
+        def _run(conn: Any) -> list[dict[str, Any]]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT source_node_id, service_id, tenant_id, "
+                    "COUNT(*) AS n, MIN(timestamp) AS first_seen, "
+                    "MAX(timestamp) AS last_seen "
+                    f"FROM {self._table} {where} "
+                    "GROUP BY source_node_id, service_id, tenant_id "
+                    "ORDER BY n DESC",
+                    params,
+                )
+                out: list[dict[str, Any]] = []
+                for r in cur.fetchall():
+                    first_seen, last_seen = r[4], r[5]
+                    out.append({
+                        "source_node_id": r[0],
+                        "service_id": r[1],
+                        "tenant_id": r[2],
+                        "rows": int(r[3]),
+                        "first_seen": first_seen.isoformat() if hasattr(first_seen, "isoformat") else first_seen,
+                        "last_seen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else last_seen,
+                    })
+                return out
+
+        return self._execute_with_retry(_run)
+
     def max_monotonic_seq(self) -> int:
         """Return MAX(monotonic_seq); 0 if no rows."""
         def _run(conn: Any) -> int:
