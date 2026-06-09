@@ -254,6 +254,8 @@ def router(
                     chain_block = {
                         "verified": result.ok,
                         "breaks": 0 if result.ok else 1,
+                        "first_break_at": result.first_break_at,
+                        "reason": result.reason,
                         "last_verified_at": datetime.now(timezone.utc).isoformat(
                             timespec="milliseconds"
                         ),
