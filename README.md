@@ -16,6 +16,11 @@ Audit + correlation SDK.
 
 **For AI agents and software systems.**
 
+A software system is more than AI agents. **fasten is the connective
+tissue across AI and non-AI components** — the fourth pillar, joining
+logs, metrics, and traces with the tamper-evident record of what happened
+and who did it.
+
 Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level. Bundled shims for HTTP, MQTT, and scheduler-fired jobs. A mountable HTTP reader API for querying it back.
 
 **v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++, and Swift
@@ -27,7 +32,16 @@ are beta. Not yet on PyPI, npm, or crates.io — install from source.
 
 ## Where it fits
 
-fasten is the open-source substrate. Two commercial layers build on it:
+A software system is more than AI agents. **fasten is the connective
+tissue across AI and non-AI components** — the fourth pillar, joining
+logs, metrics, and traces with the tamper-evident record of what happened
+and who did it.
+
+fasten is the open-source substrate. It treats AI agents as one kind of
+actor, alongside users, services, schedulers, and integrations. Same
+primitive for every actor.
+
+Two commercial layers build on it:
 
 - **[Membrane](https://fasten.sh/membrane)** governs what your agents
   believe and refuses bad writes at decision time.
