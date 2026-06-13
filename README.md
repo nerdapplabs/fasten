@@ -112,86 +112,12 @@ the shims wrap.
 
 ---
 
-## Bundled CLI + TUI (Python)
+## Reference
 
-Installed as console scripts when you `pip install ./python`. Run against
-any fasten-mounted service via the standard `/api/v1/logs/{audit,sys,api}`
-reader.
-
-| Tool       | Invoke                            | What it does                                  |
-|------------|-----------------------------------|-----------------------------------------------|
-| CLI        | `fasten dump`                     | Print registered codes (CI consistency gate)  |
-| CLI        | `fasten tail --stream sys`        | Stream rows from a mounted reader             |
-| CLI        | `fasten doctor`                   | Verify init config + correlation wiring       |
-| TUI        | `fasten-tui [--request-id <id>]`  | Live three-pane audit + sys + API feed (Rich) |
-
-**TUI interactive controls** (no mouse; works over SSH):
-
-| Key         | Action                                                     |
-|-------------|------------------------------------------------------------|
-| `L` / space | Toggle live polling on/off (default: **on** ●)            |
-| `/`         | Open request_id picker — fuzzy search, ↑↓ cursor, Enter to select, Esc to clear |
-| Tab         | Rotate primary pane: audit → sys → api → audit            |
-| `q` / Ctrl-C | Quit                                                      |
-
-If `--request-id <id>` is given, the TUI pre-selects it; `/` still lets you change it from inside the live view.
-
-The TUI is SSH-friendly — works on industrial Linux hosts where no GUI
-is permitted.
-
----
-
-## Languages
-
-| Language             | Status        | Min runtime | Location                                           |
-|----------------------|---------------|-------------|----------------------------------------------------|
-| Python               | reference     | 3.10        | [`python/`](python/)                               |
-| Go                   | beta          | 1.21        | [`go/`](go/)                                       |
-| Node.js / TypeScript | beta          | Node 18     | [`js/`](js/)                                       |
-| Rust                 | beta          | 1.70        | [`rust/`](rust/)                                   |
-| C++                  | single-header | C++14       | [`cpp/include/fasten.hpp`](cpp/include/fasten.hpp) |
-| Swift                | beta          | macOS 13 / iOS 16 / Linux | [`swift/`](swift/)                   |
-| Java                 | placeholder   | —           | [`java/`](java/)                                   |
-
-Audit-store failure handling — the queue-mode default that keeps
-`emit()` off the request path — is shipped in all 6 production SDKs
-(Python, Go, JS, Rust, C++, Swift). A locked / down audit store no
-longer cascades into 5xxs on the request path: rows queue with
-exponential backoff and the drainer self-reports queue health on the sys
-stream. Adopters who want loud failures during config debugging opt in via
-`audit_store_failure_strategy="raise"` (Python/Go/JS/Rust/C++) or
-`strategy: .raise` (Swift).
-
-### C++ logger bridges
-
-Three opt-in, header-only shims bridge popular C++ logging libraries into
-fasten's `/logs/sys` ring — no call-site changes required:
-
-| Library | Shim header | Usage |
-|---------|------------|-------|
-| **spdlog** | `fasten/shim/spdlog.hpp` | Push `fasten::shim::spdlog_sink_mt` onto your logger's sink list |
-| **glog** | `fasten/shim/glog.hpp` | Call `fasten::shim::glog::install()` once after `fasten::init()` |
-| **Boost.Log** | `fasten/shim/boost_log.hpp` | Add `fasten::shim::boost_log::sink_mt` to `boost::log::core` |
-
-Each shim applies the same key-pattern and value-shape redaction as
-`fasten::emit()`, so secrets in log messages are scrubbed before they
-reach the ring. A per-thread recursion guard prevents infinite re-entry
-if fasten's own internal log writes use the same logger.
-
-### Wire schema versioning
-
-Every audit row carries `"wire_version": "1"`. This field exists so
-that tools reading fasten output — log ingestors, compliance
-dashboards, replication outboxes — can tell which schema they are
-looking at, even years after the row was written.
-
-The contract is forward-compatible: **readers must accept any
-`wire_version` value higher than what they know about** and process
-the row on a best-effort basis. A reader that hard-rejects unknown
-versions will break silently when fasten releases a future schema
-revision. If fasten ever changes the row shape in a way that could
-break readers (renaming a required field, changing a type), it will
-bump the version number so readers have an explicit signal to act on.
+The full docs live at **[fasten.sh/docs](https://fasten.sh/docs/)** —
+language matrix (Python, Go, Node, Rust, C++, Swift), bundled CLI + TUI,
+C++ logger bridges (spdlog, glog, Boost.Log), audit-store failure
+handling, PII redaction, and the wire schema versioning contract.
 
 ---
 

@@ -12,6 +12,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - "What it solves" table moved above the install and quickstart.
 - Opening paragraphs tightened; added "For AI agents and software
   systems." subtitle.
+- Reference sections (CLI + TUI, Languages, C++ logger bridges, wire
+  schema) collapsed into a single pointer to fasten.sh/docs.
 
 ### Added — Redact conformance corpus (P0-7 Step 1)
 
