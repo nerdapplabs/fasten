@@ -18,8 +18,8 @@ Audit + correlation SDK.
 
 A software system is more than AI agents. **fasten is the connective
 tissue across AI and non-AI components** — the fourth pillar, joining
-logs, metrics, and traces with the tamper-evident record of what happened
-and who did it.
+logs, metrics, and traces with the tamper-evident record of *what
+happened, who changed it, who can prove it*.
 
 Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level. Bundled shims for HTTP, MQTT, and scheduler-fired jobs. A mountable HTTP reader API for querying it back.
 
