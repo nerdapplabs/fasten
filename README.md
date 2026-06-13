@@ -32,11 +32,6 @@ are beta. Not yet on PyPI, npm, or crates.io — install from source.
 
 ## Where it fits
 
-A software system is more than AI agents. **fasten is the connective
-tissue across AI and non-AI components** — the fourth pillar, joining
-logs, metrics, and traces with the tamper-evident record of what happened
-and who did it.
-
 fasten is the open-source substrate. It treats AI agents as one kind of
 actor, alongside users, services, schedulers, and integrations. Same
 primitive for every actor.
