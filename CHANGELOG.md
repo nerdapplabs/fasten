@@ -6,6 +6,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — README
+
+- New "Where it fits" section linking to Membrane and fasten fleet.
+- "What it solves" table moved above the install and quickstart.
+- Opening paragraphs tightened; added "For AI agents and software
+  systems." subtitle.
+
 ### Added — Redact conformance corpus (P0-7 Step 1)
 
 - `spec/redact-conformance.json` — 50-case cross-language test corpus covering all 14 key

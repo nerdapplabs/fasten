@@ -14,14 +14,40 @@
 
 Audit + correlation SDK.
 
-Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level; bundled shims for HTTP, MQTT, and scheduler-fired jobs.
+**For AI agents and software systems.**
 
-One mountable query (API endpoints) surface.
+Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level. Bundled shims for HTTP, MQTT, and scheduler-fired jobs. A mountable HTTP reader API for querying it back.
 
-**v1.0.0-beta.** Python is the reference SDK; Go / JS / Rust / C++ / Swift are
-beta. Not yet on PyPI / npm / crates.io — install from source.
+**v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++, and Swift
+are beta. Not yet on PyPI, npm, or crates.io — install from source.
 
 **[Website →](https://fasten.sh)**
+
+---
+
+## Where it fits
+
+fasten is the open-source substrate. Two commercial layers build on it:
+
+- **[Membrane](https://fasten.sh/membrane)** governs what your agents
+  believe and refuses bad writes at decision time.
+- **[fasten fleet](https://fasten.sh/fleet)** aggregates records across
+  many services, generates compliance evidence packs, and exposes
+  `/investigate` for cited cross-stream answers.
+
+You only need fasten to start.
+
+---
+
+## What it solves
+
+| Question                                          | Before fasten          | With fasten            |
+|---------------------------------------------------|-----------------------|-----------------------|
+| Who deployed this config at 14:32?                | grep + Slack + 20 min | `?since=&until=` → 30 s |
+| Which HTTP request caused this MQTT disconnect?   | Unknown               | Same `request_id`     |
+| Show every mutation to this resource in 30 days   | Log scraping          | `?target=resource-id` |
+| Compliance audit trail for a regulated deployment | Custom table + glue   | `?code=&since=&until=` |
+| Which agent tool call wrote this record?          | Unknowable across multiple agents on one key | `?actor=&request_id=` |
 
 ---
 
@@ -77,17 +103,6 @@ the shims wrap.
 
 ---
 
-## What it solves
-
-| Question                                          | Before fasten          | With fasten            |
-|---------------------------------------------------|-----------------------|-----------------------|
-| Who deployed this config at 14:32?                | grep + Slack + 20 min | `?since=&until=` → 30 s |
-| Which HTTP request caused this MQTT disconnect?   | Unknown               | Same `request_id`     |
-| Show every mutation to this resource in 30 days   | Log scraping          | `?target=resource-id` |
-| Compliance audit trail for a regulated deployment | Custom table + glue   | `?code=&since=&until=` |
-
----
-
 ## Bundled CLI + TUI (Python)
 
 Installed as console scripts when you `pip install ./python`. Run against
@@ -138,7 +153,7 @@ stream. Adopters who want loud failures during config debugging opt in via
 `audit_store_failure_strategy="raise"` (Python/Go/JS/Rust/C++) or
 `strategy: .raise` (Swift).
 
-### C++ logger bridges (P1-12)
+### C++ logger bridges
 
 Three opt-in, header-only shims bridge popular C++ logging libraries into
 fasten's `/logs/sys` ring — no call-site changes required:
