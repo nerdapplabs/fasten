@@ -60,61 +60,17 @@ You only need fasten to start.
 
 ---
 
-## Install (source)
+## Install + Quickstart
 
-```bash
-git clone https://github.com/nerdapplabs/fasten
-cd fasten
-
-pip install ./python                              # Python (reference)
-go get github.com/nerdapplabs/fasten/go           # Go
-npm install ./js                                  # Node / TypeScript
-# Swift (SPM): add .package(url: "…/fasten", from: "1.0.0") to Package.swift
-# C++14: copy cpp/include/fasten.hpp — zero dependencies
-```
-
-## Quickstart
-
-Verified to run as-is on Python 3.10+:
-
-```python
-import os
-os.environ["FASTEN_AUDIT_DSN"] = "sqlite:///./fasten-audit.db"
-
-import fasten
-from fasten.codes import register, Meta, Severity, RetentionClass
-from fasten.context import with_request_id
-
-register("user", {
-    "USER_CREATED": Meta(
-        domain="user", category="account", action="create",
-        severity=Severity.INFO, description="New user account",
-        emitter="auth-service", retention_class=RetentionClass.LONG,
-    ),
-})
-
-fasten.init(service_id="auth-service", node_id="host-01")
-
-with with_request_id():
-    fasten.emit(code="USER_CREATED", target="u-42",
-                actor="admin", detail={"email": "alice@example.com"})
-    fasten.log.info("signup_complete", user_id="u-42")
-
-fasten.flush()  # block until the audit row reaches fasten-audit.db
-```
-
-Both lines emit on stdout under the same `request_id` — that's the join
-key. The audit row is also persisted to `./fasten-audit.db`.
-
-In a real service the HTTP / MQTT / scheduler shim opens the
-`with_request_id()` context for you; the kernel pattern above is what
-the shims wrap.
+Start at **[fasten.sh/docs](https://fasten.sh/docs/)**. The
+install steps for every language and a runnable Python quickstart
+are at the top of the page.
 
 ---
 
 ## Reference
 
-The full docs live at **[fasten.sh/docs](https://fasten.sh/docs/)** —
+The same docs cover the rest:
 language matrix (Python, Go, Node, Rust, C++, Swift), bundled CLI + TUI,
 C++ logger bridges (spdlog, glog, Boost.Log), audit-store failure
 handling, PII redaction, and the wire schema versioning contract.
