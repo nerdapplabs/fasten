@@ -171,7 +171,10 @@ func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 	return cols, rows.Err()
 }
 
-func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
+// insertRow is the shared idempotent INSERT OR IGNORE for any row. The
+// originated/replicated intent split is enforced by the wrappers, not here —
+// the SQL is identical.
+func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -206,6 +209,32 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 	return err
 }
 
+// InsertOriginated inserts a row this node ORIGINATED (origin_id == id). Used
+// by the engine's own Emit path.
+func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
+	if row.OriginID != row.ID {
+		return fmt.Errorf(
+			"fasten InsertOriginated: requires origin_id == id (got origin_id=%q, id=%q); "+
+				"use InsertReplicated for rows from another origin", row.OriginID, row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// InsertReplicated inserts a sealed row replicated from another origin. Used by
+// IngestReplicated after the chain verifies.
+func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
+// Kept so the AuditRepository interface and the drainer stay stable.
+func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
+	return s.InsertOriginated(ctx, row)
+}
+
 func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	where, args := filterToSQL(f)
 	limit := f.Limit
@@ -230,6 +259,27 @@ func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, erro
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?`, auditCols, s.table),
 		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
+// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
+// from another origin are excluded: re-shipping them upstream would duplicate
+// another node's sub-chain. This is the originated-only counterpart a relay
+// should use; plain ListUnshipped returns every unshipped row regardless of
+// origin.
+func (s *SQLiteStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL AND service_id = ? AND source_node_id = ? AND origin_id = id ORDER BY monotonic_seq ASC LIMIT ?`, auditCols, s.table),
+		serviceID, sourceNodeID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -280,10 +330,27 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// MaxMonotonicSeq returns the maximum monotonic_seq stored, for seq seeding on restart.
-func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context) (int64, error) {
+// MaxMonotonicSeq returns the maximum monotonic_seq stored for the given
+// (serviceID, sourceNodeID) sub-chain, for seq seeding on restart.
+//
+// The tamper chain is per (service_id, source_node_id) and monotonic_seq is a
+// per-node counter, so seeding the engine's seq MUST be scoped to the engine's
+// OWN identity. An unscoped MAX() across all origins would, after this node
+// ingested replicated rows from another origin, seed seq from a foreign
+// sub-chain and break this node's own chain. When serviceID and sourceNodeID
+// are both empty the query falls back to the legacy global MAX (used only
+// where identity is unavailable).
+func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error) {
 	var n sql.NullInt64
-	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s`, s.table)).Scan(&n)
+	var err error
+	if serviceID != "" && sourceNodeID != "" {
+		err = s.db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s WHERE service_id = ? AND source_node_id = ?`, s.table),
+			serviceID, sourceNodeID,
+		).Scan(&n)
+	} else {
+		err = s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s`, s.table)).Scan(&n)
+	}
 	if err != nil || !n.Valid {
 		return 0, err
 	}

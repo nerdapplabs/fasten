@@ -27,7 +27,18 @@ class IngestResult:
 class AuditRepository(Protocol):
     """Long-term audit store — edge (config.db), EM (Postgres), adopter's choice."""
 
-    def insert(self, row: AuditRow) -> None: ...
+    def insert(self, row: AuditRow) -> None:
+        """Thin alias for insert_originated — the engine emit/drainer path."""
+        ...
+
+    def insert_originated(self, row: AuditRow) -> None:
+        """Insert a row this node ORIGINATED (origin_id == id)."""
+        ...
+
+    def insert_replicated(self, row: AuditRow) -> None:
+        """Insert a sealed row replicated from another origin (after the chain
+        verifies in ingest_replicated)."""
+        ...
 
     def query(
         self,
@@ -83,7 +94,7 @@ class AuditRepository(Protocol):
         Verifies the per-row hash chain first; a break rejects the whole batch
         (inserts nothing) and raises. Otherwise every row is inserted via the
         idempotent insert() so re-delivery is a no-op. Used by replication
-        sinks — edge-manager receiving rows reverse-synced from an edge node.
+        sinks — an upstream aggregator receiving rows reverse-synced from a node.
         """
         ...
 
@@ -119,7 +130,15 @@ def ingest_replicated_into(store: "AuditRepository", rows: list[AuditRow]) -> In
         )
     inserted = 0
     for row in rows:
-        store.insert(row)
+        # Replicated rows keep their origin's identity (origin_id may differ
+        # from id), so route through insert_replicated, which asserts the row
+        # is sealed rather than asserting origin_id == id. Fall back to insert
+        # for adopter stores that predate the originated/replicated split.
+        insert_replicated = getattr(store, "insert_replicated", None)
+        if callable(insert_replicated):
+            insert_replicated(row)
+        else:
+            store.insert(row)
         inserted += 1
     return IngestResult(inserted=inserted)
 

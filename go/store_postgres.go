@@ -174,7 +174,9 @@ const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, seve
 	` target, category, domain, method, request_id, detail,` +
 	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
 
-func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
+// insertRow is the shared idempotent ON CONFLICT DO NOTHING insert for any
+// row. The originated/replicated intent split is enforced by the wrappers.
+func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -209,6 +211,29 @@ func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	return err
 }
 
+// InsertOriginated inserts a row this node ORIGINATED (origin_id == id).
+func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
+	if row.OriginID != row.ID {
+		return fmt.Errorf(
+			"fasten InsertOriginated: requires origin_id == id (got origin_id=%q, id=%q); "+
+				"use InsertReplicated for rows from another origin", row.OriginID, row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// InsertReplicated inserts a sealed row replicated from another origin.
+func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
+func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
+	return s.InsertOriginated(ctx, row)
+}
+
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	where, args := filterToPostgresSQL(f)
 	limit := f.Limit
@@ -234,6 +259,25 @@ func (s *PostgresStore) ListUnshipped(ctx context.Context, limit int) ([]Row, er
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1`, pgAuditCols, s.table),
 		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsPg(rows)
+}
+
+// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
+// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
+// from another origin are excluded so they are never re-shipped upstream. See
+// SQLiteStore.ListUnshippedOriginated for the rationale.
+func (s *PostgresStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL AND service_id = $1 AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3`, pgAuditCols, s.table),
+		serviceID, sourceNodeID, limit,
 	)
 	if err != nil {
 		return nil, err

@@ -27,8 +27,8 @@ type VerifyResult struct {
 
 // VerifyChain walks the per-row tamper-evidence hash chain and reports whether
 // it is intact. It is the Go counterpart of the Python fasten.verify_chain and
-// produces byte-for-byte identical row hashes, so edge-manager (Go) can verify
-// chains that were sealed by the gateway (Python).
+// produces byte-for-byte identical row hashes, so a Go upstream aggregator can
+// verify chains that were sealed by a Python node.
 //
 // Semantics mirror Python engine.py verify_chain exactly:
 //

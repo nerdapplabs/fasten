@@ -18,7 +18,7 @@ import { _loadedPaths } from '../src/codes_yaml.js';
 
 const FLEET_YAML = `
 domain: fleet
-emitter: edge-manager
+emitter: fleet-service
 codes:
   FLEET_NODE_REGISTERED:
     category: node.lifecycle

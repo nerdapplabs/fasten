@@ -119,7 +119,7 @@ def test_reinit_flushes_old_drainer_before_replacing(mem_store):
                 received.append(row)
         def count(self, **_) -> int:
             return len(received)
-        def max_monotonic_seq(self) -> int:
+        def max_monotonic_seq(self, service_id=None, source_node_id=None) -> int:
             return 0
 
     store = _RecStore()
@@ -162,7 +162,7 @@ def test_atexit_flush_drains_pending(mem_store):
             flushed.set()
         def count(self, **_):
             return len(self.rows)
-        def max_monotonic_seq(self):
+        def max_monotonic_seq(self, service_id=None, source_node_id=None):
             return 0
 
     store = _SlowStore()
@@ -215,7 +215,7 @@ def test_issue_36_drainer_reconstructs_datetime_from_json_roundtrip():
             received.append(row)
         def count(self, **_) -> int:
             return len(received)
-        def max_monotonic_seq(self) -> int:
+        def max_monotonic_seq(self, service_id=None, source_node_id=None) -> int:
             return 0
 
     fasten.init(
@@ -255,7 +255,7 @@ def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
             raise RuntimeError("store down")
         def count(self, **_) -> int:
             return 0
-        def max_monotonic_seq(self) -> int:
+        def max_monotonic_seq(self, service_id=None, source_node_id=None) -> int:
             return 0
 
     fasten.init(

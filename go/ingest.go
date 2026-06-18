@@ -14,8 +14,8 @@ type IngestResult struct {
 // intact, inserts every row via the supplied idempotent insert function.
 //
 // This is the shared core behind SQLiteStore.IngestReplicated and
-// PostgresStore.IngestReplicated. A replication sink (edge-manager receiving
-// rows reverse-synced from an edge node) MUST refuse a broken chain wholesale:
+// PostgresStore.IngestReplicated. A replication sink (an upstream aggregator
+// receiving rows reverse-synced from a node) MUST refuse a broken chain wholesale:
 // if VerifyChain reports a break the function inserts NOTHING and returns an
 // error naming the first broken sequence. Inserts are idempotent (INSERT OR
 // IGNORE / ON CONFLICT DO NOTHING on the id PK), so re-delivering an already
@@ -44,15 +44,15 @@ func ingestReplicated(
 }
 
 // IngestReplicated verifies and stores a batch of rows replicated from another
-// origin (edge node -> edge-manager reverse sync). The chain is verified first;
-// a break rejects the whole batch and inserts nothing. See ingestReplicated.
+// origin (node -> upstream aggregator reverse sync). The chain is verified
+// first; a break rejects the whole batch and inserts nothing. See ingestReplicated.
 func (s *SQLiteStore) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	return ingestReplicated(ctx, rows, s.Insert)
+	return ingestReplicated(ctx, rows, s.InsertReplicated)
 }
 
 // IngestReplicated verifies and stores a batch of rows replicated from another
 // origin. The chain is verified first; a break rejects the whole batch and
 // inserts nothing. See ingestReplicated.
 func (s *PostgresStore) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	return ingestReplicated(ctx, rows, s.Insert)
+	return ingestReplicated(ctx, rows, s.InsertReplicated)
 }

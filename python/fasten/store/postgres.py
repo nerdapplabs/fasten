@@ -175,7 +175,10 @@ class PostgresStore:
     # AuditRepository protocol
     # ------------------------------------------------------------------
 
-    def insert(self, row: AuditRow) -> None:
+    def _insert_row(self, row: AuditRow) -> None:
+        """Idempotent ON CONFLICT DO NOTHING insert of any row. Shared by the
+        originated and replicated entry points — identical SQL; the intent
+        split is enforced by the wrappers."""
         params = (
             row.id, row.origin_id, row.monotonic_seq,
             _utc_iso(row.timestamp),
@@ -206,15 +209,62 @@ class PostgresStore:
 
         self._execute_with_retry(_run)
 
-    def list_unshipped(self, limit: int = 100) -> list[AuditRow]:
+    def insert_originated(self, row: AuditRow) -> None:
+        """Insert a row this node ORIGINATED (origin_id == id). Engine emit path."""
+        if row.origin_id != row.id:
+            raise ValueError(
+                "insert_originated requires origin_id == id "
+                f"(got origin_id={row.origin_id!r}, id={row.id!r}); "
+                "use insert_replicated for rows from another origin"
+            )
+        self._insert_row(row)
+
+    def insert_replicated(self, row: AuditRow) -> None:
+        """Insert a row replicated from another origin. ingest_replicated path;
+        the row must be sealed."""
+        if not row.hash:
+            raise ValueError(
+                "insert_replicated requires a sealed row (non-empty hash); "
+                f"row {row.id!r} has no hash"
+            )
+        self._insert_row(row)
+
+    def insert(self, row: AuditRow) -> None:
+        """Thin alias for insert_originated — the engine emit/drainer path."""
+        self.insert_originated(row)
+
+    def list_unshipped(
+        self,
+        limit: int = 100,
+        service_id: str | None = None,
+        source_node_id: str | None = None,
+    ) -> list[AuditRow]:
+        """Unshipped rows oldest-first.
+
+        Scoped to rows this engine ORIGINATED (``origin_id = id`` AND matching
+        identity) when both ``service_id`` and ``source_node_id`` are given, so
+        replicated rows from another origin are never re-shipped upstream. See
+        SQLiteStore.list_unshipped for the rationale.
+        """
+        scoped = service_id is not None and source_node_id is not None
+
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-                    "ORDER BY monotonic_seq ASC LIMIT %s",
-                    (limit,),
-                )
+                if scoped:
+                    cur.execute(
+                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        "AND service_id = %s AND source_node_id = %s AND origin_id = id "
+                        "ORDER BY monotonic_seq ASC LIMIT %s",
+                        (service_id, source_node_id, limit),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        "ORDER BY monotonic_seq ASC LIMIT %s",
+                        (limit,),
+                    )
                 return [self._row(r) for r in cur.fetchall()]
+
         return self._execute_with_retry(_run)
 
     def mark_shipped(self, ids: list[str]) -> None:
@@ -402,12 +452,34 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
-    def max_monotonic_seq(self) -> int:
-        """Return MAX(monotonic_seq); 0 if no rows."""
+    def max_monotonic_seq(
+        self,
+        service_id: str | None = None,
+        source_node_id: str | None = None,
+    ) -> int:
+        """Return MAX(monotonic_seq); 0 if no rows.
+
+        Scoped to ``(service_id, source_node_id)`` when both are provided —
+        the tamper chain is per-node and ``monotonic_seq`` is a per-node
+        counter, so seeding the engine's seq from an unscoped global MAX would
+        break this node's own chain once it has ingested replicated rows from
+        another origin. See SQLiteStore.max_monotonic_seq for the full
+        rationale.
+        """
+        scoped = service_id is not None and source_node_id is not None
+
         def _run(conn: Any) -> int:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
+                if scoped:
+                    cur.execute(
+                        f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
+                        "WHERE service_id = %s AND source_node_id = %s",
+                        (service_id, source_node_id),
+                    )
+                else:
+                    cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
                 return int(cur.fetchone()[0])
+
         return self._execute_with_retry(_run)
 
     # ------------------------------------------------------------------

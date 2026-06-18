@@ -252,9 +252,18 @@ class Engine:
         self._api_store   = cfg.api_store
 
         if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
+            # Seed seq from THIS engine's own (service_id, source_node_id)
+            # sub-chain only — never the global MAX. monotonic_seq is a
+            # per-node counter; seeding from a foreign origin's rows (which
+            # this node may have ingested via ingest_replicated) would break
+            # this node's own tamper chain.
             with self._lock:
-                self._seq = self._audit_store.max_monotonic_seq()
-            # Seed prev_hash for the hash chain from the latest stored row.
+                self._seq = self._audit_store.max_monotonic_seq(
+                    service_id=cfg.service_id,
+                    source_node_id=cfg.node_id,
+                )
+            # Seed prev_hash for the hash chain from the latest stored row of
+            # THIS node's own sub-chain.
             try:
                 latest = self._audit_store.query(
                     source_node_id=cfg.node_id, limit=1,
@@ -460,8 +469,15 @@ class Engine:
         return store
 
     def list_unshipped(self, limit: int = 100) -> "list[AuditRow]":
-        """Rows not yet shipped upstream, oldest first. Delegates to the store."""
-        return self._require_store("list_unshipped").list_unshipped(limit=limit)
+        """Rows this engine ORIGINATED that are not yet shipped upstream, oldest
+        first. Scoped to the engine's own (service_id, source_node_id) so rows
+        ingested from another origin are never re-shipped (that would duplicate
+        a foreign sub-chain). Delegates to the store."""
+        return self._require_store("list_unshipped").list_unshipped(
+            limit=limit,
+            service_id=self._service_id,
+            source_node_id=self._node_id,
+        )
 
     def mark_shipped(self, ids: "list[str]") -> None:
         """Mark rows shipped upstream by id. Delegates to the store."""

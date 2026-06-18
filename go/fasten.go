@@ -477,8 +477,13 @@ func rowToMap(r Row) map[string]any {
 // SeqSeeder is an optional extension of AuditRepository. Stores that implement
 // it allow Init() to seed monotonic_seq from persisted rows so post-restart
 // rows never collide on (timestamp, seq) with pre-restart rows.
+//
+// The seed MUST be scoped to the engine's own (serviceID, sourceNodeID): the
+// tamper chain is per-node and monotonic_seq is a per-node counter, so seeding
+// from an unscoped global MAX would break this node's own chain once it has
+// ingested replicated rows from another origin.
 type SeqSeeder interface {
-	MaxMonotonicSeq(ctx context.Context) (int64, error)
+	MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error)
 }
 
 // AuditRepository is the durable store contract.

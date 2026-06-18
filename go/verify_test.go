@@ -9,7 +9,7 @@ import (
 // pyVectorRow is the exact AuditRow the Python generator below produced. Its
 // expected hash was computed by Python fasten.engine._row_hash. The Go row hash
 // MUST equal pyVectorHash byte-for-byte, proving cross-language chain
-// compatibility (edge-manager Go verifying a gateway-Python-sealed chain).
+// compatibility (a Go upstream aggregator verifying a Python-node-sealed chain).
 //
 // To regenerate, run (from the fasten submodule root):
 //

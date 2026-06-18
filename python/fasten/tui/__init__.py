@@ -8,7 +8,7 @@ filter row at the bottom.
   - SSH-friendly. Runs over slow links / on industrial Linux hosts where
     no GUI is permitted.
   - Talks to any fasten-mounted service via the same `/api/v1/logs/*`
-    routes the CLI uses — local SQLite, edge-manager, or fasten Cloud.
+    routes the CLI uses — local SQLite, an upstream aggregator, or fasten Cloud.
   - Optional install: `pip install fasten[tui]` pulls in `rich`.
 
 v0.1 polls every `--interval` seconds. Real SSE / long-poll lands in v0.2
