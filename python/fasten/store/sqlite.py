@@ -12,10 +12,13 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
+
+if TYPE_CHECKING:
+    from .repo import IngestResult
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -224,6 +227,17 @@ class SQLiteStore:
                 [(now, i) for i in ids],
             )
             conn.commit()
+
+    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+        """Verify the chain of replicated rows, then insert all-or-nothing.
+
+        A chain break rejects the whole batch (inserts nothing) and raises
+        AuditChainError; otherwise every row is inserted via the idempotent
+        insert() (INSERT OR IGNORE on the id PK), so re-delivery is a no-op
+        and replicated multi-origin rows keep their origin_id as-is.
+        """
+        from .repo import ingest_replicated_into
+        return ingest_replicated_into(self, rows)
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         with self._txn():
