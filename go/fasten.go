@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/nerdapplabs/fasten/go/fastenctx"
 )
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
@@ -302,10 +304,6 @@ func metaOf(c Code) (Meta, bool) {
 
 // ── Correlation context ───────────────────────────────────────────────────
 
-type ctxKey int
-
-const requestIDKey ctxKey = 1
-
 // MintID returns a new 12-character hex request id.
 func MintID() string {
 	b := make([]byte, 6)
@@ -314,16 +312,18 @@ func MintID() string {
 }
 
 // WithRequestID returns ctx with the id as the ambient correlation id.
+//
+// Delegates to the zero-dependency fastenctx subpackage so the context key
+// is identical to the one fastenctx (and the HTTP RequestID middleware) use.
 func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestIDKey, id)
+	return fastenctx.WithRequestID(ctx, id)
 }
 
 // RequestIDFromContext reads the ambient id ("" if unset).
+//
+// Delegates to fastenctx — same key as WithRequestID above.
 func RequestIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(requestIDKey).(string); ok {
-		return v
-	}
-	return ""
+	return fastenctx.RequestIDFromContext(ctx)
 }
 
 // ── Audit-store failure handling ──────────────────────────────────────────
