@@ -109,3 +109,25 @@ def verify_chain(rows: "list[Any]") -> "Any":
     """
     from .engine import verify_chain as _verify_chain
     return _verify_chain(rows)
+
+
+def list_unshipped(limit: int = 100) -> "list[AuditRow]":
+    """Rows not yet shipped upstream (oldest first), via the default Engine's store.
+
+    Raises RuntimeError if the default Engine has no audit store configured.
+    """
+    return _default.list_unshipped(limit=limit)
+
+
+def mark_shipped(ids: "list[str]") -> None:
+    """Mark rows shipped upstream by id, via the default Engine's store."""
+    _default.mark_shipped(ids)
+
+
+def ingest_replicated(rows: "list[AuditRow]") -> Any:
+    """Verify + all-or-nothing insert a replicated batch, via the default Engine's store.
+
+    Verifies the per-row hash chain first; a break rejects the whole batch
+    (inserts nothing) and raises store.AuditChainError. Returns an IngestResult.
+    """
+    return _default.ingest_replicated(rows)

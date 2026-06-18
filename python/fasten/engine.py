@@ -449,6 +449,28 @@ class Engine:
         """Active AuditRepository, or None if init() has not been called."""
         return self._audit_store
 
+    def _require_store(self, op: str) -> Any:
+        store = self._audit_store
+        if store is None:
+            raise RuntimeError(
+                f"fasten.{op}() requires an audit store — call init() with "
+                "audit_store= or FASTEN_AUDIT_DSN first (stdout-only mode has "
+                "no store to read/write)."
+            )
+        return store
+
+    def list_unshipped(self, limit: int = 100) -> "list[AuditRow]":
+        """Rows not yet shipped upstream, oldest first. Delegates to the store."""
+        return self._require_store("list_unshipped").list_unshipped(limit=limit)
+
+    def mark_shipped(self, ids: "list[str]") -> None:
+        """Mark rows shipped upstream by id. Delegates to the store."""
+        self._require_store("mark_shipped").mark_shipped(ids)
+
+    def ingest_replicated(self, rows: "list[AuditRow]") -> Any:
+        """Verify + all-or-nothing insert a replicated batch. Delegates to the store."""
+        return self._require_store("ingest_replicated").ingest_replicated(rows)
+
     def last_init_at(self) -> Optional[datetime]:
         """Timestamp of the most recent init() call, or None."""
         return self._last_init_at

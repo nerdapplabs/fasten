@@ -13,10 +13,13 @@ import json
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
+
+if TYPE_CHECKING:
+    from .repo import IngestResult
 
 # Bare name ("audit_log") or schema-qualified ("fasten.audit_log").
 _SAFE_IDENTIFIER = re.compile(
@@ -226,6 +229,17 @@ class PostgresStore:
             conn.commit()
 
         self._execute_with_retry(_run)
+
+    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+        """Verify the chain of replicated rows, then insert all-or-nothing.
+
+        A chain break rejects the whole batch (inserts nothing) and raises
+        AuditChainError; otherwise every row is inserted via the idempotent
+        insert() (ON CONFLICT (id) DO NOTHING), so re-delivery is a no-op and
+        replicated multi-origin rows keep their origin_id as-is.
+        """
+        from .repo import ingest_replicated_into
+        return ingest_replicated_into(self, rows)
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"

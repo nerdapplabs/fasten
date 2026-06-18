@@ -19,9 +19,24 @@ from __future__ import annotations
 from .attrs import Anchor, AuditRow
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
-from .emitter import audit_store, emit, flush, init, init_config, log, queue_stats, redactor, start, transport, verify_chain
+from .emitter import (
+    audit_store,
+    emit,
+    flush,
+    ingest_replicated,
+    init,
+    init_config,
+    list_unshipped,
+    log,
+    mark_shipped,
+    queue_stats,
+    redactor,
+    start,
+    transport,
+    verify_chain,
+)
 from .engine import AuditStoreError, ChainVerifyResult, Engine, FastenConfig
-from .store.repo import AuditRepository
+from .store.repo import AuditChainError, AuditRepository, IngestResult
 
 __all__ = [
     # row shape
@@ -37,6 +52,12 @@ __all__ = [
     "registry",
     # storage protocol
     "AuditRepository",
+    "AuditChainError",
+    "IngestResult",
+    # replication / outbox helpers (delegate to the default engine's store)
+    "list_unshipped",
+    "mark_shipped",
+    "ingest_replicated",
     # multi-tenant / isolated engine
     "Engine",
     # config dataclass

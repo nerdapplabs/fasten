@@ -10,6 +10,11 @@ DynamoDB / Kinesis / whatever by implementing the interface.
 """
 from __future__ import annotations
 
-from .repo import AuditOutboxRepository, AuditRepository
+from .repo import AuditChainError, AuditOutboxRepository, AuditRepository, IngestResult
 
-__all__ = ["AuditRepository", "AuditOutboxRepository"]
+__all__ = [
+    "AuditRepository",
+    "AuditOutboxRepository",
+    "AuditChainError",
+    "IngestResult",
+]
