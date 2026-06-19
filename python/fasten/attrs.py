@@ -79,6 +79,12 @@ class AuditRow:
     # replication marker (edge only)
     shipped_at: Optional[datetime] = None
 
+    # canonical_form_id: which hashed canonical form sealed this row. "1" is the
+    # current (and only) form. Included in the hashed bytes so the form choice is
+    # itself tamper-evident; verify_chain dispatches on it and rejects unknown
+    # ids. See fasten.chain for the form definitions.
+    canonical_form_id: str = "1"
+
     # P1-23: tamper-evidence hash chain.
     # prev_hash: hex sha256 of the preceding row in this (service_id, source_node_id) chain,
     #            or the sentinel "genesis" for the first row.

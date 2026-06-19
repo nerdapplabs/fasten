@@ -4,7 +4,7 @@ import dataclasses
 import pytest
 
 import fasten
-from fasten.engine import _row_hash
+from fasten.chain import seal
 from fasten.store import IngestResult
 from fasten.store.sqlite import SQLiteStore
 
@@ -14,11 +14,10 @@ def _seal_chain(rows):
     sealed = []
     prev = "genesis"
     for i, r in enumerate(rows):
-        r = dataclasses.replace(r, monotonic_seq=i + 1, prev_hash=prev)
-        h = _row_hash(r.to_dict())
-        r = dataclasses.replace(r, hash=h)
+        r = dataclasses.replace(r, monotonic_seq=i + 1)
+        r = seal(prev, r)
         sealed.append(r)
-        prev = h
+        prev = r.hash
     return sealed
 
 

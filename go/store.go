@@ -46,7 +46,7 @@ var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS %s (
     shipped_at    TEXT,
     wire_version  TEXT NOT NULL DEFAULT '1',
     hash          TEXT NOT NULL DEFAULT '',
-    prev_hash     TEXT NOT NULL DEFAULT ''
+    prev_hash     TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1'
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -128,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
 	} {
 		if !existing[col.name] {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -193,8 +195,12 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	if wv == "" {
 		wv = "1"
 	}
+	formID := row.CanonicalFormID
+	if formID == "" {
+		formID = "1"
+	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.Format(time.RFC3339Nano),
 		string(row.Code), row.Action, string(row.Severity),
@@ -205,7 +211,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		string(detail),
 		piiFlag,
 		shippedAt,
-		wv, row.Hash, row.PrevHash,
+		wv, row.Hash, row.PrevHash, formID,
 	)
 	return err
 }
@@ -414,7 +420,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		var detail string
 		var piiFlag int
 		var shippedAt *string
-		var wv, hash, prevHash string
+		var wv, hash, prevHash, formID string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&ts, &code, &r.Action, &sev,
@@ -422,7 +428,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
-			&wv, &hash, &prevHash,
+			&wv, &hash, &prevHash, &formID,
 		); err != nil {
 			return nil, err
 		}
@@ -443,6 +449,11 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		}
 		r.Hash = hash
 		r.PrevHash = prevHash
+		if formID != "" {
+			r.CanonicalFormID = formID
+		} else {
+			r.CanonicalFormID = "1"
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()

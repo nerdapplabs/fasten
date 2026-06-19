@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS %s (
     shipped_at     TIMESTAMPTZ,
     wire_version   TEXT NOT NULL DEFAULT '1',
     hash           TEXT NOT NULL DEFAULT '',
-    prev_hash      TEXT NOT NULL DEFAULT ''
+    prev_hash      TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1'
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -135,6 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
 	} {
 		if _, ok := existing[col.name]; !ok {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -172,7 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
 
 // insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
 // execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
@@ -195,8 +197,12 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 	if wv == "" {
 		wv = "1"
 	}
+	formID := row.CanonicalFormID
+	if formID == "" {
+		formID = "1"
+	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
+		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
 		string(row.Code), row.Action, string(row.Severity),
@@ -207,7 +213,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		string(detail),
 		piiFlag,
 		shippedAt,
-		wv, row.Hash, row.PrevHash,
+		wv, row.Hash, row.PrevHash, formID,
 	)
 	return err
 }
@@ -380,7 +386,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		var detail string
 		var piiFlag int
 		var shippedAt *time.Time
-		var wv, hash, prevHash string
+		var wv, hash, prevHash, formID string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&r.Timestamp, &code, &r.Action, &sev,
@@ -388,7 +394,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
-			&wv, &hash, &prevHash,
+			&wv, &hash, &prevHash, &formID,
 		); err != nil {
 			return nil, err
 		}
@@ -409,6 +415,11 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		}
 		r.Hash = hash
 		r.PrevHash = prevHash
+		if formID != "" {
+			r.CanonicalFormID = formID
+		} else {
+			r.CanonicalFormID = "1"
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()

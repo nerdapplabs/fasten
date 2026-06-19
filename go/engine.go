@@ -188,26 +188,20 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 		row.Detail = RedactDetail(row.Detail)
 	}
 
-	// P1-23: assign seq + compute hash chain atomically so concurrent Emit
+	// P1-23: assign seq + seal the hash chain atomically so concurrent Emit
 	// calls produce a gapless, correctly-ordered chain. seq is incremented here
 	// (not via atomic.AddInt64 earlier) to keep seq and prevHash in lock-step.
+	//
+	// Seal is the ONE canonical seal path (see verify.go): it stamps
+	// CanonicalFormID="1", sets PrevHash, and hashes with the SAME canonical form
+	// VerifyChain uses, so Go Emit ↔ Go VerifyChain ↔ Python seal/to_dict all
+	// agree on a single field set (canonical_form_id + pii_in_detail-excluded,
+	// shipped_at:null, prev_hash always present, Python-isoformat timestamps,
+	// sorted keys, non-ASCII \uXXXX-escaped).
 	e.hashMu.Lock()
 	atomic.AddInt64(&e.seq, 1)
 	row.MonotonicSeq = atomic.LoadInt64(&e.seq)
-	row.PrevHash = e.prevHash
-	// Seal with the SAME canonical hash VerifyChain uses (rowHashPyCompat) so
-	// that Go Emit ↔ Go VerifyChain ↔ Python _row_hash/to_dict all agree on a
-	// single field set: pii_in_detail excluded, shipped_at:null and prev_hash
-	// always present, timestamps as Python isoformat(), keys sorted, non-ASCII
-	// \uXXXX-escaped. Sealing here with json.Marshal(rowToMap(...)) instead
-	// produced a Go-default JSON (pii_in_detail included, shipped_at/hash
-	// omitted when empty, RFC3339Nano timestamps) that VerifyChain could never
-	// reproduce — Go-sealed rows failed Go VerifyChain.
-	//
-	// NOTE: this is a hash-FORMAT change. Rows sealed by the previous Go Emit
-	// carry hashes that will NOT verify under this canonical form; full
-	// canonical_form_id versioning is a deferred follow-up.
-	row.Hash = rowHashPyCompat(row)
+	row = Seal(e.prevHash, row)
 	e.prevHash = row.Hash
 	e.hashMu.Unlock()
 

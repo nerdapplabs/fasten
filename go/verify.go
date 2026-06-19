@@ -13,6 +13,39 @@ import (
 	"unicode/utf8"
 )
 
+// currentCanonicalFormID is stamped on every row sealed by this SDK version.
+//
+// Canonical forms
+// ---------------
+// The hashed canonical form is versioned via Row.CanonicalFormID so the choice
+// of bytes is tamper-evident and future forms are additive.
+//
+// Form "1" (the only form today): SHA-256 of the canonical JSON of the row map
+// built by pyCanonicalRowMap (the "hash" key excluded, canonical_form_id
+// INCLUDED), matching Python json.dumps(sort_keys=True, separators=(',',':'),
+// default=str) over AuditRow.to_dict() byte-for-byte. A new form is added by
+// registering a new id in hashFnByForm with its own function; VerifyChain
+// dispatches per row and REJECTS rows carrying an unknown id.
+const currentCanonicalFormID = "1"
+
+// hashFnByForm maps a canonical_form_id to the function that hashes a row under
+// that form. Adding v2 is purely additive: register a new id here, stamp it in
+// Seal, and VerifyChain dispatches automatically.
+var hashFnByForm = map[string]func(Row) string{
+	"1": rowHashPyCompat,
+}
+
+// Seal returns a copy of row sealed into the chain: it stamps the current
+// CanonicalFormID, sets PrevHash, and computes the self Hash over the canonical
+// form. This is the ONE canonical way to seal a row — Emit goes through it, so
+// Go Emit, Go VerifyChain and Python seal all agree on a single field set.
+func Seal(prevHash string, row Row) Row {
+	row.CanonicalFormID = currentCanonicalFormID
+	row.PrevHash = prevHash
+	row.Hash = hashFnByForm[currentCanonicalFormID](row)
+	return row
+}
+
 // VerifyResult is the outcome of VerifyChain.
 //
 // OK is true when every hash-bearing row's recomputed hash matches its stored
@@ -57,7 +90,20 @@ func VerifyChain(rows []Row) VerifyResult {
 		if row.Hash == "" {
 			continue // pre-upgrade row; skip
 		}
-		expected := rowHashPyCompat(row)
+		formID := row.CanonicalFormID
+		if formID == "" {
+			formID = currentCanonicalFormID // rows sealed before the field existed
+		}
+		hashFn, ok := hashFnByForm[formID]
+		if !ok {
+			return VerifyResult{
+				OK:           false,
+				TotalRows:    total,
+				FirstBreakAt: row.MonotonicSeq,
+				Reason:       fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID),
+			}
+		}
+		expected := hashFn(row)
 		if expected != row.Hash {
 			return VerifyResult{
 				OK:           false,
@@ -124,8 +170,13 @@ func pyCanonicalRowMap(row Row) map[string]any {
 	if detail == nil {
 		detail = map[string]any{}
 	}
+	formID := row.CanonicalFormID
+	if formID == "" {
+		formID = currentCanonicalFormID
+	}
 	return map[string]any{
-		"id":             row.ID,
+		"canonical_form_id": formID,
+		"id":                row.ID,
 		"origin_id":      row.OriginID,
 		"monotonic_seq":  row.MonotonicSeq,
 		"timestamp":      pyISOFormat(row.Timestamp),

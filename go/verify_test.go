@@ -16,7 +16,7 @@ import (
 //	import sys; sys.path.insert(0, '.')
 //	from datetime import datetime, timezone
 //	from fasten.attrs import AuditRow
-//	from fasten.engine import _row_hash
+//	from fasten.chain import _row_hash
 //	row = AuditRow(
 //	    id='evt-abc123', origin_id='evt-abc123', monotonic_seq=1,
 //	    timestamp=datetime(2026,6,15,10,30,45,123456, tzinfo=timezone.utc),
@@ -27,7 +27,10 @@ import (
 //	    detail={'qty': 3, 'sku': 'WIDGET'}, prev_hash='genesis')
 //	print(_row_hash(row.to_dict()))
 //	PY
-const pyVectorHash = "561b6028cac9d69c9ae0b7f814bf99dadbe6eef558ec68481ed71e32bcfb08e2"
+//
+// The form includes canonical_form_id="1" (item 6 — the canonical form is itself
+// versioned and tamper-evident), so this hash differs from the pre-item-6 value.
+const pyVectorHash = "cbf5a1ee4bb7baeb0b433bedfa60434bdea42627b9671183895970bbff02f9ac"
 
 func pyVectorRow() Row {
 	tid := "tenant-x"

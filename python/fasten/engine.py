@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
-import hashlib
 import json
 import logging
 import os
@@ -28,11 +27,25 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .attrs import AuditRow
+from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_chain
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
 from . import core_ffi as _ffi
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
+
+# Re-exported for backwards compatibility: tests and downstream code historically
+# imported these from fasten.engine. The canonical home is now fasten.chain.
+__all__ = [
+    "AuditStoreError",
+    "ChainVerifyResult",
+    "Engine",
+    "FastenConfig",
+    "verify_chain",
+    "seal",
+    "_row_hash",
+    "_canonical_json",
+]
 
 
 class AuditStoreError(RuntimeError):
@@ -56,64 +69,6 @@ class FastenConfig:
     queue_retry_max_ms: int
     queue_retry_jitter: bool
     queue_drain_max_attempts: int
-
-
-def _canonical_json(d: dict[str, Any]) -> bytes:
-    """Canonical JSON for hash chain: sorted keys, no whitespace, None→null."""
-    return json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
-
-
-def _row_hash(row_dict: dict[str, Any]) -> str:
-    """SHA256 of canonical JSON of the row, excluding the 'hash' field."""
-    d = {k: v for k, v in row_dict.items() if k != "hash"}
-    return hashlib.sha256(_canonical_json(d)).hexdigest()
-
-
-@dataclasses.dataclass
-class ChainVerifyResult:
-    """Result of fasten.verify_chain()."""
-    ok: bool
-    total_rows: int
-    first_break_at: Optional[int]   # monotonic_seq of first tampered row
-    reason: Optional[str]
-
-
-def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
-    """Walk the per-row hash chain and return a verification result.
-
-    Detects field tampering, row insertion, deletion, and reorder.
-    Does NOT detect tail truncation — that requires an external tip-anchor
-    (see P1-23 for the documented limitation).
-
-    Rows with an empty ``hash`` field (written before hash-chain support
-    was enabled) are skipped silently — the chain is verified only for
-    the portion that carries hashes.
-    """
-    if not rows:
-        return ChainVerifyResult(ok=True, total_rows=0, first_break_at=None, reason=None)
-
-    sorted_rows = sorted(rows, key=lambda r: r.monotonic_seq)
-    for i, row in enumerate(sorted_rows):
-        if not row.hash:
-            continue  # pre-upgrade row; skip
-        expected = _row_hash(row.to_dict())
-        if expected != row.hash:
-            return ChainVerifyResult(
-                ok=False,
-                total_rows=len(rows),
-                first_break_at=row.monotonic_seq,
-                reason=f"row {row.id}: hash mismatch",
-            )
-        if i > 0:
-            prev = sorted_rows[i - 1]
-            if prev.hash and row.prev_hash != prev.hash:
-                return ChainVerifyResult(
-                    ok=False,
-                    total_rows=len(rows),
-                    first_break_at=row.monotonic_seq,
-                    reason=f"row {row.id}: prev_hash does not match preceding row {prev.id}",
-                )
-    return ChainVerifyResult(ok=True, total_rows=len(rows), first_break_at=None, reason=None)
 
 
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
@@ -388,16 +343,14 @@ class Engine:
         )
         row = dataclasses.replace(row, origin_id=row.id)
 
-        # Atomically: assign monotonic_seq + compute hash chain.
+        # Atomically: assign monotonic_seq + seal the hash chain (the ONE
+        # canonical seal path — fasten.chain.seal stamps canonical_form_id,
+        # prev_hash and computes hash).
         with self._lock:
             self._seq += 1
-            row = dataclasses.replace(row,
-                monotonic_seq=self._seq,
-                prev_hash=self._prev_hash,
-            )
-            h = _row_hash(row.to_dict())
-            row = dataclasses.replace(row, hash=h)
-            self._prev_hash = h
+            row = dataclasses.replace(row, monotonic_seq=self._seq)
+            row = seal(self._prev_hash, row)
+            self._prev_hash = row.hash
 
         # Stdout write before store routing: row reaches the log stream even
         # if the store path blocks or raises.

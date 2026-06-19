@@ -17,6 +17,7 @@ See README.md for the full design.
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
+from .chain import ChainVerifyResult, seal, verify_chain
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
 from .emitter import (
@@ -33,9 +34,9 @@ from .emitter import (
     redactor,
     start,
     transport,
-    verify_chain,
 )
-from .engine import AuditStoreError, ChainVerifyResult, Engine, FastenConfig
+from .engine import AuditStoreError, Engine, FastenConfig
+from . import replication
 from .store.repo import AuditChainError, AuditRepository, IngestResult
 
 __all__ = [
@@ -58,6 +59,8 @@ __all__ = [
     "list_unshipped",
     "mark_shipped",
     "ingest_replicated",
+    # store-scoped replication ingest (no Engine / fasten.init() required)
+    "replication",
     # multi-tenant / isolated engine
     "Engine",
     # config dataclass
@@ -65,6 +68,7 @@ __all__ = [
     # hash chain verification
     "ChainVerifyResult",
     "verify_chain",
+    "seal",
     # audit-store failure handling
     "AuditStoreError",
     "flush",

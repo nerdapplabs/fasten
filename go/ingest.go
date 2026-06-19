@@ -105,6 +105,13 @@ func ingestReplicatedTx(
 // origin (node -> upstream aggregator reverse sync). The verified prefix is
 // inserted in a single transaction; a chain break inserts only the prefix and
 // reports RejectedFromSeq (no error). See ingestReplicatedTx.
+//
+// Decoupled from the Engine: this is store-scoped (a method on the store), so a
+// replication sink calls it with only a store — no fasten.Init, no service
+// identity, no drainer required:
+//
+//	store, _ := fasten.NewSQLiteStore(db, "audit")
+//	res, _ := store.IngestReplicated(ctx, rows) // no fasten.Init needed
 func (s *SQLiteStore) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
 	return ingestReplicatedTx(ctx, s.db, rows, s.insertReplicatedTx)
 }

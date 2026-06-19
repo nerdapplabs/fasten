@@ -127,6 +127,11 @@ type Row struct {
 	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
+	// CanonicalFormID names the hashed canonical form that sealed this row. "1"
+	// is the current (and only) form. It is INCLUDED in the hashed bytes so the
+	// form choice is itself tamper-evident; VerifyChain dispatches on it and
+	// rejects unknown ids. See verify.go for the form definitions.
+	CanonicalFormID string `json:"canonical_form_id,omitempty"`
 	// P1-23: tamper-evidence hash chain. PrevHash is the hex SHA-256 of the
 	// preceding row in the (service_id, source_node_id) sequence, or "genesis"
 	// for the first row. Hash is SHA-256 of canonical JSON of this row with
@@ -461,6 +466,9 @@ func rowToMap(r Row) map[string]any {
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
 		"pii_in_detail": r.PiiInDetail,
+		"canonical_form_id": func() string {
+			if r.CanonicalFormID == "" { return "1" }; return r.CanonicalFormID
+		}(),
 		"prev_hash": r.PrevHash,
 	}
 	if r.ShippedAt != nil {

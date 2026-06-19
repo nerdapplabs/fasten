@@ -57,13 +57,15 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
-    hash             TEXT NOT NULL DEFAULT ''
+    hash             TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1'
 )
 """
 
 _MIGRATION_HASH_CHAIN = """
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
 """
 
 _INDEXES = [
@@ -180,8 +182,8 @@ class PostgresStore:
         "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
         "service_id,source_node_id,tenant_id,actor,actor_kind,"
         "target,category,domain,method,request_id,detail,shipped_at,"
-        "prev_hash,hash) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "prev_hash,hash,canonical_form_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (id) DO NOTHING"
     )
 
@@ -199,6 +201,7 @@ class PostgresStore:
             _utc_iso(row.shipped_at) if row.shipped_at else None,
             row.prev_hash,
             row.hash,
+            row.canonical_form_id,
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
@@ -539,4 +542,5 @@ class PostgresStore:
             shipped_at=datetime.fromisoformat(r[18]) if r[18] else None,
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
+            canonical_form_id=r[21] if len(r) > 21 else "1",
         )

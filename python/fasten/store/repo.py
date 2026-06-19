@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from ..attrs import AuditRow
+from ..chain import verify_chain
 
 
 @dataclasses.dataclass
@@ -140,15 +141,15 @@ def verified_prefix(
     No I/O — callers insert the prefix and report ``first_break_at`` as
     ``rejected_from_seq`` so the sender resyncs from the break.
     """
-    # Imported lazily to avoid an import cycle (engine imports stores lazily).
-    from ..engine import verify_chain
-
     sorted_rows = sorted(rows, key=lambda r: r.monotonic_seq)
     result = verify_chain(sorted_rows)
     if result.ok:
         return sorted_rows, None, ""
+    # verify_chain always sets first_break_at when ok is False; the `is not None`
+    # keeps the comparison type-safe (mypy) without assuming the invariant.
     break_at = result.first_break_at
-    prefix = [r for r in sorted_rows if r.monotonic_seq < break_at]
+    prefix = [r for r in sorted_rows
+              if break_at is not None and r.monotonic_seq < break_at]
     return prefix, break_at, result.reason or ""
 
 

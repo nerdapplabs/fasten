@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     request_id       TEXT NOT NULL,
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT ''
 );
@@ -129,6 +130,15 @@ class SQLiteStore:
                 f"ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"
             )
             bootstrap.commit()
+        # Migration: add the canonical_form_id column (item 6) to pre-existing
+        # tables. Additive — existing rows default to form "1".
+        try:
+            bootstrap.execute(f"SELECT canonical_form_id FROM {table} LIMIT 0")
+        except sqlite3.OperationalError:
+            bootstrap.execute(
+                f"ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1'"
+            )
+            bootstrap.commit()
 
     def _connect(self) -> sqlite3.Connection:
         """Return this thread's sqlite3 connection, opening it on first call.
@@ -195,8 +205,8 @@ class SQLiteStore:
             "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
             "service_id,source_node_id,tenant_id,actor,actor_kind,"
             "target,category,domain,method,request_id,detail,shipped_at,"
-            "prev_hash,hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "canonical_form_id,prev_hash,hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row.id, row.origin_id, row.monotonic_seq,
                 _utc_iso(row.timestamp),
@@ -207,6 +217,7 @@ class SQLiteStore:
                 row.method, row.request_id,
                 json.dumps(row.detail),
                 _utc_iso(row.shipped_at) if row.shipped_at else None,
+                row.canonical_form_id,
                 row.prev_hash,
                 row.hash,
             ),
@@ -518,6 +529,7 @@ class SQLiteStore:
             method=r["method"], request_id=r["request_id"],
             detail=json.loads(r["detail"]),
             shipped_at=datetime.fromisoformat(r["shipped_at"]) if r["shipped_at"] else None,
+            canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",
         )
