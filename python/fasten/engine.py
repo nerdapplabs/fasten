@@ -484,7 +484,8 @@ class Engine:
         self._require_store("mark_shipped").mark_shipped(ids)
 
     def ingest_replicated(self, rows: "list[AuditRow]") -> Any:
-        """Verify + all-or-nothing insert a replicated batch. Delegates to the store."""
+        """Verify + insert the verified prefix of a replicated batch (single
+        transaction). Delegates to the store; does not raise on a chain break."""
         return self._require_store("ingest_replicated").ingest_replicated(rows)
 
     def last_init_at(self) -> Optional[datetime]:

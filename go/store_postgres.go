@@ -174,9 +174,10 @@ const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, seve
 	` target, category, domain, method, request_id, detail,` +
 	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
 
-// insertRow is the shared idempotent ON CONFLICT DO NOTHING insert for any
-// row. The originated/replicated intent split is enforced by the wrappers.
-func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
+// insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
+// execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
+// The originated/replicated intent split is enforced by the wrappers.
+func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -194,7 +195,7 @@ func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
 	if wv == "" {
 		wv = "1"
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
@@ -211,6 +212,11 @@ func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
 	return err
 }
 
+// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
+	return s.insertRowExec(ctx, s.db, row)
+}
+
 // InsertOriginated inserts a row this node ORIGINATED (origin_id == id).
 func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 	if row.OriginID != row.ID {
@@ -221,12 +227,23 @@ func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
-// InsertReplicated inserts a sealed row replicated from another origin.
+// InsertReplicated inserts a sealed row replicated from another origin
+// (autocommit single-row path).
 func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRow(ctx, row)
+}
+
+// insertReplicatedTx inserts a sealed replicated row on the given exec context
+// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
+// it does NOT own the transaction — IngestReplicated commits once for the batch.
+func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRowExec(ctx, exec, row)
 }
 
 // Insert is a thin alias for InsertOriginated — the engine emit/drainer path.

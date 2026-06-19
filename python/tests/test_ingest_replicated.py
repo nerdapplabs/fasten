@@ -5,7 +5,7 @@ import pytest
 
 import fasten
 from fasten.engine import _row_hash
-from fasten.store import AuditChainError, IngestResult
+from fasten.store import IngestResult
 from fasten.store.sqlite import SQLiteStore
 
 
@@ -38,15 +38,71 @@ def test_ingest_replicated_inserts_valid_chain(initialized):
     assert dest.count() == 3
 
 
-def test_ingest_replicated_rejects_broken_chain(initialized):
+def test_ingest_replicated_inserts_verified_prefix_on_break(initialized):
+    """Fix #4: a chain break does NOT raise — the verified prefix is inserted
+    and rejected_from_seq points the sender at the break."""
     rows = _emit_rows(3)
     tampered = dataclasses.replace(rows[1], actor="evil")  # hash now invalid
     chain = [rows[0], tampered, rows[2]]
     dest = SQLiteStore(":memory:")
-    with pytest.raises(AuditChainError) as exc:
-        dest.ingest_replicated(chain)
-    assert exc.value.first_break_at == rows[1].monotonic_seq
-    assert dest.count() == 0  # all-or-nothing: nothing inserted
+    result = dest.ingest_replicated(chain)  # must NOT raise
+    assert result.inserted == 1  # only row 0 (the verified prefix)
+    assert result.rejected_from_seq == rows[1].monotonic_seq
+    assert result.reason  # non-empty explanation
+    assert dest.count() == 1
+    stored_ids = {r.id for r in dest.query(limit=10)}
+    assert stored_ids == {rows[0].id}  # rows 1+2 not inserted
+
+
+def test_ingest_replicated_poison_pill_five_rows(initialized):
+    """Fix #4 poison-pill: 5-row batch, row 3 tampered -> rows 1-2 inserted,
+    rejected_from_seq = row 3's seq, rows 3-5 not stored, no raise."""
+    rows = _emit_rows(5)
+    tampered = dataclasses.replace(rows[2], target="evil-target")  # row 3 broken
+    chain = [rows[0], rows[1], tampered, rows[3], rows[4]]
+    dest = SQLiteStore(":memory:")
+    result = dest.ingest_replicated(chain)
+    assert result.inserted == 2
+    assert result.rejected_from_seq == rows[2].monotonic_seq
+    stored_ids = {r.id for r in dest.query(limit=10)}
+    assert stored_ids == {rows[0].id, rows[1].id}        # 1-2 queryable
+    assert rows[2].id not in stored_ids                   # 3-5 not stored
+    assert rows[3].id not in stored_ids
+    assert rows[4].id not in stored_ids
+    assert dest.count() == 2
+
+
+def test_ingest_replicated_atomic_clean_batch_commits(initialized):
+    """Fix #3 happy path: a clean batch commits atomically as one transaction."""
+    rows = _emit_rows(4)
+    dest = SQLiteStore(":memory:")
+    result = dest.ingest_replicated(rows)
+    assert result.inserted == 4
+    assert result.rejected_from_seq is None
+    assert result.reason is None
+    assert dest.count() == 4
+
+
+def test_ingest_replicated_atomicity_rollback_on_insert_error(initialized):
+    """Fix #3 rollback: when an insert fails mid-batch, the whole transaction
+    rolls back and NOTHING from the batch is committed."""
+    rows = _emit_rows(4)
+    dest = SQLiteStore(":memory:")
+    real_core = dest._insert_row_core
+    calls = {"n": 0}
+
+    def boom(conn, row):
+        calls["n"] += 1
+        if calls["n"] == 3:  # fail on the 3rd insert, mid-transaction
+            raise RuntimeError("injected insert failure")
+        return real_core(conn, row)
+
+    dest._insert_row_core = boom  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="injected insert failure"):
+        dest.ingest_replicated(rows)
+    dest._insert_row_core = real_core  # type: ignore[method-assign]
+    # Rolled back: the first two inserts that ran before the failure are gone.
+    assert dest.count() == 0
 
 
 def test_ingest_replicated_is_idempotent(initialized):

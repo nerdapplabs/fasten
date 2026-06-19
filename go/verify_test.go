@@ -1,7 +1,6 @@
 package fasten
 
 import (
-	"context"
 	"testing"
 	"time"
 )
@@ -128,30 +127,31 @@ func TestVerifyChain_PrevHashLink(t *testing.T) {
 	}
 }
 
-// TestIngestReplicated_RejectsBrokenChain proves a broken chain inserts nothing.
-func TestIngestReplicated_RejectsBrokenChain(t *testing.T) {
+// TestVerifiedPrefix_RejectsFirstRowBreak proves a chain broken at the first
+// row yields an empty verified prefix and names the break (Fix #4 — no longer a
+// reject-all raise; the caller inserts the empty prefix and resyncs).
+func TestVerifiedPrefix_RejectsFirstRowBreak(t *testing.T) {
 	r := pyVectorRow()
-	r.Target = "tampered"
-	inserted := 0
-	_, err := ingestReplicated(context.Background(), []Row{r},
-		func(context.Context, Row) error { inserted++; return nil })
-	if err == nil {
-		t.Fatalf("expected error on broken chain")
+	r.Target = "tampered" // breaks the self-hash at seq 1
+	prefix, rejectedFromSeq, reason := verifiedPrefix([]Row{r})
+	if len(prefix) != 0 {
+		t.Fatalf("first-row break must yield empty prefix, got %d rows", len(prefix))
 	}
-	if inserted != 0 {
-		t.Fatalf("broken chain must insert nothing, inserted %d", inserted)
+	if rejectedFromSeq != r.MonotonicSeq {
+		t.Fatalf("rejectedFromSeq = %d, want %d", rejectedFromSeq, r.MonotonicSeq)
+	}
+	if reason == "" {
+		t.Fatalf("expected a non-empty reason for the break")
 	}
 }
 
-// TestIngestReplicated_InsertsValidChain proves a good chain inserts every row.
-func TestIngestReplicated_InsertsValidChain(t *testing.T) {
-	inserted := 0
-	res, err := ingestReplicated(context.Background(), []Row{pyVectorRow()},
-		func(context.Context, Row) error { inserted++; return nil })
-	if err != nil {
-		t.Fatalf("valid chain ingest failed: %v", err)
+// TestVerifiedPrefix_IntactChain proves an intact chain is fully verified.
+func TestVerifiedPrefix_IntactChain(t *testing.T) {
+	prefix, rejectedFromSeq, reason := verifiedPrefix([]Row{pyVectorRow()})
+	if len(prefix) != 1 {
+		t.Fatalf("intact chain prefix = %d rows, want 1", len(prefix))
 	}
-	if res.Inserted != 1 || inserted != 1 {
-		t.Fatalf("Inserted = %d (callback %d), want 1", res.Inserted, inserted)
+	if rejectedFromSeq != 0 || reason != "" {
+		t.Fatalf("intact chain must not reject: rejectedFromSeq=%d reason=%q", rejectedFromSeq, reason)
 	}
 }

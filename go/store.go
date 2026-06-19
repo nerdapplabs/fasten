@@ -171,10 +171,11 @@ func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 	return cols, rows.Err()
 }
 
-// insertRow is the shared idempotent INSERT OR IGNORE for any row. The
+// insertRowExec runs the idempotent INSERT OR IGNORE on any execContext
+// (*sql.DB for a single autocommit insert, or *sql.Tx for a batch). The
 // originated/replicated intent split is enforced by the wrappers, not here —
 // the SQL is identical.
-func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
+func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -192,7 +193,7 @@ func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
 	if wv == "" {
 		wv = "1"
 	}
-	_, err = s.db.ExecContext(ctx,
+	_, err = exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.Format(time.RFC3339Nano),
@@ -209,6 +210,11 @@ func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
 	return err
 }
 
+// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
+	return s.insertRowExec(ctx, s.db, row)
+}
+
 // InsertOriginated inserts a row this node ORIGINATED (origin_id == id). Used
 // by the engine's own Emit path.
 func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
@@ -221,12 +227,22 @@ func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
 }
 
 // InsertReplicated inserts a sealed row replicated from another origin. Used by
-// IngestReplicated after the chain verifies.
+// IngestReplicated after the chain verifies (autocommit single-row path).
 func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRow(ctx, row)
+}
+
+// insertReplicatedTx inserts a sealed replicated row on the given exec context
+// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
+// it does NOT own the transaction — IngestReplicated commits once for the batch.
+func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRowExec(ctx, exec, row)
 }
 
 // Insert is a thin alias for InsertOriginated — the engine emit/drainer path.

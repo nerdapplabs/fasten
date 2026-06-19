@@ -175,11 +175,19 @@ class PostgresStore:
     # AuditRepository protocol
     # ------------------------------------------------------------------
 
-    def _insert_row(self, row: AuditRow) -> None:
-        """Idempotent ON CONFLICT DO NOTHING insert of any row. Shared by the
-        originated and replicated entry points — identical SQL; the intent
-        split is enforced by the wrappers."""
-        params = (
+    _INSERT_SQL = (
+        "INSERT INTO {table} "
+        "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+        "service_id,source_node_id,tenant_id,actor,actor_kind,"
+        "target,category,domain,method,request_id,detail,shipped_at,"
+        "prev_hash,hash) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (id) DO NOTHING"
+    )
+
+    def _insert_params(self, row: AuditRow) -> tuple:
+        """Positional params for _INSERT_SQL, in column order."""
+        return (
             row.id, row.origin_id, row.monotonic_seq,
             _utc_iso(row.timestamp),
             row.code, row.action, row.severity,
@@ -192,19 +200,20 @@ class PostgresStore:
             row.prev_hash,
             row.hash,
         )
-        sql = (
-            f"INSERT INTO {self._table} "
-            "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
-            "service_id,source_node_id,tenant_id,actor,actor_kind,"
-            "target,category,domain,method,request_id,detail,shipped_at,"
-            "prev_hash,hash) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (id) DO NOTHING"
-        )
 
+    def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
+        """Execute the idempotent insert on ``cur`` WITHOUT committing — the
+        transaction boundary belongs to the caller (per-row in _insert_row, one
+        BEGIN/COMMIT in ingest_replicated)."""
+        cur.execute(self._INSERT_SQL.format(table=self._table), self._insert_params(row))
+
+    def _insert_row(self, row: AuditRow) -> None:
+        """Idempotent ON CONFLICT DO NOTHING insert of a single row, committed
+        immediately. Shared by the originated and replicated entry points —
+        identical SQL; the intent split is enforced by the wrappers."""
         def _run(conn: Any) -> None:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                self._insert_row_core(cur, row)
             conn.commit()
 
         self._execute_with_retry(_run)
@@ -281,15 +290,46 @@ class PostgresStore:
         self._execute_with_retry(_run)
 
     def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
-        """Verify the chain of replicated rows, then insert all-or-nothing.
+        """Verify the chain of replicated rows, then insert the verified prefix.
 
-        A chain break rejects the whole batch (inserts nothing) and raises
-        AuditChainError; otherwise every row is inserted via the idempotent
-        insert() (ON CONFLICT (id) DO NOTHING), so re-delivery is a no-op and
-        replicated multi-origin rows keep their origin_id as-is.
+        The longest verified prefix (rows before the first chain break) is
+        inserted in ONE transaction: all inserts run on a single connection and a
+        single ``conn.commit()`` seals them, with ``conn.rollback()`` on any
+        error, so a failure mid-batch commits nothing (real all-or-nothing).
+        Never raises on a chain break — rejected rows surface via
+        ``rejected_from_seq`` so the sender resyncs from the break. Idempotent
+        (ON CONFLICT (id) DO NOTHING): a retry after a successful commit is a
+        no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import ingest_replicated_into
-        return ingest_replicated_into(self, rows)
+        from .repo import IngestResult, verified_prefix
+
+        prefix, rejected_from_seq, reason = verified_prefix(rows)
+        for row in prefix:
+            if not row.hash:
+                raise ValueError(
+                    "ingest_replicated requires sealed rows (non-empty hash); "
+                    f"row {row.id!r} has no hash"
+                )
+
+        def _run(conn: Any) -> int:
+            inserted = 0
+            try:
+                with conn.cursor() as cur:
+                    for row in prefix:
+                        self._insert_row_core(cur, row)
+                        inserted += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return inserted
+
+        inserted = self._execute_with_retry(_run)
+        return IngestResult(
+            inserted=inserted,
+            rejected_from_seq=rejected_from_seq,
+            reason=reason or None,
+        )
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"

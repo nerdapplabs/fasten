@@ -2,57 +2,117 @@ package fasten
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
+	"sort"
 )
 
 // IngestResult reports the outcome of an IngestReplicated call.
+//
+// IngestReplicated inserts the longest VERIFIED prefix of the batch (from the
+// chain start up to, but not including, the first break) in a single
+// transaction and never returns a chain-break error. Inserted counts the rows
+// committed. When the chain breaks partway, RejectedFromSeq carries the
+// MonotonicSeq of the first broken row (rows at/after it are NOT inserted) and
+// Reason explains where it diverged, so the sender resyncs from that point
+// instead of re-shipping a poison-pilled batch forever. On a fully-verified
+// batch RejectedFromSeq is 0 and Reason is "".
 type IngestResult struct {
-	Inserted int `json:"inserted"`
+	Inserted        int    `json:"inserted"`
+	RejectedFromSeq int64  `json:"rejected_from_seq"`
+	Reason          string `json:"reason"`
 }
 
-// ingestReplicated verifies the chain of incoming rows and, only if it is
-// intact, inserts every row via the supplied idempotent insert function.
+// execContext is the subset of *sql.DB / *sql.Tx that the insert helpers need.
+// Both satisfy it, so the same SQL runs autocommit (on the DB) or inside a
+// transaction (on a Tx).
+type execContext interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// verifiedPrefix returns the longest VERIFIED run of rows from the chain start.
 //
-// This is the shared core behind SQLiteStore.IngestReplicated and
-// PostgresStore.IngestReplicated. A replication sink (an upstream aggregator
-// receiving rows reverse-synced from a node) MUST refuse a broken chain wholesale:
-// if VerifyChain reports a break the function inserts NOTHING and returns an
-// error naming the first broken sequence. Inserts are idempotent (INSERT OR
-// IGNORE / ON CONFLICT DO NOTHING on the id PK), so re-delivering an already
-// stored batch is a no-op and the rows' fields are preserved as-is.
-func ingestReplicated(
+// Rows are sorted by MonotonicSeq, then the hash chain is verified:
+//   - intact -> (allSorted, rejectedFromSeq=0, reason="")
+//   - broken -> (rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
+//
+// No I/O — the caller inserts the prefix and reports firstBreakAt as
+// RejectedFromSeq. This is the Go counterpart of the Python verified_prefix.
+func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason string) {
+	sorted := make([]Row, len(rows))
+	copy(sorted, rows)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].MonotonicSeq < sorted[j].MonotonicSeq
+	})
+
+	res := VerifyChain(sorted)
+	if res.OK {
+		return sorted, 0, ""
+	}
+	for _, row := range sorted {
+		if row.MonotonicSeq < res.FirstBreakAt {
+			prefix = append(prefix, row)
+		}
+	}
+	return prefix, res.FirstBreakAt, res.Reason
+}
+
+// ingestReplicatedTx verifies the chain, then inserts the verified prefix using
+// a single *sql.Tx: BeginTx -> insert each prefix row on the tx -> Commit, with
+// Rollback on any insert error. This gives real atomicity (a failure mid-batch
+// commits nothing), unlike per-row autocommit inserts.
+//
+// It is the shared core behind SQLiteStore.IngestReplicated and
+// PostgresStore.IngestReplicated. A chain break is NOT an error: only the
+// verified prefix is inserted and RejectedFromSeq names the first broken
+// sequence so the sender resyncs. Inserts are idempotent (INSERT OR IGNORE /
+// ON CONFLICT DO NOTHING on the id PK), so re-delivery after a commit is a
+// no-op and a retry after a rolled-back failure re-inserts cleanly.
+func ingestReplicatedTx(
 	ctx context.Context,
+	db *sql.DB,
 	rows []Row,
-	insert func(context.Context, Row) error,
+	insertTx func(context.Context, execContext, Row) error,
 ) (IngestResult, error) {
-	res := VerifyChain(rows)
-	if !res.OK {
-		return IngestResult{}, fmt.Errorf(
-			"fasten ingest_replicated: chain verification failed at monotonic_seq %d: %s",
-			res.FirstBreakAt, res.Reason,
-		)
+	prefix, rejectedFromSeq, reason := verifiedPrefix(rows)
+	if len(prefix) == 0 {
+		return IngestResult{Inserted: 0, RejectedFromSeq: rejectedFromSeq, Reason: reason}, nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return IngestResult{}, err
 	}
 	inserted := 0
-	for _, row := range rows {
-		if err := insert(ctx, row); err != nil {
-			return IngestResult{Inserted: inserted}, fmt.Errorf(
-				"fasten ingest_replicated: insert of row %s failed: %w", row.ID, err)
+	for _, row := range prefix {
+		if err := insertTx(ctx, tx, row); err != nil {
+			_ = tx.Rollback()
+			return IngestResult{}, err
 		}
 		inserted++
 	}
-	return IngestResult{Inserted: inserted}, nil
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return IngestResult{}, err
+	}
+	return IngestResult{
+		Inserted:        inserted,
+		RejectedFromSeq: rejectedFromSeq,
+		Reason:          reason,
+	}, nil
 }
 
 // IngestReplicated verifies and stores a batch of rows replicated from another
-// origin (node -> upstream aggregator reverse sync). The chain is verified
-// first; a break rejects the whole batch and inserts nothing. See ingestReplicated.
+// origin (node -> upstream aggregator reverse sync). The verified prefix is
+// inserted in a single transaction; a chain break inserts only the prefix and
+// reports RejectedFromSeq (no error). See ingestReplicatedTx.
 func (s *SQLiteStore) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	return ingestReplicated(ctx, rows, s.InsertReplicated)
+	return ingestReplicatedTx(ctx, s.db, rows, s.insertReplicatedTx)
 }
 
 // IngestReplicated verifies and stores a batch of rows replicated from another
-// origin. The chain is verified first; a break rejects the whole batch and
-// inserts nothing. See ingestReplicated.
+// origin. The verified prefix is inserted in a single transaction; a chain
+// break inserts only the prefix and reports RejectedFromSeq (no error). See
+// ingestReplicatedTx.
 func (s *PostgresStore) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	return ingestReplicated(ctx, rows, s.InsertReplicated)
+	return ingestReplicatedTx(ctx, s.db, rows, s.insertReplicatedTx)
 }

@@ -183,33 +183,40 @@ class SQLiteStore:
             wal=q.get("wal", "true") != "false",
         )
 
+    def _insert_row_core(self, conn: Any, row: AuditRow) -> None:
+        """Execute the idempotent INSERT OR IGNORE on ``conn`` WITHOUT committing.
+
+        The transaction boundary is owned by the caller: ``_insert_row`` commits
+        per row, while the batch path in ``ingest_replicated`` executes many of
+        these and commits once. Shared by the originated and replicated entry
+        points — the intent split is enforced by the wrappers, not here."""
+        conn.execute(
+            f"INSERT OR IGNORE INTO {self._table} "
+            "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+            "service_id,source_node_id,tenant_id,actor,actor_kind,"
+            "target,category,domain,method,request_id,detail,shipped_at,"
+            "prev_hash,hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row.id, row.origin_id, row.monotonic_seq,
+                _utc_iso(row.timestamp),
+                row.code, row.action, row.severity,
+                row.service_id, row.source_node_id, row.tenant_id,
+                row.actor, row.actor_kind,
+                row.target, row.category, row.domain,
+                row.method, row.request_id,
+                json.dumps(row.detail),
+                _utc_iso(row.shipped_at) if row.shipped_at else None,
+                row.prev_hash,
+                row.hash,
+            ),
+        )
+
     def _insert_row(self, row: AuditRow) -> None:
-        """Idempotent INSERT OR IGNORE of any row. Shared by the originated and
-        replicated entry points — the intent split is enforced by those
-        wrappers, not here, since the SQL is identical."""
+        """Idempotent INSERT OR IGNORE of a single row, committed immediately."""
         with self._txn():
             conn = self._connect()
-            conn.execute(
-                f"INSERT OR IGNORE INTO {self._table} "
-                "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
-                "service_id,source_node_id,tenant_id,actor,actor_kind,"
-                "target,category,domain,method,request_id,detail,shipped_at,"
-                "prev_hash,hash) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    row.id, row.origin_id, row.monotonic_seq,
-                    _utc_iso(row.timestamp),
-                    row.code, row.action, row.severity,
-                    row.service_id, row.source_node_id, row.tenant_id,
-                    row.actor, row.actor_kind,
-                    row.target, row.category, row.domain,
-                    row.method, row.request_id,
-                    json.dumps(row.detail),
-                    _utc_iso(row.shipped_at) if row.shipped_at else None,
-                    row.prev_hash,
-                    row.hash,
-                ),
-            )
+            self._insert_row_core(conn, row)
             conn.commit()
 
     def insert_originated(self, row: AuditRow) -> None:
@@ -281,15 +288,42 @@ class SQLiteStore:
             conn.commit()
 
     def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
-        """Verify the chain of replicated rows, then insert all-or-nothing.
+        """Verify the chain of replicated rows, then insert the verified prefix.
 
-        A chain break rejects the whole batch (inserts nothing) and raises
-        AuditChainError; otherwise every row is inserted via the idempotent
-        insert() (INSERT OR IGNORE on the id PK), so re-delivery is a no-op
-        and replicated multi-origin rows keep their origin_id as-is.
+        The longest verified prefix (rows before the first chain break) is
+        inserted in ONE SQL transaction: every INSERT OR IGNORE runs on the same
+        connection and a single ``conn.commit()`` seals them, so a crash mid-batch
+        rolls the whole prefix back (real all-or-nothing, unlike per-row commits).
+        Never raises on a chain break — rejected rows surface via
+        ``rejected_from_seq`` so the sender resyncs from the break. Idempotent
+        (INSERT OR IGNORE on the id PK): a retry after a successful commit is a
+        no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import ingest_replicated_into
-        return ingest_replicated_into(self, rows)
+        from .repo import IngestResult, verified_prefix
+
+        prefix, rejected_from_seq, reason = verified_prefix(rows)
+        for row in prefix:
+            if not row.hash:
+                raise ValueError(
+                    "ingest_replicated requires sealed rows (non-empty hash); "
+                    f"row {row.id!r} has no hash"
+                )
+        inserted = 0
+        with self._txn():
+            conn = self._connect()
+            try:
+                for row in prefix:
+                    self._insert_row_core(conn, row)
+                    inserted += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return IngestResult(
+            inserted=inserted,
+            rejected_from_seq=rejected_from_seq,
+            reason=reason or None,
+        )
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         with self._txn():

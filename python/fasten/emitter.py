@@ -125,9 +125,12 @@ def mark_shipped(ids: "list[str]") -> None:
 
 
 def ingest_replicated(rows: "list[AuditRow]") -> Any:
-    """Verify + all-or-nothing insert a replicated batch, via the default Engine's store.
+    """Verify + insert the verified prefix of a replicated batch, via the
+    default Engine's store.
 
-    Verifies the per-row hash chain first; a break rejects the whole batch
-    (inserts nothing) and raises store.AuditChainError. Returns an IngestResult.
+    Verifies the per-row hash chain first, then inserts the longest verified
+    prefix in a single transaction. Does NOT raise on a chain break — the
+    returned IngestResult carries ``rejected_from_seq`` (the monotonic_seq of the
+    first broken row) so the sender resyncs from there.
     """
     return _default.ingest_replicated(rows)
