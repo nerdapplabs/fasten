@@ -63,6 +63,10 @@ type VerifyResult struct {
 // produces byte-for-byte identical row hashes, so a Go upstream aggregator can
 // verify chains that were sealed by a Python node.
 //
+// The canonical hashed form, the cross-language rendering rules (including the
+// whole-number-float hazard in §1.3), the canonical_form_id registry, and the
+// replication contract are normative in ../spec/chain-replication.md.
+//
 // Semantics mirror Python engine.py verify_chain exactly:
 //
 //   - Rows are sorted by MonotonicSeq before walking.

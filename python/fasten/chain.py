@@ -106,6 +106,10 @@ class ChainVerifyResult:
 def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     """Walk the per-row hash chain and return a verification result.
 
+    The canonical hashed form, the cross-language rendering rules (including the
+    whole-number-float hazard), the canonical_form_id registry, and the
+    replication contract are normative in ``spec/chain-replication.md``.
+
     Detects field tampering, row insertion, deletion, and reorder. Does NOT
     detect tail truncation — that requires an external tip-anchor (see P1-23 for
     the documented limitation).
