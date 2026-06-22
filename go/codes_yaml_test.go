@@ -9,19 +9,19 @@ import (
 
 const fleetYAML = `
 domain: fleet
-emitter: edge-manager
+emitter: fleet-service
 codes:
   FLEET_NODE_REGISTERED:
     category: node.lifecycle
     action: registered
     severity: info
-    description: Edge node claimed and registered
+    description: Node claimed and registered
   FLEET_DEPLOY_FAILED:
     category: deploy
     action: failed
     severity: error
     retention_class: long
-    description: Deployment failed on edge node
+    description: Deployment failed on node
 `
 
 // resetYAMLState clears yaml-loader state between tests.

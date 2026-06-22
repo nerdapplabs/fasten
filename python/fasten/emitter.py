@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .attrs import AuditRow
+from .chain import verify_chain as _verify_chain
 from .engine import AuditStoreError  # noqa: F401 — re-exported
 from .engine import Engine
 from .redact import Redactor
@@ -107,5 +108,29 @@ def verify_chain(rows: "list[Any]") -> "Any":
 
     Returns a ChainVerifyResult with ok, total_rows, first_break_at, reason.
     """
-    from .engine import verify_chain as _verify_chain
     return _verify_chain(rows)
+
+
+def list_unshipped(limit: int = 100) -> "list[AuditRow]":
+    """Rows not yet shipped upstream (oldest first), via the default Engine's store.
+
+    Raises RuntimeError if the default Engine has no audit store configured.
+    """
+    return _default.list_unshipped(limit=limit)
+
+
+def mark_shipped(ids: "list[str]") -> None:
+    """Mark rows shipped upstream by id, via the default Engine's store."""
+    _default.mark_shipped(ids)
+
+
+def ingest_replicated(rows: "list[AuditRow]") -> Any:
+    """Verify + insert the verified prefix of a replicated batch, via the
+    default Engine's store.
+
+    Verifies the per-row hash chain first, then inserts the longest verified
+    prefix in a single transaction. Does NOT raise on a chain break — the
+    returned IngestResult carries ``rejected_from_seq`` (the monotonic_seq of the
+    first broken row) so the sender resyncs from there.
+    """
+    return _default.ingest_replicated(rows)

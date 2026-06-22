@@ -2,8 +2,6 @@ package fasten
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,9 +56,13 @@ func (e *Engine) Init(cfg Config) error {
 	e.auditStore = cfg.AuditStore
 
 	// Seed monotonic_seq from the store if it supports it, so post-restart
-	// rows never collide with pre-restart rows on (timestamp, seq).
+	// rows never collide with pre-restart rows on (timestamp, seq). Scoped to
+	// THIS engine's own (service_id, source_node_id) sub-chain — never the
+	// global MAX — because monotonic_seq is a per-node counter and seeding
+	// from a foreign origin's rows (ingested via IngestReplicated) would break
+	// this node's own tamper chain.
 	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
-		if max, err := seeder.MaxMonotonicSeq(context.Background()); err == nil {
+		if max, err := seeder.MaxMonotonicSeq(context.Background(), e.serviceID, e.nodeID); err == nil {
 			atomic.StoreInt64(&e.seq, max)
 		}
 	}
@@ -162,22 +164,11 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 		opt(&row)
 	}
 
-	// P1-23: assign seq + compute hash chain atomically so concurrent Emit
-	// calls produce a gapless, correctly-ordered chain. seq is incremented here
-	// (not via atomic.AddInt64 earlier) to keep seq and prevHash in lock-step.
-	e.hashMu.Lock()
-	atomic.AddInt64(&e.seq, 1)
-	row.MonotonicSeq = atomic.LoadInt64(&e.seq)
-	row.PrevHash = e.prevHash
-	m2 := rowToMap(row) // build map before hash is set so "hash" key is absent
-	delete(m2, "hash")
-	if b, err := json.Marshal(m2); err == nil {
-		sum := sha256.Sum256(b)
-		row.Hash = hex.EncodeToString(sum[:])
-	}
-	e.prevHash = row.Hash
-	e.hashMu.Unlock()
-
+	// Redact BEFORE sealing so the hash covers exactly the detail that is
+	// stored — matches Python emit(), which redacts detail before building the
+	// row it hashes. Sealing over the pre-redaction detail (the previous Go
+	// order) meant the stored row's redacted detail no longer reproduced its
+	// own hash, so Go-sealed rows failed Go VerifyChain.
 	if m.PiiInDetail {
 		passthrough := make(map[string]bool, len(m.DetailPassthroughKeys))
 		for _, k := range m.DetailPassthroughKeys {
@@ -196,6 +187,23 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 	} else {
 		row.Detail = RedactDetail(row.Detail)
 	}
+
+	// P1-23: assign seq + seal the hash chain atomically so concurrent Emit
+	// calls produce a gapless, correctly-ordered chain. seq is incremented here
+	// (not via atomic.AddInt64 earlier) to keep seq and prevHash in lock-step.
+	//
+	// Seal is the ONE canonical seal path (see verify.go): it stamps
+	// CanonicalFormID="1", sets PrevHash, and hashes with the SAME canonical form
+	// VerifyChain uses, so Go Emit ↔ Go VerifyChain ↔ Python seal/to_dict all
+	// agree on a single field set (canonical_form_id + pii_in_detail-excluded,
+	// shipped_at:null, prev_hash always present, Python-isoformat timestamps,
+	// sorted keys, non-ASCII \uXXXX-escaped).
+	e.hashMu.Lock()
+	atomic.AddInt64(&e.seq, 1)
+	row.MonotonicSeq = atomic.LoadInt64(&e.seq)
+	row = Seal(e.prevHash, row)
+	e.prevHash = row.Hash
+	e.hashMu.Unlock()
 
 	if e.xport != nil {
 		e.xport.WriteAudit(rowToMap(row))

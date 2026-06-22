@@ -15,6 +15,7 @@
 package fasten
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -22,6 +23,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/nerdapplabs/fasten/go/fastenctx"
 )
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
@@ -125,6 +128,11 @@ type Row struct {
 	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
+	// CanonicalFormID names the hashed canonical form that sealed this row. "1"
+	// is the current (and only) form. It is INCLUDED in the hashed bytes so the
+	// form choice is itself tamper-evident; VerifyChain dispatches on it and
+	// rejects unknown ids. See verify.go for the form definitions.
+	CanonicalFormID string `json:"canonical_form_id,omitempty"`
 	// P1-23: tamper-evidence hash chain. PrevHash is the hex SHA-256 of the
 	// preceding row in the (service_id, source_node_id) sequence, or "genesis"
 	// for the first row. Hash is SHA-256 of canonical JSON of this row with
@@ -132,6 +140,41 @@ type Row struct {
 	// empty strings; verify_chain skips them.
 	PrevHash string `json:"prev_hash,omitempty"`
 	Hash     string `json:"hash,omitempty"`
+}
+
+// UnmarshalJSON decodes a Row, preserving the EXACT numeric tokens in Detail.
+//
+// This is load-bearing for cross-language hash compatibility. The canonical row
+// hash is computed over the JSON rendering of Detail, and Python json.dumps
+// renders a whole-number float as "999.0" while Go's default encoder renders the
+// float64 it gets from a plain unmarshal as "999". A Python-sealed row whose
+// detail carries a whole-number float (e.g. a setpoint value 75.0) would then be
+// rejected by VerifyChain on the Go side — a silent cross-language break.
+//
+// Decoding Detail with UseNumber keeps each value as a json.Number holding its
+// original token ("999.0", "12.5", "7", "1e+20"), which canonicalJSON re-emits
+// verbatim — so Go reproduces Python's rendering byte-for-byte regardless of how
+// the number was written. The rest of the Row decodes normally.
+func (r *Row) UnmarshalJSON(data []byte) error {
+	type rowAlias Row // alias drops the method set, preventing infinite recursion
+	aux := struct {
+		Detail json.RawMessage `json:"detail"`
+		*rowAlias
+	}{rowAlias: (*rowAlias)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(aux.Detail) == 0 || string(aux.Detail) == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(aux.Detail))
+	dec.UseNumber()
+	var detail map[string]any
+	if err := dec.Decode(&detail); err != nil {
+		return err
+	}
+	r.Detail = detail
+	return nil
 }
 
 // ── Code catalog ──────────────────────────────────────────────────────────
@@ -302,10 +345,6 @@ func metaOf(c Code) (Meta, bool) {
 
 // ── Correlation context ───────────────────────────────────────────────────
 
-type ctxKey int
-
-const requestIDKey ctxKey = 1
-
 // MintID returns a new 12-character hex request id.
 func MintID() string {
 	b := make([]byte, 6)
@@ -314,16 +353,18 @@ func MintID() string {
 }
 
 // WithRequestID returns ctx with the id as the ambient correlation id.
+//
+// Delegates to the zero-dependency fastenctx subpackage so the context key
+// is identical to the one fastenctx (and the HTTP RequestID middleware) use.
 func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestIDKey, id)
+	return fastenctx.WithRequestID(ctx, id)
 }
 
 // RequestIDFromContext reads the ambient id ("" if unset).
+//
+// Delegates to fastenctx — same key as WithRequestID above.
 func RequestIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(requestIDKey).(string); ok {
-		return v
-	}
-	return ""
+	return fastenctx.RequestIDFromContext(ctx)
 }
 
 // ── Audit-store failure handling ──────────────────────────────────────────
@@ -461,6 +502,9 @@ func rowToMap(r Row) map[string]any {
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
 		"pii_in_detail": r.PiiInDetail,
+		"canonical_form_id": func() string {
+			if r.CanonicalFormID == "" { return "1" }; return r.CanonicalFormID
+		}(),
 		"prev_hash": r.PrevHash,
 	}
 	if r.ShippedAt != nil {
@@ -477,8 +521,13 @@ func rowToMap(r Row) map[string]any {
 // SeqSeeder is an optional extension of AuditRepository. Stores that implement
 // it allow Init() to seed monotonic_seq from persisted rows so post-restart
 // rows never collide on (timestamp, seq) with pre-restart rows.
+//
+// The seed MUST be scoped to the engine's own (serviceID, sourceNodeID): the
+// tamper chain is per-node and monotonic_seq is a per-node counter, so seeding
+// from an unscoped global MAX would break this node's own chain once it has
+// ingested replicated rows from another origin.
 type SeqSeeder interface {
-	MaxMonotonicSeq(ctx context.Context) (int64, error)
+	MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error)
 }
 
 // AuditRepository is the durable store contract.

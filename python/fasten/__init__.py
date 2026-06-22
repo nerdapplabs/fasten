@@ -17,11 +17,27 @@ See README.md for the full design.
 from __future__ import annotations
 
 from .attrs import Anchor, AuditRow
+from .chain import ChainVerifyResult, seal, verify_chain
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
 from .context import current_request_id, mint_id, with_request_id
-from .emitter import audit_store, emit, flush, init, init_config, log, queue_stats, redactor, start, transport, verify_chain
-from .engine import AuditStoreError, ChainVerifyResult, Engine, FastenConfig
-from .store.repo import AuditRepository
+from .emitter import (
+    audit_store,
+    emit,
+    flush,
+    ingest_replicated,
+    init,
+    init_config,
+    list_unshipped,
+    log,
+    mark_shipped,
+    queue_stats,
+    redactor,
+    start,
+    transport,
+)
+from .engine import AuditStoreError, Engine, FastenConfig
+from . import replication
+from .store.repo import AuditChainError, AuditRepository, IngestResult
 
 __all__ = [
     # row shape
@@ -37,6 +53,14 @@ __all__ = [
     "registry",
     # storage protocol
     "AuditRepository",
+    "AuditChainError",
+    "IngestResult",
+    # replication / outbox helpers (delegate to the default engine's store)
+    "list_unshipped",
+    "mark_shipped",
+    "ingest_replicated",
+    # store-scoped replication ingest (no Engine / fasten.init() required)
+    "replication",
     # multi-tenant / isolated engine
     "Engine",
     # config dataclass
@@ -44,6 +68,7 @@ __all__ = [
     # hash chain verification
     "ChainVerifyResult",
     "verify_chain",
+    "seal",
     # audit-store failure handling
     "AuditStoreError",
     "flush",

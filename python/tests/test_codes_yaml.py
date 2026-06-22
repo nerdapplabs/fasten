@@ -24,19 +24,19 @@ def fasten_yaml(tmp_path: Path) -> Path:
     p = tmp_path / "fleet.codes.yaml"
     p.write_text(textwrap.dedent("""\
         domain: fleet
-        emitter: edge-manager
+        emitter: fleet-service
         codes:
           FLEET_NODE_REGISTERED:
             category: node.lifecycle
             action: registered
             severity: info
-            description: Edge node claimed and registered
+            description: Node claimed and registered
           FLEET_DEPLOY_FAILED:
             category: deploy
             action: failed
             severity: error
             retention_class: long
-            description: Deployment failed on edge node
+            description: Deployment failed on node
     """))
     return p
 
@@ -134,7 +134,7 @@ def test_load_cross_file_collision_raises(fasten_yaml, tmp_path, clean_yaml_path
     p2 = tmp_path / "fleet-v2.codes.yaml"
     p2.write_text(textwrap.dedent("""\
         domain: fleet
-        emitter: edge-manager-v2
+        emitter: fleet-service-v2
         codes:
           FLEET_NODE_REGISTERED:
             category: drift.metadata
@@ -146,7 +146,7 @@ def test_load_cross_file_collision_raises(fasten_yaml, tmp_path, clean_yaml_path
         load(str(p2))
     # First file's metadata still wins (silent overwrite did not happen).
     reg = registry()
-    assert reg["FLEET_NODE_REGISTERED"].emitter == "edge-manager"
+    assert reg["FLEET_NODE_REGISTERED"].emitter == "fleet-service"
     assert reg["FLEET_NODE_REGISTERED"].severity == Severity.INFO
 
 

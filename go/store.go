@@ -46,7 +46,7 @@ var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS %s (
     shipped_at    TEXT,
     wire_version  TEXT NOT NULL DEFAULT '1',
     hash          TEXT NOT NULL DEFAULT '',
-    prev_hash     TEXT NOT NULL DEFAULT ''
+    prev_hash     TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1'
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -128,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
 	} {
 		if !existing[col.name] {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -171,7 +173,11 @@ func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 	return cols, rows.Err()
 }
 
-func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
+// insertRowExec runs the idempotent INSERT OR IGNORE on any execContext
+// (*sql.DB for a single autocommit insert, or *sql.Tx for a batch). The
+// originated/replicated intent split is enforced by the wrappers, not here —
+// the SQL is identical.
+func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -189,8 +195,12 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 	if wv == "" {
 		wv = "1"
 	}
-	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
+	formID := row.CanonicalFormID
+	if formID == "" {
+		formID = "1"
+	}
+	_, err = exec.ExecContext(ctx,
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.Format(time.RFC3339Nano),
 		string(row.Code), row.Action, string(row.Severity),
@@ -201,9 +211,50 @@ func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 		string(detail),
 		piiFlag,
 		shippedAt,
-		wv, row.Hash, row.PrevHash,
+		wv, row.Hash, row.PrevHash, formID,
 	)
 	return err
+}
+
+// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
+	return s.insertRowExec(ctx, s.db, row)
+}
+
+// InsertOriginated inserts a row this node ORIGINATED (origin_id == id). Used
+// by the engine's own Emit path.
+func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
+	if row.OriginID != row.ID {
+		return fmt.Errorf(
+			"fasten InsertOriginated: requires origin_id == id (got origin_id=%q, id=%q); "+
+				"use InsertReplicated for rows from another origin", row.OriginID, row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// InsertReplicated inserts a sealed row replicated from another origin. Used by
+// IngestReplicated after the chain verifies (autocommit single-row path).
+func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// insertReplicatedTx inserts a sealed replicated row on the given exec context
+// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
+// it does NOT own the transaction — IngestReplicated commits once for the batch.
+func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRowExec(ctx, exec, row)
+}
+
+// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
+// Kept so the AuditRepository interface and the drainer stay stable.
+func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
+	return s.InsertOriginated(ctx, row)
 }
 
 func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
@@ -230,6 +281,27 @@ func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, erro
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?`, auditCols, s.table),
 		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
+// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
+// from another origin are excluded: re-shipping them upstream would duplicate
+// another node's sub-chain. This is the originated-only counterpart a relay
+// should use; plain ListUnshipped returns every unshipped row regardless of
+// origin.
+func (s *SQLiteStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL AND service_id = ? AND source_node_id = ? AND origin_id = id ORDER BY monotonic_seq ASC LIMIT ?`, auditCols, s.table),
+		serviceID, sourceNodeID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -280,10 +352,27 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// MaxMonotonicSeq returns the maximum monotonic_seq stored, for seq seeding on restart.
-func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context) (int64, error) {
+// MaxMonotonicSeq returns the maximum monotonic_seq stored for the given
+// (serviceID, sourceNodeID) sub-chain, for seq seeding on restart.
+//
+// The tamper chain is per (service_id, source_node_id) and monotonic_seq is a
+// per-node counter, so seeding the engine's seq MUST be scoped to the engine's
+// OWN identity. An unscoped MAX() across all origins would, after this node
+// ingested replicated rows from another origin, seed seq from a foreign
+// sub-chain and break this node's own chain. When serviceID and sourceNodeID
+// are both empty the query falls back to the legacy global MAX (used only
+// where identity is unavailable).
+func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error) {
 	var n sql.NullInt64
-	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s`, s.table)).Scan(&n)
+	var err error
+	if serviceID != "" && sourceNodeID != "" {
+		err = s.db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s WHERE service_id = ? AND source_node_id = ?`, s.table),
+			serviceID, sourceNodeID,
+		).Scan(&n)
+	} else {
+		err = s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX(monotonic_seq) FROM %s`, s.table)).Scan(&n)
+	}
 	if err != nil || !n.Valid {
 		return 0, err
 	}
@@ -331,7 +420,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		var detail string
 		var piiFlag int
 		var shippedAt *string
-		var wv, hash, prevHash string
+		var wv, hash, prevHash, formID string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&ts, &code, &r.Action, &sev,
@@ -339,7 +428,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
-			&wv, &hash, &prevHash,
+			&wv, &hash, &prevHash, &formID,
 		); err != nil {
 			return nil, err
 		}
@@ -360,6 +449,11 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		}
 		r.Hash = hash
 		r.PrevHash = prevHash
+		if formID != "" {
+			r.CanonicalFormID = formID
+		} else {
+			r.CanonicalFormID = "1"
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()

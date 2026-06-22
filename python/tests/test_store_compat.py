@@ -25,9 +25,13 @@ def _unique_id() -> str:
 
 
 def make_row(**overrides):
+    # origin_id defaults to id (originated semantics) so store.insert — a thin
+    # alias for insert_originated — accepts these rows. Tests that need a
+    # replicated row (origin_id != id) override origin_id explicitly.
+    row_id = overrides.get("id", _unique_id())
     defaults = dict(
-        id=_unique_id(),
-        origin_id=_unique_id(),
+        id=row_id,
+        origin_id=row_id,
         monotonic_seq=1,
         timestamp=datetime.now(timezone.utc),
         code="USER_CREATED",

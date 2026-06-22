@@ -18,19 +18,19 @@ namespace {
 
 const char* FLEET_YAML = R"(
 domain: fleet
-emitter: edge-manager
+emitter: fleet-service
 codes:
   FLEET_NODE_REGISTERED:
     category: node.lifecycle
     action: registered
     severity: info
-    description: Edge node claimed and registered
+    description: Node claimed and registered
   FLEET_DEPLOY_FAILED:
     category: deploy
     action: failed
     severity: error
     retention_class: long
-    description: Deployment failed on edge node
+    description: Deployment failed on node
 )";
 
 std::string write_yaml(const std::string& contents, const std::string& name) {

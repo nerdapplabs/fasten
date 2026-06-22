@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS %s (
     shipped_at     TIMESTAMPTZ,
     wire_version   TEXT NOT NULL DEFAULT '1',
     hash           TEXT NOT NULL DEFAULT '',
-    prev_hash      TEXT NOT NULL DEFAULT ''
+    prev_hash      TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1'
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -135,6 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
 	} {
 		if _, ok := existing[col.name]; !ok {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -172,9 +174,12 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
 
-func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
+// insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
+// execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
+// The originated/replicated intent split is enforced by the wrappers.
+func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -192,8 +197,12 @@ func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	if wv == "" {
 		wv = "1"
 	}
-	_, err = s.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
+	formID := row.CanonicalFormID
+	if formID == "" {
+		formID = "1"
+	}
+	_, err = exec.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
 		string(row.Code), row.Action, string(row.Severity),
@@ -204,9 +213,48 @@ func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 		string(detail),
 		piiFlag,
 		shippedAt,
-		wv, row.Hash, row.PrevHash,
+		wv, row.Hash, row.PrevHash, formID,
 	)
 	return err
+}
+
+// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
+	return s.insertRowExec(ctx, s.db, row)
+}
+
+// InsertOriginated inserts a row this node ORIGINATED (origin_id == id).
+func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
+	if row.OriginID != row.ID {
+		return fmt.Errorf(
+			"fasten InsertOriginated: requires origin_id == id (got origin_id=%q, id=%q); "+
+				"use InsertReplicated for rows from another origin", row.OriginID, row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// InsertReplicated inserts a sealed row replicated from another origin
+// (autocommit single-row path).
+func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRow(ctx, row)
+}
+
+// insertReplicatedTx inserts a sealed replicated row on the given exec context
+// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
+// it does NOT own the transaction — IngestReplicated commits once for the batch.
+func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+	if row.Hash == "" {
+		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+	}
+	return s.insertRowExec(ctx, exec, row)
+}
+
+// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
+func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
+	return s.InsertOriginated(ctx, row)
 }
 
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
@@ -234,6 +282,25 @@ func (s *PostgresStore) ListUnshipped(ctx context.Context, limit int) ([]Row, er
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1`, pgAuditCols, s.table),
 		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsPg(rows)
+}
+
+// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
+// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
+// from another origin are excluded so they are never re-shipped upstream. See
+// SQLiteStore.ListUnshippedOriginated for the rationale.
+func (s *PostgresStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE shipped_at IS NULL AND service_id = $1 AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3`, pgAuditCols, s.table),
+		serviceID, sourceNodeID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -319,7 +386,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		var detail string
 		var piiFlag int
 		var shippedAt *time.Time
-		var wv, hash, prevHash string
+		var wv, hash, prevHash, formID string
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&r.Timestamp, &code, &r.Action, &sev,
@@ -327,7 +394,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 			&r.Actor, &r.ActorKind,
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
-			&wv, &hash, &prevHash,
+			&wv, &hash, &prevHash, &formID,
 		); err != nil {
 			return nil, err
 		}
@@ -348,6 +415,11 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		}
 		r.Hash = hash
 		r.PrevHash = prevHash
+		if formID != "" {
+			r.CanonicalFormID = formID
+		} else {
+			r.CanonicalFormID = "1"
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
