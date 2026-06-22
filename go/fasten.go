@@ -15,6 +15,7 @@
 package fasten
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -139,6 +140,41 @@ type Row struct {
 	// empty strings; verify_chain skips them.
 	PrevHash string `json:"prev_hash,omitempty"`
 	Hash     string `json:"hash,omitempty"`
+}
+
+// UnmarshalJSON decodes a Row, preserving the EXACT numeric tokens in Detail.
+//
+// This is load-bearing for cross-language hash compatibility. The canonical row
+// hash is computed over the JSON rendering of Detail, and Python json.dumps
+// renders a whole-number float as "999.0" while Go's default encoder renders the
+// float64 it gets from a plain unmarshal as "999". A Python-sealed row whose
+// detail carries a whole-number float (e.g. a setpoint value 75.0) would then be
+// rejected by VerifyChain on the Go side — a silent cross-language break.
+//
+// Decoding Detail with UseNumber keeps each value as a json.Number holding its
+// original token ("999.0", "12.5", "7", "1e+20"), which canonicalJSON re-emits
+// verbatim — so Go reproduces Python's rendering byte-for-byte regardless of how
+// the number was written. The rest of the Row decodes normally.
+func (r *Row) UnmarshalJSON(data []byte) error {
+	type rowAlias Row // alias drops the method set, preventing infinite recursion
+	aux := struct {
+		Detail json.RawMessage `json:"detail"`
+		*rowAlias
+	}{rowAlias: (*rowAlias)(r)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(aux.Detail) == 0 || string(aux.Detail) == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(aux.Detail))
+	dec.UseNumber()
+	var detail map[string]any
+	if err := dec.Decode(&detail); err != nil {
+		return err
+	}
+	r.Detail = detail
+	return nil
 }
 
 // ── Code catalog ──────────────────────────────────────────────────────────
