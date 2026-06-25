@@ -44,9 +44,9 @@ class RingBuffer:
         if service_id:
             rows = [r for r in rows if r.get("service_id") == service_id]
         if method:
-            rows = [r for r in rows if r.get("method", "").upper() == method.upper()]
+            rows = [r for r in rows if r.get("method") == method]
         if path:
-            rows = [r for r in rows if path.lower() in r.get("path", "").lower()]
+            rows = [r for r in rows if r.get("path") == path]
         if event:
             rows = [r for r in rows if r.get("event") == event]
         if status is not None:

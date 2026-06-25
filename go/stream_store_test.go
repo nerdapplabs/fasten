@@ -46,6 +46,19 @@ func TestStreamStore_RoundtripAndFilter(t *testing.T) {
 	if len(one) != 1 || one[0]["path"] != "/v1/checkout" {
 		t.Fatalf("request_id filter: got %v", one)
 	}
+	// method/path are exact-match — parity with the ring and the Python SDK.
+	if got, _ := s.Query(100, map[string]string{"method": "POST"}, "", ""); len(got) != 1 {
+		t.Errorf("method=POST exact: got %d, want 1", len(got))
+	}
+	if got, _ := s.Query(100, map[string]string{"method": "post"}, "", ""); len(got) != 0 {
+		t.Errorf("method=post must not case-fold: got %d, want 0", len(got))
+	}
+	if got, _ := s.Query(100, map[string]string{"path": "/v1/checkout"}, "", ""); len(got) != 1 {
+		t.Errorf("path exact: got %d, want 1", len(got))
+	}
+	if got, _ := s.Query(100, map[string]string{"path": "checkout"}, "", ""); len(got) != 0 {
+		t.Errorf("path must not substring-match: got %d, want 0", len(got))
+	}
 }
 
 func TestStreamStore_SurvivesBeyondRingCapacity(t *testing.T) {

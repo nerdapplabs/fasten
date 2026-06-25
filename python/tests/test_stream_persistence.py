@@ -47,10 +47,11 @@ def test_streamstore_roundtrip_and_filter():
     assert [r["request_id"] for r in allrows] == ["r-B", "r-A"]
     # request_id filter
     assert [r["path"] for r in s.query(request_id="r-A")] == ["/v1/checkout"]
-    # method filter (case-insensitive, like the ring)
-    assert len(s.query(method="post")) == 1
-    # path substring filter (like the ring)
-    assert len(s.query(path="checkout")) == 1
+    # method/path are exact-match (parity with the ring and the Go SDK)
+    assert len(s.query(method="POST")) == 1
+    assert len(s.query(method="post")) == 0          # not case-folded
+    assert len(s.query(path="/v1/checkout")) == 1
+    assert len(s.query(path="checkout")) == 0        # not substring
 
 
 def test_streamstore_survives_beyond_ring_capacity():

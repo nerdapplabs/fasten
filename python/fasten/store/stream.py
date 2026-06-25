@@ -134,10 +134,10 @@ class StreamStore:
         since: str | None = None,
         until: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return up to ``limit`` rows newest-first, applying the same filter
-        intent as the in-memory ring so store and ring reads agree. Caveat:
-        ``path`` uses SQL ``LIKE``, so ``%``/``_`` in the path argument act as
-        wildcards here while the ring does a literal substring match."""
+        """Return up to ``limit`` rows newest-first, applying the same
+        exact-match filter semantics as the in-memory ring so store and ring
+        reads agree (and match the Go SDK; ``method``/``path`` are exact, not
+        case-folded or substring)."""
         conds: list[str] = []
         params: list[Any] = []
         if level:
@@ -150,11 +150,11 @@ class StreamStore:
             conds.append("service_id = ?")
             params.append(service_id)
         if method:
-            conds.append("upper(method) = ?")
-            params.append(method.upper())
+            conds.append("method = ?")
+            params.append(method)
         if path:
-            conds.append("lower(path) LIKE ?")
-            params.append(f"%{path.lower()}%")
+            conds.append("path = ?")
+            params.append(path)
         if event:
             conds.append("event = ?")
             params.append(event)
