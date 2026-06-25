@@ -1,10 +1,10 @@
-"""FR4 (Phase 0): per-stream completeness flags on every /logs read.
+"""Per-stream completeness flags on every /logs read.
 
-Each reader response declares, per stream, whether its rows came from the
-durable ``store`` or a bounded ``ring``. With persistence still off (the
-default), audit is served from the store and api/sys from rings. The flag is
-additive — existing response keys are untouched — so consumers can adopt it
-now and Phase 1 (FR1) only flips the value once api/sys can persist.
+Each reader response declares, per stream, whether that stream is backed by
+the durable ``store`` or a bounded ``ring``. With persistence still off (the
+default), audit is classified as store-backed and api/sys as ring-backed. The
+flag is additive — existing response keys are untouched — so consumers can
+adopt it now; Phase 1 only flips the value once api/sys can persist.
 """
 import pytest
 
@@ -48,13 +48,34 @@ def test_api_reports_ring(initialized):
 
 
 def test_persist_streams_override_flips_to_store(initialized):
-    """The resolver seam Phase 1 (FR1) flips: marking a stream persisted
-    makes its reads report ``store`` instead of ``ring``."""
+    """The resolver seam Phase 1 flips: marking a stream persisted makes its
+    reads report ``store`` instead of ``ring``."""
     client = _client(persist_streams=frozenset({"audit", "api", "sys"}))
 
     assert client.get("/api/v1/logs/sys").json()["completeness"] == {"sys": "store"}
     assert client.get("/api/v1/logs/api").json()["completeness"] == {"api": "store"}
     assert client.get("/api/v1/logs/audit").json()["completeness"] == {"audit": "store"}
+
+
+def test_request_id_filter_coexists_with_completeness(initialized):
+    """The added completeness field must not shadow the pre-existing
+    request_id query param: filtering the api ring still narrows rows, and the
+    flag is still present on the filtered read."""
+    transport = fasten.transport()
+    transport.push_api({"method": "GET", "path": "/a", "request_id": "req-A"})
+    transport.push_api({"method": "GET", "path": "/b", "request_id": "req-B"})
+
+    body = _client().get("/api/v1/logs/api?request_id=req-A").json()
+    assert len(body["rows"]) == 1, body["rows"]
+    assert body["rows"][0]["request_id"] == "req-A"
+    assert body["completeness"] == {"api": "ring"}
+
+
+def test_empty_persist_streams_makes_audit_ring(initialized):
+    """`_source` is purely set-driven — with an empty persist set even audit
+    reports ``ring``, proving there is no hardcoded audit special-case."""
+    body = _client(persist_streams=frozenset()).get("/api/v1/logs/audit").json()
+    assert body["completeness"] == {"audit": "ring"}
 
 
 def test_completeness_present_on_uninitialised_reads():

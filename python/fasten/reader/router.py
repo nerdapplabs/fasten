@@ -57,11 +57,11 @@ def router(
         store: Optional AuditRepository override. Default: pulled from
             ``fasten.init()`` at request time via ``fasten.audit_store()``.
         transport: Optional StdoutTransport override. Default: same.
-        persist_streams: Streams served from the durable store rather than
-            a bounded ring. Drives the per-stream ``completeness`` flag on
+        persist_streams: Streams backed by the durable store rather than a
+            bounded ring. Drives the per-stream ``completeness`` flag on
             every read (``store`` vs ``ring``). Default ``{"audit"}`` —
-            today's behaviour: only audit is persisted, api/sys are rings.
-            Phase 1 (FR1) wires this from config once api/sys can persist.
+            audit is the only store-backed stream today, api/sys are rings.
+            Phase 1 wires this from config once api/sys can persist.
     """
     try:
         from fastapi import APIRouter, Query
@@ -81,8 +81,9 @@ def router(
         return transport if transport is not None else _active_transport()
 
     def _source(stream: str) -> str:
-        """FR4: report whether a stream's rows came from the durable store
-        or a bounded ring, so consumers stay honest about gaps."""
+        """Report whether a stream is backed by the durable store or a bounded
+        ring — its configured durability class, not the provenance of any
+        single response — so consumers stay honest about gaps."""
         return "store" if stream in _persisted else "ring"
 
     @r.get("/sys")

@@ -32,10 +32,10 @@ type Engine struct {
 	seq             int64 // accessed via atomic ops
 	failureStrategy string
 
-	// FR4 (Phase 0): streams served from the durable store rather than a
-	// bounded ring. Drives the per-stream completeness flag on every reader
-	// read. Seeded to {"audit"} in Init — today's behaviour. Phase 1 (FR1)
-	// populates this from config once api/sys can persist.
+	// Streams classified as backed by the durable store rather than a bounded
+	// ring. Drives the per-stream completeness flag on every reader read.
+	// Seeded to {"audit"} in Init — audit is the only store-backed stream
+	// today; Phase 1 wires this from config so api/sys can persist too.
 	persistedStreams map[string]bool
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash

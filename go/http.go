@@ -101,10 +101,13 @@ func (e *Engine) NewReader() http.Handler {
 // NewReader is a package-level shorthand for Default.NewReader().
 func NewReader() http.Handler { return Default.NewReader() }
 
-// streamSource reports whether a stream's rows came from the durable store
-// or a bounded ring (FR4), so consumers stay honest about gaps. Defaults to
-// "ring" unless the stream is in persistedStreams; a nil map (engine never
-// Init'd) still treats audit as the store, matching the reader's data paths.
+// streamSource reports whether a stream is backed by the durable store or a
+// bounded ring, so consumers stay honest about gaps. This is the stream's
+// configured durability class — not the provenance of any single response;
+// error/uninitialised reads still carry it so the response shape stays
+// uniform (the `error` key is what signals a read actually failed).
+// Defaults to "ring" unless the stream is in persistedStreams; a nil map
+// (engine never Init'd) still classifies audit as store-backed.
 func (e *Engine) streamSource(stream string) string {
 	if e.persistedStreams[stream] || (e.persistedStreams == nil && stream == "audit") {
 		return "store"

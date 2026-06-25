@@ -10,9 +10,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// FR4 (Phase 0): every /logs read reports, per stream, whether its rows came
-// from the durable store or a bounded ring. With persistence still off (the
-// default), audit is served from the store and api/sys from rings.
+// Every /logs read reports, per stream, whether that stream is backed by the
+// durable store or a bounded ring. With persistence still off (the default),
+// audit is classified as store-backed and api/sys as ring-backed.
 
 // getCompleteness drives one reader route and returns its completeness map.
 func getCompleteness(t *testing.T, h http.Handler, path string) (map[string]any, map[string]string) {
@@ -78,7 +78,7 @@ func TestCompleteness_DefaultStoreVsRing(t *testing.T) {
 }
 
 // TestCompleteness_FollowsPersistedStreams pins the resolver seam Phase 1
-// (FR1) flips: once a stream is marked persisted, its reads report "store".
+// flips: once a stream is marked persisted, its reads report "store".
 func TestCompleteness_FollowsPersistedStreams(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -90,6 +90,70 @@ func TestCompleteness_FollowsPersistedStreams(t *testing.T) {
 	Default.persistedStreams["api"] = true
 	if got := Default.streamSource("api"); got != "store" {
 		t.Fatalf("api after persist: got %q, want store", got)
+	}
+}
+
+// TestCompleteness_ErrorPathsCarryFlag is the parity for Python's
+// test_completeness_present_on_uninitialised_reads: a never-Init'd engine
+// still emits the flag (plus an error) on every endpoint, so consumers parse
+// one uniform shape. This also exercises the nil-map fallback through the HTTP
+// layer — a fresh engine has persistedStreams == nil.
+func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
+	h := (&Engine{}).NewReader() // never Init'd: xport, auditStore, persistedStreams all nil
+
+	cases := []struct {
+		path, stream, want string
+	}{
+		{"/sys", "sys", "ring"},
+		{"/api", "api", "ring"},
+		{"/audit", "audit", "store"},
+	}
+	for _, c := range cases {
+		body, comp := getCompleteness(t, h, c.path)
+		if comp[c.stream] != c.want {
+			t.Errorf("%s (uninitialised): completeness[%q] = %q, want %q", c.path, c.stream, comp[c.stream], c.want)
+		}
+		if _, ok := body["error"]; !ok {
+			t.Errorf("%s (uninitialised): expected an 'error' key alongside completeness, got %v", c.path, body)
+		}
+	}
+}
+
+// TestCompleteness_NilMapFallback pins the streamSource branch that fires when
+// the engine was never Init'd (persistedStreams == nil): audit still resolves
+// to "store", everything else to "ring".
+func TestCompleteness_NilMapFallback(t *testing.T) {
+	e := &Engine{} // persistedStreams == nil
+	if got := e.streamSource("audit"); got != "store" {
+		t.Errorf("nil-map audit: got %q, want store", got)
+	}
+	if got := e.streamSource("api"); got != "ring" {
+		t.Errorf("nil-map api: got %q, want ring", got)
+	}
+}
+
+// TestCompleteness_RequestIDFilterCoexists proves the added completeness field
+// did not shadow the pre-existing request_id query param: filtering the api
+// ring still narrows rows, and the flag is still present on the filtered read.
+func TestCompleteness_RequestIDFilterCoexists(t *testing.T) {
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tr := Default.GetTransport()
+	tr.PushAPI(APIRow{"method": "GET", "path": "/a", "request_id": "req-A"})
+	tr.PushAPI(APIRow{"method": "GET", "path": "/b", "request_id": "req-B"})
+
+	body, comp := getCompleteness(t, NewReader(), "/api?request_id=req-A")
+	rows, _ := body["rows"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("request_id filter: got %d rows, want 1 (%v)", len(rows), body["rows"])
+	}
+	if row, _ := rows[0].(map[string]any); row["request_id"] != "req-A" {
+		t.Errorf("request_id filter: row = %v, want request_id req-A", rows[0])
+	}
+	if comp["api"] != "ring" {
+		t.Errorf("filtered read lost completeness: got %v", comp)
 	}
 }
 
