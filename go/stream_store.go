@@ -17,8 +17,10 @@ import (
 // bounded ring.
 //
 // Table per stream — api and sys never share rows. Rows return newest-first,
-// byte-for-byte identical to what was pushed, so a store read is
-// indistinguishable from a ring read apart from depth.
+// reconstructed from the stored JSON payload, so a store read is equivalent
+// to a ring read in content and ordering. Note JSON decoding normalises
+// number types: all numbers decode to float64 (a ring read returns the
+// original int), so the value is JSON-equivalent, not type-identical.
 //
 // The caller imports the SQLite driver and opens the *sql.DB, exactly as for
 // NewSQLiteStore. SQLite-only in v1; a pluggable Postgres stream store is a
@@ -121,12 +123,15 @@ func (s *StreamStore) Query(limit int, eq map[string]string, since, until string
 		conds = append(conds, fmt.Sprintf("%s = ?", k))
 		args = append(args, eq[k])
 	}
+	// COALESCE so a NULL (timestamp-less) row sorts as "" — matching the ring,
+	// which treats a missing timestamp as empty string. Without this a NULL row
+	// is excluded by `<= until` in SQL but included in the ring.
 	if since != "" {
-		conds = append(conds, "timestamp >= ?")
+		conds = append(conds, "COALESCE(timestamp, '') >= ?")
 		args = append(args, since)
 	}
 	if until != "" {
-		conds = append(conds, "timestamp <= ?")
+		conds = append(conds, "COALESCE(timestamp, '') <= ?")
 		args = append(args, until)
 	}
 	where := ""

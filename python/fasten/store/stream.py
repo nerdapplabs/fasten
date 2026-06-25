@@ -8,8 +8,11 @@ fields into indexed columns, so the reader can filter by ``request_id`` /
 time / structured fields against durable history instead of a bounded ring.
 
 Table per stream — ``api`` and ``sys`` never share rows. Rows are returned
-newest-first, byte-for-byte identical to what was pushed, so a read served
-from the store is indistinguishable from a ring read apart from depth.
+newest-first, reconstructed from the stored JSON payload, so a store read is
+equivalent to a ring read in content and ordering. The payload is a JSON
+round-trip (``json.dumps(..., default=str)`` on the way in), so JSON-native
+scalars are preserved but non-JSON values (e.g. ``datetime``) are coerced to
+their ``str()`` form — not type-identical to the original object.
 
 Connection handling mirrors ``SQLiteStore``: one connection per thread for
 file-backed stores (WAL — many readers + one writer), and a single
@@ -132,7 +135,9 @@ class StreamStore:
         until: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return up to ``limit`` rows newest-first, applying the same filter
-        semantics as the in-memory ring so store and ring reads agree."""
+        intent as the in-memory ring so store and ring reads agree. Caveat:
+        ``path`` uses SQL ``LIKE``, so ``%``/``_`` in the path argument act as
+        wildcards here while the ring does a literal substring match."""
         conds: list[str] = []
         params: list[Any] = []
         if level:
@@ -156,11 +161,14 @@ class StreamStore:
         if status is not None:
             conds.append("status = ?")
             params.append(status)
+        # COALESCE so a NULL (timestamp-less) row sorts as "" — matching the
+        # ring, which treats a missing timestamp as empty string. Without this
+        # a NULL row is excluded by `<= until` in SQL but included in the ring.
         if since:
-            conds.append("timestamp >= ?")
+            conds.append("COALESCE(timestamp, '') >= ?")
             params.append(since)
         if until:
-            conds.append("timestamp <= ?")
+            conds.append("COALESCE(timestamp, '') <= ?")
             params.append(until)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
         sql = f"SELECT payload FROM {self._table}{where} ORDER BY seq DESC LIMIT ?"

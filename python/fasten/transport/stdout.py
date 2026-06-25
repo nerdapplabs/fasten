@@ -51,8 +51,23 @@ class StdoutTransport:
         self._service_id = service_id
         # Sentinel invariant: rows written before the first real request belong
         # to one stable boot window; context-less rows after that are orphans.
+        # _boot_over needs no lock (unlike Go's bootMu): the GIL makes the
+        # attribute read/write atomic and the flag is monotonic (False->True
+        # once), so a benign race at the transition stamps at most one extra
+        # row with the boot id.
         self._boot_request_id = boot_request_id
         self._boot_over = False
+
+    def _persist(self, store: StreamStore | None, row: dict[str, Any], stream: str) -> None:
+        """Write-through to the durable sink. A sink failure must never break
+        the hot logging path (the ring + stdout already hold the row), so it is
+        logged to stderr and swallowed — matching the Go transport."""
+        if store is None:
+            return
+        try:
+            store.insert(row)
+        except Exception as exc:  # noqa: BLE001 — best-effort durability
+            sys.stderr.write(f"fasten: {stream} persist failed: {exc}\n")
 
     def _stamp_request_id(self, row: dict[str, Any]) -> None:
         """Guarantee a non-empty request_id on every stream row (the sentinel
@@ -74,8 +89,7 @@ class StdoutTransport:
         """Write to stdout AND buffer (+ persist if configured)."""
         self._stamp_request_id(row)
         self._syslog.push(row)
-        if self._syslog_store is not None:
-            self._syslog_store.insert(row)
+        self._persist(self._syslog_store, row, "syslog")
         sys.stdout.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stdout.flush()
 
@@ -83,8 +97,7 @@ class StdoutTransport:
         """Buffer only — no stdout (+ persist if configured)."""
         self._stamp_request_id(row)
         self._syslog.push(row)
-        if self._syslog_store is not None:
-            self._syslog_store.insert(row)
+        self._persist(self._syslog_store, row, "syslog")
 
     def write_drainer_syslog(self, row: dict[str, Any]) -> None:
         """Drainer self-report path. Buffers + writes to STDERR, never stdout.
@@ -125,8 +138,7 @@ class StdoutTransport:
         """Write to stdout AND buffer (+ persist if configured)."""
         self._stamp_request_id(row)
         self._api.push(row)
-        if self._api_store is not None:
-            self._api_store.insert(row)
+        self._persist(self._api_store, row, "api")
         sys.stdout.write(json.dumps({"shape": "api", **row}, default=str) + "\n")
         sys.stdout.flush()
 
@@ -134,8 +146,7 @@ class StdoutTransport:
         """Buffer only — no stdout (+ persist if configured)."""
         self._stamp_request_id(row)
         self._api.push(row)
-        if self._api_store is not None:
-            self._api_store.insert(row)
+        self._persist(self._api_store, row, "api")
 
     def query_api(
         self,
