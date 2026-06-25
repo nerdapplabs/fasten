@@ -171,6 +171,41 @@ def router(
             "completeness": {"audit": _source("audit")},
         }
 
+    @r.get("/correlate")
+    def get_correlate(
+        request_id: str = Query(...),
+        limit: int = Query(default=100, le=1000),
+    ) -> dict[str, Any]:
+        """Unified correlation read — every stream for one ``request_id``.
+
+        Fans out to the existing per-stream query paths (audit store + sys/api
+        rings-or-stores) and assembles them, so a consumer holding a
+        ``request_id`` gets the whole operation in one call instead of
+        stitching three. Adds no new query semantics beyond fan-out +
+        assembly; ``completeness`` reports each stream's durability class so
+        the consumer knows whether a stream could be silently truncated.
+        """
+        s = _store()
+        t = _transport()
+        audit = (
+            [dataclasses.asdict(row) for row in s.query(limit=limit, request_id=request_id)]
+            if s is not None else []
+        )
+        api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
+        sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
+        return {
+            "request_id": request_id,
+            "audit": audit,
+            "api": api,
+            "sys": sys,
+            "counts": {"audit": len(audit), "api": len(api), "sys": len(sys)},
+            "completeness": {
+                "audit": _source("audit"),
+                "api": _source("api"),
+                "sys": _source("sys"),
+            },
+        }
+
     @r.get("/topology")
     def get_topology(
         since: Optional[datetime] = Query(default=None),

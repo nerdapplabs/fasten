@@ -1,0 +1,93 @@
+"""FR2 — unified correlation read: every stream for one request_id.
+
+GET /logs/correlate?request_id=X fans out to the audit store + sys/api
+rings-or-stores and assembles {request_id, audit, api, sys, counts,
+completeness}, so a consumer gets the whole operation in one call.
+"""
+import pytest
+
+import fasten
+from fasten.context import with_request_id
+from fasten.store.sqlite import SQLiteStore
+
+
+def _client():
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from fasten.reader.router import router as build_router
+
+    app = FastAPI()
+    app.include_router(build_router(), prefix="/api/v1/logs")
+    return TestClient(app)
+
+
+def _init():
+    import os
+    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
+    os.environ["FASTEN_NODE_ID"] = "test-node"
+    fasten.init(
+        service_id="test-svc", node_id="test-node",
+        audit_store=SQLiteStore(":memory:"),
+        audit_store_failure_strategy="raise",
+    )
+
+
+def test_correlate_assembles_all_three_streams():
+    _init()
+    rid = "req-corr-1"
+    with with_request_id(rid):
+        fasten.emit(code="USER_CREATED", target="u-1", actor="alice")
+    t = fasten.transport()
+    t.push_api({"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": rid})
+    t.push_syslog({"level": "error", "event": "db.timeout", "request_id": rid})
+    # noise under a different request_id must not leak in
+    t.push_api({"method": "GET", "path": "/health", "status": 200, "request_id": "other"})
+
+    body = _client().get(f"/api/v1/logs/correlate?request_id={rid}").json()
+
+    assert body["request_id"] == rid
+    assert body["counts"] == {"audit": 1, "api": 1, "sys": 1}
+    assert all(r["request_id"] == rid for r in body["audit"])
+    assert body["api"][0]["path"] == "/v1/checkout"
+    assert body["sys"][0]["event"] == "db.timeout"
+    assert body["completeness"] == {"audit": "store", "api": "ring", "sys": "ring"}
+
+
+def test_correlate_empty_for_unknown_request_id():
+    _init()
+    body = _client().get("/api/v1/logs/correlate?request_id=nope").json()
+    assert body["counts"] == {"audit": 0, "api": 0, "sys": 0}
+    assert body["audit"] == [] and body["api"] == [] and body["sys"] == []
+
+
+def test_correlate_requires_request_id():
+    _init()
+    resp = _client().get("/api/v1/logs/correlate")
+    assert resp.status_code == 422  # FastAPI: missing required query param
+
+
+def test_correlate_reports_store_when_streams_persisted():
+    """When api/sys persist, completeness flips and history is recoverable
+    past the ring window — the historical-investigation use case."""
+    from fasten.store.stream import StreamStore
+    import os
+    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
+    os.environ["FASTEN_NODE_ID"] = "test-node"
+    fasten.init(
+        service_id="test-svc", node_id="test-node",
+        audit_store=SQLiteStore(":memory:"),
+        api_store=StreamStore(":memory:", table="api_log"),
+        syslog_store=StreamStore(":memory:", table="syslog"),
+        audit_store_failure_strategy="raise",
+    )
+    rid = "req-old"
+    t = fasten.transport()
+    t.push_api({"method": "GET", "path": "/x", "request_id": rid})
+    # bury it under > ring capacity of later traffic
+    for i in range(2500):
+        t.push_api({"method": "GET", "path": "/n", "request_id": f"n-{i}"})
+
+    body = _client().get(f"/api/v1/logs/correlate?request_id={rid}").json()
+    assert body["completeness"] == {"audit": "store", "api": "store", "sys": "store"}
+    assert body["counts"]["api"] == 1  # recovered despite ring churn

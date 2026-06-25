@@ -93,6 +93,7 @@ func (e *Engine) NewReader() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
 	mux.HandleFunc("GET /api", e.handleAPI)
+	mux.HandleFunc("GET /correlate", e.handleCorrelate)
 	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
 	mux.HandleFunc("GET /audit", e.handleAudit)
 	return mux
@@ -149,6 +150,66 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		rows = []APIRow{}
 	}
 	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"api": e.streamSource("api")}})
+}
+
+// handleCorrelate is the unified correlation read (FR2): every stream for one
+// request_id in a single call. Fans out to the existing per-stream query paths
+// (audit store + sys/api rings-or-stores) and assembles them — no new query
+// semantics. completeness reports each stream's durability class so the
+// consumer knows whether a stream could be silently truncated.
+func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
+	rid := r.URL.Query().Get("request_id")
+	if rid == "" {
+		http.Error(w, "request_id is required", http.StatusBadRequest)
+		return
+	}
+	limit := intParam(r.URL.Query().Get("limit"), 100)
+
+	audit := []map[string]any{}
+	if e.auditStore != nil {
+		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, Limit: limit})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, row := range rows {
+			audit = append(audit, rowToMap(row))
+		}
+	}
+
+	api := []APIRow{}
+	sys := []SyslogRow{}
+	if e.xport != nil {
+		a, err := e.xport.QueryAPI(limit, "", "", rid)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if a != nil {
+			api = a
+		}
+		s, err := e.xport.QuerySyslog(limit, "", rid, "")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if s != nil {
+			sys = s
+		}
+	}
+
+	writeJSON(w, map[string]any{
+		"request_id": rid,
+		"audit":      audit,
+		"api":        api,
+		"sys":        sys,
+		"counts":     map[string]int{"audit": len(audit), "api": len(api), "sys": len(sys)},
+		"completeness": map[string]string{
+			"audit": e.streamSource("audit"),
+			"api":   e.streamSource("api"),
+			"sys":   e.streamSource("sys"),
+		},
+	})
 }
 
 func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
