@@ -81,6 +81,10 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
+	// Sentinel invariant: one stable boot-window id per process, in effect for
+	// context-less stream rows until the first real request arrives.
+	e.xport.serviceID = e.serviceID
+	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
 	// FR1: attach opt-in stream stores as write-through sinks + read source,
 	// and flip their completeness class to store-backed.
 	e.apiStore = cfg.APIStore

@@ -76,6 +76,13 @@ type Transport struct {
 	API         *RingBuffer[APIRow]
 	SyslogStore *StreamStore
 	APIStore    *StreamStore
+
+	// Sentinel invariant: rows written before the first real request belong to
+	// one stable boot window; context-less rows after that are orphans.
+	serviceID     string
+	bootRequestID string
+	bootMu        sync.Mutex
+	bootOver      bool
 }
 
 func NewTransport(maxlen int) *Transport {
@@ -85,9 +92,32 @@ func NewTransport(maxlen int) *Transport {
 	}
 }
 
+// stampRequestID guarantees a non-empty request_id on every stream row (the
+// sentinel invariant). A real id ends the boot window; a missing id is filled
+// with the shared boot sentinel during startup, else a unique orphan id.
+func (t *Transport) stampRequestID(row map[string]any) {
+	if rid, _ := row["request_id"].(string); rid != "" {
+		if !IsSentinel(rid) {
+			t.bootMu.Lock()
+			t.bootOver = true
+			t.bootMu.Unlock()
+		}
+		return
+	}
+	t.bootMu.Lock()
+	useBoot := t.bootRequestID != "" && !t.bootOver
+	t.bootMu.Unlock()
+	if useBoot {
+		row["request_id"] = t.bootRequestID
+	} else {
+		row["request_id"] = MintSentinel("orphan", t.serviceID)
+	}
+}
+
 // PushSyslog buffers a syslog row (+ persists if a store is attached).
 // No stdout write — caller (slog handler) owns that.
 func (t *Transport) PushSyslog(row SyslogRow) {
+	t.stampRequestID(row)
 	t.Syslog.Push(row)
 	if t.SyslogStore != nil {
 		if err := t.SyslogStore.Insert(row); err != nil {
@@ -99,6 +129,7 @@ func (t *Transport) PushSyslog(row SyslogRow) {
 // PushAPI buffers an API request row (+ persists if a store is attached).
 // No stdout write — middleware owns logging.
 func (t *Transport) PushAPI(row APIRow) {
+	t.stampRequestID(row)
 	t.API.Push(row)
 	if t.APIStore != nil {
 		if err := t.APIStore.Insert(row); err != nil {

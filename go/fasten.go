@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -351,6 +352,48 @@ func MintID() string {
 	b := make([]byte, 6)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// sentinelKinds are the namespaces for rows written outside a real request
+// context. Stamping one (instead of leaving request_id empty) keeps every
+// stream row correlatable and self-describing — see the sentinel invariant.
+var sentinelKinds = []string{"boot", "sched", "bg", "lib", "orphan"}
+
+// MintSentinel mints a namespaced sentinel request_id (e.g.
+// "orphan-svc-ab12cd34ef56"). boot is minted once per process and shared; the
+// others are per-task/per-write. Panics on an unknown kind (a programming
+// error, never runtime input).
+func MintSentinel(kind, serviceID string) string {
+	if !isSentinelKind(kind) {
+		panic(fmt.Sprintf("fasten: unknown sentinel kind %q; expected one of %v", kind, sentinelKinds))
+	}
+	if serviceID == "" {
+		serviceID = "svc"
+	}
+	return fmt.Sprintf("%s-%s-%s", kind, serviceID, MintID())
+}
+
+// RequestIDKind classifies a request_id by its namespace: a sentinel kind, or
+// "request" for a real correlation id. Lets a UI pivot/filter by origin.
+func RequestIDKind(requestID string) string {
+	for _, k := range sentinelKinds {
+		if strings.HasPrefix(requestID, k+"-") {
+			return k
+		}
+	}
+	return "request"
+}
+
+// IsSentinel reports whether requestID is a minted sentinel, not a real id.
+func IsSentinel(requestID string) bool { return RequestIDKind(requestID) != "request" }
+
+func isSentinelKind(kind string) bool {
+	for _, k := range sentinelKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // WithRequestID returns ctx with the id as the ambient correlation id.

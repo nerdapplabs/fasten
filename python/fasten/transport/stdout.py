@@ -20,6 +20,7 @@ import json
 import sys
 from typing import Any
 
+from ..context import is_sentinel, mint_sentinel
 from ..store.ring import RingBuffer
 from ..store.stream import StreamStore
 
@@ -40,16 +41,38 @@ class StdoutTransport:
         *,
         api_store: StreamStore | None = None,
         syslog_store: StreamStore | None = None,
+        service_id: str = "",
+        boot_request_id: str | None = None,
     ) -> None:
         self._syslog = RingBuffer(maxlen=maxlen)
         self._api = RingBuffer(maxlen=maxlen)
         self._api_store = api_store
         self._syslog_store = syslog_store
+        self._service_id = service_id
+        # Sentinel invariant: rows written before the first real request belong
+        # to one stable boot window; context-less rows after that are orphans.
+        self._boot_request_id = boot_request_id
+        self._boot_over = False
+
+    def _stamp_request_id(self, row: dict[str, Any]) -> None:
+        """Guarantee a non-empty request_id on every stream row (the sentinel
+        invariant). A real id ends the boot window; a missing id is filled with
+        the shared boot sentinel during startup, else a unique orphan id."""
+        rid = row.get("request_id")
+        if rid:
+            if not is_sentinel(rid):
+                self._boot_over = True
+            return
+        if self._boot_request_id is not None and not self._boot_over:
+            row["request_id"] = self._boot_request_id
+        else:
+            row["request_id"] = mint_sentinel("orphan", self._service_id)
 
     # ── syslog ──────────────────────────────────────────────────────────────
 
     def write_syslog(self, row: dict[str, Any]) -> None:
         """Write to stdout AND buffer (+ persist if configured)."""
+        self._stamp_request_id(row)
         self._syslog.push(row)
         if self._syslog_store is not None:
             self._syslog_store.insert(row)
@@ -58,6 +81,7 @@ class StdoutTransport:
 
     def push_syslog(self, row: dict[str, Any]) -> None:
         """Buffer only — no stdout (+ persist if configured)."""
+        self._stamp_request_id(row)
         self._syslog.push(row)
         if self._syslog_store is not None:
             self._syslog_store.insert(row)
@@ -75,6 +99,7 @@ class StdoutTransport:
         `query_syslog()` continue to return drainer events for adopters
         who never look at stderr.
         """
+        self._stamp_request_id(row)
         self._syslog.push(row)
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stderr.flush()
@@ -95,6 +120,7 @@ class StdoutTransport:
 
     def write_api(self, row: dict[str, Any]) -> None:
         """Write to stdout AND buffer (+ persist if configured)."""
+        self._stamp_request_id(row)
         self._api.push(row)
         if self._api_store is not None:
             self._api_store.insert(row)
@@ -103,6 +129,7 @@ class StdoutTransport:
 
     def push_api(self, row: dict[str, Any]) -> None:
         """Buffer only — no stdout (+ persist if configured)."""
+        self._stamp_request_id(row)
         self._api.push(row)
         if self._api_store is not None:
             self._api_store.insert(row)

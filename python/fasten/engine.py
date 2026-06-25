@@ -124,6 +124,7 @@ class Engine:
         self._lock = threading.Lock()
         self._seq: int = 0
         self._prev_hash: str = "genesis"  # P1-23: hash chain
+        self._boot_request_id: Optional[str] = None  # sentinel boot-window id
 
         self._service_id: str = ""
         self._node_id: str = ""
@@ -271,9 +272,15 @@ class Engine:
             replacement=cfg.redact_replacement,
             extra_value_patterns=cfg.extra_value_redact_patterns,
         )
+        # Sentinel invariant: one stable boot-window id per process, in effect
+        # for context-less stream rows until the first real request arrives.
+        from .context import mint_sentinel
+        self._boot_request_id = mint_sentinel("boot", cfg.service_id)
         self._stdout = StdoutTransport(
             api_store=self._api_store,
             syslog_store=self._syslog_store,
+            service_id=cfg.service_id,
+            boot_request_id=self._boot_request_id,
         )
         self._failure_strategy = cfg.audit_store_failure_strategy
 
