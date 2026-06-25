@@ -46,6 +46,7 @@ def router(
     *,
     store: Any = None,
     transport: Any = None,
+    persist_streams: frozenset[str] | None = None,
 ) -> Any:
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
@@ -56,6 +57,11 @@ def router(
         store: Optional AuditRepository override. Default: pulled from
             ``fasten.init()`` at request time via ``fasten.audit_store()``.
         transport: Optional StdoutTransport override. Default: same.
+        persist_streams: Streams served from the durable store rather than
+            a bounded ring. Drives the per-stream ``completeness`` flag on
+            every read (``store`` vs ``ring``). Default ``{"audit"}`` —
+            today's behaviour: only audit is persisted, api/sys are rings.
+            Phase 1 (FR1) wires this from config once api/sys can persist.
     """
     try:
         from fastapi import APIRouter, Query
@@ -66,11 +72,18 @@ def router(
 
     r = APIRouter(dependencies=dependencies or [])
 
+    _persisted = persist_streams if persist_streams is not None else frozenset({"audit"})
+
     def _store() -> Any:
         return store if store is not None else _active_audit_store()
 
     def _transport() -> Any:
         return transport if transport is not None else _active_transport()
+
+    def _source(stream: str) -> str:
+        """FR4: report whether a stream's rows came from the durable store
+        or a bounded ring, so consumers stay honest about gaps."""
+        return "store" if stream in _persisted else "ring"
 
     @r.get("/sys")
     def get_sys(
@@ -81,14 +94,18 @@ def router(
     ) -> dict[str, Any]:
         t = _transport()
         if t is None:
-            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+            return {
+                "rows": [],
+                "completeness": {"sys": _source("sys")},
+                "error": "transport not initialised — call fasten.init() first",
+            }
         rows = t.query_syslog(
             limit=limit,
             level=level,
             request_id=request_id,
             service_id=service_id,
         )
-        return {"rows": rows}
+        return {"rows": rows, "completeness": {"sys": _source("sys")}}
 
     @r.get("/api")
     def get_api(
@@ -99,14 +116,18 @@ def router(
     ) -> dict[str, Any]:
         t = _transport()
         if t is None:
-            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+            return {
+                "rows": [],
+                "completeness": {"api": _source("api")},
+                "error": "transport not initialised — call fasten.init() first",
+            }
         rows = t.query_api(
             limit=limit,
             method=method,
             path=path,
             request_id=request_id,
         )
-        return {"rows": rows}
+        return {"rows": rows, "completeness": {"api": _source("api")}}
 
     @r.get("/audit")
     def get_audit(
@@ -127,6 +148,7 @@ def router(
             return {
                 "rows": [],
                 "total": 0,
+                "completeness": {"audit": _source("audit")},
                 "error": "audit store not initialised — call fasten.init() first",
             }
         filters = dict(
@@ -142,6 +164,7 @@ def router(
             "total": total,
             "limit": limit,
             "offset": offset,
+            "completeness": {"audit": _source("audit")},
         }
 
     @r.get("/topology")

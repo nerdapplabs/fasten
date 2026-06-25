@@ -32,6 +32,12 @@ type Engine struct {
 	seq             int64 // accessed via atomic ops
 	failureStrategy string
 
+	// FR4 (Phase 0): streams served from the durable store rather than a
+	// bounded ring. Drives the per-stream completeness flag on every reader
+	// read. Seeded to {"audit"} in Init — today's behaviour. Phase 1 (FR1)
+	// populates this from config once api/sys can persist.
+	persistedStreams map[string]bool
+
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
 	// assignment so concurrent Emit calls produce a consistent, gapless chain.
 	hashMu   sync.Mutex
@@ -74,6 +80,7 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
+	e.persistedStreams = map[string]bool{"audit": true}
 
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,
@@ -294,6 +301,7 @@ func (e *Engine) ResetForTests() {
 	e.tenantID = ""
 	e.auditStore = nil
 	e.xport = nil
+	e.persistedStreams = nil
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
 	e.hashMu.Lock()

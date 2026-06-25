@@ -101,9 +101,20 @@ func (e *Engine) NewReader() http.Handler {
 // NewReader is a package-level shorthand for Default.NewReader().
 func NewReader() http.Handler { return Default.NewReader() }
 
+// streamSource reports whether a stream's rows came from the durable store
+// or a bounded ring (FR4), so consumers stay honest about gaps. Defaults to
+// "ring" unless the stream is in persistedStreams; a nil map (engine never
+// Init'd) still treats audit as the store, matching the reader's data paths.
+func (e *Engine) streamSource(stream string) string {
+	if e.persistedStreams[stream] || (e.persistedStreams == nil && stream == "audit") {
+		return "store"
+	}
+	return "ring"
+}
+
 func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if e.xport == nil {
-		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
+		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"sys": e.streamSource("sys")}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
@@ -112,12 +123,12 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
-	writeJSON(w, map[string]any{"rows": rows})
+	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"sys": e.streamSource("sys")}})
 }
 
 func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if e.xport == nil {
-		writeJSON(w, map[string]any{"rows": []any{}, "error": "fasten not initialised"})
+		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"api": e.streamSource("api")}, "error": "fasten not initialised"})
 		return
 	}
 	q := r.URL.Query()
@@ -126,12 +137,12 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []APIRow{}
 	}
-	writeJSON(w, map[string]any{"rows": rows})
+	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"api": e.streamSource("api")}})
 }
 
 func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if e.auditStore == nil {
-		writeJSON(w, map[string]any{"rows": []any{}, "error": "audit store not configured"})
+		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"audit": e.streamSource("audit")}, "error": "audit store not configured"})
 		return
 	}
 	q := r.URL.Query()
@@ -173,7 +184,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		v := rows[len(rows)-1].MonotonicSeq
 		nextAfter = &v
 	}
-	writeJSON(w, map[string]any{"rows": out, "next_after": nextAfter})
+	writeJSON(w, map[string]any{"rows": out, "next_after": nextAfter, "completeness": map[string]string{"audit": e.streamSource("audit")}})
 }
 
 func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
