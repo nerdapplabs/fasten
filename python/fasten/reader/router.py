@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .. import audit_store as _active_audit_store
+from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
 from .. import transport as _active_transport
 
@@ -59,9 +60,10 @@ def router(
         transport: Optional StdoutTransport override. Default: same.
         persist_streams: Streams backed by the durable store rather than a
             bounded ring. Drives the per-stream ``completeness`` flag on
-            every read (``store`` vs ``ring``). Default ``{"audit"}`` —
-            audit is the only store-backed stream today, api/sys are rings.
-            Phase 1 wires this from config once api/sys can persist.
+            every read (``store`` vs ``ring``). Default: resolved per request
+            from the live engine config (``fasten.persisted_streams()``) —
+            ``audit`` always, plus ``api``/``sys`` when a stream store is
+            configured. Pass an explicit set to override.
     """
     try:
         from fastapi import APIRouter, Query
@@ -72,8 +74,6 @@ def router(
 
     r = APIRouter(dependencies=dependencies or [])
 
-    _persisted = persist_streams if persist_streams is not None else frozenset({"audit"})
-
     def _store() -> Any:
         return store if store is not None else _active_audit_store()
 
@@ -83,8 +83,11 @@ def router(
     def _source(stream: str) -> str:
         """Report whether a stream is backed by the durable store or a bounded
         ring — its configured durability class, not the provenance of any
-        single response — so consumers stay honest about gaps."""
-        return "store" if stream in _persisted else "ring"
+        single response — so consumers stay honest about gaps. When
+        ``persist_streams`` is not pinned, resolve it from the live engine
+        config so the flag tracks which streams actually persist (FR1)."""
+        persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
+        return "store" if stream in persisted else "ring"
 
     @r.get("/sys")
     def get_sys(

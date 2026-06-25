@@ -30,6 +30,7 @@ from .emitter import (
     list_unshipped,
     log,
     mark_shipped,
+    persisted_streams,
     queue_stats,
     redactor,
     start,
@@ -85,6 +86,7 @@ __all__ = [
     "log",
     # adopter hooks
     "audit_store",
+    "persisted_streams",
     "redactor",
     "transport",
 ]

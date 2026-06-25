@@ -60,6 +60,7 @@ class FastenConfig:
     tenant_id: Optional[str]
     audit_store: Any
     api_store: Any
+    syslog_store: Any
     redact_replacement: str
     extra_redact_keys: Optional[list[str]]
     extra_value_redact_patterns: Optional[list[tuple[str, str, str]]]
@@ -87,6 +88,30 @@ def _store_from_dsn(dsn: str) -> Any:
     return SQLiteStore.from_dsn(dsn)
 
 
+def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
+    """Build a per-stream store (api/sys) from a DSN. SQLite-only in v1 —
+    Postgres/other stream backends are a later phase (the audit store, by
+    contrast, already supports Postgres)."""
+    from urllib.parse import parse_qs, urlparse
+
+    if dsn.startswith(("postgres://", "postgresql://")):
+        raise NotImplementedError(
+            "fasten: api/sys stream persistence is SQLite-only in v1; "
+            "a pluggable Postgres stream store lands in a later phase."
+        )
+    from .store.stream import StreamStore
+
+    u = urlparse(dsn)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    path = u.path.lstrip("/")
+    if not path:
+        raise ValueError(
+            f"fasten: stream DSN {dsn!r} has no path. Use sqlite:///./streams.db"
+        )
+    return StreamStore(path=path, table=q.get("table", default_table),
+                       wal=q.get("wal", "true") != "false")
+
+
 class Engine:
     """
     A single fasten runtime instance.
@@ -105,6 +130,7 @@ class Engine:
         self._tenant_id: Optional[str] = None
         self._audit_store: Any = None
         self._api_store: Any = None
+        self._syslog_store: Any = None
         self._stdout: Optional[StdoutTransport] = None
         self._redactor: Redactor = Redactor()
         self._failure_strategy: str = "queue"
@@ -127,6 +153,7 @@ class Engine:
         tenant_id: Optional[str] = None,
         audit_store: Any = None,
         api_store: Any = None,
+        syslog_store: Any = None,
         extra_redact_keys: Optional[list[str]] = None,
         redact_replacement: Optional[str] = None,
         extra_value_redact_patterns: Optional[list[tuple[str, str, str]]] = None,
@@ -160,11 +187,19 @@ class Engine:
             # optional. Adopters who need persistence must supply audit_store= or
             # set FASTEN_AUDIT_DSN.
 
+        # api/sys persistence (FR1) — opt-in, SQLite-backed StreamStore. When
+        # unset the stream falls back to ring-only (today's behaviour).
         resolved_api_store = api_store
         if resolved_api_store is None:
             dsn = os.environ.get("FASTEN_API_DSN")
             if dsn:
-                resolved_api_store = _store_from_dsn(dsn)
+                resolved_api_store = _stream_store_from_dsn(dsn, "api_log")
+
+        resolved_syslog_store = syslog_store
+        if resolved_syslog_store is None:
+            dsn = os.environ.get("FASTEN_SYSLOG_DSN")
+            if dsn:
+                resolved_syslog_store = _stream_store_from_dsn(dsn, "syslog")
 
         raw_keys = extra_redact_keys or (
             os.environ.get("FASTEN_REDACT_KEYS", "").split(",")
@@ -186,6 +221,7 @@ class Engine:
             tenant_id=tid,
             audit_store=resolved_store,
             api_store=resolved_api_store,
+            syslog_store=resolved_syslog_store,
             redact_replacement=replacement,
             extra_redact_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
             extra_value_redact_patterns=extra_value_redact_patterns,
@@ -205,6 +241,7 @@ class Engine:
         self._tenant_id  = cfg.tenant_id
         self._audit_store = cfg.audit_store
         self._api_store   = cfg.api_store
+        self._syslog_store = cfg.syslog_store
 
         if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
             # Seed seq from THIS engine's own (service_id, source_node_id)
@@ -234,7 +271,10 @@ class Engine:
             replacement=cfg.redact_replacement,
             extra_value_patterns=cfg.extra_value_redact_patterns,
         )
-        self._stdout = StdoutTransport()
+        self._stdout = StdoutTransport(
+            api_store=self._api_store,
+            syslog_store=self._syslog_store,
+        )
         self._failure_strategy = cfg.audit_store_failure_strategy
 
         if cfg.audit_store_failure_strategy == "queue":
@@ -257,6 +297,7 @@ class Engine:
         tenant_id: str | None = None,
         audit_store: Any | None = None,
         api_store: Any | None = None,
+        syslog_store: Any | None = None,
         extra_redact_keys: list[str] | None = None,
         redact_replacement: str | None = None,
         extra_value_redact_patterns: list[Any] | None = None,
@@ -270,7 +311,7 @@ class Engine:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(
             service_id=service_id, node_id=node_id, tenant_id=tenant_id,
-            audit_store=audit_store, api_store=api_store,
+            audit_store=audit_store, api_store=api_store, syslog_store=syslog_store,
             extra_redact_keys=extra_redact_keys, redact_replacement=redact_replacement,
             extra_value_redact_patterns=extra_value_redact_patterns,
             audit_store_failure_strategy=audit_store_failure_strategy,
@@ -411,6 +452,17 @@ class Engine:
         """Active AuditRepository, or None if init() has not been called."""
         return self._audit_store
 
+    def persisted_streams(self) -> frozenset[str]:
+        """Streams backed by the durable store rather than a bounded ring
+        (FR4 completeness). ``audit`` is always store-backed; ``api``/``sys``
+        join the set only when a stream store is configured (FR1)."""
+        streams = {"audit"}
+        if self._api_store is not None:
+            streams.add("api")
+        if self._syslog_store is not None:
+            streams.add("sys")
+        return frozenset(streams)
+
     def _require_store(self, op: str) -> Any:
         store = self._audit_store
         if store is None:
@@ -460,6 +512,7 @@ class Engine:
         self._tenant_id     = None
         self._audit_store   = None
         self._api_store     = None
+        self._syslog_store  = None
         self._stdout        = None
         self._redactor      = Redactor()
         self._failure_strategy = "queue"

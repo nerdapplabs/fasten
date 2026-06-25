@@ -31,38 +31,38 @@ import (
 type Severity string
 
 const (
-	SevDebug    Severity = "debug"  // Low-level diagnostic, filtered in production
-	SevInfo     Severity = "info"  // Normal operational event (default)
-	SevWarn     Severity = "warn"  // Potentially problematic, not yet an error
-	SevError    Severity = "error"  // Operation failed, requires attention
-	SevCritical Severity = "critical"  // Severe failure, may impact availability
+	SevDebug    Severity = "debug"    // Low-level diagnostic, filtered in production
+	SevInfo     Severity = "info"     // Normal operational event (default)
+	SevWarn     Severity = "warn"     // Potentially problematic, not yet an error
+	SevError    Severity = "error"    // Operation failed, requires attention
+	SevCritical Severity = "critical" // Severe failure, may impact availability
 )
 
 type RetentionClass string
 
 const (
 	RetShort  RetentionClass = "short"  // Default 30 days
-	RetMedium RetentionClass = "medium"  // Default 180 days (default)
-	RetLong   RetentionClass = "long"  // Default 1095 days (3 years)
+	RetMedium RetentionClass = "medium" // Default 180 days (default)
+	RetLong   RetentionClass = "long"   // Default 1095 days (3 years)
 )
 
 type ActorKind string
 
 const (
-	ActorUser     ActorKind = "user"  // Human user (browser, mobile, CLI on behalf of a user)
+	ActorUser     ActorKind = "user"     // Human user (browser, mobile, CLI on behalf of a user)
 	ActorService  ActorKind = "service"  // Internal service or daemon (default)
-	ActorSchedule ActorKind = "schedule"  // Cron job or task scheduler
-	ActorAgent    ActorKind = "agent"  // AI agent
+	ActorSchedule ActorKind = "schedule" // Cron job or task scheduler
+	ActorAgent    ActorKind = "agent"    // AI agent
 )
 
 const (
-	MethodHTTP      = "http"  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
-	MethodMQTT      = "mqtt"  // MQTT message (IoT telemetry, device command)
-	MethodCLI       = "cli"  // CLI command typed by a human
+	MethodHTTP      = "http"       // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+	MethodMQTT      = "mqtt"       // MQTT message (IoT telemetry, device command)
+	MethodCLI       = "cli"        // CLI command typed by a human
 	MethodScheduler = "scheduler"  // Automated cron or task scheduler
-	MethodUI        = "ui"  // Web or desktop UI action, human-initiated
-	MethodAgentTool = "agent_tool"  // AI agent tool call
-	MethodSDK       = "sdk"  // Direct SDK call, no transport shim active. Default. (default)
+	MethodUI        = "ui"         // Web or desktop UI action, human-initiated
+	MethodAgentTool = "agent_tool" // AI agent tool call
+	MethodSDK       = "sdk"        // Direct SDK call, no transport shim active. Default. (default)
 )
 
 const RedactReplacement = "***"
@@ -84,6 +84,7 @@ var RedactPatterns = []string{
 	"cookie",
 	"credential",
 }
+
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 // ── Anchors ───────────────────────────────────────────────────────────────
@@ -104,27 +105,27 @@ const (
 
 // Row is the canonical audit row — lossless conversion to CloudEvent / OTel.
 type Row struct {
-	WireVersion  string         `json:"wire_version"`
-	ID           string         `json:"id"`
-	OriginID     string         `json:"origin_id"`
-	MonotonicSeq int64          `json:"monotonic_seq"`
-	Timestamp    time.Time      `json:"timestamp"`
-	Code         Code           `json:"code"`
-	Action       string         `json:"action"`
-	Severity     Severity       `json:"severity"`
-	ServiceID    string         `json:"service_id"`
-	SourceNodeID string         `json:"source_node_id"`
+	WireVersion  string    `json:"wire_version"`
+	ID           string    `json:"id"`
+	OriginID     string    `json:"origin_id"`
+	MonotonicSeq int64     `json:"monotonic_seq"`
+	Timestamp    time.Time `json:"timestamp"`
+	Code         Code      `json:"code"`
+	Action       string    `json:"action"`
+	Severity     Severity  `json:"severity"`
+	ServiceID    string    `json:"service_id"`
+	SourceNodeID string    `json:"source_node_id"`
 	// TenantID is always emitted (null when absent) per the "always emit the
 	// key" convention so readers see a consistent shape across SDKs.
-	TenantID     *string        `json:"tenant_id"`
-	Actor        string         `json:"actor"`
-	ActorKind    string         `json:"actor_kind"`
-	Target       string         `json:"target"`
-	Category     string         `json:"category"`
-	Domain       Domain         `json:"domain"`
-	Method       string         `json:"method"`
-	RequestID    string         `json:"request_id"`
-	Detail       map[string]any `json:"detail"`
+	TenantID  *string        `json:"tenant_id"`
+	Actor     string         `json:"actor"`
+	ActorKind string         `json:"actor_kind"`
+	Target    string         `json:"target"`
+	Category  string         `json:"category"`
+	Domain    Domain         `json:"domain"`
+	Method    string         `json:"method"`
+	RequestID string         `json:"request_id"`
+	Detail    map[string]any `json:"detail"`
 	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
@@ -423,6 +424,12 @@ type Config struct {
 	TenantID   string
 	AuditStore AuditRepository
 
+	// FR1: opt-in durable persistence for the api/sys streams. Nil → that
+	// stream stays ring-only (default, backward compatible). Construct with
+	// NewStreamStore(db, table); the caller owns the *sql.DB as with AuditStore.
+	APIStore    *StreamStore
+	SyslogStore *StreamStore
+
 	// P1-15
 	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
 	QueueCapacity             int           // default 100
@@ -492,18 +499,24 @@ func firstNonEmpty(vals ...string) string {
 func rowToMap(r Row) map[string]any {
 	d := map[string]any{
 		"wire_version": r.WireVersion,
-		"id": r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
+		"id":           r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
 		"timestamp": r.Timestamp.Format(time.RFC3339Nano),
-		"code": string(r.Code), "action": r.Action, "severity": string(r.Severity),
+		"code":      string(r.Code), "action": r.Action, "severity": string(r.Severity),
 		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": func() any {
-			if r.TenantID != nil { return *r.TenantID }; return nil
+			if r.TenantID != nil {
+				return *r.TenantID
+			}
+			return nil
 		}(),
 		"actor": r.Actor, "actor_kind": r.ActorKind,
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
 		"pii_in_detail": r.PiiInDetail,
 		"canonical_form_id": func() string {
-			if r.CanonicalFormID == "" { return "1" }; return r.CanonicalFormID
+			if r.CanonicalFormID == "" {
+				return "1"
+			}
+			return r.CanonicalFormID
 		}(),
 		"prev_hash": r.PrevHash,
 	}

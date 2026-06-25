@@ -122,7 +122,11 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := e.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	rows, err := e.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
@@ -136,7 +140,11 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := e.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	rows, err := e.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if rows == nil {
 		rows = []APIRow{}
 	}
@@ -207,7 +215,9 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 					storeBlock["last_error"] = fmt.Sprintf("panic: %v", p)
 				}
 			}()
-			if counter, ok := store.(interface{ Count(context.Context) (int, error) }); ok {
+			if counter, ok := store.(interface {
+				Count(context.Context) (int, error)
+			}); ok {
 				n, err := counter.Count(r.Context())
 				if err != nil {
 					storeBlock["last_error"] = err.Error()

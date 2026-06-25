@@ -88,6 +88,11 @@ def audit_store() -> Any:
     return _default.audit_store()
 
 
+def persisted_streams() -> frozenset[str]:
+    """Streams of the default Engine backed by the durable store vs a ring."""
+    return _default.persisted_streams()
+
+
 def init_config(*args: Any, **kwargs: Any) -> Any:
     """Resolve init parameters to a FastenConfig without starting runtime."""
     return _default.init_config(*args, **kwargs)

@@ -21,24 +21,46 @@ import sys
 from typing import Any
 
 from ..store.ring import RingBuffer
+from ..store.stream import StreamStore
 
 
 class StdoutTransport:
-    def __init__(self, maxlen: int = 2000) -> None:
+    """Stdout writer + in-memory rings for the ``sys``/``api`` streams.
+
+    When a stream store is supplied (FR1, opt-in persistence) the ring stays
+    the hot write path and the store is a write-through sink; reads for that
+    stream are served from the store so they reach durable history instead of
+    a bounded window. Without a store the stream is ring-only — today's
+    backward-compatible behaviour.
+    """
+
+    def __init__(
+        self,
+        maxlen: int = 2000,
+        *,
+        api_store: StreamStore | None = None,
+        syslog_store: StreamStore | None = None,
+    ) -> None:
         self._syslog = RingBuffer(maxlen=maxlen)
         self._api = RingBuffer(maxlen=maxlen)
+        self._api_store = api_store
+        self._syslog_store = syslog_store
 
     # ── syslog ──────────────────────────────────────────────────────────────
 
     def write_syslog(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer. Used by fasten's own logger."""
+        """Write to stdout AND buffer (+ persist if configured)."""
         self._syslog.push(row)
+        if self._syslog_store is not None:
+            self._syslog_store.insert(row)
         sys.stdout.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stdout.flush()
 
     def push_syslog(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout. Used by adopters that own their stdout."""
+        """Buffer only — no stdout (+ persist if configured)."""
         self._syslog.push(row)
+        if self._syslog_store is not None:
+            self._syslog_store.insert(row)
 
     def write_drainer_syslog(self, row: dict[str, Any]) -> None:
         """Drainer self-report path. Buffers + writes to STDERR, never stdout.
@@ -65,20 +87,25 @@ class StdoutTransport:
         request_id: str | None = None,
         service_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self._syslog.query(limit=limit, level=level,
-                                  request_id=request_id, service_id=service_id)
+        src = self._syslog_store if self._syslog_store is not None else self._syslog
+        return src.query(limit=limit, level=level,
+                         request_id=request_id, service_id=service_id)
 
     # ── api log ─────────────────────────────────────────────────────────────
 
     def write_api(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer."""
+        """Write to stdout AND buffer (+ persist if configured)."""
         self._api.push(row)
+        if self._api_store is not None:
+            self._api_store.insert(row)
         sys.stdout.write(json.dumps({"shape": "api", **row}, default=str) + "\n")
         sys.stdout.flush()
 
     def push_api(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout."""
+        """Buffer only — no stdout (+ persist if configured)."""
         self._api.push(row)
+        if self._api_store is not None:
+            self._api_store.insert(row)
 
     def query_api(
         self,
@@ -88,8 +115,9 @@ class StdoutTransport:
         path: str | None = None,
         request_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self._api.query(limit=limit, method=method,
-                               path=path, request_id=request_id)
+        src = self._api_store if self._api_store is not None else self._api
+        return src.query(limit=limit, method=method,
+                         path=path, request_id=request_id)
 
     # ── audit ────────────────────────────────────────────────────────────────
 

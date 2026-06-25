@@ -3,6 +3,7 @@ package fasten
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 )
 
@@ -19,8 +20,8 @@ type RingBuffer[T any] struct {
 	buf   []T
 	mu    sync.RWMutex
 	cap   int
-	head  int  // index of next-write slot in buf
-	count int  // entries currently stored (<= cap)
+	head  int // index of next-write slot in buf
+	count int // entries currently stored (<= cap)
 }
 
 func newRingBuffer[T any](capacity int) *RingBuffer[T] {
@@ -65,9 +66,16 @@ type APIRow map[string]any
 // Transport owns the ring buffers and stdout writes.
 // Syslog and API use push-only (no stdout duplication — caller owns stdout).
 // Audit writes to stdout for belt-and-braces capture.
+//
+// When a stream store is attached (FR1, opt-in persistence) the ring stays
+// the hot write path and the store is a write-through sink; reads for that
+// stream are served from the store so they reach durable history instead of
+// a bounded window. Without a store the stream is ring-only (default).
 type Transport struct {
-	Syslog *RingBuffer[SyslogRow]
-	API    *RingBuffer[APIRow]
+	Syslog      *RingBuffer[SyslogRow]
+	API         *RingBuffer[APIRow]
+	SyslogStore *StreamStore
+	APIStore    *StreamStore
 }
 
 func NewTransport(maxlen int) *Transport {
@@ -77,11 +85,27 @@ func NewTransport(maxlen int) *Transport {
 	}
 }
 
-// PushSyslog buffers a syslog row. No stdout write — caller (slog handler) owns that.
-func (t *Transport) PushSyslog(row SyslogRow) { t.Syslog.Push(row) }
+// PushSyslog buffers a syslog row (+ persists if a store is attached).
+// No stdout write — caller (slog handler) owns that.
+func (t *Transport) PushSyslog(row SyslogRow) {
+	t.Syslog.Push(row)
+	if t.SyslogStore != nil {
+		if err := t.SyslogStore.Insert(row); err != nil {
+			fmt.Fprintf(os.Stderr, "fasten: syslog persist failed: %v\n", err)
+		}
+	}
+}
 
-// PushAPI buffers an API request row. No stdout write — middleware owns logging.
-func (t *Transport) PushAPI(row APIRow) { t.API.Push(row) }
+// PushAPI buffers an API request row (+ persists if a store is attached).
+// No stdout write — middleware owns logging.
+func (t *Transport) PushAPI(row APIRow) {
+	t.API.Push(row)
+	if t.APIStore != nil {
+		if err := t.APIStore.Insert(row); err != nil {
+			fmt.Fprintf(os.Stderr, "fasten: api persist failed: %v\n", err)
+		}
+	}
+}
 
 // SyslogDepth returns the current number of syslog rows in the ring buffer.
 func (t *Transport) SyslogDepth() int { return t.Syslog.Len() }
@@ -100,8 +124,22 @@ func (t *Transport) WriteAudit(row map[string]any) {
 }
 
 // QuerySyslog returns up to limit syslog rows, newest-first.
-// Optionally filter by level, requestID, serviceID.
-func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) []SyslogRow {
+// Optionally filter by level, requestID, serviceID. Served from the durable
+// store when one is attached, otherwise from the in-memory ring.
+func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) ([]SyslogRow, error) {
+	if t.SyslogStore != nil {
+		rows, err := t.SyslogStore.Query(limit, map[string]string{
+			"level": level, "request_id": requestID, "service_id": serviceID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out := make([]SyslogRow, len(rows))
+		for i, r := range rows {
+			out[i] = SyslogRow(r)
+		}
+		return out, nil
+	}
 	all := t.Syslog.All()
 	var out []SyslogRow
 	for _, r := range all {
@@ -119,11 +157,25 @@ func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) [
 			break
 		}
 	}
-	return out
+	return out, nil
 }
 
-// QueryAPI returns up to limit API rows, newest-first.
-func (t *Transport) QueryAPI(limit int, method, path, requestID string) []APIRow {
+// QueryAPI returns up to limit API rows, newest-first. Served from the
+// durable store when one is attached, otherwise from the in-memory ring.
+func (t *Transport) QueryAPI(limit int, method, path, requestID string) ([]APIRow, error) {
+	if t.APIStore != nil {
+		rows, err := t.APIStore.Query(limit, map[string]string{
+			"method": method, "path": path, "request_id": requestID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out := make([]APIRow, len(rows))
+		for i, r := range rows {
+			out[i] = APIRow(r)
+		}
+		return out, nil
+	}
 	all := t.API.All()
 	var out []APIRow
 	for _, r := range all {
@@ -144,5 +196,5 @@ func (t *Transport) QueryAPI(limit int, method, path, requestID string) []APIRow
 			break
 		}
 	}
-	return out
+	return out, nil
 }
