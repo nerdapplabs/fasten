@@ -41,7 +41,7 @@ func TestSentinel_ContextlessPushGetsBootThenOrphan(t *testing.T) {
 	tr.PushAPI(APIRow{"method": "GET", "path": "/c"})                         // orphan
 
 	got := map[string]string{}
-	rows, err := tr.QueryAPI(100, "", "", "")
+	rows, err := tr.QueryAPI(100, StreamQuery{})
 	if err != nil {
 		t.Fatalf("QueryAPI: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestSentinel_ExplicitRequestIDUntouched(t *testing.T) {
 	}
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{"level": "warn", "event": "x", "request_id": "my-own-id"})
-	rows, _ := tr.QuerySyslog(100, "", "", "")
+	rows, _ := tr.QuerySyslog(100, StreamQuery{})
 	if rows[0]["request_id"] != "my-own-id" {
 		t.Errorf("explicit id changed to %v", rows[0]["request_id"])
 	}
@@ -86,8 +86,8 @@ func TestSentinel_NoStreamRowLacksRequestID(t *testing.T) {
 	tr.PushSyslog(SyslogRow{"level": "error", "event": "boom", "request_id": "op-1"})
 	tr.PushSyslog(SyslogRow{"level": "info", "event": "bg.tick"}) // orphan
 
-	sys, _ := tr.QuerySyslog(1000, "", "", "")
-	api, _ := tr.QueryAPI(1000, "", "", "")
+	sys, _ := tr.QuerySyslog(1000, StreamQuery{})
+	api, _ := tr.QueryAPI(1000, StreamQuery{})
 	n := 0
 	for _, r := range sys {
 		if rid, _ := r["request_id"].(string); rid == "" {
@@ -113,7 +113,7 @@ func TestSentinel_BootRowsAreCorrelatable(t *testing.T) {
 	}
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{"level": "error", "event": "db.connect.failed"}) // boot
-	rows, _ := tr.QuerySyslog(100, "", "", "")
+	rows, _ := tr.QuerySyslog(100, StreamQuery{})
 	bootID := rows[0]["request_id"].(string)
 	if RequestIDKind(bootID) != "boot" {
 		t.Fatalf("expected boot id, got %q", bootID)

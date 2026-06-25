@@ -123,7 +123,14 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows, err := e.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
+		Level:     q.Get("level"),
+		RequestID: q.Get("request_id"),
+		ServiceID: q.Get("service_id"),
+		Event:     q.Get("event"),
+		Since:     q.Get("since"),
+		Until:     q.Get("until"),
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -141,7 +148,14 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows, err := e.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	rows, err := e.xport.QueryAPI(limit, StreamQuery{
+		Method:    q.Get("method"),
+		Path:      q.Get("path"),
+		RequestID: q.Get("request_id"),
+		Status:    q.Get("status"),
+		Since:     q.Get("since"),
+		Until:     q.Get("until"),
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -180,7 +194,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	api := []APIRow{}
 	sys := []SyslogRow{}
 	if e.xport != nil {
-		a, err := e.xport.QueryAPI(limit, "", "", rid)
+		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -188,7 +202,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		if a != nil {
 			api = a
 		}
-		s, err := e.xport.QuerySyslog(limit, "", rid, "")
+		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

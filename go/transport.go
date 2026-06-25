@@ -154,14 +154,42 @@ func (t *Transport) WriteAudit(row map[string]any) {
 	fmt.Println(string(b))
 }
 
-// QuerySyslog returns up to limit syslog rows, newest-first.
-// Optionally filter by level, requestID, serviceID. Served from the durable
-// store when one is attached, otherwise from the in-memory ring.
-func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) ([]SyslogRow, error) {
+// StreamQuery holds the optional filters for a sys/api stream read. Empty
+// fields are ignored. The indexed structured fields (event, status, time
+// window) are honoured identically whether the read is served from the ring
+// or the durable store.
+type StreamQuery struct {
+	Level     string // sys
+	ServiceID string // sys
+	Event     string // sys
+	Method    string // api
+	Path      string // api
+	Status    string // api ("" = no filter; matched against the row's value)
+	RequestID string // common
+	Since     string // common — timestamp >= Since (ISO-8601)
+	Until     string // common — timestamp <= Until (ISO-8601)
+}
+
+func tsOf(r map[string]any) string { s, _ := r["timestamp"].(string); return s }
+
+func inWindow(ts, since, until string) bool {
+	if since != "" && ts < since {
+		return false
+	}
+	if until != "" && ts > until {
+		return false
+	}
+	return true
+}
+
+// QuerySyslog returns up to limit syslog rows, newest-first. Served from the
+// durable store when one is attached, otherwise from the in-memory ring.
+func (t *Transport) QuerySyslog(limit int, q StreamQuery) ([]SyslogRow, error) {
 	if t.SyslogStore != nil {
 		rows, err := t.SyslogStore.Query(limit, map[string]string{
-			"level": level, "request_id": requestID, "service_id": serviceID,
-		})
+			"level": q.Level, "request_id": q.RequestID,
+			"service_id": q.ServiceID, "event": q.Event,
+		}, q.Since, q.Until)
 		if err != nil {
 			return nil, err
 		}
@@ -171,16 +199,21 @@ func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) (
 		}
 		return out, nil
 	}
-	all := t.Syslog.All()
 	var out []SyslogRow
-	for _, r := range all {
-		if level != "" && r["level"] != level {
+	for _, r := range t.Syslog.All() {
+		if q.Level != "" && r["level"] != q.Level {
 			continue
 		}
-		if requestID != "" && r["request_id"] != requestID {
+		if q.RequestID != "" && r["request_id"] != q.RequestID {
 			continue
 		}
-		if serviceID != "" && r["service_id"] != serviceID {
+		if q.ServiceID != "" && r["service_id"] != q.ServiceID {
+			continue
+		}
+		if q.Event != "" && r["event"] != q.Event {
+			continue
+		}
+		if !inWindow(tsOf(r), q.Since, q.Until) {
 			continue
 		}
 		out = append(out, r)
@@ -193,11 +226,12 @@ func (t *Transport) QuerySyslog(limit int, level, requestID, serviceID string) (
 
 // QueryAPI returns up to limit API rows, newest-first. Served from the
 // durable store when one is attached, otherwise from the in-memory ring.
-func (t *Transport) QueryAPI(limit int, method, path, requestID string) ([]APIRow, error) {
+func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {
 	if t.APIStore != nil {
 		rows, err := t.APIStore.Query(limit, map[string]string{
-			"method": method, "path": path, "request_id": requestID,
-		})
+			"method": q.Method, "path": q.Path,
+			"request_id": q.RequestID, "status": q.Status,
+		}, q.Since, q.Until)
 		if err != nil {
 			return nil, err
 		}
@@ -207,19 +241,23 @@ func (t *Transport) QueryAPI(limit int, method, path, requestID string) ([]APIRo
 		}
 		return out, nil
 	}
-	all := t.API.All()
 	var out []APIRow
-	for _, r := range all {
-		if method != "" && r["method"] != method {
+	for _, r := range t.API.All() {
+		if q.Method != "" && r["method"] != q.Method {
 			continue
 		}
-		if path != "" {
-			p, _ := r["path"].(string)
-			if path != p {
+		if q.Path != "" {
+			if p, _ := r["path"].(string); q.Path != p {
 				continue
 			}
 		}
-		if requestID != "" && r["request_id"] != requestID {
+		if q.RequestID != "" && r["request_id"] != q.RequestID {
+			continue
+		}
+		if q.Status != "" && fmt.Sprint(r["status"]) != q.Status {
+			continue
+		}
+		if !inWindow(tsOf(r), q.Since, q.Until) {
 			continue
 		}
 		out = append(out, r)

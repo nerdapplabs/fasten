@@ -111,10 +111,13 @@ class StdoutTransport:
         level: str | None = None,
         request_id: str | None = None,
         service_id: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         src = self._syslog_store if self._syslog_store is not None else self._syslog
-        return src.query(limit=limit, level=level,
-                         request_id=request_id, service_id=service_id)
+        return src.query(limit=limit, level=level, request_id=request_id,
+                         service_id=service_id, event=event, since=since, until=until)
 
     # ── api log ─────────────────────────────────────────────────────────────
 
@@ -141,10 +144,13 @@ class StdoutTransport:
         method: str | None = None,
         path: str | None = None,
         request_id: str | None = None,
+        status: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         src = self._api_store if self._api_store is not None else self._api
-        return src.query(limit=limit, method=method,
-                         path=path, request_id=request_id)
+        return src.query(limit=limit, method=method, path=path,
+                         request_id=request_id, status=status, since=since, until=until)
 
     # ── audit ────────────────────────────────────────────────────────────────
 

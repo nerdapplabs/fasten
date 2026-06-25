@@ -102,9 +102,10 @@ func (s *StreamStore) Insert(row map[string]any) error {
 }
 
 // Query returns up to limit rows newest-first, filtered by equality on the
-// given indexed columns (only columns in streamIndexedFields are honoured).
-// Mirrors the ring's exact-match filter semantics so store and ring agree.
-func (s *StreamStore) Query(limit int, eq map[string]string) ([]map[string]any, error) {
+// given indexed columns (only columns in streamIndexedFields are honoured)
+// plus an optional [since, until] window on timestamp. Mirrors the ring's
+// exact-match filter semantics so store and ring agree.
+func (s *StreamStore) Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error) {
 	var conds []string
 	var args []any
 	// Deterministic clause order for stable, testable SQL.
@@ -119,6 +120,14 @@ func (s *StreamStore) Query(limit int, eq map[string]string) ([]map[string]any, 
 		}
 		conds = append(conds, fmt.Sprintf("%s = ?", k))
 		args = append(args, eq[k])
+	}
+	if since != "" {
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, since)
+	}
+	if until != "" {
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, until)
 	}
 	where := ""
 	if len(conds) > 0 {

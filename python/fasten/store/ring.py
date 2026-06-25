@@ -30,6 +30,10 @@ class RingBuffer:
         service_id: str | None = None,
         method: str | None = None,
         path: str | None = None,
+        event: str | None = None,
+        status: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
             rows: list[dict[str, Any]] = list(self._buf)
@@ -43,6 +47,14 @@ class RingBuffer:
             rows = [r for r in rows if r.get("method", "").upper() == method.upper()]
         if path:
             rows = [r for r in rows if path.lower() in r.get("path", "").lower()]
+        if event:
+            rows = [r for r in rows if r.get("event") == event]
+        if status is not None:
+            rows = [r for r in rows if r.get("status") == status]
+        if since:
+            rows = [r for r in rows if str(r.get("timestamp", "")) >= since]
+        if until:
+            rows = [r for r in rows if str(r.get("timestamp", "")) <= until]
         return rows[:limit]
 
     def __len__(self) -> int:

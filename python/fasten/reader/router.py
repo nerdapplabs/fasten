@@ -94,6 +94,9 @@ def router(
         level: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
+        event: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
@@ -108,6 +111,9 @@ def router(
             level=level,
             request_id=request_id,
             service_id=service_id,
+            event=event,
+            since=since,
+            until=until,
         )
         return {"rows": rows, "completeness": {"sys": _source("sys")}}
 
@@ -116,6 +122,9 @@ def router(
         method: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
+        status: Optional[int] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
@@ -130,6 +139,9 @@ def router(
             method=method,
             path=path,
             request_id=request_id,
+            status=status,
+            since=since,
+            until=until,
         )
         return {"rows": rows, "completeness": {"api": _source("api")}}
 

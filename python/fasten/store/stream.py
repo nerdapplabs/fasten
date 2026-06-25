@@ -126,6 +126,10 @@ class StreamStore:
         service_id: str | None = None,
         method: str | None = None,
         path: str | None = None,
+        event: str | None = None,
+        status: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return up to ``limit`` rows newest-first, applying the same filter
         semantics as the in-memory ring so store and ring reads agree."""
@@ -146,6 +150,18 @@ class StreamStore:
         if path:
             conds.append("lower(path) LIKE ?")
             params.append(f"%{path.lower()}%")
+        if event:
+            conds.append("event = ?")
+            params.append(event)
+        if status is not None:
+            conds.append("status = ?")
+            params.append(status)
+        if since:
+            conds.append("timestamp >= ?")
+            params.append(since)
+        if until:
+            conds.append("timestamp <= ?")
+            params.append(until)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
         sql = f"SELECT payload FROM {self._table}{where} ORDER BY seq DESC LIMIT ?"
         params.append(limit)

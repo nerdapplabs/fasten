@@ -33,7 +33,7 @@ func TestStreamStore_RoundtripAndFilter(t *testing.T) {
 	must(t, s.Insert(map[string]any{"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": "r-A"}))
 	must(t, s.Insert(map[string]any{"method": "GET", "path": "/v1/health", "status": 200, "request_id": "r-B"}))
 
-	all, err := s.Query(100, nil)
+	all, err := s.Query(100, nil, "", "")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestStreamStore_RoundtripAndFilter(t *testing.T) {
 		t.Fatalf("order: got %v, want [r-B r-A]", got)
 	}
 	// request_id filter
-	one, _ := s.Query(100, map[string]string{"request_id": "r-A"})
+	one, _ := s.Query(100, map[string]string{"request_id": "r-A"}, "", "")
 	if len(one) != 1 || one[0]["path"] != "/v1/checkout" {
 		t.Fatalf("request_id filter: got %v", one)
 	}
@@ -57,7 +57,7 @@ func TestStreamStore_SurvivesBeyondRingCapacity(t *testing.T) {
 		t.Fatalf("count: got %d, want 5000", n)
 	}
 	// a request_id from long before a 2000-row ring would still hold
-	old, _ := s.Query(100, map[string]string{"request_id": "r-0"})
+	old, _ := s.Query(100, map[string]string{"request_id": "r-0"}, "", "")
 	if len(old) != 1 {
 		t.Fatalf("old request_id: got %d rows, want 1", len(old))
 	}
@@ -140,7 +140,7 @@ func TestStreamStore_StoredRowMatchesPushed(t *testing.T) {
 	s := newStreamStore(t, "api_log")
 	in := map[string]any{"method": "PUT", "path": "/v1/x", "status": 204, "request_id": "r-z", "extra": "kept"}
 	must(t, s.Insert(in))
-	out, _ := s.Query(1, nil)
+	out, _ := s.Query(1, nil, "", "")
 	b1, _ := json.Marshal(in)
 	b2, _ := json.Marshal(out[0])
 	// status round-trips through JSON as float64; compare via re-marshal of normalised maps
