@@ -14,6 +14,8 @@
 
 Audit + correlation SDK.
 
+**Beyond observability. State over time.**
+
 **For AI agents and software systems.**
 
 A software system is more than AI agents. Logs, metrics, and traces tell
