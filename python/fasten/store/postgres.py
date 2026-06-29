@@ -141,13 +141,29 @@ class PostgresStore:
         return conn
 
     def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
-        """Run fn(conn) once; on stale-connection error reconnect and retry once."""
+        """Run fn(conn) once; on stale-connection error reconnect and retry once.
+
+        After fn succeeds, roll back any transaction it left open. Write fns
+        ``commit()`` themselves (leaving the connection IDLE), but a read fn runs
+        a bare ``SELECT`` and returns — leaving the connection *idle in
+        transaction*, holding an ``ACCESS SHARE`` lock on the table until the
+        transaction ends. A long-lived reader (e.g. the engine's startup
+        hash-chain seed reads) would then block a concurrent store-init
+        ``ALTER TABLE`` (``ACCESS EXCLUSIVE``) indefinitely — the audit-store
+        deadlock. Rolling back a read here is a no-op for data and releases the
+        lock; a committed write is already IDLE, so it is left untouched."""
         import psycopg
 
+        def _call(conn: Any) -> Any:
+            result = fn(conn)
+            if conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS:
+                conn.rollback()
+            return result
+
         try:
-            return fn(self._connect())
+            return _call(self._connect())
         except (psycopg.OperationalError, psycopg.InterfaceError):
-            return fn(self._connect_fresh())
+            return _call(self._connect_fresh())
 
     def close(self) -> None:
         """Close the calling thread's connection."""
