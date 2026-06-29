@@ -6,6 +6,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed — PostgresStore idle-in-transaction deadlock (Python)
+
+- `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
+  `max_monotonic_seq`) no longer leave their connection *idle in transaction*.
+  A bare `SELECT` holds an `ACCESS SHARE` lock until the transaction ends; the
+  engine's startup hash-chain seed reads (`max_monotonic_seq` + `query`) leaked
+  such a reader, which blocked a concurrent store-init
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (`ACCESS EXCLUSIVE`, even as a
+  no-op) indefinitely — hanging adopters that initialize the audit store from
+  two processes (e.g. api + worker) against the same Postgres table.
+  `_execute_with_retry` now rolls back any transaction a read leaves open —
+  whether it returned (`INTRANS`) or raised (`INERROR`, which otherwise keeps
+  the lock held and poisons the connection for reuse); committed writes are
+  already `IDLE` and untouched. The cleanup is guarded so it can't mask a
+  stale-connection error during the reconnect-retry, which now also logs.
+  Regression coverage: `tests/test_store_idle_in_tx.py` (Postgres deadlock +
+  error-path cases, plus a no-database reconnect/cleanup unit test). Retires
+  the downstream `idle_in_transaction_session_timeout` reaper workaround.
+
 ### Changed — README
 
 - New "Where it fits" section linking to Membrane and fasten fleet.

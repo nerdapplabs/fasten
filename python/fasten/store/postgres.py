@@ -10,6 +10,7 @@ Install the optional dep:  pip install "fasten[postgres]"
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .repo import IngestResult
@@ -141,13 +144,41 @@ class PostgresStore:
         return conn
 
     def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
-        """Run fn(conn) once; on stale-connection error reconnect and retry once."""
+        """Run fn(conn) once; on stale-connection error reconnect and retry once.
+
+        Whether fn returns or raises, release any transaction it left open so the
+        connection is never parked holding locks. A write fn ``commit()``s itself
+        (leaving the connection IDLE — untouched here). A read fn runs a bare
+        ``SELECT`` and returns, leaving the connection *idle in transaction*
+        (INTRANS); a read that *raises* (e.g. a bad column during a concurrent
+        ``ALTER``) leaves it INERROR — both still hold any lock the statement
+        took (``ACCESS SHARE``) until the transaction ends, and INERROR also
+        poisons the connection for reuse. Either would let the engine's startup
+        hash-chain seed reads block a concurrent store-init ``ALTER TABLE``
+        (``ACCESS EXCLUSIVE``) indefinitely — the audit-store deadlock. The
+        cleanup rollback is itself guarded so that, on an already-dead
+        connection, it can't mask the in-flight stale-connection error the retry
+        below needs to see."""
         import psycopg
 
+        def _call(conn: Any) -> Any:
+            try:
+                return fn(conn)
+            finally:
+                if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+                    try:
+                        conn.rollback()
+                    except (psycopg.OperationalError, psycopg.InterfaceError):
+                        pass  # dead conn; don't mask the in-flight error
+
         try:
-            return fn(self._connect())
-        except (psycopg.OperationalError, psycopg.InterfaceError):
-            return fn(self._connect_fresh())
+            return _call(self._connect())
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            logger.warning(
+                "fasten audit store connection lost (%s); reconnecting and retrying once",
+                exc,
+            )
+            return _call(self._connect_fresh())
 
     def close(self) -> None:
         """Close the calling thread's connection."""
