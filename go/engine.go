@@ -35,8 +35,8 @@ type Engine struct {
 
 	// Streams classified as backed by the durable store rather than a bounded
 	// ring. Drives the per-stream completeness flag on every reader read.
-	// Seeded to {"audit"} in Init — audit is the only store-backed stream
-	// today; Phase 1 wires this from config so api/sys can persist too.
+	// Seeded in Init from defaultPersistedStreams ({"audit"}), then extended
+	// with api/sys when the corresponding stream store is configured.
 	persistedStreams map[string]bool
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
@@ -86,12 +86,17 @@ func (e *Engine) Init(cfg Config) error {
 	e.xport.serviceID = e.serviceID
 	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
 	// FR1: attach opt-in stream stores as write-through sinks + read source,
-	// and flip their completeness class to store-backed.
+	// and flip their completeness class to store-backed. Seeded from a
+	// per-engine copy of the durability default ({"audit"}) so the config-driven
+	// additions below never touch the package-level default.
 	e.apiStore = cfg.APIStore
 	e.syslogStore = cfg.SyslogStore
 	e.xport.APIStore = cfg.APIStore
 	e.xport.SyslogStore = cfg.SyslogStore
-	e.persistedStreams = map[string]bool{"audit": true}
+	e.persistedStreams = make(map[string]bool, len(defaultPersistedStreams)+2)
+	for stream, persisted := range defaultPersistedStreams {
+		e.persistedStreams[stream] = persisted
+	}
 	if cfg.APIStore != nil {
 		e.persistedStreams["api"] = true
 	}

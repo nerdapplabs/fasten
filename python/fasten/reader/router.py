@@ -82,8 +82,13 @@ def router(
 
     def _source(stream: str) -> str:
         """Report whether a stream is backed by the durable store or a bounded
-        ring — its configured durability class, not the provenance of any
-        single response — so consumers stay honest about gaps. When
+        ring — its configured durability class, not a per-response gap signal.
+
+        It says whether the stream *can* lose rows, never whether *this*
+        response did: a ring that overflowed and evicted older matching rows
+        still reports ``ring``, identical to an empty ring that lost nothing.
+        There is no truncation flag here — for ``/correlate``, the
+        totals-vs-counts pair is the per-response truncation signal. When
         ``persist_streams`` is not pinned, resolve it from the live engine
         config so the flag tracks which streams actually persist (FR1).
 
@@ -176,6 +181,8 @@ def router(
             return {
                 "rows": [],
                 "total": 0,
+                "limit": limit,
+                "offset": offset,
                 "completeness": {"audit": _source("audit")},
                 "error": "audit store not initialised — call fasten.init() first",
             }
