@@ -34,8 +34,9 @@ type Engine struct {
 
 	// Streams classified as backed by the durable store rather than a bounded
 	// ring. Drives the per-stream completeness flag on every reader read.
-	// Seeded to {"audit"} in Init — audit is the only store-backed stream
-	// today; Phase 1 wires this from config so api/sys can persist too.
+	// Seeded in Init from defaultPersistedStreams ({"audit"}) — audit is the
+	// only store-backed stream today; Phase 1 wires this from config so api/sys
+	// can persist too.
 	persistedStreams map[string]bool
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
@@ -80,7 +81,12 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
-	e.persistedStreams = map[string]bool{"audit": true}
+	// Per-engine copy of the durability default so callers may mutate this
+	// engine's map (Phase 1 config) without touching the package-level default.
+	e.persistedStreams = make(map[string]bool, len(defaultPersistedStreams))
+	for stream, persisted := range defaultPersistedStreams {
+		e.persistedStreams[stream] = persisted
+	}
 
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,

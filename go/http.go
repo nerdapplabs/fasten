@@ -101,15 +101,33 @@ func (e *Engine) NewReader() http.Handler {
 // NewReader is a package-level shorthand for Default.NewReader().
 func NewReader() http.Handler { return Default.NewReader() }
 
+// defaultPersistedStreams is the durability default applied when an engine was
+// never Init'd (nil persistedStreams): audit is the only store-backed stream
+// today. Init seeds a per-engine copy from this; streamSource falls back to it
+// so the default lives in exactly one declarative place — mirroring the Python
+// router's frozenset({"audit"}), and keeping the resolver free of any
+// hardcoded stream name.
+var defaultPersistedStreams = map[string]bool{"audit": true}
+
 // streamSource reports whether a stream is backed by the durable store or a
-// bounded ring, so consumers stay honest about gaps. This is the stream's
-// configured durability class — not the provenance of any single response;
-// error/uninitialised reads still carry it so the response shape stays
-// uniform (the `error` key is what signals a read actually failed).
-// Defaults to "ring" unless the stream is in persistedStreams; a nil map
-// (engine never Init'd) still classifies audit as store-backed.
+// bounded ring, so consumers stay honest about gaps.
+//
+// This is the stream's configured *durability class*, not a per-response gap
+// signal: it says whether the stream CAN lose rows, never whether THIS response
+// did. A ring that overflowed and evicted older matching rows still reports
+// "ring" — identical to an empty ring that lost nothing; there is no truncation
+// flag here. (Per-response truncation honesty is deferred to Phase 1.)
+//
+// error/uninitialised reads still carry it so the response shape stays uniform
+// (the `error` key is what signals a read actually failed). Defaults to "ring"
+// unless the stream is in persistedStreams; a nil map (engine never Init'd)
+// falls back to defaultPersistedStreams.
 func (e *Engine) streamSource(stream string) string {
-	if e.persistedStreams[stream] || (e.persistedStreams == nil && stream == "audit") {
+	persisted := e.persistedStreams
+	if persisted == nil {
+		persisted = defaultPersistedStreams
+	}
+	if persisted[stream] {
 		return "store"
 	}
 	return "ring"

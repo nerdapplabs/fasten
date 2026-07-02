@@ -90,3 +90,7 @@ def test_completeness_present_on_uninitialised_reads():
     audit_body = client.get("/api/v1/logs/audit").json()
     assert audit_body["completeness"] == {"audit": "store"}
     assert "error" in audit_body
+    # Uniform shape: the audit error path carries the same pagination keys as
+    # its success path, not just rows/total.
+    for key in ("rows", "total", "limit", "offset"):
+        assert key in audit_body, f"audit error path lost {key!r}"

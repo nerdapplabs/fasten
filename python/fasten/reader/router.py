@@ -82,8 +82,13 @@ def router(
 
     def _source(stream: str) -> str:
         """Report whether a stream is backed by the durable store or a bounded
-        ring — its configured durability class, not the provenance of any
-        single response — so consumers stay honest about gaps."""
+        ring — its configured durability class, not a per-response gap signal.
+
+        It says whether the stream *can* lose rows, never whether *this*
+        response did: a ring that overflowed and evicted older matching rows
+        still reports ``ring``, identical to an empty ring that lost nothing.
+        There is no truncation flag here — per-response truncation honesty is
+        deferred to Phase 1."""
         return "store" if stream in _persisted else "ring"
 
     @r.get("/sys")
@@ -149,6 +154,8 @@ def router(
             return {
                 "rows": [],
                 "total": 0,
+                "limit": limit,
+                "offset": offset,
                 "completeness": {"audit": _source("audit")},
                 "error": "audit store not initialised — call fasten.init() first",
             }
