@@ -111,3 +111,19 @@ def test_write_through_keeps_ring_and_store_in_sync():
 
     assert store.count() == 1               # write-through sink got it
     assert len(t._api) == 1                 # ring (hot path) also got it
+
+
+def test_drainer_self_reports_persist_like_any_syslog_push(capsys):
+    """write_drainer_syslog is a syslog push path like any other: with a
+    syslog store attached, reads come only from the store, so an unpersisted
+    drainer event would vanish from the reader API (Go persists them via
+    PushSyslog — parity)."""
+    _init_with_streams(syslog_store=StreamStore(":memory:", table="syslog"))
+    t = fasten.transport()
+
+    t.write_drainer_syslog({"level": "error", "event": "audit_enqueue_failed"})
+    capsys.readouterr()  # drainer path intentionally writes the row to stderr
+
+    rows = t.query_syslog(event="audit_enqueue_failed")  # served from the store
+    assert len(rows) == 1
+    assert rows[0]["request_id"]  # sentinel invariant holds on this path too

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // StreamStore is a durable, queryable backing for one ring-buffered stream
@@ -22,12 +23,28 @@ import (
 // number types: all numbers decode to float64 (a ring read returns the
 // original int), so the value is JSON-equivalent, not type-identical.
 //
+// Write cost: persistence is write-through — every pushed row is one
+// synchronous INSERT in its own transaction, on the caller's thread. With
+// WAL + synchronous=NORMAL (set by migrate; see below) a commit is a WAL
+// append without a per-commit fsync, which keeps a hot api/sys stream
+// viable. Even so this is a per-row disk write: for very hot streams prefer
+// ring-only mode, or expect stream persistence to grow an async drainer in
+// a later phase (the audit path already has one).
+//
 // The caller imports the SQLite driver and opens the *sql.DB, exactly as for
 // NewSQLiteStore. SQLite-only in v1; a pluggable Postgres stream store is a
 // later phase.
 type StreamStore struct {
 	db    *sql.DB
 	table string
+
+	// writeFailures counts Insert errors swallowed by the transport (the hot
+	// path never blocks on the sink). Non-zero means durable history has holes,
+	// so the reader degrades the stream's completeness flag from "store" to
+	// "store-degraded" — otherwise the flag would assert durability for rows
+	// that were silently lost. Sticky for the store's lifetime: a hole in
+	// history doesn't heal when the disk recovers.
+	writeFailures atomic.Int64
 }
 
 // streamIndexedFields are lifted out of the row into indexed columns for
@@ -39,6 +56,11 @@ var streamIndexedFields = []string{
 
 // NewStreamStore creates and migrates a per-stream table, then returns the
 // store. tableName must be a plain SQL identifier (see validIdentifierRe).
+//
+// migrate sets PRAGMA synchronous=NORMAL, but that pragma is per-connection
+// and database/sql pools connections — set it in the DSN so every pooled
+// connection gets it (e.g. mattn/go-sqlite3: "file:app.db?_synchronous=NORMAL";
+// modernc.org/sqlite: "file:app.db?_pragma=synchronous(NORMAL)").
 func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten StreamStore: tableName is required")
@@ -56,8 +78,15 @@ func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 }
 
 func (s *StreamStore) migrate() error {
+	// synchronous=NORMAL is the standard WAL pairing: commits append to the
+	// WAL without a per-commit fsync (the WAL is synced at checkpoints), which
+	// matters because Insert runs one commit per pushed row. In WAL mode
+	// NORMAL still guarantees database consistency after a crash; the tail of
+	// unsynced commits may be lost, which is acceptable for stream rows (the
+	// tamper-evident audit chain has its own store and drainer).
 	ddl := fmt.Sprintf(`
 PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS %s (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT,
@@ -103,11 +132,22 @@ func (s *StreamStore) Insert(row map[string]any) error {
 	return err
 }
 
-// Query returns up to limit rows newest-first, filtered by equality on the
-// given indexed columns (only columns in streamIndexedFields are honoured)
-// plus an optional [since, until] window on timestamp. Mirrors the ring's
-// exact-match filter semantics so store and ring agree.
-func (s *StreamStore) Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error) {
+// NoteWriteFailure records that a persist attempt for this store was
+// swallowed. Called by the transport at the swallow point, so callers that
+// handle an Insert error themselves don't mark the store degraded.
+func (s *StreamStore) NoteWriteFailure() { s.writeFailures.Add(1) }
+
+// WriteFailures returns how many persist attempts were swallowed.
+func (s *StreamStore) WriteFailures() int64 { return s.writeFailures.Load() }
+
+// Degraded reports whether durable history has known holes (at least one
+// swallowed persist failure). Drives the "store-degraded" completeness flag.
+func (s *StreamStore) Degraded() bool { return s.writeFailures.Load() > 0 }
+
+// whereClause builds the shared WHERE for Query/CountMatching: equality on
+// indexed columns (only streamIndexedFields are honoured) plus an optional
+// [since, until] window on timestamp.
+func (s *StreamStore) whereClause(eq map[string]string, since, until string) (string, []any) {
 	var conds []string
 	var args []any
 	// Deterministic clause order for stable, testable SQL.
@@ -134,10 +174,17 @@ func (s *StreamStore) Query(limit int, eq map[string]string, since, until string
 		conds = append(conds, "COALESCE(timestamp, '') <= ?")
 		args = append(args, until)
 	}
-	where := ""
-	if len(conds) > 0 {
-		where = " WHERE " + strings.Join(conds, " AND ")
+	if len(conds) == 0 {
+		return "", args
 	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// Query returns up to limit rows newest-first, filtered by equality on the
+// given indexed columns plus an optional [since, until] window on timestamp.
+// Mirrors the ring's exact-match filter semantics so store and ring agree.
+func (s *StreamStore) Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error) {
+	where, args := s.whereClause(eq, since, until)
 	args = append(args, limit)
 	rows, err := s.db.Query(
 		fmt.Sprintf("SELECT payload FROM %s%s ORDER BY seq DESC LIMIT ?", s.table, where),
@@ -160,6 +207,18 @@ func (s *StreamStore) Query(limit int, eq map[string]string, since, until string
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// CountMatching returns the total number of rows matching the same filters
+// as Query, without a limit — so a capped read can report how much history
+// it truncated (the /correlate totals).
+func (s *StreamStore) CountMatching(eq map[string]string, since, until string) (int, error) {
+	where, args := s.whereClause(eq, since, until)
+	var n int
+	err := s.db.QueryRow(
+		fmt.Sprintf("SELECT COUNT(*) FROM %s%s", s.table, where), args...,
+	).Scan(&n)
+	return n, err
 }
 
 // Count returns the number of persisted rows (test/diagnostic helper).

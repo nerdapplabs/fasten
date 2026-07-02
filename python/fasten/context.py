@@ -32,6 +32,10 @@ def mint_id() -> str:
 # correlatable — `/logs/correlate?request_id=boot-…` returns the whole startup
 # window — and self-describing: the prefix tells an operator what kind of
 # context produced the row instead of "anonymous noise".
+#
+# Only boot and orphan are ever auto-stamped (by the transport); sched, bg, and
+# lib exist for callers that mint sentinels explicitly via mint_sentinel() for
+# their own scheduled/background/library-context writes.
 SENTINEL_KINDS = ("boot", "sched", "bg", "lib", "orphan")
 
 
@@ -47,7 +51,13 @@ def mint_sentinel(kind: str, service_id: str = "") -> str:
 
 def request_id_kind(request_id: str) -> str:
     """Classify a request_id by its namespace: a sentinel kind, or ``request``
-    for a real correlation id. Lets a UI pivot/filter by where a row came from."""
+    for a real correlation id. Lets a UI pivot/filter by where a row came from.
+
+    Classification is by prefix, so a REAL id that happens to start with
+    ``boot-``/``sched-``/``bg-``/``lib-``/``orphan-`` is misclassified as a
+    sentinel — the practical effect is the boot window staying open past that
+    row. If your upstream request ids can carry such prefixes, strip or
+    re-namespace them at the edge (fasten's own mint_id() never collides)."""
     if request_id:
         for k in SENTINEL_KINDS:
             if request_id.startswith(k + "-"):

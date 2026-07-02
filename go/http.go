@@ -109,11 +109,27 @@ func NewReader() http.Handler { return Default.NewReader() }
 // uniform (the `error` key is what signals a read actually failed).
 // Defaults to "ring" unless the stream is in persistedStreams; a nil map
 // (engine never Init'd) still classifies audit as store-backed.
+//
+// A store-backed stream whose sink has swallowed at least one persist
+// failure reports "store-degraded": reads are still served from the store,
+// but durable history has known holes (rows that live only in the ring,
+// which store-backed reads never consult), so plain "store" would assert a
+// durability the data no longer has. Sticky for the store's lifetime.
 func (e *Engine) streamSource(stream string) string {
-	if e.persistedStreams[stream] || (e.persistedStreams == nil && stream == "audit") {
-		return "store"
+	if !(e.persistedStreams[stream] || (e.persistedStreams == nil && stream == "audit")) {
+		return "ring"
 	}
-	return "ring"
+	var st *StreamStore
+	switch stream {
+	case "api":
+		st = e.apiStore
+	case "sys":
+		st = e.syslogStore
+	}
+	if st != nil && st.Degraded() {
+		return "store-degraded"
+	}
+	return "store"
 }
 
 func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
@@ -166,11 +182,20 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"api": e.streamSource("api")}})
 }
 
+// filterCounter is the optional filtered-count capability of an audit store,
+// used for /correlate totals. The built-in SQLite and Postgres stores
+// implement it; adopter stores that don't fall back to totals == counts.
+type filterCounter interface {
+	CountFiltered(ctx context.Context, f Filter) (int, error)
+}
+
 // handleCorrelate is the unified correlation read (FR2): every stream for one
 // request_id in a single call. Fans out to the existing per-stream query paths
 // (audit store + sys/api rings-or-stores) and assembles them — no new query
-// semantics. completeness reports each stream's durability class so the
-// consumer knows whether a stream could be silently truncated.
+// semantics. completeness reports each stream's durability class, and totals
+// reports how many matching rows the backing source holds — counts is how
+// many this capped response returned, so counts < totals means the response
+// is truncated (raise limit or page the per-stream endpoints).
 func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	rid := r.URL.Query().Get("request_id")
 	if rid == "" {
@@ -180,6 +205,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	limit := intParam(r.URL.Query().Get("limit"), 100)
 
 	audit := []map[string]any{}
+	auditTotal := 0
 	if e.auditStore != nil {
 		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, Limit: limit})
 		if err != nil {
@@ -189,10 +215,17 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			audit = append(audit, rowToMap(row))
 		}
+		auditTotal = len(audit)
+		if counter, ok := e.auditStore.(filterCounter); ok {
+			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid}); err == nil {
+				auditTotal = n
+			}
+		}
 	}
 
 	api := []APIRow{}
 	sys := []SyslogRow{}
+	apiTotal, sysTotal := 0, 0
 	if e.xport != nil {
 		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
 		if err != nil {
@@ -210,6 +243,14 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		if s != nil {
 			sys = s
 		}
+		if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	writeJSON(w, map[string]any{
@@ -218,6 +259,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		"api":        api,
 		"sys":        sys,
 		"counts":     map[string]int{"audit": len(audit), "api": len(api), "sys": len(sys)},
+		"totals":     map[string]int{"audit": auditTotal, "api": apiTotal, "sys": sysTotal},
 		"completeness": map[string]string{
 			"audit": e.streamSource("audit"),
 			"api":   e.streamSource("api"),

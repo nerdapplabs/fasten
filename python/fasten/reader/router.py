@@ -85,9 +85,21 @@ def router(
         ring — its configured durability class, not the provenance of any
         single response — so consumers stay honest about gaps. When
         ``persist_streams`` is not pinned, resolve it from the live engine
-        config so the flag tracks which streams actually persist (FR1)."""
+        config so the flag tracks which streams actually persist (FR1).
+
+        A store-backed stream whose sink has swallowed at least one persist
+        failure reports ``store-degraded``: reads are still served from the
+        store, but durable history has known holes (rows that live only in
+        the ring, which store-backed reads never consult), so plain ``store``
+        would assert a durability the data no longer has. Sticky for the
+        store's lifetime."""
         persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
-        return "store" if stream in persisted else "ring"
+        if stream not in persisted:
+            return "ring"
+        t = _transport()
+        if t is not None and getattr(t, "stream_degraded", None) and t.stream_degraded(stream):
+            return "store-degraded"
+        return "store"
 
     @r.get("/sys")
     def get_sys(
@@ -194,8 +206,11 @@ def router(
         rings-or-stores) and assembles them, so a consumer holding a
         ``request_id`` gets the whole operation in one call instead of
         stitching three. Adds no new query semantics beyond fan-out +
-        assembly; ``completeness`` reports each stream's durability class so
-        the consumer knows whether a stream could be silently truncated.
+        assembly. ``completeness`` reports each stream's durability class,
+        and ``totals`` reports how many matching rows the backing source
+        holds — ``counts`` is how many this capped response returned, so
+        ``counts < totals`` means the response is truncated (raise ``limit``
+        or page the per-stream endpoints).
         """
         s = _store()
         t = _transport()
@@ -205,12 +220,21 @@ def router(
         )
         api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
         sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
+        audit_total = (
+            s.count(request_id=request_id)
+            if s is not None and hasattr(s, "count") else len(audit)
+        )
         return {
             "request_id": request_id,
             "audit": audit,
             "api": api,
             "sys": sys,
             "counts": {"audit": len(audit), "api": len(api), "sys": len(sys)},
+            "totals": {
+                "audit": audit_total,
+                "api": t.count_api(request_id=request_id) if t is not None else 0,
+                "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
+            },
             "completeness": {
                 "audit": _source("audit"),
                 "api": _source("api"),

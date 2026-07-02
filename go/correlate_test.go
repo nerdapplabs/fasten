@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -128,5 +129,81 @@ func TestCorrelate_ReportsStoreWhenPersisted(t *testing.T) {
 	counts, _ := body["counts"].(map[string]any)
 	if counts["api"] != float64(1) {
 		t.Errorf("recovered past ring churn: got %v api rows, want 1", counts["api"])
+	}
+}
+
+func TestCorrelate_TotalsExposeTruncationRingOnly(t *testing.T) {
+	// counts reflects the capped response; totals reflects what the backing
+	// source holds — counts < totals is the truncation signal (100-of-100 vs
+	// 100-of-5000 was previously indistinguishable).
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	rid := "req-hot"
+	tr := GetTransport()
+	for i := 0; i < 7; i++ {
+		tr.PushSyslog(SyslogRow{"level": "info", "event": fmt.Sprintf("step.%d", i), "request_id": rid})
+	}
+
+	body, _ := getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=3")
+	counts, _ := body["counts"].(map[string]any)
+	totals, _ := body["totals"].(map[string]any)
+	if counts["sys"] != float64(3) {
+		t.Errorf("counts.sys: got %v, want 3", counts["sys"])
+	}
+	if totals["sys"] != float64(7) {
+		t.Errorf("totals.sys: got %v, want 7 (truncated: 3 returned of 7)", totals["sys"])
+	}
+
+	// untruncated read: counts == totals
+	body, _ = getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=100")
+	counts, _ = body["counts"].(map[string]any)
+	totals, _ = body["totals"].(map[string]any)
+	if counts["sys"] != float64(7) || totals["sys"] != float64(7) {
+		t.Errorf("untruncated: counts.sys=%v totals.sys=%v, want both 7", counts["sys"], totals["sys"])
+	}
+}
+
+func TestCorrelate_TotalsCountStoreHistoryAndAudit(t *testing.T) {
+	// With persistence on, totals counts durable history for the streams AND
+	// the audit store (via CountFiltered) — every stream reports total vs
+	// returned.
+	resetGlobals(t)
+	registerTestCodes(t)
+	adb, _ := sql.Open("sqlite", ":memory:")
+	t.Cleanup(func() { adb.Close() })
+	audit, _ := NewSQLiteStore(adb, "audit_corr4")
+	apiStore := newStreamStore(t, "api_log")
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: audit, APIStore: apiStore, AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	rid := "req-deep"
+	tr := GetTransport()
+	for i := 0; i < 5; i++ {
+		tr.PushAPI(APIRow{"method": "GET", "path": "/x", "request_id": rid})
+	}
+	ctx := WithRequestID(context.Background(), rid)
+	if _, err := Emit(ctx, "USER_CREATED", Target("u-1"), Actor("alice", "user")); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if _, err := Emit(ctx, "USER_CREATED", Target("u-2"), Actor("alice", "user")); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	body, _ := getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=2")
+	counts, _ := body["counts"].(map[string]any)
+	totals, _ := body["totals"].(map[string]any)
+	if counts["audit"] != float64(2) || counts["api"] != float64(2) || counts["sys"] != float64(0) {
+		t.Errorf("counts: got %v, want audit=2 api=2 sys=0", counts)
+	}
+	if totals["api"] != float64(5) {
+		t.Errorf("totals.api: got %v, want 5", totals["api"])
+	}
+	if totals["audit"] != float64(2) {
+		t.Errorf("totals.audit: got %v, want 2", totals["audit"])
+	}
+	if totals["sys"] != float64(0) {
+		t.Errorf("totals.sys: got %v, want 0", totals["sys"])
 	}
 }

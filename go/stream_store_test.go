@@ -171,3 +171,46 @@ func must(t *testing.T, err error) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
+	// A swallowed persist failure must not leave completeness lying: reads
+	// for a store-backed stream come only from the store, so a row that
+	// failed to persist is silently missing — the flag degrades to
+	// "store-degraded" instead of asserting durability. Sticky: recovery of
+	// the sink does not clear it (the hole in history remains).
+	resetGlobals(t)
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	apiStore, err := NewStreamStore(db, "api_log")
+	if err != nil {
+		t.Fatalf("NewStreamStore: %v", err)
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", APIStore: apiStore}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tr := GetTransport()
+
+	body, _ := getJSON(t, NewReader(), "/api")
+	if comp, _ := body["completeness"].(map[string]any); comp["api"] != "store" {
+		t.Fatalf("healthy sink: completeness=%v, want store", comp["api"])
+	}
+
+	db.Close() // sink fails from here on: every Insert errors
+	tr.PushAPI(APIRow{"method": "GET", "path": "/lost", "request_id": "r1"}) // must not panic
+
+	if !apiStore.Degraded() || apiStore.WriteFailures() != 1 {
+		t.Fatalf("degraded=%v failures=%d, want true/1", apiStore.Degraded(), apiStore.WriteFailures())
+	}
+	// /api reads now fail (store is closed), but /correlate's completeness
+	// block and streamSource are what carry the degraded class; check the
+	// engine-level classification directly plus the correlate response shape
+	// is exercised elsewhere — here assert streamSource via Default.
+	if got := Default.streamSource("api"); got != "store-degraded" {
+		t.Fatalf("streamSource(api)=%q, want store-degraded", got)
+	}
+	if got := Default.streamSource("audit"); got != "store" {
+		t.Fatalf("streamSource(audit)=%q, want store (audit unaffected)", got)
+	}
+}

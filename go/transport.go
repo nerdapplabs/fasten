@@ -116,23 +116,33 @@ func (t *Transport) stampRequestID(row map[string]any) {
 
 // PushSyslog buffers a syslog row (+ persists if a store is attached).
 // No stdout write — caller (slog handler) owns that.
+//
+// A persist failure must never break the hot logging path (the ring already
+// holds the row), so it is logged to stderr and swallowed — but it is also
+// recorded on the store, which degrades the stream's completeness flag to
+// "store-degraded". Without that, reads (served from the store, never the
+// ring, once a store is attached) would silently miss the row while the flag
+// asserted durability.
 func (t *Transport) PushSyslog(row SyslogRow) {
 	t.stampRequestID(row)
 	t.Syslog.Push(row)
 	if t.SyslogStore != nil {
 		if err := t.SyslogStore.Insert(row); err != nil {
+			t.SyslogStore.NoteWriteFailure()
 			fmt.Fprintf(os.Stderr, "fasten: syslog persist failed: %v\n", err)
 		}
 	}
 }
 
 // PushAPI buffers an API request row (+ persists if a store is attached).
-// No stdout write — middleware owns logging.
+// No stdout write — middleware owns logging. Persist-failure handling is the
+// same as PushSyslog: swallow, but degrade the completeness flag.
 func (t *Transport) PushAPI(row APIRow) {
 	t.stampRequestID(row)
 	t.API.Push(row)
 	if t.APIStore != nil {
 		if err := t.APIStore.Insert(row); err != nil {
+			t.APIStore.NoteWriteFailure()
 			fmt.Fprintf(os.Stderr, "fasten: api persist failed: %v\n", err)
 		}
 	}
@@ -158,6 +168,13 @@ func (t *Transport) WriteAudit(row map[string]any) {
 // fields are ignored. The indexed structured fields (event, status, time
 // window) are honoured identically whether the read is served from the ring
 // or the durable store.
+//
+// The Since/Until window compares timestamps as strings (lexicographic, both
+// in the ring scan and in SQL). That is correct for the canonical
+// UTC RFC3339Nano timestamps fasten's own writers stamp, but mixed formats —
+// "…+00:00" vs "…Z", differing fractional-second precision — do not order
+// lexicographically. If you push rows with your own timestamps, keep them in
+// one canonical UTC format or the window will mis-compare.
 type StreamQuery struct {
 	Level     string // sys
 	ServiceID string // sys
@@ -224,6 +241,38 @@ func (t *Transport) QuerySyslog(limit int, q StreamQuery) ([]SyslogRow, error) {
 	return out, nil
 }
 
+// CountSyslog returns the total number of syslog rows matching q in the
+// backing source (durable store, or the ring's current window) — the
+// uncapped counterpart of QuerySyslog, so capped reads can report truncation.
+func (t *Transport) CountSyslog(q StreamQuery) (int, error) {
+	if t.SyslogStore != nil {
+		return t.SyslogStore.CountMatching(map[string]string{
+			"level": q.Level, "request_id": q.RequestID,
+			"service_id": q.ServiceID, "event": q.Event,
+		}, q.Since, q.Until)
+	}
+	n := 0
+	for _, r := range t.Syslog.All() {
+		if q.Level != "" && r["level"] != q.Level {
+			continue
+		}
+		if q.RequestID != "" && r["request_id"] != q.RequestID {
+			continue
+		}
+		if q.ServiceID != "" && r["service_id"] != q.ServiceID {
+			continue
+		}
+		if q.Event != "" && r["event"] != q.Event {
+			continue
+		}
+		if !inWindow(tsOf(r), q.Since, q.Until) {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 // QueryAPI returns up to limit API rows, newest-first. Served from the
 // durable store when one is attached, otherwise from the in-memory ring.
 func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {
@@ -266,4 +315,38 @@ func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {
 		}
 	}
 	return out, nil
+}
+
+// CountAPI returns the total number of API rows matching q in the backing
+// source (durable store, or the ring's current window) — the uncapped
+// counterpart of QueryAPI, so capped reads can report truncation.
+func (t *Transport) CountAPI(q StreamQuery) (int, error) {
+	if t.APIStore != nil {
+		return t.APIStore.CountMatching(map[string]string{
+			"method": q.Method, "path": q.Path,
+			"request_id": q.RequestID, "status": q.Status,
+		}, q.Since, q.Until)
+	}
+	n := 0
+	for _, r := range t.API.All() {
+		if q.Method != "" && r["method"] != q.Method {
+			continue
+		}
+		if q.Path != "" {
+			if p, _ := r["path"].(string); q.Path != p {
+				continue
+			}
+		}
+		if q.RequestID != "" && r["request_id"] != q.RequestID {
+			continue
+		}
+		if q.Status != "" && fmt.Sprint(r["status"]) != q.Status {
+			continue
+		}
+		if !inWindow(tsOf(r), q.Since, q.Until) {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }

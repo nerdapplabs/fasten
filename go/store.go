@@ -274,6 +274,18 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	return scanRows(rows)
 }
 
+// CountFiltered returns the total number of rows matching the same filter as
+// Query, ignoring Limit — so a capped read (e.g. /correlate) can report how
+// much matching history it truncated.
+func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) {
+	where, args := filterToSQL(f)
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM %s %s`, s.table, where), args...,
+	).Scan(&n)
+	return n, err
+}
+
 func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100

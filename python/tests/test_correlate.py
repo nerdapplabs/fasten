@@ -91,3 +91,53 @@ def test_correlate_reports_store_when_streams_persisted():
     body = _client().get(f"/api/v1/logs/correlate?request_id={rid}").json()
     assert body["completeness"] == {"audit": "store", "api": "store", "sys": "store"}
     assert body["counts"]["api"] == 1  # recovered despite ring churn
+
+
+def test_correlate_totals_expose_truncation_ring_only():
+    """counts reflects the capped response; totals reflects what the backing
+    source holds — counts < totals is the truncation signal a heavily
+    correlated request_id needs (100-of-100 vs 100-of-5000 was previously
+    indistinguishable)."""
+    _init()
+    rid = "req-hot"
+    t = fasten.transport()
+    for i in range(7):
+        t.push_syslog({"level": "info", "event": f"step.{i}", "request_id": rid})
+
+    body = _client().get(f"/api/v1/logs/correlate?request_id={rid}&limit=3").json()
+    assert body["counts"]["sys"] == 3
+    assert body["totals"]["sys"] == 7  # truncated: 3 returned of 7 available
+
+    # untruncated read: counts == totals
+    body = _client().get(f"/api/v1/logs/correlate?request_id={rid}&limit=100").json()
+    assert body["counts"]["sys"] == body["totals"]["sys"] == 7
+
+
+def test_correlate_totals_count_store_history_and_audit():
+    """With persistence on, totals counts durable history (beyond any window)
+    for the streams AND the audit store — every stream reports total vs
+    returned."""
+    from fasten.context import with_request_id
+    from fasten.store.stream import StreamStore
+    import os
+    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
+    os.environ["FASTEN_NODE_ID"] = "test-node"
+    fasten.init(
+        service_id="test-svc", node_id="test-node",
+        audit_store=SQLiteStore(":memory:"),
+        api_store=StreamStore(":memory:", table="api_log"),
+        audit_store_failure_strategy="raise",
+    )
+    rid = "req-deep"
+    t = fasten.transport()
+    for _ in range(5):
+        t.push_api({"method": "GET", "path": "/x", "request_id": rid})
+    with with_request_id(rid):
+        fasten.emit(code="USER_CREATED", target="u-1", actor="alice")
+        fasten.emit(code="USER_CREATED", target="u-2", actor="alice")
+
+    body = _client().get(f"/api/v1/logs/correlate?request_id={rid}&limit=2").json()
+    assert body["counts"] == {"audit": 2, "api": 2, "sys": 0}
+    assert body["totals"]["api"] == 5
+    assert body["totals"]["audit"] == 2
+    assert body["totals"]["sys"] == 0

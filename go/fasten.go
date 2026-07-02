@@ -357,6 +357,10 @@ func MintID() string {
 // sentinelKinds are the namespaces for rows written outside a real request
 // context. Stamping one (instead of leaving request_id empty) keeps every
 // stream row correlatable and self-describing — see the sentinel invariant.
+//
+// Only boot and orphan are ever auto-stamped (by the transport); sched, bg,
+// and lib exist for callers that mint sentinels explicitly via MintSentinel
+// for their own scheduled/background/library-context writes.
 var sentinelKinds = []string{"boot", "sched", "bg", "lib", "orphan"}
 
 // MintSentinel mints a namespaced sentinel request_id (e.g.
@@ -375,6 +379,12 @@ func MintSentinel(kind, serviceID string) string {
 
 // RequestIDKind classifies a request_id by its namespace: a sentinel kind, or
 // "request" for a real correlation id. Lets a UI pivot/filter by origin.
+//
+// Classification is by prefix, so a REAL id that happens to start with
+// "boot-"/"sched-"/"bg-"/"lib-"/"orphan-" is misclassified as a sentinel —
+// the practical effect is the boot window staying open past that row. If
+// your upstream request ids can carry such prefixes, strip or re-namespace
+// them at the edge (fasten's own MintID never collides).
 func RequestIDKind(requestID string) string {
 	for _, k := range sentinelKinds {
 		if strings.HasPrefix(requestID, k+"-") {

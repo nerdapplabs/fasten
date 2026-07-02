@@ -61,13 +61,32 @@ class StdoutTransport:
     def _persist(self, store: StreamStore | None, row: dict[str, Any], stream: str) -> None:
         """Write-through to the durable sink. A sink failure must never break
         the hot logging path (the ring + stdout already hold the row), so it is
-        logged to stderr and swallowed — matching the Go transport."""
+        logged to stderr and swallowed — matching the Go transport. But the
+        failure is recorded on the store, which degrades the stream's
+        completeness flag to ``store-degraded``: reads for a store-backed
+        stream never consult the ring, so without that the flag would assert
+        durability for rows that were silently lost."""
         if store is None:
             return
         try:
             store.insert(row)
         except Exception as exc:  # noqa: BLE001 — best-effort durability
+            store.note_write_failure()
             sys.stderr.write(f"fasten: {stream} persist failed: {exc}\n")
+
+    def _stream_store(self, stream: str) -> StreamStore | None:
+        if stream == "api":
+            return self._api_store
+        if stream == "sys":
+            return self._syslog_store
+        return None
+
+    def stream_degraded(self, stream: str) -> bool:
+        """True when the stream's durable sink has swallowed at least one
+        persist failure — durable history has known holes. Always False for
+        ring-only streams."""
+        store = self._stream_store(stream)
+        return store is not None and store.degraded
 
     def _stamp_request_id(self, row: dict[str, Any]) -> None:
         """Guarantee a non-empty request_id on every stream row (the sentinel
@@ -111,9 +130,17 @@ class StdoutTransport:
         also pushed to the in-memory ring so `/logs/sys` and
         `query_syslog()` continue to return drainer events for adopters
         who never look at stderr.
+
+        The row is persisted like every other syslog push (matching Go, whose
+        drainer self-reports go through PushSyslog): with a syslog store
+        attached, reads are served from the store, so skipping the persist
+        would make drainer events vanish from the reader API. The store
+        insert touches SQLite, not stdout, so it cannot reintroduce the
+        stdout-backpressure deadlock above.
         """
         self._stamp_request_id(row)
         self._syslog.push(row)
+        self._persist(self._syslog_store, row, "syslog")
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stderr.flush()
 
@@ -131,6 +158,15 @@ class StdoutTransport:
         src = self._syslog_store if self._syslog_store is not None else self._syslog
         return src.query(limit=limit, level=level, request_id=request_id,
                          service_id=service_id, event=event, since=since, until=until)
+
+    def count_syslog(self, **filters: Any) -> int:
+        """Total syslog rows matching the filters in the backing source
+        (durable store, or the ring's current window) — the uncapped
+        counterpart of query_syslog(), so capped reads can report
+        truncation."""
+        if self._syslog_store is not None:
+            return self._syslog_store.count_matching(**filters)
+        return self._syslog.count(**filters)
 
     # ── api log ─────────────────────────────────────────────────────────────
 
@@ -162,6 +198,14 @@ class StdoutTransport:
         src = self._api_store if self._api_store is not None else self._api
         return src.query(limit=limit, method=method, path=path,
                          request_id=request_id, status=status, since=since, until=until)
+
+    def count_api(self, **filters: Any) -> int:
+        """Total api rows matching the filters in the backing source (durable
+        store, or the ring's current window) — the uncapped counterpart of
+        query_api(), so capped reads can report truncation."""
+        if self._api_store is not None:
+            return self._api_store.count_matching(**filters)
+        return self._api.count(**filters)
 
     # ── audit ────────────────────────────────────────────────────────────────
 

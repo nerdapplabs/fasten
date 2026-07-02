@@ -36,12 +36,12 @@ def _init(**stores):
 
 # ── write-through resilience ──────────────────────────────────────────────
 
-class _BrokenStore:
+class _BrokenStore(StreamStore):
+    def __init__(self):
+        super().__init__(":memory:", table="broken_sink")
+
     def insert(self, row):
         raise RuntimeError("disk full")
-
-    def query(self, **kw):
-        return []
 
 
 def test_persist_failure_does_not_break_hot_path(capsys):
@@ -53,6 +53,39 @@ def test_persist_failure_does_not_break_hot_path(capsys):
     t.push_api({"method": "GET", "path": "/x", "request_id": "r1"})  # must not raise
     assert len(t._api) == 1                       # ring (hot path) kept the row
     assert "api persist failed" in capsys.readouterr().err
+
+
+def test_persist_failure_degrades_completeness_flag(capsys):
+    """A swallowed persist failure must not leave completeness lying: reads
+    for a store-backed stream come only from the store, so a row that failed
+    to persist is silently missing — the flag degrades to "store-degraded"
+    instead of asserting durability. Sticky: a later successful write does
+    not clear it (the hole in history remains)."""
+    store = StreamStore(":memory:", table="api_log")
+    _init(api_store=store)
+    t = fasten.transport()
+
+    assert _client().get("/api/v1/logs/api").json()["completeness"] == {"api": "store"}
+
+    real_insert = StreamStore.insert
+    store.insert = lambda row: (_ for _ in ()).throw(RuntimeError("disk full"))
+    t.push_api({"method": "GET", "path": "/lost", "request_id": "r1"})  # swallowed
+    assert "api persist failed" in capsys.readouterr().err
+
+    body = _client().get("/api/v1/logs/api").json()
+    assert body["completeness"] == {"api": "store-degraded"}
+    assert store.degraded and store.write_failures == 1
+
+    # sink recovers — the flag stays degraded, because the lost row does not come back
+    store.insert = lambda row: real_insert(store, row)
+    t.push_api({"method": "GET", "path": "/kept", "request_id": "r2"})
+    body = _client().get("/api/v1/logs/api").json()
+    assert body["completeness"] == {"api": "store-degraded"}
+    assert [r["path"] for r in body["rows"]] == ["/kept"]  # /lost is gone — the hole
+
+    # /correlate carries the same degraded class
+    corr = _client().get("/api/v1/logs/correlate?request_id=r2").json()
+    assert corr["completeness"]["api"] == "store-degraded"
 
 
 # ── null-timestamp ring/store agreement ───────────────────────────────────

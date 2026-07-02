@@ -14,6 +14,14 @@ round-trip (``json.dumps(..., default=str)`` on the way in), so JSON-native
 scalars are preserved but non-JSON values (e.g. ``datetime``) are coerced to
 their ``str()`` form — not type-identical to the original object.
 
+Write cost: persistence is write-through — every pushed row is one
+synchronous INSERT + commit on the caller's thread. With WAL +
+``synchronous=NORMAL`` (set on every connection) a commit is a WAL append
+without a per-commit fsync, which keeps a hot api/sys stream viable. Even so
+this is a per-row disk write: for very hot streams prefer ring-only mode, or
+expect stream persistence to grow an async drainer in a later phase (the
+audit path already has one).
+
 Connection handling mirrors ``SQLiteStore``: one connection per thread for
 file-backed stores (WAL — many readers + one writer), and a single
 lock-guarded connection for ``:memory:`` (which cannot be shared across
@@ -77,9 +85,14 @@ class StreamStore:
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
+        # Persist attempts swallowed by the transport. Non-zero means durable
+        # history has holes, so the reader degrades the stream's completeness
+        # flag from "store" to "store-degraded". Sticky for the store's
+        # lifetime: a hole in history doesn't heal when the disk recovers.
+        # Plain int under the GIL — a lost increment can only undercount, and
+        # ``degraded`` only needs "at least one".
+        self._write_failures = 0
         bootstrap = self._connect()
-        if wal and not self._is_memory:
-            bootstrap.execute("PRAGMA journal_mode=WAL")
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():
                 bootstrap.execute(stmt)
@@ -97,6 +110,14 @@ class StreamStore:
             conn.row_factory = sqlite3.Row
             if self._wal:
                 conn.execute("PRAGMA journal_mode=WAL")
+                # The standard WAL pairing, and per-connection (unlike
+                # journal_mode, which persists in the file): commits append to
+                # the WAL without a per-commit fsync. That matters because
+                # insert() runs one commit per pushed row. NORMAL still
+                # guarantees database consistency after a crash; the tail of
+                # unsynced commits may be lost, acceptable for stream rows
+                # (the audit chain has its own store and drainer).
+                conn.execute("PRAGMA synchronous=NORMAL")
             self._tls.conn = conn
         return conn
 
@@ -120,10 +141,26 @@ class StreamStore:
             )
             conn.commit()
 
-    def query(
+    def note_write_failure(self) -> None:
+        """Record that a persist attempt for this store was swallowed. Called
+        by the transport at the swallow point, so callers that handle an
+        insert() error themselves don't mark the store degraded."""
+        self._write_failures += 1
+
+    @property
+    def write_failures(self) -> int:
+        """How many persist attempts were swallowed."""
+        return self._write_failures
+
+    @property
+    def degraded(self) -> bool:
+        """True when durable history has known holes (at least one swallowed
+        persist failure). Drives the ``store-degraded`` completeness flag."""
+        return self._write_failures > 0
+
+    def _build_where(
         self,
         *,
-        limit: int = 100,
         level: str | None = None,
         request_id: str | None = None,
         service_id: str | None = None,
@@ -133,16 +170,14 @@ class StreamStore:
         status: int | None = None,
         since: str | None = None,
         until: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Return up to ``limit`` rows newest-first, applying the same
-        exact-match filter semantics as the in-memory ring so store and ring
-        reads agree (and match the Go SDK; ``method``/``path`` are exact, not
-        case-folded or substring)."""
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE for query()/count_matching(): exact-match equality on
+        the indexed columns plus an optional [since, until] timestamp window."""
         conds: list[str] = []
         params: list[Any] = []
         if level:
             conds.append("level = ?")
-            params.append(level.lower())
+            params.append(level)
         if request_id:
             conds.append("request_id = ?")
             params.append(request_id)
@@ -164,6 +199,8 @@ class StreamStore:
         # COALESCE so a NULL (timestamp-less) row sorts as "" — matching the
         # ring, which treats a missing timestamp as empty string. Without this
         # a NULL row is excluded by `<= until` in SQL but included in the ring.
+        # The window compares lexicographically (as does the ring): correct for
+        # fasten's own canonical UTC timestamps, but mixed formats mis-compare.
         if since:
             conds.append("COALESCE(timestamp, '') >= ?")
             params.append(since)
@@ -171,12 +208,65 @@ class StreamStore:
             conds.append("COALESCE(timestamp, '') <= ?")
             params.append(until)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        return where, params
+
+    def query(
+        self,
+        *,
+        limit: int = 100,
+        level: str | None = None,
+        request_id: str | None = None,
+        service_id: str | None = None,
+        method: str | None = None,
+        path: str | None = None,
+        event: str | None = None,
+        status: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` rows newest-first, applying the same
+        exact-match filter semantics as the in-memory ring so store and ring
+        reads agree (and match the Go SDK; every filter — including ``level``
+        — is exact, not case-folded or substring)."""
+        where, params = self._build_where(
+            level=level, request_id=request_id, service_id=service_id,
+            method=method, path=path, event=event, status=status,
+            since=since, until=until,
+        )
         sql = f"SELECT payload FROM {self._table}{where} ORDER BY seq DESC LIMIT ?"
         params.append(limit)
         with self._txn():
             conn = self._connect()
             rows = conn.execute(sql, params).fetchall()
         return [json.loads(r["payload"]) for r in rows]
+
+    def count_matching(
+        self,
+        *,
+        level: str | None = None,
+        request_id: str | None = None,
+        service_id: str | None = None,
+        method: str | None = None,
+        path: str | None = None,
+        event: str | None = None,
+        status: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> int:
+        """Total rows matching the same filters as query(), without a limit —
+        so a capped read can report how much history it truncated (the
+        /correlate totals)."""
+        where, params = self._build_where(
+            level=level, request_id=request_id, service_id=service_id,
+            method=method, path=path, event=event, status=status,
+            since=since, until=until,
+        )
+        with self._txn():
+            conn = self._connect()
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {self._table}{where}", params
+            ).fetchone()
+        return int(row[0])
 
     def count(self) -> int:
         with self._txn():
