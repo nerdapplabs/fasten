@@ -450,8 +450,11 @@ class PostgresStore:
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
                 cur.execute(
+                    # Wall-clock first: monotonic_seq is a per-(service_id,
+                    # source_node_id) counter, meaningless across sub-chains —
+                    # it stays as the same-timestamp tie-breaker only (#68).
                     f"SELECT * FROM {self._table} {where} "
-                    "ORDER BY monotonic_seq DESC LIMIT %s OFFSET %s",
+                    "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s OFFSET %s",
                     (*params, limit, offset),
                 )
                 return [self._row(r) for r in cur.fetchall()]
