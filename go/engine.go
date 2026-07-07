@@ -12,7 +12,6 @@ import (
 	"time"
 )
 
-
 // Engine holds all runtime state for one fasten deployment context.
 //
 // The package-level free functions (Init, Emit, …) delegate to Default.
@@ -29,14 +28,15 @@ type Engine struct {
 	tenantID        string
 	auditStore      AuditRepository
 	xport           *Transport
-	seq             int64 // accessed via atomic ops
+	apiStore        *StreamStore // FR1: opt-in api persistence, nil = ring-only
+	syslogStore     *StreamStore // FR1: opt-in sys persistence, nil = ring-only
+	seq             int64        // accessed via atomic ops
 	failureStrategy string
 
 	// Streams classified as backed by the durable store rather than a bounded
 	// ring. Drives the per-stream completeness flag on every reader read.
-	// Seeded in Init from defaultPersistedStreams ({"audit"}) — audit is the
-	// only store-backed stream today; Phase 1 wires this from config so api/sys
-	// can persist too.
+	// Seeded in Init from defaultPersistedStreams ({"audit"}), then extended
+	// with api/sys when the corresponding stream store is configured.
 	persistedStreams map[string]bool
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
@@ -54,8 +54,8 @@ var Default = &Engine{}
 // Init configures this Engine. See the package-level Config docs for details.
 func (e *Engine) Init(cfg Config) error {
 	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
-	e.nodeID    = firstNonEmpty(cfg.NodeID,    envOr("FASTEN_NODE_ID", ""))
-	e.tenantID  = firstNonEmpty(cfg.TenantID,  envOr("FASTEN_TENANT_ID", ""))
+	e.nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
+	e.tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
 
 	if e.serviceID == "" || e.nodeID == "" {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
@@ -81,11 +81,27 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
-	// Per-engine copy of the durability default so callers may mutate this
-	// engine's map (Phase 1 config) without touching the package-level default.
-	e.persistedStreams = make(map[string]bool, len(defaultPersistedStreams))
+	// Sentinel invariant: one stable boot-window id per process, in effect for
+	// context-less stream rows until the first real request arrives.
+	e.xport.serviceID = e.serviceID
+	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
+	// FR1: attach opt-in stream stores as write-through sinks + read source,
+	// and flip their completeness class to store-backed. Seeded from a
+	// per-engine copy of the durability default ({"audit"}) so the config-driven
+	// additions below never touch the package-level default.
+	e.apiStore = cfg.APIStore
+	e.syslogStore = cfg.SyslogStore
+	e.xport.APIStore = cfg.APIStore
+	e.xport.SyslogStore = cfg.SyslogStore
+	e.persistedStreams = make(map[string]bool, len(defaultPersistedStreams)+2)
 	for stream, persisted := range defaultPersistedStreams {
 		e.persistedStreams[stream] = persisted
+	}
+	if cfg.APIStore != nil {
+		e.persistedStreams["api"] = true
+	}
+	if cfg.SyslogStore != nil {
+		e.persistedStreams["sys"] = true
 	}
 
 	strategy := strings.ToLower(firstNonEmpty(
@@ -307,6 +323,8 @@ func (e *Engine) ResetForTests() {
 	e.tenantID = ""
 	e.auditStore = nil
 	e.xport = nil
+	e.apiStore = nil
+	e.syslogStore = nil
 	e.persistedStreams = nil
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""

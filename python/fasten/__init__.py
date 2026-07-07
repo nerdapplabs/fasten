@@ -19,7 +19,14 @@ from __future__ import annotations
 from .attrs import Anchor, AuditRow
 from .chain import ChainVerifyResult, seal, verify_chain
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
-from .context import current_request_id, mint_id, with_request_id
+from .context import (
+    current_request_id,
+    is_sentinel,
+    mint_id,
+    mint_sentinel,
+    request_id_kind,
+    with_request_id,
+)
 from .emitter import (
     audit_store,
     emit,
@@ -30,6 +37,7 @@ from .emitter import (
     list_unshipped,
     log,
     mark_shipped,
+    persisted_streams,
     queue_stats,
     redactor,
     start,
@@ -75,7 +83,10 @@ __all__ = [
     "queue_stats",
     # context
     "current_request_id",
+    "is_sentinel",
     "mint_id",
+    "mint_sentinel",
+    "request_id_kind",
     "with_request_id",
     # core
     "emit",
@@ -85,6 +96,7 @@ __all__ = [
     "log",
     # adopter hooks
     "audit_store",
+    "persisted_streams",
     "redactor",
     "transport",
 ]

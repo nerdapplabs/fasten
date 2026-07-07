@@ -29,7 +29,7 @@ vendor/
 # Rust
 rust/target/
 rust/Cargo.lock
-fasten-core/target/
+fasten-core/target
 
 # Java
 java/target/

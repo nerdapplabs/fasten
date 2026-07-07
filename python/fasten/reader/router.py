@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .. import audit_store as _active_audit_store
+from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
 from .. import transport as _active_transport
 
@@ -59,9 +60,10 @@ def router(
         transport: Optional StdoutTransport override. Default: same.
         persist_streams: Streams backed by the durable store rather than a
             bounded ring. Drives the per-stream ``completeness`` flag on
-            every read (``store`` vs ``ring``). Default ``{"audit"}`` —
-            audit is the only store-backed stream today, api/sys are rings.
-            Phase 1 wires this from config once api/sys can persist.
+            every read (``store`` vs ``ring``). Default: resolved per request
+            from the live engine config (``fasten.persisted_streams()``) —
+            ``audit`` always, plus ``api``/``sys`` when a stream store is
+            configured. Pass an explicit set to override.
     """
     try:
         from fastapi import APIRouter, Query
@@ -71,8 +73,6 @@ def router(
         ) from e
 
     r = APIRouter(dependencies=dependencies or [])
-
-    _persisted = persist_streams if persist_streams is not None else frozenset({"audit"})
 
     def _store() -> Any:
         return store if store is not None else _active_audit_store()
@@ -87,15 +87,33 @@ def router(
         It says whether the stream *can* lose rows, never whether *this*
         response did: a ring that overflowed and evicted older matching rows
         still reports ``ring``, identical to an empty ring that lost nothing.
-        There is no truncation flag here — per-response truncation honesty is
-        deferred to Phase 1."""
-        return "store" if stream in _persisted else "ring"
+        There is no truncation flag here — for ``/correlate``, the
+        totals-vs-counts pair is the per-response truncation signal. When
+        ``persist_streams`` is not pinned, resolve it from the live engine
+        config so the flag tracks which streams actually persist (FR1).
+
+        A store-backed stream whose sink has swallowed at least one persist
+        failure reports ``store-degraded``: reads are still served from the
+        store, but durable history has known holes (rows that live only in
+        the ring, which store-backed reads never consult), so plain ``store``
+        would assert a durability the data no longer has. Sticky for the
+        store's lifetime."""
+        persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
+        if stream not in persisted:
+            return "ring"
+        t = _transport()
+        if t is not None and getattr(t, "stream_degraded", None) and t.stream_degraded(stream):
+            return "store-degraded"
+        return "store"
 
     @r.get("/sys")
     def get_sys(
         level: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
+        event: Optional[str] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
@@ -110,6 +128,9 @@ def router(
             level=level,
             request_id=request_id,
             service_id=service_id,
+            event=event,
+            since=since,
+            until=until,
         )
         return {"rows": rows, "completeness": {"sys": _source("sys")}}
 
@@ -118,6 +139,9 @@ def router(
         method: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
+        status: Optional[int] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
@@ -132,6 +156,9 @@ def router(
             method=method,
             path=path,
             request_id=request_id,
+            status=status,
+            since=since,
+            until=until,
         )
         return {"rows": rows, "completeness": {"api": _source("api")}}
 
@@ -173,6 +200,53 @@ def router(
             "limit": limit,
             "offset": offset,
             "completeness": {"audit": _source("audit")},
+        }
+
+    @r.get("/correlate")
+    def get_correlate(
+        request_id: str = Query(...),
+        limit: int = Query(default=100, le=1000),
+    ) -> dict[str, Any]:
+        """Unified correlation read — every stream for one ``request_id``.
+
+        Fans out to the existing per-stream query paths (audit store + sys/api
+        rings-or-stores) and assembles them, so a consumer holding a
+        ``request_id`` gets the whole operation in one call instead of
+        stitching three. Adds no new query semantics beyond fan-out +
+        assembly. ``completeness`` reports each stream's durability class,
+        and ``totals`` reports how many matching rows the backing source
+        holds — ``counts`` is how many this capped response returned, so
+        ``counts < totals`` means the response is truncated (raise ``limit``
+        or page the per-stream endpoints).
+        """
+        s = _store()
+        t = _transport()
+        audit = (
+            [dataclasses.asdict(row) for row in s.query(limit=limit, request_id=request_id)]
+            if s is not None else []
+        )
+        api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
+        sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
+        audit_total = (
+            s.count(request_id=request_id)
+            if s is not None and hasattr(s, "count") else len(audit)
+        )
+        return {
+            "request_id": request_id,
+            "audit": audit,
+            "api": api,
+            "sys": sys,
+            "counts": {"audit": len(audit), "api": len(api), "sys": len(sys)},
+            "totals": {
+                "audit": audit_total,
+                "api": t.count_api(request_id=request_id) if t is not None else 0,
+                "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
+            },
+            "completeness": {
+                "audit": _source("audit"),
+                "api": _source("api"),
+                "sys": _source("sys"),
+            },
         }
 
     @r.get("/topology")

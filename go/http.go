@@ -93,6 +93,7 @@ func (e *Engine) NewReader() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
 	mux.HandleFunc("GET /api", e.handleAPI)
+	mux.HandleFunc("GET /correlate", e.handleCorrelate)
 	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
 	mux.HandleFunc("GET /audit", e.handleAudit)
 	return mux
@@ -102,11 +103,12 @@ func (e *Engine) NewReader() http.Handler {
 func NewReader() http.Handler { return Default.NewReader() }
 
 // defaultPersistedStreams is the durability default applied when an engine was
-// never Init'd (nil persistedStreams): audit is the only store-backed stream
-// today. Init seeds a per-engine copy from this; streamSource falls back to it
-// so the default lives in exactly one declarative place — mirroring the Python
-// router's frozenset({"audit"}), and keeping the resolver free of any
-// hardcoded stream name.
+// never Init'd (nil persistedStreams): audit is the only stream that is
+// store-backed unconditionally. Init seeds a per-engine copy from this (then
+// extends it with api/sys per config); streamSource falls back to it so the
+// default lives in exactly one declarative place — mirroring the Python
+// engine's default, and keeping the resolver free of any hardcoded stream
+// name.
 var defaultPersistedStreams = map[string]bool{"audit": true}
 
 // streamSource reports whether a stream is backed by the durable store or a
@@ -116,21 +118,38 @@ var defaultPersistedStreams = map[string]bool{"audit": true}
 // signal: it says whether the stream CAN lose rows, never whether THIS response
 // did. A ring that overflowed and evicted older matching rows still reports
 // "ring" — identical to an empty ring that lost nothing; there is no truncation
-// flag here. (Per-response truncation honesty is deferred to Phase 1.)
+// flag here. (For /correlate, the totals-vs-counts pair is the per-response
+// truncation signal.)
 //
 // error/uninitialised reads still carry it so the response shape stays uniform
 // (the `error` key is what signals a read actually failed). Defaults to "ring"
 // unless the stream is in persistedStreams; a nil map (engine never Init'd)
 // falls back to defaultPersistedStreams.
+//
+// A store-backed stream whose sink has swallowed at least one persist
+// failure reports "store-degraded": reads are still served from the store,
+// but durable history has known holes (rows that live only in the ring,
+// which store-backed reads never consult), so plain "store" would assert a
+// durability the data no longer has. Sticky for the store's lifetime.
 func (e *Engine) streamSource(stream string) string {
 	persisted := e.persistedStreams
 	if persisted == nil {
 		persisted = defaultPersistedStreams
 	}
-	if persisted[stream] {
-		return "store"
+	if !persisted[stream] {
+		return "ring"
 	}
-	return "ring"
+	var st *StreamStore
+	switch stream {
+	case "api":
+		st = e.apiStore
+	case "sys":
+		st = e.syslogStore
+	}
+	if st != nil && st.Degraded() {
+		return "store-degraded"
+	}
+	return "store"
 }
 
 func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +159,18 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := e.xport.QuerySyslog(limit, q.Get("level"), q.Get("request_id"), q.Get("service_id"))
+	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
+		Level:     q.Get("level"),
+		RequestID: q.Get("request_id"),
+		ServiceID: q.Get("service_id"),
+		Event:     q.Get("event"),
+		Since:     q.Get("since"),
+		Until:     q.Get("until"),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
@@ -154,11 +184,108 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 100)
-	rows := e.xport.QueryAPI(limit, q.Get("method"), q.Get("path"), q.Get("request_id"))
+	rows, err := e.xport.QueryAPI(limit, StreamQuery{
+		Method:    q.Get("method"),
+		Path:      q.Get("path"),
+		RequestID: q.Get("request_id"),
+		Status:    q.Get("status"),
+		Since:     q.Get("since"),
+		Until:     q.Get("until"),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if rows == nil {
 		rows = []APIRow{}
 	}
 	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"api": e.streamSource("api")}})
+}
+
+// filterCounter is the optional filtered-count capability of an audit store,
+// used for /correlate totals. The built-in SQLite and Postgres stores
+// implement it; adopter stores that don't fall back to totals == counts.
+type filterCounter interface {
+	CountFiltered(ctx context.Context, f Filter) (int, error)
+}
+
+// handleCorrelate is the unified correlation read (FR2): every stream for one
+// request_id in a single call. Fans out to the existing per-stream query paths
+// (audit store + sys/api rings-or-stores) and assembles them — no new query
+// semantics. completeness reports each stream's durability class, and totals
+// reports how many matching rows the backing source holds — counts is how
+// many this capped response returned, so counts < totals means the response
+// is truncated (raise limit or page the per-stream endpoints).
+func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
+	rid := r.URL.Query().Get("request_id")
+	if rid == "" {
+		http.Error(w, "request_id is required", http.StatusBadRequest)
+		return
+	}
+	limit := intParam(r.URL.Query().Get("limit"), 100)
+
+	audit := []map[string]any{}
+	auditTotal := 0
+	if e.auditStore != nil {
+		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, Limit: limit})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, row := range rows {
+			audit = append(audit, rowToMap(row))
+		}
+		auditTotal = len(audit)
+		if counter, ok := e.auditStore.(filterCounter); ok {
+			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid}); err == nil {
+				auditTotal = n
+			}
+		}
+	}
+
+	api := []APIRow{}
+	sys := []SyslogRow{}
+	apiTotal, sysTotal := 0, 0
+	if e.xport != nil {
+		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if a != nil {
+			api = a
+		}
+		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if s != nil {
+			sys = s
+		}
+		if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	writeJSON(w, map[string]any{
+		"request_id": rid,
+		"audit":      audit,
+		"api":        api,
+		"sys":        sys,
+		"counts":     map[string]int{"audit": len(audit), "api": len(api), "sys": len(sys)},
+		"totals":     map[string]int{"audit": auditTotal, "api": apiTotal, "sys": sysTotal},
+		"completeness": map[string]string{
+			"audit": e.streamSource("audit"),
+			"api":   e.streamSource("api"),
+			"sys":   e.streamSource("sys"),
+		},
+	})
 }
 
 func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +352,9 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 					storeBlock["last_error"] = fmt.Sprintf("panic: %v", p)
 				}
 			}()
-			if counter, ok := store.(interface{ Count(context.Context) (int, error) }); ok {
+			if counter, ok := store.(interface {
+				Count(context.Context) (int, error)
+			}); ok {
 				n, err := counter.Count(r.Context())
 				if err != nil {
 					storeBlock["last_error"] = err.Error()

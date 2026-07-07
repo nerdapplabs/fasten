@@ -69,6 +69,35 @@ FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=host-01 go run server.go
 curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 ```
 
+## Reading logs back: whole record, or a recent window?
+
+Every reader response carries a per-stream `completeness` flag that answers
+exactly this:
+
+- **`store`** — the stream is backed by a durable store. The response is a
+  query over the whole recorded history (paged by `limit`), not a window.
+- **`ring`** — the stream lives in a bounded in-memory ring (default 2000
+  rows, cleared on restart). The response only reaches as far back as the
+  ring: older rows have been evicted, and there is no signal for *whether*
+  eviction dropped matching rows. Treat it as "recent window", never "the
+  record".
+- **`store-degraded`** — store-backed, but at least one row failed to persist
+  (full disk, closed handle, …). Reads still serve from the store, but durable
+  history has known holes. The flag is sticky: it marks the history, not the
+  current sink state.
+
+The flag is the stream's durability *class* — it never says whether one
+specific response lost rows. For `/correlate`, which caps each stream at
+`limit`, compare `counts` (returned) against `totals` (matching rows available
+in the backing source): `counts < totals` means the response is truncated —
+raise `limit` or page the per-stream endpoints.
+
+`audit` is always store-backed. `api`/`sys` are ring-only unless you attach a
+`StreamStore` via `Config.APIStore` / `Config.SyslogStore`; persistence is
+write-through (one synchronous INSERT per pushed row — WAL +
+`synchronous=NORMAL`, so no per-commit fsync, but still a per-row disk write;
+set the pragma in your DSN so every pooled connection gets it).
+
 ## P1-15: audit-store failure handling
 
 `fasten.Emit()` defaults to **queue mode** — rows go onto a bounded
