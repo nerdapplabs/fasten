@@ -112,11 +112,11 @@ When changing drainer behavior, sync `spec/drainer-conformance.md` and every SDK
 
 ### fasten-core (Rust, C-ABI)
 
-- `src/redact.rs` — key-pattern + value-shape redaction (JWT, AWS key, PEM, GH/Stripe/OpenAI tokens, Luhn-valid CC).
-- `src/catalog.rs` — code registration + validation.
-- `src/store/{sqlite,postgres}.rs` — sync `AuditStore` trait implementations. Postgres uses pure-Rust `postgres` 0.19 (sync, no libpq) so it can be called from non-async hosts without `block_on` panics.
-- `include/fasten_core.h` — C ABI header all SDKs include.
-- `bindings/{python,go,node,swift,java}/` — thin language-side wrappers with co-located tests.
+- `fasten-core/src/redact.rs` — key-pattern + value-shape redaction (JWT, AWS key, PEM, GH/Stripe/OpenAI tokens, Luhn-valid CC).
+- `fasten-core/src/catalog.rs` — code registration + validation.
+- `fasten-core/src/store/{sqlite,postgres}.rs` — sync `AuditStore` trait implementations. Postgres uses pure-Rust `postgres` 0.19 (sync, no libpq) so it can be called from non-async hosts without `block_on` panics.
+- `fasten-core/include/fasten_core.h` — C ABI header all SDKs include.
+- `fasten-core/bindings/{python,go,node,swift,java}/` — thin language-side wrappers with co-located tests.
 
 Built with `crate-type = ["cdylib", "staticlib", "rlib"]`. Canonical build: `cargo build --release --features all`.
 
