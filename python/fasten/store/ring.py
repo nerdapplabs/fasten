@@ -19,6 +19,17 @@ from collections import deque
 from typing import Any
 
 
+def _row_ts(row: dict[str, Any]) -> str:
+    """Timestamp of a row for windowing, coalescing a missing or ``None`` value
+    to the empty string — matching the store's ``COALESCE(timestamp, '')`` so a
+    ring read and a store read window a timestamp-less row identically. Without
+    this, an explicit ``timestamp: None`` becomes ``str(None) == "None"``, which
+    sorts above real ISO timestamps and is silently kept where the store drops
+    it."""
+    t = row.get("timestamp")
+    return "" if t is None else str(t)
+
+
 class RingBuffer:
     def __init__(self, maxlen: int = 2000) -> None:
         self._buf: deque[dict[str, Any]] = deque(maxlen=maxlen)
@@ -58,9 +69,9 @@ class RingBuffer:
         if status is not None:
             rows = [r for r in rows if r.get("status") == status]
         if since:
-            rows = [r for r in rows if str(r.get("timestamp", "")) >= since]
+            rows = [r for r in rows if _row_ts(r) >= since]
         if until:
-            rows = [r for r in rows if str(r.get("timestamp", "")) <= until]
+            rows = [r for r in rows if _row_ts(r) <= until]
         return rows
 
     def query(self, *, limit: int = 100, **filters: Any) -> list[dict[str, Any]]:
