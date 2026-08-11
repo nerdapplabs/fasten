@@ -291,6 +291,23 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 	return d.flush(timeout)
 }
 
+// marshalWithShape renders row as a JSON line tagged with its stream shape
+// WITHOUT mutating row. Once a row has been handed to PushSyslog/PushAPI the
+// ring holds it by reference and a store may have persisted it, so writing
+// row["shape"] afterwards would (1) race a concurrent reader iterating the ring
+// snapshot — a fatal "concurrent map read and map write" — and (2) leave the
+// persisted copy missing the shape the ring copy carries. Tagging a shallow
+// copy keeps the shared row untouched (mirroring the Python transport, which
+// builds {"shape": ..., **row} for stdout).
+func marshalWithShape(row map[string]any, shape string) ([]byte, error) {
+	out := make(map[string]any, len(row)+1)
+	for k, v := range row {
+		out[k] = v
+	}
+	out["shape"] = shape
+	return json.Marshal(out)
+}
+
 // LogSys writes a structured {shape:"sys"} line via this Engine.
 func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 	row := SyslogRow{
@@ -310,8 +327,7 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
+	if b, err := marshalWithShape(row, "sys"); err == nil {
 		fmt.Println(string(b))
 	}
 }
@@ -392,8 +408,7 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}
-	row["shape"] = "sys"
-	if b, err := json.Marshal(row); err == nil {
+	if b, err := marshalWithShape(row, "sys"); err == nil {
 		fmt.Fprintln(os.Stderr, string(b))
 	}
 }
