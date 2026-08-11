@@ -78,9 +78,22 @@ def test_empty_persist_streams_makes_audit_ring(initialized):
     assert body["completeness"] == {"audit": "ring"}
 
 
+def test_stdout_only_audit_reports_ring():
+    """Initialised without an audit store (stdout-only mode): audit is not
+    durable, so its completeness is ``ring``. The reader must not advertise a
+    ``store`` that was never configured."""
+    fasten.init(service_id="test-svc", node_id="test-node")  # no audit_store
+
+    body = _client().get("/api/v1/logs/audit").json()
+    assert body["completeness"] == {"audit": "ring"}
+    assert "error" in body  # no store to read from — but honestly flagged ring
+
+
 def test_completeness_present_on_uninitialised_reads():
     """Even the not-initialised error paths carry the flag, so consumers can
-    parse one uniform shape on every response."""
+    parse one uniform shape on every response. With no audit store configured,
+    audit is honestly ``ring`` — it must not claim a durable ``store`` while
+    simultaneously erroring that nothing is stored."""
     client = _client()  # no `initialized` fixture → globals are unset
 
     sys_body = client.get("/api/v1/logs/sys").json()
@@ -88,7 +101,7 @@ def test_completeness_present_on_uninitialised_reads():
     assert "error" in sys_body
 
     audit_body = client.get("/api/v1/logs/audit").json()
-    assert audit_body["completeness"] == {"audit": "store"}
+    assert audit_body["completeness"] == {"audit": "ring"}
     assert "error" in audit_body
     # Uniform shape: the audit error path carries the same pagination keys as
     # its success path, not just rows/total.

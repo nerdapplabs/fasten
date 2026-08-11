@@ -34,9 +34,10 @@ type Engine struct {
 	failureStrategy string
 
 	// Streams classified as backed by the durable store rather than a bounded
-	// ring. Drives the per-stream completeness flag on every reader read.
-	// Seeded in Init from defaultPersistedStreams ({"audit"}), then extended
-	// with api/sys when the corresponding stream store is configured.
+	// ring. Drives the per-stream completeness flag on every reader read. A
+	// stream is present only when it actually has a store: audit when an audit
+	// store is configured, api/sys when a stream store is. A nil map (never
+	// Init'd) reads as all-ring.
 	persistedStreams map[string]bool
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
@@ -86,16 +87,17 @@ func (e *Engine) Init(cfg Config) error {
 	e.xport.serviceID = e.serviceID
 	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
 	// FR1: attach opt-in stream stores as write-through sinks + read source,
-	// and flip their completeness class to store-backed. Seeded from a
-	// per-engine copy of the durability default ({"audit"}) so the config-driven
-	// additions below never touch the package-level default.
+	// and flip their completeness class to store-backed. A stream is
+	// store-backed only when it actually has a store — audit included: in
+	// stdout-only mode (no audit store) audit stays ring, so a read never
+	// claims a durable store that does not exist.
 	e.apiStore = cfg.APIStore
 	e.syslogStore = cfg.SyslogStore
 	e.xport.APIStore = cfg.APIStore
 	e.xport.SyslogStore = cfg.SyslogStore
-	e.persistedStreams = make(map[string]bool, len(defaultPersistedStreams)+2)
-	for stream, persisted := range defaultPersistedStreams {
-		e.persistedStreams[stream] = persisted
+	e.persistedStreams = map[string]bool{}
+	if cfg.AuditStore != nil {
+		e.persistedStreams["audit"] = true
 	}
 	if cfg.APIStore != nil {
 		e.persistedStreams["api"] = true

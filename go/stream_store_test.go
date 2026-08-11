@@ -187,7 +187,18 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStreamStore: %v", err)
 	}
-	if err := Init(Config{ServiceID: "svc", NodeID: "node", APIStore: apiStore}); err != nil {
+	// A real audit store on its own DB, so "audit unaffected" below is a
+	// genuine store-backed audit — not the old unconditional default.
+	auditDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open (audit): %v", err)
+	}
+	t.Cleanup(func() { auditDB.Close() })
+	auditStore, err := NewSQLiteStore(auditDB, "audit_degrade_test")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: auditStore, APIStore: apiStore}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	tr := GetTransport()

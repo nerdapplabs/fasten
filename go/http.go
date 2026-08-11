@@ -102,15 +102,6 @@ func (e *Engine) NewReader() http.Handler {
 // NewReader is a package-level shorthand for Default.NewReader().
 func NewReader() http.Handler { return Default.NewReader() }
 
-// defaultPersistedStreams is the durability default applied when an engine was
-// never Init'd (nil persistedStreams): audit is the only stream that is
-// store-backed unconditionally. Init seeds a per-engine copy from this (then
-// extends it with api/sys per config); streamSource falls back to it so the
-// default lives in exactly one declarative place — mirroring the Python
-// engine's default, and keeping the resolver free of any hardcoded stream
-// name.
-var defaultPersistedStreams = map[string]bool{"audit": true}
-
 // streamSource reports whether a stream is backed by the durable store or a
 // bounded ring, so consumers stay honest about gaps.
 //
@@ -121,10 +112,13 @@ var defaultPersistedStreams = map[string]bool{"audit": true}
 // flag here. (For /correlate, the totals-vs-counts pair is the per-response
 // truncation signal.)
 //
-// error/uninitialised reads still carry it so the response shape stays uniform
-// (the `error` key is what signals a read actually failed). Defaults to "ring"
-// unless the stream is in persistedStreams; a nil map (engine never Init'd)
-// falls back to defaultPersistedStreams.
+// A stream is "store" only when it actually has a store (audit included), so a
+// stdout-only or never-Init'd engine reports "ring" rather than advertising a
+// durable store that was never configured. persistedStreams is nil until Init;
+// indexing a nil map yields false, so that case resolves to "ring".
+//
+// error/uninitialised reads still carry the flag so the response shape stays
+// uniform (the `error` key is what signals a read actually failed).
 //
 // A store-backed stream whose sink has swallowed at least one persist
 // failure reports "store-degraded": reads are still served from the store,
@@ -132,11 +126,7 @@ var defaultPersistedStreams = map[string]bool{"audit": true}
 // which store-backed reads never consult), so plain "store" would assert a
 // durability the data no longer has. Sticky for the store's lifetime.
 func (e *Engine) streamSource(stream string) string {
-	persisted := e.persistedStreams
-	if persisted == nil {
-		persisted = defaultPersistedStreams
-	}
-	if !persisted[stream] {
+	if !e.persistedStreams[stream] {
 		return "ring"
 	}
 	var st *StreamStore

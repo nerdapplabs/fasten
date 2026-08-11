@@ -93,11 +93,31 @@ func TestCompleteness_FollowsPersistedStreams(t *testing.T) {
 	}
 }
 
+// TestCompleteness_StdoutOnlyAuditIsRing mirrors Python's
+// test_stdout_only_audit_reports_ring: Init'd without an audit store
+// (stdout-only mode), audit is not durable, so its completeness is "ring". The
+// reader must not advertise a store that was never configured.
+func TestCompleteness_StdoutOnlyAuditIsRing(t *testing.T) {
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil { // no AuditStore
+		t.Fatalf("Init: %v", err)
+	}
+	if got := Default.streamSource("audit"); got != "ring" {
+		t.Errorf("stdout-only audit: got %q, want ring", got)
+	}
+	_, comp := getCompleteness(t, NewReader(), "/audit")
+	if comp["audit"] != "ring" {
+		t.Errorf("stdout-only /audit completeness: got %q, want ring", comp["audit"])
+	}
+}
+
 // TestCompleteness_ErrorPathsCarryFlag is the parity for Python's
 // test_completeness_present_on_uninitialised_reads: a never-Init'd engine
 // still emits the flag (plus an error) on every endpoint, so consumers parse
-// one uniform shape. This also exercises the nil-map fallback through the HTTP
-// layer — a fresh engine has persistedStreams == nil.
+// one uniform shape. With no audit store configured, audit is honestly "ring" —
+// it must not claim a durable "store" while erroring that nothing is stored.
+// This also exercises the nil-map path through the HTTP layer — a fresh engine
+// has persistedStreams == nil.
 func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
 	h := (&Engine{}).NewReader() // never Init'd: xport, auditStore, persistedStreams all nil
 
@@ -106,7 +126,7 @@ func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
 	}{
 		{"/sys", "sys", "ring"},
 		{"/api", "api", "ring"},
-		{"/audit", "audit", "store"},
+		{"/audit", "audit", "ring"},
 	}
 	for _, c := range cases {
 		body, comp := getCompleteness(t, h, c.path)
@@ -119,13 +139,14 @@ func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
 	}
 }
 
-// TestCompleteness_NilMapFallback pins the streamSource branch that fires when
-// the engine was never Init'd (persistedStreams == nil): audit still resolves
-// to "store", everything else to "ring".
-func TestCompleteness_NilMapFallback(t *testing.T) {
+// TestCompleteness_NilMap pins the streamSource path that fires when the engine
+// was never Init'd (persistedStreams == nil): with no store configured, every
+// stream — audit included — resolves to "ring". Indexing a nil map yields false,
+// so no stream is claimed durable.
+func TestCompleteness_NilMap(t *testing.T) {
 	e := &Engine{} // persistedStreams == nil
-	if got := e.streamSource("audit"); got != "store" {
-		t.Errorf("nil-map audit: got %q, want store", got)
+	if got := e.streamSource("audit"); got != "ring" {
+		t.Errorf("nil-map audit: got %q, want ring", got)
 	}
 	if got := e.streamSource("api"); got != "ring" {
 		t.Errorf("nil-map api: got %q, want ring", got)

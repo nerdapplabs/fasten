@@ -461,9 +461,14 @@ class Engine:
 
     def persisted_streams(self) -> frozenset[str]:
         """Streams backed by the durable store rather than a bounded ring
-        (FR4 completeness). ``audit`` is always store-backed; ``api``/``sys``
-        join the set only when a stream store is configured (FR1)."""
-        streams = {"audit"}
+        (FR4 completeness). A stream joins the set only when it actually has a
+        store: ``audit`` when an audit store is configured, ``api``/``sys``
+        when a stream store is (FR1). In stdout-only mode (no audit store)
+        ``audit`` is absent, so its reads report ``ring`` instead of asserting
+        a durable ``store`` that does not exist."""
+        streams: set[str] = set()
+        if self._audit_store is not None:
+            streams.add("audit")
         if self._api_store is not None:
             streams.add("api")
         if self._syslog_store is not None:
