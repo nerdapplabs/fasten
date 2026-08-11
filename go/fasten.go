@@ -483,6 +483,12 @@ type Config struct {
 	APIStore    *StreamStore
 	SyslogStore *StreamStore
 
+	// FR3: opt-in free-text search (/logs/search and q=). Off by default — it is
+	// a linear scan, so it must be explicitly enabled (also via
+	// FASTEN_SEARCH_ENABLED). Enabling it without a SyslogStore still yields
+	// "search requires sys persistence" at read time.
+	SearchEnabled bool
+
 	// P1-15
 	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
 	QueueCapacity             int           // default 100

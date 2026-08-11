@@ -248,6 +248,45 @@ func (s *StreamStore) Purge(before string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// Search is the FR3 escape hatch: a case-insensitive substring scan over the
+// persisted row text inside a mandatory [since, until] window, newest-first,
+// hard-capped, with NO relevance ranking. For "I only have an error string"
+// when structured field discovery can't help. q is matched against the full
+// serialized row (payload); LIKE wildcards (% _ \) are escaped so they match
+// literally. Mirrors the Python StreamStore.search contract.
+func (s *StreamStore) Search(q, since, until string, limit int) ([]map[string]any, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(q))
+	conds := []string{"COALESCE(timestamp,'') >= ?", "lower(payload) LIKE ? ESCAPE '\\'"}
+	args := []any{since, "%" + esc + "%"}
+	if until != "" {
+		conds = append(conds, "COALESCE(timestamp,'') <= ?")
+		args = append(args, until)
+	}
+	args = append(args, limit)
+	query := fmt.Sprintf(
+		"SELECT payload FROM %s WHERE %s ORDER BY seq DESC LIMIT ?",
+		s.table, strings.Join(conds, " AND "),
+	)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 func isStreamIndexed(col string) bool {
 	for _, f := range streamIndexedFields {
 		if f == col {

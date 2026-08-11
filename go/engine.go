@@ -32,6 +32,7 @@ type Engine struct {
 	syslogStore     *StreamStore // FR1: opt-in sys persistence, nil = ring-only
 	seq             int64        // accessed via atomic ops
 	failureStrategy string
+	searchEnabled   bool // FR3: opt-in free-text search (/logs/search, q=)
 
 	// Streams classified as backed by the durable store rather than a bounded
 	// ring. Drives the per-stream completeness flag on every reader read. A
@@ -105,6 +106,8 @@ func (e *Engine) Init(cfg Config) error {
 	if cfg.SyslogStore != nil {
 		e.persistedStreams["sys"] = true
 	}
+	// FR3: search is off unless explicitly enabled, via config or env.
+	e.searchEnabled = cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", ""))
 
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,
@@ -344,11 +347,24 @@ func (e *Engine) ResetForTests() {
 	e.apiStore = nil
 	e.syslogStore = nil
 	e.persistedStreams = nil
+	e.searchEnabled = false
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
 	e.hashMu.Lock()
 	e.prevHash = ""
 	e.hashMu.Unlock()
+}
+
+// SearchEnabled reports whether FR3 free-text search is enabled on this engine.
+func (e *Engine) SearchEnabled() bool { return e.searchEnabled }
+
+// isTruthy parses a boolean-ish env value ("1", "true", "yes", "on").
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // ── Drainer management (per-Engine) ──────────────────────────────────────────

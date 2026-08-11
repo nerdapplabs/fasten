@@ -273,6 +273,26 @@ func (t *Transport) CountSyslog(q StreamQuery) (int, error) {
 	return n, nil
 }
 
+// SearchSyslog runs the FR3 free-text search over persisted sys history.
+// Returns (nil, nil) when the sys stream is ring-only — search is defined over
+// durable history, not a bounded window, so without a store there is nothing
+// honest to search (the reader surfaces this as "search requires sys
+// persistence"). The bool return distinguishes "no store" from "no matches".
+func (t *Transport) SearchSyslog(q, since, until string, limit int) ([]SyslogRow, bool, error) {
+	if t.SyslogStore == nil {
+		return nil, false, nil
+	}
+	rows, err := t.SyslogStore.Search(q, since, until, limit)
+	if err != nil {
+		return nil, true, err
+	}
+	out := make([]SyslogRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, SyslogRow(r))
+	}
+	return out, true, nil
+}
+
 // QueryAPI returns up to limit API rows, newest-first. Served from the
 // durable store when one is attached, otherwise from the in-memory ring.
 func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {

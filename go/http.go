@@ -93,6 +93,7 @@ func (e *Engine) NewReader() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
 	mux.HandleFunc("GET /api", e.handleAPI)
+	mux.HandleFunc("GET /search", e.handleSearch)
 	mux.HandleFunc("GET /correlate", e.handleCorrelate)
 	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
 	mux.HandleFunc("GET /audit", e.handleAudit)
@@ -148,6 +149,30 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	comp := map[string]string{"sys": e.streamSource("sys")}
+	if qtext := q.Get("q"); qtext != "" {
+		// FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
+		if msg := e.searchGuard(qtext, q.Get("since")); msg != "" {
+			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp, "error": msg})
+			return
+		}
+		limit := searchLimit(q.Get("limit"))
+		rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp,
+				"error": "search requires sys persistence — configure a syslog store (FR1)"})
+			return
+		}
+		if rows == nil {
+			rows = []SyslogRow{}
+		}
+		writeJSON(w, map[string]any{"rows": rows, "completeness": comp})
+		return
+	}
 	limit := intParam(q.Get("limit"), 100)
 	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
 		Level:     q.Get("level"),
@@ -164,7 +189,75 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
-	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"sys": e.streamSource("sys")}})
+	writeJSON(w, map[string]any{"rows": rows, "completeness": comp})
+}
+
+// searchGuard returns "" when a q= read is allowed, else the reason it is not:
+// search must be explicitly enabled (§4.1) and time-bounded (since= mandatory,
+// no unbounded scans).
+func (e *Engine) searchGuard(q, since string) string {
+	if !e.searchEnabled {
+		return "search disabled — set search.enabled (FASTEN_SEARCH_ENABLED=true) to enable free-text q="
+	}
+	if since == "" {
+		return "q= search requires a 'since' bound (no unbounded scans)"
+	}
+	return ""
+}
+
+// searchLimit resolves the FR3 result cap: default 50, hard max 200.
+func searchLimit(s string) int {
+	n := intParam(s, 50)
+	if n > 200 {
+		n = 200
+	}
+	return n
+}
+
+// handleSearch is the FR3 free-text escape hatch (§4.1): sys-only, time-bounded,
+// hard-capped, no ranking. Returns matches carrying request_id so a consumer can
+// hand one to /correlate.
+func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	comp := map[string]string{"sys": e.streamSource("sys")}
+	fail := func(msg string) {
+		writeJSON(w, map[string]any{"matches": []any{}, "counts": map[string]int{"sys": 0},
+			"completeness": comp, "error": msg})
+	}
+	qtext := q.Get("q")
+	if qtext == "" {
+		fail("q= is required")
+		return
+	}
+	if msg := e.searchGuard(qtext, q.Get("since")); msg != "" {
+		fail(msg)
+		return
+	}
+	if e.xport == nil {
+		fail("fasten not initialised")
+		return
+	}
+	rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), searchLimit(q.Get("limit")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		fail("search requires sys persistence — configure a syslog store (FR1)")
+		return
+	}
+	matches := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		matches = append(matches, map[string]any{
+			"stream":     "sys",
+			"request_id": row["request_id"],
+			"ts":         row["timestamp"],
+			"summary":    row["event"],
+			"row":        row,
+		})
+	}
+	writeJSON(w, map[string]any{"matches": matches, "counts": map[string]int{"sys": len(matches)},
+		"completeness": comp})
 }
 
 func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
