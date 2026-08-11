@@ -114,7 +114,7 @@ def router(
         event: Optional[str] = Query(default=None),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
         if t is None:
@@ -142,7 +142,7 @@ def router(
         status: Optional[int] = Query(default=None),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
         if t is None:
@@ -173,7 +173,7 @@ def router(
         target: Optional[str] = Query(default=None),
         since: Optional[datetime] = Query(default=None),
         until: Optional[datetime] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
         s = _store()
@@ -205,7 +205,7 @@ def router(
     @r.get("/correlate")
     def get_correlate(
         request_id: str = Query(...),
-        limit: int = Query(default=100, le=1000),
+        limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         """Unified correlation read — every stream for one ``request_id``.
 
