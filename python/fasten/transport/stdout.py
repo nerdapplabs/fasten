@@ -168,6 +168,17 @@ class StdoutTransport:
             return self._syslog_store.count_matching(**filters)
         return self._syslog.count(**filters)
 
+    def search_syslog(
+        self, *, q: str, since: str, until: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]] | None:
+        """FR3 free-text search over persisted sys history. Returns ``None`` when
+        the sys stream is ring-only — search is defined over durable history, not
+        a bounded window, so without a store there is nothing honest to search
+        (the caller surfaces this as "search requires sys persistence")."""
+        if self._syslog_store is None:
+            return None
+        return self._syslog_store.search(q=q, since=since, until=until, limit=limit)
+
     # ── api log ─────────────────────────────────────────────────────────────
 
     def write_api(self, row: dict[str, Any]) -> None:

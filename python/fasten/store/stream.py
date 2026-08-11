@@ -293,6 +293,42 @@ class StreamStore:
             conn.commit()
             return cur.rowcount
 
+    def search(
+        self,
+        *,
+        q: str,
+        since: str,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search over the persisted row text, inside
+        a mandatory ``[since, until]`` window, newest-first, hard-capped.
+
+        The FR3 escape hatch for "I only have an error string" — deliberately
+        constrained (§4.1): it is a linear ``LIKE`` scan bounded by the ``since``
+        floor and the ``limit`` cap, with **no relevance ranking**. Callers reach
+        it only when structured discovery (indexed fields) can't. ``q`` is
+        matched against the full serialized row (``payload``), which for a sys
+        row is the event name plus its fields — small, unlike a typed audit row.
+
+        ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally
+        rather than acting as LIKE wildcards."""
+        esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds = ["COALESCE(timestamp, '') >= ?", "lower(payload) LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [since, f"%{esc}%"]
+        if until:
+            conds.append("COALESCE(timestamp, '') <= ?")
+            params.append(until)
+        sql = (
+            f"SELECT payload FROM {self._table} WHERE {' AND '.join(conds)} "
+            "ORDER BY seq DESC LIMIT ?"
+        )
+        params.append(limit)
+        with self._txn():
+            conn = self._connect()
+            rows = conn.execute(sql, params).fetchall()
+        return [json.loads(r["payload"]) for r in rows]
+
     @staticmethod
     def _utc_iso(dt: datetime) -> str:
         if dt.tzinfo is None:

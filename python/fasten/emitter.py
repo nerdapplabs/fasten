@@ -93,6 +93,11 @@ def persisted_streams() -> frozenset[str]:
     return _default.persisted_streams()
 
 
+def search_enabled() -> bool:
+    """Whether FR3 free-text search is enabled on the default Engine."""
+    return _default.search_enabled()
+
+
 def init_config(*args: Any, **kwargs: Any) -> Any:
     """Resolve init parameters to a FastenConfig without starting runtime."""
     return _default.init_config(*args, **kwargs)

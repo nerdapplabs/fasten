@@ -40,6 +40,7 @@ from .emitter import (
     persisted_streams,
     queue_stats,
     redactor,
+    search_enabled,
     start,
     transport,
 )
@@ -97,6 +98,7 @@ __all__ = [
     # adopter hooks
     "audit_store",
     "persisted_streams",
+    "search_enabled",
     "redactor",
     "transport",
 ]

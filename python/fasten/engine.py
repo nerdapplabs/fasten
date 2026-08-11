@@ -70,6 +70,7 @@ class FastenConfig:
     queue_retry_max_ms: int
     queue_retry_jitter: bool
     queue_drain_max_attempts: int
+    search_enabled: bool
 
 
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
@@ -135,6 +136,7 @@ class Engine:
         self._stdout: Optional[StdoutTransport] = None
         self._redactor: Redactor = Redactor()
         self._failure_strategy: str = "queue"
+        self._search_enabled: bool = False
         self._stdlib_logger = logging.getLogger("fasten")
 
         self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
@@ -164,6 +166,7 @@ class Engine:
         queue_retry_max_ms: int = 60_000,
         queue_retry_jitter: bool = True,
         queue_drain_max_attempts: int = 50,
+        search_enabled: bool = False,
     ) -> FastenConfig:
         """Resolve all parameters and environment variables into a FastenConfig.
 
@@ -216,6 +219,12 @@ class Engine:
                 f"(got {strategy!r})"
             )
 
+        # FR3 free-text search is opt-in (§4.1): off unless explicitly enabled,
+        # via arg or FASTEN_SEARCH_ENABLED. Enabling it without a syslog store
+        # still yields "search requires sys persistence" at read time.
+        env_search = os.environ.get("FASTEN_SEARCH_ENABLED")
+        search_on = search_enabled or (env_search or "").lower() in ("1", "true", "yes")
+
         return FastenConfig(
             service_id=svc,
             node_id=node,
@@ -232,6 +241,7 @@ class Engine:
             queue_retry_max_ms=queue_retry_max_ms,
             queue_retry_jitter=queue_retry_jitter,
             queue_drain_max_attempts=queue_drain_max_attempts,
+            search_enabled=search_on,
         )
 
     def start(self, cfg: FastenConfig) -> None:
@@ -283,6 +293,7 @@ class Engine:
             boot_request_id=self._boot_request_id,
         )
         self._failure_strategy = cfg.audit_store_failure_strategy
+        self._search_enabled = cfg.search_enabled
 
         if cfg.audit_store_failure_strategy == "queue":
             self._install_drainer(
@@ -314,6 +325,7 @@ class Engine:
         queue_retry_max_ms: int = 60_000,
         queue_retry_jitter: bool = True,
         queue_drain_max_attempts: int = 50,
+        search_enabled: bool = False,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(
@@ -325,6 +337,7 @@ class Engine:
             queue_capacity=queue_capacity, queue_retry_initial_ms=queue_retry_initial_ms,
             queue_retry_max_ms=queue_retry_max_ms, queue_retry_jitter=queue_retry_jitter,
             queue_drain_max_attempts=queue_drain_max_attempts,
+            search_enabled=search_enabled,
         ))
 
     # ── Emit ──────────────────────────────────────────────────────────────
@@ -475,6 +488,11 @@ class Engine:
             streams.add("sys")
         return frozenset(streams)
 
+    def search_enabled(self) -> bool:
+        """Whether FR3 free-text search (``/logs/search`` and ``q=``) is enabled.
+        Off by default (§4.1) — an explicit opt-in, since it is a linear scan."""
+        return self._search_enabled
+
     def _require_store(self, op: str) -> Any:
         store = self._audit_store
         if store is None:
@@ -528,6 +546,7 @@ class Engine:
         self._stdout        = None
         self._redactor      = Redactor()
         self._failure_strategy = "queue"
+        self._search_enabled = False
         self._last_init_at  = None
 
     # ── Internal ──────────────────────────────────────────────────────────

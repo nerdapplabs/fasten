@@ -39,6 +39,7 @@ from typing import Any, Optional
 from .. import audit_store as _active_audit_store
 from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
+from .. import search_enabled as _active_search_enabled
 from .. import transport as _active_transport
 
 
@@ -48,6 +49,7 @@ def router(
     store: Any = None,
     transport: Any = None,
     persist_streams: frozenset[str] | None = None,
+    search_enabled: bool | None = None,
 ) -> Any:
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
@@ -79,6 +81,21 @@ def router(
 
     def _transport() -> Any:
         return transport if transport is not None else _active_transport()
+
+    def _search_on() -> bool:
+        return search_enabled if search_enabled is not None else _active_search_enabled()
+
+    def _search_guard(q: Optional[str], since: Optional[str]) -> Optional[str]:
+        """Shared FR3 preconditions: search must be enabled and time-bounded.
+        Returns an error message when a ``q=`` read is not allowed, else None."""
+        if not _search_on():
+            return (
+                "search disabled — set search.enabled "
+                "(FASTEN_SEARCH_ENABLED=true) to enable free-text q="
+            )
+        if not since:
+            return "q= search requires a 'since' bound (no unbounded scans)"
+        return None
 
     def _source(stream: str) -> str:
         """Report whether a stream is backed by the durable store or a bounded
@@ -112,6 +129,7 @@ def router(
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
         event: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
@@ -123,6 +141,19 @@ def router(
                 "completeness": {"sys": _source("sys")},
                 "error": "transport not initialised — call fasten.init() first",
             }
+        if q is not None:
+            # FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
+            err = _search_guard(q, since)
+            if err is not None:
+                return {"rows": [], "completeness": {"sys": _source("sys")}, "error": err}
+            rows = t.search_syslog(q=q, since=since, until=until, limit=min(limit, 200))
+            if rows is None:
+                return {
+                    "rows": [],
+                    "completeness": {"sys": _source("sys")},
+                    "error": "search requires sys persistence — configure a syslog store (FR1)",
+                }
+            return {"rows": rows, "completeness": {"sys": _source("sys")}}
         rows = t.query_syslog(
             limit=limit,
             level=level,
@@ -247,6 +278,48 @@ def router(
                 "api": _source("api"),
                 "sys": _source("sys"),
             },
+        }
+
+    @r.get("/search")
+    def get_search(
+        q: str = Query(..., min_length=1),
+        since: str = Query(...),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        """FR3 free-text search — the sys-only, time-bounded escape hatch (§4.1).
+
+        For "I only have an error string": a case-insensitive substring scan over
+        persisted sys history, returning each match's ``request_id`` so a consumer
+        can hand it to ``/correlate``. Deliberately constrained — opt-in
+        (``search.enabled``), ``since`` mandatory (no unbounded scans), hard
+        result cap, and **no relevance ranking** (newest-first). Not a log query
+        language; structured field reads are the primary discovery path.
+        """
+        empty = {"matches": [], "counts": {"sys": 0}, "completeness": {"sys": _source("sys")}}
+        err = _search_guard(q, since)
+        if err is not None:
+            return {**empty, "error": err}
+        t = _transport()
+        if t is None:
+            return {**empty, "error": "transport not initialised — call fasten.init() first"}
+        rows = t.search_syslog(q=q, since=since, until=until, limit=limit)
+        if rows is None:
+            return {**empty, "error": "search requires sys persistence — configure a syslog store (FR1)"}
+        matches = [
+            {
+                "stream": "sys",
+                "request_id": row.get("request_id"),
+                "ts": row.get("timestamp"),
+                "summary": row.get("event"),
+                "row": row,
+            }
+            for row in rows
+        ]
+        return {
+            "matches": matches,
+            "counts": {"sys": len(matches)},
+            "completeness": {"sys": _source("sys")},
         }
 
     @r.get("/topology")
