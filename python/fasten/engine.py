@@ -90,16 +90,14 @@ def _store_from_dsn(dsn: str) -> Any:
 
 
 def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
-    """Build a per-stream store (api/sys) from a DSN. SQLite-only in v1 —
-    Postgres/other stream backends are a later phase (the audit store, by
-    contrast, already supports Postgres)."""
+    """Build a per-stream store (api/sys) from a DSN. SQLite and Postgres are
+    both supported: a ``postgres[ql]://`` DSN builds a PostgresStreamStore, any
+    other builds the SQLite-backed StreamStore."""
     from urllib.parse import parse_qs, urlparse
 
     if dsn.startswith(("postgres://", "postgresql://")):
-        raise NotImplementedError(
-            "fasten: api/sys stream persistence is SQLite-only in v1; "
-            "a pluggable Postgres stream store lands in a later phase."
-        )
+        from .store.stream_postgres import PostgresStreamStore
+        return PostgresStreamStore.from_dsn(dsn, default_table)
     from .store.stream import StreamStore
 
     u = urlparse(dsn)
