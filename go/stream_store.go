@@ -228,6 +228,26 @@ func (s *StreamStore) Count() (int, error) {
 	return n, err
 }
 
+// Purge deletes rows older than before (a canonical UTC ISO-8601 string) and
+// returns how many were removed. Per-stream retention pruning (FR1): api/sys
+// run 10-100x audit volume, so their history is trimmed by age. Unlike audit,
+// stream rows have no ship/replication lifecycle, so this is an unconditional
+// age-based delete backed by idx_<table>_ts.
+//
+// Rows with a NULL/absent timestamp are never purged (timestamp < ? is never
+// true for NULL) — the age of a timestamp-less row is unknown, so it is kept
+// rather than silently dropped. The comparison is lexicographic, matching the
+// read window; keep before in the same canonical UTC form as stored timestamps.
+func (s *StreamStore) Purge(before string) (int64, error) {
+	res, err := s.db.Exec(
+		fmt.Sprintf("DELETE FROM %s WHERE timestamp < ?", s.table), before,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func isStreamIndexed(col string) bool {
 	for _, f := range streamIndexedFields {
 		if f == col {

@@ -273,6 +273,26 @@ class StreamStore:
             conn = self._connect()
             return int(conn.execute(f"SELECT COUNT(*) FROM {self._table}").fetchone()[0])
 
+    def purge(self, *, before: str) -> int:
+        """Delete rows older than ``before`` (a canonical UTC ISO-8601 string),
+        returning the number removed. Per-stream retention pruning (FR1): api/sys
+        run 10–100× audit volume, so their history is trimmed by age. Unlike
+        audit, stream rows have no ship/replication lifecycle, so this is an
+        unconditional age-based delete, backed by ``idx_{table}_ts``.
+
+        Rows with a NULL/absent timestamp are never purged (``timestamp < ?`` is
+        never true for NULL) — the age of a timestamp-less row is unknown, so it
+        is kept rather than silently dropped. The comparison is lexicographic,
+        matching the read window; keep ``before`` in the same canonical UTC form
+        as the stored timestamps."""
+        with self._txn():
+            conn = self._connect()
+            cur = conn.execute(
+                f"DELETE FROM {self._table} WHERE timestamp < ?", (before,)
+            )
+            conn.commit()
+            return cur.rowcount
+
     @staticmethod
     def _utc_iso(dt: datetime) -> str:
         if dt.tzinfo is None:
