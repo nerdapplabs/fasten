@@ -29,6 +29,13 @@ func newRingBuffer[T any](capacity int) *RingBuffer[T] {
 }
 
 func (rb *RingBuffer[T]) Push(item T) {
+	if rb.cap == 0 {
+		// maxlen 0: drop silently, matching Python's deque(maxlen=0). cap is
+		// immutable after construction, so this read needs no lock. Without
+		// this guard buf[head] indexes an empty slice and head % cap divides
+		// by zero — both panic on the first push.
+		return
+	}
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	rb.buf[rb.head] = item
