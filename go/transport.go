@@ -74,8 +74,8 @@ type APIRow map[string]any
 type Transport struct {
 	Syslog      *RingBuffer[SyslogRow]
 	API         *RingBuffer[APIRow]
-	SyslogStore *StreamStore
-	APIStore    *StreamStore
+	SyslogStore StreamRepository
+	APIStore    StreamRepository
 
 	// Sentinel invariant: rows written before the first real request belong to
 	// one stable boot window; context-less rows after that are orphans.

@@ -34,6 +34,22 @@ import (
 // The caller imports the SQLite driver and opens the *sql.DB, exactly as for
 // NewSQLiteStore. SQLite-only in v1; a pluggable Postgres stream store is a
 // later phase.
+// StreamRepository is the durable backing for one ring-buffered stream
+// (api or sys). *StreamStore (SQLite) and *PostgresStreamStore both implement
+// it, so Config/Transport can hold either backend behind one type — mirroring
+// how AuditRepository abstracts the audit store. WriteFailures() is
+// intentionally not in the interface (only tests reach for the concrete count).
+type StreamRepository interface {
+	Insert(row map[string]any) error
+	Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error)
+	CountMatching(eq map[string]string, since, until string) (int, error)
+	Count() (int, error)
+	Purge(before string) (int64, error)
+	Search(q, since, until string, limit int) ([]map[string]any, error)
+	NoteWriteFailure()
+	Degraded() bool
+}
+
 type StreamStore struct {
 	db    *sql.DB
 	table string

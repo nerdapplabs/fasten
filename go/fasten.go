@@ -479,9 +479,10 @@ type Config struct {
 
 	// FR1: opt-in durable persistence for the api/sys streams. Nil → that
 	// stream stays ring-only (default, backward compatible). Construct with
-	// NewStreamStore(db, table); the caller owns the *sql.DB as with AuditStore.
-	APIStore    *StreamStore
-	SyslogStore *StreamStore
+	// NewStreamStore(db, table) for SQLite or NewPostgresStreamStore(db, table)
+	// for Postgres; the caller owns the *sql.DB as with AuditStore.
+	APIStore    StreamRepository
+	SyslogStore StreamRepository
 
 	// FR3: opt-in free-text search (/logs/search and q=). Off by default — it is
 	// a linear scan, so it must be explicitly enabled (also via

@@ -130,7 +130,7 @@ func (e *Engine) streamSource(stream string) string {
 	if !e.persistedStreams[stream] {
 		return "ring"
 	}
-	var st *StreamStore
+	var st StreamRepository
 	switch stream {
 	case "api":
 		st = e.apiStore

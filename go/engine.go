@@ -28,8 +28,8 @@ type Engine struct {
 	tenantID        string
 	auditStore      AuditRepository
 	xport           *Transport
-	apiStore        *StreamStore // FR1: opt-in api persistence, nil = ring-only
-	syslogStore     *StreamStore // FR1: opt-in sys persistence, nil = ring-only
+	apiStore        StreamRepository // FR1: opt-in api persistence, nil = ring-only
+	syslogStore     StreamRepository // FR1: opt-in sys persistence, nil = ring-only
 	seq             int64        // accessed via atomic ops
 	failureStrategy string
 	searchEnabled   bool // FR3: opt-in free-text search (/logs/search, q=)
