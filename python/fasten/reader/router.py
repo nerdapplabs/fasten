@@ -129,7 +129,7 @@ def router(
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
         event: Optional[str] = Query(default=None),
-        q: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None, min_length=1),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
