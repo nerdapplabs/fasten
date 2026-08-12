@@ -268,6 +268,12 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	if _, ok := q["q"]; ok {
+		// Free-text search is sys-only in v1 (§9). Reject rather than
+		// silently drop, so callers can't assume q= works on the api stream.
+		http.Error(w, "free-text q= is sys-only in v1 — use /logs/sys?q=", http.StatusBadRequest)
+		return
+	}
 	limit := intParam(q.Get("limit"), 100)
 	rows, err := e.xport.QueryAPI(limit, StreamQuery{
 		Method:    q.Get("method"),

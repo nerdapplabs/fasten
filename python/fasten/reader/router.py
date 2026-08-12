@@ -68,7 +68,7 @@ def router(
             configured. Pass an explicit set to override.
     """
     try:
-        from fastapi import APIRouter, Query
+        from fastapi import APIRouter, HTTPException, Query
     except ImportError as e:
         raise RuntimeError(
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
@@ -174,7 +174,16 @@ def router(
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
+        q: Optional[str] = Query(default=None),
     ) -> dict[str, Any]:
+        if q is not None:
+            # Free-text search is sys-only in v1 (§9). Reject rather than
+            # silently drop, so callers (and copy-pasted handlers) can't
+            # assume q= works on the api stream.
+            raise HTTPException(
+                status_code=400,
+                detail="free-text q= is sys-only in v1 — use /logs/sys?q=",
+            )
         t = _transport()
         if t is None:
             return {
