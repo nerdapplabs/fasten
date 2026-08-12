@@ -235,7 +235,7 @@ def router(
 
     @r.get("/correlate")
     def get_correlate(
-        request_id: str = Query(...),
+        request_id: str = Query(..., min_length=1),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         """Unified correlation read — every stream for one ``request_id``.
