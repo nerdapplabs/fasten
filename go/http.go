@@ -175,7 +175,11 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"rows": rows, "completeness": comp})
 		return
 	}
-	limit := intParam(q.Get("limit"), 100)
+	limit, lerr := parseLimit(q.Get("limit"), 100, 1000)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
 		Level:     q.Get("level"),
 		RequestID: q.Get("request_id"),
@@ -274,7 +278,11 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "free-text q= is sys-only in v1 — use /logs/sys?q=", http.StatusBadRequest)
 		return
 	}
-	limit := intParam(q.Get("limit"), 100)
+	limit, lerr := parseLimit(q.Get("limit"), 100, 1000)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	rows, err := e.xport.QueryAPI(limit, StreamQuery{
 		Method:    q.Get("method"),
 		Path:      q.Get("path"),
@@ -313,7 +321,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request_id is required", http.StatusBadRequest)
 		return
 	}
-	limit := intParam(r.URL.Query().Get("limit"), 100)
+	limit, lerr := parseLimit(r.URL.Query().Get("limit"), 100, 1000)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 
 	audit := []map[string]any{}
 	auditTotal := 0
@@ -385,6 +397,11 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	auditLimit, lerr := parseLimit(q.Get("limit"), 100, 1000)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	f := Filter{
 		RequestID:    q.Get("request_id"),
 		Code:         Code(q.Get("code")),
@@ -393,7 +410,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		TenantID:     q.Get("tenant_id"),
 		Actor:        q.Get("actor"),
 		Target:       q.Get("target"),
-		Limit:        intParam(q.Get("limit"), 100),
+		Limit:        auditLimit,
 	}
 	if s := q.Get("since"); s != "" {
 		f.Since, _ = time.Parse(time.RFC3339, s)
@@ -591,6 +608,25 @@ func intParam(s string, def int) int {
 		return 1000
 	}
 	return n
+}
+
+// parseLimit parses the ?limit= param for the structured-query endpoints.
+// Empty -> def. A present value must be an integer in [1, max]; anything else
+// (non-integer, non-positive, over max) is a caller error, returned so the
+// handler can answer 422 — parity with Python's Query(ge=1, le=max), which
+// rejects rather than silently coercing to the default or clamping.
+func parseLimit(s string, def, max int) (int, error) {
+	if s == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("limit must be an integer")
+	}
+	if n < 1 || n > max {
+		return 0, fmt.Errorf("limit must be between 1 and %d", max)
+	}
+	return n, nil
 }
 
 // contextKey for stdlib context (unexported, avoids collision).
