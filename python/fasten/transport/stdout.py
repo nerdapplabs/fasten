@@ -93,7 +93,10 @@ class StdoutTransport:
         invariant). A real id ends the boot window; a missing id is filled with
         the shared boot sentinel during startup, else a unique orphan id."""
         rid = row.get("request_id")
-        if rid:
+        # Only a non-empty *string* counts as a caller-supplied id. A truthy
+        # non-string (e.g. an int a shim stashed) is treated as missing and
+        # gets a sentinel — parity with Go's `.(string)` assertion.
+        if isinstance(rid, str) and rid:
             if not is_sentinel(rid):
                 self._boot_over = True
             return
