@@ -372,6 +372,15 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 	if f.SourceNodeID != "" {
 		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n)); args = append(args, f.SourceNodeID); n++
 	}
+	if f.TenantID != "" {
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n)); args = append(args, f.TenantID); n++
+	}
+	if f.Actor != "" {
+		conds = append(conds, fmt.Sprintf("actor = $%d", n)); args = append(args, f.Actor); n++
+	}
+	if f.Target != "" {
+		conds = append(conds, fmt.Sprintf("target = $%d", n)); args = append(args, f.Target); n++
+	}
 	if !f.Since.IsZero() {
 		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n)); args = append(args, f.Since.UTC()); n++
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -95,6 +96,7 @@ func (e *Engine) NewReader() http.Handler {
 	mux.HandleFunc("GET /api", e.handleAPI)
 	mux.HandleFunc("GET /search", e.handleSearch)
 	mux.HandleFunc("GET /correlate", e.handleCorrelate)
+	mux.HandleFunc("GET /topology", e.handleTopology)
 	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
 	mux.HandleFunc("GET /audit", e.handleAudit)
 	return mux
@@ -382,6 +384,9 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Code:         Code(q.Get("code")),
 		Domain:       Domain(q.Get("domain")),
 		SourceNodeID: q.Get("source_node_id"),
+		TenantID:     q.Get("tenant_id"),
+		Actor:        q.Get("actor"),
+		Target:       q.Get("target"),
 		Limit:        intParam(q.Get("limit"), 100),
 	}
 	if s := q.Get("since"); s != "" {
@@ -416,6 +421,63 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		nextAfter = &v
 	}
 	writeJSON(w, map[string]any{"rows": out, "next_after": nextAfter, "completeness": map[string]string{"audit": e.streamSource("audit")}})
+}
+
+// sourceAggregator is the optional fleet-topology capability of an audit store.
+// The built-in SQLite store implements it; stores that don't cause /topology to
+// report "store does not support topology aggregation".
+type sourceAggregator interface {
+	Sources(ctx context.Context, since, until time.Time) ([]map[string]any, error)
+}
+
+// handleTopology reports who is emitting into the store — one entry per distinct
+// (source_node_id, service_id, tenant_id) with row counts and first/last-seen —
+// plus distinct node/service/tenant counts. No separate topology table: the
+// fleet view falls out of the rows already recorded, so it can't drift. Parity
+// with the Python /topology.
+func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
+	empty := map[string]any{"sources": []any{}, "nodes": 0, "services": 0, "tenants": 0}
+	if e.auditStore == nil {
+		empty["error"] = "audit store not configured"
+		writeJSON(w, empty)
+		return
+	}
+	agg, ok := e.auditStore.(sourceAggregator)
+	if !ok {
+		empty["error"] = "store does not support topology aggregation"
+		writeJSON(w, empty)
+		return
+	}
+	q := r.URL.Query()
+	var since, until time.Time
+	if s := q.Get("since"); s != "" {
+		since, _ = time.Parse(time.RFC3339, s)
+	}
+	if u := q.Get("until"); u != "" {
+		until, _ = time.Parse(time.RFC3339, u)
+	}
+	sources, err := agg.Sources(r.Context(), since, until)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if sources == nil {
+		sources = []map[string]any{}
+	}
+	nodes, services, tenants := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, s := range sources {
+		nodes[fmt.Sprint(s["source_node_id"])] = true
+		services[fmt.Sprint(s["service_id"])] = true
+		if t, ok := s["tenant_id"].(string); ok && t != "" {
+			tenants[t] = true
+		}
+	}
+	writeJSON(w, map[string]any{
+		"sources":  sources,
+		"nodes":    len(nodes),
+		"services": len(services),
+		"tenants":  len(tenants),
+	})
 }
 
 func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
@@ -471,13 +533,38 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		"node_id":          e.nodeID,
 		"tenant_id":        e.tenantID,
 		"failure_strategy": e.failureStrategy,
+		// Multi-worker awareness: callers can confirm which OS process they hit.
+		"worker_pid": os.Getpid(),
+	}
+
+	// Redaction is always applied (RedactDetail) once the engine is initialised.
+	redactorBlock := map[string]any{"active": e.serviceID != ""}
+
+	// Spot-check the tamper chain over this node's latest rows (best-effort).
+	chainBlock := map[string]any{"verified": nil, "breaks": 0, "last_verified_at": nil}
+	if store != nil {
+		if recent, err := store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50}); err == nil && len(recent) > 0 {
+			res := VerifyChain(recent)
+			breaks := 0
+			if !res.OK {
+				breaks = 1
+			}
+			chainBlock = map[string]any{
+				"verified":       res.OK,
+				"breaks":         breaks,
+				"first_break_at": res.FirstBreakAt,
+				"reason":         res.Reason,
+			}
+		}
 	}
 
 	writeJSON(w, map[string]any{
 		"store":     storeBlock,
 		"queue":     queueBlock,
 		"transport": xportBlock,
+		"redactor":  redactorBlock,
 		"init":      initBlock,
+		"chain":     chainBlock,
 	})
 }
 

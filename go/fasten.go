@@ -618,6 +618,9 @@ type Filter struct {
 	Code         Code
 	Domain       Domain
 	SourceNodeID string
+	TenantID     string
+	Actor        string
+	Target       string
 	Since        time.Time
 	Until        time.Time
 	Limit        int

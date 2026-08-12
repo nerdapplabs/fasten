@@ -391,6 +391,64 @@ func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNode
 	return n.Int64, nil
 }
 
+// Sources aggregates the fleet topology from the rows already recorded: one
+// entry per distinct (source_node_id, service_id, tenant_id) with its row count
+// and first/last-seen timestamps, ordered by count. No separate topology table
+// — the view falls out of the audit rows, so it can't drift. Mirrors the Python
+// SQLiteStore.sources. Optional [since, until] windows the aggregation.
+func (s *SQLiteStore) Sources(ctx context.Context, since, until time.Time) ([]map[string]any, error) {
+	var conds []string
+	var args []any
+	if !since.IsZero() {
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, since.UTC().Format(time.RFC3339Nano))
+	}
+	if !until.IsZero() {
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, until.UTC().Format(time.RFC3339Nano))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+	query := fmt.Sprintf(
+		"SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, "+
+			"MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen "+
+			"FROM %s %s GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC",
+		s.table, where,
+	)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var node, svc string
+		var tenant, first, last sql.NullString
+		var n int
+		if err := rows.Scan(&node, &svc, &tenant, &n, &first, &last); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"source_node_id": node,
+			"service_id":     svc,
+			"tenant_id":      nullStrOrNil(tenant),
+			"rows":           n,
+			"first_seen":     nullStrOrNil(first),
+			"last_seen":      nullStrOrNil(last),
+		})
+	}
+	return out, rows.Err()
+}
+
+func nullStrOrNil(ns sql.NullString) any {
+	if ns.Valid {
+		return ns.String
+	}
+	return nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 func filterToSQL(f Filter) (string, []any) {
@@ -407,6 +465,15 @@ func filterToSQL(f Filter) (string, []any) {
 	}
 	if f.SourceNodeID != "" {
 		conds = append(conds, "source_node_id = ?"); args = append(args, f.SourceNodeID)
+	}
+	if f.TenantID != "" {
+		conds = append(conds, "tenant_id = ?"); args = append(args, f.TenantID)
+	}
+	if f.Actor != "" {
+		conds = append(conds, "actor = ?"); args = append(args, f.Actor)
+	}
+	if f.Target != "" {
+		conds = append(conds, "target = ?"); args = append(args, f.Target)
 	}
 	if !f.Since.IsZero() {
 		conds = append(conds, "timestamp >= ?"); args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
