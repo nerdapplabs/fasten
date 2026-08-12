@@ -250,3 +250,39 @@ def test_postgres_fasten_prefix_table():
     s.close()
     with psycopg.connect(dsn) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+# ---------------------------------------------------------------------------
+# QUERY ORDERING ACROSS SUB-CHAINS (#68)
+# ---------------------------------------------------------------------------
+
+def test_query_orders_by_time_across_sub_chains(store):
+    """monotonic_seq is a per-(service_id, source_node_id) counter — comparing
+    it across sub-chains is meaningless. Global query() must order by
+    wall-clock first, so a chatty old chain's high counters cannot bury a
+    quieter chain's newer rows below the page limit (#68)."""
+    now = datetime.now(timezone.utc)
+    # Chain A: an older, chattier writer — high seq, day-old timestamps.
+    for i in range(5):
+        store.insert(make_row(service_id="svc-a", source_node_id="node-a",
+                              monotonic_seq=100 + i,
+                              timestamp=now - timedelta(days=1, minutes=5 - i)))
+    # Chain B: a fresh writer — counter restarted at 1, current timestamps.
+    for i in range(3):
+        store.insert(make_row(service_id="svc-b", source_node_id="node-b",
+                              monotonic_seq=1 + i,
+                              timestamp=now - timedelta(minutes=3 - i)))
+
+    page = store.query(limit=4)
+    # Newest wall-clock rows come first: all of chain B precedes any of chain A.
+    assert [r.source_node_id for r in page[:3]] == ["node-b"] * 3
+    stamps = [r.timestamp for r in page]
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_query_same_millisecond_ties_break_by_seq(store):
+    """Within one sub-chain, seq stays the same-timestamp tie-breaker."""
+    t = datetime.now(timezone.utc)
+    store.insert(make_row(monotonic_seq=1, timestamp=t))
+    store.insert(make_row(monotonic_seq=2, timestamp=t))
+    assert [r.monotonic_seq for r in store.query(limit=2)] == [2, 1]

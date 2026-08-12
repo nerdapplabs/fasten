@@ -263,8 +263,11 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
+	// counter, meaningless across sub-chains — it stays as the
+	// same-timestamp tie-breaker only (#68).
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY monotonic_seq DESC LIMIT ?`, auditCols, s.table, where),
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`, auditCols, s.table, where),
 		append(args, limit)...,
 	)
 	if err != nil {

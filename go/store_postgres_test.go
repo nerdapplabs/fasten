@@ -403,3 +403,41 @@ func TestPostgres_PiiInDetail(t *testing.T) {
 		t.Fatalf("expected PiiInDetail=true, got %+v", got)
 	}
 }
+
+func TestPostgres_QueryOrdersByTimeAcrossSubChains(t *testing.T) {
+	db := pgDB(t)
+	table := uniqueTable("pg_order")
+	defer dropTable(t, db, table)
+
+	store, err := NewPostgresStore(db, table)
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Chain A: chatty old writer (high seq, day-old); chain B: fresh (seq 1..3, now).
+	for i := 0; i < 5; i++ {
+		row := orderRow(int64(100+i), now.Add(-24*time.Hour).Add(time.Duration(i)*time.Minute), "svc-a", "node-a")
+		if err := store.InsertOriginated(ctx, row); err != nil {
+			t.Fatalf("insert chain A: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		row := orderRow(int64(1+i), now.Add(time.Duration(i-3)*time.Minute), "svc-b", "node-b")
+		if err := store.InsertOriginated(ctx, row); err != nil {
+			t.Fatalf("insert chain B: %v", err)
+		}
+	}
+
+	page, err := store.Query(ctx, Filter{Limit: 4})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if page[i].SourceNodeID != "node-b" {
+			t.Fatalf("row %d: expected node-b (newer chain) first, got %s (seq %d)",
+				i, page[i].SourceNodeID, page[i].MonotonicSeq)
+		}
+	}
+}
