@@ -45,6 +45,7 @@ from .emitter import (
     transport,
 )
 from .engine import AuditStoreError, Engine, FastenConfig
+from .query import Chips, RuleTranslator, Translator, translate as translate_query
 from . import replication
 from .store.repo import AuditChainError, AuditRepository, IngestResult
 
@@ -101,6 +102,11 @@ __all__ = [
     "search_enabled",
     "redactor",
     "transport",
+    # query translation (NL / smart-box → structured chips)
+    "Chips",
+    "Translator",
+    "RuleTranslator",
+    "translate_query",
 ]
 
 __version__ = "1.0.0b0"
