@@ -421,6 +421,30 @@ func RequestIDFromContext(ctx context.Context) string {
 	return fastenctx.RequestIDFromContext(ctx)
 }
 
+// Background returns ctx carrying a bg- sentinel request_id when ctx has none,
+// so work outside a request — a background goroutine, worker, or scheduled tick
+// — stays correlatable; if ctx already carries a request_id it is returned
+// unchanged. §5.1/§8.1: keeps the every-row-correlatable invariant for
+// context-less work instead of leaving orphans. Pass "sched"/"lib" via
+// BackgroundKind for those namespaces.
+func Background(ctx context.Context) context.Context { return BackgroundKind(ctx, "bg") }
+
+// BackgroundKind is Background with an explicit sentinel namespace.
+func BackgroundKind(ctx context.Context, kind string) context.Context {
+	if RequestIDFromContext(ctx) == "" {
+		return WithRequestID(ctx, MintSentinel(kind, Default.serviceID))
+	}
+	return ctx
+}
+
+// Go runs fn in a new goroutine under a Background context: it inherits ctx's
+// request_id if present, else a fresh bg- sentinel, so the goroutine's sys logs
+// remain correlatable. The mirror of Python's fasten.go.
+func Go(ctx context.Context, fn func(context.Context)) {
+	c := Background(ctx)
+	go fn(c)
+}
+
 // ── Audit-store failure handling ──────────────────────────────────────────
 
 // AuditStoreError wraps an underlying store error for the "raise"

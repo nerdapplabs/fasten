@@ -29,8 +29,10 @@ from .context import (
 )
 from .emitter import (
     audit_store,
+    background,
     emit,
     flush,
+    go,
     ingest_replicated,
     init,
     init_config,
@@ -96,6 +98,9 @@ __all__ = [
     "init_config",
     "start",
     "log",
+    # background-work correlation (bg- sentinel context)
+    "background",
+    "go",
     # adopter hooks
     "audit_store",
     "persisted_streams",
