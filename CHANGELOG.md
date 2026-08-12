@@ -6,6 +6,43 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
+
+- **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),
+  write-through behind the ring, with per-stream retention (`purge(before=…)`).
+- **FR2 correlation** — `GET /logs/correlate?request_id=X` fans out to
+  audit + api + sys in one call, with `counts`/`totals` truncation signalling.
+- **FR3 search (constrained)** — `GET /logs/search` and a gated `q=` on
+  `/logs/sys`: sys-only, `since=` mandatory, hard-capped, no ranking, opt-in via
+  `search.enabled` / `FASTEN_SEARCH_ENABLED`.
+- **FR4 completeness** — every read reports `store` / `ring` / `store-degraded`
+  per stream.
+- **Structured field indexes** on `api`/`sys` (`method`/`path`/`status`,
+  `level`/`service_id`/`event`) for fast, indexed discovery.
+- **Sentinel `request_id` invariant** — `boot`/`orphan` (auto) plus
+  `sched`/`bg`/`lib` namespaces, so every persisted stream row is correlatable;
+  covered by a boot→request→background→shutdown conformance test.
+- **Query translator** (`fasten.query`) — NL / smart-box text → structured chips
+  + bounded `q=`; an interface plus a deterministic reference parser, not a new
+  endpoint.
+- **Reader parity (FR5)** — Go gains `/topology`, `/audit` `tenant_id`/`actor`/
+  `target` filters, and `redactor`/`chain`/`worker_pid` in `/audit/doctor`.
+- `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
+  retention, and constrained-search contract.
+
+### Fixed — Reader hardening (gh #58, Python + Go)
+
+- `/sys`, `/api`, `/audit`, `/correlate` reject a non-positive `limit` (a
+  negative limit was `LIMIT -1` = an unbounded read on SQLite / a 500 on
+  Postgres).
+- `completeness.audit` no longer reports `store` in stdout-only mode (no audit
+  store); it honestly reports `ring`.
+- The ring windows a `None`/absent timestamp like the store (`COALESCE`), so ring
+  and store agree on `since`/`until`.
+- Go `LogSys`/`drainerSysLog` no longer mutate the ring-shared row — fixes a
+  `concurrent map read and map write` crash and a store-vs-ring `shape`
+  divergence.
+
 ### Changed — README
 
 - New "Where it fits" section linking to Membrane and fasten fleet.
