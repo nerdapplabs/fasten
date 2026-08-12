@@ -102,7 +102,13 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
 
     u = urlparse(dsn)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
-    path = u.path.lstrip("/")
+    # SQLAlchemy-style sqlite paths: strip only the single URL-separator slash,
+    # not every leading slash. sqlite:///rel.db -> rel.db (relative);
+    # sqlite:////abs/path.db -> /abs/path.db (absolute). The old lstrip("/")
+    # collapsed the four-slash absolute form into a relative path.
+    path = u.path
+    if u.scheme and path.startswith("/"):
+        path = path[1:]
     if not path:
         raise ValueError(
             f"fasten: stream DSN {dsn!r} has no path. Use sqlite:///./streams.db"
