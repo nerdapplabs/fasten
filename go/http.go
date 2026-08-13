@@ -397,6 +397,9 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Truncation is counts < totals per stream. The pair is authoritative; this
+	// boolean is a convenience so every caller doesn't re-derive the inequality
+	// (and get it subtly wrong). Reported per stream.
 	writeJSON(w, map[string]any{
 		"request_id": rid,
 		"audit":      audit,
@@ -404,6 +407,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		"sys":        sys,
 		"counts":     map[string]int{"audit": len(audit), "api": len(api), "sys": len(sys)},
 		"totals":     map[string]int{"audit": auditTotal, "api": apiTotal, "sys": sysTotal},
+		"truncated": map[string]bool{
+			"audit": len(audit) < auditTotal,
+			"api":   len(api) < apiTotal,
+			"sys":   len(sys) < sysTotal,
+		},
 		"completeness": map[string]string{
 			"audit": e.streamSource("audit"),
 			"api":   e.streamSource("api"),

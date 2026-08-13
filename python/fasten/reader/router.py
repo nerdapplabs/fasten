@@ -118,8 +118,9 @@ def router(
         It says whether the stream *can* lose rows, never whether *this*
         response did: a ring that overflowed and evicted older matching rows
         still reports ``ring``, identical to an empty ring that lost nothing.
-        There is no truncation flag here — for ``/correlate``, the
-        totals-vs-counts pair is the per-response truncation signal. When
+        This is a durability class, not a truncation signal — ``/correlate``
+        reports truncation separately via the counts/totals pair and the
+        derived per-stream ``truncated`` boolean. When
         ``persist_streams`` is not pinned, resolve it from the live engine
         config so the flag tracks which streams actually persist (FR1).
 
@@ -283,7 +284,8 @@ def router(
         and ``totals`` reports how many matching rows the backing source
         holds — ``counts`` is how many this capped response returned, so
         ``counts < totals`` means the response is truncated (raise ``limit``
-        or page the per-stream endpoints).
+        or page the per-stream endpoints); the per-stream ``truncated`` boolean
+        reports that inequality directly so callers don't re-derive it.
         """
         s = _store()
         t = _transport()
@@ -297,17 +299,24 @@ def router(
             s.count(request_id=request_id)
             if s is not None and hasattr(s, "count") else len(audit)
         )
+        counts = {"audit": len(audit), "api": len(api), "sys": len(sys)}
+        totals = {
+            "audit": audit_total,
+            "api": t.count_api(request_id=request_id) if t is not None else 0,
+            "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
+        }
+        # Truncation is counts < totals per stream. The pair is authoritative;
+        # this boolean is a convenience so every caller doesn't re-derive the
+        # inequality (and get it subtly wrong). Reported per stream.
+        truncated = {k: counts[k] < totals[k] for k in ("audit", "api", "sys")}
         return {
             "request_id": request_id,
             "audit": audit,
             "api": api,
             "sys": sys,
-            "counts": {"audit": len(audit), "api": len(api), "sys": len(sys)},
-            "totals": {
-                "audit": audit_total,
-                "api": t.count_api(request_id=request_id) if t is not None else 0,
-                "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
-            },
+            "counts": counts,
+            "totals": totals,
+            "truncated": truncated,
             "completeness": {
                 "audit": _source("audit"),
                 "api": _source("api"),
