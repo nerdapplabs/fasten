@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+
+	_ "modernc.org/sqlite" // registers the "sqlite" driver used by OpenStreamStore
 )
 
 // StreamStore is a durable, queryable backing for one ring-buffered stream
@@ -77,6 +79,43 @@ var streamIndexedFields = []string{
 // and database/sql pools connections — set it in the DSN so every pooled
 // connection gets it (e.g. mattn/go-sqlite3: "file:app.db?_synchronous=NORMAL";
 // modernc.org/sqlite: "file:app.db?_pragma=synchronous(NORMAL)").
+// OpenStreamStore opens a SQLite-backed stream store from a DSN and migrates
+// it, setting WAL + synchronous=NORMAL as DSN pragmas so *every* pooled
+// connection gets them. This is the fix for NewStreamStore's caveat below: a
+// PRAGMA issued during migrate lands on a single pooled connection, and the
+// other connections database/sql opens keep the default synchronous=FULL (an
+// fsync per commit). Setting the pragma in the DSN makes modernc.org/sqlite
+// apply it on every connection open — mirroring the Python StreamStore, which
+// sets the pragma on each connection it opens.
+//
+// It uses the modernc.org/sqlite driver (pure Go, already the SDK's sqlite
+// dependency). Callers who need a different driver (e.g. mattn/go-sqlite3), or
+// who already own a *sql.DB, should use NewStreamStore(db, tableName) and set
+// the per-connection pragma in their own DSN.
+func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
+	db, err := sql.Open("sqlite", streamPragmaDSN(dsn))
+	if err != nil {
+		return nil, fmt.Errorf("fasten StreamStore open: %w", err)
+	}
+	s, err := NewStreamStore(db, tableName)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// streamPragmaDSN appends the WAL + synchronous=NORMAL pragmas to a modernc
+// sqlite DSN so they apply on every connection open, preserving any existing
+// query parameters.
+func streamPragmaDSN(dsn string) string {
+	pragmas := "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + pragmas
+	}
+	return dsn + "?" + pragmas
+}
+
 func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten StreamStore: tableName is required")
