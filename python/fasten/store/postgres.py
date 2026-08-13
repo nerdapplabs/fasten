@@ -97,6 +97,9 @@ class PostgresStore:
             )
         self._dsn = dsn
         self._table = table  # full ref used in SQL (may be "schema.table")
+        # Swallowed persist-failure counter (mirrors StreamStore). At least one
+        # means durable audit history has a known hole → "store-degraded". Sticky.
+        self._write_failures = 0
         # Bare table name for index identifiers — dots are not allowed there.
         self._idx_prefix = table.split(".")[-1]
         self._schema = table.split(".")[0] if "." in table else None
@@ -275,6 +278,21 @@ class PostgresStore:
     def insert(self, row: AuditRow) -> None:
         """Thin alias for insert_originated — the engine emit/drainer path."""
         self.insert_originated(row)
+
+    def note_write_failure(self) -> None:
+        """Record a swallowed persist failure (durable history has a hole).
+        Callers that surface the insert() error don't mark the store degraded."""
+        self._write_failures += 1
+
+    @property
+    def write_failures(self) -> int:
+        return self._write_failures
+
+    @property
+    def degraded(self) -> bool:
+        """True once at least one persist failure was swallowed. Drives the
+        ``store-degraded`` completeness flag."""
+        return self._write_failures > 0
 
     def list_unshipped(
         self,

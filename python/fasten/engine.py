@@ -432,6 +432,11 @@ class Engine:
                     try:
                         self._audit_store.insert(row)
                     except Exception as e:  # noqa: BLE001
+                        # Swallowed on the hot path → durable history now has a
+                        # hole; degrade the audit completeness flag.
+                        note = getattr(self._audit_store, "note_write_failure", None)
+                        if callable(note):
+                            note()
                         self._drainer_sys_log("error", "audit_sync_fallback_failed", {
                             "error": f"{type(e).__name__}: {e}",
                             "row_id": row.id,

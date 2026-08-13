@@ -100,6 +100,11 @@ class SQLiteStore:
         self._path = path
         self._table = table
         self._wal = wal
+        # Swallowed persist-failure counter (mirrors StreamStore). At least one
+        # means durable audit history has a known hole, so the reader degrades
+        # the audit completeness flag from "store" to "store-degraded". Sticky
+        # for the store's lifetime: a hole doesn't heal when the disk recovers.
+        self._write_failures = 0
         # `:memory:` databases cannot be shared across connections, so
         # the per-thread model breaks. Detect once at init and route
         # subsequent calls accordingly.
@@ -255,6 +260,22 @@ class SQLiteStore:
         """Thin alias for insert_originated — the engine emit/drainer path. Kept
         so the AuditRepository protocol and the drainer callback stay stable."""
         self.insert_originated(row)
+
+    def note_write_failure(self) -> None:
+        """Record a persist failure the caller swallowed on the hot path, so
+        durable history has a known hole. Callers that surface (raise) the
+        insert() error themselves don't mark the store degraded."""
+        self._write_failures += 1
+
+    @property
+    def write_failures(self) -> int:
+        return self._write_failures
+
+    @property
+    def degraded(self) -> bool:
+        """True once at least one persist failure was swallowed (durable
+        history has holes). Drives the ``store-degraded`` completeness flag."""
+        return self._write_failures > 0
 
     def list_unshipped(
         self,

@@ -97,6 +97,20 @@ def router(
             return "q= search requires a 'since' bound (no unbounded scans)"
         return None
 
+    def _audit_degraded() -> bool:
+        """Audit durable history has known holes when either the audit store
+        swallowed a persist failure (sync fallback path) or the drainer
+        dead-lettered at least one row (async path). Unlike api/sys, audit
+        durability spans the store *and* the drainer, so both are consulted."""
+        s = _store()
+        if s is not None and getattr(s, "degraded", False):
+            return True
+        from ..emitter import _default as _default_engine
+        stats = _default_engine.queue_stats()
+        if stats and stats.get("dead_lettered_total", 0) > 0:
+            return True
+        return False
+
     def _source(stream: str) -> str:
         """Report whether a stream is backed by the durable store or a bounded
         ring — its configured durability class, not a per-response gap signal.
@@ -118,6 +132,10 @@ def router(
         persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
         if stream not in persisted:
             return "ring"
+        if stream == "audit":
+            # Audit is not a transport stream — its degraded signal comes from
+            # the audit store + drainer, not transport.stream_degraded (api/sys).
+            return "store-degraded" if _audit_degraded() else "store"
         t = _transport()
         if t is not None and getattr(t, "stream_degraded", None) and t.stream_degraded(stream):
             return "store-degraded"
