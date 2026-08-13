@@ -276,13 +276,30 @@ func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	n := len(args) + 1
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	// Cursor pagination (canonical): newest-first, so paging forward means
+	// older rows — monotonic_seq < AfterSeq. Applied here, not in
+	// filterToPostgresSQL, so CountFiltered/total stays the full filtered count.
+	if f.AfterSeq > 0 {
+		n := len(args) + 1
+		if where == "" {
+			where = fmt.Sprintf("WHERE monotonic_seq < $%d", n)
+		} else {
+			where += fmt.Sprintf(" AND monotonic_seq < $%d", n)
+		}
+		args = append(args, f.AfterSeq)
+	}
+	limIdx := len(args) + 1
+	offIdx := len(args) + 2
 	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
 	// counter, meaningless across sub-chains — it stays as the
 	// same-timestamp tie-breaker only (#68).
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d`, pgAuditCols, s.table, where, n),
-		append(args, limit)...,
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d OFFSET $%d`, pgAuditCols, s.table, where, limIdx, offIdx),
+		append(args, limit, offset)...,
 	)
 	if err != nil {
 		return nil, err
@@ -403,9 +420,8 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n)); args = append(args, f.Until.UTC()); n++
 	}
-	if f.AfterSeq > 0 {
-		conds = append(conds, fmt.Sprintf("monotonic_seq > $%d", n)); args = append(args, f.AfterSeq); n++
-	}
+	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
+	// bound, applied in Query so CountFiltered/total stays the full match count.
 	_ = n
 	if len(conds) == 0 {
 		return "", args

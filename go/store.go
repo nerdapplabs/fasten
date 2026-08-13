@@ -278,12 +278,27 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	// Cursor pagination (canonical): newest-first, so paging forward means
+	// older rows — monotonic_seq < AfterSeq. Applied here, not in filterToSQL,
+	// so CountFiltered/total stays the full filtered count.
+	if f.AfterSeq > 0 {
+		if where == "" {
+			where = "WHERE monotonic_seq < ?"
+		} else {
+			where += " AND monotonic_seq < ?"
+		}
+		args = append(args, f.AfterSeq)
+	}
 	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
 	// counter, meaningless across sub-chains — it stays as the
 	// same-timestamp tie-breaker only (#68).
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`, auditCols, s.table, where),
-		append(args, limit)...,
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ? OFFSET ?`, auditCols, s.table, where),
+		append(args, limit, offset)...,
 	)
 	if err != nil {
 		return nil, err
@@ -499,9 +514,8 @@ func filterToSQL(f Filter) (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, "timestamp <= ?"); args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
 	}
-	if f.AfterSeq > 0 {
-		conds = append(conds, "monotonic_seq > ?"); args = append(args, f.AfterSeq)
-	}
+	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
+	// bound, applied in Query so CountFiltered/total stays the full match count.
 	if len(conds) == 0 {
 		return "", args
 	}

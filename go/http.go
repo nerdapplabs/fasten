@@ -423,6 +423,12 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	offset := 0
+	if o := q.Get("offset"); o != "" {
+		if n, err := strconv.Atoi(o); err == nil && n >= 0 {
+			offset = n
+		}
+	}
 	f := Filter{
 		RequestID:    q.Get("request_id"),
 		Code:         Code(q.Get("code")),
@@ -432,6 +438,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Actor:        q.Get("actor"),
 		Target:       q.Get("target"),
 		Limit:        auditLimit,
+		Offset:       offset,
 	}
 	if s := q.Get("since"); s != "" {
 		f.Since, _ = time.Parse(time.RFC3339, s)
@@ -456,15 +463,30 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		out = append(out, rowToMap(row))
 	}
-	// Return next_after cursor: the smallest monotonic_seq in this page so
-	// the caller can pass ?after=<next_after> for the preceding page.
-	// (Results are newest-first, so the last row has the smallest seq.)
+	// Dual pagination (FR5): offset (total/limit/offset) for page-number UIs and
+	// cursor (next_after) as the canonical, insert-stable model. next_after is
+	// the smallest monotonic_seq in this page (results are newest-first), passed
+	// back as ?after= to page forward into older rows. Both are always reported.
+	total := len(rows)
+	if counter, ok := e.auditStore.(filterCounter); ok {
+		// CountFiltered ignores Limit/Offset/AfterSeq → the full filtered count.
+		if n, cerr := counter.CountFiltered(r.Context(), f); cerr == nil {
+			total = n
+		}
+	}
 	var nextAfter *int64
 	if len(rows) > 0 {
 		v := rows[len(rows)-1].MonotonicSeq
 		nextAfter = &v
 	}
-	writeJSON(w, map[string]any{"rows": out, "next_after": nextAfter, "completeness": map[string]string{"audit": e.streamSource("audit")}})
+	writeJSON(w, map[string]any{
+		"rows":         out,
+		"total":        total,
+		"limit":        auditLimit,
+		"offset":       offset,
+		"next_after":   nextAfter,
+		"completeness": map[string]string{"audit": e.streamSource("audit")},
+	})
 }
 
 // sourceAggregator is the optional fleet-topology capability of an audit store.

@@ -648,7 +648,12 @@ type Filter struct {
 	Since        time.Time
 	Until        time.Time
 	Limit        int
-	// AfterSeq is a cursor: only return rows with monotonic_seq > AfterSeq.
-	// Set to the last row's MonotonicSeq from the previous page to paginate.
+	// AfterSeq is the canonical cursor: results are newest-first, so paging
+	// forward returns older rows — only rows with monotonic_seq < AfterSeq.
+	// Set to next_after (the smallest MonotonicSeq of the previous page) to
+	// continue. Insert-stable, unlike Offset.
 	AfterSeq int64
+	// Offset is the alternative page-number cursor (SQL OFFSET), for UIs that
+	// want total/limit/offset. Drifts as rows are inserted; prefer AfterSeq.
+	Offset int
 }
