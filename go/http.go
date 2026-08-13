@@ -132,6 +132,14 @@ func (e *Engine) streamSource(stream string) string {
 	if !e.persistedStreams[stream] {
 		return "ring"
 	}
+	if stream == "audit" {
+		// Audit is not a transport stream — its degraded signal comes from the
+		// audit store + drainer, not the api/sys StreamStores.
+		if e.auditDegraded() {
+			return "store-degraded"
+		}
+		return "store"
+	}
 	var st StreamRepository
 	switch stream {
 	case "api":
@@ -143,6 +151,19 @@ func (e *Engine) streamSource(stream string) string {
 		return "store-degraded"
 	}
 	return "store"
+}
+
+// auditDegraded reports whether audit durable history has known holes: the
+// audit store swallowed a persist failure (sync fallback path) or the drainer
+// dead-lettered at least one row (async path).
+func (e *Engine) auditDegraded() bool {
+	if d, ok := e.auditStore.(interface{ Degraded() bool }); ok && d.Degraded() {
+		return true
+	}
+	if qs := e.GetQueueStats(); qs != nil && qs.DeadLetteredTotal > 0 {
+		return true
+	}
+	return false
 }
 
 func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {

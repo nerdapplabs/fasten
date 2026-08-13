@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +31,21 @@ func envOr(key, fallback string) string {
 type SQLiteStore struct {
 	db    *sql.DB
 	table string
+
+	// writeFailures counts swallowed persist failures; >0 means durable audit
+	// history has a known hole, so the reader degrades the audit completeness
+	// flag from "store" to "store-degraded". Sticky for the store's lifetime.
+	writeFailures atomic.Int64
 }
+
+// NoteWriteFailure records a persist failure the caller swallowed on the hot
+// path (durable history has a hole). Callers that surface the Insert error
+// don't mark the store degraded.
+func (s *SQLiteStore) NoteWriteFailure() { s.writeFailures.Add(1) }
+
+// Degraded reports whether at least one persist failure was swallowed. Drives
+// the "store-degraded" audit completeness flag.
+func (s *SQLiteStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // validIdentifierRe gates tableName against SQL injection. Every Insert /
 // Query / migrate string-substitutes `s.table` into the SQL via fmt.Sprintf

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,7 +26,19 @@ type PostgresStore struct {
 	table  string
 	schema string
 	bare   string
+
+	// writeFailures counts swallowed persist failures; >0 means durable audit
+	// history has a known hole → "store-degraded". Sticky for the store's life.
+	writeFailures atomic.Int64
 }
+
+// NoteWriteFailure records a swallowed persist failure (durable history has a
+// hole). Callers that surface the Insert error don't mark the store degraded.
+func (s *PostgresStore) NoteWriteFailure() { s.writeFailures.Add(1) }
+
+// Degraded reports whether at least one persist failure was swallowed. Drives
+// the "store-degraded" audit completeness flag.
+func (s *PostgresStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // NewPostgresStore creates and migrates the audit table, then returns the store.
 // tableName may be a plain identifier or schema-qualified (schema.table).

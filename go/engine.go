@@ -250,6 +250,11 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 				d.enqueue(row)
 			} else {
 				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
+					// Swallowed on the hot path → durable history has a hole;
+					// degrade the audit completeness flag.
+					if nwf, ok := e.auditStore.(interface{ NoteWriteFailure() }); ok {
+						nwf.NoteWriteFailure()
+					}
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
 						"error":  ferr.Error(),
 						"row_id": row.ID,
