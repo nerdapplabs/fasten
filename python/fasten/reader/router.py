@@ -233,6 +233,7 @@ def router(
         until: Optional[datetime] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
+        after: Optional[int] = Query(default=None, ge=1),
     ) -> dict[str, Any]:
         s = _store()
         if s is None:
@@ -241,6 +242,7 @@ def router(
                 "total": 0,
                 "limit": limit,
                 "offset": offset,
+                "next_after": None,
                 "completeness": {"audit": _source("audit")},
                 "error": "audit store not initialised — call fasten.init() first",
             }
@@ -250,13 +252,19 @@ def router(
             actor=actor, target=target,
             since=since, until=until,
         )
-        rows = s.query(limit=limit, offset=offset, **filters)
+        rows = s.query(limit=limit, offset=offset, after_seq=(after or 0), **filters)
         total = s.count(**filters) if hasattr(s, "count") else len(rows)
+        # Dual pagination (FR5): offset (total/limit/offset) for page-number UIs
+        # and cursor (next_after) as the canonical, insert-stable model. Rows are
+        # newest-first, so the last row carries the smallest monotonic_seq — pass
+        # it back as ?after= to continue. Both models are always reported.
+        next_after = rows[-1].monotonic_seq if rows else None
         return {
             "rows": [dataclasses.asdict(row) for row in rows],
             "total": total,
             "limit": limit,
             "offset": offset,
+            "next_after": next_after,
             "completeness": {"audit": _source("audit")},
         }
 

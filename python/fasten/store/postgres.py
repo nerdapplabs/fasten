@@ -457,6 +457,7 @@ class PostgresStore:
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
+        after_seq: int = 0,
     ) -> list[AuditRow]:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
@@ -464,6 +465,13 @@ class PostgresStore:
             actor=actor, target=target,
             since=since, until=until,
         )
+        # Cursor pagination (canonical): rows are newest-first, so paging forward
+        # means older rows — monotonic_seq < after_seq. Applied here, not in
+        # _build_where, so count()/total stays the full filtered count
+        # independent of the cursor. Mirrors the Go audit store.
+        if after_seq > 0:
+            where = f"{where} AND monotonic_seq < %s" if where else "WHERE monotonic_seq < %s"
+            params = [*params, after_seq]
 
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
