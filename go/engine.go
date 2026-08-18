@@ -54,6 +54,27 @@ type Engine struct {
 var Default = &Engine{}
 
 // Init configures this Engine. See the package-level Config docs for details.
+// streamStoreFromEnvDSN builds a SQLite stream store from an env-var DSN, or
+// returns (nil, nil) if the env var is unset. Postgres DSNs are rejected: Go
+// bundles no Postgres driver, so a Postgres stream store must be wired
+// explicitly via Config with a caller-opened *sql.DB.
+func streamStoreFromEnvDSN(envVar, table string) (*StreamStore, error) {
+	dsn := envOr(envVar, "")
+	if dsn == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		return nil, fmt.Errorf("fasten.Init: %s is a Postgres DSN; Go does not "+
+			"autoload Postgres stream stores (no bundled driver) — pass an "+
+			"explicit APIStore/SyslogStore", envVar)
+	}
+	s, err := OpenStreamStore(dsn, table)
+	if err != nil {
+		return nil, fmt.Errorf("fasten.Init: %s: %w", envVar, err)
+	}
+	return s, nil
+}
+
 func (e *Engine) Init(cfg Config) error {
 	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
 	e.nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
@@ -92,18 +113,42 @@ func (e *Engine) Init(cfg Config) error {
 	// store-backed only when it actually has a store — audit included: in
 	// stdout-only mode (no audit store) audit stays ring, so a read never
 	// claims a durable store that does not exist.
-	e.apiStore = cfg.APIStore
-	e.syslogStore = cfg.SyslogStore
-	e.xport.APIStore = cfg.APIStore
-	e.xport.SyslogStore = cfg.SyslogStore
+	// Env-var DSN autoload (parity with the Python SDK): if a stream store was
+	// not passed explicitly, build a SQLite-backed one from FASTEN_API_DSN /
+	// FASTEN_SYSLOG_DSN. SQLite only — Go bundles no Postgres driver, so a
+	// Postgres DSN must be wired as an explicit *sql.DB-backed store.
+	apiStore := cfg.APIStore
+	if apiStore == nil {
+		s, err := streamStoreFromEnvDSN("FASTEN_API_DSN", "api_log")
+		if err != nil {
+			return err
+		}
+		if s != nil {
+			apiStore = s
+		}
+	}
+	syslogStore := cfg.SyslogStore
+	if syslogStore == nil {
+		s, err := streamStoreFromEnvDSN("FASTEN_SYSLOG_DSN", "syslog")
+		if err != nil {
+			return err
+		}
+		if s != nil {
+			syslogStore = s
+		}
+	}
+	e.apiStore = apiStore
+	e.syslogStore = syslogStore
+	e.xport.APIStore = apiStore
+	e.xport.SyslogStore = syslogStore
 	e.persistedStreams = map[string]bool{}
 	if cfg.AuditStore != nil {
 		e.persistedStreams["audit"] = true
 	}
-	if cfg.APIStore != nil {
+	if apiStore != nil {
 		e.persistedStreams["api"] = true
 	}
-	if cfg.SyslogStore != nil {
+	if syslogStore != nil {
 		e.persistedStreams["sys"] = true
 	}
 	// FR3: search is off unless explicitly enabled, via config or env.
