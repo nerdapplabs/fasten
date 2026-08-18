@@ -75,6 +75,30 @@ func streamStoreFromEnvDSN(envVar, table string) (*StreamStore, error) {
 	return s, nil
 }
 
+// configureRedaction resolves the extra redact keys + replacement token from
+// explicit config, else env (FASTEN_REDACT_KEYS comma-separated /
+// FASTEN_REDACT_REPLACEMENT), and stores them for RedactDetail. Always sets both
+// globals (resetting to defaults when unconfigured) so repeated Init calls don't
+// leak a prior configuration.
+func configureRedaction(extraKeys []string, replacement string) {
+	if len(extraKeys) == 0 {
+		if env := envOr("FASTEN_REDACT_KEYS", ""); env != "" {
+			for _, k := range strings.Split(env, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					extraKeys = append(extraKeys, k)
+				}
+			}
+		}
+	}
+	redactExtraKeysJSON = ""
+	if len(extraKeys) > 0 {
+		if b, err := json.Marshal(extraKeys); err == nil {
+			redactExtraKeysJSON = string(b)
+		}
+	}
+	redactReplacement = firstNonEmpty(replacement, envOr("FASTEN_REDACT_REPLACEMENT", ""))
+}
+
 func (e *Engine) Init(cfg Config) error {
 	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
 	e.nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
@@ -153,6 +177,9 @@ func (e *Engine) Init(cfg Config) error {
 	}
 	// FR3: search is off unless explicitly enabled, via config or env.
 	e.searchEnabled = cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", ""))
+
+	// Redaction customization (parity with Python FASTEN_REDACT_KEYS/REPLACEMENT).
+	configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
 
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,

@@ -38,6 +38,43 @@ func coreRedactJSON(inJSON string) (string, error) {
 	return C.GoString(outJSON), nil
 }
 
+// coreRedactJSONFull redacts with extra key patterns and a custom replacement
+// token (extra value-shape patterns unused here). extraKeysJSON is a JSON array
+// of key strings ("" = none); replacement is the token for key-pattern hits
+// ("" = the core default "***"). Extra keys AUGMENT the built-in patterns.
+func coreRedactJSONFull(inJSON, extraKeysJSON, replacement string) (string, error) {
+	cIn := C.CString(inJSON)
+	defer C.free(unsafe.Pointer(cIn))
+	var cKeys, cRepl *C.char
+	if extraKeysJSON != "" {
+		cKeys = C.CString(extraKeysJSON)
+		defer C.free(unsafe.Pointer(cKeys))
+	}
+	if replacement != "" {
+		cRepl = C.CString(replacement)
+		defer C.free(unsafe.Pointer(cRepl))
+	}
+	var outJSON, outErr *C.char
+	rc := C.fasten_redact_full(cIn, cKeys, cRepl, nil, &outJSON, &outErr)
+	if outErr != nil {
+		defer C.fasten_store_free_str(outErr)
+	}
+	if outJSON != nil {
+		defer C.fasten_store_free_str(outJSON)
+	}
+	if rc != C.FASTEN_OK {
+		msg := "redact failed"
+		if outErr != nil {
+			msg = C.GoString(outErr)
+		}
+		return "", fmt.Errorf("fasten: %s", msg)
+	}
+	if outJSON == nil {
+		return inJSON, nil
+	}
+	return C.GoString(outJSON), nil
+}
+
 // coreRegisterCodes delegates code registration to the Rust catalog engine.
 // On validation failure the Rust error string is returned as a Go error.
 func coreRegisterCodes(domain, codesJSON string) error {

@@ -476,6 +476,13 @@ type Config struct {
 	// "search requires sys persistence" at read time.
 	SearchEnabled bool
 
+	// Redaction customization (parity with the Python SDK). ExtraRedactKeys are
+	// added to the built-in PII key patterns; RedactReplacement overrides the
+	// "***" token. Both also read from FASTEN_REDACT_KEYS (comma-separated) /
+	// FASTEN_REDACT_REPLACEMENT when the field is empty. Empty = defaults.
+	ExtraRedactKeys   []string
+	RedactReplacement string
+
 	// P1-15
 	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
 	QueueCapacity             int           // default 100
