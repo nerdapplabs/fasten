@@ -327,6 +327,29 @@ describe('withRequestID / currentRequestID', () => {
         });
         assert.equal(row.request_id, 'deadbeef1234');
     });
+
+    test('non-string request_id is treated as missing (minted), not stashed', async () => {
+        // Parity with Python (isinstance) / Go (.(string)): a non-string id
+        // must not be stamped onto the row as-is.
+        initTestSDK();
+        let ctx, row;
+        await withRequestID(12345, async () => {
+            ctx = currentRequestID();
+            row = emit({ code: 'USER_CREATED', target: 'u-1' });
+        });
+        assert.equal(ctx, null); // a number reads as no id
+        assert.equal(typeof row.request_id, 'string');
+        assert.match(row.request_id, /^[0-9a-f]{12}$/); // a freshly minted id
+    });
+
+    test('empty-string request_id is treated as missing (minted)', async () => {
+        initTestSDK();
+        let row;
+        await withRequestID('', async () => {
+            row = emit({ code: 'USER_CREATED', target: 'u-1' });
+        });
+        assert.match(row.request_id, /^[0-9a-f]{12}$/);
+    });
 });
 
 // ── mintID ────────────────────────────────────────────────────────────────

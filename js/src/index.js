@@ -25,7 +25,12 @@ export function mintID() {
 }
 
 export function currentRequestID() {
-	return als.getStore()?.requestId ?? null;
+	// Only a non-empty string counts as a caller-supplied id. A non-string (e.g.
+	// a number passed to withRequestID) is treated as missing, so the emit path
+	// mints a real id instead of stamping the wrong type onto the row — parity
+	// with the Python (isinstance) and Go (.(string)) guards.
+	const rid = als.getStore()?.requestId;
+	return typeof rid === "string" && rid ? rid : null;
 }
 
 export function withRequestID(requestId, fn) {
