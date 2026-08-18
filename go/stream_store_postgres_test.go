@@ -41,11 +41,21 @@ func TestPostgresStreamStore_Parity(t *testing.T) {
 		t.Errorf("level filter should be exact-match: %v", r)
 	}
 
-	// status compared via CAST(status AS TEXT) — the text-in-eq path
+	// status compared numerically (parsed to int) — the text-in-eq path
 	rows, err = s.Query(10, map[string]string{"status": "502"}, "", "")
 	must(t, err)
 	if len(rows) != 1 || rows[0]["request_id"] != "r-3" {
 		t.Errorf("status filter: %v", rows)
+	}
+	// non-canonical numeric form must still match the integer column (FR5-10;
+	// parity with the Python SDK, which binds status as int).
+	rows, err = s.Query(10, map[string]string{"status": "0502"}, "", "")
+	must(t, err)
+	if len(rows) != 1 || rows[0]["request_id"] != "r-3" {
+		t.Errorf("status=0502 should match integer 502 (parity with Python): %v", rows)
+	}
+	if r, _ := s.Query(10, map[string]string{"status": "50"}, "", ""); len(r) != 0 {
+		t.Errorf("status=50 must not match 502: %v", r)
 	}
 
 	// time window

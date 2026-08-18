@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -105,8 +106,10 @@ func (s *PostgresStreamStore) WriteFailures() int64 { return s.writeFailures.Loa
 func (s *PostgresStreamStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // whereClause builds an equality + time-window WHERE with $N placeholders
-// starting at argStart. status is compared as text (CAST) because it arrives as
-// a string in the eq map, mirroring the SQLite path's numeric-affinity match.
+// starting at argStart. status arrives as a string in the eq map but the column
+// is INTEGER: compare it numerically (parse to int) so non-canonical forms like
+// "007" match 7 — matching the Python SDK, which binds status as an int. (The
+// old CAST(status AS TEXT) compared '7' != '007' and silently missed.)
 func (s *PostgresStreamStore) whereClause(eq map[string]string, since, until string, argStart int) (string, []any, int) {
 	var conds []string
 	var args []any
@@ -120,6 +123,14 @@ func (s *PostgresStreamStore) whereClause(eq map[string]string, since, until str
 	sort.Strings(keys)
 	for _, k := range keys {
 		if k == "status" {
+			if iv, err := strconv.Atoi(eq[k]); err == nil {
+				conds = append(conds, fmt.Sprintf("status = $%d", n))
+				args = append(args, iv)
+				n++
+				continue
+			}
+			// Non-numeric status can't match an INTEGER column; keep a text
+			// compare so it matches nothing rather than erroring.
 			conds = append(conds, fmt.Sprintf("CAST(status AS TEXT) = $%d", n))
 		} else {
 			conds = append(conds, fmt.Sprintf("%s = $%d", k, n))
