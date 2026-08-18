@@ -1123,6 +1123,18 @@ inline void init(Config cfg = {}) {
 
     if (!cfg.extra_redact_keys.empty()) {
         g.redact_cfg.extra_keys = cfg.extra_redact_keys;
+    } else {
+        // env FASTEN_REDACT_KEYS (comma-separated), parity with the other SDKs.
+        std::string env_keys = env_or("FASTEN_REDACT_KEYS", "");
+        if (!env_keys.empty()) {
+            std::stringstream ss(env_keys);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                size_t a = tok.find_first_not_of(" \t");
+                size_t b = tok.find_last_not_of(" \t");
+                if (a != std::string::npos) g.redact_cfg.extra_keys.push_back(tok.substr(a, b - a + 1));
+            }
+        }
     }
     g.redact_cfg.replacement = cfg.redact_replacement.empty()
         ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
