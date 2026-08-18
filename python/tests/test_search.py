@@ -106,6 +106,31 @@ def test_search_wildcard_escaped():
     assert body["matches"][0]["request_id"] == "r-w"
 
 
+def test_search_wildcard_escaped_underscore():
+    # `_` is the single-char LIKE wildcard; it must be escaped to match literally.
+    # Regression guard for the escape order in stream.py / stream_store.go.
+    _init(search=True)
+    t = fasten.transport()
+    t.push_syslog({"event": "ab_cd", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-u"})
+    t.push_syslog({"event": "abXcd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
+    body = _client().get("/api/v1/logs/search", params={"q": "ab_cd", "since": SINCE}).json()
+    assert body["counts"]["sys"] == 1  # literal _, not a wildcard → only r-u (not abXcd)
+    assert body["matches"][0]["request_id"] == "r-u"
+
+
+def test_search_backslash_escaped():
+    # `\` is the ESCAPE char itself; it must be escaped so it is matched as data,
+    # not treated as a metacharacter that consumes the next char. The event value
+    # c\d (one backslash) is stored in the JSON payload as c\\d.
+    _init(search=True)
+    t = fasten.transport()
+    t.push_syslog({"event": "c\\d", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-bs"})
+    t.push_syslog({"event": "cXd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-dec"})
+    body = _client().get("/api/v1/logs/search", params={"q": "c\\\\d", "since": SINCE}).json()
+    assert body["counts"]["sys"] == 1  # backslashes matched literally → only r-bs
+    assert body["matches"][0]["request_id"] == "r-bs"
+
+
 def test_sys_q_param_gated_and_bounded():
     _init(search=True)
     _seed()

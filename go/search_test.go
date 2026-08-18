@@ -127,6 +127,38 @@ func TestSearch_WildcardEscaped(t *testing.T) {
 	}
 }
 
+func TestSearch_WildcardEscapedUnderscore(t *testing.T) {
+	// `_` is the single-char LIKE wildcard; it must be escaped to match literally.
+	initSearch(t, true, true)
+	tr := GetTransport()
+	tr.PushSyslog(SyslogRow{"event": "ab_cd", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-u"})
+	tr.PushSyslog(SyslogRow{"event": "abXcd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
+	body, _ := getJSON(t, NewReader(), "/search?q=ab_cd&since="+searchSince)
+	if body["counts"].(map[string]any)["sys"] != float64(1) {
+		t.Fatalf("literal _ should match only r-u (not abXcd), got %v", body["counts"])
+	}
+	if body["matches"].([]any)[0].(map[string]any)["request_id"] != "r-u" {
+		t.Errorf("wrong match: %v", body["matches"])
+	}
+}
+
+func TestSearch_BackslashEscaped(t *testing.T) {
+	// `\` is the ESCAPE char; it must be escaped so it is matched as data. The
+	// event c\d (one backslash) is stored as c\\d in the JSON payload, so the
+	// query carries two backslashes (%5C%5C).
+	initSearch(t, true, true)
+	tr := GetTransport()
+	tr.PushSyslog(SyslogRow{"event": "c\\d", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-bs"})
+	tr.PushSyslog(SyslogRow{"event": "cXd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-dec"})
+	body, _ := getJSON(t, NewReader(), "/search?q=c%5C%5Cd&since="+searchSince)
+	if body["counts"].(map[string]any)["sys"] != float64(1) {
+		t.Fatalf("backslashes matched literally should give only r-bs, got %v", body["counts"])
+	}
+	if body["matches"].([]any)[0].(map[string]any)["request_id"] != "r-bs" {
+		t.Errorf("wrong match: %v", body["matches"])
+	}
+}
+
 func TestSysQParamGatedAndBounded(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()
