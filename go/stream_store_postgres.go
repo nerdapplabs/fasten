@@ -206,7 +206,10 @@ func (s *PostgresStreamStore) Purge(before string) (int64, error) {
 func (s *PostgresStreamStore) Search(q, since, until string, limit int) ([]map[string]any, error) {
 	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 	// ILIKE is case-insensitive, so no lower(); wildcards in q are escaped.
-	conds := []string{"COALESCE(timestamp,'') >= $1", `payload ILIKE $2 ESCAPE '\'`}
+	// ESCAPE E'\\' (explicit escape-string) always means one backslash,
+	// independent of standard_conforming_strings; plain '\' would break if a
+	// deployment turned that off (FR3-4).
+	conds := []string{"COALESCE(timestamp,'') >= $1", `payload ILIKE $2 ESCAPE E'\\'`}
 	args := []any{since, "%" + esc + "%"}
 	n := 3
 	if until != "" {

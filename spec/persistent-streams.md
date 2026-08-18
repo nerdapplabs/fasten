@@ -232,6 +232,9 @@ constrained** (§4.1 of the issue — the escape hatch, not the discovery path):
   requires sys persistence").
 - Case-insensitive substring over the JSON `payload`; `%` / `_` / `\` in `q` are
   escaped so they match literally (SQLite `LIKE … ESCAPE`, Postgres `ILIKE`).
+  The Postgres escape char is declared as `ESCAPE E'\\'` (explicit escape-string)
+  so it means one backslash regardless of the server's `standard_conforming_strings`
+  setting — a plain `ESCAPE '\'` would break where that is turned off.
 
 Surfaces as `GET /logs/search` (returns matches with `request_id` for a
 follow-up `/correlate`) and a gated `q=` on `/logs/sys`. Discovery input reaches

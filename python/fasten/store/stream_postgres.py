@@ -244,7 +244,10 @@ class PostgresStreamStore:
         """FR3 bounded substring search (§4.1). Case-insensitive via ILIKE; %/_/\\
         in ``q`` are escaped so they match literally."""
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conds = ["COALESCE(timestamp, '') >= %s", "payload ILIKE %s ESCAPE '\\'"]
+        # ESCAPE E'\\' (explicit escape-string) always means one backslash,
+        # independent of standard_conforming_strings; plain '\' would break if a
+        # deployment turned that off (FR3-4).
+        conds = ["COALESCE(timestamp, '') >= %s", "payload ILIKE %s ESCAPE E'\\\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:
             conds.append("COALESCE(timestamp, '') <= %s")
