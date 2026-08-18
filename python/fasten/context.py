@@ -43,7 +43,14 @@ def mint_sentinel(kind: str, service_id: str = "") -> str:
     """Mint a namespaced sentinel request_id (e.g. ``orphan-svc-ab12cd34ef56``).
 
     boot is minted once per process and shared (one startup window); the
-    others are per-task/per-write and unique."""
+    others are per-task/per-write and unique.
+
+    An unknown ``kind`` is a programming error (never runtime input), so this
+    raises ``ValueError`` — the idiomatic Python signal. The Go SDK
+    (``fasten.MintSentinel``) ``panic``s on the same condition, likewise the
+    idiomatic Go signal for a programmer error. The behaviour deliberately
+    differs per language idiom; the contract (reject an unknown kind loudly) is
+    the same."""
     if kind not in SENTINEL_KINDS:
         raise ValueError(f"unknown sentinel kind {kind!r}; expected one of {SENTINEL_KINDS}")
     return f"{kind}-{service_id or 'svc'}-{mint_id()}"

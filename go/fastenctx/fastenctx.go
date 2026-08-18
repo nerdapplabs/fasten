@@ -44,8 +44,13 @@ var SentinelKinds = []string{"boot", "sched", "bg", "lib", "orphan"}
 
 // MintSentinel mints a namespaced sentinel request_id (e.g.
 // "orphan-svc-ab12cd34ef56"). boot is minted once per process and shared; the
-// others are per-task/per-write. Panics on an unknown kind (a programming
-// error, never runtime input).
+// others are per-task/per-write.
+//
+// Panics on an unknown kind — a programming error, never runtime input, so a
+// panic is the idiomatic Go signal. The Python SDK (fasten.mint_sentinel)
+// raises ValueError on the same condition, likewise idiomatic there. The
+// behaviour differs by language idiom on purpose; the contract (reject an
+// unknown kind loudly) is identical.
 func MintSentinel(kind, serviceID string) string {
 	if !isSentinelKind(kind) {
 		panic(fmt.Sprintf("fasten: unknown sentinel kind %q; expected one of %v", kind, SentinelKinds))
