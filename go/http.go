@@ -90,6 +90,20 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //
 // Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
 // Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
+// NewReader returns an http.Handler serving the reader endpoints bound to this
+// engine's configuration (stores, SearchEnabled, persisted streams).
+//
+// Per-reader overrides (the equivalent of Python's router(persist_streams=,
+// search_enabled=, store=, transport=)) are achieved by binding the reader to a
+// separately-configured *Engine rather than passing options to NewReader:
+//
+//	e2 := &fasten.Engine{}
+//	_ = e2.Init(fasten.Config{ServiceID: "svc", NodeID: "n", SearchEnabled: true,
+//	    AuditStore: replica, APIStore: apiStore}) // read-replica / multi-store
+//	mux.Handle("/logs/", http.StripPrefix("/logs", e2.NewReader()))
+//
+// so a reader can point at different stores or a different search/persistence
+// policy than the process-wide Default engine.
 func (e *Engine) NewReader() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
