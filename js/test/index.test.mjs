@@ -396,6 +396,40 @@ describe('redact via emit detail', () => {
     });
 });
 
+// ── redact customization (env / opts parity) ───────────────────────────────
+
+describe('redact customization', () => {
+    test('extra keys + custom replacement via opts', () => {
+        initTestSDK({ extraRedactKeys: ['badge'], redactReplacement: '[X]' });
+        const row = emit({
+            code: 'USER_CREATED', target: 'u-1',
+            detail: { password: 'p', badge: 'b', ok: 'v' },
+        });
+        assert.equal(row.detail.password, '[X]'); // built-in key, custom token
+        assert.equal(row.detail.badge, '[X]');    // extra key
+        assert.equal(row.detail.ok, 'v');
+    });
+
+    test('FASTEN_REDACT_REPLACEMENT env', () => {
+        process.env.FASTEN_REDACT_REPLACEMENT = '###';
+        try {
+            initTestSDK();
+            const row = emit({ code: 'USER_CREATED', target: 'u-1', detail: { secret: 's', ok: 'v' } });
+            assert.equal(row.detail.secret, '###');
+            assert.equal(row.detail.ok, 'v');
+        } finally {
+            delete process.env.FASTEN_REDACT_REPLACEMENT;
+        }
+    });
+
+    test('default replacement unchanged', () => {
+        initTestSDK();
+        const row = emit({ code: 'USER_CREATED', target: 'u-1', detail: { password: 'p', ok: 'v' } });
+        assert.equal(row.detail.password, REDACT_REPLACEMENT); // ***
+        assert.equal(row.detail.ok, 'v');
+    });
+});
+
 // ── dump ──────────────────────────────────────────────────────────────────
 
 describe('dump', () => {
