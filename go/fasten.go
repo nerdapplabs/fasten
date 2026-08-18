@@ -21,7 +21,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -347,64 +346,27 @@ func metaOf(c Code) (Meta, bool) {
 
 // ── Correlation context ───────────────────────────────────────────────────
 
-// MintID returns a new 12-character hex request id.
-func MintID() string {
-	b := make([]byte, 6)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
+// MintID returns a new 12-character hex request id. Delegates to the
+// zero-dependency fastenctx subpackage so a zero-cgo consumer can mint ids
+// without importing the cgo-bound top-level package.
+func MintID() string { return fastenctx.MintID() }
 
-// sentinelKinds are the namespaces for rows written outside a real request
-// context. Stamping one (instead of leaving request_id empty) keeps every
-// stream row correlatable and self-describing — see the sentinel invariant.
-//
-// Only boot and orphan are ever auto-stamped (by the transport); sched, bg,
-// and lib exist for callers that mint sentinels explicitly via MintSentinel
-// for their own scheduled/background/library-context writes.
-var sentinelKinds = []string{"boot", "sched", "bg", "lib", "orphan"}
+// SentinelKinds re-exports fastenctx.SentinelKinds — the namespaces for rows
+// written outside a real request context (boot, sched, bg, lib, orphan).
+var SentinelKinds = fastenctx.SentinelKinds
 
 // MintSentinel mints a namespaced sentinel request_id (e.g.
-// "orphan-svc-ab12cd34ef56"). boot is minted once per process and shared; the
-// others are per-task/per-write. Panics on an unknown kind (a programming
-// error, never runtime input).
-func MintSentinel(kind, serviceID string) string {
-	if !isSentinelKind(kind) {
-		panic(fmt.Sprintf("fasten: unknown sentinel kind %q; expected one of %v", kind, sentinelKinds))
-	}
-	if serviceID == "" {
-		serviceID = "svc"
-	}
-	return fmt.Sprintf("%s-%s-%s", kind, serviceID, MintID())
-}
+// "orphan-svc-ab12cd34ef56"). Panics on an unknown kind (a programming error,
+// never runtime input). Delegates to fastenctx (cgo-free).
+func MintSentinel(kind, serviceID string) string { return fastenctx.MintSentinel(kind, serviceID) }
 
 // RequestIDKind classifies a request_id by its namespace: a sentinel kind, or
-// "request" for a real correlation id. Lets a UI pivot/filter by origin.
-//
-// Classification is by prefix, so a REAL id that happens to start with
-// "boot-"/"sched-"/"bg-"/"lib-"/"orphan-" is misclassified as a sentinel —
-// the practical effect is the boot window staying open past that row. If
-// your upstream request ids can carry such prefixes, strip or re-namespace
-// them at the edge (fasten's own MintID never collides).
-func RequestIDKind(requestID string) string {
-	for _, k := range sentinelKinds {
-		if strings.HasPrefix(requestID, k+"-") {
-			return k
-		}
-	}
-	return "request"
-}
+// "request" for a real correlation id. Delegates to fastenctx (cgo-free).
+func RequestIDKind(requestID string) string { return fastenctx.RequestIDKind(requestID) }
 
 // IsSentinel reports whether requestID is a minted sentinel, not a real id.
-func IsSentinel(requestID string) bool { return RequestIDKind(requestID) != "request" }
-
-func isSentinelKind(kind string) bool {
-	for _, k := range sentinelKinds {
-		if k == kind {
-			return true
-		}
-	}
-	return false
-}
+// Delegates to fastenctx (cgo-free).
+func IsSentinel(requestID string) bool { return fastenctx.IsSentinel(requestID) }
 
 // WithRequestID returns ctx with the id as the ambient correlation id.
 //
