@@ -498,6 +498,16 @@ type Config struct {
 	// day support). Runs the first purge on Init, then every hour.
 	RetentionAPI    time.Duration
 	RetentionSyslog time.Duration
+
+	// #58 PersistStreams: explicit allowlist of streams the operator has
+	// opted into persisting. When non-nil, Init asserts the set matches the
+	// streams with stores attached (bidirectional — a named stream without
+	// a store or an attached store without the name both fail loudly).
+	// When nil, persistence is derived from store attachment (the earlier
+	// behaviour, and still the default). "audit" is never valid here —
+	// audit persistence is driven by AuditStore. Also read from
+	// FASTEN_PERSIST_STREAMS as a comma-separated list.
+	PersistStreams []string
 }
 
 // Init configures fasten. Delegates to Default.Init.

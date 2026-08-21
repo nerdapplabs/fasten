@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,6 +200,15 @@ func (e *Engine) Init(cfg Config) error {
 	e.syslogStore = syslogStore
 	e.xport.APIStore = apiStore
 	e.xport.SyslogStore = syslogStore
+
+	// #58 PersistStreams assertion — every named stream needs a store,
+	// every attached store needs to be named. Env fallback: comma-separated
+	// list in FASTEN_PERSIST_STREAMS. Nil = fall back to derivation (the
+	// existing behaviour and still the default).
+	if err := e.assertPersistStreams(cfg.PersistStreams, apiStore, syslogStore); err != nil {
+		return err
+	}
+
 	e.persistedStreams = map[string]bool{}
 	if cfg.AuditStore != nil {
 		e.persistedStreams["audit"] = true
@@ -260,6 +270,75 @@ func (e *Engine) Init(cfg Config) error {
 		return err
 	}
 	return nil
+}
+
+// assertPersistStreams: when PersistStreams is set (or FASTEN_PERSIST_STREAMS
+// is), the named streams must exactly match the attached stream stores —
+// bidirectional. A named stream without a store would make completeness lie
+// "store" over rows the stream never persisted; an attached store not in the
+// allowlist is surprise IO on a stream the operator thought was ring-only.
+// Nil / empty env = skip (fall back to derivation, the pre-existing default).
+func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore StreamRepository) error {
+	named := fromConfig
+	if named == nil {
+		if s := envOr("FASTEN_PERSIST_STREAMS", ""); s != "" {
+			for _, part := range strings.Split(s, ",") {
+				if p := strings.TrimSpace(part); p != "" {
+					named = append(named, p)
+				}
+			}
+		} else {
+			return nil // no config, no env → derivation
+		}
+	}
+	namedSet := map[string]bool{}
+	for _, s := range named {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if s != "api" && s != "sys" {
+			return fmt.Errorf(
+				"fasten.Init: PersistStreams contains unknown stream %q "+
+					"(only \"api\" and \"sys\" are valid; audit persistence "+
+					"is driven by AuditStore, not PersistStreams)", s)
+		}
+		namedSet[s] = true
+	}
+	have := map[string]bool{}
+	if apiStore != nil {
+		have["api"] = true
+	}
+	if syslogStore != nil {
+		have["sys"] = true
+	}
+	var missingStore, unlisted []string
+	for s := range namedSet {
+		if !have[s] {
+			missingStore = append(missingStore, s)
+		}
+	}
+	for s := range have {
+		if !namedSet[s] {
+			unlisted = append(unlisted, s)
+		}
+	}
+	if len(missingStore) == 0 && len(unlisted) == 0 {
+		return nil
+	}
+	sort.Strings(missingStore)
+	sort.Strings(unlisted)
+	var parts []string
+	if len(missingStore) > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"named in PersistStreams but no store attached: %v", missingStore))
+	}
+	if len(unlisted) > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"store attached but not in PersistStreams: %v", unlisted))
+	}
+	return fmt.Errorf("fasten.Init: PersistStreams / stores mismatch — %s",
+		strings.Join(parts, "; "))
 }
 
 // startRetention stops any previous purgers and spawns fresh ones for every

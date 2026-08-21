@@ -13,6 +13,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   and a background retention loop that calls purge on a schedule when
   `retention_api` / `retention_syslog` (config or env `FASTEN_RETENTION_API`
   / `FASTEN_RETENTION_SYSLOG`) is set — durations like `"7d"` / `"24h"`.
+- **`persist_streams` allowlist** — explicit config knob (Python
+  `fasten.init(persist_streams=…)` / Go `Config.PersistStreams` / env
+  `FASTEN_PERSIST_STREAMS`) that must exactly match the streams with stores
+  attached. Bidirectional error on mismatch — a stream named without a
+  store or an attached store not in the allowlist both fail Init loudly.
+  When unset, persistence is derived from store attachment (the default).
 - **FR2 correlation** — `GET /logs/correlate?request_id=X` fans out to
   audit + api + sys in one call, with `counts`/`totals` truncation signalling.
 - **FR3 search (constrained)** — `GET /logs/search` and a gated `q=` on

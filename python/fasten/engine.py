@@ -75,6 +75,14 @@ class FastenConfig:
     # stores. None disables. Strings are duration tokens ("7d", "24h").
     retention_api: Optional[str]
     retention_syslog: Optional[str]
+    # #58 persist_streams: explicit allowlist of streams the operator has
+    # opted into persisting. When set, start() asserts that the set matches
+    # the streams with stores attached (bidirectional — a named stream
+    # without a store or an attached store without the name both fail
+    # loudly). When None, persistence is derived from store attachment
+    # (the earlier behaviour, and still the default). Never includes
+    # "audit" (audit persistence is driven by audit_store, not this knob).
+    persist_streams: Optional[frozenset[str]]
 
 
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
@@ -207,6 +215,7 @@ class Engine:
         search_enabled: bool = False,
         retention_api: Optional[str] = None,
         retention_syslog: Optional[str] = None,
+        persist_streams: Optional[list[str] | set[str] | frozenset[str]] = None,
     ) -> FastenConfig:
         """Resolve all parameters and environment variables into a FastenConfig.
 
@@ -270,6 +279,28 @@ class Engine:
         ret_api = retention_api if retention_api is not None else (os.environ.get("FASTEN_RETENTION_API") or None)
         ret_sys = retention_syslog if retention_syslog is not None else (os.environ.get("FASTEN_RETENTION_SYSLOG") or None)
 
+        # #58 persist_streams: explicit stream allowlist. Env supports a
+        # comma-separated list; empty-string counts as unset. Validated
+        # against the set of stores in start(), not here — init_config
+        # never touches runtime state.
+        env_ps = os.environ.get("FASTEN_PERSIST_STREAMS")
+        if persist_streams is not None:
+            ps: Optional[frozenset[str]] = frozenset(persist_streams)
+        elif env_ps:
+            ps = frozenset(s.strip() for s in env_ps.split(",") if s.strip())
+        else:
+            ps = None
+        if ps is not None:
+            allowed = {"api", "sys"}
+            unknown = ps - allowed
+            if unknown:
+                raise RuntimeError(
+                    f"fasten.init_config: persist_streams={sorted(ps)} — "
+                    f"unknown stream(s) {sorted(unknown)}. "
+                    f"Only {sorted(allowed)} are valid (audit persistence is "
+                    "driven by audit_store, not persist_streams)."
+                )
+
         return FastenConfig(
             service_id=svc,
             node_id=node,
@@ -289,6 +320,7 @@ class Engine:
             search_enabled=search_on,
             retention_api=ret_api,
             retention_syslog=ret_sys,
+            persist_streams=ps,
         )
 
     def start(self, cfg: FastenConfig) -> None:
@@ -298,6 +330,35 @@ class Engine:
         # re-Init on the same Engine leaves orphan purgers hammering the old
         # store (which may already be closed).
         self._stop_retention_threads()
+
+        # #58 persist_streams assertion — every named stream needs a store,
+        # every attached store needs to be named. Both directions so an
+        # operator can't declare persistence without wiring it (silent
+        # ring-only under a "store" flag) or wire a store the config didn't
+        # opt into (surprise IO on a stream the operator thought was
+        # ring-only). Skipped when persist_streams is None.
+        if cfg.persist_streams is not None:
+            have = {name for name, store in
+                    (("api", cfg.api_store), ("sys", cfg.syslog_store))
+                    if store is not None}
+            named = set(cfg.persist_streams)
+            missing_store = named - have
+            unlisted_store = have - named
+            if missing_store or unlisted_store:
+                bits = []
+                if missing_store:
+                    bits.append(
+                        f"named in persist_streams but no store attached: "
+                        f"{sorted(missing_store)}"
+                    )
+                if unlisted_store:
+                    bits.append(
+                        f"store attached but not in persist_streams: "
+                        f"{sorted(unlisted_store)}"
+                    )
+                raise RuntimeError(
+                    "fasten.init: persist_streams / stores mismatch — " + "; ".join(bits)
+                )
 
         self._service_id = cfg.service_id
         self._node_id    = cfg.node_id
@@ -428,6 +489,7 @@ class Engine:
         search_enabled: bool = False,
         retention_api: str | None = None,
         retention_syslog: str | None = None,
+        persist_streams: list[str] | set[str] | frozenset[str] | None = None,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(
@@ -441,6 +503,7 @@ class Engine:
             queue_drain_max_attempts=queue_drain_max_attempts,
             search_enabled=search_enabled,
             retention_api=retention_api, retention_syslog=retention_syslog,
+            persist_streams=persist_streams,
         ))
 
     # ── Emit ──────────────────────────────────────────────────────────────
