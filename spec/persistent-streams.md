@@ -125,7 +125,37 @@ same order for the same filters:
 3. **Time window:** optional inclusive `[since, until]` on `timestamp`. A
    missing/`NULL` timestamp is treated as the empty string
    (`COALESCE(timestamp,'')`, matching the ring). Comparison is **lexicographic**
-   — correct for canonical UTC timestamps; callers MUST keep one canonical form.
+   over the canonical UTC form defined in §4.3.
+
+### §4.3 Canonical UTC timestamp form (writer obligation)
+
+Every timestamp fasten writes — audit `timestamp` / `shipped_at`, stream
+`timestamp`, purge cutoffs, drainer sys events, `last_verified_at`,
+retention cutoffs — MUST render as **RFC3339 with a fixed six-digit
+sub-second and an always-`Z` suffix**:
+
+    2026-08-21T10:00:00.000000Z
+    2026-08-21T10:00:00.500000Z
+
+Fixed width places the fractional dot at byte 19 for every stamp, so
+`.NNNNNNZ` sorts as digits — `'Z'` (0x5A) can never appear where `'.'`
+(0x2E) does, which was the historical Go-only same-second inversion
+(`RFC3339Nano` stripped `.000000` from whole seconds). Six digits matches
+Postgres `timestamptz` default resolution + Python stdlib default; no
+sub-microsecond carrier exists across runtimes.
+
+The two SDKs stamp identically through `canonical_ts` (Python:
+`fasten/canonical_ts.py`; Go: `go/canonical_ts.go`), pinned to
+byte-identical output by parallel conformance tests in each SDK. Adopter
+code that writes rows into a fasten table (custom loaders, replication)
+MUST use the same form or windowed reads on the mixed table will
+mis-compare at boundary instants.
+
+Parsers are permissive: the reader path (`time.Parse(time.RFC3339Nano,
+...)` / `fasten.canonical_ts.parse_canonical_or_legacy`) accepts the
+canonical form and the pre-canonical forms already in existing tables,
+so historical rows read back cleanly. Only the *writer* obligation is
+strict.
 4. **Limit:** every read is capped (default 100, max 1000) after filtering and
    ordering. A non-positive limit is refused.
 

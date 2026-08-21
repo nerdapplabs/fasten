@@ -199,7 +199,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	}
 	var shippedAt *string
 	if row.ShippedAt != nil {
-		v := row.ShippedAt.Format(time.RFC3339Nano)
+		v := canonicalTS(*row.ShippedAt)
 		shippedAt = &v
 	}
 	piiFlag := 0
@@ -217,7 +217,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	_, err = exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
-		row.Timestamp.Format(time.RFC3339Nano),
+		canonicalTS(row.Timestamp),
 		string(row.Code), row.Action, string(row.Severity),
 		row.ServiceID, row.SourceNodeID, row.TenantID,
 		row.Actor, row.ActorKind,
@@ -401,7 +401,7 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := canonicalTS(time.Now())
 	placeholders := make([]string, len(ids))
 	args := make([]any, 0, len(ids)+1)
 	args = append(args, now)
@@ -419,7 +419,7 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 
 func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
 	q := fmt.Sprintf(`DELETE FROM %s WHERE timestamp < ?`, s.table)
-	args := []any{before.UTC().Format(time.RFC3339Nano)}
+	args := []any{canonicalTS(before)}
 	if respectUnshipped {
 		q += " AND shipped_at IS NOT NULL"
 	}
@@ -476,11 +476,11 @@ func (s *SQLiteStore) Sources(ctx context.Context, since, until time.Time) ([]ma
 	var args []any
 	if !since.IsZero() {
 		conds = append(conds, "timestamp >= ?")
-		args = append(args, since.UTC().Format(time.RFC3339Nano))
+		args = append(args, canonicalTS(since))
 	}
 	if !until.IsZero() {
 		conds = append(conds, "timestamp <= ?")
-		args = append(args, until.UTC().Format(time.RFC3339Nano))
+		args = append(args, canonicalTS(until))
 	}
 	where := ""
 	if len(conds) > 0 {
@@ -551,10 +551,10 @@ func filterToSQL(f Filter) (string, []any) {
 		conds = append(conds, "target = ?"); args = append(args, f.Target)
 	}
 	if !f.Since.IsZero() {
-		conds = append(conds, "timestamp >= ?"); args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		conds = append(conds, "timestamp >= ?"); args = append(args, canonicalTS(f.Since))
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, "timestamp <= ?"); args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
+		conds = append(conds, "timestamp <= ?"); args = append(args, canonicalTS(f.Until))
 	}
 	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
 	// bound, applied in Query so CountFiltered/total stays the full match count.

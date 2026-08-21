@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"strings"
-	"time"
 )
 
 // SlogHandler wraps an underlying slog.Handler and pushes each log record
@@ -42,7 +41,7 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 			// rows unfindable next to every other writer.
 			"level":      strings.ToLower(r.Level.String()),
 			"event":      r.Message,
-			"timestamp":  r.Time.UTC().Format(time.RFC3339Nano),
+			"timestamp":  canonicalTS(r.Time),
 			"request_id": RequestIDFromContext(ctx),
 			"service_id": Default.serviceID,
 		}

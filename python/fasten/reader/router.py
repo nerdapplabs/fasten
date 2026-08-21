@@ -36,6 +36,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ..canonical_ts import canonical_now, canonical_ts
 from .. import audit_store as _active_audit_store
 from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
@@ -474,7 +475,7 @@ def router(
                     matches.append({
                         "stream": "audit",
                         "request_id": row.request_id,
-                        "ts": row.timestamp.isoformat() if row.timestamp else None,
+                        "ts": canonical_ts(row.timestamp) if row.timestamp else None,
                         "summary": row.code,
                         "row": dataclasses.asdict(row),
                     })
@@ -604,9 +605,7 @@ def router(
                         "breaks": 0 if result.ok else 1,
                         "first_break_at": result.first_break_at,
                         "reason": result.reason,
-                        "last_verified_at": datetime.now(timezone.utc).isoformat(
-                            timespec="milliseconds"
-                        ),
+                        "last_verified_at": canonical_now(),
                     }
             except Exception as e:  # noqa: BLE001
                 # Never collapse a failed check into breaks: 0. Surface the

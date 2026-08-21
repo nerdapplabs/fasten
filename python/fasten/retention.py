@@ -66,9 +66,11 @@ def parse_duration(s: str) -> timedelta:
 
 
 def _cutoff_iso(now: datetime, retention: timedelta) -> str:
-    """Cutoff = now - retention, stamped as a canonical UTC ISO string that
-    matches the stream stores' comparison form."""
-    return (now - retention).astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    """Cutoff = now - retention, stamped in the canonical form so the
+    lexicographic compare against the stream stores' `timestamp` column
+    agrees byte-for-byte with the writer format (spec §4.3)."""
+    from .canonical_ts import canonical_ts
+    return canonical_ts(now - retention)
 
 
 def start_purger(

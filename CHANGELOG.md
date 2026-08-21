@@ -42,22 +42,27 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
   retention, and constrained-search contract.
 
-### Known limitation — cross-SDK lexicographic time windows
+### Changed — canonical UTC timestamp form on both SDKs
 
-- Spec §4.3 mandates lexicographic `[since, until]` comparison and states
-  callers MUST keep one canonical timestamp form. The two SDKs currently
-  stamp different forms — Go writes `time.RFC3339Nano`
-  (`2026-08-21T10:00:00Z`, trailing zeros stripped); Python writes
-  `isoformat(timespec="milliseconds")` (`2026-08-21T10:00:00.500+00:00`).
-- **Consequence:** windowed reads on a table with both Python and Go
-  writers silently truncate — a Python row 0.5s after a Go `since` bound
-  is excluded, a row at the exact boundary instant is excluded. A Go-only
-  edge case also puts whole-second rows above fractional rows in the same
-  second (`'Z'` > `'.'`).
-- **Workaround:** run one SDK per stream table, or query with a
-  wide-enough window. The full fix — a single canonical writer form on
-  both SDKs + a conformance-corpus entry that exercises byte-identical
-  Python↔Go output — is a spec amendment targeted for 1.1.
+- Every outbound fasten timestamp is now stamped in the canonical form
+  named in spec §4.3: **RFC3339 with fixed six-digit microseconds and
+  always-`Z`** (`2026-08-21T10:00:00.500000Z`, 27 chars). Applies to
+  audit `timestamp`/`shipped_at`, stream `timestamp`, purge cutoffs,
+  drainer sys events, `/audit/doctor` `last_verified_at`, and the
+  retention-loop cutoff — everywhere both SDKs used to disagree.
+- **Fixes** the cross-SDK window truncation that used to skip Python
+  rows 0.5s after a Go `since` bound (Python emitted
+  `…:00.500+00:00`, Go emitted `…:00Z` with `RFC3339Nano` stripping
+  trailing zeros) and the Go-only same-second inversion where
+  whole-second rows sorted above fractional rows in the same second
+  (`'Z'` 0x5A > `'.'` 0x2E).
+- **Migration:** parsers stay permissive — `time.Parse(time.RFC3339Nano,
+  ...)` and `fasten.canonical_ts.parse_canonical_or_legacy` still accept
+  the pre-canonical forms, so historical rows read back cleanly. Only
+  the writer contract is strict from this release forward.
+- Pinned by parallel conformance tests in each SDK
+  (`python/tests/test_canonical_ts.py`, `go/canonical_ts_test.go`) that
+  assert byte-identical output on the same instant.
 
 ### Changed — Ring filter semantics now match the store (gh #58, Python)
 

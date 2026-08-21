@@ -178,11 +178,13 @@ func (t *Transport) WriteAudit(row map[string]any) {
 // or the durable store.
 //
 // The Since/Until window compares timestamps as strings (lexicographic, both
-// in the ring scan and in SQL). That is correct for the canonical
-// UTC RFC3339Nano timestamps fasten's own writers stamp, but mixed formats —
-// "…+00:00" vs "…Z", differing fractional-second precision — do not order
-// lexicographically. If you push rows with your own timestamps, keep them in
-// one canonical UTC format or the window will mis-compare.
+// in the ring scan and in SQL). That is correct for the canonical UTC form
+// fasten's own writers stamp (fixed-width microseconds + always-Z; see
+// canonical_ts.go), which sorts byte-for-byte identically across Python and
+// Go writers. Adopter-supplied timestamps must use the same form or the
+// window will mis-compare — the older mixed forms ("…+00:00" vs "…Z",
+// trailing-zero-stripped whole seconds) are the exact fault the canonical
+// form was introduced to prevent (spec §4.3).
 type StreamQuery struct {
 	Level     string // sys
 	ServiceID string // sys

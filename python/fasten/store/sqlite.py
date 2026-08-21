@@ -24,20 +24,15 @@ _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _utc_iso(dt: datetime) -> str:
-    """Serialise to UTC ISO-8601, treating naive datetimes as UTC.
+    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``).
 
-    SQLite stores timestamps as ISO strings with the +00:00 offset.
-    A naive datetime calling `.isoformat()` would produce a string
-    *without* an offset, so lexicographic ordering against existing
-    rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
-    silently mis-orders. Always normalise to UTC-aware before
-    serialising so query()/since/until are correct under all inputs.
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
+    Naive datetimes are treated as UTC. A naive `.isoformat()` produced
+    a string without an offset, so lexicographic ordering against
+    existing rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
+    silently mis-ordered. Canonical form additionally fixes cross-SDK
+    boundary truncation — see fasten/canonical_ts.py."""
+    from ..canonical_ts import canonical_ts
+    return canonical_ts(dt)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (

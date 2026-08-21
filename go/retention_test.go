@@ -80,9 +80,11 @@ func TestStartPurger_RunsImmediatelyAndUsesNowMinusRetention(t *testing.T) {
 
 	select {
 	case got := <-f.mu.ch:
-		// cutoff = 2026-08-21 - 7d = 2026-08-14T10:00:00Z
-		if got[:20] != "2026-08-14T10:00:00Z"[:20] {
-			t.Errorf("cutoff = %q, want prefix 2026-08-14T10:00:00Z", got)
+		// cutoff = 2026-08-21 - 7d = 2026-08-14T10:00:00, stamped in the
+		// canonical form (§4.3): fixed 6-digit microseconds + always-Z.
+		want := "2026-08-14T10:00:00.000000Z"
+		if got != want {
+			t.Errorf("cutoff = %q, want %q", got, want)
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("first purge did not fire within 1s")

@@ -577,7 +577,7 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 	row := SyslogRow{
 		"level":      level,
 		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"timestamp":  canonicalTS(time.Now()),
 		"request_id": RequestIDFromContext(ctx),
 		"service_id": e.serviceID,
 	}
@@ -684,7 +684,7 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,
 		"event":      event,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
+		"timestamp":  canonicalTS(time.Now()),
 		"request_id": "",
 		"service_id": e.serviceID,
 	}

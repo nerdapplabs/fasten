@@ -77,7 +77,7 @@ func startPurger(ctx context.Context, p retentionParams) {
 	go func() {
 		// tick immediately, then every checkInterval
 		fire := func() {
-			cutoff := p.nowFn().Add(-p.retention).UTC().Format(time.RFC3339Nano)
+			cutoff := canonicalTS(p.nowFn().Add(-p.retention))
 			if _, err := p.store.Purge(cutoff); err != nil && p.onError != nil {
 				p.onError(p.stream, err)
 			}

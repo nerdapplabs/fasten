@@ -25,6 +25,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from ..canonical_ts import canonical_ts
+
 # Records originating from fasten itself are tagged with this attribute on
 # the LogRecord so the handler can skip them and avoid recursion. fasten's
 # own ``log._emit`` falls back to stdlib logging pre-init().
@@ -67,9 +69,9 @@ class LoggingHandler(logging.Handler):
                 "level": record.levelname.lower(),
                 "event": message,
                 "logger": record.name,
-                "timestamp": datetime.fromtimestamp(
-                    record.created, tz=timezone.utc
-                ).isoformat(timespec="milliseconds"),
+                "timestamp": canonical_ts(
+                    datetime.fromtimestamp(record.created, tz=timezone.utc)
+                ),
             }
 
             # Pull the ambient request_id if any.

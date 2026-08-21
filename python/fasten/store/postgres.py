@@ -31,11 +31,9 @@ _SAFE_IDENTIFIER = re.compile(
 
 
 def _utc_iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
+    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``)."""
+    from ..canonical_ts import canonical_ts
+    return canonical_ts(dt)
 
 
 _DDL = """

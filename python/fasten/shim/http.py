@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
+from ..canonical_ts import canonical_now
 from ..context import _request_id, current_request_id, mint_id, _set_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
@@ -112,6 +113,6 @@ class APILogger:
                 "status": snapshot["status"],
                 "duration_ms": duration_ms,
                 "request_id": snapshot["request_id"],
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "timestamp": canonical_now(),
             }
             t.write_api(row)

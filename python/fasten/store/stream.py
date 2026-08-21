@@ -339,6 +339,6 @@ class StreamStore:
 
     @staticmethod
     def _utc_iso(dt: datetime) -> str:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
+        """Canonical UTC form for lex-safe cross-SDK compares (spec §4.3)."""
+        from ..canonical_ts import canonical_ts
+        return canonical_ts(dt)

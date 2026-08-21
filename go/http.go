@@ -68,7 +68,7 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 					"status":      rec.Status(),
 					"duration_ms": time.Since(start).Milliseconds(),
 					"request_id":  RequestIDFromContext(r.Context()),
-					"timestamp":   start.UTC().Format(time.RFC3339Nano),
+					"timestamp":   canonicalTS(start),
 				})
 			}
 		})
@@ -418,7 +418,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 			for _, row := range rows {
 				ts := ""
 				if !row.Timestamp.IsZero() {
-					ts = row.Timestamp.UTC().Format(time.RFC3339Nano)
+					ts = canonicalTS(row.Timestamp)
 				}
 				matches = append(matches, map[string]any{
 					"stream": "audit", "request_id": row.RequestID,

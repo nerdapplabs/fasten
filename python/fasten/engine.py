@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .attrs import AuditRow
+from .canonical_ts import canonical_now, canonical_ts, parse_canonical_or_legacy
 from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_chain
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
@@ -748,7 +749,7 @@ class Engine:
             "event": event,
             "request_id": current_request_id(),
             "service_id": self._service_id or None,
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timestamp": canonical_now(),
             **fields,
         }
         self._stdout.write_drainer_syslog(payload)
@@ -777,7 +778,7 @@ class Engine:
                 for fld in ("timestamp", "shipped_at"):
                     v = row_dict.get(fld)
                     if isinstance(v, str):
-                        row_dict[fld] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                        row_dict[fld] = parse_canonical_or_legacy(v)
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
                 store.insert(row)
                 return 0
@@ -870,7 +871,7 @@ class _Logger:
             "event": event,
             "request_id": current_request_id(),
             "service_id": eng._service_id or None,
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timestamp": canonical_now(),
             **self._bound,
             **fields,
         }

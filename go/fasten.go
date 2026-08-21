@@ -571,7 +571,7 @@ func rowToMap(r Row) map[string]any {
 	d := map[string]any{
 		"wire_version": r.WireVersion,
 		"id":           r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
-		"timestamp": r.Timestamp.Format(time.RFC3339Nano),
+		"timestamp": canonicalTS(r.Timestamp),
 		"code":      string(r.Code), "action": r.Action, "severity": string(r.Severity),
 		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": func() any {
 			if r.TenantID != nil {
@@ -592,7 +592,7 @@ func rowToMap(r Row) map[string]any {
 		"prev_hash": r.PrevHash,
 	}
 	if r.ShippedAt != nil {
-		d["shipped_at"] = r.ShippedAt.Format(time.RFC3339Nano)
+		d["shipped_at"] = canonicalTS(*r.ShippedAt)
 	}
 	if r.Hash != "" {
 		d["hash"] = r.Hash
