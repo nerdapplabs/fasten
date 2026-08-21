@@ -222,7 +222,11 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 				"over the raw payload.", http.StatusBadRequest)
 			return
 		}
-		limit := searchLimit(q.Get("limit"))
+		limit, lerr := parseSearchLimit(q.Get("limit"))
+		if lerr != nil {
+			http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+			return
+		}
 		rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -275,15 +279,6 @@ func (e *Engine) searchGuard(q, since string) string {
 	return ""
 }
 
-// searchLimit resolves the FR3 result cap: default 50, hard max 200.
-func searchLimit(s string) int {
-	n := intParam(s, 50)
-	if n > 200 {
-		n = 200
-	}
-	return n
-}
-
 // handleSearch is the FR3 free-text escape hatch (§4.1): sys-only, time-bounded,
 // hard-capped, no ranking. Returns matches carrying request_id so a consumer can
 // hand one to /correlate.
@@ -307,7 +302,12 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		fail("fasten not initialised")
 		return
 	}
-	rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), searchLimit(q.Get("limit")))
+	limit, lerr := parseSearchLimit(q.Get("limit"))
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -474,11 +474,27 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	offset := 0
-	if o := q.Get("offset"); o != "" {
-		if n, err := strconv.Atoi(o); err == nil && n >= 0 {
-			offset = n
-		}
+	offset64, oerr := parseNonNegInt("offset", q.Get("offset"), 0)
+	if oerr != nil {
+		http.Error(w, oerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	since, serr := parseRFC3339("since", q.Get("since"))
+	if serr != nil {
+		http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	until, uerr := parseRFC3339("until", q.Get("until"))
+	if uerr != nil {
+		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	// Cursor-based pagination: ?after=<monotonic_seq> returns the next page.
+	// Use the lowest MonotonicSeq from the previous response as the cursor.
+	after, aerr := parseNonNegInt("after", q.Get("after"), 0)
+	if aerr != nil {
+		http.Error(w, aerr.Error(), http.StatusUnprocessableEntity)
+		return
 	}
 	f := Filter{
 		RequestID:    q.Get("request_id"),
@@ -489,20 +505,10 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Actor:        q.Get("actor"),
 		Target:       q.Get("target"),
 		Limit:        auditLimit,
-		Offset:       offset,
-	}
-	if s := q.Get("since"); s != "" {
-		f.Since, _ = time.Parse(time.RFC3339, s)
-	}
-	if u := q.Get("until"); u != "" {
-		f.Until, _ = time.Parse(time.RFC3339, u)
-	}
-	// Cursor-based pagination: ?after=<monotonic_seq> returns the next page.
-	// Use the lowest MonotonicSeq from the previous response as the cursor.
-	if a := q.Get("after"); a != "" {
-		if n, err := strconv.ParseInt(a, 10, 64); err == nil && n > 0 {
-			f.AfterSeq = n
-		}
+		Offset:       int(offset64),
+		Since:        since,
+		Until:        until,
+		AfterSeq:     after,
 	}
 	rows, err := e.auditStore.Query(r.Context(), f)
 	if err != nil {
@@ -534,7 +540,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		"rows":         out,
 		"total":        total,
 		"limit":        auditLimit,
-		"offset":       offset,
+		"offset":       int(offset64),
 		"next_after":   nextAfter,
 		"completeness": map[string]string{"audit": e.streamSource("audit")},
 	})
@@ -566,12 +572,15 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	var since, until time.Time
-	if s := q.Get("since"); s != "" {
-		since, _ = time.Parse(time.RFC3339, s)
+	since, serr := parseRFC3339("since", q.Get("since"))
+	if serr != nil {
+		http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+		return
 	}
-	if u := q.Get("until"); u != "" {
-		until, _ = time.Parse(time.RFC3339, u)
+	until, uerr := parseRFC3339("until", q.Get("until"))
+	if uerr != nil {
+		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+		return
 	}
 	sources, err := agg.Sources(r.Context(), since, until)
 	if err != nil {
@@ -690,20 +699,6 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func intParam(s string, def int) int {
-	if s == "" {
-		return def
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n <= 0 {
-		return def
-	}
-	if n > 1000 {
-		return 1000
-	}
-	return n
-}
-
 // parseLimit parses the ?limit= param for the structured-query endpoints.
 // Empty -> def. A present value must be an integer in [1, max]; anything else
 // (non-integer, non-positive, over max) is a caller error, returned so the
@@ -719,6 +714,54 @@ func parseLimit(s string, def, max int) (int, error) {
 	}
 	if n < 1 || n > max {
 		return 0, fmt.Errorf("limit must be between 1 and %d", max)
+	}
+	return n, nil
+}
+
+// parseNonNegInt parses ?offset=, ?after=, etc. Same policy as parseLimit:
+// empty -> def, non-integer / negative -> caller error. Fixes the silent
+// coercion where ?after=12a3 fell back to 0 and re-served page one, so a
+// client paging to exhaustion looped forever (PR #59 finding 8).
+func parseNonNegInt(name, s string, def int64) (int64, error) {
+	if s == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", name)
+	}
+	return n, nil
+}
+
+// parseRFC3339 parses ?since= / ?until= strictly. A malformed value used to
+// zero-out the bound silently, which dropped the whole window and returned
+// an aggregate over all history under HTTP 200 (PR #59 finding 8).
+func parseRFC3339(name, s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s must be RFC3339 (e.g. 2026-08-21T10:00:00Z): %v", name, err)
+	}
+	return t, nil
+}
+
+// parseSearchLimit resolves the FR3 result cap: default 50, hard max 200.
+// Rejects non-integer / out-of-range rather than silently coercing.
+func parseSearchLimit(s string) (int, error) {
+	if s == "" {
+		return 50, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("limit must be an integer")
+	}
+	if n < 1 || n > 200 {
+		return 0, fmt.Errorf("limit must be between 1 and 200")
 	}
 	return n, nil
 }

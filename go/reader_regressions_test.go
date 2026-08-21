@@ -48,6 +48,79 @@ func TestLimitRejectedWith422(t *testing.T) {
 	}
 }
 
+// PR #59 finding 8 — offset / after / since / until / search-limit are
+// parsed strictly on the Go audit + topology + search endpoints. A corrupted
+// cursor (?after=12a3) used to silently fall back to 0 and re-serve page one
+// (client paging to exhaustion loops forever); a bad ?since= silently zeroed
+// the bound and returned an aggregate over all history.
+func TestAuditStrictParamRejects(t *testing.T) {
+	registerTestCodes(t)
+	db, _ := sql.Open("sqlite", ":memory:")
+	store, err := NewSQLiteStore(db, "audit_strict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewReader()
+
+	cases := []struct{ url, param string }{
+		{"/audit?offset=12a3", "offset"},
+		{"/audit?offset=-1", "offset"},
+		{"/audit?after=12a3", "after"},
+		{"/audit?since=2026-08-01", "since"}, // date-only, not RFC3339
+		{"/audit?until=notatime", "until"},
+		{"/topology?since=2026-08-01", "since"},
+		{"/topology?until=nope", "until"},
+	}
+	for _, c := range cases {
+		if code := status(t, h, c.url); code != 422 {
+			t.Errorf("%s -> %d, want 422 (%s param)", c.url, code, c.param)
+		}
+	}
+	// Well-formed values still work.
+	for _, url := range []string{
+		"/audit", "/audit?offset=0", "/audit?after=1", "/audit?since=2026-08-01T00:00:00Z",
+		"/topology?since=2026-08-01T00:00:00Z",
+	} {
+		if code := status(t, h, url); code != 200 {
+			t.Errorf("%s -> %d, want 200", url, code)
+		}
+	}
+}
+
+func TestSearchLimitStrict(t *testing.T) {
+	registerTestCodes(t)
+	db, _ := sql.Open("sqlite", ":memory:")
+	ss, err := NewStreamStore(db, "syslog_strict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", SearchEnabled: true, SyslogStore: ss}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewReader()
+
+	base := "/search?q=x&since=2026-01-01T00:00:00Z"
+	for _, bad := range []string{"abc", "0", "-1", "500"} {
+		if code := status(t, h, base+"&limit="+bad); code != 422 {
+			t.Errorf("/search limit=%s -> %d, want 422", bad, code)
+		}
+	}
+	if code := status(t, h, base+"&limit=100"); code != 200 {
+		t.Errorf("/search limit=100 -> %d, want 200", code)
+	}
+	// /sys?q= path shares the helper.
+	sysBase := "/sys?q=x&since=2026-01-01T00:00:00Z"
+	for _, bad := range []string{"abc", "500"} {
+		if code := status(t, h, sysBase+"&limit="+bad); code != 422 {
+			t.Errorf("/sys?q= limit=%s -> %d, want 422", bad, code)
+		}
+	}
+}
+
 // FR3-3 — free-text q= is sys-only; the api endpoint rejects it (400) rather
 // than silently dropping it.
 func TestApiQParamRejected(t *testing.T) {
