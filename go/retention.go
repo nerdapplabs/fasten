@@ -19,33 +19,37 @@ import (
 // Shutdown is cooperative: the caller-owned context.CancelFunc must fire
 // on Engine reset / atexit.
 
-// parseRetentionDuration accepts time.ParseDuration's forms (30s, 15m, 1h,
-// 2h30m) plus a small day extension ("7d" / "30d") that Go's time package
-// doesn't understand. Zero is disabled. Compound day+time is rejected
-// (deliberate — no "1d12h"); pass hours instead.
+// parseRetentionDuration accepts a single positive integer + one unit
+// suffix from {s, m, h, d} — matching the Python parser in
+// python/fasten/retention.py verbatim so FASTEN_RETENTION_API=<value>
+// means the same thing on both SDKs. Empty = disabled. Compound
+// forms ("2h30m", "1d12h") and fractional forms ("1.5h") are rejected
+// deliberately; pass a single-unit value ("150m", "36h").
+var _retentionUnits = map[byte]time.Duration{
+	's': time.Second, 'm': time.Minute,
+	'h': time.Hour, 'd': 24 * time.Hour,
+}
+
 func parseRetentionDuration(s string) (time.Duration, error) {
 	token := strings.TrimSpace(s)
 	if token == "" {
 		return 0, nil
 	}
-	if strings.HasSuffix(token, "d") {
-		n, err := strconv.Atoi(token[:len(token)-1])
-		if err != nil {
-			return 0, fmt.Errorf("retention duration %q: expected integer before d", s)
-		}
-		if n <= 0 {
-			return 0, fmt.Errorf("retention duration %q: must be positive", s)
-		}
-		return time.Duration(n) * 24 * time.Hour, nil
+	if len(token) < 2 {
+		return 0, fmt.Errorf("retention duration %q: unit must be one of s/m/h/d (e.g. \"7d\", \"24h\")", s)
 	}
-	d, err := time.ParseDuration(token)
+	unit, ok := _retentionUnits[token[len(token)-1]]
+	if !ok {
+		return 0, fmt.Errorf("retention duration %q: unit must be one of s/m/h/d (e.g. \"7d\", \"24h\")", s)
+	}
+	n, err := strconv.Atoi(token[:len(token)-1])
 	if err != nil {
-		return 0, fmt.Errorf("retention duration %q: %w", s, err)
+		return 0, fmt.Errorf("retention duration %q: expected integer before the unit", s)
 	}
-	if d <= 0 {
+	if n <= 0 {
 		return 0, fmt.Errorf("retention duration %q: must be positive", s)
 	}
-	return d, nil
+	return time.Duration(n) * unit, nil
 }
 
 // retentionParams is what the engine hands to startPurger: the wired stream,

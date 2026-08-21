@@ -88,7 +88,11 @@ func (s *PostgresStreamStore) migrate() error {
 }
 
 func (s *PostgresStreamStore) Insert(row map[string]any) error {
-	payload, err := json.Marshal(row)
+	// SetEscapeHTML(false) so <, >, & land as literal UTF-8, matching
+	// Python's json.dumps(..., ensure_ascii=False). Without parity, a
+	// mixed-writer table returns different rows depending on which SDK
+	// wrote each row for a q= over payloads containing those chars.
+	payload, err := marshalStreamPayload(row)
 	if err != nil {
 		return err
 	}

@@ -482,7 +482,11 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		json.Unmarshal([]byte(detail), &r.Detail)
+		// Strict — a malformed detail column is a bug at the writer, must
+		// fail loudly instead of silently returning an empty map.
+		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+			return nil, fmt.Errorf("scanRowsPg: row %q detail: %w", r.ID, err)
+		}
 		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
 			t := shippedAt.UTC()

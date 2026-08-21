@@ -227,7 +227,17 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), limit)
+		since, serr := parseWindowTS("since", q.Get("since"))
+		if serr != nil {
+			http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		until, uerr := parseWindowTS("until", q.Get("until"))
+		if uerr != nil {
+			http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -248,13 +258,23 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	since, serr := parseWindowTS("since", q.Get("since"))
+	if serr != nil {
+		http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	until, uerr := parseWindowTS("until", q.Get("until"))
+	if uerr != nil {
+		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
 		Level:     q.Get("level"),
 		RequestID: q.Get("request_id"),
 		ServiceID: q.Get("service_id"),
 		Event:     q.Get("event"),
-		Since:     q.Get("since"),
-		Until:     q.Get("until"),
+		Since:     since,
+		Until:     until,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -342,9 +362,16 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-
-	since := q.Get("since")
-	until := q.Get("until")
+	since, serr := parseWindowTS("since", q.Get("since"))
+	if serr != nil {
+		http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	until, uerr := parseWindowTS("until", q.Get("until"))
+	if uerr != nil {
+		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	matches := []map[string]any{}
 	counts := map[string]int{}
 	errs := map[string]string{}
@@ -454,13 +481,23 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	since, serr := parseWindowTS("since", q.Get("since"))
+	if serr != nil {
+		http.Error(w, serr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	until, uerr := parseWindowTS("until", q.Get("until"))
+	if uerr != nil {
+		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	rows, err := e.xport.QueryAPI(limit, StreamQuery{
 		Method:    q.Get("method"),
 		Path:      q.Get("path"),
 		RequestID: q.Get("request_id"),
 		Status:    q.Get("status"),
-		Since:     q.Get("since"),
-		Until:     q.Get("until"),
+		Since:     since,
+		Until:     until,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -617,9 +654,17 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cursor-based pagination: ?after=<monotonic_seq> returns the next page.
 	// Use the lowest MonotonicSeq from the previous response as the cursor.
+	// after=0 is refused (Python's Query(ge=1) equivalent) — MonotonicSeq
+	// starts at 1, so 0 is never a real cursor value; treating it as
+	// "no cursor" would silently accept a bad copy-paste.
 	after, aerr := parseNonNegInt("after", q.Get("after"), 0)
 	if aerr != nil {
 		http.Error(w, aerr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if q.Get("after") != "" && after == 0 {
+		http.Error(w, "after must be >= 1 (MonotonicSeq starts at 1; 0 is not a valid cursor)",
+			http.StatusUnprocessableEntity)
 		return
 	}
 	f := Filter{
@@ -878,6 +923,24 @@ func parseRFC3339(name, s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%s must be RFC3339 (e.g. 2026-08-21T10:00:00Z): %v", name, err)
 	}
 	return t, nil
+}
+
+// parseWindowTS parses a ?since= / ?until= reader input and returns it in
+// the canonical form (spec §4.3) — the same string every fasten writer
+// stamps into the timestamp column. Handlers pass the canonical string
+// straight into the lex compare, so a caller writing
+// ``?since=2026-08-21T10:00:00Z`` (20-char short form) reads the same
+// rows a caller writing the full 27-char form would. Empty stays empty
+// (no filter). Malformed → 422.
+func parseWindowTS(name, s string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "", fmt.Errorf("%s must be RFC3339 (e.g. 2026-08-21T10:00:00Z): %v", name, err)
+	}
+	return canonicalTS(t), nil
 }
 
 // parseSearchLimit resolves the FR3 result cap: default 50, hard max 200.

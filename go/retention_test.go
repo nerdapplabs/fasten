@@ -20,7 +20,7 @@ func TestParseRetentionDuration_Accepts(t *testing.T) {
 		{"30s", 30 * time.Second},
 		{"15m", 15 * time.Minute},
 		{"1h", time.Hour},
-		{"2h30m", 2*time.Hour + 30*time.Minute}, // time.ParseDuration native
+		{"90m", 90 * time.Minute},
 		{"24h", 24 * time.Hour},
 		{"7d", 7 * 24 * time.Hour},
 		{"", 0}, // empty = disabled, not an error
@@ -37,7 +37,16 @@ func TestParseRetentionDuration_Accepts(t *testing.T) {
 }
 
 func TestParseRetentionDuration_Rejects(t *testing.T) {
-	bad := []string{"7", "d", "0d", "-1d", "week", "1d12h", "3.5d"}
+	// Rejects everything except a single positive integer + one unit from
+	// {s,m,h,d}. Compound forms (2h30m, 1d12h) and fractional forms (1.5h,
+	// 500ms) are refused deliberately — the Python parser accepts the same
+	// set, and matching it keeps FASTEN_RETENTION_API meaning one thing
+	// across both SDKs.
+	bad := []string{
+		"7", "d", "0d", "-1d", "week",
+		"1d12h", "2h30m", "1h5m3s", // compound
+		"3.5d", "1.5h", "500ms",     // fractional / sub-second
+	}
 	for _, s := range bad {
 		if _, err := parseRetentionDuration(s); err == nil {
 			t.Errorf("parseRetentionDuration(%q) should have failed", s)

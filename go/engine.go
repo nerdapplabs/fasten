@@ -485,8 +485,13 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 	// shipped_at:null, prev_hash always present, Python-isoformat timestamps,
 	// sorted keys, non-ASCII \uXXXX-escaped).
 	e.hashMu.Lock()
-	atomic.AddInt64(&e.seq, 1)
-	row.MonotonicSeq = atomic.LoadInt64(&e.seq)
+	// Under hashMu — plain increment; atomic ops here were belt-and-braces
+	// with no reader (the seq is read only through Query paths that go
+	// through the store, not through e.seq directly). ResetForTests and
+	// Init use atomic.StoreInt64 so the field stays lock-free-safe when
+	// hashMu isn't held (test setup / re-Init).
+	e.seq++
+	row.MonotonicSeq = e.seq
 	row = Seal(e.prevHash, row)
 	e.prevHash = row.Hash
 	e.hashMu.Unlock()

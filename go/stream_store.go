@@ -1,6 +1,7 @@
 package fasten
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -223,7 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_sts ON %s(status);
 
 // Insert write-through persists a single stream row. Newest rows sort first.
 func (s *StreamStore) Insert(row map[string]any) error {
-	payload, err := json.Marshal(row)
+	payload, err := marshalStreamPayload(row)
 	if err != nil {
 		return err
 	}
@@ -391,6 +392,29 @@ func (s *StreamStore) Search(q, since, until string, limit int) ([]map[string]an
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// marshalStreamPayload serialises a stream row without HTML-escaping. Go's
+// default json.Marshal escapes '<', '>', '&' to < etc; Python's
+// stream store writes UTF-8 literals via ensure_ascii=False. Without this
+// parity Insert-writing "<foo>" would land as `"<foo>"` in
+// Go-backed tables and `"<foo>"` in Python-backed ones, and
+// search(q="<foo>") would return different rows depending on which SDK
+// wrote them. Sibling of Python's json.dumps(..., ensure_ascii=False).
+func marshalStreamPayload(row map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(row); err != nil {
+		return nil, err
+	}
+	// Encode() appends a trailing newline; strip it so the stored payload
+	// matches json.Marshal's output byte-for-byte apart from the escaping.
+	b := buf.Bytes()
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+	}
+	return b, nil
 }
 
 func isStreamIndexed(col string) bool {

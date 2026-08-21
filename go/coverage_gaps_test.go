@@ -97,18 +97,24 @@ func TestRing_WindowInclusiveOnBothEnds(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	tr := GetTransport()
-	boundary := "2026-08-15T00:00:00Z"
+	// Row is written in the canonical form (spec §4.3) — writers MUST use
+	// canonical_ts / canonicalTS. Query param can be any RFC3339 flavour;
+	// the reader canonicalises it before the lex compare.
+	boundary := "2026-08-15T00:00:00.000000Z"
 	tr.PushSyslog(SyslogRow{"event": "at.boundary", "request_id": "r-eq",
 		"timestamp": boundary})
 
+	// Query param uses the shorter RFC3339 form — the reader canonicalises
+	// it to the same 27-char shape the row was stored in.
+	shortForm := "2026-08-15T00:00:00Z"
 	// since == ts must include the row.
-	body, _ := getJSON(t, NewReader(), "/sys?since="+boundary)
+	body, _ := getJSON(t, NewReader(), "/sys?since="+shortForm)
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Errorf("since=ts must be inclusive; got %d rows", len(rows))
 	}
 	// until == ts must include the row too.
-	body, _ = getJSON(t, NewReader(), "/sys?until="+boundary)
+	body, _ = getJSON(t, NewReader(), "/sys?until="+shortForm)
 	rows, _ = body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Errorf("until=ts must be inclusive; got %d rows", len(rows))
@@ -129,22 +135,23 @@ func TestStore_WindowInclusiveOnBothEnds(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", SyslogStore: ss}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	boundary := "2026-08-15T00:00:00Z"
+	boundary := "2026-08-15T00:00:00.000000Z"
 	GetTransport().PushSyslog(SyslogRow{"event": "at.boundary", "request_id": "r-eq",
 		"timestamp": boundary})
 
-	body, _ := getJSON(t, NewReader(), "/sys?since="+boundary)
+	shortForm := "2026-08-15T00:00:00Z"
+	body, _ := getJSON(t, NewReader(), "/sys?since="+shortForm)
 	if r, _ := body["rows"].([]any); len(r) != 1 {
 		t.Errorf("store since=ts must be inclusive; got %d rows", len(r))
 	}
-	body, _ = getJSON(t, NewReader(), "/sys?until="+boundary)
+	body, _ = getJSON(t, NewReader(), "/sys?until="+shortForm)
 	if r, _ := body["rows"].([]any); len(r) != 1 {
 		t.Errorf("store until=ts must be inclusive; got %d rows", len(r))
 	}
-	// One microsecond earlier must NOT match with since equal to boundary
+	// One second earlier must NOT match with a window that ends there
 	// (paranoia against an accidental exclusive-lower switch).
-	one := "2026-08-14T23:59:59Z"
-	body, _ = getJSON(t, NewReader(), "/sys?since="+one+"&until="+one)
+	oneEarlier := "2026-08-14T23:59:59Z"
+	body, _ = getJSON(t, NewReader(), "/sys?since="+oneEarlier+"&until="+oneEarlier)
 	if r, _ := body["rows"].([]any); len(r) != 0 {
 		t.Errorf("row at boundary must not match a window ending 1s earlier; got %d", len(r))
 	}

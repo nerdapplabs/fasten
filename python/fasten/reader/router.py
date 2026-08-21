@@ -87,6 +87,25 @@ def router(
     def _search_on() -> bool:
         return search_enabled if search_enabled is not None else _active_search_enabled()
 
+    def _parse_window_ts(name: str, s: Optional[str]) -> Optional[str]:
+        """Parse a ``?since=`` / ``?until=`` reader input and return it in the
+        canonical form (spec §4.3) — the exact string every fasten writer
+        stamps into the timestamp column. Downstream compares are
+        lexicographic against canonical rows, so an operator writing
+        ``?since=2026-08-21T10:00:00Z`` (20-char short form) reads the same
+        rows a caller writing the full 27-char form would. None / empty
+        stays None (no filter). Malformed → HTTPException(422)."""
+        if s is None or s == "":
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{name} must be RFC3339 (e.g. 2026-08-21T10:00:00Z): {e}",
+            )
+        return canonical_ts(dt)
+
     def _search_guard(q: Optional[str], since: Optional[str]) -> Optional[str]:
         """Shared FR3 preconditions: search must be enabled and time-bounded.
         Returns an error message when a ``q=`` read is not allowed, else None."""
@@ -168,6 +187,8 @@ def router(
                 "completeness": {"sys": _source("sys")},
                 "error": "transport not initialised — call fasten.init() first",
             }
+        since = _parse_window_ts("since", since)
+        until = _parse_window_ts("until", until)
         if q is not None:
             # FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
             err = _search_guard(q, since)
@@ -248,8 +269,8 @@ def router(
             path=path,
             request_id=request_id,
             status=status,
-            since=since,
-            until=until,
+            since=_parse_window_ts("since", since),
+            until=_parse_window_ts("until", until),
         )
         return {"rows": rows, "completeness": {"api": _source("api")}}
 
@@ -286,11 +307,18 @@ def router(
             since=since, until=until,
         )
         rows = s.query(limit=limit, offset=offset, after_seq=(after or 0), **filters)
-        # total is None when the store doesn't implement count — a null total
-        # is honest; falling back to len(rows) would lie because len(rows) is
-        # capped at limit, so a paginating caller can't tell page N is the last
-        # (PR #59 finding 9).
-        total = s.count(**filters) if hasattr(s, "count") else None
+        # total is None when the store doesn't implement count, OR when a
+        # count call fails. A null total is honest; falling back to len(rows)
+        # would lie (len is capped at limit, so a paginating caller can't tell
+        # page N is the last), and raising a 500 kills the row set the caller
+        # actually got. Mirrors Go's handleAudit — same wire behaviour on
+        # both SDKs (PR #59 finding 9 + branch-review #4).
+        total: int | None = None
+        if hasattr(s, "count"):
+            try:
+                total = s.count(**filters)
+            except Exception:  # noqa: BLE001
+                total = None
         # Dual pagination (FR5): offset (total/limit/offset) for page-number UIs
         # and cursor (next_after) as the canonical, insert-stable model. Rows are
         # newest-first, so the last row carries the smallest monotonic_seq — pass
@@ -331,14 +359,16 @@ def router(
         )
         api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
         sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
-        # audit_total is None when the store lacks count() — null is honest;
-        # falling back to len(audit) would lie because len is capped at limit,
-        # so counts == totals and truncated would read false when the caller
-        # has 100 of 4,000 rows (PR #59 finding 9).
-        audit_total = (
-            s.count(request_id=request_id)
-            if s is not None and hasattr(s, "count") else None
-        )
+        # audit_total is None when the store lacks count() OR the call fails
+        # — null is honest; len(audit) would lie (capped at limit) and 500
+        # would kill the useful row set. Mirrors Go's handleCorrelate — one
+        # wire policy on both SDKs (PR #59 finding 9 + branch-review #4).
+        audit_total: int | None = None
+        if s is not None and hasattr(s, "count"):
+            try:
+                audit_total = s.count(request_id=request_id)
+            except Exception:  # noqa: BLE001
+                audit_total = None
         counts = {"audit": len(audit), "api": len(api), "sys": len(sys)}
         totals = {
             "audit": audit_total,
@@ -414,6 +444,13 @@ def router(
 
         completeness = {s: _source(s) for s in parsed}
         empty_counts = {s: 0 for s in parsed}
+        # Canonicalise the window BEFORE the guard so /search's own
+        # since-mandatory check and the store's lex compare both see the
+        # same shape. Raises 422 on non-RFC3339 input. `since` is Query(...)
+        # required, but Query("") sends an empty string past that check —
+        # normalise to None so the guard's ``if not since`` catches it.
+        since = _parse_window_ts("since", since) or ""
+        until = _parse_window_ts("until", until)
         err = _search_guard(q, since)
         if err is not None:
             return {"matches": [], "counts": empty_counts,

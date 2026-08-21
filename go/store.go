@@ -585,14 +585,29 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		); err != nil {
 			return nil, err
 		}
-		r.Timestamp, _ = time.Parse(canonicalTSLayout, ts)
+		// Strict parses — a row that doesn't round-trip through parseCanonicalTS
+		// / json.Unmarshal is a bug at the source (writer bypassed
+		// canonical_ts, or the column got hand-edited). Swallowing the error
+		// used to leave Timestamp = time.Time{} — Jan 1 year 1 — which sorts
+		// to the top of any timestamp-DESC query and quietly breaks the
+		// contract the whole canonical work was defending. Fail loudly instead.
+		parsedTs, err := parseCanonicalTS(ts)
+		if err != nil {
+			return nil, fmt.Errorf("scanRows: row %q: %w", r.ID, err)
+		}
+		r.Timestamp = parsedTs
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		json.Unmarshal([]byte(detail), &r.Detail)
+		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+			return nil, fmt.Errorf("scanRows: row %q detail: %w", r.ID, err)
+		}
 		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
-			t, _ := time.Parse(canonicalTSLayout, *shippedAt)
+			t, err := parseCanonicalTS(*shippedAt)
+			if err != nil {
+				return nil, fmt.Errorf("scanRows: row %q shipped_at: %w", r.ID, err)
+			}
 			r.ShippedAt = &t
 		}
 		if wv != "" {

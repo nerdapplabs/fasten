@@ -57,7 +57,17 @@ _INDEXED_FIELDS = ("request_id", "timestamp", "level", "service_id",
 class PostgresStreamStore:
     """Durable, queryable Postgres backing for one ring-buffered stream."""
 
-    def __init__(self, dsn: str, table: str = "syslog") -> None:
+    def __init__(self, dsn: str, table: str) -> None:
+        # `table` is required — earlier versions defaulted to "syslog" so a
+        # caller wiring an api stream with a blank name silently landed api
+        # rows in the syslog table (parity with Go's NewPostgresStreamStore
+        # fix). Pass "api_log" / "syslog" (or whatever you choose) explicitly.
+        if not table:
+            raise ValueError(
+                "fasten PostgresStreamStore: table name is required "
+                "(no default — pass \"api_log\" / \"syslog\" explicitly to "
+                "avoid api rows landing in the syslog table)."
+            )
         if not _SAFE_IDENTIFIER.match(table):
             raise ValueError(
                 f"fasten PostgresStreamStore: table name {table!r} is not a valid SQL "
@@ -149,10 +159,12 @@ class PostgresStreamStore:
         self._tls.conn = None
 
     @classmethod
-    def from_dsn(cls, dsn: str, default_table: str = "syslog") -> "PostgresStreamStore":
+    def from_dsn(cls, dsn: str, default_table: str) -> "PostgresStreamStore":
         """Parse ``postgres[ql]://...?table=X`` — strip the fasten-specific
         ``table`` param before handing the DSN to psycopg (libpq rejects
-        unknown params)."""
+        unknown params). ``default_table`` is used only when the DSN has
+        no ``?table=`` override; caller must pass one explicitly (no
+        implicit "syslog" — same reasoning as PostgresStreamStore.__init__)."""
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         table = q.pop("table", default_table)
