@@ -2,21 +2,15 @@ package fasten
 
 import "encoding/json"
 
-// Redaction customization (parity with the Python SDK's FASTEN_REDACT_KEYS /
-// FASTEN_REDACT_REPLACEMENT and init params). These are process-global —
-// every Engine.Init reset them, so multi-tenant callers with more than one
-// Engine share (and race on) the same redact config. See the Engine-scoped
-// fields for the per-engine values RedactDetail actually consults.
-// Empty = use the core defaults (built-in patterns + "***"). Extra keys augment
-// the built-ins; they never replace them.
-var (
-	redactExtraKeysJSON string // JSON array of extra key patterns, "" = none
-	redactReplacement   string // replacement token, "" = core default "***"
-)
-
-// RedactDetail returns a deep-redacted copy of detail via the Rust core.
-// All redaction logic (key-pattern + value-shape) lives in fasten-core.
-func RedactDetail(d map[string]any) map[string]any {
+// redactDetail returns a deep-redacted copy of detail via the Rust core,
+// using this Engine's extra keys + replacement token. All redaction logic
+// (key-pattern + value-shape) lives in fasten-core.
+//
+// Engine-scoped so multi-tenant callers running more than one Engine keep
+// isolated redact config. redactMu is a RWMutex read here — concurrent
+// Emits (readers) don't contend, while Init (writer) blocks new reads to
+// swap in the new config atomically.
+func (e *Engine) redactDetail(d map[string]any) map[string]any {
 	if d == nil {
 		return nil
 	}
@@ -24,9 +18,14 @@ func RedactDetail(d map[string]any) map[string]any {
 	if err != nil {
 		return d
 	}
+	e.redactMu.RLock()
+	extra := e.redactExtraKeysJSON
+	repl := e.redactReplacement
+	e.redactMu.RUnlock()
+
 	var out string
-	if redactExtraKeysJSON != "" || redactReplacement != "" {
-		out, err = coreRedactJSONFull(string(b), redactExtraKeysJSON, redactReplacement)
+	if extra != "" || repl != "" {
+		out, err = coreRedactJSONFull(string(b), extra, repl)
 	} else {
 		out, err = coreRedactJSON(string(b))
 	}
@@ -38,4 +37,11 @@ func RedactDetail(d map[string]any) map[string]any {
 		return d
 	}
 	return result
+}
+
+// RedactDetail is the package-level shim that redacts via the Default engine.
+// New code should reach for Engine.redactDetail through a specific Engine
+// instance (multi-tenant callers keep isolated redact config that way).
+func RedactDetail(d map[string]any) map[string]any {
+	return Default.redactDetail(d)
 }

@@ -65,7 +65,7 @@ jobs:
           CGO_LDFLAGS: -L${{ github.workspace }}/fasten-core/target/release
           LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
           FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@localhost:5432/fasten_test?sslmode=disable
-        run: go test -tags=integration -v -count=1 -coverprofile=coverage.out ./...
+        run: go test -tags=integration -v -race -count=1 -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

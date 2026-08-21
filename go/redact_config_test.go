@@ -53,3 +53,35 @@ func TestRedactDefaults_Unchanged(t *testing.T) {
 		t.Fatalf("non-PII field changed: %v", out)
 	}
 }
+
+// TestRedactEnginesAreIsolated (PR #59 finding 2): multi-tenant callers
+// create separate *Engine instances. Configuring engine B must not silently
+// un-redact engine A's PII keys. Before the fix, redactExtraKeysJSON /
+// redactReplacement were package-level, and B.Init reset A's config to "".
+func TestRedactEnginesAreIsolated(t *testing.T) {
+	registerTestCodes(t)
+
+	a := &Engine{}
+	if err := a.Init(Config{ServiceID: "svc-a", NodeID: "n",
+		ExtraRedactKeys: []string{"ssn"}, RedactReplacement: "[A]"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { a.ResetForTests() })
+
+	b := &Engine{}
+	if err := b.Init(Config{ServiceID: "svc-b", NodeID: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.ResetForTests() })
+
+	got := a.redactDetail(map[string]any{"ssn": "123-45-6789", "ok": "v"})
+	if got["ssn"] != "[A]" {
+		t.Fatalf("engine A must still redact ssn with [A] after engine B Init; got %v", got)
+	}
+
+	// Engine b uses core defaults — "ssn" is not a built-in and stays through.
+	got2 := b.redactDetail(map[string]any{"ssn": "999", "password": "p"})
+	if got2["password"] != "***" {
+		t.Fatalf("engine B default token should be ***: %v", got2)
+	}
+}

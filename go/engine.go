@@ -56,6 +56,16 @@ type Engine struct {
 	// invisible, leaving completeness reporting "store" over durable history
 	// that has holes. Sticky — a hole doesn't heal.
 	auditWriteSwallowed atomic.Bool
+
+	// Redaction customization (parity with Python FASTEN_REDACT_KEYS /
+	// FASTEN_REDACT_REPLACEMENT). Engine-scoped so multi-tenant callers
+	// running more than one Engine keep isolated redact config — see the
+	// package doc comment above. redactMu guards concurrent Init writes vs.
+	// Emit-goroutine reads (redactDetail runs on the caller's thread).
+	// Empty JSON / empty replacement = core defaults.
+	redactMu            sync.RWMutex
+	redactExtraKeysJSON string
+	redactReplacement   string
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -85,10 +95,13 @@ func streamStoreFromEnvDSN(envVar, table string) (*StreamStore, error) {
 
 // configureRedaction resolves the extra redact keys + replacement token from
 // explicit config, else env (FASTEN_REDACT_KEYS comma-separated /
-// FASTEN_REDACT_REPLACEMENT), and stores them for RedactDetail. Always sets both
-// globals (resetting to defaults when unconfigured) so repeated Init calls don't
-// leak a prior configuration.
-func configureRedaction(extraKeys []string, replacement string) {
+// FASTEN_REDACT_REPLACEMENT), and stores them on this Engine's redact fields.
+// Always sets both (resetting to defaults when unconfigured) so a repeat Init
+// on the same Engine doesn't leak the prior configuration. Engine-scoped so
+// multiple Engines in one process keep isolated redact config — the earlier
+// package-global lived here as a race hazard: concurrent Init on one Engine
+// silently reset a sibling Engine's redact keys mid-Emit.
+func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
 	if len(extraKeys) == 0 {
 		if env := envOr("FASTEN_REDACT_KEYS", ""); env != "" {
 			for _, k := range strings.Split(env, ",") {
@@ -98,13 +111,18 @@ func configureRedaction(extraKeys []string, replacement string) {
 			}
 		}
 	}
-	redactExtraKeysJSON = ""
+	extraJSON := ""
 	if len(extraKeys) > 0 {
 		if b, err := json.Marshal(extraKeys); err == nil {
-			redactExtraKeysJSON = string(b)
+			extraJSON = string(b)
 		}
 	}
-	redactReplacement = firstNonEmpty(replacement, envOr("FASTEN_REDACT_REPLACEMENT", ""))
+	replacement = firstNonEmpty(replacement, envOr("FASTEN_REDACT_REPLACEMENT", ""))
+
+	e.redactMu.Lock()
+	e.redactExtraKeysJSON = extraJSON
+	e.redactReplacement = replacement
+	e.redactMu.Unlock()
 }
 
 func (e *Engine) Init(cfg Config) error {
@@ -190,7 +208,7 @@ func (e *Engine) Init(cfg Config) error {
 	e.searchEnabled = cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", ""))
 
 	// Redaction customization (parity with Python FASTEN_REDACT_KEYS/REPLACEMENT).
-	configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
+	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
 
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,
@@ -297,12 +315,12 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 				kept[k] = v
 			}
 		}
-		kept = RedactDetail(kept)
+		kept = e.redactDetail(kept)
 		kept["_redacted"] = "***"
 		kept["_pii_in_detail"] = true
 		row.Detail = kept
 	} else {
-		row.Detail = RedactDetail(row.Detail)
+		row.Detail = e.redactDetail(row.Detail)
 	}
 
 	// P1-23: assign seq + seal the hash chain atomically so concurrent Emit
@@ -446,6 +464,10 @@ func (e *Engine) ResetForTests() {
 	e.hashMu.Lock()
 	e.prevHash = ""
 	e.hashMu.Unlock()
+	e.redactMu.Lock()
+	e.redactExtraKeysJSON = ""
+	e.redactReplacement = ""
+	e.redactMu.Unlock()
 }
 
 // SearchEnabled reports whether FR3 free-text search is enabled on this engine.
