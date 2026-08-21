@@ -21,9 +21,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   When unset, persistence is derived from store attachment (the default).
 - **FR2 correlation** — `GET /logs/correlate?request_id=X` fans out to
   audit + api + sys in one call, with `counts`/`totals` truncation signalling.
-- **FR3 search (constrained)** — `GET /logs/search` and a gated `q=` on
-  `/logs/sys`: sys-only, `since=` mandatory, hard-capped, no ranking, opt-in via
-  `search.enabled` / `FASTEN_SEARCH_ENABLED`.
+- **FR3 search** — `GET /logs/search?streams=audit,api,sys` (comma-separated
+  subset; default `sys`) plus a gated `q=` on `/logs/sys`: `since=` mandatory,
+  hard-capped, no ranking, opt-in via `search.enabled` /
+  `FASTEN_SEARCH_ENABLED`. Each named stream must have a store — ring-only
+  streams report `errors.<stream>` per-stream rather than an empty match list.
+  Result stream order (sys → api → audit) mirrors `/correlate`.
 - **FR4 completeness** — every read reports `store` / `ring` / `store-degraded`
   per stream.
 - **Structured field indexes** on `api`/`sys` (`method`/`path`/`status`,

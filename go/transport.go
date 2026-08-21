@@ -301,6 +301,25 @@ func (t *Transport) SearchSyslog(q, since, until string, limit int) ([]SyslogRow
 	return out, true, nil
 }
 
+// SearchAPI runs FR3 free-text search over persisted api history. Same
+// shape as SearchSyslog — the api StreamStore is identical to sys, so the
+// reader plugs both into /search?streams=... without stream-specific
+// branches. Returns (nil, false, nil) when the api stream is ring-only.
+func (t *Transport) SearchAPI(q, since, until string, limit int) ([]APIRow, bool, error) {
+	if t.APIStore == nil {
+		return nil, false, nil
+	}
+	rows, err := t.APIStore.Search(q, since, until, limit)
+	if err != nil {
+		return nil, true, err
+	}
+	out := make([]APIRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, APIRow(r))
+	}
+	return out, true, nil
+}
+
 // QueryAPI returns up to limit API rows, newest-first. Served from the
 // durable store when one is attached, otherwise from the in-memory ring.
 func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {

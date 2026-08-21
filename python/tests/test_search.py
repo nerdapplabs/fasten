@@ -81,7 +81,10 @@ def test_search_requires_persistence():
     _init(search=True, with_store=False)  # ring-only sys — no durable history
     _seed()
     body = _client().get("/api/v1/logs/search", params={"q": "reset", "since": SINCE}).json()
-    assert "persistence" in body["error"]
+    # Per-stream error since #16: ring-only sys reports errors.sys, not a
+    # top-level error (a global error is only for policy failures like
+    # search-disabled or since-missing).
+    assert "persistence" in body["errors"]["sys"]
 
 
 def test_search_result_cap():
@@ -163,6 +166,105 @@ def test_search_non_ascii_utf8(tmp_path):
         ).json()
         assert body["counts"]["sys"] == 1, f"non-ASCII q={q!r}: {body}"
         assert body["matches"][0]["request_id"] == expected_rid
+
+
+def test_search_streams_param_rejects_unknown():
+    """?streams=foo must fail loudly — a typo silently searching sys is
+    the exact "silent narrowing" the finding #6 fix prevented on /sys?q=."""
+    _init(search=True)
+    _seed()
+    resp = _client().get(
+        "/api/v1/logs/search",
+        params={"q": "x", "since": SINCE, "streams": "sys,foo"},
+    )
+    assert resp.status_code == 400
+    assert "unknown stream" in resp.json()["detail"]
+
+
+def test_search_api_stream():
+    """PR #59 finding 16 (phase0 restoration): /search?streams=api must
+    scan persisted api history the same way sys does."""
+    from fasten.store.stream import StreamStore
+    fasten.init(
+        service_id="svc", node_id="n",
+        audit_store=SQLiteStore(":memory:"),
+        api_store=StreamStore(":memory:", table="api_search"),
+        syslog_store=StreamStore(":memory:", table="sys_search"),
+        audit_store_failure_strategy="raise",
+        search_enabled=True,
+    )
+    t = fasten.transport()
+    t.push_api({"method": "POST", "path": "/checkout", "status": 502,
+                "message": "gateway timeout on payment provider",
+                "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-api"})
+    body = _client().get(
+        "/api/v1/logs/search",
+        params={"q": "gateway", "since": SINCE, "streams": "api"},
+    ).json()
+    assert body["counts"]["api"] == 1
+    assert body["matches"][0]["stream"] == "api"
+    assert body["matches"][0]["request_id"] == "r-api"
+    assert "POST /checkout" in body["matches"][0]["summary"]
+
+
+def test_search_audit_stream():
+    """PR #59 finding 16 restoration: /search?streams=audit scans the
+    detail column so operators can find rows by an error string they only
+    have from a support ticket."""
+    _init(search=True)
+    fasten.emit(code="USER_CREATED", target="u-99", actor="a",
+                detail={"message": "onboarding hit gateway timeout on retry"})
+    body = _client().get(
+        "/api/v1/logs/search",
+        params={"q": "gateway", "since": SINCE, "streams": "audit"},
+    ).json()
+    assert body["counts"]["audit"] == 1
+    assert body["matches"][0]["stream"] == "audit"
+    assert body["matches"][0]["summary"] == "USER_CREATED"
+
+
+def test_search_all_three_streams_fan_out():
+    """?streams=audit,api,sys returns matches from every named stream that
+    has a store. Stream order in the response is stable (sys → api → audit)
+    for UI-friendly tab rendering."""
+    from fasten.store.stream import StreamStore
+    fasten.init(
+        service_id="svc", node_id="n",
+        audit_store=SQLiteStore(":memory:"),
+        api_store=StreamStore(":memory:", table="api_all"),
+        syslog_store=StreamStore(":memory:", table="sys_all"),
+        audit_store_failure_strategy="raise",
+        search_enabled=True,
+    )
+    t = fasten.transport()
+    t.push_syslog({"event": "cache.miss", "message": "cache miss on key foo",
+                   "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-sys"})
+    t.push_api({"method": "GET", "path": "/foo", "status": 200,
+                "message": "hit for foo",
+                "timestamp": "2026-08-01T00:00:01Z", "request_id": "r-api"})
+    fasten.emit(code="USER_CREATED", target="u", detail={"note": "foo did it"})
+
+    body = _client().get(
+        "/api/v1/logs/search",
+        params={"q": "foo", "since": SINCE, "streams": "audit,api,sys"},
+    ).json()
+    assert body["counts"] == {"sys": 1, "api": 1, "audit": 1}
+    streams_in_order = [m["stream"] for m in body["matches"]]
+    assert streams_in_order == ["sys", "api", "audit"], streams_in_order
+
+
+def test_search_stream_without_store_reports_per_stream_error():
+    """?streams=api on a ring-only api engine must NOT return an empty
+    counts.api=0 with no explanation — that would read as "no matches"
+    when the caller actually has no store. Per-stream errors dict."""
+    _init(search=True)  # syslog_store attached, api_store not
+    body = _client().get(
+        "/api/v1/logs/search",
+        params={"q": "x", "since": SINCE, "streams": "sys,api"},
+    ).json()
+    assert body["counts"]["api"] == 0
+    assert "api" in body["errors"]
+    assert "persistence" in body["errors"]["api"]
 
 
 def test_sys_q_param_rejects_structured_filter_combination():

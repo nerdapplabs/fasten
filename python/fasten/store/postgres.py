@@ -514,6 +514,39 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
+    def search(
+        self,
+        *,
+        q: str,
+        since: str,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> list[AuditRow]:
+        """FR3 free-text search over persisted audit history (§4.1). Case-
+        insensitive substring scan over the ``detail`` JSON column via
+        ILIKE + ESCAPE E'\\\\'. Result carries request_id for ``/correlate``.
+
+        ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally.
+        Newest-first, hard-capped by ``limit``, no ranking."""
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds = ["timestamp >= %s", "detail::text ILIKE %s ESCAPE E'\\\\'"]
+        params: list[Any] = [since, f"%{esc}%"]
+        if until:
+            conds.append("timestamp <= %s")
+            params.append(until)
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s"
+        )
+
+        def _run(conn: Any) -> list[AuditRow]:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [self._row(r) for r in cur.fetchall()]
+
+        return self._execute_with_retry(_run)
+
     def sources(
         self,
         *,

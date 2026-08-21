@@ -94,8 +94,13 @@ func TestSearch_RequiresPersistence(t *testing.T) {
 	initSearch(t, true, false) // ring-only sys — no durable history
 	seedSearch()
 	body, _ := getJSON(t, NewReader(), "/search?q=reset&since="+searchSince)
-	if !strings.Contains(errStr(body), "persistence") {
-		t.Fatalf("want persistence error, got %v", body)
+	// Per-stream error since #16 restoration — a global "error" key is only
+	// for policy failures (search-disabled, since-missing); ring-only stream
+	// reports errors.sys.
+	perStream, _ := body["errors"].(map[string]any)
+	msg, _ := perStream["sys"].(string)
+	if !strings.Contains(msg, "persistence") {
+		t.Fatalf("want per-stream persistence error, got %v", body)
 	}
 }
 

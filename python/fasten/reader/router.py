@@ -229,7 +229,10 @@ def router(
             # assume q= works on the api stream.
             raise HTTPException(
                 status_code=400,
-                detail="free-text q= is sys-only in v1 — use /logs/sys?q=",
+                detail=(
+                    "free-text q= not accepted on /api — use "
+                    "/search?streams=api (or /logs/sys?q= for syslog only)"
+                ),
             )
         t = _transport()
         if t is None:
@@ -346,10 +349,10 @@ def router(
         # inequality (and get it subtly wrong). Reported per stream. A null
         # total (audit only, on stores without count) means "unknown" — the
         # truncated flag mirrors that as None rather than a spurious False.
-        truncated = {
-            k: (None if totals[k] is None else counts[k] < totals[k])
-            for k in ("audit", "api", "sys")
-        }
+        def _trunc(k: str) -> Optional[bool]:
+            total = totals[k]                # pull into a local so mypy narrows
+            return None if total is None else counts[k] < total
+        truncated = {k: _trunc(k) for k in ("audit", "api", "sys")}
         return {
             "request_id": request_id,
             "audit": audit,
@@ -365,47 +368,125 @@ def router(
             },
         }
 
+    _VALID_SEARCH_STREAMS = frozenset({"audit", "api", "sys"})
+
     @r.get("/search")
     def get_search(
         q: str = Query(..., min_length=1),
         since: str = Query(...),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=50, ge=1, le=200),
+        streams: Optional[str] = Query(default=None),
     ) -> dict[str, Any]:
-        """FR3 free-text search — the sys-only, time-bounded escape hatch (§4.1).
+        """FR3 free-text search across audit / api / sys — the time-bounded
+        escape hatch (§4.1).
 
-        For "I only have an error string": a case-insensitive substring scan over
-        persisted sys history, returning each match's ``request_id`` so a consumer
-        can hand it to ``/correlate``. Deliberately constrained — opt-in
-        (``search.enabled``), ``since`` mandatory (no unbounded scans), hard
-        result cap, and **no relevance ranking** (newest-first). Not a log query
-        language; structured field reads are the primary discovery path.
+        Case-insensitive substring scan over persisted history. Each match
+        carries ``request_id`` so a consumer can hand it to ``/correlate``.
+        Deliberately constrained — opt-in (``search.enabled``), ``since``
+        mandatory (no unbounded scans), hard result cap, and no relevance
+        ranking (newest-first per stream). Not a log query language; structured
+        field reads are the primary discovery path.
+
+        ``streams=`` is a comma-separated subset of ``{audit, api, sys}``.
+        Default: ``sys`` (backward compat + preserves the "linear scan is
+        opt-in" principle). Each named stream must have a store — for
+        ring-only streams the response reports a per-stream error, not an
+        empty list that reads as "no matches".
         """
-        empty = {"matches": [], "counts": {"sys": 0}, "completeness": {"sys": _source("sys")}}
+        # Parse + validate streams param before hitting the search guard so
+        # a bad ?streams=foo fails loudly rather than falling through.
+        requested = streams.split(",") if streams else ["sys"]
+        parsed = {s.strip() for s in requested if s.strip()}
+        unknown = parsed - _VALID_SEARCH_STREAMS
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"streams={sorted(parsed)}: unknown stream(s) {sorted(unknown)}. "
+                    f"Valid: {sorted(_VALID_SEARCH_STREAMS)}."
+                ),
+            )
+        if not parsed:
+            parsed = {"sys"}
+
+        completeness = {s: _source(s) for s in parsed}
+        empty_counts = {s: 0 for s in parsed}
         err = _search_guard(q, since)
         if err is not None:
-            return {**empty, "error": err}
+            return {"matches": [], "counts": empty_counts,
+                    "completeness": completeness, "error": err}
+
         t = _transport()
+        s = _store()
         if t is None:
-            return {**empty, "error": "transport not initialised — call fasten.init() first"}
-        rows = t.search_syslog(q=q, since=since, until=until, limit=limit)
-        if rows is None:
-            return {**empty, "error": "search requires sys persistence — configure a syslog store (FR1)"}
-        matches = [
-            {
-                "stream": "sys",
-                "request_id": row.get("request_id"),
-                "ts": row.get("timestamp"),
-                "summary": row.get("event"),
-                "row": row,
-            }
-            for row in rows
-        ]
-        return {
+            return {"matches": [], "counts": empty_counts,
+                    "completeness": completeness,
+                    "error": "transport not initialised — call fasten.init() first"}
+
+        matches: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        # Stable stream order in the response so a UI can render tabs
+        # deterministically. Sys first (the historical default), then api,
+        # then audit — mirrors the /correlate response order.
+        for stream in ("sys", "api", "audit"):
+            if stream not in parsed:
+                continue
+            if stream == "sys":
+                rows = t.search_syslog(q=q, since=since, until=until, limit=limit)
+                if rows is None:
+                    errors["sys"] = "requires sys persistence — configure a syslog store (FR1)"
+                    counts["sys"] = 0
+                    continue
+                counts["sys"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "sys",
+                        "request_id": row.get("request_id"),
+                        "ts": row.get("timestamp"),
+                        "summary": row.get("event"),
+                        "row": row,
+                    })
+            elif stream == "api":
+                rows = t.search_api(q=q, since=since, until=until, limit=limit)
+                if rows is None:
+                    errors["api"] = "requires api persistence — configure an api store (FR1)"
+                    counts["api"] = 0
+                    continue
+                counts["api"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "api",
+                        "request_id": row.get("request_id"),
+                        "ts": row.get("timestamp"),
+                        "summary": f"{row.get('method','')} {row.get('path','')}".strip(),
+                        "row": row,
+                    })
+            elif stream == "audit":
+                if s is None or not hasattr(s, "search"):
+                    errors["audit"] = "requires an audit store with a search method (FR1)"
+                    counts["audit"] = 0
+                    continue
+                rows = s.search(q=q, since=since, until=until, limit=limit)
+                counts["audit"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "audit",
+                        "request_id": row.request_id,
+                        "ts": row.timestamp.isoformat() if row.timestamp else None,
+                        "summary": row.code,
+                        "row": dataclasses.asdict(row),
+                    })
+
+        resp: dict[str, Any] = {
             "matches": matches,
-            "counts": {"sys": len(matches)},
-            "completeness": {"sys": _source("sys")},
+            "counts": counts,
+            "completeness": completeness,
         }
+        if errors:
+            resp["errors"] = errors
+        return resp
 
     @r.get("/topology")
     def get_topology(

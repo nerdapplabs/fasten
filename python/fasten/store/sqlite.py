@@ -489,6 +489,37 @@ class SQLiteStore:
             )
             return int(cur.fetchone()[0])
 
+    def search(
+        self,
+        *,
+        q: str,
+        since: str,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> list[AuditRow]:
+        """FR3 free-text search over persisted audit history (§4.1). Substring
+        scan over the ``detail`` JSON column (audit's payload equivalent). The
+        result carries the same ``request_id`` that ``/correlate`` consumes.
+
+        Deliberately constrained: ``since`` is mandatory to bound the linear
+        scan; ``%``/``_``/``\\`` in ``q`` are escaped so they match literally
+        rather than acting as LIKE wildcards. Newest-first, hard-capped by
+        ``limit`` — no relevance ranking."""
+        esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds = ["COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [since, f"%{esc}%"]
+        if until:
+            conds.append("COALESCE(timestamp, '') <= ?")
+            params.append(until)
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?"
+        )
+        with self._txn():
+            cur = self._connect().execute(sql, params)
+            return [self._row(r) for r in cur.fetchall()]
+
     def sources(
         self,
         *,

@@ -329,6 +329,38 @@ func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) 
 	return n, err
 }
 
+// Search runs FR3 free-text search over the audit store's detail column
+// (§4.1). Case-insensitive substring, since= bounded, hard-capped by limit,
+// newest-first, no relevance ranking. Result rows carry request_id for
+// /correlate follow-up. %/_/\ in q are escaped so they match literally.
+func (s *SQLiteStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+	esc := escapeLikeLiteral(strings.ToLower(q))
+	conds := []string{"COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"}
+	args := []any{since, "%" + esc + "%"}
+	if until != "" {
+		conds = append(conds, "COALESCE(timestamp, '') <= ?")
+		args = append(args, until)
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`,
+		auditCols, s.table, strings.Join(conds, " AND "),
+	)
+	rows, err := s.db.QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+// escapeLikeLiteral escapes LIKE metacharacters (%, _, \) so they match
+// as data under an ESCAPE '\' clause.
+func escapeLikeLiteral(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
 func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100

@@ -279,17 +279,52 @@ func (e *Engine) searchGuard(q, since string) string {
 	return ""
 }
 
-// handleSearch is the FR3 free-text escape hatch (§4.1): sys-only, time-bounded,
-// hard-capped, no ranking. Returns matches carrying request_id so a consumer can
-// hand one to /correlate.
+// handleSearch is the FR3 free-text escape hatch (§4.1): time-bounded,
+// hard-capped, no ranking, opt-in via SearchEnabled. Returns matches carrying
+// request_id so a consumer can hand one to /correlate.
+//
+// ?streams= is a comma-separated subset of {audit, api, sys}. Default: sys.
+// Each named stream must have a store — ring-only streams produce a
+// per-stream error (errors.<stream>) rather than an empty list that reads
+// as "no matches".
 func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	comp := map[string]string{"sys": e.streamSource("sys")}
-	fail := func(msg string) {
-		writeJSON(w, map[string]any{"matches": []any{}, "counts": map[string]int{"sys": 0},
-			"completeness": comp, "error": msg})
-	}
 	qtext := q.Get("q")
+
+	// Parse streams= before the guard — a bad ?streams=foo fails loudly
+	// rather than falling through.
+	valid := map[string]bool{"audit": true, "api": true, "sys": true}
+	wanted := []string{"sys"} // default
+	if s := q.Get("streams"); s != "" {
+		wanted = wanted[:0]
+		for _, p := range strings.Split(s, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !valid[p] {
+				http.Error(w,
+					fmt.Sprintf("streams=%q: unknown stream %q (valid: audit, api, sys)", s, p),
+					http.StatusBadRequest)
+				return
+			}
+			wanted = append(wanted, p)
+		}
+		if len(wanted) == 0 {
+			wanted = []string{"sys"}
+		}
+	}
+	completeness := map[string]string{}
+	countsEmpty := map[string]int{}
+	for _, s := range wanted {
+		completeness[s] = e.streamSource(s)
+		countsEmpty[s] = 0
+	}
+
+	fail := func(msg string) {
+		writeJSON(w, map[string]any{"matches": []any{}, "counts": countsEmpty,
+			"completeness": completeness, "error": msg})
+	}
 	if qtext == "" {
 		fail("q= is required")
 		return
@@ -307,27 +342,98 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, lerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	rows, ok, err := e.xport.SearchSyslog(qtext, q.Get("since"), q.Get("until"), limit)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+
+	since := q.Get("since")
+	until := q.Get("until")
+	matches := []map[string]any{}
+	counts := map[string]int{}
+	errs := map[string]string{}
+	// Stable stream order in the response so a UI can render tabs
+	// deterministically. Sys first (the historical default), then api,
+	// then audit — mirrors the /correlate response order.
+	wantSet := map[string]bool{}
+	for _, s := range wanted {
+		wantSet[s] = true
 	}
-	if !ok {
-		fail("search requires sys persistence — configure a syslog store (FR1)")
-		return
+	for _, stream := range []string{"sys", "api", "audit"} {
+		if !wantSet[stream] {
+			continue
+		}
+		switch stream {
+		case "sys":
+			rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !ok {
+				errs["sys"] = "requires sys persistence — configure a syslog store (FR1)"
+				counts["sys"] = 0
+				continue
+			}
+			counts["sys"] = len(rows)
+			for _, row := range rows {
+				matches = append(matches, map[string]any{
+					"stream": "sys", "request_id": row["request_id"],
+					"ts": row["timestamp"], "summary": row["event"], "row": row,
+				})
+			}
+		case "api":
+			rows, ok, err := e.xport.SearchAPI(qtext, since, until, limit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !ok {
+				errs["api"] = "requires api persistence — configure an api store (FR1)"
+				counts["api"] = 0
+				continue
+			}
+			counts["api"] = len(rows)
+			for _, row := range rows {
+				summary := ""
+				if m, _ := row["method"].(string); m != "" {
+					summary = m + " " + fmt.Sprint(row["path"])
+				}
+				matches = append(matches, map[string]any{
+					"stream": "api", "request_id": row["request_id"],
+					"ts": row["timestamp"], "summary": strings.TrimSpace(summary), "row": row,
+				})
+			}
+		case "audit":
+			searcher, ok := e.auditStore.(interface {
+				Search(ctx context.Context, q, since, until string, limit int) ([]Row, error)
+			})
+			if e.auditStore == nil || !ok {
+				errs["audit"] = "requires an audit store with a Search method (FR1)"
+				counts["audit"] = 0
+				continue
+			}
+			rows, err := searcher.Search(r.Context(), qtext, since, until, limit)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			counts["audit"] = len(rows)
+			for _, row := range rows {
+				ts := ""
+				if !row.Timestamp.IsZero() {
+					ts = row.Timestamp.UTC().Format(time.RFC3339Nano)
+				}
+				matches = append(matches, map[string]any{
+					"stream": "audit", "request_id": row.RequestID,
+					"ts": ts, "summary": string(row.Code), "row": rowToMap(row),
+				})
+			}
+		}
 	}
-	matches := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		matches = append(matches, map[string]any{
-			"stream":     "sys",
-			"request_id": row["request_id"],
-			"ts":         row["timestamp"],
-			"summary":    row["event"],
-			"row":        row,
-		})
+	resp := map[string]any{
+		"matches": matches, "counts": counts, "completeness": completeness,
 	}
-	writeJSON(w, map[string]any{"matches": matches, "counts": map[string]int{"sys": len(matches)},
-		"completeness": comp})
+	if len(errs) > 0 {
+		resp["errors"] = errs
+	}
+	writeJSON(w, resp)
 }
 
 func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
@@ -339,7 +445,8 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if _, ok := q["q"]; ok {
 		// Free-text search is sys-only in v1 (§9). Reject rather than
 		// silently drop, so callers can't assume q= works on the api stream.
-		http.Error(w, "free-text q= is sys-only in v1 — use /logs/sys?q=", http.StatusBadRequest)
+		http.Error(w, "free-text q= not accepted on /api — use /search?streams=api "+
+			"(or /logs/sys?q= for syslog only)", http.StatusBadRequest)
 		return
 	}
 	limit, lerr := parseLimit(q.Get("limit"), 100, 1000)

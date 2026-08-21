@@ -320,6 +320,33 @@ func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error
 	return count, err
 }
 
+// Search runs FR3 free-text search over the audit detail column (§4.1).
+// Case-insensitive ILIKE substring, since= bounded, hard-capped by limit,
+// newest-first, no ranking. Result rows carry request_id for /correlate.
+// %/_/\ in q are escaped so they match literally under ESCAPE E'\\'.
+func (s *PostgresStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+	esc := escapeLikeLiteral(q)
+	conds := []string{"timestamp >= $1", `detail::text ILIKE $2 ESCAPE E'\\'`}
+	args := []any{since, "%" + esc + "%"}
+	n := 3
+	if until != "" {
+		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n))
+		args = append(args, until)
+		n++
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d`,
+		pgAuditCols, s.table, strings.Join(conds, " AND "), n,
+	)
+	rows, err := s.db.QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsPg(rows)
+}
+
 func (s *PostgresStore) ListUnshipped(ctx context.Context, limit int) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100

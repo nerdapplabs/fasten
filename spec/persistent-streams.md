@@ -223,24 +223,29 @@ there is no tamper-evident form. The discipline here is schema compatibility.
 `q=` substring search over persisted stream history is **opt-in and deliberately
 constrained** (§4.1 of the issue — the escape hatch, not the discovery path):
 
-- **`sys` only** in v1.
+- **`streams=` comma-separated subset of `{audit, api, sys}`.** Default: `sys`
+  (preserves the "linear scan is opt-in" principle). Every named stream must
+  have a store attached — ring-only streams report a per-stream error in
+  `errors.<stream>` rather than an empty match list. Stream order in the
+  response is stable (`sys → api → audit`), mirroring `/correlate`.
 - **`since=` mandatory** — an unbounded substring scan is refused.
 - **Hard result cap** (default 50, max 200), **no relevance ranking**
-  (newest-first).
-- **Gated** behind `search.enabled` (config or `FASTEN_SEARCH_ENABLED`);
-  disabled until persistence is on (a ring-only sys stream reports "search
-  requires sys persistence").
-- Case-insensitive substring over the JSON `payload`; `%` / `_` / `\` in `q` are
-  escaped so they match literally (SQLite `LIKE … ESCAPE`, Postgres `ILIKE`).
-  The Postgres escape char is declared as `ESCAPE E'\\'` (explicit escape-string)
-  so it means one backslash regardless of the server's `standard_conforming_strings`
-  setting — a plain `ESCAPE '\'` would break where that is turned off.
+  (newest-first per stream).
+- **Gated** behind `search.enabled` (config or `FASTEN_SEARCH_ENABLED`).
+- Case-insensitive substring over each stream's payload — the JSON `payload`
+  column on `api`/`sys`, the JSON `detail` column on `audit`. `%` / `_` / `\`
+  in `q` are escaped so they match literally (SQLite `LIKE … ESCAPE`, Postgres
+  `ILIKE`). The Postgres escape char is declared as `ESCAPE E'\\'` (explicit
+  escape-string) so it means one backslash regardless of the server's
+  `standard_conforming_strings` setting.
 
-Surfaces as `GET /logs/search` (returns matches with `request_id` for a
-follow-up `/correlate`) and a gated `q=` on `/logs/sys`. Discovery input reaches
-these primitives through the query translator (§3.7 of the issue): NL / smart-box
-text is parsed into structured chips + the bounded `q=`, never a fourth query
-semantic.
+Surfaces as `GET /logs/search?streams=…` (returns matches with `request_id`
+for a follow-up `/correlate`) and a gated `q=` on `/logs/sys`. `/logs/api?q=`
+is refused (400) with a pointer to `/search?streams=api` — combining
+free-text and structured filters on a per-stream endpoint is a semantic
+mismatch. Discovery input reaches these primitives through the query
+translator (§3.7 of the issue): NL / smart-box text is parsed into structured
+chips + the bounded `q=`, never a fourth query semantic.
 
 ---
 

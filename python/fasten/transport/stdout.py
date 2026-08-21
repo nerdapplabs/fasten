@@ -182,6 +182,17 @@ class StdoutTransport:
             return None
         return self._syslog_store.search(q=q, since=since, until=until, limit=limit)
 
+    def search_api(
+        self, *, q: str, since: str, until: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]] | None:
+        """FR3 free-text search over persisted api history. Same shape as
+        search_syslog — the api StreamStore is identical to the sys one, and
+        this method is what the reader calls when ``/search?streams=api`` is
+        requested. ``None`` = api ring-only, "requires api persistence"."""
+        if self._api_store is None:
+            return None
+        return self._api_store.search(q=q, since=since, until=until, limit=limit)
+
     # ── api log ─────────────────────────────────────────────────────────────
 
     def write_api(self, row: dict[str, Any]) -> None:
