@@ -459,9 +459,12 @@ def router(
         }
 
         # P1-23: hash chain verification — spot-check latest 50 rows.
+        # breaks is None until verification actually runs; 0 when the chain is
+        # clean, 1+ when broken. Never report 0 for "we didn't check", which
+        # would read as green on a status page colouring on this field.
         chain_block: dict[str, Any] = {
             "verified": None,
-            "breaks": 0,
+            "breaks": None,
             "last_verified_at": None,
         }
         if s is not None and hasattr(s, "query"):
@@ -472,6 +475,7 @@ def router(
                     limit=50,
                 )
                 if recent:
+                    recent.reverse()  # verify_chain requires oldest-first traversal
                     result = verify_chain(recent)
                     chain_block = {
                         "verified": result.ok,
@@ -482,8 +486,17 @@ def router(
                             timespec="milliseconds"
                         ),
                     }
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Never collapse a failed check into breaks: 0. Surface the
+                # error so operators can see verification is broken rather
+                # than seeing a green status page.
+                chain_block = {
+                    "verified": None,
+                    "breaks": None,
+                    "error": type(e).__name__,
+                    "reason": str(e),
+                    "last_verified_at": None,
+                }
 
         return {
             "store": store_block,
