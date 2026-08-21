@@ -30,6 +30,23 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
   retention, and constrained-search contract.
 
+### Known limitation — cross-SDK lexicographic time windows
+
+- Spec §4.3 mandates lexicographic `[since, until]` comparison and states
+  callers MUST keep one canonical timestamp form. The two SDKs currently
+  stamp different forms — Go writes `time.RFC3339Nano`
+  (`2026-08-21T10:00:00Z`, trailing zeros stripped); Python writes
+  `isoformat(timespec="milliseconds")` (`2026-08-21T10:00:00.500+00:00`).
+- **Consequence:** windowed reads on a table with both Python and Go
+  writers silently truncate — a Python row 0.5s after a Go `since` bound
+  is excluded, a row at the exact boundary instant is excluded. A Go-only
+  edge case also puts whole-second rows above fractional rows in the same
+  second (`'Z'` > `'.'`).
+- **Workaround:** run one SDK per stream table, or query with a
+  wide-enough window. The full fix — a single canonical writer form on
+  both SDKs + a conformance-corpus entry that exercises byte-identical
+  Python↔Go output — is a spec amendment targeted for 1.1.
+
 ### Changed — Ring filter semantics now match the store (gh #58, Python)
 
 - `python/fasten/store/ring.py` filter comparisons switched from lax to strict
