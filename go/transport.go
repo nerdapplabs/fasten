@@ -181,10 +181,8 @@ func (t *Transport) WriteAudit(row map[string]any) {
 // in the ring scan and in SQL). That is correct for the canonical UTC form
 // fasten's own writers stamp (fixed-width microseconds + always-Z; see
 // canonical_ts.go), which sorts byte-for-byte identically across Python and
-// Go writers. Adopter-supplied timestamps must use the same form or the
-// window will mis-compare — the older mixed forms ("…+00:00" vs "…Z",
-// trailing-zero-stripped whole seconds) are the exact fault the canonical
-// form was introduced to prevent (spec §4.3).
+// Go writers. Adopter-supplied timestamps must use canonical_ts / canonicalTS
+// too, or the window will mis-compare (spec §4.3).
 type StreamQuery struct {
 	Level     string // sys
 	ServiceID string // sys

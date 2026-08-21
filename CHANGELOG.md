@@ -56,13 +56,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   trailing zeros) and the Go-only same-second inversion where
   whole-second rows sorted above fractional rows in the same second
   (`'Z'` 0x5A > `'.'` 0x2E).
-- **Migration:** parsers stay permissive — `time.Parse(time.RFC3339Nano,
-  ...)` and `fasten.canonical_ts.parse_canonical_or_legacy` still accept
-  the pre-canonical forms, so historical rows read back cleanly. Only
-  the writer contract is strict from this release forward.
+- **One form, one parser.** Reader paths (`parseCanonicalTS` in Go,
+  `parse_canonical` in Python) are strict — anything but the canonical
+  form is a bug at the source and fails loudly, not something to
+  round-trip silently.
 - Pinned by parallel conformance tests in each SDK
   (`python/tests/test_canonical_ts.py`, `go/canonical_ts_test.go`) that
-  assert byte-identical output on the same instant.
+  assert byte-identical output on the same instant plus strict-reject
+  of every non-canonical shape.
 
 ### Changed — Ring filter semantics now match the store (gh #58, Python)
 

@@ -585,13 +585,14 @@ class SQLiteStore:
             return int(cur.fetchone()[0])
 
     def _row(self, r: sqlite3.Row) -> AuditRow:
-        from ..canonical_ts import parse_canonical_or_legacy
+        from ..canonical_ts import parse_canonical
         keys = r.keys()
         return AuditRow(
             id=r["id"], origin_id=r["origin_id"], monotonic_seq=r["monotonic_seq"],
-            # parse_canonical_or_legacy handles both the canonical Z-suffix form
-            # (Python 3.10's fromisoformat rejects 'Z') and older +00:00 rows.
-            timestamp=parse_canonical_or_legacy(r["timestamp"]),
+            # Strict canonical parse (spec §4.3). Every row in this table was
+            # written by _utc_iso → canonical_ts, so anything else is a bug at
+            # the source and must fail loudly instead of round-tripping.
+            timestamp=parse_canonical(r["timestamp"]),
             code=r["code"], action=r["action"], severity=r["severity"],
             service_id=r["service_id"], source_node_id=r["source_node_id"],
             tenant_id=r["tenant_id"],
@@ -599,7 +600,7 @@ class SQLiteStore:
             target=r["target"], category=r["category"], domain=r["domain"],
             method=r["method"], request_id=r["request_id"],
             detail=json.loads(r["detail"]),
-            shipped_at=parse_canonical_or_legacy(r["shipped_at"]) if r["shipped_at"] else None,
+            shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",

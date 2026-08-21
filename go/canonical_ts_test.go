@@ -90,15 +90,34 @@ func TestCanonicalTS_LexOrderMatchesTimeOrder(t *testing.T) {
 	}
 }
 
-func TestCanonicalTS_ParseBackRoundtrips(t *testing.T) {
-	// time.Parse with RFC3339Nano must accept the canonical form (this is
-	// what the audit store's scan path relies on).
+func TestParseCanonicalTS_RoundTripsWriter(t *testing.T) {
+	// The strict parser round-trips exactly what canonicalTS writes.
+	// That is the only round-trip we owe.
 	want := time.Date(2026, 8, 21, 10, 0, 0, 500_000_000, time.UTC)
-	got, err := time.Parse(time.RFC3339Nano, canonicalTS(want))
+	got, err := parseCanonicalTS(canonicalTS(want))
 	if err != nil {
-		t.Fatalf("time.Parse rejected canonical form: %v", err)
+		t.Fatalf("strict parser rejected canonical form: %v", err)
 	}
 	if !got.Equal(want) {
 		t.Errorf("roundtrip lost precision: got %v, want %v", got, want)
+	}
+}
+
+func TestParseCanonicalTS_RejectsAnythingElse(t *testing.T) {
+	// Strict: only the exact 27-char canonical form is accepted. Anything
+	// else means a writer bypassed canonicalTS — a bug at the source, must
+	// fail loudly instead of silently round-tripping.
+	bad := []string{
+		"2026-08-21T10:00:00Z",             // whole-second RFC3339Nano (20 chars)
+		"2026-08-21T10:00:00.500Z",         // short fractional (3 digits)
+		"2026-08-21T10:00:00.500+00:00",     // offset form, not Z
+		"2026-08-21T10:00:00.123456+05:30",  // non-UTC offset
+		"",                                    // empty
+		"not-a-timestamp",                    // garbage
+	}
+	for _, s := range bad {
+		if _, err := parseCanonicalTS(s); err == nil {
+			t.Errorf("parseCanonicalTS(%q) accepted; must reject non-canonical", s)
+		}
 	}
 }

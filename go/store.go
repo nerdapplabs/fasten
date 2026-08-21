@@ -585,14 +585,14 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		); err != nil {
 			return nil, err
 		}
-		r.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		r.Timestamp, _ = time.Parse(canonicalTSLayout, ts)
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
 		json.Unmarshal([]byte(detail), &r.Detail)
 		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
-			t, _ := time.Parse(time.RFC3339Nano, *shippedAt)
+			t, _ := time.Parse(canonicalTSLayout, *shippedAt)
 			r.ShippedAt = &t
 		}
 		if wv != "" {

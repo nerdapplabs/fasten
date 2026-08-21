@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .attrs import AuditRow
-from .canonical_ts import canonical_now, parse_canonical_or_legacy
+from .canonical_ts import canonical_now, parse_canonical
 from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_chain
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
@@ -80,9 +80,10 @@ class FastenConfig:
     # opted into persisting. When set, start() asserts that the set matches
     # the streams with stores attached (bidirectional — a named stream
     # without a store or an attached store without the name both fail
-    # loudly). When None, persistence is derived from store attachment
-    # (the earlier behaviour, and still the default). Never includes
-    # "audit" (audit persistence is driven by audit_store, not this knob).
+    # loudly). When None, persistence is derived from store attachment —
+    # a stream reports "store" only when it actually has one. Never
+    # includes "audit" (audit persistence is driven by audit_store, not
+    # this knob).
     persist_streams: Optional[frozenset[str]]
 
 
@@ -778,7 +779,7 @@ class Engine:
                 for fld in ("timestamp", "shipped_at"):
                     v = row_dict.get(fld)
                     if isinstance(v, str):
-                        row_dict[fld] = parse_canonical_or_legacy(v)
+                        row_dict[fld] = parse_canonical(v)
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
                 store.insert(row)
                 return 0

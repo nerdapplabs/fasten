@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from fasten.canonical_ts import canonical_ts, parse_canonical_or_legacy
+from fasten.canonical_ts import canonical_ts, parse_canonical
 
 
 # ── conformance pins (must match go/canonical_ts_test.go byte-for-byte) ──
@@ -60,15 +60,27 @@ def test_canonical_ts_lex_order_matches_time_order():
     assert whole < half, f"whole second {whole!r} must sort below half {half!r}"
 
 
-# ── parser accepts both canonical and legacy forms ──────────────────────
+# ── parser is strict (one form, one parser) ─────────────────────────────
 
-@pytest.mark.parametrize("s, want_iso", [
-    ("2026-08-21T10:00:00.000000Z", "2026-08-21T10:00:00+00:00"),
-    ("2026-08-21T10:00:00Z", "2026-08-21T10:00:00+00:00"),
-    ("2026-08-21T10:00:00.500+00:00", "2026-08-21T10:00:00.500000+00:00"),
-    ("2026-08-21T10:00:00.123456+00:00", "2026-08-21T10:00:00.123456+00:00"),
+def test_parse_canonical_round_trips_writer():
+    """The writer stamps canonical; the parser round-trips it back to the
+    exact input datetime. That is the only round-trip we owe."""
+    dt = datetime(2026, 8, 21, 10, 0, 0, 500_000, tzinfo=timezone.utc)
+    assert parse_canonical(canonical_ts(dt)) == dt
+
+
+@pytest.mark.parametrize("bad", [
+    "2026-08-21T10:00:00Z",              # whole-second Go RFC3339Nano — 20 chars
+    "2026-08-21T10:00:00.500+00:00",      # Python isoformat(ms) — offset form
+    "2026-08-21T10:00:00.123456+00:00",   # Python isoformat(µs) — offset form
+    "2026-08-21T10:00:00.500Z",           # short fractional — 3 digits
+    "2026-08-21T10:00:00.123456+05:30",   # non-UTC offset
+    "",                                    # empty
+    "not-a-timestamp",                    # garbage
 ])
-def test_parse_accepts_canonical_and_legacy(s, want_iso):
-    """Historical rows in stores written before the canonical form rollout
-    must read back cleanly — the parser accepts both forms."""
-    assert parse_canonical_or_legacy(s).isoformat() == want_iso
+def test_parse_rejects_anything_but_canonical(bad):
+    """Strict: only the exact 27-char canonical form is accepted. Anything
+    else means a writer bypassed canonical_ts — a bug at the source, must
+    fail loudly instead of silently round-tripping."""
+    with pytest.raises(ValueError):
+        parse_canonical(bad)

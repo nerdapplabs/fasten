@@ -390,10 +390,11 @@ def router(
         field reads are the primary discovery path.
 
         ``streams=`` is a comma-separated subset of ``{audit, api, sys}``.
-        Default: ``sys`` (backward compat + preserves the "linear scan is
-        opt-in" principle). Each named stream must have a store — for
-        ring-only streams the response reports a per-stream error, not an
-        empty list that reads as "no matches".
+        Default: ``sys`` — the linear scan stays opt-in per stream, so an
+        operator hitting /search without ``streams=`` doesn't fan out
+        across audit + api unless they ask for it. Each named stream must
+        have a store — for ring-only streams the response reports a
+        per-stream error, not an empty list that reads as "no matches".
         """
         # Parse + validate streams param before hitting the search guard so
         # a bad ?streams=foo fails loudly rather than falling through.

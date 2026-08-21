@@ -151,11 +151,12 @@ code that writes rows into a fasten table (custom loaders, replication)
 MUST use the same form or windowed reads on the mixed table will
 mis-compare at boundary instants.
 
-Parsers are permissive: the reader path (`time.Parse(time.RFC3339Nano,
-...)` / `fasten.canonical_ts.parse_canonical_or_legacy`) accepts the
-canonical form and the pre-canonical forms already in existing tables,
-so historical rows read back cleanly. Only the *writer* obligation is
-strict.
+Parsers are strict too: `parseCanonicalTS` (Go) and
+`fasten.canonical_ts.parse_canonical` (Python) accept only the exact
+27-char canonical form. Anything else means a writer bypassed the
+canonical helper, which is a bug at the source — reads fail loudly
+rather than silently round-tripping a shape the compare doesn't
+handle.
 4. **Limit:** every read is capped (default 100, max 1000) after filtering and
    ordering. A non-positive limit is refused.
 

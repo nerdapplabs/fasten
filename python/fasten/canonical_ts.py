@@ -1,42 +1,32 @@
-"""Canonical timestamp form for cross-SDK lexicographic windows.
+"""Canonical timestamp form for cross-SDK lexicographic windows (spec §4.3).
 
-Spec §4.3 mandates `[since, until]` lexicographic comparison and states
-callers MUST keep one canonical form. Historically Go stamped
-``time.RFC3339Nano`` (`2026-08-21T10:00:00Z`, trailing zeros stripped)
-while Python stamped ``isoformat(timespec="milliseconds")``
-(`2026-08-21T10:00:00.500+00:00`) — the two disagreed byte-for-byte on
-the same instant, so windowed reads on tables with both writers silently
-truncated at boundary instants, and a Go-only same-second ordering case
-inverted (`'Z'` 0x5A > `'.'` 0x2E).
-
-**Canonical form:** RFC3339 with a **fixed six-digit sub-second** and an
-always-`Z` suffix (never `+00:00`, never a trailing-zero-stripped whole
-second):
+**One form, one parser.** Every outbound fasten timestamp — audit rows,
+stream rows, purge cutoffs, drainer sys events, `last_verified_at`,
+retention cutoffs — is stamped as RFC3339 with a **fixed six-digit
+sub-second and an always-`Z`** suffix:
 
     2026-08-21T10:00:00.000000Z
     2026-08-21T10:00:00.500000Z
 
-Fixed-width guarantees every stamp has the fractional dot at byte 19, so
-`.NNNNNNZ` sorts as digits and never as `Z` > `.`. Microsecond precision
-matches Postgres `timestamptz` default resolution + Python's stdlib
-default; anything finer (nanoseconds) has no cross-runtime carrier.
+Fixed width places the fractional dot at byte 19 for every stamp, so
+`.NNNNNNZ` sorts as digits and `'Z'` (0x5A) never appears where `'.'`
+(0x2E) does — the specific inversion that let whole-second stamps sort
+above fractional stamps in the same second under the older
+`RFC3339Nano` writer that stripped trailing zeros. Six digits matches
+Postgres `timestamptz` default resolution + Python stdlib default; no
+sub-microsecond carrier exists across runtimes.
 
-Every outbound fasten timestamp (audit / api / sys rows, purge cutoffs,
-drainer sys log entries, reader `last_verified_at`, retention loop
-cutoff) must go through ``canonical_ts``. See the sibling
-``go/canonical_ts.go`` for the Go writer helper; a conformance corpus
-row in ``spec/timestamp-canonical.md`` pins byte-identical output on the
-same instant across the two SDKs.
-
-Parsing stays permissive — ``datetime.fromisoformat`` (via
-``parse_canonical_or_legacy``) accepts both the canonical form and the
-older RFC3339Nano / millisecond forms already in the wild, so a read on
-a store written before this release never rejects a historical row."""
+`canonical_ts` writes it; `parse_canonical` reads it. Both are strict —
+any other form is a bug at the source and must not silently round-trip.
+The sibling `go/canonical_ts.go` is the parallel Go writer + strict
+parser; parallel conformance tests in each SDK pin byte-identical output
+on the same instant."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
-__all__ = ["canonical_ts", "canonical_now", "parse_canonical_or_legacy"]
+__all__ = ["canonical_ts", "canonical_now", "parse_canonical"]
 
 
 def canonical_ts(dt: datetime) -> str:
@@ -55,11 +45,22 @@ def canonical_now() -> str:
     return canonical_ts(datetime.now(timezone.utc))
 
 
-def parse_canonical_or_legacy(s: str) -> datetime:
-    """Parse a timestamp string emitted by either the canonical form or
-    an older RFC3339Nano / millisecond form. Returns a tz-aware UTC
-    datetime. Historical rows in stores written before the canonical-form
-    rollout must still read back cleanly."""
-    # Python 3.11+'s fromisoformat handles 'Z' natively; the .replace keeps
-    # 3.10 (dev target) working too.
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+# The one form the writer emits. 27 chars, fixed six-digit sub-second, Z
+# suffix. Anything else is not a fasten stamp.
+_CANONICAL_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
+)
+
+
+def parse_canonical(s: str) -> datetime:
+    """Parse a canonical UTC timestamp back into a tz-aware datetime.
+    Strict — only the exact 27-char `YYYY-MM-DDTHH:MM:SS.NNNNNNZ` form
+    is accepted; anything else raises ``ValueError``. Nothing in fasten
+    should ever hand this a non-canonical string, so a mismatch is a
+    bug at the source, not something to swallow."""
+    if not _CANONICAL_TS_RE.match(s):
+        raise ValueError(f"not the canonical timestamp form: {s!r}")
+    # Python 3.10's ``datetime.fromisoformat`` doesn't accept the ``Z``
+    # suffix natively; swap for ``+00:00`` (a stdlib-version shim, not
+    # a legacy compat layer — the string is fully canonical either way).
+    return datetime.fromisoformat(s[:-1] + "+00:00")
