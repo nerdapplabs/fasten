@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -201,6 +202,24 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		// FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
 		if msg := e.searchGuard(qtext, q.Get("since")); msg != "" {
 			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp, "error": msg})
+			return
+		}
+		// Reject q= combined with structured chips rather than silently
+		// dropping them (parity with /api?q= — see the reject just below in
+		// handleAPI). An operator who narrows with ?q=timeout&level=error
+		// must not get a superset back with no signal that the chip was
+		// ignored.
+		var dropped []string
+		for _, name := range []string{"level", "request_id", "service_id", "event"} {
+			if q.Get(name) != "" {
+				dropped = append(dropped, name)
+			}
+		}
+		if len(dropped) > 0 {
+			http.Error(w, "q= is a free-text search and cannot be combined with "+
+				"structured filters ("+strings.Join(dropped, ", ")+"). Use one or "+
+				"the other — structured filters run over the store index; q= runs "+
+				"over the raw payload.", http.StatusBadRequest)
 			return
 		}
 		limit := searchLimit(q.Get("limit"))

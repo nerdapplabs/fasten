@@ -172,6 +172,27 @@ def router(
             err = _search_guard(q, since)
             if err is not None:
                 return {"rows": [], "completeness": {"sys": _source("sys")}, "error": err}
+            # Reject q= combined with structured chips rather than silently
+            # dropping them. Matches /api?q= policy: an operator who narrows
+            # with ?q=timeout&level=error must not get a superset back with
+            # no signal that the chip was ignored. Callers use q= alone, or
+            # structured filters alone.
+            dropped = [
+                name for name, val in (
+                    ("level", level), ("request_id", request_id),
+                    ("service_id", service_id), ("event", event),
+                ) if val is not None
+            ]
+            if dropped:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "q= is a free-text search and cannot be combined with "
+                        f"structured filters ({', '.join(dropped)}). Use one or "
+                        "the other — structured filters run over the store index; "
+                        "q= runs over the raw payload."
+                    ),
+                )
             rows = t.search_syslog(q=q, since=since, until=until, limit=min(limit, 200))
             if rows is None:
                 return {

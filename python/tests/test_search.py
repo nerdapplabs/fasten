@@ -142,3 +142,23 @@ def test_sys_q_param_gated_and_bounded():
 
     no_since = _client().get("/api/v1/logs/sys", params={"q": "timeout"}).json()
     assert "since" in no_since["error"]
+
+
+def test_sys_q_param_rejects_structured_filter_combination():
+    """PR #59 finding 6: /sys?q=... combined with a structured filter
+    (level/request_id/service_id/event) must 400, not silently discard the
+    filter. Parity with the existing /api?q= reject policy."""
+    _init(search=True)
+    _seed()
+    c = _client()
+    for chip in ("level", "request_id", "service_id", "event"):
+        resp = c.get(
+            "/api/v1/logs/sys",
+            params={"q": "timeout", "since": SINCE, chip: "anything"},
+        )
+        assert resp.status_code == 400, (
+            f"chip={chip} should 400 (structured + q=); got {resp.status_code} {resp.text}"
+        )
+        # The error names the dropped chip so the caller knows which filter
+        # was refused, not just "bad request".
+        assert chip in resp.json()["detail"]

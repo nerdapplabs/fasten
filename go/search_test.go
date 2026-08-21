@@ -172,3 +172,18 @@ func TestSysQParamGatedAndBounded(t *testing.T) {
 		t.Errorf("want since error on /sys?q= without since, got %v", noSince)
 	}
 }
+
+// TestSysQParamRejectsStructuredFilterCombination (PR #59 finding 6):
+// /sys?q=... combined with a structured filter (level/request_id/service_id/
+// event) must 400, not silently discard the filter. Matches /api?q= policy.
+func TestSysQParamRejectsStructuredFilterCombination(t *testing.T) {
+	initSearch(t, true, true)
+	seedSearch()
+	for _, param := range []string{"level=error", "request_id=r-1", "service_id=svc", "event=db.timeout"} {
+		url := "/sys?q=timeout&since=" + searchSince + "&" + param
+		body, code := getJSON(t, NewReader(), url)
+		if code != 400 {
+			t.Errorf("%s: want 400, got %d (%v)", url, code, body)
+		}
+	}
+}
