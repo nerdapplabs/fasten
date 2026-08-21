@@ -34,11 +34,11 @@ def _init():
     )
 
 
-def _emit_n(n: int, code: str = "NOTE_WRITTEN"):
+def _emit_n(n: int, code: str = "USER_CREATED"):
     for i in range(n):
         fasten.emit(
             code=code,
-            target=f"note_{i}",
+            target=f"u_{i}",
             actor="tester",
             actor_kind="service",
             detail={"i": i},
@@ -67,7 +67,7 @@ def test_doctor_pinpoints_tampered_row_at_correct_seq():
 
     # Tamper directly in SQLite so verify_chain sees the change on next read.
     store = fasten.audit_store()
-    conn = store._conn if hasattr(store, "_conn") else None
+    conn = getattr(store, "_mem_conn", None)
     if conn is None:
         pytest.skip("cannot reach underlying connection for tamper")
     conn.execute("UPDATE audit_log SET detail = '{\"i\": 99}' WHERE monotonic_seq = 2")
