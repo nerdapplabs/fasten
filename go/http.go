@@ -392,7 +392,13 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	audit := []map[string]any{}
-	auditTotal := 0
+	// auditTotal is *int so a count failure (or missing filterCounter capability)
+	// reports null rather than lying with len(rows) — which is capped at limit,
+	// so counts == totals and truncated would read false when the caller has 100
+	// of 4,000 rows. Spec §4.1 makes counts-vs-totals the normative truncation
+	// signal; a null total is honest, a total equal to the cap is a lie
+	// (PR #59 finding 9).
+	var auditTotal *int
 	if e.auditStore != nil {
 		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, Limit: limit})
 		if err != nil {
@@ -402,10 +408,9 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			audit = append(audit, rowToMap(row))
 		}
-		auditTotal = len(audit)
 		if counter, ok := e.auditStore.(filterCounter); ok {
 			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid}); err == nil {
-				auditTotal = n
+				auditTotal = &n
 			}
 		}
 	}
@@ -442,16 +447,30 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 
 	// Truncation is counts < totals per stream. The pair is authoritative; this
 	// boolean is a convenience so every caller doesn't re-derive the inequality
-	// (and get it subtly wrong). Reported per stream.
+	// (and get it subtly wrong). Reported per stream. audit total may be null
+	// (count failure or no filterCounter capability), in which case truncated
+	// is also null — an honest "unknown", not a spurious false.
+	var auditTruncated any
+	if auditTotal != nil {
+		auditTruncated = len(audit) < *auditTotal
+	}
+	// totals must marshal as {audit: null, api: N, sys: N} on count failure.
+	// A map[string]int can't hold nil, so use map[string]any.
+	totals := map[string]any{"api": apiTotal, "sys": sysTotal}
+	if auditTotal != nil {
+		totals["audit"] = *auditTotal
+	} else {
+		totals["audit"] = nil
+	}
 	writeJSON(w, map[string]any{
 		"request_id": rid,
 		"audit":      audit,
 		"api":        api,
 		"sys":        sys,
 		"counts":     map[string]int{"audit": len(audit), "api": len(api), "sys": len(sys)},
-		"totals":     map[string]int{"audit": auditTotal, "api": apiTotal, "sys": sysTotal},
-		"truncated": map[string]bool{
-			"audit": len(audit) < auditTotal,
+		"totals":     totals,
+		"truncated": map[string]any{
+			"audit": auditTruncated,
 			"api":   len(api) < apiTotal,
 			"sys":   len(sys) < sysTotal,
 		},
@@ -524,11 +543,15 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	// cursor (next_after) as the canonical, insert-stable model. next_after is
 	// the smallest monotonic_seq in this page (results are newest-first), passed
 	// back as ?after= to page forward into older rows. Both are always reported.
-	total := len(rows)
+	// total is *int so a count failure (or no filterCounter) reports null rather
+	// than falling back to len(rows) — which is capped at limit, so a paginating
+	// caller can't tell page N is the last one. Null = unknown; consumers should
+	// treat that as "may have more" (PR #59 finding 9).
+	var total *int
 	if counter, ok := e.auditStore.(filterCounter); ok {
 		// CountFiltered ignores Limit/Offset/AfterSeq → the full filtered count.
 		if n, cerr := counter.CountFiltered(r.Context(), f); cerr == nil {
-			total = n
+			total = &n
 		}
 	}
 	var nextAfter *int64

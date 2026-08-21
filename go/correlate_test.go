@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -206,4 +207,43 @@ func TestCorrelate_TotalsCountStoreHistoryAndAudit(t *testing.T) {
 	if totals["sys"] != float64(0) {
 		t.Errorf("totals.sys: got %v, want 0", totals["sys"])
 	}
+}
+
+// TestCorrelate_AuditTotalNullOnCountUnavailable (PR #59 finding 9): an audit
+// store without filterCounter capability must report totals.audit=null and
+// truncated.audit=null — NOT auditTotal=len(rows) which is capped at limit.
+// Reporting totals.audit == counts.audit == limit lies "not truncated" when
+// the caller has limit rows out of many more.
+func TestCorrelate_AuditTotalNullOnCountUnavailable(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	// An adopter store shape with no CountFiltered method.
+	nocount := &noCountFilteredAuditStore{}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: nocount,
+		AuditStoreFailureStrategy: "queue"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/correlate?request_id=r-x")
+	totals, _ := body["totals"].(map[string]any)
+	if totals["audit"] != nil {
+		t.Errorf("totals.audit: got %v, want null (adopter store has no filterCounter)", totals["audit"])
+	}
+	tr, _ := body["truncated"].(map[string]any)
+	if tr["audit"] != nil {
+		t.Errorf("truncated.audit: got %v, want null (null total = unknown, not false)", tr["audit"])
+	}
+}
+
+// noCountFilteredAuditStore satisfies AuditRepository but not filterCounter —
+// the adopter case that used to trip finding 9 into falsely reporting truncated=false.
+type noCountFilteredAuditStore struct{}
+
+func (*noCountFilteredAuditStore) Insert(context.Context, Row) error         { return nil }
+func (*noCountFilteredAuditStore) Query(context.Context, Filter) ([]Row, error) { return nil, nil }
+func (*noCountFilteredAuditStore) ListUnshipped(context.Context, int) ([]Row, error) {
+	return nil, nil
+}
+func (*noCountFilteredAuditStore) MarkShipped(context.Context, []string) error { return nil }
+func (*noCountFilteredAuditStore) Purge(context.Context, time.Time, bool) (int, error) {
+	return 0, nil
 }

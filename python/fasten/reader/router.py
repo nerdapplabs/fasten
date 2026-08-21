@@ -282,7 +282,11 @@ def router(
             since=since, until=until,
         )
         rows = s.query(limit=limit, offset=offset, after_seq=(after or 0), **filters)
-        total = s.count(**filters) if hasattr(s, "count") else len(rows)
+        # total is None when the store doesn't implement count — a null total
+        # is honest; falling back to len(rows) would lie because len(rows) is
+        # capped at limit, so a paginating caller can't tell page N is the last
+        # (PR #59 finding 9).
+        total = s.count(**filters) if hasattr(s, "count") else None
         # Dual pagination (FR5): offset (total/limit/offset) for page-number UIs
         # and cursor (next_after) as the canonical, insert-stable model. Rows are
         # newest-first, so the last row carries the smallest monotonic_seq — pass
@@ -323,9 +327,13 @@ def router(
         )
         api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
         sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
+        # audit_total is None when the store lacks count() — null is honest;
+        # falling back to len(audit) would lie because len is capped at limit,
+        # so counts == totals and truncated would read false when the caller
+        # has 100 of 4,000 rows (PR #59 finding 9).
         audit_total = (
             s.count(request_id=request_id)
-            if s is not None and hasattr(s, "count") else len(audit)
+            if s is not None and hasattr(s, "count") else None
         )
         counts = {"audit": len(audit), "api": len(api), "sys": len(sys)}
         totals = {
@@ -335,8 +343,13 @@ def router(
         }
         # Truncation is counts < totals per stream. The pair is authoritative;
         # this boolean is a convenience so every caller doesn't re-derive the
-        # inequality (and get it subtly wrong). Reported per stream.
-        truncated = {k: counts[k] < totals[k] for k in ("audit", "api", "sys")}
+        # inequality (and get it subtly wrong). Reported per stream. A null
+        # total (audit only, on stores without count) means "unknown" — the
+        # truncated flag mirrors that as None rather than a spurious False.
+        truncated = {
+            k: (None if totals[k] is None else counts[k] < totals[k])
+            for k in ("audit", "api", "sys")
+        }
         return {
             "request_id": request_id,
             "audit": audit,
