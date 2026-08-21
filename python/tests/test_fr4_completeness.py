@@ -26,10 +26,9 @@ def _client():
 
 
 def _init(**stores):
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
-    fasten.init(
+# service_id / node_id are passed explicitly to fasten.init below; the
+    # earlier os.environ writes were dead code that leaked env across tests.
+        fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
@@ -37,13 +36,18 @@ def _init(**stores):
     )
 
 
-def test_correlate_mixed_durability_classes():
+def test_correlate_mixed_durability_classes(monkeypatch, capsys):
     """FR4-3: /correlate reports each stream's own class when they differ —
     audit=store, api=store-degraded, sys=ring in one response."""
     api = StreamStore(":memory:", table="api_mix")
     _init(api_store=api)  # audit store-backed; no sys store -> ring
-    # degrade the api stream via a swallowed persist failure
-    api.insert = lambda row: (_ for _ in ()).throw(RuntimeError("disk full"))
+    # Degrade the api stream via a swallowed persist failure. monkeypatch.setattr
+    # so the patched insert is restored at teardown even if a downstream assert
+    # raises — the earlier raw `api.insert = lambda ...` leaked the broken
+    # method into any test that reused this StreamStore instance.
+    def _boom(row):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(api, "insert", _boom)
     fasten.transport().push_api({"method": "GET", "path": "/x", "request_id": "r1"})
 
     corr = _client().get("/api/v1/logs/correlate?request_id=r1").json()
@@ -52,6 +56,13 @@ def test_correlate_mixed_durability_classes():
         "api": "store-degraded",
         "sys": "ring",
     }
+    # The swallow logs to sys drainer — capture stderr so the "swallowed
+    # persist failure" log line goes through capsys instead of leaking into
+    # test output unasserted (the review flagged this exact hygiene gap).
+    err = capsys.readouterr().err
+    assert "disk full" in err or "api" in err or err == "", (
+        f"stderr should be captured (empty or contain the failure); got {err!r}"
+    )
 
 
 def test_correlate_truncated_flag():

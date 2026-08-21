@@ -12,9 +12,10 @@ from fasten.store.sqlite import SQLiteStore
 
 
 def _init():
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
+    # service_id / node_id are passed explicitly to fasten.init, so the
+    # earlier os.environ writes were dead code that leaked env across
+    # tests. Removed — the explicit kwargs are the sole configuration
+    # surface this test needs.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),

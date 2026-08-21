@@ -19,16 +19,19 @@ def mem_store():
 
 
 @pytest.fixture
-def initialized(mem_store):
+def initialized(mem_store, monkeypatch):
     """Initialised SDK with an in-memory store.
 
     Uses ``raise`` failure strategy so the legacy "emit then read store"
     test pattern stays synchronous. Tests that need to exercise the
     default ``queue`` drainer set the strategy explicitly.
-    """
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
+
+    Env vars are set via ``monkeypatch.setenv`` so pytest restores them
+    automatically at teardown — even if the test raises before the yield
+    return path can hand-restore them (the earlier ``del os.environ[...]``
+    would silently fail on that path)."""
+    monkeypatch.setenv("FASTEN_SERVICE_ID", "test-svc")
+    monkeypatch.setenv("FASTEN_NODE_ID", "test-node")
     import fasten
     fasten.init(
         service_id="test-svc",
@@ -37,8 +40,6 @@ def initialized(mem_store):
         audit_store_failure_strategy="raise",
     )
     yield fasten
-    del os.environ["FASTEN_SERVICE_ID"]
-    del os.environ["FASTEN_NODE_ID"]
 
 
 @pytest.fixture(scope="session", autouse=True)

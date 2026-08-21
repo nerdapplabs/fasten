@@ -23,9 +23,7 @@ def _client():
 
 
 def _init():
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
+    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
@@ -71,9 +69,7 @@ def test_correlate_reports_store_when_streams_persisted():
     """When api/sys persist, completeness flips and history is recoverable
     past the ring window — the historical-investigation use case."""
     from fasten.store.stream import StreamStore
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
+    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
@@ -119,9 +115,7 @@ def test_correlate_totals_count_store_history_and_audit():
     returned."""
     from fasten.context import with_request_id
     from fasten.store.stream import StreamStore
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
+    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),

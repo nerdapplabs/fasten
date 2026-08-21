@@ -23,10 +23,9 @@ def _client():
 
 
 def _init(**stores):
-    import os
-    os.environ["FASTEN_SERVICE_ID"] = "test-svc"
-    os.environ["FASTEN_NODE_ID"] = "test-node"
-    fasten.init(
+# service_id / node_id are passed explicitly to fasten.init below; the
+    # earlier os.environ writes were dead code that leaked env across tests.
+        fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
