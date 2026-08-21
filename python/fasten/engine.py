@@ -149,6 +149,14 @@ class Engine:
         self._atexit_registered = False
         self._last_init_at: Optional[datetime] = None
 
+        # Engine-side "at least one audit-store insert was swallowed" flag.
+        # Tracked here (not only on the store) because AuditRepository does
+        # not require ``note_write_failure``: an adopter-supplied store fails
+        # the getattr check below and the swallow would otherwise be
+        # invisible, leaving completeness reporting "store" over durable
+        # history that has holes. Sticky — a hole doesn't heal.
+        self._audit_write_swallowed: bool = False
+
         self.log: _Logger = _Logger(self)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -257,6 +265,9 @@ class Engine:
         self._audit_store = cfg.audit_store
         self._api_store   = cfg.api_store
         self._syslog_store = cfg.syslog_store
+        # Re-init on a fresh store clears the sticky degrade — a hole in the
+        # previous store's history doesn't apply to this one.
+        self._audit_write_swallowed = False
 
         if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
             # Seed seq from THIS engine's own (service_id, source_node_id)
@@ -433,7 +444,12 @@ class Engine:
                         self._audit_store.insert(row)
                     except Exception as e:  # noqa: BLE001
                         # Swallowed on the hot path → durable history now has a
-                        # hole; degrade the audit completeness flag.
+                        # hole; degrade the audit completeness flag. Set the
+                        # engine flag unconditionally (adopter stores may not
+                        # implement note_write_failure); also call the store's
+                        # notifier when present so store-side reporting is
+                        # accurate too.
+                        self._audit_write_swallowed = True
                         note = getattr(self._audit_store, "note_write_failure", None)
                         if callable(note):
                             note()
@@ -480,6 +496,13 @@ class Engine:
     def audit_store(self) -> Any:
         """Active AuditRepository, or None if init() has not been called."""
         return self._audit_store
+
+    def audit_write_swallowed(self) -> bool:
+        """True iff at least one audit-store insert was swallowed on the sync
+        fallback path since Engine construction. Sticky — durable history has
+        a hole that doesn't heal. See ``_audit_write_swallowed`` on the
+        engine and the /correlate + /logs completeness readers."""
+        return self._audit_write_swallowed
 
     def persisted_streams(self) -> frozenset[str]:
         """Streams backed by the durable store rather than a bounded ring

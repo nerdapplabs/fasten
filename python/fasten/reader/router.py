@@ -102,11 +102,17 @@ def router(
         """Audit durable history has known holes when either the audit store
         swallowed a persist failure (sync fallback path) or the drainer
         dead-lettered at least one row (async path). Unlike api/sys, audit
-        durability spans the store *and* the drainer, so both are consulted."""
+        durability spans the store *and* the drainer, so both are consulted.
+
+        The engine-side flag is checked even when the store itself doesn't
+        expose ``degraded`` (an adopter AuditRepository may not implement
+        ``note_write_failure`` — see engine._audit_write_swallowed)."""
+        from ..emitter import _default as _default_engine
+        if _default_engine.audit_write_swallowed():
+            return True
         s = _store()
         if s is not None and getattr(s, "degraded", False):
             return True
-        from ..emitter import _default as _default_engine
         stats = _default_engine.queue_stats()
         if stats and stats.get("dead_lettered_total", 0) > 0:
             return True

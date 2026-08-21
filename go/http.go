@@ -173,7 +173,14 @@ func (e *Engine) streamSource(stream string) string {
 // auditDegraded reports whether audit durable history has known holes: the
 // audit store swallowed a persist failure (sync fallback path) or the drainer
 // dead-lettered at least one row (async path).
+//
+// The engine-side flag is checked even when the store itself doesn't expose
+// Degraded (an adopter AuditRepository may not implement NoteWriteFailure —
+// see Engine.auditWriteSwallowed).
 func (e *Engine) auditDegraded() bool {
+	if e.auditWriteSwallowed.Load() {
+		return true
+	}
 	if d, ok := e.auditStore.(interface{ Degraded() bool }); ok && d.Degraded() {
 		return true
 	}

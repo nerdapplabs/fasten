@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 )
 
 // TestStoreDegradedStickyThroughSuccessfulWrite covers FR4-2: a store that has
@@ -131,3 +132,62 @@ func TestCorrelateTruncatedFlag(t *testing.T) {
 		t.Fatalf("limit=10: truncated.audit=%v, want false", body2["truncated"])
 	}
 }
+
+// TestAdopterAuditStoreDegradeThroughEngine (PR #59 finding 3):
+// AuditRepository does not require NoteWriteFailure — the sync-fallback
+// swallow used to be a no-op for adopter stores, so completeness kept
+// reporting "store" over durable history that had holes. The engine-side
+// auditWriteSwallowed flag must catch this case.
+func TestAdopterAuditStoreDegradeThroughEngine(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+
+	broken := &brokenAdopterAuditStore{}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: broken,
+		AuditStoreFailureStrategy: "queue"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// Uninstall the drainer so Emit takes the sync-fallback path.
+	Default.uninstallDrainer()
+
+	if Default.auditWriteSwallowed.Load() {
+		t.Fatal("swallow flag must start false")
+	}
+	if _, err := Emit(context.Background(), "USER_CREATED",
+		Target("u1"), Actor("tester", "service"), WithDetail(map[string]any{})); err != nil {
+		t.Fatalf("Emit: %v (should be swallowed on queue+no-drainer)", err)
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("swallow flag must be set after a swallowed insert")
+	}
+	// Reader must reflect the degrade via the engine flag, not any store hook.
+	body, _ := getJSON(t, NewReader(), "/audit?limit=1")
+	comp, _ := body["completeness"].(map[string]any)
+	if comp["audit"] != "store-degraded" {
+		t.Fatalf("audit completeness = %v, want store-degraded (engine flag)", comp["audit"])
+	}
+}
+
+// brokenAdopterAuditStore is an AuditRepository with no NoteWriteFailure
+// / Degraded — the documented adopter shape. Insert always fails.
+type brokenAdopterAuditStore struct{}
+
+func (*brokenAdopterAuditStore) Insert(context.Context, Row) error {
+	return errAdopterStoreDown
+}
+func (*brokenAdopterAuditStore) Query(context.Context, Filter) ([]Row, error) {
+	return nil, nil
+}
+func (*brokenAdopterAuditStore) ListUnshipped(context.Context, int) ([]Row, error) {
+	return nil, nil
+}
+func (*brokenAdopterAuditStore) MarkShipped(context.Context, []string) error { return nil }
+func (*brokenAdopterAuditStore) Purge(context.Context, time.Time, bool) (int, error) {
+	return 0, nil
+}
+
+var errAdopterStoreDown = errAdopterDown("adopter store down")
+
+type errAdopterDown string
+
+func (e errAdopterDown) Error() string { return string(e) }

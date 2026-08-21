@@ -48,6 +48,14 @@ type Engine struct {
 
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
+
+	// Engine-side "at least one audit-store insert was swallowed" flag.
+	// Tracked here (not only on the store) because AuditRepository does not
+	// require NoteWriteFailure: an adopter-supplied store fails the type
+	// assertion in the sync-fallback path and the swallow would otherwise be
+	// invisible, leaving completeness reporting "store" over durable history
+	// that has holes. Sticky — a hole doesn't heal.
+	auditWriteSwallowed atomic.Bool
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -108,6 +116,9 @@ func (e *Engine) Init(cfg Config) error {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
 	e.auditStore = cfg.AuditStore
+	// Re-init on a fresh store clears the sticky degrade — a hole in the
+	// previous store's history doesn't apply to this one.
+	e.auditWriteSwallowed.Store(false)
 
 	// Seed monotonic_seq from the store if it supports it, so post-restart
 	// rows never collide with pre-restart rows on (timestamp, seq). Scoped to
@@ -323,7 +334,11 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 			} else {
 				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;
-					// degrade the audit completeness flag.
+					// degrade the audit completeness flag. Set the engine flag
+					// unconditionally (adopter stores may not implement
+					// NoteWriteFailure); also call the store's notifier when
+					// present so store-side reporting is accurate too.
+					e.auditWriteSwallowed.Store(true)
 					if nwf, ok := e.auditStore.(interface{ NoteWriteFailure() }); ok {
 						nwf.NoteWriteFailure()
 					}
@@ -427,6 +442,7 @@ func (e *Engine) ResetForTests() {
 	e.searchEnabled = false
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
+	e.auditWriteSwallowed.Store(false)
 	e.hashMu.Lock()
 	e.prevHash = ""
 	e.hashMu.Unlock()
