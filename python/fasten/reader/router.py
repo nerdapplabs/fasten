@@ -64,7 +64,8 @@ def router(
             bounded ring. Drives the per-stream ``completeness`` flag on
             every read (``store`` vs ``ring``). Default: resolved per request
             from the live engine config (``fasten.persisted_streams()``) —
-            ``audit`` always, plus ``api``/``sys`` when a stream store is
+            ``audit`` when an audit store is attached (``ring`` on a
+            stdout-only engine), plus ``api``/``sys`` when a stream store is
             configured. Pass an explicit set to override.
     """
     try:

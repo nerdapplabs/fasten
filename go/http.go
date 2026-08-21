@@ -76,22 +76,25 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 
 // ── Reader ────────────────────────────────────────────────────────────────
 
-// NewReader returns an http.Handler bound to this Engine serving:
+// NewReader returns an http.Handler bound to this Engine's configuration
+// (stores, SearchEnabled, persisted streams), serving:
 //
-//	GET /sys               — syslog ring buffer
-//	GET /api               — api-log ring buffer
+//	GET /sys               — syslog ring / store (?q= search when enabled)
+//	GET /api               — api-log ring / store
 //	GET /audit             — audit store query (?request_id=, ?code=, ?domain=,
 //	                         ?since=, ?until=, ?limit=, ?after=<monotonic_seq>)
 //	GET /audit/doctor      — audit pipeline health
+//	GET /search            — cross-stream free-text search (sys-only in v1)
+//	GET /correlate         — request_id → merged audit/api/sys view
+//	GET /topology          — service_id → event aggregation
 //
 // SECURITY: these endpoints expose internal state (queue stats, init config,
-// raw audit rows). Mount them behind authentication middleware or restrict
-// them to internal network interfaces before exposing to untrusted callers.
+// raw audit rows, full log payloads). Mount them behind authentication
+// middleware or restrict them to internal network interfaces before exposing
+// to untrusted callers.
 //
 // Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
 // Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
-// NewReader returns an http.Handler serving the reader endpoints bound to this
-// engine's configuration (stores, SearchEnabled, persisted streams).
 //
 // Per-reader overrides (the equivalent of Python's router(persist_streams=,
 // search_enabled=, store=, transport=)) are achieved by binding the reader to a

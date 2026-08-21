@@ -3,7 +3,10 @@ package fasten
 import "encoding/json"
 
 // Redaction customization (parity with the Python SDK's FASTEN_REDACT_KEYS /
-// FASTEN_REDACT_REPLACEMENT and init params). Set once by Init/configureRedaction.
+// FASTEN_REDACT_REPLACEMENT and init params). These are process-global —
+// every Engine.Init reset them, so multi-tenant callers with more than one
+// Engine share (and race on) the same redact config. See the Engine-scoped
+// fields for the per-engine values RedactDetail actually consults.
 // Empty = use the core defaults (built-in patterns + "***"). Extra keys augment
 // the built-ins; they never replace them.
 var (

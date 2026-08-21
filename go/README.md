@@ -92,8 +92,11 @@ specific response lost rows. For `/correlate`, which caps each stream at
 in the backing source): `counts < totals` means the response is truncated —
 raise `limit` or page the per-stream endpoints.
 
-`audit` is always store-backed. `api`/`sys` are ring-only unless you attach a
-`StreamStore` via `Config.APIStore` / `Config.SyslogStore`; persistence is
+`audit` reports `store` when an audit store is attached (the default in
+production `fasten.Init(...)`) and `ring` when the SDK is running stdout-only
+without one — a stdout-only audit is honestly not a durable record, and
+`completeness` must reflect that. `api`/`sys` are ring-only unless you attach
+a `StreamStore` via `Config.APIStore` / `Config.SyslogStore`; persistence is
 write-through (one synchronous INSERT per pushed row — WAL +
 `synchronous=NORMAL`, so no per-commit fsync, but still a per-row disk write;
 set the pragma in your DSN so every pooled connection gets it).

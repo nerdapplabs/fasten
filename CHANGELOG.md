@@ -30,6 +30,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
   retention, and constrained-search contract.
 
+### Changed — Ring filter semantics now match the store (gh #58, Python)
+
+- `python/fasten/store/ring.py` filter comparisons switched from lax to strict
+  to match store behaviour (spec §4.2, and closes a real ring/store divergence):
+  - `level` is now case-sensitive (`level == "ERROR"` no longer matches `error`).
+  - `method` is now case-sensitive (`method == "GET"` no longer matches `get`).
+  - `path` now requires an exact match, not a substring (`path == "/users"` no
+    longer matches `/users/42`).
+- **Breaking for existing callers** who relied on the lax behaviour without
+  persistence attached. If a dashboard calls `/logs/sys?level=ERROR` and rows
+  were logged with `error`, or `/logs/api?path=/users` for prefix matches, the
+  query now returns zero rows. Uppercase/lowercase your query values to match
+  what the emitter writes, or switch to an indexed store-backed read.
+
 ### Fixed — Reader hardening (gh #58, Python + Go)
 
 - `/sys`, `/api`, `/audit`, `/correlate` reject a non-positive `limit` (a

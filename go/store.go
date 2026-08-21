@@ -285,6 +285,16 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	// Cursor pagination (canonical): newest-first, so paging forward means
 	// older rows — monotonic_seq < AfterSeq. Applied here, not in filterToSQL,
 	// so CountFiltered/total stays the full filtered count.
+	//
+	// Accepted limitation on multi-origin stores (A1 in PR #59 review): the
+	// query orders by (timestamp, monotonic_seq) but the cursor is
+	// monotonic_seq alone, which is a per-(service_id, source_node_id)
+	// counter (see the tie-breaker note below). Paging to exhaustion across
+	// rows from more than one origin can skip or repeat rows because a lower
+	// seq in origin B can appear at a newer timestamp than a higher seq in
+	// origin A. Single-origin stores are unaffected. A composite
+	// (timestamp, seq) cursor would fix this but changes the wire contract;
+	// keeping the simpler cursor is the deliberate call.
 	if f.AfterSeq > 0 {
 		if where == "" {
 			where = "WHERE monotonic_seq < ?"

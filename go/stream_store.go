@@ -11,31 +11,6 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver used by OpenStreamStore
 )
 
-// StreamStore is a durable, queryable backing for one ring-buffered stream
-// (api or sys). Unlike the audit store (typed Row + tamper-evident hash
-// chain), stream rows are schemaless maps produced by the logging/HTTP
-// shims. The full row is persisted as a JSON payload and the queryable
-// fields are duplicated into indexed columns, so the reader can filter by
-// request_id / time / structured fields against durable history instead of a
-// bounded ring.
-//
-// Table per stream — api and sys never share rows. Rows return newest-first,
-// reconstructed from the stored JSON payload, so a store read is equivalent
-// to a ring read in content and ordering. Note JSON decoding normalises
-// number types: all numbers decode to float64 (a ring read returns the
-// original int), so the value is JSON-equivalent, not type-identical.
-//
-// Write cost: persistence is write-through — every pushed row is one
-// synchronous INSERT in its own transaction, on the caller's thread. With
-// WAL + synchronous=NORMAL (set by migrate; see below) a commit is a WAL
-// append without a per-commit fsync, which keeps a hot api/sys stream
-// viable. Even so this is a per-row disk write: for very hot streams prefer
-// ring-only mode, or expect stream persistence to grow an async drainer in
-// a later phase (the audit path already has one).
-//
-// The caller imports the SQLite driver and opens the *sql.DB, exactly as for
-// NewSQLiteStore. SQLite-only in v1; a pluggable Postgres stream store is a
-// later phase.
 // StreamRepository is the durable backing for one ring-buffered stream
 // (api or sys). *StreamStore (SQLite) and *PostgresStreamStore both implement
 // it, so Config/Transport can hold either backend behind one type — mirroring
@@ -52,6 +27,31 @@ type StreamRepository interface {
 	Degraded() bool
 }
 
+// StreamStore is a durable, queryable SQLite backing for one ring-buffered
+// stream (api or sys). Unlike the audit store (typed Row + tamper-evident
+// hash chain), stream rows are schemaless maps produced by the logging/HTTP
+// shims. The full row is persisted as a JSON payload and the queryable
+// fields are duplicated into indexed columns, so the reader can filter by
+// request_id / time / structured fields against durable history instead of a
+// bounded ring.
+//
+// Table per stream — api and sys never share rows. Rows return newest-first,
+// reconstructed from the stored JSON payload, so a store read is equivalent
+// to a ring read in content and ordering. Note JSON decoding normalises
+// number types: all numbers decode to float64 (a ring read returns the
+// original int), so the value is JSON-equivalent, not type-identical.
+//
+// Write cost: persistence is write-through — every pushed row is one
+// synchronous INSERT in its own transaction, on the caller's thread. With
+// WAL + synchronous=NORMAL (set as DSN pragmas by OpenStreamStore) a commit
+// is a WAL append without a per-commit fsync, which keeps a hot api/sys
+// stream viable. Even so this is a per-row disk write: for very hot streams
+// prefer ring-only mode. An async drainer may land later as a follow-up if
+// benchmarks show write-through cost is the bottleneck (the audit path
+// already has one).
+//
+// The caller imports the SQLite driver and opens the *sql.DB, exactly as
+// for NewSQLiteStore. See *PostgresStreamStore for the Postgres backend.
 type StreamStore struct {
 	db    *sql.DB
 	table string
@@ -72,13 +72,6 @@ var streamIndexedFields = []string{
 	"event", "method", "path", "status",
 }
 
-// NewStreamStore creates and migrates a per-stream table, then returns the
-// store. tableName must be a plain SQL identifier (see validIdentifierRe).
-//
-// migrate sets PRAGMA synchronous=NORMAL, but that pragma is per-connection
-// and database/sql pools connections — set it in the DSN so every pooled
-// connection gets it (e.g. mattn/go-sqlite3: "file:app.db?_synchronous=NORMAL";
-// modernc.org/sqlite: "file:app.db?_pragma=synchronous(NORMAL)").
 // OpenStreamStore opens a SQLite-backed stream store from a DSN and migrates
 // it, setting WAL + synchronous=NORMAL as DSN pragmas so *every* pooled
 // connection gets them. This is the fix for NewStreamStore's caveat below: a
@@ -116,6 +109,16 @@ func streamPragmaDSN(dsn string) string {
 	return dsn + "?" + pragmas
 }
 
+// NewStreamStore creates and migrates a per-stream table on an
+// already-opened *sql.DB, then returns the store. tableName must be a plain
+// SQL identifier (see validIdentifierRe).
+//
+// Caveat: migrate sets PRAGMA synchronous=NORMAL, but that pragma is
+// per-connection and database/sql pools connections — set it in the DSN so
+// every pooled connection gets it (e.g. mattn/go-sqlite3:
+// "file:app.db?_synchronous=NORMAL"; modernc.org/sqlite:
+// "file:app.db?_pragma=synchronous(NORMAL)"). OpenStreamStore does this
+// automatically for the modernc driver.
 func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten StreamStore: tableName is required")
