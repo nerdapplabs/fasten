@@ -173,7 +173,11 @@ class PostgresStreamStore:
                     (
                         cols["request_id"], cols["timestamp"], cols["level"],
                         cols["service_id"], cols["event"], cols["method"],
-                        cols["path"], cols["status"], json.dumps(row, default=str),
+                        cols["path"], cols["status"],
+                        # ensure_ascii=False — see stream.py for why (parity
+                        # with Go's json.Marshal, otherwise q= over non-ASCII
+                        # text returns zero matches).
+                        json.dumps(row, default=str, ensure_ascii=False),
                     ),
                 )
             conn.commit()

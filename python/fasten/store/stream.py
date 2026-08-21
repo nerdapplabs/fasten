@@ -136,7 +136,15 @@ class StreamStore:
                 (
                     cols["request_id"], cols["timestamp"], cols["level"],
                     cols["service_id"], cols["event"], cols["method"],
-                    cols["path"], cols["status"], json.dumps(row, default=str),
+                    cols["path"], cols["status"],
+                    # ensure_ascii=False keeps non-ASCII characters as UTF-8
+                    # bytes in the JSON payload instead of \uXXXX escapes.
+                    # With escapes, search(q="prüfung") returns zero matches
+                    # against a row containing "prüfung" while the ASCII half
+                    # of the same row matches fine — and Go's json.Marshal
+                    # (the sibling SDK sharing the table) never escapes, so a
+                    # mixed-writer table would return different rows per SDK.
+                    json.dumps(row, default=str, ensure_ascii=False),
                 ),
             )
             conn.commit()

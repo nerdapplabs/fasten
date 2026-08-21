@@ -144,6 +144,27 @@ def test_sys_q_param_gated_and_bounded():
     assert "since" in no_since["error"]
 
 
+def test_search_non_ascii_utf8(tmp_path):
+    """PR #59 finding 7: json.dumps default ensure_ascii=True stored 'café'
+    as '\\u00e9'; a search for the raw UTF-8 substring returned zero.
+    ensure_ascii=False keeps the row bytes queryable and matches Go's
+    json.Marshal, which never escapes."""
+    _init(search=True)
+    t = fasten.transport()
+    t.push_syslog({"event": "de.prüfung.failed", "message": "Prüfung fehlgeschlagen",
+                   "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-de"})
+    t.push_syslog({"event": "fr.café.opened",
+                   "timestamp": "2026-08-01T00:00:01Z", "request_id": "r-fr"})
+    # Substring q= over the UTF-8 payload must match; with ensure_ascii=True
+    # the store held '\\u00fc' / '\\u00e9', so these q= values missed.
+    for q, expected_rid in (("prüfung", "r-de"), ("café", "r-fr")):
+        body = _client().get(
+            "/api/v1/logs/search", params={"q": q, "since": SINCE}
+        ).json()
+        assert body["counts"]["sys"] == 1, f"non-ASCII q={q!r}: {body}"
+        assert body["matches"][0]["request_id"] == expected_rid
+
+
 def test_sys_q_param_rejects_structured_filter_combination():
     """PR #59 finding 6: /sys?q=... combined with a structured filter
     (level/request_id/service_id/event) must 400, not silently discard the
