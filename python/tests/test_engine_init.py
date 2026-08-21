@@ -11,7 +11,6 @@ import pytest
 
 import fasten
 from fasten.emitter import _default
-from fasten.store.sqlite import SQLiteStore
 
 
 # ── init() error paths ────────────────────────────────────────────────────

@@ -16,7 +16,6 @@ from __future__ import annotations
 import dataclasses
 from datetime import datetime, timezone
 
-import fasten
 from fasten import AuditRow, Engine, verify_chain
 from fasten.engine import _row_hash
 from fasten.store.sqlite import SQLiteStore

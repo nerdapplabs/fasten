@@ -1,6 +1,5 @@
 """RingBuffer: capacity, push order, query filters, thread-safety."""
 import threading
-import pytest
 from fasten.store.ring import RingBuffer
 from fasten.transport.stdout import StdoutTransport
 

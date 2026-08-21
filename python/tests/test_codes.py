@@ -33,7 +33,7 @@ def test_duplicate_code_raises():
 def test_dump_format():
     output = dump()
     lines = output.strip().splitlines()
-    assert any(l.startswith("USER_CREATED,") for l in lines)
+    assert any(ln.startswith("USER_CREATED,") for ln in lines)
     for line in lines:
         parts = line.split(",")
         assert len(parts) == 3, f"expected id,domain,severity got: {line!r}"

@@ -1,7 +1,6 @@
 """Tests for fasten.shim.http — RequestIDMiddleware + APILogger."""
 import asyncio
 
-import pytest
 
 import fasten
 from fasten.shim.http import APILogger, RequestIDMiddleware

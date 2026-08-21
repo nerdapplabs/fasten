@@ -9,7 +9,6 @@ Two runtime behaviours, all verified here:
 """
 import logging
 
-import pytest
 
 import fasten
 from fasten.codes import Meta, RetentionClass, Severity, _registry, register

@@ -5,7 +5,6 @@ Covers:
   #2 — fasten.shim.stdlib.LoggingHandler standalone + recursion guard
   #3 — fasten.log.bound(name, **fields)
 """
-import importlib
 import logging
 
 import pytest

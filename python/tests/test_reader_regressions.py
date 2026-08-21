@@ -13,7 +13,6 @@ import pytest
 import fasten
 from fasten.context import is_sentinel, with_request_id
 from fasten.store.sqlite import SQLiteStore
-from fasten.store.stream import StreamStore
 
 
 def _client():

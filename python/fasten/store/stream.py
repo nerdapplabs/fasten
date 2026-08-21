@@ -34,7 +34,7 @@ import json
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

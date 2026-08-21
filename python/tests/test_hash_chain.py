@@ -4,9 +4,8 @@ import hashlib
 import json
 import re
 
-import pytest
 import fasten
-from fasten import verify_chain, ChainVerifyResult
+from fasten import verify_chain
 from fasten.engine import _row_hash
 
 
@@ -125,7 +124,6 @@ def test_verify_chain_from_store(initialized, mem_store):
 # ── Re-init seeds prev_hash correctly ─────────────────────────────────────────
 
 def test_reinit_seeds_prev_hash_from_store(mem_store, monkeypatch):
-    import os
     monkeypatch.setenv("FASTEN_SERVICE_ID", "svc-chain")
     monkeypatch.setenv("FASTEN_NODE_ID", "node-chain")
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from ..canonical_ts import canonical_now, canonical_ts

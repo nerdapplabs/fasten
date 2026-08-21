@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .attrs import AuditRow
-from .canonical_ts import canonical_now, canonical_ts, parse_canonical_or_legacy
+from .canonical_ts import canonical_now, parse_canonical_or_legacy
 from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_chain
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
