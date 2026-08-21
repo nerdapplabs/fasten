@@ -106,12 +106,41 @@ class PostgresStreamStore:
         return conn
 
     def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
+        """Run fn(conn) once; on stale-connection error reconnect and retry once.
+
+        Whether fn returns or raises, release any transaction it left open so the
+        connection is never parked holding locks. A write fn ``commit()``s itself
+        (leaving the connection IDLE — untouched here). A read fn runs a bare
+        ``SELECT`` and returns, leaving the connection *idle in transaction*
+        (INTRANS); a read that *raises* (e.g. a bad column during a concurrent
+        ``ALTER``) leaves it INERROR — both still hold any lock the statement
+        took (``ACCESS SHARE``) until the transaction ends, and INERROR also
+        poisons the connection for reuse.
+
+        Without this guard, a non-Operational error in a write fn (e.g.
+        ``UndefinedTable``, ``NotNullViolation``) is swallowed one level up,
+        leaves the thread-local connection ``INERROR``, and every subsequent
+        statement raises ``InFailedSqlTransaction`` — which is
+        ``psycopg.InternalError``, **not** ``OperationalError`` — so the
+        reconnect branch never fires. Every api/sys row on that thread then
+        fails to persist forever while the flag stays green. Mirrors
+        ``PostgresStore._execute_with_retry`` in ``postgres.py``."""
         import psycopg
 
+        def _call(conn: Any) -> Any:
+            try:
+                return fn(conn)
+            finally:
+                if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+                    try:
+                        conn.rollback()
+                    except (psycopg.OperationalError, psycopg.InterfaceError):
+                        pass  # dead conn; don't mask the in-flight error
+
         try:
-            return fn(self._connect())
+            return _call(self._connect())
         except (psycopg.OperationalError, psycopg.InterfaceError):
-            return fn(self._connect_fresh())
+            return _call(self._connect_fresh())
 
     def close(self) -> None:
         conn = getattr(self._tls, "conn", None)
