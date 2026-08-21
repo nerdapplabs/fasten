@@ -95,6 +95,27 @@ func TestPostgresStreamStore_Parity(t *testing.T) {
 		t.Errorf("search escape: %v", esc)
 	}
 
+	// PR #59 test-coverage gap: the ESCAPE E'\\' construction that spec §9
+	// singles out is exercised only for % — but Postgres LIKE treats _ as a
+	// single-char wildcard, and \ becomes a metacharacter under that ESCAPE
+	// clause. If the query for either isn't escaped, they match too much.
+	must(t, s.Insert(map[string]any{"event": "a_b", "timestamp": "2026-08-01T00:00:07Z", "request_id": "r-u1"}))
+	must(t, s.Insert(map[string]any{"event": "aXb", "timestamp": "2026-08-01T00:00:08Z", "request_id": "r-u2"}))
+	uh, err := s.Search("a_b", "2026-01-01T00:00:00Z", "", 50)
+	must(t, err)
+	if len(uh) != 1 || uh[0]["request_id"] != "r-u1" {
+		t.Errorf("search underscore literal: got %v, want only r-u1 (aXb must not match a_b)", uh)
+	}
+	// event c\d stored in the JSON payload as c\\d; q= must match backslash
+	// as data, not consume the following char as an escape.
+	must(t, s.Insert(map[string]any{"event": "c\\d", "timestamp": "2026-08-01T00:00:09Z", "request_id": "r-bs"}))
+	must(t, s.Insert(map[string]any{"event": "cXd", "timestamp": "2026-08-01T00:00:10Z", "request_id": "r-bs2"}))
+	bh, err := s.Search("c\\d", "2026-01-01T00:00:00Z", "", 50)
+	must(t, err)
+	if len(bh) != 1 || bh[0]["request_id"] != "r-bs" {
+		t.Errorf("search backslash literal: got %v, want only r-bs (cXd must not match c\\d)", bh)
+	}
+
 	// degraded flag
 	if s.Degraded() {
 		t.Error("degraded should start false")

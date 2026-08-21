@@ -79,6 +79,29 @@ def test_search_case_insensitive_and_escape(store):
     assert {r["request_id"] for r in esc} == {"r-w"}  # literal %, not a wildcard
 
 
+def test_search_escapes_underscore_and_backslash(store):
+    """PR #59 test-coverage gap: Postgres LIKE treats _ as a single-char
+    wildcard and \\ as the escape metacharacter under ESCAPE E'\\\\'. The
+    existing suite only tested %, so a regression in the _ / \\ escape path
+    would ship."""
+    store.insert({"event": "a_b", "timestamp": "2026-08-01T00:00:07Z", "request_id": "r-u1"})
+    store.insert({"event": "aXb", "timestamp": "2026-08-01T00:00:08Z", "request_id": "r-u2"})
+    uh = store.search(q="a_b", since="2026-01-01T00:00:00Z")
+    assert {r["request_id"] for r in uh} == {"r-u1"}, (
+        f"underscore must be a literal, not a single-char wildcard; got {uh}"
+    )
+    # event c\d (one real backslash) → JSON payload has "c\\d" (two chars, per
+    # JSON string encoding). To find it via LIKE the query needs to match the
+    # payload bytes, so pass "c\\\\d" here (Python source → two backslashes).
+    # Same shape as the existing test_search_backslash_escaped test.
+    store.insert({"event": "c\\d", "timestamp": "2026-08-01T00:00:09Z", "request_id": "r-bs"})
+    store.insert({"event": "cXd", "timestamp": "2026-08-01T00:00:10Z", "request_id": "r-bs2"})
+    bh = store.search(q="c\\\\d", since="2026-01-01T00:00:00Z")
+    assert {r["request_id"] for r in bh} == {"r-bs"}, (
+        f"backslash must be a literal, not consume the next char; got {bh}"
+    )
+
+
 def test_degraded_flag(store):
     assert store.degraded is False
     store.note_write_failure()

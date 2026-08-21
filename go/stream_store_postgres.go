@@ -31,10 +31,14 @@ type PostgresStreamStore struct {
 }
 
 // NewPostgresStreamStore validates the table name, ensures the schema/table and
-// indexes exist, and returns a ready store. Default table "syslog".
+// indexes exist, and returns a ready store. tableName is required — earlier
+// versions defaulted to "syslog" when empty, so a caller wiring an API stream
+// with a blank name silently landed api rows in the syslog table (PR #59
+// test-coverage gap). Pass "api_log" / "syslog" (or whatever you choose)
+// explicitly.
 func NewPostgresStreamStore(db *sql.DB, tableName string) (*PostgresStreamStore, error) {
 	if tableName == "" {
-		tableName = "syslog"
+		return nil, fmt.Errorf("fasten: stream table name is required (was empty)")
 	}
 	if !validPgIdentifierRe.MatchString(tableName) {
 		return nil, fmt.Errorf("fasten: invalid stream table name %q", tableName)
