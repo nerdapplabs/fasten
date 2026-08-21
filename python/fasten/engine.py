@@ -89,18 +89,35 @@ def _store_from_dsn(dsn: str) -> Any:
     return SQLiteStore.from_dsn(dsn)
 
 
+_STREAM_DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
+
+
 def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
-    """Build a per-stream store (api/sys) from a DSN. SQLite and Postgres are
-    both supported: a ``postgres[ql]://`` DSN builds a PostgresStreamStore, any
-    other builds the SQLite-backed StreamStore."""
+    """Build a per-stream store (api/sys) from a DSN. Explicit scheme whitelist:
+
+    - ``postgres://`` / ``postgresql://`` → PostgresStreamStore
+    - ``sqlite:///path`` or bare path → SQLite-backed StreamStore
+
+    Any other scheme (e.g. ``postgresql+psycopg://``, ``mysql://``) is rejected
+    with a clear error. The earlier fall-through accepted every scheme and
+    silently created a local SQLite file named after the DSN's path component
+    (``postgresql+psycopg://host/db`` → SQLite file ``db``), asserting
+    durability over an ephemeral container file — PR #59 finding 11."""
     from urllib.parse import parse_qs, urlparse
 
-    if dsn.startswith(("postgres://", "postgresql://")):
+    u = urlparse(dsn)
+    scheme = u.scheme.lower()
+    if scheme not in _STREAM_DSN_SCHEMES:
+        raise ValueError(
+            f"fasten: stream DSN scheme {scheme!r} not supported "
+            f"(dsn={dsn!r}). Use sqlite:///./streams.db, postgres://..., or a "
+            "bare filesystem path."
+        )
+    if scheme in ("postgres", "postgresql"):
         from .store.stream_postgres import PostgresStreamStore
         return PostgresStreamStore.from_dsn(dsn, default_table)
     from .store.stream import StreamStore
 
-    u = urlparse(dsn)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     # SQLAlchemy-style sqlite paths: strip only the single URL-separator slash,
     # not every leading slash. sqlite:///rel.db -> rel.db (relative);

@@ -77,6 +77,22 @@ def test_stream_store_from_dsn_preserves_absolute_path(tmp_path):
     assert getattr(s2, "path", getattr(s2, "_path", None)) == "rel.db"
 
 
+# PR #59 finding 11: reject unknown DSN schemes rather than silently opening
+# a local SQLite file named after the DSN's path component. Any of these
+# used to create a container-local file that reads then reports
+# completeness=store — durability asserted over an ephemeral file.
+def test_stream_store_dsn_rejects_unknown_schemes():
+    import pytest as _pytest
+    from fasten.engine import _stream_store_from_dsn
+    for dsn in (
+        "postgresql+psycopg://host/db",   # SQLAlchemy dialect form
+        "mysql://host/logs",              # wrong database entirely
+        "redis://host/0",                 # completely unrelated
+    ):
+        with _pytest.raises(ValueError, match="scheme"):
+            _stream_store_from_dsn(dsn, "api_log")
+
+
 # ── M4 ────────────────────────────────────────────────────────────────────
 def test_stamp_request_id_non_string_becomes_sentinel():
     from fasten.transport.stdout import StdoutTransport

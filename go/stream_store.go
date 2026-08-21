@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -86,11 +87,15 @@ var streamIndexedFields = []string{
 // who already own a *sql.DB, should use NewStreamStore(db, tableName) and set
 // the per-connection pragma in their own DSN.
 func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
-	db, err := sql.Open("sqlite", streamPragmaDSN(dsn))
+	path, table, err := parseStreamDSN(dsn, tableName)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", streamPragmaDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("fasten StreamStore open: %w", err)
 	}
-	s, err := NewStreamStore(db, tableName)
+	s, err := NewStreamStore(db, table)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -107,6 +112,49 @@ func streamPragmaDSN(dsn string) string {
 		return dsn + "&" + pragmas
 	}
 	return dsn + "?" + pragmas
+}
+
+// parseStreamDSN normalises a caller-provided DSN into (fs path for modernc
+// sqlite, table override, err). Accepts:
+//   - bare filesystem path: "./streams.db"
+//   - sqlite URL: "sqlite:///./rel.db" (three slashes = relative),
+//     "sqlite:////abs/path.db" (four = absolute)
+//   - "?table=X" query param to override the default table on either form
+//
+// Fixes PR #59 finding 11: earlier code passed the raw DSN through to
+// sql.Open("sqlite", ...) which fails to open sqlite:/// URLs and silently
+// ignored ?table= — Python's own error message recommends sqlite:///, so
+// the two SDKs disagreed on the same DSN.
+func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
+	table := defaultTable
+	path := dsn
+	if strings.HasPrefix(dsn, "sqlite:") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", "", fmt.Errorf("fasten StreamStore: invalid sqlite DSN %q: %w", dsn, err)
+		}
+		path = u.Path
+		// URL-encoded path strips only the single URL-separator slash:
+		// sqlite:///rel.db → "/rel.db" → "rel.db" (relative);
+		// sqlite:////abs.db → "//abs.db" → "/abs.db" (absolute).
+		if strings.HasPrefix(path, "/") {
+			path = path[1:]
+		}
+		if t := u.Query().Get("table"); t != "" {
+			table = t
+		}
+	} else if strings.Contains(dsn, "://") {
+		// A URL-shaped DSN that isn't sqlite:// — likely a Postgres/MySQL DSN
+		// that shouldn't have reached here. Reject rather than treating as a
+		// filesystem path (the SQLite driver would fail confusingly).
+		return "", "", fmt.Errorf(
+			"fasten StreamStore: DSN scheme not supported for SQLite backend "+
+				"(dsn=%q). Use sqlite:///./path.db or a bare filesystem path.", dsn)
+	}
+	if path == "" {
+		return "", "", fmt.Errorf("fasten StreamStore: DSN %q has no path", dsn)
+	}
+	return path, table, nil
 }
 
 // NewStreamStore creates and migrates a per-stream table on an
