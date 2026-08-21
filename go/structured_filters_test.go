@@ -73,3 +73,73 @@ func TestStructuredFilters_StoreAgreesWithRing(t *testing.T) {
 		t.Errorf("persisted api since window: got %v", body["rows"])
 	}
 }
+
+// TestRingStatusNumericCompare_ParityWithStore (PR #59 finding 5): the ring
+// used fmt.Sprint(row["status"]) != q.Status — string equality that returns
+// zero rows for ?status=0502 against integer 502. Both stores compare
+// numerically (SQLite affinity, Postgres strconv.Atoi), so enabling
+// persistence silently changed query results. Pin the numeric compare.
+func TestRingStatusNumericCompare_ParityWithStore(t *testing.T) {
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	seedFilterRows(GetTransport())
+	h := NewReader()
+
+	// The seed pushes status=502 (int). Query with leading-zero equivalent,
+	// exact numeric string, and plain int-form — all three must match the
+	// same row, and none should return zero.
+	for _, q := range []string{"?status=502", "?status=0502", "?status=00502"} {
+		body, _ := getJSON(t, h, "/api"+q)
+		rows, _ := body["rows"].([]any)
+		if len(rows) != 1 || rows[0].(map[string]any)["path"] != "/checkout" {
+			t.Errorf("ring /api%s got %v (want the status=502 row)", q, body["rows"])
+		}
+	}
+	// Genuine mismatch still returns zero.
+	body, _ := getJSON(t, h, "/api?status=418")
+	if rows, _ := body["rows"].([]any); len(rows) != 0 {
+		t.Errorf("status=418 should not match: %v", body["rows"])
+	}
+	// Non-numeric status query stays defensible (no crash, no bogus match).
+	body, _ = getJSON(t, h, "/api?status=abc")
+	if rows, _ := body["rows"].([]any); len(rows) != 0 {
+		t.Errorf("status=abc should not match numeric rows: %v", body["rows"])
+	}
+}
+
+// TestStructuredFilters_RingAndStoreAgree (PR #59 test-coverage gap):
+// run the same query on ring-only and persisted, assert the row set matches.
+// The earlier suite tested each in isolation, so the ring/store status
+// divergence shipped.
+func TestStructuredFilters_RingAndStoreAgree(t *testing.T) {
+	// Ring-only pass.
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+		t.Fatalf("Init(ring): %v", err)
+	}
+	seedFilterRows(GetTransport())
+	ringBody, _ := getJSON(t, NewReader(), "/api?status=0502")
+	ringRows, _ := ringBody["rows"].([]any)
+
+	// Persisted pass.
+	resetGlobals(t)
+	adb, _ := sql.Open("sqlite", ":memory:")
+	t.Cleanup(func() { adb.Close() })
+	apiStore, _ := NewStreamStore(adb, "api_log")
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", APIStore: apiStore}); err != nil {
+		t.Fatalf("Init(store): %v", err)
+	}
+	seedFilterRows(GetTransport())
+	storeBody, _ := getJSON(t, NewReader(), "/api?status=0502")
+	storeRows, _ := storeBody["rows"].([]any)
+
+	if len(ringRows) != len(storeRows) {
+		t.Fatalf("ring/store row count diverges for ?status=0502: ring=%d store=%d",
+			len(ringRows), len(storeRows))
+	}
+	if len(ringRows) == 0 {
+		t.Fatal("both returned zero rows — the seed row status=502 should match ?status=0502 on both paths")
+	}
+}

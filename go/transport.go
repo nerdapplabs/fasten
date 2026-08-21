@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 )
 
@@ -330,7 +331,7 @@ func (t *Transport) QueryAPI(limit int, q StreamQuery) ([]APIRow, error) {
 		if q.RequestID != "" && r["request_id"] != q.RequestID {
 			continue
 		}
-		if q.Status != "" && fmt.Sprint(r["status"]) != q.Status {
+		if q.Status != "" && !statusEquals(r["status"], q.Status) {
 			continue
 		}
 		if !inWindow(tsOf(r), q.Since, q.Until) {
@@ -367,7 +368,7 @@ func (t *Transport) CountAPI(q StreamQuery) (int, error) {
 		if q.RequestID != "" && r["request_id"] != q.RequestID {
 			continue
 		}
-		if q.Status != "" && fmt.Sprint(r["status"]) != q.Status {
+		if q.Status != "" && !statusEquals(r["status"], q.Status) {
 			continue
 		}
 		if !inWindow(tsOf(r), q.Since, q.Until) {
@@ -376,4 +377,32 @@ func (t *Transport) CountAPI(q StreamQuery) (int, error) {
 		n++
 	}
 	return n, nil
+}
+
+// statusEquals compares a ring row's status to a query string. It matches the
+// stores' numeric-first policy — "0502" == 502 == "502" — so a store read and
+// a ring read return the same rows (spec §4). A plain fmt.Sprint(row) != query
+// string compare (the earlier ring behaviour) diverges from every store: SQLite
+// affinity coerces "502" and 502 both to INTEGER 502, and PostgresStreamStore
+// parses the query string with strconv.Atoi. If either side isn't a valid int,
+// fall back to string equality so odd values still get a defensible answer.
+func statusEquals(rowStatus any, queryStatus string) bool {
+	qi, qerr := strconv.Atoi(queryStatus)
+	switch v := rowStatus.(type) {
+	case int:
+		return qerr == nil && v == qi
+	case int64:
+		return qerr == nil && v == int64(qi)
+	case float64:
+		return qerr == nil && int(v) == qi
+	case string:
+		if qerr == nil {
+			if ri, err := strconv.Atoi(v); err == nil {
+				return ri == qi
+			}
+		}
+		return v == queryStatus
+	default:
+		return fmt.Sprint(rowStatus) == queryStatus
+	}
 }
