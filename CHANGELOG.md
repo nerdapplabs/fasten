@@ -9,7 +9,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 
 - **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),
-  write-through behind the ring, with per-stream retention (`purge(before=…)`).
+  write-through behind the ring, with per-stream retention (`purge(before=…)`)
+  and a background retention loop that calls purge on a schedule when
+  `retention_api` / `retention_syslog` (config or env `FASTEN_RETENTION_API`
+  / `FASTEN_RETENTION_SYSLOG`) is set — durations like `"7d"` / `"24h"`.
 - **FR2 correlation** — `GET /logs/correlate?request_id=X` fans out to
   audit + api + sys in one call, with `counts`/`totals` truncation signalling.
 - **FR3 search (constrained)** — `GET /logs/search` and a gated `q=` on

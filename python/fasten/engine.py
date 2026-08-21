@@ -71,6 +71,10 @@ class FastenConfig:
     queue_retry_jitter: bool
     queue_drain_max_attempts: int
     search_enabled: bool
+    # FR1 retention (spec §1): background age-based purge on api/sys stream
+    # stores. None disables. Strings are duration tokens ("7d", "24h").
+    retention_api: Optional[str]
+    retention_syslog: Optional[str]
 
 
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
@@ -174,6 +178,11 @@ class Engine:
         # history that has holes. Sticky — a hole doesn't heal.
         self._audit_write_swallowed: bool = False
 
+        # FR1 retention (spec §1). One shutdown event + one thread per
+        # configured stream. See fasten.retention.start_purger.
+        self._retention_stop: threading.Event = threading.Event()
+        self._retention_threads: list[threading.Thread] = []
+
         self.log: _Logger = _Logger(self)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -196,6 +205,8 @@ class Engine:
         queue_retry_jitter: bool = True,
         queue_drain_max_attempts: int = 50,
         search_enabled: bool = False,
+        retention_api: Optional[str] = None,
+        retention_syslog: Optional[str] = None,
     ) -> FastenConfig:
         """Resolve all parameters and environment variables into a FastenConfig.
 
@@ -254,6 +265,11 @@ class Engine:
         env_search = os.environ.get("FASTEN_SEARCH_ENABLED")
         search_on = search_enabled or (env_search or "").lower() in ("1", "true", "yes")
 
+        # FR1 retention (§1). Env overrides the arg if arg is None; env
+        # empty-string counts as unset.
+        ret_api = retention_api if retention_api is not None else (os.environ.get("FASTEN_RETENTION_API") or None)
+        ret_sys = retention_syslog if retention_syslog is not None else (os.environ.get("FASTEN_RETENTION_SYSLOG") or None)
+
         return FastenConfig(
             service_id=svc,
             node_id=node,
@@ -271,11 +287,18 @@ class Engine:
             queue_retry_jitter=queue_retry_jitter,
             queue_drain_max_attempts=queue_drain_max_attempts,
             search_enabled=search_on,
+            retention_api=ret_api,
+            retention_syslog=ret_sys,
         )
 
     def start(self, cfg: FastenConfig) -> None:
         """Wire runtime from a resolved FastenConfig. Idempotent — safe to call
         on re-configuration; flushes and stops the previous drainer first."""
+        # Stop any previous retention threads before re-wiring — otherwise a
+        # re-Init on the same Engine leaves orphan purgers hammering the old
+        # store (which may already be closed).
+        self._stop_retention_threads()
+
         self._service_id = cfg.service_id
         self._node_id    = cfg.node_id
         self._tenant_id  = cfg.tenant_id
@@ -338,7 +361,52 @@ class Engine:
             )
         else:
             self._uninstall_drainer()
+
+        # FR1 retention (§1). Only when a store is attached AND a retention
+        # is set; running a background purger over a nil store is a no-op
+        # that would still hit disk on a bare ring-only engine.
+        self._start_retention_threads(
+            api_ret=cfg.retention_api, sys_ret=cfg.retention_syslog,
+        )
         self._last_init_at = datetime.now(timezone.utc)
+
+    def _start_retention_threads(
+        self, *, api_ret: Optional[str], sys_ret: Optional[str],
+    ) -> None:
+        """Spawn one purger thread per configured (store, retention) pair.
+        Called from start(); the previous set has already been stopped."""
+        from .retention import parse_duration, start_purger
+
+        # Fresh event for this generation of threads so old wait() calls on
+        # a re-Init don't return prematurely on the new event.
+        self._retention_stop = threading.Event()
+
+        def _log_err(stream: str, e: Exception) -> None:
+            self._drainer_sys_log("error", "retention_purge_failed", {
+                "stream": stream, "error": f"{type(e).__name__}: {e}",
+            })
+
+        for stream, store, dur_s in (
+            ("api", self._api_store, api_ret),
+            ("sys", self._syslog_store, sys_ret),
+        ):
+            if store is None or not dur_s:
+                continue
+            retention = parse_duration(dur_s)   # raises early on malformed input
+            t = start_purger(
+                store=store, stream=stream, retention=retention,
+                stop_event=self._retention_stop, on_error=_log_err,
+            )
+            self._retention_threads.append(t)
+
+    def _stop_retention_threads(self) -> None:
+        """Wake and join every purger thread. Idempotent."""
+        if not self._retention_threads:
+            return
+        self._retention_stop.set()
+        for t in self._retention_threads:
+            t.join(timeout=2.0)
+        self._retention_threads = []
 
     def init(
         self,
@@ -358,6 +426,8 @@ class Engine:
         queue_retry_jitter: bool = True,
         queue_drain_max_attempts: int = 50,
         search_enabled: bool = False,
+        retention_api: str | None = None,
+        retention_syslog: str | None = None,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(
@@ -370,6 +440,7 @@ class Engine:
             queue_retry_max_ms=queue_retry_max_ms, queue_retry_jitter=queue_retry_jitter,
             queue_drain_max_attempts=queue_drain_max_attempts,
             search_enabled=search_enabled,
+            retention_api=retention_api, retention_syslog=retention_syslog,
         ))
 
     # ── Emit ──────────────────────────────────────────────────────────────
@@ -700,6 +771,7 @@ class Engine:
         if handle is not None:
             _ffi.drainer_flush(handle, 5_000)
         self._uninstall_drainer()
+        self._stop_retention_threads()
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────

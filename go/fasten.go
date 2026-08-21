@@ -490,6 +490,14 @@ type Config struct {
 	QueueRetryMax             time.Duration // default 60 * time.Second
 	DisableQueueJitter        bool          // zero (default) = jitter ON
 	QueueDrainMaxAttempts     int           // default 50; row → DLQ after this many failures
+
+	// FR1 retention (spec §1): background age-based purge on the api/sys
+	// stream stores. Zero disables. Also read from FASTEN_RETENTION_API and
+	// FASTEN_RETENTION_SYSLOG when the field is zero (values there are
+	// duration tokens like "7d" / "24h", parsed by time.ParseDuration with
+	// day support). Runs the first purge on Init, then every hour.
+	RetentionAPI    time.Duration
+	RetentionSyslog time.Duration
 }
 
 // Init configures fasten. Delegates to Default.Init.

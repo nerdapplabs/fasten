@@ -66,6 +66,11 @@ type Engine struct {
 	redactMu            sync.RWMutex
 	redactExtraKeysJSON string
 	redactReplacement   string
+
+	// FR1 retention (spec §1) — cancel func for every purger goroutine
+	// spawned on this Engine. Init stops the previous set before wiring the
+	// new one; ResetForTests + shutdown stop unconditionally.
+	retentionCancel context.CancelFunc
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -248,6 +253,73 @@ func (e *Engine) Init(cfg Config) error {
 		)
 	} else {
 		e.uninstallDrainer()
+	}
+
+	// FR1 retention (§1). Env-var overrides zero-valued fields.
+	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startRetention stops any previous purgers and spawns fresh ones for every
+// stream that has both a store attached AND a positive retention (either
+// from Config or the env-var override). Empty / invalid env values are a
+// hard Init error rather than a silent fall-through — an operator who set
+// FASTEN_RETENTION_SYSLOG=foo needs to hear about it, not have their
+// history grow forever behind a green completeness flag.
+func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
+	// Env override: only when Config was zero. Empty env = disabled.
+	if apiRet == 0 {
+		if s := envOr("FASTEN_RETENTION_API", ""); s != "" {
+			d, err := parseRetentionDuration(s)
+			if err != nil {
+				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_API: %w", err)
+			}
+			apiRet = d
+		}
+	}
+	if sysRet == 0 {
+		if s := envOr("FASTEN_RETENTION_SYSLOG", ""); s != "" {
+			d, err := parseRetentionDuration(s)
+			if err != nil {
+				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_SYSLOG: %w", err)
+			}
+			sysRet = d
+		}
+	}
+
+	// Stop any previous generation before starting a new one — a re-Init on
+	// the same Engine leaves an orphan goroutine hammering the old store
+	// otherwise.
+	if e.retentionCancel != nil {
+		e.retentionCancel()
+		e.retentionCancel = nil
+	}
+
+	// Nothing configured on either stream → no goroutine.
+	if (apiRet == 0 || e.apiStore == nil) && (sysRet == 0 || e.syslogStore == nil) {
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.retentionCancel = cancel
+	onErr := func(stream string, err error) {
+		e.drainerSysLog("error", "retention_purge_failed", map[string]any{
+			"stream": stream, "error": err.Error(),
+		})
+	}
+	if apiRet > 0 && e.apiStore != nil {
+		startPurger(ctx, retentionParams{
+			stream: "api", store: e.apiStore, retention: apiRet,
+			checkInterval: time.Hour, onError: onErr,
+		})
+	}
+	if sysRet > 0 && e.syslogStore != nil {
+		startPurger(ctx, retentionParams{
+			stream: "sys", store: e.syslogStore, retention: sysRet,
+			checkInterval: time.Hour, onError: onErr,
+		})
 	}
 	return nil
 }
@@ -468,6 +540,10 @@ func (e *Engine) ResetForTests() {
 	e.redactExtraKeysJSON = ""
 	e.redactReplacement = ""
 	e.redactMu.Unlock()
+	if e.retentionCancel != nil {
+		e.retentionCancel()
+		e.retentionCancel = nil
+	}
 }
 
 // SearchEnabled reports whether FR3 free-text search is enabled on this engine.
