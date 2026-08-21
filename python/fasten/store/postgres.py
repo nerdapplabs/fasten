@@ -621,16 +621,19 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     def _row(self, r: tuple) -> AuditRow:
+        from ..canonical_ts import parse_canonical_or_legacy
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            timestamp=datetime.fromisoformat(r[3]),
+            # parse_canonical_or_legacy handles both the canonical Z-suffix form
+            # (Python 3.10's fromisoformat rejects 'Z') and older +00:00 rows.
+            timestamp=parse_canonical_or_legacy(r[3]),
             code=r[4], action=r[5], severity=r[6],
             service_id=r[7], source_node_id=r[8], tenant_id=r[9],
             actor=r[10], actor_kind=r[11],
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            shipped_at=datetime.fromisoformat(r[18]) if r[18] else None,
+            shipped_at=parse_canonical_or_legacy(r[18]) if r[18] else None,
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
             canonical_form_id=r[21] if len(r) > 21 else "1",
