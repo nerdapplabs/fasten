@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -76,6 +77,12 @@ type Engine struct {
 	// e.xport swap surfaces as a -race data race (drainerSysLog reads xport).
 	retentionCancel context.CancelFunc
 	retentionWg     sync.WaitGroup
+
+	// P1-44 tenant isolation on reader endpoints. Wired via
+	// NewReader(WithTenantScope(...)). Nil = single-tenant mode
+	// (no scope enforced, ?tenant_id= honoured as-is).
+	tenantScope            func(*http.Request) (string, bool)
+	enforceTenantIsolation bool
 }
 
 // Default is the package-level Engine used by all free-function API calls.

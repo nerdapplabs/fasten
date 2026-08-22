@@ -519,19 +519,26 @@ class PostgresStore:
         since: str,
         until: str | None = None,
         limit: int = 50,
+        tenant_id: str | None = None,
     ) -> list[AuditRow]:
         """FR3 free-text search over persisted audit history (§4.1). Case-
         insensitive substring scan over the ``detail`` JSON column via
         ILIKE + ESCAPE E'\\\\'. Result carries request_id for ``/correlate``.
 
         ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally.
-        Newest-first, hard-capped by ``limit``, no ranking."""
+        Newest-first, hard-capped by ``limit``, no ranking.
+
+        ``tenant_id`` scopes the search to one tenant when supplied — see
+        SQLiteStore.search for the P1-44 reasoning."""
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["timestamp >= %s", "detail::text ILIKE %s ESCAPE E'\\\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:
             conds.append("timestamp <= %s")
             params.append(until)
+        if tenant_id is not None:
+            conds.append("tenant_id = %s")
+            params.append(tenant_id)
         params.append(limit)
         sql = (
             f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "

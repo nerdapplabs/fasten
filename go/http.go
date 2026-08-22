@@ -108,7 +108,27 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //
 // so a reader can point at different stores or a different search/persistence
 // policy than the process-wide Default engine.
-func (e *Engine) NewReader() http.Handler {
+//
+// P1-44 tenant isolation: on shared-store multi-tenant deployments wire
+//
+//	fasten.NewReader(fasten.WithTenantScope(fn), fasten.EnforceTenantIsolation())
+//
+// where `fn func(*http.Request) (tenant string, ok bool)` returns the
+// resolved tenant from the (already-authenticated) request. Every reader
+// endpoint (/audit, /correlate, /search, /sys, /api, /topology) then
+// injects that tenant into the store filter and IGNORES any caller
+// ?tenant_id=. Without the hook, ?tenant_id= is honoured as-is — safe
+// for single-tenant deployments, unsafe on any shared-store multi-
+// tenant fleet.
+func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
+	for _, opt := range opts {
+		opt(e)
+	}
+	if e.enforceTenantIsolation && e.tenantScope == nil {
+		panic("fasten.NewReader(EnforceTenantIsolation()) requires WithTenantScope(fn) — " +
+			"wire (r) -> (tenant, ok) from your auth layer, or drop " +
+			"EnforceTenantIsolation() for a single-tenant deployment (see P1-44).")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
 	mux.HandleFunc("GET /api", e.handleAPI)
@@ -121,7 +141,71 @@ func (e *Engine) NewReader() http.Handler {
 }
 
 // NewReader is a package-level shorthand for Default.NewReader().
-func NewReader() http.Handler { return Default.NewReader() }
+func NewReader(opts ...ReaderOption) http.Handler { return Default.NewReader(opts...) }
+
+// ReaderOption configures a reader constructed by NewReader.
+type ReaderOption func(*Engine)
+
+// WithTenantScope wires a tenant-resolution hook. See NewReader's doc.
+// The hook returns (tenant, ok) — ok=false signals unauthenticated, and
+// the handler responds 401 with no rows leaked.
+func WithTenantScope(fn func(*http.Request) (string, bool)) ReaderOption {
+	return func(e *Engine) { e.tenantScope = fn }
+}
+
+// EnforceTenantIsolation refuses to construct the reader unless
+// WithTenantScope is also wired. Set this on any shared-store multi-
+// tenant deployment so a mis-configured reader can't ship without
+// tenant enforcement.
+func EnforceTenantIsolation() ReaderOption {
+	return func(e *Engine) { e.enforceTenantIsolation = true }
+}
+
+// resolveTenant runs the wired scope hook. Returns:
+//   - ("", true, nil)  when no hook is wired (single-tenant mode)
+//   - (tenant, true, nil) when the hook returns a scope
+//   - ("", false, wroteResponse)  when the hook returns ok=false; caller
+//     must return immediately (401 already written)
+func (e *Engine) resolveTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if e.tenantScope == nil {
+		return "", true
+	}
+	t, ok := e.tenantScope(r)
+	if !ok {
+		http.Error(w, "unauthenticated: tenant scope unresolved", http.StatusUnauthorized)
+		return "", false
+	}
+	return t, true
+}
+
+// scopeStreamRows post-filters sys/api rows by tenant. See the Python
+// _scope_stream_rows for the reasoning (tenant_id is a payload key,
+// not a lifted index column). scope="" is single-tenant mode.
+func scopeSyslogRows(rows []SyslogRow, scope string) []SyslogRow {
+	if scope == "" {
+		return rows
+	}
+	out := rows[:0]
+	for _, r := range rows {
+		if t, _ := r["tenant_id"].(string); t == scope {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func scopeAPIRows(rows []APIRow, scope string) []APIRow {
+	if scope == "" {
+		return rows
+	}
+	out := rows[:0]
+	for _, r := range rows {
+		if t, _ := r["tenant_id"].(string); t == scope {
+			out = append(out, r)
+		}
+	}
+	return out
+}
 
 // streamSource reports whether a stream is backed by the durable store or a
 // bounded ring, so consumers stay honest about gaps.
@@ -192,6 +276,10 @@ func (e *Engine) auditDegraded() bool {
 }
 
 func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	if e.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"sys": e.streamSource("sys")}, "error": "fasten not initialised"})
 		return
@@ -250,7 +338,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		if rows == nil {
 			rows = []SyslogRow{}
 		}
-		writeJSON(w, map[string]any{"rows": rows, "completeness": comp})
+		writeJSON(w, map[string]any{"rows": scopeSyslogRows(rows, tenant), "completeness": comp})
 		return
 	}
 	limit, lerr := parseLimit(q.Get("limit"), 100, 1000)
@@ -283,7 +371,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []SyslogRow{}
 	}
-	writeJSON(w, map[string]any{"rows": rows, "completeness": comp})
+	writeJSON(w, map[string]any{"rows": scopeSyslogRows(rows, tenant), "completeness": comp})
 }
 
 // searchGuard returns "" when a q= read is allowed, else the reason it is not:
@@ -308,6 +396,10 @@ func (e *Engine) searchGuard(q, since string) string {
 // per-stream error (errors.<stream>) rather than an empty list that reads
 // as "no matches".
 func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	q := r.URL.Query()
 	qtext := q.Get("q")
 
@@ -398,6 +490,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				counts["sys"] = 0
 				continue
 			}
+			rows = scopeSyslogRows(rows, tenant)
 			counts["sys"] = len(rows)
 			for _, row := range rows {
 				matches = append(matches, map[string]any{
@@ -416,6 +509,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				counts["api"] = 0
 				continue
 			}
+			rows = scopeAPIRows(rows, tenant)
 			counts["api"] = len(rows)
 			for _, row := range rows {
 				summary := ""
@@ -429,14 +523,16 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		case "audit":
 			searcher, ok := e.auditStore.(interface {
-				Search(ctx context.Context, q, since, until string, limit int) ([]Row, error)
+				Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error)
 			})
 			if e.auditStore == nil || !ok {
 				errs["audit"] = "requires an audit store with a Search method (FR1)"
 				counts["audit"] = 0
 				continue
 			}
-			rows, err := searcher.Search(r.Context(), qtext, since, until, limit)
+			// Tenant scope pushed into the store (SQL WHERE tenant_id=?)
+			// when resolveTenant returned a scope; "" is single-tenant.
+			rows, err := searcher.Search(r.Context(), qtext, since, until, tenant, limit)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -464,6 +560,10 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	if e.xport == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"api": e.streamSource("api")}, "error": "fasten not initialised"})
 		return
@@ -506,7 +606,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []APIRow{}
 	}
-	writeJSON(w, map[string]any{"rows": rows, "completeness": map[string]string{"api": e.streamSource("api")}})
+	writeJSON(w, map[string]any{"rows": scopeAPIRows(rows, tenant), "completeness": map[string]string{"api": e.streamSource("api")}})
 }
 
 // filterCounter is the optional filtered-count capability of an audit store,
@@ -524,6 +624,10 @@ type filterCounter interface {
 // many this capped response returned, so counts < totals means the response
 // is truncated (raise limit or page the per-stream endpoints).
 func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	rid := r.URL.Query().Get("request_id")
 	if rid == "" {
 		http.Error(w, "request_id is required", http.StatusBadRequest)
@@ -536,15 +640,12 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	audit := []map[string]any{}
-	// auditTotal is *int so a count failure (or missing filterCounter capability)
-	// reports null rather than lying with len(rows) — which is capped at limit,
-	// so counts == totals and truncated would read false when the caller has 100
-	// of 4,000 rows. Spec §4.1 makes counts-vs-totals the normative truncation
-	// signal; a null total is honest, a total equal to the cap is a lie
-	// (PR #59 finding 9).
 	var auditTotal *int
 	if e.auditStore != nil {
-		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, Limit: limit})
+		// Tenant pushed down to the store filter — prevents the
+		// X-Request-ID pivot attack where tenant B guesses/replays a
+		// known tenant-A request_id to read A's rows (P1-44).
+		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -553,7 +654,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 			audit = append(audit, rowToMap(row))
 		}
 		if counter, ok := e.auditStore.(filterCounter); ok {
-			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid}); err == nil {
+			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid, TenantID: tenant}); err == nil {
 				auditTotal = &n
 			}
 		}
@@ -568,24 +669,28 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if a != nil {
-			api = a
-		}
+		api = scopeAPIRows(a, tenant)
 		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if s != nil {
-			sys = s
-		}
-		if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		sys = scopeSyslogRows(s, tenant)
+		// Stream count APIs don't take tenant_id; when a scope is active
+		// use the post-filter len to keep totals consistent with what
+		// the caller can actually see.
+		if tenant != "" {
+			apiTotal = len(api)
+			sysTotal = len(sys)
+		} else {
+			if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -627,6 +732,10 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	if e.auditStore == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"audit": e.streamSource("audit")}, "error": "audit store not configured"})
 		return
@@ -667,12 +776,19 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 			http.StatusUnprocessableEntity)
 		return
 	}
+	// P1-44: when tenantScope is wired, override any caller-supplied
+	// ?tenant_id= with the resolved scope. Without the hook, ?tenant_id=
+	// is honoured as-is (single-tenant / legacy call sites).
+	tenantParam := q.Get("tenant_id")
+	if tenant != "" {
+		tenantParam = tenant
+	}
 	f := Filter{
 		RequestID:    q.Get("request_id"),
 		Code:         Code(q.Get("code")),
 		Domain:       Domain(q.Get("domain")),
 		SourceNodeID: q.Get("source_node_id"),
-		TenantID:     q.Get("tenant_id"),
+		TenantID:     tenantParam,
 		Actor:        q.Get("actor"),
 		Target:       q.Get("target"),
 		Limit:        auditLimit,
@@ -734,6 +850,10 @@ type sourceAggregator interface {
 // fleet view falls out of the rows already recorded, so it can't drift. Parity
 // with the Python /topology.
 func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
+	tenant, tok := e.resolveTenant(w, r)
+	if !tok {
+		return
+	}
 	empty := map[string]any{"sources": []any{}, "nodes": 0, "services": 0, "tenants": 0}
 	if e.auditStore == nil {
 		empty["error"] = "audit store not configured"
@@ -764,6 +884,16 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 	}
 	if sources == nil {
 		sources = []map[string]any{}
+	}
+	if tenant != "" {
+		// P1-44: post-filter fleet enumeration by the resolved tenant.
+		filtered := sources[:0]
+		for _, s := range sources {
+			if t, _ := s["tenant_id"].(string); t == tenant {
+				filtered = append(filtered, s)
+			}
+		}
+		sources = filtered
 	}
 	nodes, services, tenants := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, s := range sources {
