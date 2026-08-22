@@ -50,7 +50,7 @@ from .. import search_enabled as _active_search_enabled
 try:
     from starlette.requests import Request
 except ImportError:  # pragma: no cover — fastapi missing; router() raises anyway
-    Request = None  # type: ignore[assignment,misc]
+    pass
 from .. import transport as _active_transport
 
 
