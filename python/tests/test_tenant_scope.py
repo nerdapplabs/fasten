@@ -31,7 +31,8 @@ def _client(*, tenant_scope=None, enforce=False):
 
     app = FastAPI()
     app.include_router(
-        build_router(tenant_scope=tenant_scope, enforce_tenant_isolation=enforce),
+        build_router(dependencies=[], tenant_scope=tenant_scope,
+                     enforce_tenant_isolation=enforce),
         prefix="/api/v1/logs",
     )
     return TestClient(app)
@@ -95,7 +96,7 @@ def test_no_scope_hook_keeps_current_behaviour():
 def test_enforce_without_hook_refuses_construction():
     from fasten.reader.router import router as build_router
     with pytest.raises(RuntimeError, match="tenant_scope"):
-        build_router(enforce_tenant_isolation=True)
+        build_router(dependencies=[], enforce_tenant_isolation=True)
 
 
 # ── with scope: audit endpoint filters ───────────────────────────────────

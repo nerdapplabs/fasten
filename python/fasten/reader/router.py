@@ -54,8 +54,11 @@ except ImportError:  # pragma: no cover — fastapi missing; router() raises any
 from .. import transport as _active_transport
 
 
+_UNSET: Any = object()
+
+
 def router(
-    dependencies: list[Any] | None = None,
+    dependencies: list[Any] | None = _UNSET,  # required — explicit [] for no-auth
     *,
     store: Any = None,
     transport: Any = None,
@@ -68,8 +71,14 @@ def router(
 
     Args:
         dependencies: FastAPI dependencies applied to every route, e.g.
-            ``[Depends(require_admin)]``. None means no auth — only use
-            that behind a trusted-network boundary.
+            ``[Depends(require_admin)]``. **Required** — the earlier
+            no-default reader shipped unauthenticated by accident on
+            every misconfigured proxy (P1-45). Explicit opt-in for the
+            no-auth case: pass ``dependencies=[]`` when you deliberately
+            want the reader unauthenticated (dev / localhost / a proxy
+            that already enforces auth). No default means the "I forgot
+            to wire auth" bug produces a startup error, not a silently
+            public audit log.
         store: Optional AuditRepository override. Default: pulled from
             ``fasten.init()`` at request time via ``fasten.audit_store()``.
         transport: Optional StdoutTransport override. Default: same.
@@ -104,6 +113,17 @@ def router(
         raise RuntimeError(
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
         ) from e
+
+    if dependencies is _UNSET:
+        raise RuntimeError(
+            "fasten.reader.router: `dependencies=` is required. Pass an "
+            "auth hook — e.g. `[Depends(require_admin)]` or the bundled "
+            "helper `fasten.reader.require_bearer()` — or pass "
+            "`dependencies=[]` to opt into unauthenticated mode "
+            "explicitly (dev / localhost / a proxy that enforces auth "
+            "already). No default so a mis-configured production deploy "
+            "can't ship an unauthenticated audit reader (P1-45)."
+        )
 
     if enforce_tenant_isolation and tenant_scope is None:
         raise RuntimeError(

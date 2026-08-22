@@ -106,7 +106,7 @@ def test_boot_rows_are_correlatable():
     assert request_id_kind(boot_id) == "boot"
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     body = TestClient(app).get(f"/api/v1/logs/correlate?request_id={boot_id}").json()
     assert body["counts"]["sys"] == 1
     assert body["sys"][0]["event"] == "db.connect.failed"
