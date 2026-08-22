@@ -374,10 +374,19 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"rows": scopeSyslogRows(rows, tenant), "completeness": comp})
 }
 
+// MaxQueryLength is the maximum accepted length of ?q= on /sys, /api,
+// and /search. Rejects a naive attempt to DoS the store's LIKE pattern
+// with a multi-MB query. Parity with the Python side (P1-46).
+const MaxQueryLength = 1024
+
 // searchGuard returns "" when a q= read is allowed, else the reason it is not:
 // search must be explicitly enabled (§4.1) and time-bounded (since= mandatory,
-// no unbounded scans).
+// no unbounded scans). Also caps q= length so a caller can't hand the store
+// a multi-MB LIKE pattern that runs quadratic per row (P1-46).
 func (e *Engine) searchGuard(q, since string) string {
+	if len(q) > MaxQueryLength {
+		return fmt.Sprintf("q= is capped at %d characters", MaxQueryLength)
+	}
 	if !e.searchEnabled {
 		return "search disabled — set search.enabled (FASTEN_SEARCH_ENABLED=true) to enable free-text q="
 	}

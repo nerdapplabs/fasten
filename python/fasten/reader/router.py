@@ -271,7 +271,7 @@ def router(
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
         event: Optional[str] = Query(default=None),
-        q: Optional[str] = Query(default=None, min_length=1),
+        q: Optional[str] = Query(default=None, min_length=1, max_length=1024),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
@@ -343,7 +343,7 @@ def router(
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
-        q: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None, max_length=1024),
     ) -> dict[str, Any]:
         tenant = _resolve_tenant(request)
         if q is not None:
@@ -531,7 +531,7 @@ def router(
     @r.get("/search")
     def get_search(
         request: Request,
-        q: str = Query(..., min_length=1),
+        q: str = Query(..., min_length=1, max_length=1024),
         since: str = Query(...),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=50, ge=1, le=200),
