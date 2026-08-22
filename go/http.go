@@ -841,22 +841,42 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	// Redaction is always applied (RedactDetail) once the engine is initialised.
 	redactorBlock := map[string]any{"active": e.serviceID != ""}
 
-	// Spot-check the tamper chain over this node's latest rows (best-effort).
-	chainBlock := map[string]any{"verified": nil, "breaks": 0, "last_verified_at": nil}
+	// Spot-check the tamper chain over this node's latest rows.
+	// breaks is nil until verification actually runs; 0 when the chain is
+	// clean, 1+ when broken. Never report 0 for "we didn't check" — a
+	// status page colouring on this field would read green (parity with
+	// Python's /audit/doctor, PR #59 finding 10).
+	chainBlock := map[string]any{
+		"verified":         nil,
+		"breaks":           nil,
+		"last_verified_at": nil,
+	}
 	if store != nil {
-		if recent, err := store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50}); err == nil && len(recent) > 0 {
+		recent, err := store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+		switch {
+		case err != nil:
+			// Store reachable but the query failed. Surface the error so
+			// operators see verification is broken rather than seeing a green
+			// status page (same shape as the storeBlock's last_error above).
+			chainBlock["error"] = "query failed"
+			chainBlock["reason"] = err.Error()
+		case len(recent) > 0:
 			res := VerifyChain(recent)
 			breaks := 0
 			if !res.OK {
 				breaks = 1
 			}
 			chainBlock = map[string]any{
-				"verified":       res.OK,
-				"breaks":         breaks,
-				"first_break_at": res.FirstBreakAt,
-				"reason":         res.Reason,
+				"verified":         res.OK,
+				"breaks":           breaks,
+				"first_break_at":   res.FirstBreakAt,
+				"reason":           res.Reason,
+				"last_verified_at": canonicalNow(),
 			}
 		}
+		// len(recent) == 0 case: leave chainBlock as (nil, nil, nil) —
+		// verification didn't run (no rows to verify is not an error, but
+		// it's also not "clean").
 	}
 
 	writeJSON(w, map[string]any{
