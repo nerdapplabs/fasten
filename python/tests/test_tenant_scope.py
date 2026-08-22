@@ -94,6 +94,7 @@ def test_no_scope_hook_keeps_current_behaviour():
 # ── enforce_tenant_isolation refuses to construct without hook ───────────
 
 def test_enforce_without_hook_refuses_construction():
+    pytest.importorskip("fastapi")
     from fasten.reader.router import router as build_router
     with pytest.raises(RuntimeError, match="tenant_scope"):
         build_router(dependencies=[], enforce_tenant_isolation=True)
