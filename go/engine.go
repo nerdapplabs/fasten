@@ -163,6 +163,8 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
+	// Uniform PII scrub for every sys/api push. See Transport.redactRow.
+	e.xport.redact = e.redactDetail
 	// Sentinel invariant: one stable boot-window id per process, in effect for
 	// context-less stream rows until the first real request arrives.
 	e.xport.serviceID = e.serviceID
@@ -385,7 +387,9 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 	e.retentionCancel = cancel
 	onErr := func(stream string, err error) {
 		e.drainerSysLog("error", "retention_purge_failed", map[string]any{
-			"stream": stream, "error": err.Error(),
+			// Type-only, not err.Error() — driver error strings can carry
+			// the offending row value; sys is redacted key-pattern only.
+			"stream": stream, "error_type": fmt.Sprintf("%T", err),
 		})
 	}
 	if apiRet > 0 && e.apiStore != nil {
@@ -517,8 +521,9 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 						nwf.NoteWriteFailure()
 					}
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
-						"error":  ferr.Error(),
-						"row_id": row.ID,
+						// Type-only — see retention_purge_failed comment.
+						"error_type": fmt.Sprintf("%T", ferr),
+						"row_id":     row.ID,
 					})
 				}
 			}
@@ -593,6 +598,12 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 		}
 		row[k] = kv[i+1]
 	}
+	// Uniform PII scrub — key-pattern redactor over both structured kv and
+	// stdout NDJSON, so caller-supplied secrets (fasten.LogError(ctx,
+	// "auth_failed", "password", pw)) never hit stdout, the ring, or the
+	// persistent store. PushSyslog would redact anyway; scrub the local
+	// copy up front so the stdout NDJSON also sees the redacted form.
+	row = SyslogRow(e.redactDetail(row))
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}
@@ -655,7 +666,8 @@ func (e *Engine) installDrainer(
 		store, capacity, retryInitialMs, retryMaxMs, retryJitter, uint32(maxAttempts),
 	)
 	if err != nil {
-		e.drainerSysLog("error", "audit_drainer_install_failed", map[string]any{"error": err.Error()})
+		e.drainerSysLog("error", "audit_drainer_install_failed",
+			map[string]any{"error_type": fmt.Sprintf("%T", err)})
 		return
 	}
 	e.drainerMu.Lock()
@@ -696,6 +708,12 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	for k, v := range fields {
 		row[k] = v
 	}
+	// Fields commonly include an "error" carrying a driver error string
+	// that can quote the offending row value (Postgres NotNullViolation
+	// cites the column). Redact the local copy before both the transport
+	// push AND the direct stderr write — PushSyslog would redact its
+	// own copy, but the stderr line uses this local `row`.
+	row = SyslogRow(e.redactDetail(row))
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}
