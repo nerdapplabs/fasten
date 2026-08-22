@@ -70,8 +70,12 @@ type Engine struct {
 
 	// FR1 retention (spec §1) — cancel func for every purger goroutine
 	// spawned on this Engine. Init stops the previous set before wiring the
-	// new one; ResetForTests + shutdown stop unconditionally.
+	// new one; ResetForTests + shutdown stop unconditionally. retentionWg
+	// counts live purgers so stopRetention can Wait: cancel alone doesn't
+	// bound goroutine exit, and an in-flight purger racing the next Init's
+	// e.xport swap surfaces as a -race data race (drainerSysLog reads xport).
 	retentionCancel context.CancelFunc
+	retentionWg     sync.WaitGroup
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -370,13 +374,11 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 		}
 	}
 
-	// Stop any previous generation before starting a new one — a re-Init on
-	// the same Engine leaves an orphan goroutine hammering the old store
-	// otherwise.
-	if e.retentionCancel != nil {
-		e.retentionCancel()
-		e.retentionCancel = nil
-	}
+	// Stop any previous generation before starting a new one AND wait for
+	// its goroutines to actually exit — a re-Init on the same Engine leaves
+	// an orphan goroutine hammering the old store otherwise, and its
+	// drainerSysLog error path races the new Init's e.xport swap.
+	e.stopRetention()
 
 	// Nothing configured on either stream → no goroutine.
 	if (apiRet == 0 || e.apiStore == nil) && (sysRet == 0 || e.syslogStore == nil) {
@@ -393,18 +395,29 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 		})
 	}
 	if apiRet > 0 && e.apiStore != nil {
-		startPurger(ctx, retentionParams{
+		startPurger(ctx, &e.retentionWg, retentionParams{
 			stream: "api", store: e.apiStore, retention: apiRet,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
 	if sysRet > 0 && e.syslogStore != nil {
-		startPurger(ctx, retentionParams{
+		startPurger(ctx, &e.retentionWg, retentionParams{
 			stream: "sys", store: e.syslogStore, retention: sysRet,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
 	return nil
+}
+
+// stopRetention cancels any live purger goroutines and Waits for them to
+// exit. Safe to call when none are running. Must be paired: cancel alone
+// leaks a goroutine that races the next Init.
+func (e *Engine) stopRetention() {
+	if e.retentionCancel != nil {
+		e.retentionCancel()
+		e.retentionCancel = nil
+	}
+	e.retentionWg.Wait()
 }
 
 // Emit produces an audit row for a registered code.
@@ -635,10 +648,7 @@ func (e *Engine) ResetForTests() {
 	e.redactExtraKeysJSON = ""
 	e.redactReplacement = ""
 	e.redactMu.Unlock()
-	if e.retentionCancel != nil {
-		e.retentionCancel()
-		e.retentionCancel = nil
-	}
+	e.stopRetention()
 }
 
 // SearchEnabled reports whether FR3 free-text search is enabled on this engine.
