@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional
 
 from . import core_ffi
+
+# ARCH #4 — single lock guarding every read/write of _registry. Shared
+# with fasten.codes_yaml (imports this symbol) so a yaml reload's
+# clear-and-rebuild swap can't tear a concurrent emit()'s meta_of()
+# lookup. Reentrant so callers already holding the lock (register()
+# inside a yaml-load callback, in tests) don't self-deadlock.
+_lock = threading.RLock()
 
 _logger = logging.getLogger("fasten")
 
@@ -173,27 +181,40 @@ def register(domain: Domain, codes: Mapping[str, Meta]) -> None:
     codes_dict = {name: _meta_to_dict(name, meta) for name, meta in codes.items()}
     # Raises AuditCatalogError on validation failure (mapped from Rust error codes).
     core_ffi.register_codes(domain, json.dumps(codes_dict))
-    # Populate Python cache from the Rust-validated state.
-    for name in codes:
-        meta_json = core_ffi.meta_of_json(name)
-        if meta_json and meta_json != "{}":
-            _registry[name] = _dict_to_meta(json.loads(meta_json))
+    # Populate Python cache from the Rust-validated state — under _lock so a
+    # concurrent meta_of() reader can't see a half-populated batch and so a
+    # concurrent codes_yaml.reload() can't tear the swap (both acquire the
+    # same lock — see the module docstring in codes_yaml).
+    with _lock:
+        for name in codes:
+            meta_json = core_ffi.meta_of_json(name)
+            if meta_json and meta_json != "{}":
+                _registry[name] = _dict_to_meta(json.loads(meta_json))
 
 
 def meta_of(code: str) -> Optional[Meta]:
-    """Return the Meta for `code`, or None if not registered."""
-    return _registry.get(code)
+    """Return the Meta for `code`, or None if not registered.
+
+    Locked so a codes_yaml.reload() in another thread can't return None
+    to us during its clear-and-rebuild swap. The RLock lets the caller
+    already hold it (register() inside a reload) without self-deadlock.
+    """
+    with _lock:
+        return _registry.get(code)
 
 
 def registry() -> dict[str, Meta]:
     """Return a copy of the current catalog."""
-    return dict(_registry)
+    with _lock:
+        return dict(_registry)
 
 
 def dump() -> str:
     """`id,domain,severity` sorted one-per-line — feeds cross-language consistency gate."""
+    with _lock:
+        snapshot = list(_registry.values())
     rows = sorted(
-        (m.id, m.domain, str(m.severity)) for m in _registry.values()
+        (m.id, m.domain, str(m.severity)) for m in snapshot
     )
     return "\n".join(f"{i},{d},{s}" for (i, d, s) in rows)
 

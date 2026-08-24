@@ -41,7 +41,6 @@ removed code remain readable (the wire ``code`` field is a free string).
 from __future__ import annotations
 
 import re
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +49,7 @@ from .codes import (
     Meta,
     RetentionClass,
     Severity,
+    _lock,
     _registry,
 )
 
@@ -67,7 +67,11 @@ _yaml_codes: set[str] = set()
 # in load(): the same id loaded from two different files used to silently
 # overwrite the first registration with the second's metadata.
 _yaml_code_origins: dict[str, Path] = {}
-_lock = threading.Lock()
+# _lock is the shared reentrant lock exported by fasten.codes — imported
+# above. Sharing it here (rather than declaring a local threading.Lock) is
+# what closes the ARCH #4 race: register() / meta_of() and reload() /
+# load() all funnel through the same critical section, so a concurrent
+# emit's meta_of() never sees the empty dict during clear-and-rebuild.
 
 
 def _yaml_loader() -> Any:
@@ -259,13 +263,13 @@ def reload() -> None:
         }
         new_registry = {**programmatic, **fresh_yaml}
 
-        # Atomic swap inside the critical section. Concurrent emit()
-        # readers either see old contents or new — the clear+update pair
-        # runs under the same lock that any future register() / reload()
-        # acquires, but emit's metaOf does not lock (single dict.get is
-        # GIL-atomic). Brief window during clear+update where emit may
-        # raise unknown-code; for typical reload frequencies (manual /
-        # SIGHUP) the window is microseconds.
+        # Swap inside the critical section. meta_of() locks on the same
+        # _lock, so a concurrent emit either sees the old contents (before
+        # this critical section runs) or the new (after) — the clear+update
+        # sequence is invisible. Prior comment here claimed dict.get was
+        # "GIL-atomic and safe unlocked"; that was true for a fully-formed
+        # dict but not during clear+update, and produced ARCH #4's read-side
+        # race (an unlucky emit saw None → "unknown audit code").
         _registry.clear()
         _registry.update(new_registry)
         _yaml_codes.clear()
