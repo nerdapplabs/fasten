@@ -228,7 +228,6 @@ def test_postgres_schema_qualified_table():
     assert s.count() == 1
     assert s.query()[0].id == row.id
     s.close()
-    bare = table.split(".")[-1]
     with psycopg.connect(dsn) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute("DROP SCHEMA IF EXISTS fasten CASCADE")

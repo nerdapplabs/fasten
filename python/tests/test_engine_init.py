@@ -11,7 +11,6 @@ import pytest
 
 import fasten
 from fasten.emitter import _default
-from fasten.store.sqlite import SQLiteStore
 
 
 # ── init() error paths ────────────────────────────────────────────────────
@@ -277,3 +276,45 @@ def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
 
     events = [r.get("event") for r in captured]
     assert "audit_sync_fallback_failed" in events
+
+
+def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_notifier():
+    """PR #59 finding 3: an adopter AuditRepository doesn't have to implement
+    note_write_failure — the swallow must still land on the engine flag, or
+    completeness reports 'store' over a store that just lost a row."""
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from fasten.reader.router import router as build_router
+    from fasten.emitter import _default as eng
+
+    class _AdopterStore:
+        """AuditRepository shape but no note_write_failure / degraded — the
+        documented extension point (adopter-supplied audit store)."""
+        def insert(self, row) -> None:
+            raise RuntimeError("adopter store down")
+        def count(self, **_) -> int:
+            return 0
+        def query(self, **_) -> list:
+            return []
+        def max_monotonic_seq(self, service_id=None, source_node_id=None) -> int:
+            return 0
+
+    fasten.init(
+        service_id="svc", node_id="n",
+        audit_store=_AdopterStore(),
+        audit_store_failure_strategy="queue",
+    )
+    eng._uninstall_drainer()
+
+    assert eng.audit_write_swallowed() is False
+    fasten.emit(code="USER_CREATED", target="u-adopter")
+    assert eng.audit_write_swallowed() is True
+
+    app = FastAPI()
+    app.include_router(build_router(), prefix="/api/v1/logs")
+    resp = TestClient(app).get("/api/v1/logs/audit?limit=1")
+    assert resp.status_code == 200
+    # Was reporting 'store' before the fix — 'store-degraded' proves the
+    # engine-side flag flows into the reader.
+    assert resp.json()["completeness"] == {"audit": "store-degraded"}

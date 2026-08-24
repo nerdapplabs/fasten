@@ -24,20 +24,15 @@ _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _utc_iso(dt: datetime) -> str:
-    """Serialise to UTC ISO-8601, treating naive datetimes as UTC.
+    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``).
 
-    SQLite stores timestamps as ISO strings with the +00:00 offset.
-    A naive datetime calling `.isoformat()` would produce a string
-    *without* an offset, so lexicographic ordering against existing
-    rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
-    silently mis-orders. Always normalise to UTC-aware before
-    serialising so query()/since/until are correct under all inputs.
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
+    Naive datetimes are treated as UTC. A naive `.isoformat()` produced
+    a string without an offset, so lexicographic ordering against
+    existing rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
+    silently mis-ordered. Canonical form additionally fixes cross-SDK
+    boundary truncation — see fasten/canonical_ts.py."""
+    from ..canonical_ts import canonical_ts
+    return canonical_ts(dt)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -100,6 +95,11 @@ class SQLiteStore:
         self._path = path
         self._table = table
         self._wal = wal
+        # Swallowed persist-failure counter (mirrors StreamStore). At least one
+        # means durable audit history has a known hole, so the reader degrades
+        # the audit completeness flag from "store" to "store-degraded". Sticky
+        # for the store's lifetime: a hole doesn't heal when the disk recovers.
+        self._write_failures = 0
         # `:memory:` databases cannot be shared across connections, so
         # the per-thread model breaks. Detect once at init and route
         # subsequent calls accordingly.
@@ -256,6 +256,22 @@ class SQLiteStore:
         so the AuditRepository protocol and the drainer callback stay stable."""
         self.insert_originated(row)
 
+    def note_write_failure(self) -> None:
+        """Record a persist failure the caller swallowed on the hot path, so
+        durable history has a known hole. Callers that surface (raise) the
+        insert() error themselves don't mark the store degraded."""
+        self._write_failures += 1
+
+    @property
+    def write_failures(self) -> int:
+        return self._write_failures
+
+    @property
+    def degraded(self) -> bool:
+        """True once at least one persist failure was swallowed (durable
+        history has holes). Drives the ``store-degraded`` completeness flag."""
+        return self._write_failures > 0
+
     def list_unshipped(
         self,
         limit: int = 100,
@@ -406,6 +422,7 @@ class SQLiteStore:
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
+        after_seq: int = 0,
     ) -> list[AuditRow]:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
@@ -413,6 +430,23 @@ class SQLiteStore:
             actor=actor, target=target,
             since=since, until=until,
         )
+        # Cursor pagination (canonical): rows are newest-first, so paging forward
+        # means older rows — monotonic_seq < after_seq. Applied here, not in
+        # _build_where, so count()/total stays the full filtered count
+        # independent of the cursor. Mirrors the Go audit store.
+        #
+        # Accepted limitation on multi-origin stores (A1 in PR #59 review):
+        # the query orders by (timestamp, monotonic_seq) but the cursor is
+        # monotonic_seq alone, which is a per-(service_id, source_node_id)
+        # counter (see the tie-breaker note below). Paging to exhaustion
+        # across rows from more than one origin can skip or repeat rows
+        # because a lower seq in origin B can appear at a newer timestamp
+        # than a higher seq in origin A. Single-origin stores are unaffected.
+        # A composite (timestamp, seq) cursor would fix this but changes the
+        # wire contract; keeping the simpler cursor is the deliberate call.
+        if after_seq > 0:
+            where = f"{where} AND monotonic_seq < ?" if where else "WHERE monotonic_seq < ?"
+            params = [*params, after_seq]
         with self._txn():
             cur = self._connect().execute(
                 # Wall-clock first: monotonic_seq is a per-(service_id,
@@ -449,6 +483,37 @@ class SQLiteStore:
                 params,
             )
             return int(cur.fetchone()[0])
+
+    def search(
+        self,
+        *,
+        q: str,
+        since: str,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> list[AuditRow]:
+        """FR3 free-text search over persisted audit history (§4.1). Substring
+        scan over the ``detail`` JSON column (audit's payload equivalent). The
+        result carries the same ``request_id`` that ``/correlate`` consumes.
+
+        Deliberately constrained: ``since`` is mandatory to bound the linear
+        scan; ``%``/``_``/``\\`` in ``q`` are escaped so they match literally
+        rather than acting as LIKE wildcards. Newest-first, hard-capped by
+        ``limit`` — no relevance ranking."""
+        esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds = ["COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [since, f"%{esc}%"]
+        if until:
+            conds.append("COALESCE(timestamp, '') <= ?")
+            params.append(until)
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?"
+        )
+        with self._txn():
+            cur = self._connect().execute(sql, params)
+            return [self._row(r) for r in cur.fetchall()]
 
     def sources(
         self,
@@ -520,10 +585,14 @@ class SQLiteStore:
             return int(cur.fetchone()[0])
 
     def _row(self, r: sqlite3.Row) -> AuditRow:
+        from ..canonical_ts import parse_canonical
         keys = r.keys()
         return AuditRow(
             id=r["id"], origin_id=r["origin_id"], monotonic_seq=r["monotonic_seq"],
-            timestamp=datetime.fromisoformat(r["timestamp"]),
+            # Strict canonical parse (spec §4.3). Every row in this table was
+            # written by _utc_iso → canonical_ts, so anything else is a bug at
+            # the source and must fail loudly instead of round-tripping.
+            timestamp=parse_canonical(r["timestamp"]),
             code=r["code"], action=r["action"], severity=r["severity"],
             service_id=r["service_id"], source_node_id=r["source_node_id"],
             tenant_id=r["tenant_id"],
@@ -531,7 +600,7 @@ class SQLiteStore:
             target=r["target"], category=r["category"], domain=r["domain"],
             method=r["method"], request_id=r["request_id"],
             detail=json.loads(r["detail"]),
-            shipped_at=datetime.fromisoformat(r["shipped_at"]) if r["shipped_at"] else None,
+            shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",

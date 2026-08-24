@@ -1,6 +1,5 @@
 """RingBuffer: capacity, push order, query filters, thread-safety."""
 import threading
-import pytest
 from fasten.store.ring import RingBuffer
 from fasten.transport.stdout import StdoutTransport
 
@@ -54,18 +53,20 @@ def test_query_filter_method():
     rb = RingBuffer()
     rb.push({"method": "GET", "path": "/health"})
     rb.push({"method": "POST", "path": "/api/users"})
-    results = rb.query(method="post")
+    # exact-match (parity with the store + the Go SDK); not case-folded
+    results = rb.query(method="POST")
     assert len(results) == 1
     assert results[0]["path"] == "/api/users"
+    assert rb.query(method="post") == []
 
 
-def test_query_filter_path_substring():
+def test_query_filter_path_exact():
     rb = RingBuffer()
     rb.push({"method": "GET", "path": "/api/users/42"})
     rb.push({"method": "GET", "path": "/health"})
-    results = rb.query(path="/api")
-    assert len(results) == 1
-    assert "users" in results[0]["path"]
+    # exact-match; a partial path no longer substring-matches
+    assert rb.query(path="/api/users/42")[0]["path"] == "/api/users/42"
+    assert rb.query(path="/api") == []
 
 
 def test_empty_query_returns_all():

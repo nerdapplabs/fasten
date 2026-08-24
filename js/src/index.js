@@ -25,7 +25,12 @@ export function mintID() {
 }
 
 export function currentRequestID() {
-	return als.getStore()?.requestId ?? null;
+	// Only a non-empty string counts as a caller-supplied id. A non-string (e.g.
+	// a number passed to withRequestID) is treated as missing, so the emit path
+	// mints a real id instead of stamping the wrong type onto the row — parity
+	// with the Python (isinstance) and Go (.(string)) guards.
+	const rid = als.getStore()?.requestId;
+	return typeof rid === "string" && rid ? rid : null;
 }
 
 export function withRequestID(requestId, fn) {
@@ -231,6 +236,7 @@ export class Engine {
 		auditStore: null,
 		apiStore: null,
 		extraRedactKeys: [],
+		redactReplacement: null,
 		failureStrategy: "queue",
 	};
 	#seq = 0;
@@ -262,6 +268,8 @@ export class Engine {
 			auditStore: opts.auditStore ?? null,
 			apiStore: opts.apiStore ?? null,
 			extraRedactKeys: extraKeys ?? [],
+			redactReplacement:
+				opts.redactReplacement ?? process.env.FASTEN_REDACT_REPLACEMENT ?? null,
 			failureStrategy: strategy,
 		};
 		if (!this.#config.serviceId || !this.#config.nodeId) {
@@ -302,6 +310,7 @@ export class Engine {
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 		const extraKeys = cfg.extraRedactKeys;
+		const redactRepl = cfg.redactReplacement; // null → core default "***"
 		let outDetail;
 		if (meta.piiInDetail) {
 			const passthrough = new Set(meta.detailPassthroughKeys ?? []);
@@ -310,9 +319,10 @@ export class Engine {
 				if (passthrough.has(k)) kept[k] = v;
 			}
 			const keptJson = JSON.stringify(kept);
-			const redactedJson = extraKeys.length
-				? coreRedactFull(keptJson, JSON.stringify(extraKeys), null)
-				: coreRedact(keptJson);
+			const redactedJson =
+				extraKeys.length || redactRepl
+					? coreRedactFull(keptJson, JSON.stringify(extraKeys), redactRepl)
+					: coreRedact(keptJson);
 			outDetail = {
 				_redacted: REDACT_REPLACEMENT,
 				_pii_in_detail: true,
@@ -320,9 +330,10 @@ export class Engine {
 			};
 		} else {
 			const detailJson = JSON.stringify(detail);
-			const redactedJson = extraKeys.length
-				? coreRedactFull(detailJson, JSON.stringify(extraKeys), null)
-				: coreRedact(detailJson);
+			const redactedJson =
+				extraKeys.length || redactRepl
+					? coreRedactFull(detailJson, JSON.stringify(extraKeys), redactRepl)
+					: coreRedact(detailJson);
 			outDetail = JSON.parse(redactedJson);
 		}
 

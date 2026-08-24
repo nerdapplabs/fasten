@@ -3,6 +3,7 @@ module github.com/nerdapplabs/fasten/go
 go 1.22
 
 require (
+	github.com/lib/pq v1.12.3
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.34.4
 )

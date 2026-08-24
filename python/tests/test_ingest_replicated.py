@@ -142,7 +142,6 @@ def test_module_list_unshipped_and_mark_shipped(initialized):
 
 
 def test_module_ingest_replicated_uses_default_store(initialized):
-    src = SQLiteStore(":memory:")
     rows = _seal_chain([
         fasten.emit(code="USER_CREATED", target="x"),
     ])

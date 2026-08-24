@@ -9,7 +9,6 @@ Two runtime behaviours, all verified here:
 """
 import logging
 
-import pytest
 
 import fasten
 from fasten.codes import Meta, RetentionClass, Severity, _registry, register
@@ -251,7 +250,7 @@ def test_sqlite_legacy_table_rows_still_queryable(tmp_path):
             shipped_at       TEXT
         );
         INSERT INTO audit_log VALUES (
-            'evt-legacy', 'evt-legacy', 1, '2026-01-01T00:00:00+00:00',
+            'evt-legacy', 'evt-legacy', 1, '2026-01-01T00:00:00.000000Z',
             'OLD_CODE', 'do', 'info',
             's', 'n', NULL, 'a', 'user',
             't', 'c', 'd', 'sdk', 'req-1', '{}', NULL

@@ -31,38 +31,38 @@ import (
 type Severity string
 
 const (
-	SevDebug    Severity = "debug"  // Low-level diagnostic, filtered in production
-	SevInfo     Severity = "info"  // Normal operational event (default)
-	SevWarn     Severity = "warn"  // Potentially problematic, not yet an error
-	SevError    Severity = "error"  // Operation failed, requires attention
-	SevCritical Severity = "critical"  // Severe failure, may impact availability
+	SevDebug    Severity = "debug"    // Low-level diagnostic, filtered in production
+	SevInfo     Severity = "info"     // Normal operational event (default)
+	SevWarn     Severity = "warn"     // Potentially problematic, not yet an error
+	SevError    Severity = "error"    // Operation failed, requires attention
+	SevCritical Severity = "critical" // Severe failure, may impact availability
 )
 
 type RetentionClass string
 
 const (
 	RetShort  RetentionClass = "short"  // Default 30 days
-	RetMedium RetentionClass = "medium"  // Default 180 days (default)
-	RetLong   RetentionClass = "long"  // Default 1095 days (3 years)
+	RetMedium RetentionClass = "medium" // Default 180 days (default)
+	RetLong   RetentionClass = "long"   // Default 1095 days (3 years)
 )
 
 type ActorKind string
 
 const (
-	ActorUser     ActorKind = "user"  // Human user (browser, mobile, CLI on behalf of a user)
+	ActorUser     ActorKind = "user"     // Human user (browser, mobile, CLI on behalf of a user)
 	ActorService  ActorKind = "service"  // Internal service or daemon (default)
-	ActorSchedule ActorKind = "schedule"  // Cron job or task scheduler
-	ActorAgent    ActorKind = "agent"  // AI agent
+	ActorSchedule ActorKind = "schedule" // Cron job or task scheduler
+	ActorAgent    ActorKind = "agent"    // AI agent
 )
 
 const (
-	MethodHTTP      = "http"  // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
-	MethodMQTT      = "mqtt"  // MQTT message (IoT telemetry, device command)
-	MethodCLI       = "cli"  // CLI command typed by a human
+	MethodHTTP      = "http"       // HTTP/HTTPS request (REST, GraphQL, gRPC-web, webhook)
+	MethodMQTT      = "mqtt"       // MQTT message (IoT telemetry, device command)
+	MethodCLI       = "cli"        // CLI command typed by a human
 	MethodScheduler = "scheduler"  // Automated cron or task scheduler
-	MethodUI        = "ui"  // Web or desktop UI action, human-initiated
-	MethodAgentTool = "agent_tool"  // AI agent tool call
-	MethodSDK       = "sdk"  // Direct SDK call, no transport shim active. Default. (default)
+	MethodUI        = "ui"         // Web or desktop UI action, human-initiated
+	MethodAgentTool = "agent_tool" // AI agent tool call
+	MethodSDK       = "sdk"        // Direct SDK call, no transport shim active. Default. (default)
 )
 
 const RedactReplacement = "***"
@@ -84,6 +84,7 @@ var RedactPatterns = []string{
 	"cookie",
 	"credential",
 }
+
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
 // ── Anchors ───────────────────────────────────────────────────────────────
@@ -104,27 +105,27 @@ const (
 
 // Row is the canonical audit row — lossless conversion to CloudEvent / OTel.
 type Row struct {
-	WireVersion  string         `json:"wire_version"`
-	ID           string         `json:"id"`
-	OriginID     string         `json:"origin_id"`
-	MonotonicSeq int64          `json:"monotonic_seq"`
-	Timestamp    time.Time      `json:"timestamp"`
-	Code         Code           `json:"code"`
-	Action       string         `json:"action"`
-	Severity     Severity       `json:"severity"`
-	ServiceID    string         `json:"service_id"`
-	SourceNodeID string         `json:"source_node_id"`
+	WireVersion  string    `json:"wire_version"`
+	ID           string    `json:"id"`
+	OriginID     string    `json:"origin_id"`
+	MonotonicSeq int64     `json:"monotonic_seq"`
+	Timestamp    time.Time `json:"timestamp"`
+	Code         Code      `json:"code"`
+	Action       string    `json:"action"`
+	Severity     Severity  `json:"severity"`
+	ServiceID    string    `json:"service_id"`
+	SourceNodeID string    `json:"source_node_id"`
 	// TenantID is always emitted (null when absent) per the "always emit the
 	// key" convention so readers see a consistent shape across SDKs.
-	TenantID     *string        `json:"tenant_id"`
-	Actor        string         `json:"actor"`
-	ActorKind    string         `json:"actor_kind"`
-	Target       string         `json:"target"`
-	Category     string         `json:"category"`
-	Domain       Domain         `json:"domain"`
-	Method       string         `json:"method"`
-	RequestID    string         `json:"request_id"`
-	Detail       map[string]any `json:"detail"`
+	TenantID  *string        `json:"tenant_id"`
+	Actor     string         `json:"actor"`
+	ActorKind string         `json:"actor_kind"`
+	Target    string         `json:"target"`
+	Category  string         `json:"category"`
+	Domain    Domain         `json:"domain"`
+	Method    string         `json:"method"`
+	RequestID string         `json:"request_id"`
+	Detail    map[string]any `json:"detail"`
 	// P1-5: stamped true when the code declares PiiInDetail=true.
 	PiiInDetail bool       `json:"pii_in_detail"`
 	ShippedAt   *time.Time `json:"shipped_at,omitempty"`
@@ -345,12 +346,27 @@ func metaOf(c Code) (Meta, bool) {
 
 // ── Correlation context ───────────────────────────────────────────────────
 
-// MintID returns a new 12-character hex request id.
-func MintID() string {
-	b := make([]byte, 6)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
+// MintID returns a new 12-character hex request id. Delegates to the
+// zero-dependency fastenctx subpackage so a zero-cgo consumer can mint ids
+// without importing the cgo-bound top-level package.
+func MintID() string { return fastenctx.MintID() }
+
+// SentinelKinds re-exports fastenctx.SentinelKinds — the namespaces for rows
+// written outside a real request context (boot, sched, bg, lib, orphan).
+var SentinelKinds = fastenctx.SentinelKinds
+
+// MintSentinel mints a namespaced sentinel request_id (e.g.
+// "orphan-svc-ab12cd34ef56"). Panics on an unknown kind (a programming error,
+// never runtime input). Delegates to fastenctx (cgo-free).
+func MintSentinel(kind, serviceID string) string { return fastenctx.MintSentinel(kind, serviceID) }
+
+// RequestIDKind classifies a request_id by its namespace: a sentinel kind, or
+// "request" for a real correlation id. Delegates to fastenctx (cgo-free).
+func RequestIDKind(requestID string) string { return fastenctx.RequestIDKind(requestID) }
+
+// IsSentinel reports whether requestID is a minted sentinel, not a real id.
+// Delegates to fastenctx (cgo-free).
+func IsSentinel(requestID string) bool { return fastenctx.IsSentinel(requestID) }
 
 // WithRequestID returns ctx with the id as the ambient correlation id.
 //
@@ -365,6 +381,30 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 // Delegates to fastenctx — same key as WithRequestID above.
 func RequestIDFromContext(ctx context.Context) string {
 	return fastenctx.RequestIDFromContext(ctx)
+}
+
+// Background returns ctx carrying a bg- sentinel request_id when ctx has none,
+// so work outside a request — a background goroutine, worker, or scheduled tick
+// — stays correlatable; if ctx already carries a request_id it is returned
+// unchanged. §5.1/§8.1: keeps the every-row-correlatable invariant for
+// context-less work instead of leaving orphans. Pass "sched"/"lib" via
+// BackgroundKind for those namespaces.
+func Background(ctx context.Context) context.Context { return BackgroundKind(ctx, "bg") }
+
+// BackgroundKind is Background with an explicit sentinel namespace.
+func BackgroundKind(ctx context.Context, kind string) context.Context {
+	if RequestIDFromContext(ctx) == "" {
+		return WithRequestID(ctx, MintSentinel(kind, Default.serviceID))
+	}
+	return ctx
+}
+
+// Go runs fn in a new goroutine under a Background context: it inherits ctx's
+// request_id if present, else a fresh bg- sentinel, so the goroutine's sys logs
+// remain correlatable. The mirror of Python's fasten.go.
+func Go(ctx context.Context, fn func(context.Context)) {
+	c := Background(ctx)
+	go fn(c)
 }
 
 // ── Audit-store failure handling ──────────────────────────────────────────
@@ -423,6 +463,26 @@ type Config struct {
 	TenantID   string
 	AuditStore AuditRepository
 
+	// FR1: opt-in durable persistence for the api/sys streams. Nil → that
+	// stream stays ring-only (default, backward compatible). Construct with
+	// NewStreamStore(db, table) for SQLite or NewPostgresStreamStore(db, table)
+	// for Postgres; the caller owns the *sql.DB as with AuditStore.
+	APIStore    StreamRepository
+	SyslogStore StreamRepository
+
+	// FR3: opt-in free-text search (/logs/search and q=). Off by default — it is
+	// a linear scan, so it must be explicitly enabled (also via
+	// FASTEN_SEARCH_ENABLED). Enabling it without a SyslogStore still yields
+	// "search requires sys persistence" at read time.
+	SearchEnabled bool
+
+	// Redaction customization (parity with the Python SDK). ExtraRedactKeys are
+	// added to the built-in PII key patterns; RedactReplacement overrides the
+	// "***" token. Both also read from FASTEN_REDACT_KEYS (comma-separated) /
+	// FASTEN_REDACT_REPLACEMENT when the field is empty. Empty = defaults.
+	ExtraRedactKeys   []string
+	RedactReplacement string
+
 	// P1-15
 	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
 	QueueCapacity             int           // default 100
@@ -430,6 +490,24 @@ type Config struct {
 	QueueRetryMax             time.Duration // default 60 * time.Second
 	DisableQueueJitter        bool          // zero (default) = jitter ON
 	QueueDrainMaxAttempts     int           // default 50; row → DLQ after this many failures
+
+	// FR1 retention (spec §1): background age-based purge on the api/sys
+	// stream stores. Zero disables. Also read from FASTEN_RETENTION_API and
+	// FASTEN_RETENTION_SYSLOG when the field is zero (values there are
+	// duration tokens like "7d" / "24h", parsed by time.ParseDuration with
+	// day support). Runs the first purge on Init, then every hour.
+	RetentionAPI    time.Duration
+	RetentionSyslog time.Duration
+
+	// #58 PersistStreams: explicit allowlist of streams the operator has
+	// opted into persisting. When non-nil, Init asserts the set matches the
+	// streams with stores attached (bidirectional — a named stream without
+	// a store or an attached store without the name both fail loudly).
+	// When nil, persistence is derived from store attachment (the earlier
+	// behaviour, and still the default). "audit" is never valid here —
+	// audit persistence is driven by AuditStore. Also read from
+	// FASTEN_PERSIST_STREAMS as a comma-separated list.
+	PersistStreams []string
 }
 
 // Init configures fasten. Delegates to Default.Init.
@@ -492,23 +570,29 @@ func firstNonEmpty(vals ...string) string {
 func rowToMap(r Row) map[string]any {
 	d := map[string]any{
 		"wire_version": r.WireVersion,
-		"id": r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
-		"timestamp": r.Timestamp.Format(time.RFC3339Nano),
-		"code": string(r.Code), "action": r.Action, "severity": string(r.Severity),
+		"id":           r.ID, "origin_id": r.OriginID, "monotonic_seq": r.MonotonicSeq,
+		"timestamp": canonicalTS(r.Timestamp),
+		"code":      string(r.Code), "action": r.Action, "severity": string(r.Severity),
 		"service_id": r.ServiceID, "source_node_id": r.SourceNodeID, "tenant_id": func() any {
-			if r.TenantID != nil { return *r.TenantID }; return nil
+			if r.TenantID != nil {
+				return *r.TenantID
+			}
+			return nil
 		}(),
 		"actor": r.Actor, "actor_kind": r.ActorKind,
 		"target": r.Target, "category": r.Category, "domain": string(r.Domain),
 		"method": r.Method, "request_id": r.RequestID, "detail": r.Detail,
 		"pii_in_detail": r.PiiInDetail,
 		"canonical_form_id": func() string {
-			if r.CanonicalFormID == "" { return "1" }; return r.CanonicalFormID
+			if r.CanonicalFormID == "" {
+				return "1"
+			}
+			return r.CanonicalFormID
 		}(),
 		"prev_hash": r.PrevHash,
 	}
 	if r.ShippedAt != nil {
-		d["shipped_at"] = r.ShippedAt.Format(time.RFC3339Nano)
+		d["shipped_at"] = canonicalTS(*r.ShippedAt)
 	}
 	if r.Hash != "" {
 		d["hash"] = r.Hash
@@ -545,10 +629,18 @@ type Filter struct {
 	Code         Code
 	Domain       Domain
 	SourceNodeID string
+	TenantID     string
+	Actor        string
+	Target       string
 	Since        time.Time
 	Until        time.Time
 	Limit        int
-	// AfterSeq is a cursor: only return rows with monotonic_seq > AfterSeq.
-	// Set to the last row's MonotonicSeq from the previous page to paginate.
+	// AfterSeq is the canonical cursor: results are newest-first, so paging
+	// forward returns older rows — only rows with monotonic_seq < AfterSeq.
+	// Set to next_after (the smallest MonotonicSeq of the previous page) to
+	// continue. Insert-stable, unlike Offset.
 	AfterSeq int64
+	// Offset is the alternative page-number cursor (SQL OFFSET), for UIs that
+	// want total/limit/offset. Drifts as rows are inserted; prefer AfterSeq.
+	Offset int
 }

@@ -10,7 +10,6 @@ import pytest
 
 import fasten  # noqa: F401
 from fasten.attrs import AuditRow
-from fasten.store.sqlite import SQLiteStore
 
 
 def _row(seq, *, node, service, tenant, when=None):

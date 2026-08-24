@@ -33,11 +33,14 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
+from ..canonical_ts import canonical_now, canonical_ts
 from .. import audit_store as _active_audit_store
+from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
+from .. import search_enabled as _active_search_enabled
 from .. import transport as _active_transport
 
 
@@ -46,6 +49,8 @@ def router(
     *,
     store: Any = None,
     transport: Any = None,
+    persist_streams: frozenset[str] | None = None,
+    search_enabled: bool | None = None,
 ) -> Any:
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
@@ -56,9 +61,16 @@ def router(
         store: Optional AuditRepository override. Default: pulled from
             ``fasten.init()`` at request time via ``fasten.audit_store()``.
         transport: Optional StdoutTransport override. Default: same.
+        persist_streams: Streams backed by the durable store rather than a
+            bounded ring. Drives the per-stream ``completeness`` flag on
+            every read (``store`` vs ``ring``). Default: resolved per request
+            from the live engine config (``fasten.persisted_streams()``) —
+            ``audit`` when an audit store is attached (``ring`` on a
+            stdout-only engine), plus ``api``/``sys`` when a stream store is
+            configured. Pass an explicit set to override.
     """
     try:
-        from fastapi import APIRouter, Query
+        from fastapi import APIRouter, HTTPException, Query
     except ImportError as e:
         raise RuntimeError(
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
@@ -72,41 +84,195 @@ def router(
     def _transport() -> Any:
         return transport if transport is not None else _active_transport()
 
+    def _search_on() -> bool:
+        return search_enabled if search_enabled is not None else _active_search_enabled()
+
+    def _parse_window_ts(name: str, s: Optional[str]) -> Optional[str]:
+        """Parse a ``?since=`` / ``?until=`` reader input and return it in the
+        canonical form (spec §4.3) — the exact string every fasten writer
+        stamps into the timestamp column. Downstream compares are
+        lexicographic against canonical rows, so an operator writing
+        ``?since=2026-08-21T10:00:00Z`` (20-char short form) reads the same
+        rows a caller writing the full 27-char form would. None / empty
+        stays None (no filter). Malformed → HTTPException(422)."""
+        if s is None or s == "":
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{name} must be RFC3339 (e.g. 2026-08-21T10:00:00Z): {e}",
+            )
+        return canonical_ts(dt)
+
+    def _search_guard(q: Optional[str], since: Optional[str]) -> Optional[str]:
+        """Shared FR3 preconditions: search must be enabled and time-bounded.
+        Returns an error message when a ``q=`` read is not allowed, else None."""
+        if not _search_on():
+            return (
+                "search disabled — set search.enabled "
+                "(FASTEN_SEARCH_ENABLED=true) to enable free-text q="
+            )
+        if not since:
+            return "q= search requires a 'since' bound (no unbounded scans)"
+        return None
+
+    def _audit_degraded() -> bool:
+        """Audit durable history has known holes when either the audit store
+        swallowed a persist failure (sync fallback path) or the drainer
+        dead-lettered at least one row (async path). Unlike api/sys, audit
+        durability spans the store *and* the drainer, so both are consulted.
+
+        The engine-side flag is checked even when the store itself doesn't
+        expose ``degraded`` (an adopter AuditRepository may not implement
+        ``note_write_failure`` — see engine._audit_write_swallowed)."""
+        from ..emitter import _default as _default_engine
+        if _default_engine.audit_write_swallowed():
+            return True
+        s = _store()
+        if s is not None and getattr(s, "degraded", False):
+            return True
+        stats = _default_engine.queue_stats()
+        if stats and stats.get("dead_lettered_total", 0) > 0:
+            return True
+        return False
+
+    def _source(stream: str) -> str:
+        """Report whether a stream is backed by the durable store or a bounded
+        ring — its configured durability class, not a per-response gap signal.
+
+        It says whether the stream *can* lose rows, never whether *this*
+        response did: a ring that overflowed and evicted older matching rows
+        still reports ``ring``, identical to an empty ring that lost nothing.
+        This is a durability class, not a truncation signal — ``/correlate``
+        reports truncation separately via the counts/totals pair and the
+        derived per-stream ``truncated`` boolean. When
+        ``persist_streams`` is not pinned, resolve it from the live engine
+        config so the flag tracks which streams actually persist (FR1).
+
+        A store-backed stream whose sink has swallowed at least one persist
+        failure reports ``store-degraded``: reads are still served from the
+        store, but durable history has known holes (rows that live only in
+        the ring, which store-backed reads never consult), so plain ``store``
+        would assert a durability the data no longer has. Sticky for the
+        store's lifetime."""
+        persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
+        if stream not in persisted:
+            return "ring"
+        if stream == "audit":
+            # Audit is not a transport stream — its degraded signal comes from
+            # the audit store + drainer, not transport.stream_degraded (api/sys).
+            return "store-degraded" if _audit_degraded() else "store"
+        t = _transport()
+        if t is not None and getattr(t, "stream_degraded", None) and t.stream_degraded(stream):
+            return "store-degraded"
+        return "store"
+
     @r.get("/sys")
     def get_sys(
         level: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        event: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None, min_length=1),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         t = _transport()
         if t is None:
-            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+            return {
+                "rows": [],
+                "completeness": {"sys": _source("sys")},
+                "error": "transport not initialised — call fasten.init() first",
+            }
+        since = _parse_window_ts("since", since)
+        until = _parse_window_ts("until", until)
+        if q is not None:
+            # FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
+            err = _search_guard(q, since)
+            if err is not None:
+                return {"rows": [], "completeness": {"sys": _source("sys")}, "error": err}
+            # Reject q= combined with structured chips rather than silently
+            # dropping them. Matches /api?q= policy: an operator who narrows
+            # with ?q=timeout&level=error must not get a superset back with
+            # no signal that the chip was ignored. Callers use q= alone, or
+            # structured filters alone.
+            dropped = [
+                name for name, val in (
+                    ("level", level), ("request_id", request_id),
+                    ("service_id", service_id), ("event", event),
+                ) if val is not None
+            ]
+            if dropped:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "q= is a free-text search and cannot be combined with "
+                        f"structured filters ({', '.join(dropped)}). Use one or "
+                        "the other — structured filters run over the store index; "
+                        "q= runs over the raw payload."
+                    ),
+                )
+            rows = t.search_syslog(q=q, since=since, until=until, limit=min(limit, 200))
+            if rows is None:
+                return {
+                    "rows": [],
+                    "completeness": {"sys": _source("sys")},
+                    "error": "search requires sys persistence — configure a syslog store (FR1)",
+                }
+            return {"rows": rows, "completeness": {"sys": _source("sys")}}
         rows = t.query_syslog(
             limit=limit,
             level=level,
             request_id=request_id,
             service_id=service_id,
+            event=event,
+            since=since,
+            until=until,
         )
-        return {"rows": rows}
+        return {"rows": rows, "completeness": {"sys": _source("sys")}}
 
     @r.get("/api")
     def get_api(
         method: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        status: Optional[int] = Query(default=None),
+        since: Optional[str] = Query(default=None),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+        q: Optional[str] = Query(default=None),
     ) -> dict[str, Any]:
+        if q is not None:
+            # Free-text search is sys-only in v1 (§9). Reject rather than
+            # silently drop, so callers (and copy-pasted handlers) can't
+            # assume q= works on the api stream.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "free-text q= not accepted on /api — use "
+                    "/search?streams=api (or /logs/sys?q= for syslog only)"
+                ),
+            )
         t = _transport()
         if t is None:
-            return {"rows": [], "error": "transport not initialised — call fasten.init() first"}
+            return {
+                "rows": [],
+                "completeness": {"api": _source("api")},
+                "error": "transport not initialised — call fasten.init() first",
+            }
         rows = t.query_api(
             limit=limit,
             method=method,
             path=path,
             request_id=request_id,
+            status=status,
+            since=_parse_window_ts("since", since),
+            until=_parse_window_ts("until", until),
         )
-        return {"rows": rows}
+        return {"rows": rows, "completeness": {"api": _source("api")}}
 
     @r.get("/audit")
     def get_audit(
@@ -119,14 +285,19 @@ def router(
         target: Optional[str] = Query(default=None),
         since: Optional[datetime] = Query(default=None),
         until: Optional[datetime] = Query(default=None),
-        limit: int = Query(default=100, le=1000),
+        limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
+        after: Optional[int] = Query(default=None, ge=1),
     ) -> dict[str, Any]:
         s = _store()
         if s is None:
             return {
                 "rows": [],
                 "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "next_after": None,
+                "completeness": {"audit": _source("audit")},
                 "error": "audit store not initialised — call fasten.init() first",
             }
         filters = dict(
@@ -135,14 +306,226 @@ def router(
             actor=actor, target=target,
             since=since, until=until,
         )
-        rows = s.query(limit=limit, offset=offset, **filters)
-        total = s.count(**filters) if hasattr(s, "count") else len(rows)
+        rows = s.query(limit=limit, offset=offset, after_seq=(after or 0), **filters)
+        # total is None when the store doesn't implement count, OR when a
+        # count call fails. A null total is honest; falling back to len(rows)
+        # would lie (len is capped at limit, so a paginating caller can't tell
+        # page N is the last), and raising a 500 kills the row set the caller
+        # actually got. Mirrors Go's handleAudit — same wire behaviour on
+        # both SDKs (PR #59 finding 9 + branch-review #4).
+        total: int | None = None
+        if hasattr(s, "count"):
+            try:
+                total = s.count(**filters)
+            except Exception:  # noqa: BLE001
+                total = None
+        # Dual pagination (FR5): offset (total/limit/offset) for page-number UIs
+        # and cursor (next_after) as the canonical, insert-stable model. Rows are
+        # newest-first, so the last row carries the smallest monotonic_seq — pass
+        # it back as ?after= to continue. Both models are always reported.
+        next_after = rows[-1].monotonic_seq if rows else None
         return {
             "rows": [dataclasses.asdict(row) for row in rows],
             "total": total,
             "limit": limit,
             "offset": offset,
+            "next_after": next_after,
+            "completeness": {"audit": _source("audit")},
         }
+
+    @r.get("/correlate")
+    def get_correlate(
+        request_id: str = Query(..., min_length=1),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        """Unified correlation read — every stream for one ``request_id``.
+
+        Fans out to the existing per-stream query paths (audit store + sys/api
+        rings-or-stores) and assembles them, so a consumer holding a
+        ``request_id`` gets the whole operation in one call instead of
+        stitching three. Adds no new query semantics beyond fan-out +
+        assembly. ``completeness`` reports each stream's durability class,
+        and ``totals`` reports how many matching rows the backing source
+        holds — ``counts`` is how many this capped response returned, so
+        ``counts < totals`` means the response is truncated (raise ``limit``
+        or page the per-stream endpoints); the per-stream ``truncated`` boolean
+        reports that inequality directly so callers don't re-derive it.
+        """
+        s = _store()
+        t = _transport()
+        audit = (
+            [dataclasses.asdict(row) for row in s.query(limit=limit, request_id=request_id)]
+            if s is not None else []
+        )
+        api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
+        sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
+        # audit_total is None when the store lacks count() OR the call fails
+        # — null is honest; len(audit) would lie (capped at limit) and 500
+        # would kill the useful row set. Mirrors Go's handleCorrelate — one
+        # wire policy on both SDKs (PR #59 finding 9 + branch-review #4).
+        audit_total: int | None = None
+        if s is not None and hasattr(s, "count"):
+            try:
+                audit_total = s.count(request_id=request_id)
+            except Exception:  # noqa: BLE001
+                audit_total = None
+        counts = {"audit": len(audit), "api": len(api), "sys": len(sys)}
+        totals = {
+            "audit": audit_total,
+            "api": t.count_api(request_id=request_id) if t is not None else 0,
+            "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
+        }
+        # Truncation is counts < totals per stream. The pair is authoritative;
+        # this boolean is a convenience so every caller doesn't re-derive the
+        # inequality (and get it subtly wrong). Reported per stream. A null
+        # total (audit only, on stores without count) means "unknown" — the
+        # truncated flag mirrors that as None rather than a spurious False.
+        def _trunc(k: str) -> Optional[bool]:
+            total = totals[k]                # pull into a local so mypy narrows
+            return None if total is None else counts[k] < total
+        truncated = {k: _trunc(k) for k in ("audit", "api", "sys")}
+        return {
+            "request_id": request_id,
+            "audit": audit,
+            "api": api,
+            "sys": sys,
+            "counts": counts,
+            "totals": totals,
+            "truncated": truncated,
+            "completeness": {
+                "audit": _source("audit"),
+                "api": _source("api"),
+                "sys": _source("sys"),
+            },
+        }
+
+    _VALID_SEARCH_STREAMS = frozenset({"audit", "api", "sys"})
+
+    @r.get("/search")
+    def get_search(
+        q: str = Query(..., min_length=1),
+        since: str = Query(...),
+        until: Optional[str] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        streams: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        """FR3 free-text search across audit / api / sys — the time-bounded
+        escape hatch (§4.1).
+
+        Case-insensitive substring scan over persisted history. Each match
+        carries ``request_id`` so a consumer can hand it to ``/correlate``.
+        Deliberately constrained — opt-in (``search.enabled``), ``since``
+        mandatory (no unbounded scans), hard result cap, and no relevance
+        ranking (newest-first per stream). Not a log query language; structured
+        field reads are the primary discovery path.
+
+        ``streams=`` is a comma-separated subset of ``{audit, api, sys}``.
+        Default: ``sys`` — the linear scan stays opt-in per stream, so an
+        operator hitting /search without ``streams=`` doesn't fan out
+        across audit + api unless they ask for it. Each named stream must
+        have a store — for ring-only streams the response reports a
+        per-stream error, not an empty list that reads as "no matches".
+        """
+        # Parse + validate streams param before hitting the search guard so
+        # a bad ?streams=foo fails loudly rather than falling through.
+        requested = streams.split(",") if streams else ["sys"]
+        parsed = {s.strip() for s in requested if s.strip()}
+        unknown = parsed - _VALID_SEARCH_STREAMS
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"streams={sorted(parsed)}: unknown stream(s) {sorted(unknown)}. "
+                    f"Valid: {sorted(_VALID_SEARCH_STREAMS)}."
+                ),
+            )
+        if not parsed:
+            parsed = {"sys"}
+
+        completeness = {s: _source(s) for s in parsed}
+        empty_counts = {s: 0 for s in parsed}
+        # Canonicalise the window BEFORE the guard so /search's own
+        # since-mandatory check and the store's lex compare both see the
+        # same shape. Raises 422 on non-RFC3339 input. `since` is Query(...)
+        # required, but Query("") sends an empty string past that check —
+        # normalise to None so the guard's ``if not since`` catches it.
+        since = _parse_window_ts("since", since) or ""
+        until = _parse_window_ts("until", until)
+        err = _search_guard(q, since)
+        if err is not None:
+            return {"matches": [], "counts": empty_counts,
+                    "completeness": completeness, "error": err}
+
+        t = _transport()
+        s = _store()
+        if t is None:
+            return {"matches": [], "counts": empty_counts,
+                    "completeness": completeness,
+                    "error": "transport not initialised — call fasten.init() first"}
+
+        matches: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        # Stable stream order in the response so a UI can render tabs
+        # deterministically. Sys first (the historical default), then api,
+        # then audit — mirrors the /correlate response order.
+        for stream in ("sys", "api", "audit"):
+            if stream not in parsed:
+                continue
+            if stream == "sys":
+                rows = t.search_syslog(q=q, since=since, until=until, limit=limit)
+                if rows is None:
+                    errors["sys"] = "requires sys persistence — configure a syslog store (FR1)"
+                    counts["sys"] = 0
+                    continue
+                counts["sys"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "sys",
+                        "request_id": row.get("request_id"),
+                        "ts": row.get("timestamp"),
+                        "summary": row.get("event"),
+                        "row": row,
+                    })
+            elif stream == "api":
+                rows = t.search_api(q=q, since=since, until=until, limit=limit)
+                if rows is None:
+                    errors["api"] = "requires api persistence — configure an api store (FR1)"
+                    counts["api"] = 0
+                    continue
+                counts["api"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "api",
+                        "request_id": row.get("request_id"),
+                        "ts": row.get("timestamp"),
+                        "summary": f"{row.get('method','')} {row.get('path','')}".strip(),
+                        "row": row,
+                    })
+            elif stream == "audit":
+                if s is None or not hasattr(s, "search"):
+                    errors["audit"] = "requires an audit store with a search method (FR1)"
+                    counts["audit"] = 0
+                    continue
+                rows = s.search(q=q, since=since, until=until, limit=limit)
+                counts["audit"] = len(rows)
+                for row in rows:
+                    matches.append({
+                        "stream": "audit",
+                        "request_id": row.request_id,
+                        "ts": canonical_ts(row.timestamp) if row.timestamp else None,
+                        "summary": row.code,
+                        "row": dataclasses.asdict(row),
+                    })
+
+        resp: dict[str, Any] = {
+            "matches": matches,
+            "counts": counts,
+            "completeness": completeness,
+        }
+        if errors:
+            resp["errors"] = errors
+        return resp
 
     @r.get("/topology")
     def get_topology(
@@ -237,9 +620,12 @@ def router(
         }
 
         # P1-23: hash chain verification — spot-check latest 50 rows.
+        # breaks is None until verification actually runs; 0 when the chain is
+        # clean, 1+ when broken. Never report 0 for "we didn't check", which
+        # would read as green on a status page colouring on this field.
         chain_block: dict[str, Any] = {
             "verified": None,
-            "breaks": 0,
+            "breaks": None,
             "last_verified_at": None,
         }
         if s is not None and hasattr(s, "query"):
@@ -250,18 +636,26 @@ def router(
                     limit=50,
                 )
                 if recent:
+                    recent.reverse()  # verify_chain requires oldest-first traversal
                     result = verify_chain(recent)
                     chain_block = {
                         "verified": result.ok,
                         "breaks": 0 if result.ok else 1,
                         "first_break_at": result.first_break_at,
                         "reason": result.reason,
-                        "last_verified_at": datetime.now(timezone.utc).isoformat(
-                            timespec="milliseconds"
-                        ),
+                        "last_verified_at": canonical_now(),
                     }
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Never collapse a failed check into breaks: 0. Surface the
+                # error so operators can see verification is broken rather
+                # than seeing a green status page.
+                chain_block = {
+                    "verified": None,
+                    "breaks": None,
+                    "error": type(e).__name__,
+                    "reason": str(e),
+                    "last_verified_at": None,
+                }
 
         return {
             "store": store_block,

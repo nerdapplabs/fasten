@@ -19,23 +19,35 @@ from __future__ import annotations
 from .attrs import Anchor, AuditRow
 from .chain import ChainVerifyResult, seal, verify_chain
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
-from .context import current_request_id, mint_id, with_request_id
+from .context import (
+    current_request_id,
+    is_sentinel,
+    mint_id,
+    mint_sentinel,
+    request_id_kind,
+    with_request_id,
+)
 from .emitter import (
     audit_store,
+    background,
     emit,
     flush,
+    go,
     ingest_replicated,
     init,
     init_config,
     list_unshipped,
     log,
     mark_shipped,
+    persisted_streams,
     queue_stats,
     redactor,
+    search_enabled,
     start,
     transport,
 )
 from .engine import AuditStoreError, Engine, FastenConfig
+from .query import Chips, RuleTranslator, Translator, translate as translate_query
 from . import replication
 from .store.repo import AuditChainError, AuditRepository, IngestResult
 
@@ -75,7 +87,10 @@ __all__ = [
     "queue_stats",
     # context
     "current_request_id",
+    "is_sentinel",
     "mint_id",
+    "mint_sentinel",
+    "request_id_kind",
     "with_request_id",
     # core
     "emit",
@@ -83,10 +98,20 @@ __all__ = [
     "init_config",
     "start",
     "log",
+    # background-work correlation (bg- sentinel context)
+    "background",
+    "go",
     # adopter hooks
     "audit_store",
+    "persisted_streams",
+    "search_enabled",
     "redactor",
     "transport",
+    # query translation (NL / smart-box → structured chips)
+    "Chips",
+    "Translator",
+    "RuleTranslator",
+    "translate_query",
 ]
 
 __version__ = "1.0.0b0"

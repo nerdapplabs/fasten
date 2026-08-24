@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,7 +26,19 @@ type PostgresStore struct {
 	table  string
 	schema string
 	bare   string
+
+	// writeFailures counts swallowed persist failures; >0 means durable audit
+	// history has a known hole → "store-degraded". Sticky for the store's life.
+	writeFailures atomic.Int64
 }
+
+// NoteWriteFailure records a swallowed persist failure (durable history has a
+// hole). Callers that surface the Insert error don't mark the store degraded.
+func (s *PostgresStore) NoteWriteFailure() { s.writeFailures.Add(1) }
+
+// Degraded reports whether at least one persist failure was swallowed. Drives
+// the "store-degraded" audit completeness flag.
+func (s *PostgresStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // NewPostgresStore creates and migrates the audit table, then returns the store.
 // tableName may be a plain identifier or schema-qualified (schema.table).
@@ -263,14 +276,70 @@ func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	n := len(args) + 1
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	// Cursor pagination (canonical): newest-first, so paging forward means
+	// older rows — monotonic_seq < AfterSeq. Applied here, not in
+	// filterToPostgresSQL, so CountFiltered/total stays the full filtered count.
+	if f.AfterSeq > 0 {
+		n := len(args) + 1
+		if where == "" {
+			where = fmt.Sprintf("WHERE monotonic_seq < $%d", n)
+		} else {
+			where += fmt.Sprintf(" AND monotonic_seq < $%d", n)
+		}
+		args = append(args, f.AfterSeq)
+	}
+	limIdx := len(args) + 1
+	offIdx := len(args) + 2
 	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
 	// counter, meaningless across sub-chains — it stays as the
 	// same-timestamp tie-breaker only (#68).
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d`, pgAuditCols, s.table, where, n),
-		append(args, limit)...,
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d OFFSET $%d`, pgAuditCols, s.table, where, limIdx, offIdx),
+		append(args, limit, offset)...,
 	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsPg(rows)
+}
+
+// CountFiltered returns the total number of rows matching the same filter as
+// Query, ignoring Limit — so a capped read (e.g. /correlate) can report how
+// much matching history it truncated.
+func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error) {
+	where, args := filterToPostgresSQL(f)
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM %s %s`, s.table, where), args...,
+	).Scan(&count)
+	return count, err
+}
+
+// Search runs FR3 free-text search over the audit detail column (§4.1).
+// Case-insensitive ILIKE substring, since= bounded, hard-capped by limit,
+// newest-first, no ranking. Result rows carry request_id for /correlate.
+// %/_/\ in q are escaped so they match literally under ESCAPE E'\\'.
+func (s *PostgresStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+	esc := escapeLikeLiteral(q)
+	conds := []string{"timestamp >= $1", `detail::text ILIKE $2 ESCAPE E'\\'`}
+	args := []any{since, "%" + esc + "%"}
+	n := 3
+	if until != "" {
+		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n))
+		args = append(args, until)
+		n++
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d`,
+		pgAuditCols, s.table, strings.Join(conds, " AND "), n,
+	)
+	rows, err := s.db.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -363,15 +432,23 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 	if f.SourceNodeID != "" {
 		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n)); args = append(args, f.SourceNodeID); n++
 	}
+	if f.TenantID != "" {
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n)); args = append(args, f.TenantID); n++
+	}
+	if f.Actor != "" {
+		conds = append(conds, fmt.Sprintf("actor = $%d", n)); args = append(args, f.Actor); n++
+	}
+	if f.Target != "" {
+		conds = append(conds, fmt.Sprintf("target = $%d", n)); args = append(args, f.Target); n++
+	}
 	if !f.Since.IsZero() {
 		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n)); args = append(args, f.Since.UTC()); n++
 	}
 	if !f.Until.IsZero() {
 		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n)); args = append(args, f.Until.UTC()); n++
 	}
-	if f.AfterSeq > 0 {
-		conds = append(conds, fmt.Sprintf("monotonic_seq > $%d", n)); args = append(args, f.AfterSeq); n++
-	}
+	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
+	// bound, applied in Query so CountFiltered/total stays the full match count.
 	_ = n
 	if len(conds) == 0 {
 		return "", args
@@ -405,7 +482,11 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		json.Unmarshal([]byte(detail), &r.Detail)
+		// Strict — a malformed detail column is a bug at the writer, must
+		// fail loudly instead of silently returning an empty map.
+		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+			return nil, fmt.Errorf("scanRowsPg: row %q detail: %w", r.ID, err)
+		}
 		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
 			t := shippedAt.UTC()

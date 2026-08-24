@@ -6,6 +6,92 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
+
+- **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),
+  write-through behind the ring, with per-stream retention (`purge(before=…)`)
+  and a background retention loop that calls purge on a schedule when
+  `retention_api` / `retention_syslog` (config or env `FASTEN_RETENTION_API`
+  / `FASTEN_RETENTION_SYSLOG`) is set — durations like `"7d"` / `"24h"`.
+- **`persist_streams` allowlist** — explicit config knob (Python
+  `fasten.init(persist_streams=…)` / Go `Config.PersistStreams` / env
+  `FASTEN_PERSIST_STREAMS`) that must exactly match the streams with stores
+  attached. Bidirectional error on mismatch — a stream named without a
+  store or an attached store not in the allowlist both fail Init loudly.
+  When unset, persistence is derived from store attachment (the default).
+- **FR2 correlation** — `GET /logs/correlate?request_id=X` fans out to
+  audit + api + sys in one call, with `counts`/`totals` truncation signalling.
+- **FR3 search** — `GET /logs/search?streams=audit,api,sys` (comma-separated
+  subset; default `sys`) plus a gated `q=` on `/logs/sys`: `since=` mandatory,
+  hard-capped, no ranking, opt-in via `search.enabled` /
+  `FASTEN_SEARCH_ENABLED`. Each named stream must have a store — ring-only
+  streams report `errors.<stream>` per-stream rather than an empty match list.
+  Result stream order (sys → api → audit) mirrors `/correlate`.
+- **FR4 completeness** — every read reports `store` / `ring` / `store-degraded`
+  per stream.
+- **Structured field indexes** on `api`/`sys` (`method`/`path`/`status`,
+  `level`/`service_id`/`event`) for fast, indexed discovery.
+- **Sentinel `request_id` invariant** — `boot`/`orphan` (auto) plus
+  `sched`/`bg`/`lib` namespaces, so every persisted stream row is correlatable;
+  covered by a boot→request→background→shutdown conformance test.
+- **Query translator** (`fasten.query`) — NL / smart-box text → structured chips
+  + bounded `q=`; an interface plus a deterministic reference parser, not a new
+  endpoint.
+- **Reader parity (FR5)** — Go gains `/topology`, `/audit` `tenant_id`/`actor`/
+  `target` filters, and `redactor`/`chain`/`worker_pid` in `/audit/doctor`.
+- `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
+  retention, and constrained-search contract.
+
+### Changed — canonical UTC timestamp form on both SDKs
+
+- Every outbound fasten timestamp is now stamped in the canonical form
+  named in spec §4.3: **RFC3339 with fixed six-digit microseconds and
+  always-`Z`** (`2026-08-21T10:00:00.500000Z`, 27 chars). Applies to
+  audit `timestamp`/`shipped_at`, stream `timestamp`, purge cutoffs,
+  drainer sys events, `/audit/doctor` `last_verified_at`, and the
+  retention-loop cutoff — everywhere both SDKs used to disagree.
+- **Fixes** the cross-SDK window truncation that used to skip Python
+  rows 0.5s after a Go `since` bound (Python emitted
+  `…:00.500+00:00`, Go emitted `…:00Z` with `RFC3339Nano` stripping
+  trailing zeros) and the Go-only same-second inversion where
+  whole-second rows sorted above fractional rows in the same second
+  (`'Z'` 0x5A > `'.'` 0x2E).
+- **One form, one parser.** Reader paths (`parseCanonicalTS` in Go,
+  `parse_canonical` in Python) are strict — anything but the canonical
+  form is a bug at the source and fails loudly, not something to
+  round-trip silently.
+- Pinned by parallel conformance tests in each SDK
+  (`python/tests/test_canonical_ts.py`, `go/canonical_ts_test.go`) that
+  assert byte-identical output on the same instant plus strict-reject
+  of every non-canonical shape.
+
+### Changed — Ring filter semantics now match the store (gh #58, Python)
+
+- `python/fasten/store/ring.py` filter comparisons switched from lax to strict
+  to match store behaviour (spec §4.2, and closes a real ring/store divergence):
+  - `level` is now case-sensitive (`level == "ERROR"` no longer matches `error`).
+  - `method` is now case-sensitive (`method == "GET"` no longer matches `get`).
+  - `path` now requires an exact match, not a substring (`path == "/users"` no
+    longer matches `/users/42`).
+- **Breaking for existing callers** who relied on the lax behaviour without
+  persistence attached. If a dashboard calls `/logs/sys?level=ERROR` and rows
+  were logged with `error`, or `/logs/api?path=/users` for prefix matches, the
+  query now returns zero rows. Uppercase/lowercase your query values to match
+  what the emitter writes, or switch to an indexed store-backed read.
+
+### Fixed — Reader hardening (gh #58, Python + Go)
+
+- `/sys`, `/api`, `/audit`, `/correlate` reject a non-positive `limit` (a
+  negative limit was `LIMIT -1` = an unbounded read on SQLite / a 500 on
+  Postgres).
+- `completeness.audit` no longer reports `store` in stdout-only mode (no audit
+  store); it honestly reports `ring`.
+- The ring windows a `None`/absent timestamp like the store (`COALESCE`), so ring
+  and store agree on `since`/`until`.
+- Go `LogSys`/`drainerSysLog` no longer mutate the ring-shared row — fixes a
+  `concurrent map read and map write` crash and a store-vs-ring `shape`
+  divergence.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

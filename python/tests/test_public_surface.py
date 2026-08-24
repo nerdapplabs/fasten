@@ -11,10 +11,8 @@ Covers:
 import pytest
 
 import fasten  # noqa: F401  (used by fixtures)
-from fasten.codes import Meta, Severity, RetentionClass, register
 from fasten.emitter import _default
 from fasten.redact import Redactor
-from fasten.store.sqlite import SQLiteStore
 from fasten.transport.stdout import StdoutTransport
 
 

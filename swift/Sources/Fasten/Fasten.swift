@@ -47,6 +47,23 @@ public enum Fasten {
     ///   - store:     Audit store; `nil` = stdout-only (no persistence).
     ///   - strategy:  `.queue` (default, non-blocking) or `.raise`.
     ///   - extraRedactKeys: Additional key names to redact in `detail`.
+    /// Extra redact key patterns from FASTEN_REDACT_KEYS (comma-separated), or
+    /// [] if unset. Used as the default for `configure(extraRedactKeys:)` so an
+    /// explicit arg still wins — parity with the other SDKs.
+    public static func envRedactKeys() -> [String] {
+        guard let s = ProcessInfo.processInfo.environment["FASTEN_REDACT_KEYS"], !s.isEmpty
+        else { return [] }
+        return s.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Redaction replacement token from FASTEN_REDACT_REPLACEMENT, or "***".
+    public static func envRedactReplacement() -> String {
+        let s = ProcessInfo.processInfo.environment["FASTEN_REDACT_REPLACEMENT"] ?? ""
+        return s.isEmpty ? "***" : s
+    }
+
     public static func configure(
         serviceID: String,
         nodeID: String,
@@ -54,8 +71,8 @@ public enum Fasten {
         store: (any AuditStore)? = nil,
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500,
-        extraRedactKeys: [String] = [],
-        redactReplacement: String = "***"
+        extraRedactKeys: [String] = Fasten.envRedactKeys(),
+        redactReplacement: String = Fasten.envRedactReplacement()
     ) throws {
         _defaultEngine.configure(
             serviceID: serviceID, nodeID: nodeID, tenantID: tenantID,

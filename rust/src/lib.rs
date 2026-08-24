@@ -414,15 +414,21 @@ pub mod log {
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
+    replacement: Option<&str>,
 ) -> HashMap<String, serde_json::Value> {
     use fasten_core::redact::{Redactor, REDACTOR};
     let v = serde_json::Value::Object(detail.into_iter().collect());
-    let redacted = match extra {
-        Some(keys) if !keys.is_empty() => {
-            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            Redactor::new(&refs, "", &[]).redact_value(&v)
-        }
-        _ => REDACTOR.redact_value(&v),
+    // "" → Redactor falls back to the built-in "***". Use a custom Redactor
+    // when extra keys OR a custom replacement is set, else the shared default.
+    let repl = replacement.unwrap_or("");
+    let has_extra = extra.is_some_and(|k| !k.is_empty());
+    let redacted = if has_extra || !repl.is_empty() {
+        let refs: Vec<&str> = extra
+            .map(|k| k.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        Redactor::new(&refs, repl, &[]).redact_value(&v)
+    } else {
+        REDACTOR.redact_value(&v)
     };
     match redacted {
         serde_json::Value::Object(map) => map.into_iter().collect(),
@@ -443,6 +449,9 @@ pub struct Config {
     pub node_id: String,
     pub tenant_id: Option<String>,
     pub extra_redact_keys: Option<Vec<String>>,
+    /// Custom redaction replacement token (None → the built-in "***"). Also
+    /// read from FASTEN_REDACT_REPLACEMENT by `config_from_env`.
+    pub redact_replacement: Option<String>,
     /// P1-15: durable audit store. When set together with
     /// `audit_store_failure_strategy = "queue"`, `EmitBuilder::submit()`
     /// pushes rows onto a bounded in-memory queue drained in the
@@ -477,11 +486,15 @@ pub fn config_from_env() -> Result<Config, Error> {
             .filter(|x| !x.is_empty())
             .collect::<Vec<_>>()
     });
+    let replacement = std::env::var("FASTEN_REDACT_REPLACEMENT")
+        .ok()
+        .filter(|s| !s.is_empty());
     Ok(Config {
         service_id,
         node_id,
         tenant_id: std::env::var("FASTEN_TENANT_ID").ok(),
         extra_redact_keys: extra,
+        redact_replacement: replacement,
         ..Default::default()
     })
 }
@@ -598,12 +611,20 @@ impl EmitBuilder {
                 .into_iter()
                 .filter(|(k, _)| passthrough.contains(k.as_str()))
                 .collect();
-            let mut out = redact_detail(kept, cfg.extra_redact_keys.as_deref());
+            let mut out = redact_detail(
+                kept,
+                cfg.extra_redact_keys.as_deref(),
+                cfg.redact_replacement.as_deref(),
+            );
             out.insert("_redacted".into(), serde_json::Value::String(REDACT_REPLACEMENT.into()));
             out.insert("_pii_in_detail".into(), serde_json::Value::Bool(true));
             out
         } else {
-            redact_detail(self.detail, cfg.extra_redact_keys.as_deref())
+            redact_detail(
+                self.detail,
+                cfg.extra_redact_keys.as_deref(),
+                cfg.redact_replacement.as_deref(),
+            )
         };
         let row = Row {
             wire_version: "1".into(),
@@ -686,11 +707,32 @@ mod tests {
             "nested".into(),
             serde_json::json!({"token": "xyz", "ok": "keep"}),
         );
-        let out = redact_detail(d, None);
+        let out = redact_detail(d, None, None);
         assert_eq!(out["email"], serde_json::json!("a@b.com"));
         assert_eq!(out["api_key"], serde_json::json!("***"));
         assert_eq!(out["nested"]["token"], serde_json::json!("***"));
         assert_eq!(out["nested"]["ok"], serde_json::json!("keep"));
+    }
+
+    #[test]
+    fn redact_custom_replacement_and_extra_keys() {
+        let mut d = HashMap::new();
+        d.insert("password".into(), serde_json::json!("p")); // built-in key
+        d.insert("badge".into(), serde_json::json!("b"));    // extra key
+        d.insert("ok".into(), serde_json::json!("v"));
+        let extra = vec!["badge".to_string()];
+        let out = redact_detail(d, Some(&extra), Some("[X]"));
+        assert_eq!(out["password"], serde_json::json!("[X]")); // built-in, custom token
+        assert_eq!(out["badge"], serde_json::json!("[X]"));    // extra key
+        assert_eq!(out["ok"], serde_json::json!("v"));
+
+        // custom replacement alone (no extra keys) still redacts built-ins
+        let mut d2 = HashMap::new();
+        d2.insert("secret".into(), serde_json::json!("s"));
+        d2.insert("ok".into(), serde_json::json!("v"));
+        let out2 = redact_detail(d2, None, Some("##"));
+        assert_eq!(out2["secret"], serde_json::json!("##"));
+        assert_eq!(out2["ok"], serde_json::json!("v"));
     }
 
     #[test]

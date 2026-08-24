@@ -13,10 +13,13 @@ single default Engine so existing single-tenant adopter code is unchanged.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+import threading
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional
 
 from .attrs import AuditRow
 from .chain import verify_chain as _verify_chain
+from .context import current_request_id, mint_sentinel, with_request_id
 from .engine import AuditStoreError  # noqa: F401 — re-exported
 from .engine import Engine
 from .redact import Redactor
@@ -86,6 +89,50 @@ def redactor() -> Redactor:
 def audit_store() -> Any:
     """Active AuditRepository of the default Engine."""
     return _default.audit_store()
+
+
+def persisted_streams() -> frozenset[str]:
+    """Streams of the default Engine backed by the durable store vs a ring."""
+    return _default.persisted_streams()
+
+
+def search_enabled() -> bool:
+    """Whether FR3 free-text search is enabled on the default Engine."""
+    return _default.search_enabled()
+
+
+@contextmanager
+def background(kind: str = "bg") -> Iterator[str]:
+    """Context for work that runs outside a request — a background task, worker,
+    or scheduled tick. If no request_id is active, mint a sentinel (``bg-`` by
+    default; ``kind`` may be ``sched``/``lib``) so the block's sys logs stay
+    correlatable; if one is already active, inherit it. Returns the request_id in
+    effect. §5.1/§8.1: keeps the every-row-correlatable invariant for
+    context-less work instead of leaving orphans."""
+    active = current_request_id()
+    if active:
+        yield active
+    else:
+        with with_request_id(mint_sentinel(kind, _default._service_id)) as rid:
+            yield rid
+
+
+def go(fn: Callable[..., Any], *args: Any, _kind: str = "bg", **kwargs: Any) -> threading.Thread:
+    """Run ``fn`` in a daemon thread under a background context — the mirror of
+    Go's ``fasten.Go``. contextvars do not cross threads, so the request_id is
+    established inside the thread: it inherits the caller's active id if there is
+    one, else a fresh ``bg-`` sentinel, so the thread's sys logs remain
+    correlatable. Returns the started thread."""
+    parent = current_request_id()
+
+    def _run() -> None:
+        rid = parent or mint_sentinel(_kind, _default._service_id)
+        with with_request_id(rid):
+            fn(*args, **kwargs)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
 
 
 def init_config(*args: Any, **kwargs: Any) -> Any:

@@ -3,7 +3,7 @@ package fasten
 import (
 	"context"
 	"log/slog"
-	"time"
+	"strings"
 )
 
 // SlogHandler wraps an underlying slog.Handler and pushes each log record
@@ -35,9 +35,13 @@ func (h *SlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	if h.transport != nil {
 		row := SyslogRow{
-			"level":      r.Level.String(),
+			// Lowercase is fasten's canonical level casing: Python's fasten.log
+			// and Go's LogSys/drainer events all write lowercase, and level
+			// filters are exact-match, so slog's "INFO"/"ERROR" would make slog
+			// rows unfindable next to every other writer.
+			"level":      strings.ToLower(r.Level.String()),
 			"event":      r.Message,
-			"timestamp":  r.Time.UTC().Format(time.RFC3339Nano),
+			"timestamp":  canonicalTS(r.Time),
 			"request_id": RequestIDFromContext(ctx),
 			"service_id": Default.serviceID,
 		}

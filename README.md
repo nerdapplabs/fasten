@@ -16,7 +16,9 @@ Audit + correlation SDK.
 
 **Beyond observability. State over time.**
 
-**For AI agents and software systems.**
+**Verify before · govern during · prove after.**
+
+**From observation to evidence.  For AI agents and software systems.**
 
 A software system is more than AI agents. Logs, metrics, and traces tell
 you *what is happening*. **fasten is the connective tissue across AI and

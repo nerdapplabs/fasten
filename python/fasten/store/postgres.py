@@ -31,11 +31,9 @@ _SAFE_IDENTIFIER = re.compile(
 
 
 def _utc_iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
+    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``)."""
+    from ..canonical_ts import canonical_ts
+    return canonical_ts(dt)
 
 
 _DDL = """
@@ -97,6 +95,9 @@ class PostgresStore:
             )
         self._dsn = dsn
         self._table = table  # full ref used in SQL (may be "schema.table")
+        # Swallowed persist-failure counter (mirrors StreamStore). At least one
+        # means durable audit history has a known hole → "store-degraded". Sticky.
+        self._write_failures = 0
         # Bare table name for index identifiers — dots are not allowed there.
         self._idx_prefix = table.split(".")[-1]
         self._schema = table.split(".")[0] if "." in table else None
@@ -276,6 +277,21 @@ class PostgresStore:
         """Thin alias for insert_originated — the engine emit/drainer path."""
         self.insert_originated(row)
 
+    def note_write_failure(self) -> None:
+        """Record a swallowed persist failure (durable history has a hole).
+        Callers that surface the insert() error don't mark the store degraded."""
+        self._write_failures += 1
+
+    @property
+    def write_failures(self) -> int:
+        return self._write_failures
+
+    @property
+    def degraded(self) -> bool:
+        """True once at least one persist failure was swallowed. Drives the
+        ``store-degraded`` completeness flag."""
+        return self._write_failures > 0
+
     def list_unshipped(
         self,
         limit: int = 100,
@@ -439,6 +455,7 @@ class PostgresStore:
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
+        after_seq: int = 0,
     ) -> list[AuditRow]:
         where, params = self._build_where(
             request_id=request_id, code=code, domain=domain,
@@ -446,6 +463,13 @@ class PostgresStore:
             actor=actor, target=target,
             since=since, until=until,
         )
+        # Cursor pagination (canonical): rows are newest-first, so paging forward
+        # means older rows — monotonic_seq < after_seq. Applied here, not in
+        # _build_where, so count()/total stays the full filtered count
+        # independent of the cursor. Mirrors the Go audit store.
+        if after_seq > 0:
+            where = f"{where} AND monotonic_seq < %s" if where else "WHERE monotonic_seq < %s"
+            params = [*params, after_seq]
 
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
@@ -485,6 +509,39 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self._table} {where}", params)
                 return int(cur.fetchone()[0])
+
+        return self._execute_with_retry(_run)
+
+    def search(
+        self,
+        *,
+        q: str,
+        since: str,
+        until: str | None = None,
+        limit: int = 50,
+    ) -> list[AuditRow]:
+        """FR3 free-text search over persisted audit history (§4.1). Case-
+        insensitive substring scan over the ``detail`` JSON column via
+        ILIKE + ESCAPE E'\\\\'. Result carries request_id for ``/correlate``.
+
+        ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally.
+        Newest-first, hard-capped by ``limit``, no ranking."""
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds = ["timestamp >= %s", "detail::text ILIKE %s ESCAPE E'\\\\'"]
+        params: list[Any] = [since, f"%{esc}%"]
+        if until:
+            conds.append("timestamp <= %s")
+            params.append(until)
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s"
+        )
+
+        def _run(conn: Any) -> list[AuditRow]:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [self._row(r) for r in cur.fetchall()]
 
         return self._execute_with_retry(_run)
 
@@ -564,16 +621,20 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     def _row(self, r: tuple) -> AuditRow:
+        from ..canonical_ts import parse_canonical
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            timestamp=datetime.fromisoformat(r[3]),
+            # Strict canonical parse (spec §4.3). Every row in this table was
+            # written by _utc_iso → canonical_ts, so anything else is a bug at
+            # the source and must fail loudly instead of round-tripping.
+            timestamp=parse_canonical(r[3]),
             code=r[4], action=r[5], severity=r[6],
             service_id=r[7], source_node_id=r[8], tenant_id=r[9],
             actor=r[10], actor_kind=r[11],
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            shipped_at=datetime.fromisoformat(r[18]) if r[18] else None,
+            shipped_at=parse_canonical(r[18]) if r[18] else None,
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
             canonical_form_id=r[21] if len(r) > 21 else "1",

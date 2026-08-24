@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -101,21 +101,24 @@ class AuditRow:
             raise ValueError("audit row requires WHERE: service_id + source_node_id")
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable dict — datetimes are ISO-8601 strings."""
+        """Return a JSON-serialisable dict — datetimes in the canonical
+        cross-SDK UTC form (spec §4.3)."""
+        from .canonical_ts import canonical_ts
         d = dataclasses.asdict(self)
-        d["timestamp"] = self.timestamp.isoformat()
+        d["timestamp"] = canonical_ts(self.timestamp)
         if self.shipped_at is not None:
-            d["shipped_at"] = self.shipped_at.isoformat()
+            d["shipped_at"] = canonical_ts(self.shipped_at)
         return d
 
     def to_cloud_event(self) -> dict[str, Any]:
         """CloudEvent 1.0 shape — id / source / type / time / data."""
+        from .canonical_ts import canonical_ts
         return {
             "specversion": "1.0",
             "id": self.id,
             "source": self.source_node_id,
             "type": self.code,
-            "time": self.timestamp.astimezone(timezone.utc).isoformat(),
+            "time": canonical_ts(self.timestamp),
             "data": {
                 **self.detail,
                 "actor": self.actor,

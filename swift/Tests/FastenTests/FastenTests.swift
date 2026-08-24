@@ -54,6 +54,32 @@ final class RedactorTests: XCTestCase {
         XCTAssertEqual(out["user_id"] as? String, "u-42")
     }
 
+    func testRedactEnvConfig() {
+        setenv("FASTEN_REDACT_KEYS", "badge_no, employee_ref", 1)
+        setenv("FASTEN_REDACT_REPLACEMENT", "[X]", 1)
+        defer {
+            unsetenv("FASTEN_REDACT_KEYS")
+            unsetenv("FASTEN_REDACT_REPLACEMENT")
+        }
+        XCTAssertEqual(Fasten.envRedactKeys(), ["badge_no", "employee_ref"])
+        XCTAssertEqual(Fasten.envRedactReplacement(), "[X]")
+        // configure() defaults to the env values; a Redactor built from them
+        // redacts the env extra key AND the built-ins with the custom token.
+        let r = Redactor(extraKeys: Fasten.envRedactKeys(),
+                         replacement: Fasten.envRedactReplacement())
+        let out = r.redact(["badge_no": "b", "password": "p", "ok": "v"])
+        XCTAssertEqual(out["badge_no"] as? String, "[X]")
+        XCTAssertEqual(out["password"] as? String, "[X]")
+        XCTAssertEqual(out["ok"] as? String, "v")
+    }
+
+    func testRedactEnvDefaultsWhenUnset() {
+        unsetenv("FASTEN_REDACT_KEYS")
+        unsetenv("FASTEN_REDACT_REPLACEMENT")
+        XCTAssertEqual(Fasten.envRedactKeys(), [])
+        XCTAssertEqual(Fasten.envRedactReplacement(), "***")
+    }
+
     func testNestedRedaction() {
         let r = Redactor()
         let out = r.redact(["meta": ["token": "xyz", "ok": "visible"] as [String: Any]])

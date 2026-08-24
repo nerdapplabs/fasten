@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +31,21 @@ func envOr(key, fallback string) string {
 type SQLiteStore struct {
 	db    *sql.DB
 	table string
+
+	// writeFailures counts swallowed persist failures; >0 means durable audit
+	// history has a known hole, so the reader degrades the audit completeness
+	// flag from "store" to "store-degraded". Sticky for the store's lifetime.
+	writeFailures atomic.Int64
 }
+
+// NoteWriteFailure records a persist failure the caller swallowed on the hot
+// path (durable history has a hole). Callers that surface the Insert error
+// don't mark the store degraded.
+func (s *SQLiteStore) NoteWriteFailure() { s.writeFailures.Add(1) }
+
+// Degraded reports whether at least one persist failure was swallowed. Drives
+// the "store-degraded" audit completeness flag.
+func (s *SQLiteStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // validIdentifierRe gates tableName against SQL injection. Every Insert /
 // Query / migrate string-substitutes `s.table` into the SQL via fmt.Sprintf
@@ -184,7 +199,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	}
 	var shippedAt *string
 	if row.ShippedAt != nil {
-		v := row.ShippedAt.Format(time.RFC3339Nano)
+		v := canonicalTS(*row.ShippedAt)
 		shippedAt = &v
 	}
 	piiFlag := 0
@@ -202,7 +217,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	_, err = exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
-		row.Timestamp.Format(time.RFC3339Nano),
+		canonicalTS(row.Timestamp),
 		string(row.Code), row.Action, string(row.Severity),
 		row.ServiceID, row.SourceNodeID, row.TenantID,
 		row.Actor, row.ActorKind,
@@ -263,18 +278,87 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	// Cursor pagination (canonical): newest-first, so paging forward means
+	// older rows — monotonic_seq < AfterSeq. Applied here, not in filterToSQL,
+	// so CountFiltered/total stays the full filtered count.
+	//
+	// Accepted limitation on multi-origin stores (A1 in PR #59 review): the
+	// query orders by (timestamp, monotonic_seq) but the cursor is
+	// monotonic_seq alone, which is a per-(service_id, source_node_id)
+	// counter (see the tie-breaker note below). Paging to exhaustion across
+	// rows from more than one origin can skip or repeat rows because a lower
+	// seq in origin B can appear at a newer timestamp than a higher seq in
+	// origin A. Single-origin stores are unaffected. A composite
+	// (timestamp, seq) cursor would fix this but changes the wire contract;
+	// keeping the simpler cursor is the deliberate call.
+	if f.AfterSeq > 0 {
+		if where == "" {
+			where = "WHERE monotonic_seq < ?"
+		} else {
+			where += " AND monotonic_seq < ?"
+		}
+		args = append(args, f.AfterSeq)
+	}
 	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
 	// counter, meaningless across sub-chains — it stays as the
 	// same-timestamp tie-breaker only (#68).
 	rows, err := s.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`, auditCols, s.table, where),
-		append(args, limit)...,
+		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ? OFFSET ?`, auditCols, s.table, where),
+		append(args, limit, offset)...,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanRows(rows)
+}
+
+// CountFiltered returns the total number of rows matching the same filter as
+// Query, ignoring Limit — so a capped read (e.g. /correlate) can report how
+// much matching history it truncated.
+func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) {
+	where, args := filterToSQL(f)
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM %s %s`, s.table, where), args...,
+	).Scan(&n)
+	return n, err
+}
+
+// Search runs FR3 free-text search over the audit store's detail column
+// (§4.1). Case-insensitive substring, since= bounded, hard-capped by limit,
+// newest-first, no relevance ranking. Result rows carry request_id for
+// /correlate follow-up. %/_/\ in q are escaped so they match literally.
+func (s *SQLiteStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+	esc := escapeLikeLiteral(strings.ToLower(q))
+	conds := []string{"COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"}
+	args := []any{since, "%" + esc + "%"}
+	if until != "" {
+		conds = append(conds, "COALESCE(timestamp, '') <= ?")
+		args = append(args, until)
+	}
+	args = append(args, limit)
+	sql := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`,
+		auditCols, s.table, strings.Join(conds, " AND "),
+	)
+	rows, err := s.db.QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
+// escapeLikeLiteral escapes LIKE metacharacters (%, _, \) so they match
+// as data under an ESCAPE '\' clause.
+func escapeLikeLiteral(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, error) {
@@ -317,7 +401,7 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := canonicalTS(time.Now())
 	placeholders := make([]string, len(ids))
 	args := make([]any, 0, len(ids)+1)
 	args = append(args, now)
@@ -335,7 +419,7 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 
 func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
 	q := fmt.Sprintf(`DELETE FROM %s WHERE timestamp < ?`, s.table)
-	args := []any{before.UTC().Format(time.RFC3339Nano)}
+	args := []any{canonicalTS(before)}
 	if respectUnshipped {
 		q += " AND shipped_at IS NOT NULL"
 	}
@@ -382,6 +466,64 @@ func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNode
 	return n.Int64, nil
 }
 
+// Sources aggregates the fleet topology from the rows already recorded: one
+// entry per distinct (source_node_id, service_id, tenant_id) with its row count
+// and first/last-seen timestamps, ordered by count. No separate topology table
+// — the view falls out of the audit rows, so it can't drift. Mirrors the Python
+// SQLiteStore.sources. Optional [since, until] windows the aggregation.
+func (s *SQLiteStore) Sources(ctx context.Context, since, until time.Time) ([]map[string]any, error) {
+	var conds []string
+	var args []any
+	if !since.IsZero() {
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, canonicalTS(since))
+	}
+	if !until.IsZero() {
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, canonicalTS(until))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+	query := fmt.Sprintf(
+		"SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, "+
+			"MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen "+
+			"FROM %s %s GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC",
+		s.table, where,
+	)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var node, svc string
+		var tenant, first, last sql.NullString
+		var n int
+		if err := rows.Scan(&node, &svc, &tenant, &n, &first, &last); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"source_node_id": node,
+			"service_id":     svc,
+			"tenant_id":      nullStrOrNil(tenant),
+			"rows":           n,
+			"first_seen":     nullStrOrNil(first),
+			"last_seen":      nullStrOrNil(last),
+		})
+	}
+	return out, rows.Err()
+}
+
+func nullStrOrNil(ns sql.NullString) any {
+	if ns.Valid {
+		return ns.String
+	}
+	return nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 func filterToSQL(f Filter) (string, []any) {
@@ -399,15 +541,23 @@ func filterToSQL(f Filter) (string, []any) {
 	if f.SourceNodeID != "" {
 		conds = append(conds, "source_node_id = ?"); args = append(args, f.SourceNodeID)
 	}
+	if f.TenantID != "" {
+		conds = append(conds, "tenant_id = ?"); args = append(args, f.TenantID)
+	}
+	if f.Actor != "" {
+		conds = append(conds, "actor = ?"); args = append(args, f.Actor)
+	}
+	if f.Target != "" {
+		conds = append(conds, "target = ?"); args = append(args, f.Target)
+	}
 	if !f.Since.IsZero() {
-		conds = append(conds, "timestamp >= ?"); args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		conds = append(conds, "timestamp >= ?"); args = append(args, canonicalTS(f.Since))
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, "timestamp <= ?"); args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
+		conds = append(conds, "timestamp <= ?"); args = append(args, canonicalTS(f.Until))
 	}
-	if f.AfterSeq > 0 {
-		conds = append(conds, "monotonic_seq > ?"); args = append(args, f.AfterSeq)
-	}
+	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
+	// bound, applied in Query so CountFiltered/total stays the full match count.
 	if len(conds) == 0 {
 		return "", args
 	}
@@ -435,14 +585,29 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		); err != nil {
 			return nil, err
 		}
-		r.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		// Strict parses — a row that doesn't round-trip through parseCanonicalTS
+		// / json.Unmarshal is a bug at the source (writer bypassed
+		// canonical_ts, or the column got hand-edited). Swallowing the error
+		// used to leave Timestamp = time.Time{} — Jan 1 year 1 — which sorts
+		// to the top of any timestamp-DESC query and quietly breaks the
+		// contract the whole canonical work was defending. Fail loudly instead.
+		parsedTs, err := parseCanonicalTS(ts)
+		if err != nil {
+			return nil, fmt.Errorf("scanRows: row %q: %w", r.ID, err)
+		}
+		r.Timestamp = parsedTs
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		json.Unmarshal([]byte(detail), &r.Detail)
+		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+			return nil, fmt.Errorf("scanRows: row %q detail: %w", r.ID, err)
+		}
 		r.PiiInDetail = piiFlag != 0
 		if shippedAt != nil {
-			t, _ := time.Parse(time.RFC3339Nano, *shippedAt)
+			t, err := parseCanonicalTS(*shippedAt)
+			if err != nil {
+				return nil, fmt.Errorf("scanRows: row %q shipped_at: %w", r.ID, err)
+			}
 			r.ShippedAt = &t
 		}
 		if wv != "" {

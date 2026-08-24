@@ -73,6 +73,37 @@ Console scripts installed by `pip install`:
 | CLI         | `fasten tail --stream sys`         | Stream rows from a mounted reader             |
 | TUI         | `fasten-tui --request-id <id>`     | Live multi-pane audit + sys + API feed (Rich) |
 
+## Reading logs back: whole record, or a recent window?
+
+Every reader response carries a per-stream `completeness` flag that answers
+exactly this:
+
+- **`store`** — the stream is backed by a durable store. The response is a
+  query over the whole recorded history (paged by `limit`), not a window.
+- **`ring`** — the stream lives in a bounded in-memory ring (default 2000
+  rows, cleared on restart). The response only reaches as far back as the
+  ring: older rows have been evicted, and there is no signal for *whether*
+  eviction dropped matching rows. Treat it as "recent window", never "the
+  record".
+- **`store-degraded`** — store-backed, but at least one row failed to persist
+  (full disk, closed handle, …). Reads still serve from the store, but durable
+  history has known holes. The flag is sticky: it marks the history, not the
+  current sink state.
+
+The flag is the stream's durability *class* — it never says whether one
+specific response lost rows. For `/correlate`, which caps each stream at
+`limit`, compare `counts` (returned) against `totals` (matching rows available
+in the backing source): `counts < totals` means the response is truncated —
+raise `limit` or page the per-stream endpoints.
+
+`audit` reports `store` when an audit store is attached (the default in
+production `fasten.init(...)`) and `ring` when the SDK is running stdout-only
+without one — a stdout-only audit is honestly not a durable record, and
+`completeness` must reflect that. `api`/`sys` are ring-only unless you attach
+a `StreamStore` via `fasten.init(api_store=…, syslog_store=…)`; persistence is
+write-through (one synchronous INSERT + commit per pushed row — WAL +
+`synchronous=NORMAL`, so no per-commit fsync, but still a per-row disk write).
+
 ## P1-15: audit-store failure handling
 
 `fasten.emit()` defaults to **queue mode** — rows go onto a bounded

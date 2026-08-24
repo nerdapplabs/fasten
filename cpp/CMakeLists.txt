@@ -83,6 +83,13 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_substring_smoke COMMAND redact_substring_smoke)
 
+    add_executable(redact_env_keys_smoke tests/redact_env_keys_smoke.cpp)
+    target_link_libraries(redact_env_keys_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(redact_env_keys_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME redact_env_keys_smoke COMMAND redact_env_keys_smoke)
+
     # spec/redact-conformance.json cross-language conformance
     add_executable(redact_conformance_smoke tests/redact_conformance_smoke.cpp)
     target_link_libraries(redact_conformance_smoke PRIVATE fasten)
