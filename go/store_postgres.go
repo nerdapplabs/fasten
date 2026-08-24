@@ -71,52 +71,29 @@ func (s *PostgresStore) migrate() error {
 			return err
 		}
 	}
-
-	ddl := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s (
-    id             TEXT PRIMARY KEY,
-    origin_id      TEXT NOT NULL,
-    monotonic_seq  BIGINT NOT NULL,
-    timestamp      TIMESTAMPTZ NOT NULL,
-    code           TEXT NOT NULL,
-    action         TEXT NOT NULL,
-    severity       TEXT NOT NULL,
-    service_id     TEXT NOT NULL,
-    source_node_id TEXT NOT NULL,
-    tenant_id      TEXT,
-    actor          TEXT NOT NULL,
-    actor_kind     TEXT NOT NULL,
-    target         TEXT NOT NULL,
-    category       TEXT NOT NULL,
-    domain         TEXT NOT NULL,
-    method         TEXT NOT NULL,
-    request_id     TEXT NOT NULL,
-    detail         TEXT NOT NULL,
-    pii_in_detail  SMALLINT NOT NULL DEFAULT 0,
-    shipped_at     TIMESTAMPTZ,
-    wire_version   TEXT NOT NULL DEFAULT '1',
-    hash           TEXT NOT NULL DEFAULT '',
-    prev_hash      TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
-);
-CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
-CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
-CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
-CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
-CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
-`, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-	)
-	if _, err := s.db.Exec(ddl); err != nil {
-		return err
+	// Canonical DDL from spec/audit_log.postgres.sql — see go/audit_ddl.go.
+	// Split at @DEFERRED_AFTER_MIGRATIONS so post-migration indexes on
+	// additively-added columns run once the ADD COLUMN IF NOT EXISTS
+	// statements above them have taken effect. Postgres handles inline
+	// but the split keeps the loader path identical across dialects.
+	pre, post := splitDDL(auditLogPostgresDDL)
+	repl := map[string]string{"table": s.table, "bare": s.bare}
+	for _, stmt := range renderDDL(pre, repl) {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	for _, stmt := range renderDDL(post, repl) {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
 	}
 
+	// Type migration for legacy TEXT timestamp columns → TIMESTAMPTZ. Left
+	// out of the spec because it's a data-migration step not a shape
+	// declaration, and it must only run when we know the current type is
+	// text (not on every fresh install). Look up column data_type from
+	// information_schema and cast in place.
 	lookupSchema := "public"
 	if s.schema != "" {
 		lookupSchema = s.schema
@@ -128,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 	if err != nil {
 		return err
 	}
-	existing := map[string]string{} // name → data_type
+	existing := map[string]string{}
 	for rows.Next() {
 		var name, dtype string
 		if err := rows.Scan(&name, &dtype); err != nil {
@@ -141,26 +118,6 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 	if err := rows.Err(); err != nil {
 		return err
 	}
-
-	// Idempotent column additions for tables created before a given column existed.
-	type colDef struct{ name, ddl string }
-	for _, col := range []colDef{
-		{"pii_in_detail", "SMALLINT NOT NULL DEFAULT 0"},
-		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
-		{"hash", "TEXT NOT NULL DEFAULT ''"},
-		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
-		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
-	} {
-		if _, ok := existing[col.name]; !ok {
-			if _, err := s.db.Exec(fmt.Sprintf(
-				`ALTER TABLE %s ADD COLUMN %s %s`, s.table, col.name, col.ddl,
-			)); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Migrate legacy TEXT timestamp columns to TIMESTAMPTZ.
 	if dtype, ok := existing["timestamp"]; ok && dtype == "text" {
 		if _, err := s.db.Exec(fmt.Sprintf(
 			`ALTER TABLE %s ALTER COLUMN timestamp TYPE TIMESTAMPTZ USING timestamp::TIMESTAMPTZ`,
@@ -177,7 +134,6 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 			return err
 		}
 	}
-
 	return nil
 }
 

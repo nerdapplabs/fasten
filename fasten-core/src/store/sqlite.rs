@@ -53,39 +53,63 @@ impl SqliteStore {
     }
 
     fn migrate(&self) -> Result<(), Error> {
+        // ARCH #3: canonical DDL from spec/audit_log.sqlite.sql. Rust's
+        // include_str! reaches outside the crate root by relative path,
+        // so no mirror is needed here.
+        const SPEC_DDL: &str = include_str!("../../../spec/audit_log.sqlite.sql");
+        const MARKER: &str = "@DEFERRED_AFTER_MIGRATIONS";
         let t = &self.table;
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {t} (
-                id              TEXT    PRIMARY KEY,
-                wire_version    TEXT    NOT NULL DEFAULT '1',
-                origin_id       TEXT    NOT NULL,
-                monotonic_seq   INTEGER NOT NULL DEFAULT 0,
-                timestamp       TEXT    NOT NULL,
-                code            TEXT    NOT NULL,
-                action          TEXT    NOT NULL DEFAULT '',
-                severity        TEXT    NOT NULL DEFAULT 'info',
-                service_id      TEXT    NOT NULL DEFAULT '',
-                source_node_id  TEXT    NOT NULL DEFAULT '',
-                tenant_id       TEXT,
-                actor           TEXT    NOT NULL DEFAULT '',
-                actor_kind      TEXT    NOT NULL DEFAULT '',
-                target          TEXT    NOT NULL DEFAULT '',
-                category        TEXT    NOT NULL DEFAULT '',
-                domain          TEXT    NOT NULL DEFAULT '',
-                method          TEXT    NOT NULL DEFAULT '',
-                request_id      TEXT    NOT NULL DEFAULT '',
-                detail          TEXT    NOT NULL DEFAULT '{{}}',
-                pii_in_detail   INTEGER NOT NULL DEFAULT 0,
-                shipped_at      TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_{t}_req  ON {t}(request_id);
-            CREATE INDEX IF NOT EXISTS idx_{t}_code ON {t}(code);
-            CREATE INDEX IF NOT EXISTS idx_{t}_ts   ON {t}(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_{t}_svc  ON {t}(service_id);"
-        );
+
+        // Split at the marker so post-migration indexes run after the
+        // additively-added columns exist.
+        let (pre, post) = match SPEC_DDL.find(MARKER) {
+            Some(i) => {
+                let (a, b) = SPEC_DDL.split_at(i);
+                let b_after_line = b.find('\n').map_or("", |n| &b[n + 1..]);
+                (a.to_string(), b_after_line.to_string())
+            }
+            None => (SPEC_DDL.to_string(), String::new()),
+        };
+        let render = |section: &str| -> String {
+            section
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace("{table}", t)
+        };
 
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        guard.execute_batch(&ddl)?;
+
+        // Pre-migration: CREATE TABLE + safe indexes.
+        guard.execute_batch(&render(&pre))?;
+
+        // Additive-column migrations for tables predating a column.
+        // SQLite has no ADD COLUMN IF NOT EXISTS.
+        let existing: std::collections::HashSet<String> = guard
+            .prepare(&format!("PRAGMA table_info({t})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (col, defn) in [
+            ("pii_in_detail",     "INTEGER NOT NULL DEFAULT 0"),
+            ("wire_version",      "TEXT    NOT NULL DEFAULT '1'"),
+            ("hash",              "TEXT    NOT NULL DEFAULT ''"),
+            ("prev_hash",         "TEXT    NOT NULL DEFAULT 'genesis'"),
+            ("canonical_form_id", "TEXT    NOT NULL DEFAULT '1'"),
+        ] {
+            if !existing.contains(col) {
+                guard.execute_batch(&format!(
+                    "ALTER TABLE {t} ADD COLUMN {col} {defn}"
+                ))?;
+            }
+        }
+
+        // Post-migration indexes (reference additively-added columns).
+        let post_rendered = render(&post);
+        if !post_rendered.trim().is_empty() {
+            guard.execute_batch(&post_rendered)?;
+        }
         Ok(())
     }
 }

@@ -56,6 +56,11 @@ fn ensure_schema(client: &mut pg::Client, schema: &str) -> Result<(), crate::Err
 }
 
 fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), crate::Error> {
+    // ARCH #3 (deferred): canonical schema in spec/audit_log.postgres.sql
+    // uses TIMESTAMPTZ + carries the hash-chain columns. This legacy
+    // rust/ postgres store still on TEXT timestamps + no hash-chain cols;
+    // wholesale migration needs coordinated insert/select changes.
+    // Same deferral as fasten-core's postgres store — kept inline.
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             id              TEXT        NOT NULL,

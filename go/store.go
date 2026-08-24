@@ -86,51 +86,20 @@ func NewSQLiteStore(db *sql.DB, tableName string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) migrate() error {
-	ddl := fmt.Sprintf(`
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS %s (
-    id            TEXT PRIMARY KEY,
-    origin_id     TEXT NOT NULL,
-    monotonic_seq INTEGER NOT NULL,
-    timestamp     TEXT NOT NULL,
-    code          TEXT NOT NULL,
-    action        TEXT NOT NULL,
-    severity      TEXT NOT NULL,
-    service_id    TEXT NOT NULL,
-    source_node_id TEXT NOT NULL,
-    tenant_id     TEXT,
-    actor         TEXT NOT NULL,
-    actor_kind    TEXT NOT NULL,
-    target        TEXT NOT NULL,
-    category      TEXT NOT NULL,
-    domain        TEXT NOT NULL,
-    method        TEXT NOT NULL,
-    request_id    TEXT NOT NULL,
-    detail        TEXT NOT NULL,
-    pii_in_detail INTEGER NOT NULL DEFAULT 0,
-    shipped_at    TEXT,
-    wire_version  TEXT NOT NULL DEFAULT '1',
-    hash          TEXT NOT NULL DEFAULT '',
-    prev_hash     TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
-);
-CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
-CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
-CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
-CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
-CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
-`, s.table,
-		s.table, s.table,
-		s.table, s.table,
-		s.table, s.table,
-		s.table, s.table,
-		s.table, s.table,
-	)
-	if _, err := s.db.Exec(ddl); err != nil {
-		return err
+	// Canonical DDL from spec/audit_log.sqlite.sql — see go/audit_ddl.go.
+	// Split at @DEFERRED_AFTER_MIGRATIONS: pre → migrations → post so
+	// indexes on additively-migrated columns run once those exist.
+	pre, post := splitDDL(auditLogSqliteDDL)
+	repl := map[string]string{"table": s.table}
+	for _, stmt := range renderDDL(pre, repl) {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
 	}
 
-	// Idempotent column migrations for tables predating a given column.
+	// Additive column migrations for tables predating a column. SQLite
+	// has no ADD COLUMN IF NOT EXISTS, so we check via PRAGMA table_info
+	// first. Keep this list in sync with spec/audit_log.sqlite.sql.
 	existing, err := s.existingColumns()
 	if err != nil {
 		return err
@@ -143,7 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		{"pii_in_detail", "INTEGER NOT NULL DEFAULT 0"},
 		{"wire_version", "TEXT NOT NULL DEFAULT '1'"},
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
-		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"prev_hash", "TEXT NOT NULL DEFAULT 'genesis'"},
 		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
 	} {
 		if !existing[col.name] {
@@ -155,12 +124,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		}
 	}
 
-	// Partial indexes created outside CREATE TABLE so they work on both fresh
-	// and legacy-migrated tables.
-	for _, idx := range []string{
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1", s.table, s.table),
-	} {
-		if _, err := s.db.Exec(idx); err != nil {
+	for _, stmt := range renderDDL(post, repl) {
+		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
 	}

@@ -36,36 +36,50 @@ def _utc_iso(dt: datetime) -> str:
     return canonical_ts(dt)
 
 
+# ARCH #3 (deferred): the canonical schema in spec/audit_log.postgres.sql
+# uses TIMESTAMPTZ for `timestamp` / `shipped_at`. This Python store still
+# uses TEXT because the read path (`_row` below) calls `parse_canonical(r[3])`
+# on the raw column value — psycopg's TIMESTAMPTZ decoder returns a
+# `datetime`, not a string, and would break that call. Switching the type
+# needs a coordinated update to _row + insert bindings; queued as a
+# follow-up so this refactor doesn't ship a read-path regression.
+# The COLUMN SET matches spec (all 24 cols) — that's the ARCH #3 win here.
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
-    id               TEXT PRIMARY KEY,
-    origin_id        TEXT NOT NULL,
-    monotonic_seq    BIGINT NOT NULL,
-    timestamp        TEXT NOT NULL,
-    code             TEXT NOT NULL,
-    action           TEXT NOT NULL,
-    severity         TEXT NOT NULL,
-    service_id       TEXT NOT NULL,
-    source_node_id   TEXT NOT NULL,
-    tenant_id        TEXT,
-    actor            TEXT NOT NULL,
-    actor_kind       TEXT NOT NULL,
-    target           TEXT NOT NULL,
-    category         TEXT NOT NULL,
-    domain           TEXT NOT NULL,
-    method           TEXT NOT NULL,
-    request_id       TEXT NOT NULL,
-    detail           TEXT NOT NULL,
-    shipped_at       TEXT,
-    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
-    hash             TEXT NOT NULL DEFAULT '',
+    id                TEXT PRIMARY KEY,
+    origin_id         TEXT NOT NULL,
+    monotonic_seq     BIGINT NOT NULL,
+    timestamp         TEXT NOT NULL,
+    code              TEXT NOT NULL,
+    action            TEXT NOT NULL,
+    severity          TEXT NOT NULL,
+    service_id        TEXT NOT NULL,
+    source_node_id    TEXT NOT NULL,
+    tenant_id         TEXT,
+    actor             TEXT NOT NULL,
+    actor_kind        TEXT NOT NULL,
+    target            TEXT NOT NULL,
+    category          TEXT NOT NULL,
+    domain            TEXT NOT NULL,
+    method            TEXT NOT NULL,
+    request_id        TEXT NOT NULL,
+    detail            TEXT NOT NULL,
+    pii_in_detail     SMALLINT NOT NULL DEFAULT 0,
+    shipped_at        TEXT,
+    wire_version      TEXT NOT NULL DEFAULT '1',
+    hash              TEXT NOT NULL DEFAULT '',
+    prev_hash         TEXT NOT NULL DEFAULT 'genesis',
     canonical_form_id TEXT NOT NULL DEFAULT '1'
 )
 """
 
-_MIGRATION_HASH_CHAIN = """
-ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
-ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
+# Additive migrations for pre-existing tables. Postgres supports
+# ADD COLUMN IF NOT EXISTS natively so no PRAGMA-table_info dance needed.
+_MIGRATION_ADD_COLUMNS = """
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pii_in_detail     SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS wire_version      TEXT NOT NULL DEFAULT '1';
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash         TEXT NOT NULL DEFAULT 'genesis';
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash              TEXT NOT NULL DEFAULT '';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
 """
 
@@ -75,7 +89,10 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_{p}_req       ON {t}(request_id)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_seq       ON {t}(monotonic_seq)",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_svc       ON {t}(service_id)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_{p}_pii       ON {t}(pii_in_detail) WHERE pii_in_detail = 1",
 ]
 
 
@@ -109,12 +126,11 @@ class PostgresStore:
             if self._schema:
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             cur.execute(_DDL.format(table=self._table))
-            for sql in _INDEXES:
-                cur.execute(sql.format(t=self._table, p=self._idx_prefix))
-            # Migration: add hash chain columns to pre-existing tables (no-op on new tables).
-            for stmt in _MIGRATION_HASH_CHAIN.format(table=self._table).strip().split(";"):
+            for stmt in _MIGRATION_ADD_COLUMNS.format(table=self._table).strip().split(";"):
                 if stmt.strip():
                     cur.execute(stmt)
+            for sql in _INDEXES:
+                cur.execute(sql.format(t=self._table, p=self._idx_prefix))
         conn.commit()
 
     # ------------------------------------------------------------------

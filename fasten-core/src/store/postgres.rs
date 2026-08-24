@@ -395,6 +395,14 @@ fn migrate(
         pg_exec(client, &format!("CREATE SCHEMA IF NOT EXISTS {s}"))?;
     }
 
+    // ARCH #3 (deferred): the canonical schema in spec/audit_log.postgres.sql
+    // uses TIMESTAMPTZ + carries the hash-chain columns (hash, prev_hash,
+    // canonical_form_id). This Rust core postgres store still writes/reads
+    // TEXT timestamps and does not know the hash-chain columns yet — a
+    // wholesale switch needs coordinated changes to build_insert_sql,
+    // build_select_all, and the row-mapping code. Kept inline for now so
+    // this DDL refactor doesn't ship a read-path regression; queued as a
+    // follow-up commit.
     pg_exec(
         client,
         &format!(

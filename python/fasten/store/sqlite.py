@@ -12,6 +12,7 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -34,36 +35,42 @@ def _utc_iso(dt: datetime) -> str:
     from ..canonical_ts import canonical_ts
     return canonical_ts(dt)
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS {table} (
-    id               TEXT PRIMARY KEY,
-    origin_id        TEXT NOT NULL,
-    monotonic_seq    INTEGER NOT NULL,
-    timestamp        TEXT NOT NULL,
-    code             TEXT NOT NULL,
-    action           TEXT NOT NULL,
-    severity         TEXT NOT NULL,
-    service_id       TEXT NOT NULL,
-    source_node_id   TEXT NOT NULL,
-    tenant_id        TEXT,
-    actor            TEXT NOT NULL,
-    actor_kind       TEXT NOT NULL,
-    target           TEXT NOT NULL,
-    category         TEXT NOT NULL,
-    domain           TEXT NOT NULL,
-    method           TEXT NOT NULL,
-    request_id       TEXT NOT NULL,
-    detail           TEXT NOT NULL,
-    shipped_at       TEXT,
-    canonical_form_id TEXT NOT NULL DEFAULT '1',
-    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
-    hash             TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
-CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
-CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
-CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
-"""
+# ARCH #3: the audit_log DDL lives in spec/audit_log.sqlite.sql — the single
+# source of truth every SQLite-backed fasten store now loads. Prior state
+# was 7 hand-rolled CREATE TABLEs that had already drifted. See the spec
+# file's header for the migration + placeholder contract.
+_SPEC_DDL_PATH = Path(__file__).parent.parent.parent.parent / "spec" / "audit_log.sqlite.sql"
+_SPEC_DDL = _SPEC_DDL_PATH.read_text()
+
+# The spec file carries a `@DEFERRED_AFTER_MIGRATIONS` marker; the loader
+# splits at it so post-migration index creation (which references
+# additively-added columns) runs after those migrations complete.
+_SPEC_DEFERRED_MARKER = "@DEFERRED_AFTER_MIGRATIONS"
+
+# Columns whose presence must be idempotently ensured on pre-existing
+# tables. SQLite has no ADD COLUMN IF NOT EXISTS, so the store checks
+# via PRAGMA table_info and only runs ADD COLUMN for what's missing.
+_MIGRATION_COLUMNS = [
+    ("pii_in_detail",     "INTEGER NOT NULL DEFAULT 0"),
+    ("wire_version",      "TEXT    NOT NULL DEFAULT '1'"),
+    ("prev_hash",         "TEXT    NOT NULL DEFAULT 'genesis'"),
+    ("hash",              "TEXT    NOT NULL DEFAULT ''"),
+    ("canonical_form_id", "TEXT    NOT NULL DEFAULT '1'"),
+]
+
+
+def _split_spec(raw: str) -> tuple[str, str]:
+    """Return (pre-migration, post-migration) SQL from the spec.
+
+    The marker (a full-line SQL comment) sits after the CREATE TABLE + the
+    always-safe indexes and before the CREATE INDEX statements that
+    reference additively-migrated columns."""
+    marker = _SPEC_DEFERRED_MARKER
+    if marker not in raw:
+        return raw, ""
+    lines = raw.splitlines()
+    split = next(i for i, line in enumerate(lines) if marker in line)
+    return "\n".join(lines[:split]), "\n".join(lines[split + 1:])
 
 
 class SQLiteStore:
@@ -115,29 +122,31 @@ class SQLiteStore:
         if wal and not self._is_memory:
             # WAL is meaningless for `:memory:` (no journal file).
             bootstrap.execute("PRAGMA journal_mode=WAL")
-        for stmt in _DDL.format(table=table).split(";"):
-            if stmt.strip():
-                bootstrap.execute(stmt)
+        pre, post = _split_spec(_SPEC_DDL)
+        # Strip SQL line comments so the .sql file's header doesn't survive
+        # into the split-on-semicolon statement stream.
+        def _run_ddl(section: str) -> None:
+            body = "\n".join(
+                line for line in section.splitlines()
+                if not line.lstrip().startswith("--")
+            )
+            for stmt in body.format(table=table).split(";"):
+                if stmt.strip():
+                    bootstrap.execute(stmt)
+        # 1) pre-migration: CREATE TABLE + safe indexes.
+        _run_ddl(pre)
         bootstrap.commit()
-        # Migration: add hash chain columns to pre-existing tables.
-        try:
-            bootstrap.execute(f"SELECT prev_hash FROM {table} LIMIT 0")
-        except sqlite3.OperationalError:
-            bootstrap.execute(
-                f"ALTER TABLE {table} ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'genesis'"
-            )
-            bootstrap.execute(
-                f"ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"
-            )
-            bootstrap.commit()
-        # Migration: add the canonical_form_id column (item 6) to pre-existing
-        # tables. Additive — existing rows default to form "1".
-        try:
-            bootstrap.execute(f"SELECT canonical_form_id FROM {table} LIMIT 0")
-        except sqlite3.OperationalError:
-            bootstrap.execute(
-                f"ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1'"
-            )
+        # 2) additive column migrations for tables predating a column.
+        existing = {row["name"] for row in bootstrap.execute(
+            f"PRAGMA table_info({table})"
+        )}
+        for col, defn in _MIGRATION_COLUMNS:
+            if col not in existing:
+                bootstrap.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
+        bootstrap.commit()
+        # 3) post-migration indexes (reference additively-added columns).
+        if post.strip():
+            _run_ddl(post)
             bootstrap.commit()
 
     def _connect(self) -> sqlite3.Connection:
