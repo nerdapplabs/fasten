@@ -491,6 +491,7 @@ class SQLiteStore:
         since: str,
         until: str | None = None,
         limit: int = 50,
+        tenant_id: str | None = None,
     ) -> list[AuditRow]:
         """FR3 free-text search over persisted audit history (§4.1). Substring
         scan over the ``detail`` JSON column (audit's payload equivalent). The
@@ -499,13 +500,21 @@ class SQLiteStore:
         Deliberately constrained: ``since`` is mandatory to bound the linear
         scan; ``%``/``_``/``\\`` in ``q`` are escaped so they match literally
         rather than acting as LIKE wildcards. Newest-first, hard-capped by
-        ``limit`` — no relevance ranking."""
+        ``limit`` — no relevance ranking.
+
+        ``tenant_id`` scopes the search to one tenant when supplied — the
+        reader wires the caller's authenticated tenant into this arg so a
+        multi-tenant shared store doesn't leak substring matches across
+        tenant boundaries (P1-44)."""
         esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:
             conds.append("COALESCE(timestamp, '') <= ?")
             params.append(until)
+        if tenant_id is not None:
+            conds.append("tenant_id = ?")
+            params.append(tenant_id)
         params.append(limit)
         sql = (
             f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "

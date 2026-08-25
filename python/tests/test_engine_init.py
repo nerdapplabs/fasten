@@ -312,7 +312,7 @@ def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_noti
     assert eng.audit_write_swallowed() is True
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     resp = TestClient(app).get("/api/v1/logs/audit?limit=1")
     assert resp.status_code == 200
     # Was reporting 'store' before the fix — 'store-degraded' proves the

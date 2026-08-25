@@ -333,13 +333,21 @@ func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) 
 // (§4.1). Case-insensitive substring, since= bounded, hard-capped by limit,
 // newest-first, no relevance ranking. Result rows carry request_id for
 // /correlate follow-up. %/_/\ in q are escaped so they match literally.
-func (s *SQLiteStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+// Search: `tenantID != ""` scopes the query to one tenant (SQL WHERE
+// tenant_id=?) — the reader wires the caller's authenticated tenant here
+// so a shared multi-tenant store doesn't leak substring matches across
+// tenants (P1-44).
+func (s *SQLiteStore) Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error) {
 	esc := escapeLikeLiteral(strings.ToLower(q))
 	conds := []string{"COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"}
 	args := []any{since, "%" + esc + "%"}
 	if until != "" {
 		conds = append(conds, "COALESCE(timestamp, '') <= ?")
 		args = append(args, until)
+	}
+	if tenantID != "" {
+		conds = append(conds, "tenant_id = ?")
+		args = append(args, tenantID)
 	}
 	args = append(args, limit)
 	sql := fmt.Sprintf(

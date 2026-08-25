@@ -30,9 +30,86 @@ struct Inner {
 impl Inner {
     fn connect(dsn: &str, insert_sql: &str) -> Result<Self, Error> {
         // Pure-Rust wire protocol; no libpq, no C dependency.
-        let mut client = pg::Client::connect(dsn, pg::NoTls)?;
+        let mut client = connect_client(dsn)?;
         let stmt = client.prepare(insert_sql)?;
         Ok(Self { client, stmt })
+    }
+}
+
+// ── Connector selection ─────────────────────────────────────────────────────
+//
+// `postgres-tls` feature ON  → native-tls connector, honours sslmode=require.
+// `postgres-tls` feature OFF → NoTls; a DSN with sslmode=require|verify-* is
+// refused up-front rather than being silently downgraded to plaintext (the
+// exact fault P1-43 documents — the DSN said TLS, the client type was NoTls,
+// negotiation completed in clear and no error was raised).
+
+#[cfg(feature = "postgres-tls")]
+fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
+    let tls = native_tls::TlsConnector::builder()
+        .build()
+        .map_err(|e| Error::TlsConnector(e.to_string()))?;
+    let connector = postgres_native_tls::MakeTlsConnector::new(tls);
+    Ok(pg::Client::connect(dsn, connector)?)
+}
+
+#[cfg(not(feature = "postgres-tls"))]
+fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
+    if requires_tls(dsn) {
+        return Err(Error::TlsUnavailable(
+            "DSN requests TLS (sslmode=require|verify-ca|verify-full) but \
+             fasten-core was built without the `postgres-tls` feature. \
+             Rebuild with `--features postgres-tls` (on by default), or \
+             remove the sslmode param to accept plaintext explicitly."
+                .to_string(),
+        ));
+    }
+    Ok(pg::Client::connect(dsn, pg::NoTls)?)
+}
+
+// requires_tls: crude DSN scan for sslmode requesting encryption. Matches
+// libpq's rule set — the three sslmode values that MUST fail if TLS isn't
+// available are `require`, `verify-ca`, `verify-full` (`prefer` allows
+// fallback, `allow` allows fallback, `disable` is explicit plaintext).
+// #[allow(dead_code)]: only the `#[cfg(not(feature = "postgres-tls"))]`
+// arm of connect_client calls this at runtime; the test module below
+// exercises it under every feature set so the sslmode semantics don't
+// silently drift.
+#[allow(dead_code)]
+fn requires_tls(dsn: &str) -> bool {
+    // Cover both URL form (?sslmode=require) and keyword form (sslmode=require).
+    for part in dsn.split(|c: char| c == '?' || c == '&' || c.is_whitespace()) {
+        let mut kv = part.splitn(2, '=');
+        let k = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+        let v = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+        if k == "sslmode" && (v == "require" || v == "verify-ca" || v == "verify-full") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::requires_tls;
+    #[test]
+    fn requires_tls_matches_libpq_ssl_semantics() {
+        // Positive: every "must-be-encrypted" sslmode.
+        assert!(requires_tls("host=db user=x sslmode=require"));
+        assert!(requires_tls("host=db user=x sslmode=verify-ca"));
+        assert!(requires_tls("host=db user=x sslmode=verify-full"));
+        assert!(requires_tls("postgres://u:p@db/x?sslmode=require"));
+        assert!(requires_tls("postgres://u:p@db/x?sslmode=verify-full&application_name=a"));
+        // Case-insensitive.
+        assert!(requires_tls("host=db sslmode=REQUIRE"));
+        // Negative: fallback-allowing modes.
+        assert!(!requires_tls("host=db user=x sslmode=prefer"));
+        assert!(!requires_tls("host=db user=x sslmode=allow"));
+        assert!(!requires_tls("host=db user=x sslmode=disable"));
+        assert!(!requires_tls("host=db user=x"));
+        assert!(!requires_tls(""));
+        // A key that only contains "sslmode" as a substring must not match.
+        assert!(!requires_tls("host=db user=x sslmodex=require"));
     }
 }
 
@@ -59,7 +136,12 @@ impl PostgresStore {
     /// statement.
     ///
     /// `dsn`   — libpq-style connection string or `postgresql://` URI.
-    ///           For PG 15+ TLS, use `sslmode=require` in the DSN.
+    ///           TLS: `sslmode=require|verify-ca|verify-full` in the DSN
+    ///           actually negotiates TLS when the crate is built with the
+    ///           `postgres-tls` feature (ON by default). Without that
+    ///           feature the connect **fails loudly** rather than silently
+    ///           downgrading to plaintext — the P1-43 fault, where the docs
+    ///           described a protection the code did not deliver.
     ///           For read-only replicas, add `target_session_attrs=read-write`
     ///           so the driver rejects replica endpoints automatically.
     ///           Example: `"host=db.prod.example.com user=audit dbname=audit
@@ -76,7 +158,7 @@ impl PostgresStore {
         let bare = bare.to_owned();
         let insert_sql = build_insert_sql(table);
 
-        let mut client = pg::Client::connect(dsn, pg::NoTls)?;
+        let mut client = connect_client(dsn)?;
         migrate(&mut client, table, &bare, schema.as_deref())?;
         let stmt = client.prepare(&insert_sql)?;
 

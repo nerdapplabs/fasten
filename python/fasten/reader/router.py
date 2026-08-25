@@ -41,23 +41,44 @@ from .. import audit_store as _active_audit_store
 from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
 from .. import search_enabled as _active_search_enabled
+
+# starlette.requests.Request is hard-depended on by fastapi; import it at
+# module top so `from __future__ import annotations` stringified type hints
+# (`request: Request`) resolve via typing.get_type_hints(). Without this the
+# endpoint functions' Request annotation is unresolvable in the module
+# globals and FastAPI misclassifies `request` as a query param → 422.
+try:
+    from starlette.requests import Request
+except ImportError:  # pragma: no cover — fastapi missing; router() raises anyway
+    pass
 from .. import transport as _active_transport
 
 
+_UNSET: Any = object()
+
+
 def router(
-    dependencies: list[Any] | None = None,
+    dependencies: list[Any] | None = _UNSET,  # required — explicit [] for no-auth
     *,
     store: Any = None,
     transport: Any = None,
     persist_streams: frozenset[str] | None = None,
     search_enabled: bool | None = None,
+    tenant_scope: Any = None,
+    enforce_tenant_isolation: bool = False,
 ) -> Any:
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
     Args:
         dependencies: FastAPI dependencies applied to every route, e.g.
-            ``[Depends(require_admin)]``. None means no auth — only use
-            that behind a trusted-network boundary.
+            ``[Depends(require_admin)]``. **Required** — the earlier
+            no-default reader shipped unauthenticated by accident on
+            every misconfigured proxy (P1-45). Explicit opt-in for the
+            no-auth case: pass ``dependencies=[]`` when you deliberately
+            want the reader unauthenticated (dev / localhost / a proxy
+            that already enforces auth). No default means the "I forgot
+            to wire auth" bug produces a startup error, not a silently
+            public audit log.
         store: Optional AuditRepository override. Default: pulled from
             ``fasten.init()`` at request time via ``fasten.audit_store()``.
         transport: Optional StdoutTransport override. Default: same.
@@ -68,15 +89,89 @@ def router(
             ``audit`` when an audit store is attached (``ring`` on a
             stdout-only engine), plus ``api``/``sys`` when a stream store is
             configured. Pass an explicit set to override.
+        tenant_scope: Callable ``(request) -> str | None`` invoked per
+            request to resolve the caller's tenant from the (already-
+            authenticated) request. When supplied, EVERY reader endpoint
+            (``/audit``, ``/correlate``, ``/search``, ``/topology``)
+            injects the resolved tenant into the store filter and
+            **ignores** any ``?tenant_id=`` from the caller. Returning
+            ``None`` (unauthenticated / no scope) rejects the request
+            with 401. Without this hook, ``?tenant_id=`` is honoured
+            as-is — safe for single-tenant deployments, unsafe on any
+            shared-store multi-tenant deployment (P1-44).
+        enforce_tenant_isolation: When True, refuse to construct the
+            router unless ``tenant_scope`` is wired. Set this on any
+            shared-store multi-tenant deployment so a mis-configured
+            reader can't ship without tenant enforcement.
     """
     try:
+        # Request is imported at module top (from starlette.requests) so
+        # endpoint type hints resolve under `from __future__ import
+        # annotations`. Local fastapi import stays scoped to router().
         from fastapi import APIRouter, HTTPException, Query
     except ImportError as e:
         raise RuntimeError(
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
         ) from e
 
+    if dependencies is _UNSET:
+        raise RuntimeError(
+            "fasten.reader.router: `dependencies=` is required. Pass an "
+            "auth hook — e.g. `[Depends(require_admin)]` or the bundled "
+            "helper `fasten.reader.require_bearer()` — or pass "
+            "`dependencies=[]` to opt into unauthenticated mode "
+            "explicitly (dev / localhost / a proxy that enforces auth "
+            "already). No default so a mis-configured production deploy "
+            "can't ship an unauthenticated audit reader (P1-45)."
+        )
+
+    if enforce_tenant_isolation and tenant_scope is None:
+        raise RuntimeError(
+            "fasten.reader.router(enforce_tenant_isolation=True) requires a "
+            "tenant_scope callable. Wire (request) -> str | None from your "
+            "auth layer, or pass enforce_tenant_isolation=False for a "
+            "single-tenant deployment (see P1-44)."
+        )
+
     r = APIRouter(dependencies=dependencies or [])
+
+    def _resolve_tenant(request: "Request") -> Optional[str]:
+        """Return the tenant scope for this request, or raise 401 when a
+        scope hook was wired but resolved to None. Returns None when no
+        hook is wired (single-tenant mode)."""
+        if tenant_scope is None:
+            return None
+        t = tenant_scope(request)
+        if t is None:
+            raise HTTPException(status_code=401, detail="unauthenticated: tenant scope unresolved")
+        return t
+
+    def _scope_stream_rows(rows: list[dict[str, Any]], scope: Optional[str]) -> list[dict[str, Any]]:
+        """Post-filter sys/api stream rows by tenant. sys/api rows are
+        freeform dicts with an optional ``tenant_id`` key — not a lifted
+        index column — so we can't push this down to the store the way
+        we can for audit. Post-filter is defensive: rows without a
+        tenant_id are dropped when a scope is active (fail-closed:
+        undated-tenant rows are ambiguous, and returning them to a
+        scoped caller would leak). Scope=None (single-tenant mode)
+        returns rows unchanged.
+
+        This is the (P1-44) enforcement point for /logs/sys, /logs/api,
+        /correlate api+sys, and /search api+sys."""
+        if scope is None:
+            return rows
+        return [r for r in rows if r.get("tenant_id") == scope]
+
+    def _scope_audit_rows(rows: list[Any], scope: Optional[str]) -> list[Any]:
+        """Same as _scope_stream_rows but for AuditRow dataclasses (typed
+        tenant_id attribute). Used by /search audit path where we call
+        the store's search() which doesn't yet accept tenant_id — the
+        two commits are staged: post-filter here now, push the filter
+        down to the store as a follow-up so /search doesn't scan across
+        tenants at all."""
+        if scope is None:
+            return rows
+        return [r for r in rows if r.tenant_id == scope]
 
     def _store() -> Any:
         return store if store is not None else _active_audit_store()
@@ -171,15 +266,17 @@ def router(
 
     @r.get("/sys")
     def get_sys(
+        request: Request,
         level: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
         service_id: Optional[str] = Query(default=None),
         event: Optional[str] = Query(default=None),
-        q: Optional[str] = Query(default=None, min_length=1),
+        q: Optional[str] = Query(default=None, min_length=1, max_length=1024),
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
+        tenant = _resolve_tenant(request)
         t = _transport()
         if t is None:
             return {
@@ -222,7 +319,8 @@ def router(
                     "completeness": {"sys": _source("sys")},
                     "error": "search requires sys persistence — configure a syslog store (FR1)",
                 }
-            return {"rows": rows, "completeness": {"sys": _source("sys")}}
+            return {"rows": _scope_stream_rows(rows, tenant),
+                    "completeness": {"sys": _source("sys")}}
         rows = t.query_syslog(
             limit=limit,
             level=level,
@@ -232,10 +330,12 @@ def router(
             since=since,
             until=until,
         )
-        return {"rows": rows, "completeness": {"sys": _source("sys")}}
+        return {"rows": _scope_stream_rows(rows, tenant),
+                "completeness": {"sys": _source("sys")}}
 
     @r.get("/api")
     def get_api(
+        request: Request,
         method: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
         request_id: Optional[str] = Query(default=None),
@@ -243,8 +343,9 @@ def router(
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
-        q: Optional[str] = Query(default=None),
+        q: Optional[str] = Query(default=None, max_length=1024),
     ) -> dict[str, Any]:
+        tenant = _resolve_tenant(request)
         if q is not None:
             # Free-text search is sys-only in v1 (§9). Reject rather than
             # silently drop, so callers (and copy-pasted handlers) can't
@@ -272,10 +373,12 @@ def router(
             since=_parse_window_ts("since", since),
             until=_parse_window_ts("until", until),
         )
-        return {"rows": rows, "completeness": {"api": _source("api")}}
+        return {"rows": _scope_stream_rows(rows, tenant),
+                "completeness": {"api": _source("api")}}
 
     @r.get("/audit")
     def get_audit(
+        request: Request,
         request_id: Optional[str] = Query(default=None),
         code: Optional[str] = Query(default=None),
         domain: Optional[str] = Query(default=None),
@@ -289,6 +392,13 @@ def router(
         offset: int = Query(default=0, ge=0),
         after: Optional[int] = Query(default=None, ge=1),
     ) -> dict[str, Any]:
+        # P1-44: when tenant_scope is wired, IGNORE any ?tenant_id= from
+        # the caller and inject the resolved scope. Without the hook,
+        # ?tenant_id= is honoured as-is (single-tenant deployments and
+        # legacy call sites).
+        tenant = _resolve_tenant(request)
+        if tenant is not None:
+            tenant_id = tenant
         s = _store()
         if s is None:
             return {
@@ -335,6 +445,7 @@ def router(
 
     @r.get("/correlate")
     def get_correlate(
+        request: Request,
         request_id: str = Query(..., min_length=1),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
@@ -350,30 +461,46 @@ def router(
         ``counts < totals`` means the response is truncated (raise ``limit``
         or page the per-stream endpoints); the per-stream ``truncated`` boolean
         reports that inequality directly so callers don't re-derive it.
+
+        P1-44: when ``tenant_scope`` is wired, every stream is scoped to
+        the caller's tenant. Otherwise the ``X-Request-ID`` header a
+        tenant sends could be used to pivot into another tenant's rows
+        via a known/guessed request_id.
         """
+        tenant = _resolve_tenant(request)
         s = _store()
         t = _transport()
         audit = (
-            [dataclasses.asdict(row) for row in s.query(limit=limit, request_id=request_id)]
+            [dataclasses.asdict(row) for row in s.query(limit=limit, request_id=request_id,
+                                                       tenant_id=tenant)]
             if s is not None else []
         )
-        api = t.query_api(limit=limit, request_id=request_id) if t is not None else []
-        sys = t.query_syslog(limit=limit, request_id=request_id) if t is not None else []
-        # audit_total is None when the store lacks count() OR the call fails
-        # — null is honest; len(audit) would lie (capped at limit) and 500
-        # would kill the useful row set. Mirrors Go's handleCorrelate — one
-        # wire policy on both SDKs (PR #59 finding 9 + branch-review #4).
+        api = _scope_stream_rows(
+            t.query_api(limit=limit, request_id=request_id) if t is not None else [],
+            tenant,
+        )
+        sys = _scope_stream_rows(
+            t.query_syslog(limit=limit, request_id=request_id) if t is not None else [],
+            tenant,
+        )
         audit_total: int | None = None
         if s is not None and hasattr(s, "count"):
             try:
-                audit_total = s.count(request_id=request_id)
+                audit_total = s.count(request_id=request_id, tenant_id=tenant)
             except Exception:  # noqa: BLE001
                 audit_total = None
         counts = {"audit": len(audit), "api": len(api), "sys": len(sys)}
+        # Stream count APIs don't take tenant_id; when a scope is active
+        # the totals for api/sys are the visible-after-post-filter len,
+        # not the unfiltered store count. Post-filter is a defensive
+        # over-count avoidance — the response truncated boolean below
+        # reads consistently with what the caller actually sees.
         totals = {
             "audit": audit_total,
-            "api": t.count_api(request_id=request_id) if t is not None else 0,
-            "sys": t.count_syslog(request_id=request_id) if t is not None else 0,
+            "api": len(api) if tenant is not None
+            else (t.count_api(request_id=request_id) if t is not None else 0),
+            "sys": len(sys) if tenant is not None
+            else (t.count_syslog(request_id=request_id) if t is not None else 0),
         }
         # Truncation is counts < totals per stream. The pair is authoritative;
         # this boolean is a convenience so every caller doesn't re-derive the
@@ -403,7 +530,8 @@ def router(
 
     @r.get("/search")
     def get_search(
-        q: str = Query(..., min_length=1),
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=1024),
         since: str = Query(...),
         until: Optional[str] = Query(default=None),
         limit: int = Query(default=50, ge=1, le=200),
@@ -426,6 +554,7 @@ def router(
         have a store — for ring-only streams the response reports a
         per-stream error, not an empty list that reads as "no matches".
         """
+        tenant = _resolve_tenant(request)
         # Parse + validate streams param before hitting the search guard so
         # a bad ?streams=foo fails loudly rather than falling through.
         requested = streams.split(",") if streams else ["sys"]
@@ -478,6 +607,7 @@ def router(
                     errors["sys"] = "requires sys persistence — configure a syslog store (FR1)"
                     counts["sys"] = 0
                     continue
+                rows = _scope_stream_rows(rows, tenant)
                 counts["sys"] = len(rows)
                 for row in rows:
                     matches.append({
@@ -493,6 +623,7 @@ def router(
                     errors["api"] = "requires api persistence — configure an api store (FR1)"
                     counts["api"] = 0
                     continue
+                rows = _scope_stream_rows(rows, tenant)
                 counts["api"] = len(rows)
                 for row in rows:
                     matches.append({
@@ -507,7 +638,9 @@ def router(
                     errors["audit"] = "requires an audit store with a search method (FR1)"
                     counts["audit"] = 0
                     continue
-                rows = s.search(q=q, since=since, until=until, limit=limit)
+                # Tenant scope pushed into the store (SQL WHERE tenant_id=?),
+                # not post-filtered — the store now accepts it as a kwarg.
+                rows = s.search(q=q, since=since, until=until, limit=limit, tenant_id=tenant)
                 counts["audit"] = len(rows)
                 for row in rows:
                     matches.append({
@@ -529,6 +662,7 @@ def router(
 
     @r.get("/topology")
     def get_topology(
+        request: Request,
         since: Optional[datetime] = Query(default=None),
         until: Optional[datetime] = Query(default=None),
     ) -> dict[str, Any]:
@@ -541,8 +675,13 @@ def router(
         the rows already recorded, so it can never drift from reality.
 
         Same auth as ``/audit`` (router-level dependencies). Optional
-        ``since``/``until`` window the aggregation.
+        ``since``/``until`` window the aggregation. P1-44: when
+        ``tenant_scope`` is wired, the aggregation is post-filtered to
+        the resolved tenant only — mild fleet enumeration
+        (`service_id` / `node_id` values of other tenants) is not
+        available across the tenant boundary.
         """
+        tenant = _resolve_tenant(request)
         empty = {"sources": [], "nodes": 0, "services": 0, "tenants": 0}
         s = _store()
         if s is None:
@@ -550,6 +689,8 @@ def router(
         if not hasattr(s, "sources"):
             return {**empty, "error": "store does not support topology aggregation"}
         sources = s.sources(since=since, until=until)
+        if tenant is not None:
+            sources = [x for x in sources if x.get("tenant_id") == tenant]
         return {
             "sources": sources,
             "nodes": len({x["source_node_id"] for x in sources}),
