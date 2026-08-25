@@ -409,6 +409,7 @@ class Engine:
             syslog_store=self._syslog_store,
             service_id=cfg.service_id,
             boot_request_id=self._boot_request_id,
+            redactor=self._redactor,
         )
         self._failure_strategy = cfg.audit_store_failure_strategy
         self._search_enabled = cfg.search_enabled
@@ -445,8 +446,11 @@ class Engine:
         self._retention_stop = threading.Event()
 
         def _log_err(stream: str, e: Exception) -> None:
+            # Type-only — the exception message can carry the offending
+            # row value (Postgres NotNullViolation cites the column) and
+            # the sys stream is redacted key-pattern only.
             self._drainer_sys_log("error", "retention_purge_failed", {
-                "stream": stream, "error": f"{type(e).__name__}: {e}",
+                "stream": stream, "error_type": type(e).__name__,
             })
 
         for stream, store, dur_s in (
@@ -607,7 +611,8 @@ class Engine:
                         if callable(note):
                             note()
                         self._drainer_sys_log("error", "audit_sync_fallback_failed", {
-                            "error": f"{type(e).__name__}: {e}",
+                            # Type-only — see retention_purge_failed comment.
+                            "error_type": type(e).__name__,
                             "row_id": row.id,
                         })
             else:

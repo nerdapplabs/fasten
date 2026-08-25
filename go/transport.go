@@ -91,6 +91,12 @@ type Transport struct {
 	bootRequestID string
 	bootMu        sync.Mutex
 	bootOver      bool
+
+	// Redact hook for sys/api push paths. Wired by Init to the Engine's
+	// redactDetail so key-pattern PII (password, token, ssn, ...) never
+	// hits stdout, the ring, or the persistent store — matching the audit
+	// path. Nil ⇒ no-op passthrough (pre-Init writers).
+	redact func(map[string]any) map[string]any
 }
 
 func NewTransport(maxlen int) *Transport {
@@ -133,11 +139,15 @@ func (t *Transport) stampRequestID(row map[string]any) {
 // asserted durability.
 func (t *Transport) PushSyslog(row SyslogRow) {
 	t.stampRequestID(row)
+	row = SyslogRow(t.redactRow(row))
 	t.Syslog.Push(row)
 	if t.SyslogStore != nil {
 		if err := t.SyslogStore.Insert(row); err != nil {
 			t.SyslogStore.NoteWriteFailure()
-			fmt.Fprintf(os.Stderr, "fasten: syslog persist failed: %v\n", err)
+			// Type-only stderr — a Postgres INSERT error message can carry
+			// the offending row value (NotNullViolation cites the column),
+			// and stderr is not redacted.
+			fmt.Fprintf(os.Stderr, "fasten: syslog persist failed: %T\n", err)
 		}
 	}
 }
@@ -147,13 +157,25 @@ func (t *Transport) PushSyslog(row SyslogRow) {
 // same as PushSyslog: swallow, but degrade the completeness flag.
 func (t *Transport) PushAPI(row APIRow) {
 	t.stampRequestID(row)
+	row = APIRow(t.redactRow(row))
 	t.API.Push(row)
 	if t.APIStore != nil {
 		if err := t.APIStore.Insert(row); err != nil {
 			t.APIStore.NoteWriteFailure()
-			fmt.Fprintf(os.Stderr, "fasten: api persist failed: %v\n", err)
+			// Type-only stderr — see PushSyslog for why.
+			fmt.Fprintf(os.Stderr, "fasten: api persist failed: %T\n", err)
 		}
 	}
+}
+
+// redactRow runs the engine's key-pattern redactor over a stream row before
+// it lands in the ring, the store, and stdout/stderr. Nil hook ⇒ pass
+// through unchanged (pre-Init writers).
+func (t *Transport) redactRow(row map[string]any) map[string]any {
+	if t.redact == nil {
+		return row
+	}
+	return t.redact(row)
 }
 
 // SyslogDepth returns the current number of syslog rows in the ring buffer.

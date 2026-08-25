@@ -70,8 +70,12 @@ type Engine struct {
 
 	// FR1 retention (spec §1) — cancel func for every purger goroutine
 	// spawned on this Engine. Init stops the previous set before wiring the
-	// new one; ResetForTests + shutdown stop unconditionally.
+	// new one; ResetForTests + shutdown stop unconditionally. retentionWg
+	// counts live purgers so stopRetention can Wait: cancel alone doesn't
+	// bound goroutine exit, and an in-flight purger racing the next Init's
+	// e.xport swap surfaces as a -race data race (drainerSysLog reads xport).
 	retentionCancel context.CancelFunc
+	retentionWg     sync.WaitGroup
 }
 
 // Default is the package-level Engine used by all free-function API calls.
@@ -163,6 +167,8 @@ func (e *Engine) Init(cfg Config) error {
 	e.prevHash = "genesis"
 	e.hashMu.Unlock()
 	e.xport = NewTransport(2000)
+	// Uniform PII scrub for every sys/api push. See Transport.redactRow.
+	e.xport.redact = e.redactDetail
 	// Sentinel invariant: one stable boot-window id per process, in effect for
 	// context-less stream rows until the first real request arrives.
 	e.xport.serviceID = e.serviceID
@@ -368,13 +374,11 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 		}
 	}
 
-	// Stop any previous generation before starting a new one — a re-Init on
-	// the same Engine leaves an orphan goroutine hammering the old store
-	// otherwise.
-	if e.retentionCancel != nil {
-		e.retentionCancel()
-		e.retentionCancel = nil
-	}
+	// Stop any previous generation before starting a new one AND wait for
+	// its goroutines to actually exit — a re-Init on the same Engine leaves
+	// an orphan goroutine hammering the old store otherwise, and its
+	// drainerSysLog error path races the new Init's e.xport swap.
+	e.stopRetention()
 
 	// Nothing configured on either stream → no goroutine.
 	if (apiRet == 0 || e.apiStore == nil) && (sysRet == 0 || e.syslogStore == nil) {
@@ -385,22 +389,35 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 	e.retentionCancel = cancel
 	onErr := func(stream string, err error) {
 		e.drainerSysLog("error", "retention_purge_failed", map[string]any{
-			"stream": stream, "error": err.Error(),
+			// Type-only, not err.Error() — driver error strings can carry
+			// the offending row value; sys is redacted key-pattern only.
+			"stream": stream, "error_type": fmt.Sprintf("%T", err),
 		})
 	}
 	if apiRet > 0 && e.apiStore != nil {
-		startPurger(ctx, retentionParams{
+		startPurger(ctx, &e.retentionWg, retentionParams{
 			stream: "api", store: e.apiStore, retention: apiRet,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
 	if sysRet > 0 && e.syslogStore != nil {
-		startPurger(ctx, retentionParams{
+		startPurger(ctx, &e.retentionWg, retentionParams{
 			stream: "sys", store: e.syslogStore, retention: sysRet,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
 	return nil
+}
+
+// stopRetention cancels any live purger goroutines and Waits for them to
+// exit. Safe to call when none are running. Must be paired: cancel alone
+// leaks a goroutine that races the next Init.
+func (e *Engine) stopRetention() {
+	if e.retentionCancel != nil {
+		e.retentionCancel()
+		e.retentionCancel = nil
+	}
+	e.retentionWg.Wait()
 }
 
 // Emit produces an audit row for a registered code.
@@ -517,8 +534,9 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 						nwf.NoteWriteFailure()
 					}
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
-						"error":  ferr.Error(),
-						"row_id": row.ID,
+						// Type-only — see retention_purge_failed comment.
+						"error_type": fmt.Sprintf("%T", ferr),
+						"row_id":     row.ID,
 					})
 				}
 			}
@@ -593,6 +611,12 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 		}
 		row[k] = kv[i+1]
 	}
+	// Uniform PII scrub — key-pattern redactor over both structured kv and
+	// stdout NDJSON, so caller-supplied secrets (fasten.LogError(ctx,
+	// "auth_failed", "password", pw)) never hit stdout, the ring, or the
+	// persistent store. PushSyslog would redact anyway; scrub the local
+	// copy up front so the stdout NDJSON also sees the redacted form.
+	row = SyslogRow(e.redactDetail(row))
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}
@@ -624,10 +648,7 @@ func (e *Engine) ResetForTests() {
 	e.redactExtraKeysJSON = ""
 	e.redactReplacement = ""
 	e.redactMu.Unlock()
-	if e.retentionCancel != nil {
-		e.retentionCancel()
-		e.retentionCancel = nil
-	}
+	e.stopRetention()
 }
 
 // SearchEnabled reports whether FR3 free-text search is enabled on this engine.
@@ -655,7 +676,8 @@ func (e *Engine) installDrainer(
 		store, capacity, retryInitialMs, retryMaxMs, retryJitter, uint32(maxAttempts),
 	)
 	if err != nil {
-		e.drainerSysLog("error", "audit_drainer_install_failed", map[string]any{"error": err.Error()})
+		e.drainerSysLog("error", "audit_drainer_install_failed",
+			map[string]any{"error_type": fmt.Sprintf("%T", err)})
 		return
 	}
 	e.drainerMu.Lock()
@@ -696,6 +718,12 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	for k, v := range fields {
 		row[k] = v
 	}
+	// Fields commonly include an "error" carrying a driver error string
+	// that can quote the offending row value (Postgres NotNullViolation
+	// cites the column). Redact the local copy before both the transport
+	// push AND the direct stderr write — PushSyslog would redact its
+	// own copy, but the stderr line uses this local `row`.
+	row = SyslogRow(e.redactDetail(row))
 	if e.xport != nil {
 		e.xport.PushSyslog(row)
 	}

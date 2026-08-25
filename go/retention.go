@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -70,15 +71,24 @@ type retentionParams struct {
 // startPurger spawns a goroutine that runs an age-based purge on p.store
 // every p.checkInterval. Returns immediately; the caller cancels via ctx.
 // The first purge runs on entry (no waiting a full interval), so operators
-// see the effect on Init rather than an hour later.
-func startPurger(ctx context.Context, p retentionParams) {
+// see the effect on Init rather than an hour later. wg (nil-safe) lets the
+// caller Wait for the goroutine to actually exit after cancel — required
+// because Engine fields the onError callback reads (via drainerSysLog) are
+// swapped by the next Init, and cancel alone doesn't bound exit timing.
+func startPurger(ctx context.Context, wg *sync.WaitGroup, p retentionParams) {
 	if p.checkInterval <= 0 {
 		p.checkInterval = time.Hour
 	}
 	if p.nowFn == nil {
 		p.nowFn = time.Now
 	}
+	if wg != nil {
+		wg.Add(1)
+	}
 	go func() {
+		if wg != nil {
+			defer wg.Done()
+		}
 		// tick immediately, then every checkInterval
 		fire := func() {
 			cutoff := canonicalTS(p.nowFn().Add(-p.retention))
