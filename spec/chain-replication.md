@@ -92,14 +92,33 @@ the number was originally typed.
 
 ### §1.4 Canonical form `"2"` — committed detail
 
-Form `"2"` replaces `detail` in the hashed field set with a **salted commitment**
-to it. Everything else — rendering, number handling, key sorting, the inclusion
-of `canonical_form_id` — is identical to §1.2 and §1.3.
+Form `"2"` makes two changes to form `"1"`:
+
+1. `detail` in the hashed field set is replaced by a **salted commitment** to it.
+2. **Timestamps use the canonical wire form of §4.3** — RFC 3339 with `Z` and a
+   fixed six-digit sub-second (`2026-06-15T10:30:45.000000Z`) — not form `"1"`'s
+   `+00:00` with variable-width microseconds.
+
+Key sorting, number handling (§1.3) and the inclusion of `canonical_form_id` are
+unchanged.
+
+**Why (2).** Form `"1"` hashed a *different* timestamp spelling from the one the
+row carries on the wire, so every SDK needed a second, private timestamp renderer
+used only in the hash path. Two renderers for one value is how Go and Python
+drifted apart (P1-48): both were correct about the instant and disagreed about the
+bytes. Form `"2"` has exactly one timestamp form, the one already written to the
+wire and already pinned by the §4.3 conformance tests. `Z` is also the spelling
+RFC 3339 examples, JSON Schema `date-time` and OpenAPI use, so it is the less
+surprising choice for anyone reading a row.
+
+Implementations MUST hash the timestamp exactly as serialised, and MUST NOT
+re-render it. A private `pyISOFormat`-style helper in the hash path is
+non-conformant under form `"2"`.
 
 ```
-form "1": sha256(canonical_json(row − {hash}))
+form "1": sha256(canonical_json(row − {hash}))                  ts: +00:00, var width
 form "2": sha256(canonical_json(row − {hash, detail, detail_salt}
-                                     + {detail_commitment}))
+                                     + {detail_commitment}))     ts: Z, fixed 6 digits
 
 detail_commitment = sha256(detail_salt || canonical_json(detail))   hex
 detail_salt       = 32 random bytes, hex, unique per row

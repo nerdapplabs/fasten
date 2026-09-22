@@ -233,3 +233,46 @@ def test_redacted_row_round_trips_through_sqlite():
     store.insert_replicated(redact(_seal2("genesis", _row())))
     (back,) = store.query(limit=10)
     assert back.detail is None
+
+
+# ── one timestamp renderer (spec §1.4) ───────────────────────────────────────
+
+def test_form_2_hashes_the_wire_timestamp_verbatim():
+    """REGRESSION for the two-renderer hazard (P1-48).
+
+    Form "1" hashed "+00:00" while the row carried "Z", so every SDK needed a
+    second private timestamp renderer in the hash path — and Go and Python
+    drifted apart inside it. Form "2" hashes the timestamp exactly as
+    serialised. If anyone reintroduces a conversion, this fails.
+    """
+    import hashlib
+    from fasten.chain import _FORM_2_EXCLUDED, _canonical_json, _row_hash_form_2
+
+    row = _seal2("genesis", _row(), salt=VECTOR_SALT)
+    d = row.to_dict()
+    assert d["timestamp"].endswith("Z"), "wire form should be Z (§4.3)"
+
+    expected = hashlib.sha256(_canonical_json(
+        {k: v for k, v in d.items() if k not in _FORM_2_EXCLUDED})).hexdigest()
+    assert _row_hash_form_2(d) == expected, (
+        "form 2 re-rendered the timestamp instead of hashing it verbatim"
+    )
+
+
+def test_form_2_whole_second_and_zero_micros():
+    """micros==0 takes the branch that variable-width rendering got wrong.
+
+    Under form "2" the width is fixed, so a whole second and a 1-microsecond
+    instant must both round-trip and differ from each other.
+    """
+    whole = dataclasses.replace(
+        _row(), timestamp=datetime(2026, 6, 15, 10, 30, 45, 0, tzinfo=timezone.utc))
+    one = dataclasses.replace(
+        _row(), timestamp=datetime(2026, 6, 15, 10, 30, 45, 1, tzinfo=timezone.utc))
+
+    a = _seal2("genesis", whole, salt=VECTOR_SALT)
+    b = _seal2("genesis", one, salt=VECTOR_SALT)
+    assert a.to_dict()["timestamp"] == "2026-06-15T10:30:45.000000Z"
+    assert b.to_dict()["timestamp"] == "2026-06-15T10:30:45.000001Z"
+    assert a.hash != b.hash
+    assert verify_chain([a]).ok and verify_chain([b]).ok

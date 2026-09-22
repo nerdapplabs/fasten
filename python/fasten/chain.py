@@ -124,8 +124,11 @@ def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
     successor's ``prev_hash``, which would otherwise cascade a re-seal down the
     whole chain and be indistinguishable from tampering.
     """
+    # NO _to_hashed_form here: form "2" hashes the timestamp exactly as the row
+    # carries it on the wire (§4.3 / §1.4). One renderer, one spelling. Form "1"
+    # needs the conversion because it hashed a different spelling than it wrote.
     d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
-    return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
+    return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 
 # Form-id -> hash function registry. Adding a v2 is purely additive: register a
