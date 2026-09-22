@@ -44,6 +44,15 @@ class AuditRepository(Protocol):
         """Insert a row this node ORIGINATED (origin_id == id)."""
         ...
 
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert atomically (spec §2.1).
+
+        Returns the SEALED row. Implementations MUST serialise concurrent
+        allocations for the same source_node_id, so that N writers on one node
+        produce ONE verifiable chain rather than N rows claiming seq 1.
+        """
+        ...
+
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a sealed row replicated from another origin (after the chain
         verifies in ingest_replicated)."""

@@ -7,6 +7,7 @@ and uses WAL mode by default.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import re
 import sqlite3
@@ -240,6 +241,51 @@ class SQLiteStore:
                 "use insert_replicated for rows from another origin"
             )
         self._insert_row(row)
+
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+
+        One node, one chain: ``monotonic_seq`` is unique within a
+        ``source_node_id``. Allocating in the engine's memory is non-conformant —
+        two engine instances (two services on one store, a forking supervisor,
+        ``uvicorn --workers``) each mint from 1 and produce two rows at seq 1,
+        which ``verify_chain`` must then report as a duplicate allocation.
+
+        ``BEGIN IMMEDIATE`` takes a RESERVED lock before the read, so two writers
+        cannot both observe the same MAX(seq) and then both insert. Without it
+        this method would be a read-modify-write race that merely moves the bug
+        from memory into SQL.
+
+        Returns the SEALED row actually written.
+        """
+        from ..chain import seal
+
+        if row.origin_id != row.id:
+            raise ValueError(
+                "allocate_and_insert_originated requires origin_id == id "
+                f"(got origin_id={row.origin_id!r}, id={row.id!r})"
+            )
+        with self._txn():
+            conn = self._connect()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    f"SELECT monotonic_seq, hash FROM {self._table} "
+                    "WHERE source_node_id = ? AND hash != '' "
+                    "ORDER BY monotonic_seq DESC LIMIT 1",
+                    (row.source_node_id,),
+                )
+                tip = cur.fetchone()
+                next_seq = (tip[0] + 1) if tip else 1
+                prev_hash = tip[1] if tip else "genesis"
+                sealed = seal(prev_hash, dataclasses.replace(
+                    row, monotonic_seq=next_seq))
+                self._insert_row_core(conn, sealed)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return sealed
 
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a row replicated from another origin. Used by

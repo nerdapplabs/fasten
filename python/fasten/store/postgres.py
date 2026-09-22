@@ -9,12 +9,13 @@ Install the optional dep:  pip install "fasten[postgres]"
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
@@ -262,6 +263,57 @@ class PostgresStore:
                 "use insert_replicated for rows from another origin"
             )
         self._insert_row(row)
+
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+
+        One node, one chain: ``monotonic_seq`` is unique within a
+        ``source_node_id``. Allocating in engine memory is non-conformant — two
+        engine instances on one node each mint from 1 and produce two rows at
+        seq 1, which ``verify_chain`` reports as a duplicate allocation.
+
+        Serialisation uses ``pg_advisory_xact_lock`` keyed on the node, NOT
+        ``SELECT … FOR UPDATE`` on the tip row: with an empty table there is no
+        tip row to lock, so FOR UPDATE would let every concurrent writer through
+        to allocate seq 1. The advisory lock is transaction-scoped and released
+        on commit or rollback.
+
+        Returns the SEALED row actually written.
+        """
+        from ..chain import seal
+
+        if row.origin_id != row.id:
+            raise ValueError(
+                "allocate_and_insert_originated requires origin_id == id "
+                f"(got origin_id={row.origin_id!r}, id={row.id!r})"
+            )
+
+        def _run(conn: Any) -> AuditRow:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (row.source_node_id,),
+                    )
+                    cur.execute(
+                        f"SELECT monotonic_seq, hash FROM {self._table} "
+                        "WHERE source_node_id = %s AND hash <> '' "
+                        "ORDER BY monotonic_seq DESC LIMIT 1",
+                        (row.source_node_id,),
+                    )
+                    tip = cur.fetchone()
+                    next_seq = (tip[0] + 1) if tip else 1
+                    prev_hash = tip[1] if tip else "genesis"
+                    sealed = seal(prev_hash, dataclasses.replace(
+                        row, monotonic_seq=next_seq))
+                    self._insert_row_core(cur, sealed)
+                conn.commit()
+                return sealed
+            except BaseException:
+                conn.rollback()
+                raise
+
+        return cast(AuditRow, self._execute_with_retry(_run))
 
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a row replicated from another origin. ingest_replicated path;

@@ -174,6 +174,11 @@ class Engine:
         self._search_enabled: bool = False
         self._stdlib_logger = logging.getLogger("fasten")
 
+        # spec §2.1: fasten-core does not yet allocate monotonic_seq/prev_hash
+        # in the store transaction, so audit rows bypass the FFI drainer. Flip
+        # to True when core lands §2.1.
+        self._drainer_allocates: bool = False
+        self._drainer_bypass_logged: bool = False
         self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
         self._drainer_callback: Any = None        # keep ctypes callback alive (GC guard)
         self._drainer_lock = threading.Lock()
@@ -576,29 +581,39 @@ class Engine:
         )
         row = dataclasses.replace(row, origin_id=row.id)
 
-        # Atomically: assign monotonic_seq + seal the hash chain (the ONE
-        # canonical seal path — fasten.chain.seal stamps canonical_form_id,
-        # prev_hash and computes hash).
-        with self._lock:
-            self._seq += 1
-            row = dataclasses.replace(row, monotonic_seq=self._seq)
-            row = seal(self._prev_hash, row)
-            self._prev_hash = row.hash
-
-        # Stdout write before store routing: row reaches the log stream even
-        # if the store path blocks or raises.
+        # monotonic_seq / prev_hash / hash are NOT assigned here. They are
+        # allocated by the store inside the insert transaction (spec §2.1), so
+        # that N engine instances on one node produce ONE chain instead of N
+        # rows all claiming seq 1. Sealing therefore happens at insert time.
+        #
+        # Phase 1 of the two-phase stdout contract (spec §8): write the unsealed
+        # row before store routing, so it reaches the log stream even if the
+        # store path blocks or raises. Phase 2 re-emits it sealed below.
         if self._stdout is not None:
             self._stdout.write_audit(row.to_dict())
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":
+                # The FFI drainer allocates in fasten-core, which does not yet
+                # implement spec §2.1. Routing audit rows through it would leave
+                # them unsealed and unsequenced — silently disabling the chain.
+                # Correctness beats throughput: take the Python allocating path
+                # and say so once. Remove this guard when core lands §2.1.
                 handle = self._drainer_handle
+                if handle is not None and not self._drainer_allocates:
+                    if not self._drainer_bypass_logged:
+                        self._drainer_bypass_logged = True
+                        self._drainer_sys_log(
+                            "warn", "drainer_bypassed_for_chain_allocation",
+                            {"reason": "fasten-core does not implement spec 2.1"},
+                        )
+                    handle = None
                 if handle is not None:
                     row_json = json.dumps(row.to_dict(), default=str)
                     _ffi.drainer_enqueue(handle, row_json)
                 else:
                     try:
-                        self._audit_store.insert(row)
+                        row = self._allocate_and_store(row)
                     except Exception as e:  # noqa: BLE001
                         # Swallowed on the hot path → durable history now has a
                         # hole; degrade the audit completeness flag. Set the
@@ -617,7 +632,7 @@ class Engine:
                         })
             else:
                 try:
-                    self._audit_store.insert(row)
+                    row = self._allocate_and_store(row)
                 except Exception as e:  # noqa: BLE001
                     raise AuditStoreError(f"{type(e).__name__}: {e}") from e
         return row
@@ -740,6 +755,22 @@ class Engine:
         self._last_init_at  = None
 
     # ── Internal ──────────────────────────────────────────────────────────
+
+    def _allocate_and_store(self, row: AuditRow) -> AuditRow:
+        """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
+
+        Falls back to the legacy unallocated insert for adopter repositories that
+        predate the protocol method, so a custom store keeps working (unchained)
+        rather than raising on the hot path.
+        """
+        allocate = getattr(self._audit_store, "allocate_and_insert_originated", None)
+        if not callable(allocate):
+            self._audit_store.insert(row)
+            return row
+        sealed = allocate(row)
+        if self._stdout is not None and sealed.hash:
+            self._stdout.write_audit(sealed.to_dict())
+        return sealed
 
     def _next_seq(self) -> int:
         with self._lock:
