@@ -295,15 +295,23 @@ class PostgresStore:
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (row.source_node_id,),
                     )
+                    # See the SQLite implementation: seq must span ALL rows on
+                    # the node (an unsealed row still holds its number), while
+                    # prev_hash may only chain from a sealed one.
                     cur.execute(
-                        f"SELECT monotonic_seq, hash FROM {self._table} "
+                        f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
+                        "WHERE source_node_id = %s",
+                        (row.source_node_id,),
+                    )
+                    next_seq = int(cur.fetchone()[0]) + 1
+                    cur.execute(
+                        f"SELECT hash FROM {self._table} "
                         "WHERE source_node_id = %s AND hash <> '' "
                         "ORDER BY monotonic_seq DESC LIMIT 1",
                         (row.source_node_id,),
                     )
                     tip = cur.fetchone()
-                    next_seq = (tip[0] + 1) if tip else 1
-                    prev_hash = tip[1] if tip else "genesis"
+                    prev_hash = tip[0] if tip else "genesis"
                     sealed = seal(prev_hash, dataclasses.replace(
                         row, monotonic_seq=next_seq))
                     self._insert_row_core(cur, sealed)

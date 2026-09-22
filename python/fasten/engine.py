@@ -158,8 +158,6 @@ class Engine:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._seq: int = 0
-        self._prev_hash: str = "genesis"  # P1-23: hash chain
         self._boot_request_id: Optional[str] = None  # sentinel boot-window id
 
         self._service_id: str = ""
@@ -377,28 +375,11 @@ class Engine:
         # previous store's history doesn't apply to this one.
         self._audit_write_swallowed = False
 
-        if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
-            # Seed seq from THIS engine's own (service_id, source_node_id)
-            # sub-chain only — never the global MAX. monotonic_seq is a
-            # per-node counter; seeding from a foreign origin's rows (which
-            # this node may have ingested via ingest_replicated) would break
-            # this node's own tamper chain.
-            with self._lock:
-                self._seq = self._audit_store.max_monotonic_seq(
-                    service_id=cfg.service_id,
-                    source_node_id=cfg.node_id,
-                )
-            # Seed prev_hash for the hash chain from the latest stored row of
-            # THIS node's own sub-chain.
-            try:
-                latest = self._audit_store.query(
-                    source_node_id=cfg.node_id, limit=1,
-                )
-                seed = latest[0].hash if latest and latest[0].hash else "genesis"
-            except Exception:
-                seed = "genesis"
-            with self._lock:
-                self._prev_hash = seed
+        # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
+        # (spec §2.1) and happens inside the insert transaction, so an engine
+        # holds no chain state at all. Seeding here previously cost two store
+        # round trips per init() and — worse — implied the engine owned the
+        # counter, which is the bug P0-9 fixed.
 
         self._redactor = Redactor(
             extra_keys=cfg.extra_redact_keys,
@@ -562,7 +543,7 @@ class Engine:
         row = AuditRow(
             id=f"evt-{uuid.uuid4().hex[:20]}",
             origin_id="",
-            monotonic_seq=0,  # placeholder — replaced under lock
+            monotonic_seq=0,  # placeholder — the store allocates (spec §2.1)
             timestamp=datetime.now(timezone.utc),
             code=code,
             action=meta.action,
@@ -739,9 +720,6 @@ class Engine:
         constructing a new one. Do not call in production code.
         """
         self._uninstall_drainer()
-        with self._lock:
-            self._seq = 0
-            self._prev_hash = "genesis"
         self._service_id    = ""
         self._node_id       = ""
         self._tenant_id     = None
@@ -771,11 +749,6 @@ class Engine:
         if self._stdout is not None and sealed.hash:
             self._stdout.write_audit(sealed.to_dict())
         return sealed
-
-    def _next_seq(self) -> int:
-        with self._lock:
-            self._seq += 1
-            return self._seq
 
     def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any]) -> None:
         """Route drainer events to stderr (not stdout) to avoid backpressure deadlock."""

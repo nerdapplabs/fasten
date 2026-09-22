@@ -120,3 +120,39 @@ def test_rollback_leaves_no_gap(store):
     nxt = store.allocate_and_insert_originated(_unsealed(3))
     assert nxt.monotonic_seq == 2
     assert verify_chain(store.query(limit=10)).ok
+
+
+def test_unsealed_rows_still_occupy_their_sequence(store):
+    """REGRESSION: allocation must count UNSEALED rows too.
+
+    A pre-upgrade row, or one written in stdout-only mode (spec §8.1), has
+    hash="". It still occupies its monotonic_seq. An allocator that filters on
+    `hash != ''` when computing MAX(seq) restarts the counter at 1 and mints
+    duplicates against those rows — silently, until verify_chain reports a
+    duplicate allocation.
+
+    seq spans ALL rows on the node; prev_hash chains only from sealed ones.
+    """
+    import dataclasses
+    unsealed = dataclasses.replace(_unsealed(99), monotonic_seq=42)
+    assert unsealed.hash == ""
+    store._insert_row(unsealed)                       # bypass sealing entirely
+
+    nxt = store.allocate_and_insert_originated(_unsealed(1))
+    assert nxt.monotonic_seq == 43, (
+        f"allocated seq {nxt.monotonic_seq} against an existing unsealed row at "
+        "42 — the counter restarted"
+    )
+    # No sealed predecessor exists, so this row legitimately starts the chain.
+    assert nxt.prev_hash == "genesis"
+    assert verify_chain([r for r in store.query(limit=10) if r.hash]).ok
+
+
+def test_prev_hash_skips_unsealed_tip(store):
+    """prev_hash must chain from the last SEALED row, not the last row."""
+    import dataclasses
+    first = store.allocate_and_insert_originated(_unsealed(1))
+    store._insert_row(dataclasses.replace(_unsealed(98), monotonic_seq=500))
+    third = store.allocate_and_insert_originated(_unsealed(2))
+    assert third.monotonic_seq == 501, "seq ignored the unsealed row"
+    assert third.prev_hash == first.hash, "chained from an unsealed row"

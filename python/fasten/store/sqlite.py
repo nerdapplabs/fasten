@@ -269,15 +269,29 @@ class SQLiteStore:
             conn = self._connect()
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # TWO questions, TWO queries — conflating them is a bug.
+                #
+                # seq must be unique across EVERY row on this node, sealed or
+                # not: an unsealed row (pre-upgrade, or stdout-only mode per
+                # §8.1) still occupies its sequence number. Filtering those out
+                # here restarts the counter at 1 and collides with them.
+                #
+                # prev_hash, by contrast, may only chain from a SEALED row —
+                # an empty hash is not a link.
                 cur = conn.execute(
-                    f"SELECT monotonic_seq, hash FROM {self._table} "
+                    f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
+                    "WHERE source_node_id = ?",
+                    (row.source_node_id,),
+                )
+                next_seq = int(cur.fetchone()[0]) + 1
+                cur = conn.execute(
+                    f"SELECT hash FROM {self._table} "
                     "WHERE source_node_id = ? AND hash != '' "
                     "ORDER BY monotonic_seq DESC LIMIT 1",
                     (row.source_node_id,),
                 )
                 tip = cur.fetchone()
-                next_seq = (tip[0] + 1) if tip else 1
-                prev_hash = tip[1] if tip else "genesis"
+                prev_hash = tip[0] if tip else "genesis"
                 sealed = seal(prev_hash, dataclasses.replace(
                     row, monotonic_seq=next_seq))
                 self._insert_row_core(conn, sealed)
