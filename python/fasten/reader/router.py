@@ -699,8 +699,14 @@ def router(
         }
 
     @r.get("/audit/doctor")
-    def get_audit_doctor() -> dict[str, Any]:
+    def get_audit_doctor(request: "Request") -> dict[str, Any]:
         """P1-15: read-side audit-pipeline health snapshot.
+
+        Takes ``request`` and calls ``_resolve_tenant`` like every other
+        handler. It previously took no argument, so it could not scope and
+        returned 200 to a caller that every other route 401s — leaking the
+        global row count, the host tenant_id, a cross-tenant chain sample and
+        raw driver errors carrying DSN host/user.
 
         Same auth as ``/audit`` (router-level dependencies). Use cases:
 
@@ -709,6 +715,9 @@ def router(
         - Status page: red/yellow/green tiles from this single payload.
         """
         from ..emitter import _default as _default_engine
+
+        # 401s when isolation is on and the scope is unresolved/blank.
+        tenant = _resolve_tenant(request)
 
         s = _store()
         store_block: dict[str, Any] = {

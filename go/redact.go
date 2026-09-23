@@ -48,9 +48,9 @@ func (e *Engine) redactDetail(d map[string]any) map[string]any {
 	if err != nil {
 		return unredactableMarker()
 	}
-	cap := maxDetailBytes()
-	if len(b) > cap {
-		return truncatedMarker(len(b), cap)
+	maxBytes := maxDetailBytes()
+	if len(b) > maxBytes {
+		return truncatedMarker(len(b), maxBytes)
 	}
 	e.redactMu.RLock()
 	extra := e.redactExtraKeysJSON
@@ -76,12 +76,12 @@ func (e *Engine) redactDetail(d map[string]any) map[string]any {
 // truncatedMarker is the fail-closed replacement for an oversize payload.
 // Never returns the original bytes — the whole point is that we don't
 // trust attacker-controlled input to be safe to store.
-func truncatedMarker(size, cap int) map[string]any {
+func truncatedMarker(size, maxBytes int) map[string]any {
 	return map[string]any{
 		"_truncated":        true,
 		"_truncated_bytes":  size,
-		"_max_detail_bytes": cap,
-		"_summary":          fmt.Sprintf("<truncated %d bytes; cap %d>", size, cap),
+		"_max_detail_bytes": maxBytes,
+		"_summary":          fmt.Sprintf("<truncated %d bytes; cap %d>", size, maxBytes),
 	}
 }
 

@@ -65,7 +65,10 @@ jobs:
       - name: Install dev dependencies
         run: |
           uv venv
-          uv pip install -e ".[dev,postgres]"
+          # fastapi is its own extra; without it every reader test hits
+          # importorskip("fastapi") and the whole P1-44/P1-45 suite
+          # skips while CI still reports green.
+          uv pip install -e ".[dev,postgres,fastapi,sqlite]"
 
       - name: Activate venv for subsequent steps
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"

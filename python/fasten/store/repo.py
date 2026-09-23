@@ -71,6 +71,10 @@ class AuditRepository(Protocol):
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
+        # Declared because the reader passes it UNCONDITIONALLY (router.py
+        # /logs/audit, /correlate, /search). A third-party store implementing
+        # this Protocol without it raises TypeError on every scoped request.
+        tenant_id: str | None = None,
     ) -> list[AuditRow]: ...
 
     def count(
