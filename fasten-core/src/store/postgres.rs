@@ -60,7 +60,10 @@ fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
             "DSN requests TLS (sslmode=require|verify-ca|verify-full) but \
              fasten-core was built without the `postgres-tls` feature. \
              Rebuild with `--features postgres-tls` (on by default), or \
-             remove the sslmode param to accept plaintext explicitly."
+             remove the sslmode param to accept plaintext explicitly. \
+             NOTE: use `sslmode=require` — the driver accepts only \
+             disable|prefer|require, and `require` with native-tls already \
+             verifies the certificate chain AND the hostname."
                 .to_string(),
         ));
     }
@@ -71,6 +74,16 @@ fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
 // libpq's rule set — the three sslmode values that MUST fail if TLS isn't
 // available are `require`, `verify-ca`, `verify-full` (`prefer` allows
 // fallback, `allow` allows fallback, `disable` is explicit plaintext).
+//
+// IMPORTANT, and the reason this list differs from what you should WRITE in a
+// DSN: tokio-postgres's Config parser accepts only `disable | prefer |
+// require`. `verify-ca` / `verify-full` are REJECTED at connect time. We still
+// match them here so a DSN carrying one fails closed rather than silently
+// connecting in plaintext — but the value to document and use is `require`,
+// which with native-tls already verifies both the certificate chain and the
+// hostname. Recommending verify-* leads users to a connect error they then
+// "fix" by dropping to `prefer`, which is exactly the plaintext fallback
+// P1-43 closed.
 // #[allow(dead_code)]: only the `#[cfg(not(feature = "postgres-tls"))]`
 // arm of connect_client calls this at runtime; the test module below
 // exercises it under every feature set so the sslmode semantics don't
@@ -92,6 +105,20 @@ fn requires_tls(dsn: &str) -> bool {
 #[cfg(test)]
 mod tls_tests {
     use super::requires_tls;
+    /// The driver accepts only disable|prefer|require. verify-ca/verify-full
+    /// are rejected at connect time, so they must never be RECOMMENDED even
+    /// though requires_tls() matches them (fail-closed). Pins the documented
+    /// value so the guidance can't drift back.
+    #[test]
+    fn documented_strict_sslmode_is_require() {
+        assert!(requires_tls("host=db user=x sslmode=require"));
+        // Still fail-closed on values the driver will reject:
+        assert!(requires_tls("host=db user=x sslmode=verify-full"));
+        // Fallback-permitting modes must NOT be treated as requiring TLS.
+        assert!(!requires_tls("host=db user=x sslmode=prefer"));
+        assert!(!requires_tls("host=db user=x sslmode=disable"));
+    }
+
     #[test]
     fn requires_tls_matches_libpq_ssl_semantics() {
         // Positive: every "must-be-encrypted" sslmode.
@@ -136,7 +163,9 @@ impl PostgresStore {
     /// statement.
     ///
     /// `dsn`   — libpq-style connection string or `postgresql://` URI.
-    ///           TLS: `sslmode=require|verify-ca|verify-full` in the DSN
+    ///           TLS: use `sslmode=require` in the DSN. The driver rejects
+    ///           `verify-ca`/`verify-full`; `require` + native-tls already
+    ///           verifies the chain and the hostname.
     ///           actually negotiates TLS when the crate is built with the
     ///           `postgres-tls` feature (ON by default). Without that
     ///           feature the connect **fails loudly** rather than silently
