@@ -142,7 +142,11 @@ def router(
         if tenant_scope is None:
             return None
         t = tenant_scope(request)
-        if t is None:
+        if not t:
+            # `not t`, NOT `t is None`: an empty string is a resolved-but-blank
+            # scope, and the store treats a falsy tenant_id as "no filter"
+            # (sqlite.py `if tenant_id:`). Letting "" through the gate turns
+            # tenant isolation into a full cross-tenant read. Fail closed.
             raise HTTPException(status_code=401, detail="unauthenticated: tenant scope unresolved")
         return t
 

@@ -162,3 +162,30 @@ def test_two_engines_one_store_produce_one_chain():
         e.flush()
     time.sleep(1)
     assert verify_chain(SQLiteStore(db).query(limit=100)).ok
+
+
+# ── tenant isolation: empty scope must not widen the query ───────────────────
+
+def test_empty_tenant_id_filters_to_nothing_not_everything():
+    """SECURITY REGRESSION: `if tenant_id:` treated "" as no-filter.
+
+    A tenant_scope hook returning "" passed the router's `is None` gate and then
+    disabled filtering in the store — a full cross-tenant read with isolation
+    nominally enabled.
+    """
+    import os
+    import tempfile
+    from fasten.store.sqlite import SQLiteStore
+
+    store = SQLiteStore(path=os.path.join(tempfile.mkdtemp(), "audit.db"),
+                        table="fasten_audit")
+    for tid in ("tenant-a", "tenant-b"):
+        r = _row("svc", 1)
+        store.insert_replicated(seal("genesis", dataclasses.replace(
+            r, id=f"evt-{tid}", origin_id=f"evt-{tid}", tenant_id=tid)))
+
+    assert len(store.query(limit=10)) == 2
+    assert store.query(tenant_id="tenant-a", limit=10)[0].tenant_id == "tenant-a"
+    assert store.query(tenant_id="", limit=10) == [], (
+        "empty tenant_id returned rows — the filter was dropped"
+    )

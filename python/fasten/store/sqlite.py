@@ -450,7 +450,10 @@ class SQLiteStore:
         if source_node_id:
             conds.append("source_node_id = ?")
             params.append(source_node_id)
-        if tenant_id:
+        # `is not None`, not truthiness: an empty tenant_id must filter to
+        # nothing, never silently widen the query to every tenant. Matches the
+        # convention already used elsewhere in this file.
+        if tenant_id is not None:
             conds.append("tenant_id = ?")
             params.append(tenant_id)
         if actor:
