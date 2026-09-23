@@ -1,6 +1,7 @@
 package fasten
 
 import (
+	"unicode/utf8"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -384,7 +385,10 @@ const MaxQueryLength = 1024
 // no unbounded scans). Also caps q= length so a caller can't hand the store
 // a multi-MB LIKE pattern that runs quadratic per row (P1-46).
 func (e *Engine) searchGuard(q, since string) string {
-	if len(q) > MaxQueryLength {
+	// Count RUNES, not bytes. len() is bytes, so a 1024-character UTF-8 query
+	// with any multibyte character was rejected here while Python's
+	// max_length=1024 (characters) accepted it — same input, two answers.
+	if utf8.RuneCountInString(q) > MaxQueryLength {
 		return fmt.Sprintf("q= is capped at %d characters", MaxQueryLength)
 	}
 	if !e.searchEnabled {
