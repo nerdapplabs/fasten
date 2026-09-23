@@ -50,9 +50,11 @@ jobs:
         working-directory: fasten-core
         # native-tls links OpenSSL, which needs pkg-config + headers. Without
         # them the job fails at build, which is how tls_tests stayed unrun.
+        # The job runs in `container: rust:1.85` — root, and no sudo binary,
+        # so `sudo apt-get` fails with "sudo: not found". Install directly.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libssl-dev
+          apt-get update -qq
+          apt-get install -y -qq pkg-config libssl-dev
           cargo test --all-features --quiet
 
       - name: Install llvm-tools for coverage
