@@ -55,8 +55,12 @@ def require_bearer(token_env: str = "FASTEN_READER_TOKEN") -> Any:
         prefix = "Bearer "
         if not authorization.startswith(prefix):
             raise HTTPException(status_code=401, detail="unauthenticated")
-        presented = authorization[len(prefix):]
-        if not hmac.compare_digest(presented, expected):
+        # Compare BYTES. hmac.compare_digest() raises TypeError on a str with
+        # any non-ASCII character, and HTTP headers decode as latin-1 — so a
+        # single non-ASCII byte in the Authorization header turned every route
+        # into an unhandled 500 for anonymous callers.
+        presented = authorization[len(prefix):].encode("utf-8", "surrogateescape")
+        if not hmac.compare_digest(presented, expected.encode("utf-8")):
             raise HTTPException(status_code=401, detail="unauthenticated")
 
     return dep

@@ -114,6 +114,13 @@ def router(
             "fasten.reader.router() requires fastapi; install fasten[fastapi]"
         ) from e
 
+    if dependencies is None:
+        raise RuntimeError(
+            "fasten.reader.router: `dependencies=None` is not a valid no-auth "
+            "opt-in — it was the old spelling and now reads as 'unset'. Pass "
+            "`dependencies=[]` to deliberately mount without auth, or an auth "
+            "hook such as `[Depends(require_admin)]`."
+        )
     if dependencies is _UNSET:
         raise RuntimeError(
             "fasten.reader.router: `dependencies=` is required. Pass an "
@@ -165,17 +172,6 @@ def router(
         if scope is None:
             return rows
         return [r for r in rows if r.get("tenant_id") == scope]
-
-    def _scope_audit_rows(rows: list[Any], scope: Optional[str]) -> list[Any]:
-        """Same as _scope_stream_rows but for AuditRow dataclasses (typed
-        tenant_id attribute). Used by /search audit path where we call
-        the store's search() which doesn't yet accept tenant_id — the
-        two commits are staged: post-filter here now, push the filter
-        down to the store as a follow-up so /search doesn't scan across
-        tenants at all."""
-        if scope is None:
-            return rows
-        return [r for r in rows if r.tenant_id == scope]
 
     def _store() -> Any:
         return store if store is not None else _active_audit_store()

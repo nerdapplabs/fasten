@@ -175,6 +175,8 @@ class Engine:
         # spec §2.1: fasten-core does not yet allocate monotonic_seq/prev_hash
         # in the store transaction, so audit rows bypass the FFI drainer. Flip
         # to True when core lands §2.1.
+        self._unchained_store_logged: bool = False
+        self._audit_chain_unavailable: bool = False
         self._drainer_allocates: bool = False
         self._drainer_bypass_logged: bool = False
         self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
@@ -743,6 +745,18 @@ class Engine:
         """
         allocate = getattr(self._audit_store, "allocate_and_insert_originated", None)
         if not callable(allocate):
+            # This store predates spec §2.1, so rows go in UNSEALED: no seq, no
+            # hash. verify_chain SKIPS hashless rows, so /audit/doctor would
+            # otherwise report verified=true over a completely unchained table.
+            # Say it once, loudly, and set the degrade flag.
+            if not self._unchained_store_logged:
+                self._unchained_store_logged = True
+                self._audit_chain_unavailable = True
+                self._drainer_sys_log("error", "audit_chain_unavailable", {
+                    "store": type(self._audit_store).__name__,
+                    "reason": "store has no allocate_and_insert_originated "
+                              "(spec 2.1); rows are written unsealed",
+                })
             self._audit_store.insert(row)
             return row
         sealed = allocate(row)
