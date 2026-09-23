@@ -116,6 +116,22 @@ def _row_hash_form_1(row_dict: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
 
 
+def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
+    """Form "1" as Python ACTUALLY sealed it before the §1.2 conformance fix.
+
+    Python hashed the wire timestamp verbatim (always-``Z``) while the spec and
+    Go used ``+00:00`` — the P1-48 divergence. Fixing it changed every hash
+    Python had already written, so a pre-upgrade row fails against the
+    conformant function and is reported as "hash mismatch" — which reads as
+    tampering, the exact false signal this chain exists to avoid.
+
+    ``verify_chain`` falls back to this for form-"1" rows ONLY. Delete it when
+    form "1" is retired.
+    """
+    d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+    return hashlib.sha256(_canonical_json(d)).hexdigest()
+
+
 def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
     """Form "2" (spec §1.4): ``detail`` replaced by ``detail_commitment``.
 
@@ -265,7 +281,13 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
                     first_break_at=row.monotonic_seq,
                     reason=f'row {row.id}: unknown canonical_form_id "{form_id}"',
                 )
-            expected = hash_fn({k: v for k, v in row.to_dict().items()})
+            row_d = {k: v for k, v in row.to_dict().items()}
+            expected = hash_fn(row_d)
+            if expected != row.hash and form_id == "1":
+                # Pre-P1-48 Python sealed form "1" over the wire "Z" spelling.
+                # Accept it rather than report our own spec fix as tampering.
+                if _row_hash_form_1_legacy_z(row_d) == row.hash:
+                    expected = row.hash
             if expected != row.hash:
                 return ChainVerifyResult(
                     ok=False,

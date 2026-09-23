@@ -276,3 +276,44 @@ def test_form_2_whole_second_and_zero_micros():
     assert b.to_dict()["timestamp"] == "2026-06-15T10:30:45.000001Z"
     assert a.hash != b.hash
     assert verify_chain([a]).ok and verify_chain([b]).ok
+
+
+def test_pre_upgrade_form_1_rows_still_verify():
+    """REGRESSION: the P1-48 fix must not orphan rows Python already sealed.
+
+    Python once hashed form "1" over the wire "Z" spelling. Making it
+    spec-conformant (+00:00) changed every hash it had written, so a
+    pre-upgrade corpus failed with "hash mismatch" — reported as tampering.
+    verify_chain falls back to the legacy spelling for form "1" only.
+    """
+    import hashlib
+    from fasten.chain import _FORM_1_EXCLUDED, _canonical_json
+
+    row = dataclasses.replace(_row(), canonical_form_id="1", prev_hash="genesis")
+    legacy = hashlib.sha256(_canonical_json(
+        {k: v for k, v in row.to_dict().items() if k not in _FORM_1_EXCLUDED}
+    )).hexdigest()
+    stored = dataclasses.replace(row, hash=legacy)
+
+    result = verify_chain([stored])
+    assert result.ok, f"pre-upgrade row rejected: {result.reason}"
+
+
+def test_legacy_fallback_does_not_weaken_tamper_detection():
+    """The fallback must accept only the legacy SPELLING, not arbitrary edits."""
+    import hashlib
+    from fasten.chain import _FORM_1_EXCLUDED, _canonical_json
+
+    row = dataclasses.replace(_row(), canonical_form_id="1", prev_hash="genesis")
+    legacy = hashlib.sha256(_canonical_json(
+        {k: v for k, v in row.to_dict().items() if k not in _FORM_1_EXCLUDED}
+    )).hexdigest()
+    tampered = dataclasses.replace(row, hash=legacy, target="u/999")
+    assert not verify_chain([tampered]).ok
+
+
+def test_legacy_fallback_is_scoped_to_form_1():
+    """A form-"2" row must NOT get a second chance at matching."""
+    sealed = _seal2("genesis", _row())
+    broken = dataclasses.replace(sealed, target="u/999")
+    assert not verify_chain([broken]).ok
