@@ -107,6 +107,17 @@ class PostgresStore:
         # subsequently opens its own connection will see the table already present.
         conn = self._connect()
         with conn.cursor() as cur:
+            # Serialise bootstrap across PROCESSES. "IF NOT EXISTS" is not a
+            # concurrency primitive: N workers starting together each take an
+            # AccessExclusiveLock for CREATE TABLE / CREATE INDEX and deadlock
+            # against each other. Verified against a real server — 12 concurrent
+            # from_dsn() calls raised DeadlockDetected before this lock existed.
+            #
+            # Session-scoped (not xact) so it spans the whole DDL block, and
+            # released explicitly below. Keyed on the qualified table name so
+            # two different tables never block one another.
+            cur.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                        (f"fasten.bootstrap.{self._table}",))
             if self._schema:
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             cur.execute(_DDL.format(table=self._table))
@@ -116,6 +127,8 @@ class PostgresStore:
             for stmt in _MIGRATION_HASH_CHAIN.format(table=self._table).strip().split(";"):
                 if stmt.strip():
                     cur.execute(stmt)
+            cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                        (f"fasten.bootstrap.{self._table}",))
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -291,6 +304,26 @@ class PostgresStore:
         def _run(conn: Any) -> AuditRow:
             try:
                 with conn.cursor() as cur:
+                    # IDEMPOTENCE under retry. _execute_with_retry re-runs this
+                    # whole function when an ack is lost, but the first attempt
+                    # may well have COMMITTED. Re-running would allocate a fresh
+                    # seq, hit ON CONFLICT DO NOTHING on the id, and hand the
+                    # caller a sealed row that is not the one in the store.
+                    # Check first: if this id already landed, return what was
+                    # actually persisted.
+                    cur.execute(
+                        f"SELECT monotonic_seq, prev_hash, hash, canonical_form_id "
+                        f"FROM {self._table} WHERE id = %s",
+                        (row.id,),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        conn.commit()
+                        return dataclasses.replace(
+                            row, monotonic_seq=int(existing[0]),
+                            prev_hash=existing[1], hash=existing[2],
+                            canonical_form_id=existing[3],
+                        )
                     cur.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (row.source_node_id,),
