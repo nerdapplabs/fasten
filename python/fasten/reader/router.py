@@ -734,7 +734,13 @@ def router(
                 # custom store without count() get reachable=true and
                 # rows=null (good enough for the probe).
                 if hasattr(s, "count"):
-                    store_block["rows"] = s.count()
+                    # Scoped. An unscoped count() here reported the GLOBAL row
+                    # total to a tenant-scoped caller — the data half of the
+                    # leak that resolving the tenant only half-closed.
+                    store_block["rows"] = (
+                        s.count(tenant_id=tenant) if tenant is not None
+                        else s.count()
+                    )
                 store_block["reachable"] = True
             except Exception as e:  # noqa: BLE001
                 store_block["reachable"] = False
