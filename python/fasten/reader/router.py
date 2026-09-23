@@ -719,6 +719,12 @@ def router(
         # 401s when isolation is on and the scope is unresolved/blank.
         tenant = _resolve_tenant(request)
 
+        # #5: the engine sets this when a store lacks §2.1 allocation, so rows
+        # go in unsealed. verify_chain SKIPS hashless rows, so without surfacing
+        # it here doctor reports verified=true over a fully unchained table.
+        chain_unavailable = bool(
+            getattr(_default_engine, "_audit_chain_unavailable", False))
+
         s = _store()
         store_block: dict[str, Any] = {
             "kind": type(s).__name__ if s is not None else None,
@@ -783,6 +789,11 @@ def router(
             "verified": None,
             "breaks": None,
             "last_verified_at": None,
+            # #5: true when the store cannot chain (no §2.1 allocation), so
+            # rows are written unsealed. verify_chain SKIPS hashless rows, so
+            # "verified": true would otherwise be reported over a table that
+            # carries no tamper evidence at all.
+            "chain_unavailable": chain_unavailable,
         }
         if s is not None and hasattr(s, "query"):
             try:
@@ -795,8 +806,9 @@ def router(
                     recent.reverse()  # verify_chain requires oldest-first traversal
                     result = verify_chain(recent)
                     chain_block = {
-                        "verified": result.ok,
-                        "breaks": 0 if result.ok else 1,
+                        # An unchained store can never be "verified".
+                        "verified": (False if chain_unavailable else result.ok),
+                        "breaks": None if chain_unavailable else (0 if result.ok else 1),
                         "first_break_at": result.first_break_at,
                         "reason": result.reason,
                         "last_verified_at": canonical_now(),

@@ -516,7 +516,7 @@ class PostgresStore:
         if source_node_id:
             conds.append("source_node_id = %s")
             params.append(source_node_id)
-        if tenant_id:
+        if tenant_id is not None:
             conds.append("tenant_id = %s")
             params.append(tenant_id)
         if actor:

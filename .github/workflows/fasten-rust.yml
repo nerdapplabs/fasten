@@ -43,6 +43,13 @@ jobs:
       - name: Unit tests
         run: cargo test --quiet
 
+      # rust/Cargo.toml pulls fasten-core with default-features = false, so a
+      # `cargo test` in rust/ never compiles store/postgres.rs — tls_tests has
+      # never run. Test the core in its own directory with all features on.
+      - name: Test fasten-core (all features)
+        working-directory: fasten-core
+        run: cargo test --all-features --quiet
+
       - name: Install llvm-tools for coverage
         run: rustup component add llvm-tools-preview
 

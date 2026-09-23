@@ -77,6 +77,20 @@ class AuditRepository(Protocol):
         tenant_id: str | None = None,
     ) -> list[AuditRow]: ...
 
+    def search(
+        self,
+        *,
+        q: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+        tenant_id: str | None = None,
+    ) -> list[AuditRow]:
+        """Free-text search. Declared because the reader calls it when
+        search is enabled; an undeclared method meant every third-party store
+        either 500'd or silently degraded to "no Search method"."""
+        ...
+
     def count(
         self,
         *,
@@ -88,6 +102,10 @@ class AuditRepository(Protocol):
         target: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
+        # Declared because the reader passes it unconditionally
+        # (router.py /audit, /search, /audit/doctor). A store built
+        # to this Protocol without it raises TypeError per request.
+        tenant_id: str | None = None,
     ) -> int:
         """Total rows matching the same filter as query() — for pagination."""
         ...

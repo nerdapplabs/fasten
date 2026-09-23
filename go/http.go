@@ -172,7 +172,11 @@ func (e *Engine) resolveTenant(w http.ResponseWriter, r *http.Request) (string, 
 		return "", true
 	}
 	t, ok := e.tenantScope(r)
-	if !ok {
+	if !ok || t == "" {
+		// t == "" is a resolved-but-blank scope. Every downstream branch tests
+		// `tenant != ""` / `scope == ""` and treats blank as "no filter", so
+		// letting it through turns isolation into a full cross-tenant read —
+		// the same defect fixed on the Python side.
 		http.Error(w, "unauthenticated: tenant scope unresolved", http.StatusUnauthorized)
 		return "", false
 	}
@@ -197,9 +201,12 @@ func scopeSyslogRows(rows []SyslogRow, scope string) []SyslogRow {
 
 func scopeAPIRows(rows []APIRow, scope string) []APIRow {
 	if scope == "" {
+		if rows == nil {
+			return []APIRow{} // never marshal as null
+		}
 		return rows
 	}
-	out := rows[:0]
+	out := make([]APIRow, 0, len(rows))
 	for _, r := range rows {
 		if t, _ := r["tenant_id"].(string); t == scope {
 			out = append(out, r)
@@ -925,6 +932,15 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
+	// Scope like every other handler. Without this the endpoint 200s to a
+	// caller that /audit 401s, and leaks the global row count, the host
+	// tenant_id, a cross-tenant chain sample, and raw driver errors carrying
+	// DSN host/user.
+	tenant, ok := e.resolveTenant(w, r)
+	if !ok {
+		return
+	}
+	_ = tenant
 	store := e.auditStore
 	storeBlock := map[string]any{
 		"kind":           nil,
