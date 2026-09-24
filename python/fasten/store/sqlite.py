@@ -13,7 +13,7 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
@@ -437,6 +437,46 @@ class SQLiteStore:
             cur = conn.execute(sql, params)
             conn.commit()
             return cur.rowcount
+
+    def redact_expired(self, *, before: datetime, codes: "Sequence[str]") -> int:
+        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
+
+        This is what makes ``pii_in_detail`` mean something. Retention policy
+        differs by code — personal data may have to go at 30 days while
+        operational history is kept for a year — and ``purge()`` alone cannot
+        express that because it filters on age only.
+
+        DELETE would be wrong: it removes rows from the MIDDLE of the chain,
+        which ``verify_chain`` is built to detect as tampering. Under form "2"
+        the hash covers ``detail_commitment``, not ``detail``, so nulling
+        ``detail`` and its salt destroys the data while leaving ``hash``,
+        ``prev_hash`` and ``monotonic_seq`` untouched — the chain still
+        verifies, and the commitment still proves what the row originally said
+        to anyone holding the original.
+
+        Refuses form-"1" rows: their ``detail`` IS hashed, so redacting one
+        would change its hash and cascade a re-seal down the rest of the chain.
+
+        Returns the number of rows redacted.
+        """
+        if not codes:
+            return 0
+        placeholders = ",".join("?" for _ in codes)
+        with self._txn():
+            conn = self._connect()
+            cur = conn.execute(
+                # 'null' (the JSON literal), not SQL NULL: the detail column is
+                # NOT NULL, and dropping that constraint on SQLite needs a full
+                # table rebuild. json.loads('null') is Python None, so the row
+                # reads back with detail=None exactly as spec §1.4 requires,
+                # and the bytes are genuinely gone either way.
+                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
+                f"WHERE timestamp < ? AND code IN ({placeholders}) "
+                "AND canonical_form_id = '2' AND detail <> 'null'",
+                (_utc_iso(before), *codes),
+            )
+            conn.commit()
+            return int(cur.rowcount)
 
     def _build_where(
         self,

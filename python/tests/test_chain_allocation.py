@@ -156,3 +156,42 @@ def test_prev_hash_skips_unsealed_tip(store):
     third = store.allocate_and_insert_originated(_unsealed(2))
     assert third.monotonic_seq == 501, "seq ignored the unsealed row"
     assert third.prev_hash == first.hash, "chained from an unsealed row"
+
+
+def test_redact_expired_destroys_pii_and_keeps_the_chain(store):
+    """#90: the whole point — PII on a SHORT horizon, ops history on a LONG one,
+    without DELETE breaking the chain."""
+    import dataclasses
+    from datetime import timedelta
+    old = datetime.now(timezone.utc) - timedelta(days=40)
+
+    pii = store.allocate_and_insert_originated(dataclasses.replace(
+        _unsealed(1), code="USER_EXPORTED", timestamp=old,
+        detail={"email": "a@b.c"}))
+    ops = store.allocate_and_insert_originated(dataclasses.replace(
+        _unsealed(2), code="SERVICE_PINGED", timestamp=old, detail={"n": 1}))
+
+    n = store.redact_expired(
+        before=datetime.now(timezone.utc) - timedelta(days=30),
+        codes=["USER_EXPORTED"])
+    assert n == 1, "PII row was not redacted"
+
+    rows = {r.id: r for r in store.query(limit=10)}
+    assert rows[pii.id].detail is None, "PII survived"
+    assert rows[pii.id].detail_salt is None, "salt survived — digest still guessable"
+    assert rows[ops.id].detail == {"n": 1}, "operational history was destroyed too"
+    # hash/seq untouched, and the chain still walks
+    assert rows[pii.id].hash == pii.hash
+    assert verify_chain(list(rows.values())).ok
+
+
+def test_redact_expired_respects_the_cutoff(store):
+    import dataclasses
+    from datetime import timedelta
+    fresh = store.allocate_and_insert_originated(dataclasses.replace(
+        _unsealed(3), code="USER_EXPORTED",
+        timestamp=datetime.now(timezone.utc), detail={"email": "x@y.z"}))
+    assert store.redact_expired(
+        before=datetime.now(timezone.utc) - timedelta(days=30),
+        codes=["USER_EXPORTED"]) == 0
+    assert {r.id: r for r in store.query(limit=10)}[fresh.id].detail is not None
