@@ -188,9 +188,12 @@ func (e *Engine) resolveTenant(w http.ResponseWriter, r *http.Request) (string, 
 // not a lifted index column). scope="" is single-tenant mode.
 func scopeSyslogRows(rows []SyslogRow, scope string) []SyslogRow {
 	if scope == "" {
+		if rows == nil {
+			return []SyslogRow{} // never marshal as null
+		}
 		return rows
 	}
-	out := rows[:0]
+	out := make([]SyslogRow, 0, len(rows))
 	for _, r := range rows {
 		if t, _ := r["tenant_id"].(string); t == scope {
 			out = append(out, r)

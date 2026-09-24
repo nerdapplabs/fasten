@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
     canonical_form_id TEXT NOT NULL DEFAULT '1',
+    -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
+    -- can be destroyed for retention without moving the row hash. Nullable:
+    -- NULL on form-"1" rows, and NULL again once redacted.
+    detail_salt       TEXT,
+    detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT ''
 );
@@ -139,6 +144,14 @@ class SQLiteStore:
             bootstrap.execute(
                 f"ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1'"
             )
+
+        # P1-47 migration: form "2" commitment columns. Nullable with no default,
+        # so existing rows are untouched and their form-"1" hashes still verify.
+        for _col in ("detail_salt", "detail_commitment"):
+            try:
+                bootstrap.execute(f"SELECT {_col} FROM {table} LIMIT 0")
+            except Exception:
+                bootstrap.execute(f"ALTER TABLE {table} ADD COLUMN {_col} TEXT")
             bootstrap.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -206,8 +219,8 @@ class SQLiteStore:
             "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
             "service_id,source_node_id,tenant_id,actor,actor_kind,"
             "target,category,domain,method,request_id,detail,shipped_at,"
-            "canonical_form_id,prev_hash,hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "canonical_form_id,prev_hash,hash,detail_salt,detail_commitment) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row.id, row.origin_id, row.monotonic_seq,
                 _utc_iso(row.timestamp),
@@ -221,6 +234,8 @@ class SQLiteStore:
                 row.canonical_form_id,
                 row.prev_hash,
                 row.hash,
+                row.detail_salt,
+                row.detail_commitment,
             ),
         )
 
@@ -674,6 +689,9 @@ class SQLiteStore:
             detail=json.loads(r["detail"]),
             shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
+            detail_salt=r["detail_salt"] if "detail_salt" in keys else None,
+            detail_commitment=(
+                r["detail_commitment"] if "detail_commitment" in keys else None),
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",
         )

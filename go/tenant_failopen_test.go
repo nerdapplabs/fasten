@@ -55,3 +55,36 @@ func TestScopeAPIRows_NeverMarshalsNull(t *testing.T) {
 		})
 	}
 }
+
+// Same invariant as TestScopeAPIRows_NeverMarshalsNull. Written as a table over
+// BOTH helpers so a future scope*Rows can be added here rather than fixed one
+// at a time — scopeSyslogRows was missed precisely because the first test only
+// covered the half that had been fixed.
+func TestScopeRows_NeverMarshalsNull(t *testing.T) {
+	for _, scope := range []string{"", "tenant-a"} {
+		t.Run("syslog/nil/scope="+scope, func(t *testing.T) {
+			b, err := json.Marshal(scopeSyslogRows(nil, scope))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) == "null" {
+				t.Fatal("scopeSyslogRows marshalled as null, want []")
+			}
+		})
+		t.Run("api/nil/scope="+scope, func(t *testing.T) {
+			b, err := json.Marshal(scopeAPIRows(nil, scope))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) == "null" {
+				t.Fatal("scopeAPIRows marshalled as null, want []")
+			}
+		})
+	}
+	t.Run("syslog/no-match-scoped", func(t *testing.T) {
+		b, _ := json.Marshal(scopeSyslogRows([]SyslogRow{{"tenant_id": "other"}}, "tenant-a"))
+		if string(b) == "null" {
+			t.Fatal("scoped no-match marshalled as null, want []")
+		}
+	})
+}

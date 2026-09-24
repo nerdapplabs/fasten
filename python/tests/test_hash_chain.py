@@ -41,9 +41,10 @@ def test_hash_excludes_hash_field(initialized):
     # offset, NOT the always-"Z" wire form that to_dict() stamps via
     # canonical_ts (spec §4.3). Recomputing with the wire form here is what
     # previously let Python drift away from the Go cross-language vector.
-    from fasten.chain import _FORM_1_EXCLUDED, _to_hashed_form
-    d = _to_hashed_form(
-        {k: v for k, v in row.to_dict().items() if k not in _FORM_1_EXCLUDED})
+    # Emitted rows are form "2" now, which hashes detail_commitment in place of
+    # detail and uses the wire timestamp verbatim (no _to_hashed_form).
+    from fasten.chain import _FORM_2_EXCLUDED
+    d = {k: v for k, v in row.to_dict().items() if k not in _FORM_2_EXCLUDED}
     expected = hashlib.sha256(
         json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
     ).hexdigest()
