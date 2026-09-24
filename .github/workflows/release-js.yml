@@ -24,7 +24,7 @@ jobs:
         working-directory: js
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Configure npm registry
         run: |
