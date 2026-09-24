@@ -88,3 +88,47 @@ func TestScopeRows_NeverMarshalsNull(t *testing.T) {
 		}
 	})
 }
+
+// Reader options must NOT mutate the shared Engine. fasten.NewReader() targets
+// the package-level Default, so applying options to the engine meant a second
+// reader silently re-scoped the first and two policies on one engine were
+// impossible.
+func TestNewReader_OptionsDoNotMutateTheEngine(t *testing.T) {
+	e := &Engine{}
+	_ = e.NewReader(WithTenantScope(
+		func(*http.Request) (string, bool) { return "tenant-a", true }))
+
+	if e.tenantScope != nil {
+		t.Fatal("NewReader mutated the engine's tenantScope")
+	}
+	if e.enforceTenantIsolation {
+		t.Fatal("NewReader mutated enforceTenantIsolation")
+	}
+}
+
+func TestNewReader_TwoReadersKeepSeparateScopes(t *testing.T) {
+	e := &Engine{}
+
+	// Reader A resolves a real tenant. Reader B resolves BLANK, which must 401
+	// under enforcement. If options still mutated the shared engine, whichever
+	// reader was constructed last would decide for both.
+	a := e.NewReader(
+		EnforceTenantIsolation(),
+		WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	b := e.NewReader(
+		EnforceTenantIsolation(),
+		WithTenantScope(func(*http.Request) (string, bool) { return "", true }))
+
+	status := func(h http.Handler) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/topology", nil))
+		return rec.Code
+	}
+
+	if got := status(b); got != http.StatusUnauthorized {
+		t.Fatalf("reader B (blank scope) = %d, want 401", got)
+	}
+	if got := status(a); got == http.StatusUnauthorized {
+		t.Fatal("reader A was 401'd — reader B's scope leaked onto it")
+	}
+}

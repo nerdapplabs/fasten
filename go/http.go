@@ -122,10 +122,20 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 // for single-tenant deployments, unsafe on any shared-store multi-
 // tenant fleet.
 func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
+	// Options are collected into a SCRATCH Engine, never applied to e.
+	// Applying them to e mutated shared state: fasten.NewReader() targets the
+	// package-level Default, so a second reader silently re-scoped the first
+	// and two policies on one engine were impossible. The scratch value exists
+	// only to keep ReaderOption's public signature (func(*Engine)) intact.
+	scratch := &Engine{}
 	for _, opt := range opts {
-		opt(e)
+		opt(scratch)
 	}
-	if e.enforceTenantIsolation && e.tenantScope == nil {
+	rc := readerConfig{
+		tenantScope:            scratch.tenantScope,
+		enforceTenantIsolation: scratch.enforceTenantIsolation,
+	}
+	if rc.enforceTenantIsolation && rc.tenantScope == nil {
 		panic("fasten.NewReader(EnforceTenantIsolation()) requires WithTenantScope(fn) — " +
 			"wire (r) -> (tenant, ok) from your auth layer, or drop " +
 			"EnforceTenantIsolation() for a single-tenant deployment (see P1-44).")
@@ -138,7 +148,36 @@ func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
 	mux.HandleFunc("GET /topology", e.handleTopology)
 	mux.HandleFunc("GET /audit/doctor", e.handleAuditDoctor)
 	mux.HandleFunc("GET /audit", e.handleAudit)
-	return mux
+
+	// Carry this reader's config on the request, so handlers stay *Engine
+	// methods and resolveTenant reads per-reader scope instead of engine state.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(
+			context.WithValue(r.Context(), readerConfigKey{}, rc)))
+	})
+}
+
+// readerConfig is the per-reader scope policy. It lives on the request rather
+// than on the Engine so two readers over one engine can hold different
+// policies.
+type readerConfig struct {
+	tenantScope            func(*http.Request) (string, bool)
+	enforceTenantIsolation bool
+}
+
+type readerConfigKey struct{}
+
+// readerConfigFrom returns the config for the reader handling r, falling back
+// to the engine fields for callers that invoke handlers outside NewReader
+// (tests, and any adopter wiring handlers directly).
+func (e *Engine) readerConfigFrom(r *http.Request) readerConfig {
+	if rc, ok := r.Context().Value(readerConfigKey{}).(readerConfig); ok {
+		return rc
+	}
+	return readerConfig{
+		tenantScope:            e.tenantScope,
+		enforceTenantIsolation: e.enforceTenantIsolation,
+	}
 }
 
 // NewReader is a package-level shorthand for Default.NewReader().
@@ -168,10 +207,11 @@ func EnforceTenantIsolation() ReaderOption {
 //   - ("", false, wroteResponse)  when the hook returns ok=false; caller
 //     must return immediately (401 already written)
 func (e *Engine) resolveTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
-	if e.tenantScope == nil {
+	rc := e.readerConfigFrom(r)
+	if rc.tenantScope == nil {
 		return "", true
 	}
-	t, ok := e.tenantScope(r)
+	t, ok := rc.tenantScope(r)
 	if !ok || t == "" {
 		// t == "" is a resolved-but-blank scope. Every downstream branch tests
 		// `tenant != ""` / `scope == ""` and treats blank as "no filter", so
