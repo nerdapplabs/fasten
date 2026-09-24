@@ -66,6 +66,18 @@ pub enum Error {
     #[error("no drainer installed; call fasten_drainer_install first")]
     DrainerNotInstalled,
 
+    /// The DSN requested TLS (`sslmode=require|verify-*`) but this binary
+    /// was built without the `postgres-tls` feature — fail loud rather
+    /// than silently downgrade to plaintext (P1-43).
+    #[error("{0}")]
+    TlsUnavailable(String),
+
+    /// Building the TLS connector itself failed (system CA store missing,
+    /// bad protocol setting, etc.). Rare, distinct from
+    /// `TlsUnavailable` so it doesn't get misread as a config error.
+    #[error("tls connector build failed: {0}")]
+    TlsConnector(String),
+
     /// A host-language insert callback (installed via
     /// `fasten_store_open_callback`) returned a non-zero rc. The actual
     /// exception lives on the host side; this variant carries only the
@@ -116,6 +128,8 @@ impl From<&Error> for FastenErrorCode {
             Error::DuplicateCode(_)    => FastenErrorCode::ErrDuplicateCode,
             Error::DrainerNotInstalled => FastenErrorCode::ErrNullArg,
             Error::CallbackFailed(_)   => FastenErrorCode::ErrBackend,
+            Error::TlsUnavailable(_)   => FastenErrorCode::ErrBackend,
+            Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

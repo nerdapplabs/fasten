@@ -9,12 +9,13 @@ Install the optional dep:  pip install "fasten[postgres]"
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
@@ -106,6 +107,17 @@ class PostgresStore:
         # subsequently opens its own connection will see the table already present.
         conn = self._connect()
         with conn.cursor() as cur:
+            # Serialise bootstrap across PROCESSES. "IF NOT EXISTS" is not a
+            # concurrency primitive: N workers starting together each take an
+            # AccessExclusiveLock for CREATE TABLE / CREATE INDEX and deadlock
+            # against each other. Verified against a real server — 12 concurrent
+            # from_dsn() calls raised DeadlockDetected before this lock existed.
+            #
+            # Session-scoped (not xact) so it spans the whole DDL block, and
+            # released explicitly below. Keyed on the qualified table name so
+            # two different tables never block one another.
+            cur.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                        (f"fasten.bootstrap.{self._table}",))
             if self._schema:
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
             cur.execute(_DDL.format(table=self._table))
@@ -115,6 +127,8 @@ class PostgresStore:
             for stmt in _MIGRATION_HASH_CHAIN.format(table=self._table).strip().split(";"):
                 if stmt.strip():
                     cur.execute(stmt)
+            cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                        (f"fasten.bootstrap.{self._table}",))
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -262,6 +276,85 @@ class PostgresStore:
                 "use insert_replicated for rows from another origin"
             )
         self._insert_row(row)
+
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+
+        One node, one chain: ``monotonic_seq`` is unique within a
+        ``source_node_id``. Allocating in engine memory is non-conformant — two
+        engine instances on one node each mint from 1 and produce two rows at
+        seq 1, which ``verify_chain`` reports as a duplicate allocation.
+
+        Serialisation uses ``pg_advisory_xact_lock`` keyed on the node, NOT
+        ``SELECT … FOR UPDATE`` on the tip row: with an empty table there is no
+        tip row to lock, so FOR UPDATE would let every concurrent writer through
+        to allocate seq 1. The advisory lock is transaction-scoped and released
+        on commit or rollback.
+
+        Returns the SEALED row actually written.
+        """
+        from ..chain import seal
+
+        if row.origin_id != row.id:
+            raise ValueError(
+                "allocate_and_insert_originated requires origin_id == id "
+                f"(got origin_id={row.origin_id!r}, id={row.id!r})"
+            )
+
+        def _run(conn: Any) -> AuditRow:
+            try:
+                with conn.cursor() as cur:
+                    # IDEMPOTENCE under retry. _execute_with_retry re-runs this
+                    # whole function when an ack is lost, but the first attempt
+                    # may well have COMMITTED. Re-running would allocate a fresh
+                    # seq, hit ON CONFLICT DO NOTHING on the id, and hand the
+                    # caller a sealed row that is not the one in the store.
+                    # Check first: if this id already landed, return what was
+                    # actually persisted.
+                    cur.execute(
+                        f"SELECT monotonic_seq, prev_hash, hash, canonical_form_id "
+                        f"FROM {self._table} WHERE id = %s",
+                        (row.id,),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        conn.commit()
+                        return dataclasses.replace(
+                            row, monotonic_seq=int(existing[0]),
+                            prev_hash=existing[1], hash=existing[2],
+                            canonical_form_id=existing[3],
+                        )
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (row.source_node_id,),
+                    )
+                    # See the SQLite implementation: seq must span ALL rows on
+                    # the node (an unsealed row still holds its number), while
+                    # prev_hash may only chain from a sealed one.
+                    cur.execute(
+                        f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
+                        "WHERE source_node_id = %s",
+                        (row.source_node_id,),
+                    )
+                    next_seq = int(cur.fetchone()[0]) + 1
+                    cur.execute(
+                        f"SELECT hash FROM {self._table} "
+                        "WHERE source_node_id = %s AND hash <> '' "
+                        "ORDER BY monotonic_seq DESC LIMIT 1",
+                        (row.source_node_id,),
+                    )
+                    tip = cur.fetchone()
+                    prev_hash = tip[0] if tip else "genesis"
+                    sealed = seal(prev_hash, dataclasses.replace(
+                        row, monotonic_seq=next_seq))
+                    self._insert_row_core(cur, sealed)
+                conn.commit()
+                return sealed
+            except BaseException:
+                conn.rollback()
+                raise
+
+        return cast(AuditRow, self._execute_with_retry(_run))
 
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a row replicated from another origin. ingest_replicated path;
@@ -423,7 +516,7 @@ class PostgresStore:
         if source_node_id:
             conds.append("source_node_id = %s")
             params.append(source_node_id)
-        if tenant_id:
+        if tenant_id is not None:
             conds.append("tenant_id = %s")
             params.append(tenant_id)
         if actor:
@@ -519,19 +612,26 @@ class PostgresStore:
         since: str,
         until: str | None = None,
         limit: int = 50,
+        tenant_id: str | None = None,
     ) -> list[AuditRow]:
         """FR3 free-text search over persisted audit history (§4.1). Case-
         insensitive substring scan over the ``detail`` JSON column via
         ILIKE + ESCAPE E'\\\\'. Result carries request_id for ``/correlate``.
 
         ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally.
-        Newest-first, hard-capped by ``limit``, no ranking."""
+        Newest-first, hard-capped by ``limit``, no ranking.
+
+        ``tenant_id`` scopes the search to one tenant when supplied — see
+        SQLiteStore.search for the P1-44 reasoning."""
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["timestamp >= %s", "detail::text ILIKE %s ESCAPE E'\\\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:
             conds.append("timestamp <= %s")
             params.append(until)
+        if tenant_id is not None:
+            conds.append("tenant_id = %s")
+            params.append(tenant_id)
         params.append(limit)
         sql = (
             f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "

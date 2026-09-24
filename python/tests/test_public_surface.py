@@ -57,7 +57,7 @@ def test_router_lazy_fetches_store_from_globals(initialized, mem_store):
     fasten.emit(code="USER_CREATED", target="u-99", actor="bob")
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     client = TestClient(app)
 
     resp = client.get("/api/v1/logs/audit?limit=10")
@@ -93,7 +93,7 @@ def test_audit_filter_by_actor(initialized):
     fasten.emit(code="USER_CREATED", target="u-3", actor="alice")
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     client = TestClient(app)
 
     resp = client.get("/api/v1/logs/audit?actor=alice")
@@ -112,7 +112,7 @@ def test_audit_filter_by_target(initialized):
     fasten.emit(code="USER_CREATED", target="u-9", actor="y")
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     client = TestClient(app)
 
     resp = client.get("/api/v1/logs/audit?target=u-7")
@@ -131,7 +131,7 @@ def test_audit_pagination_offset_and_total(initialized):
         fasten.emit(code="USER_CREATED", target=f"u-{i}", actor="alice")
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     client = TestClient(app)
 
     page1 = client.get("/api/v1/logs/audit?limit=3&offset=0").json()

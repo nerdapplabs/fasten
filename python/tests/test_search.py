@@ -19,6 +19,7 @@ def _client(**router_kwargs):
     from fasten.reader.router import router as build_router
 
     app = FastAPI()
+    router_kwargs.setdefault("dependencies", [])
     app.include_router(build_router(**router_kwargs), prefix="/api/v1/logs")
     return TestClient(app)
 

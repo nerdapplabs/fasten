@@ -18,11 +18,56 @@ Two-pass algorithm (canonical implementation in fasten-core/src/redact.rs):
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Callable, Optional
 
 from . import core_ffi
 from .codes import _REDACT_PATTERNS, _REDACT_REPLACEMENT
+
+# P1-46 caps — per-row byte ceiling read once at import.
+# 64 KiB is enough for the largest legitimate structured audit rows
+# we've measured and small enough that 2000 ring slots stay < 128 MiB.
+# Override with FASTEN_MAX_DETAIL_BYTES (integer bytes).
+_MAX_DETAIL_BYTES_DEFAULT = 64 * 1024
+
+
+def _max_detail_bytes() -> int:
+    raw = os.environ.get("FASTEN_MAX_DETAIL_BYTES", "").strip()
+    if not raw:
+        return _MAX_DETAIL_BYTES_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _MAX_DETAIL_BYTES_DEFAULT
+    return n if n > 0 else _MAX_DETAIL_BYTES_DEFAULT
+
+def _truncated_marker(value: Any, size: int, cap: int) -> Any:
+    """Fail-closed replacement for an oversize payload — never returns the
+    original bytes. Preserves the top-level shape (dict → dict, else scalar)
+    so downstream consumers do not have to special-case type."""
+    marker = {
+        "_truncated": True,
+        "_truncated_bytes": size,
+        "_max_detail_bytes": cap,
+        "_summary": f"<truncated {size} bytes; cap {cap}>",
+    }
+    if isinstance(value, dict):
+        return marker
+    return marker["_summary"]
+
+
+def _unredactable_marker(value: Any) -> Any:
+    """Fail-closed replacement for a redact-core failure (deep nesting, invalid
+    utf, etc.). Same rule as truncation: never return the original bytes."""
+    marker = {
+        "_redact_failed": True,
+        "_summary": "<unredactable>",
+    }
+    if isinstance(value, dict):
+        return marker
+    return marker["_summary"]
+
 
 # Structlog internals that are never redacted regardless of key name.
 _STRUCTLOG_SKIP = frozenset({
@@ -102,7 +147,17 @@ class Redactor:
         )
 
     def redact(self, value: Any) -> Any:
-        """Deep-redact a value (dict / list / scalar) via the Rust core."""
+        """Deep-redact a value (dict / list / scalar) via the Rust core.
+
+        P1-46: guarded by a byte cap (FASTEN_MAX_DETAIL_BYTES, default 64 KiB) —
+        oversize inputs are replaced with a truncation marker BEFORE the Rust
+        call so an attacker-controlled 50 MB string can't fill the ring, and
+        Rust core failures (e.g. serde_json's 128-depth recursion limit) are
+        caught and turned into an ``<unredactable>`` marker rather than
+        propagating out of ``emit()``. In both defensive paths we must NOT
+        return the original value — it may still contain PII we failed to
+        scrub.
+        """
         # For dicts with non-string keys, json.dumps would fail; use the Python fallback.
         if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
             return self._redact_native(value)
@@ -110,7 +165,14 @@ class Redactor:
             in_json = json.dumps(value)
         except (TypeError, ValueError):
             return self._redact_native(value)
-        return json.loads(self._fast_redact_json(in_json))
+        cap = _max_detail_bytes()
+        raw_bytes = len(in_json.encode("utf-8", errors="replace"))
+        if raw_bytes > cap:
+            return _truncated_marker(value, raw_bytes, cap)
+        try:
+            return json.loads(self._fast_redact_json(in_json))
+        except Exception:  # noqa: BLE001 — deep nesting, invalid utf, or core failure
+            return _unredactable_marker(value)
 
     def as_structlog_processor(self) -> Callable[..., Any]:
         """Return a structlog processor that redacts sensitive keys from event_dict.

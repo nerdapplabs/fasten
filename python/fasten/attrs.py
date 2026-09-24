@@ -71,7 +71,11 @@ class AuditRow:
     request_id: str = ""
 
     # payload
-    detail: dict[str, Any] = field(default_factory=dict)
+    # Optional because redaction sets it to null (spec §1.4/§7.1):
+    # under canonical form "2" the hash covers detail_commitment,
+    # not detail, so the payload can be destroyed for retention
+    # without moving the row hash.
+    detail: Optional[dict[str, Any]] = field(default_factory=dict)
 
     # wire schema version — readers MUST tolerate higher values on best-effort
     wire_version: str = "1"
@@ -91,6 +95,13 @@ class AuditRow:
     # hash:      hex sha256 of canonical JSON of this row (all fields except `hash` itself).
     prev_hash: str = "genesis"
     hash: str = ""
+
+    # spec §1.4 (form "2"): detail is committed to, not hashed directly, so it
+    # can be destroyed for retention without moving the row hash. Both fields
+    # are STORED but NOT hashed — detail_commitment is what enters the hash.
+    # Set to None on a redacted row; None on form-"1" rows, which predate them.
+    detail_salt: Optional[str] = None
+    detail_commitment: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.code:
@@ -120,7 +131,8 @@ class AuditRow:
             "type": self.code,
             "time": canonical_ts(self.timestamp),
             "data": {
-                **self.detail,
+                # `or {}` — detail is None on a redacted row (spec §7.1).
+                **(self.detail or {}),
                 "actor": self.actor,
                 "actor_kind": self.actor_kind,
                 "target": self.target,

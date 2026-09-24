@@ -49,11 +49,21 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # with all PG versions ≥ 7.4, including PG 17.
 pg = { package = "postgres", version = "0.19", optional = true }
 
+# TLS support for the Postgres connector. Pulled in by the
+# `postgres-tls` feature (ON by default whenever `postgres` is on) so
+# that a DSN with `sslmode=require` actually negotiates TLS — the
+# earlier default of unconditional NoTls silently downgraded to
+# plaintext even when the DSN asked for TLS (P1-43).
+native-tls           = { version = "0.2", optional = true }
+postgres-native-tls  = { version = "0.5", optional = true }
+
 [features]
-default  = ["sqlite"]
-sqlite   = ["dep:rusqlite"]
-postgres = ["dep:pg"]
-all      = ["sqlite", "postgres"]
+default       = ["sqlite", "postgres", "postgres-tls"]
+sqlite        = ["dep:rusqlite"]
+postgres      = ["dep:pg"]
+postgres-tls  = ["postgres", "dep:native-tls", "dep:postgres-native-tls"]
+# `all` kept for existing build scripts; now implies TLS too.
+all           = ["sqlite", "postgres", "postgres-tls"]
 
 [dev-dependencies]
 # No additional dev deps — unit tests use only std + the crate's own types.
