@@ -485,7 +485,8 @@ class PostgresStore:
             reason=reason or None,
         )
 
-    def redact_expired(self, *, before: datetime, codes: "Sequence[str]") -> int:
+    def redact_expired(self, *, before: datetime,
+                       codes: "Sequence[str]") -> "list[str]":
         """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
 
         See the SQLite implementation for the rationale. In short: DELETE would
@@ -499,25 +500,28 @@ class PostgresStore:
         it back into Python ``None``, so the row reads exactly as spec §7.1
         requires and the bytes are gone either way.
 
-        Returns the number of rows redacted.
+        Returns the ids of the rows redacted, so the caller can emit one
+        AUDIT_ROW_REDACTED event per row (spec §7.2) — without that, an
+        honest erasure and a quiet redaction are indistinguishable.
         """
         if not codes:
-            return 0
+            return []
 
-        def _run(conn: Any) -> int:
+        def _run(conn: Any) -> "list[str]":
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {self._table} "
                     "SET detail = 'null', detail_salt = NULL "
                     "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id = '2' AND detail <> 'null'",
+                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "RETURNING id",
                     (_utc_iso(before), list(codes)),
                 )
-                n = cur.rowcount
+                ids = [r[0] for r in cur.fetchall()]
             conn.commit()
-            return int(n)
+            return ids
 
-        return cast(int, self._execute_with_retry(_run))
+        return cast("list[str]", self._execute_with_retry(_run))
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"

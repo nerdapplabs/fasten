@@ -121,10 +121,10 @@ def test_redact_expired_destroys_pii_keeps_ops_and_chain(store):
     ops = store.allocate_and_insert_originated(dataclasses.replace(
         _row(22), code="SERVICE_PINGED", timestamp=old, detail={"n": 1}))
 
-    n = store.redact_expired(
+    redacted = store.redact_expired(
         before=datetime.now(timezone.utc) - timedelta(days=30),
         codes=["USER_EXPORTED"])
-    assert n == 1
+    assert redacted == [pii.id]
 
     rows = {r.id: r for r in store.query(limit=50)}
     assert rows[pii.id].detail is None
@@ -142,7 +142,7 @@ def test_redact_expired_respects_cutoff_and_codes(store):
         timestamp=datetime.now(timezone.utc), detail={"email": "x@y.z"}))
     assert store.redact_expired(
         before=datetime.now(timezone.utc) - timedelta(days=30),
-        codes=["USER_EXPORTED"]) == 0
+        codes=["USER_EXPORTED"]) == []
     assert store.redact_expired(before=datetime(2099, 1, 1, tzinfo=timezone.utc),
-                                codes=[]) == 0
+                                codes=[]) == []
     assert {r.id: r for r in store.query(limit=50)}[fresh.id].detail is not None

@@ -736,6 +736,64 @@ class Engine:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
+    # spec §7.2: fasten's own code for the redaction event. Registered lazily on
+    # first use so adopters who never redact don't carry it in their catalog.
+    _REDACTION_DOMAIN = "fasten"
+    _REDACTION_CODE = "AUDIT_ROW_REDACTED"
+
+    def _ensure_redaction_code(self) -> None:
+        from .codes import Meta, RetentionClass, Severity, meta_of, register
+        # Check the RETURN VALUE. meta_of() yields None for an unknown code
+        # rather than raising, so `try: meta_of(); return` skipped registration
+        # every time and emit() then failed with "unknown audit code".
+        try:
+            if meta_of(self._REDACTION_CODE) is not None:
+                return
+        except Exception:
+            pass
+        register(self._REDACTION_DOMAIN, {self._REDACTION_CODE: Meta(
+            domain=self._REDACTION_DOMAIN, category="retention", action="redact",
+            severity=Severity.WARN if hasattr(Severity, "WARN") else list(Severity)[0],
+            description="Audit row detail destroyed under a retention policy",
+            emitter="fasten",
+            retention_class=RetentionClass.LONG,
+        )})
+
+    def redact_expired(
+        self,
+        *,
+        before: datetime,
+        codes: "list[str]",
+        reason: str = "retention",
+    ) -> list[str]:
+        """Destroy ``detail`` on expired rows AND record that it happened.
+
+        The store redaction alone leaves an honest erasure and a quiet
+        redaction indistinguishable — both yield a row whose detail is null.
+        Spec §7.2 requires the destruction itself be an originated, chained
+        row, so a verifier can see the suffix was altered *because of a
+        recorded policy action*.
+
+        Returns the ids of the rows redacted.
+        """
+        store = self._audit_store
+        if store is None or not hasattr(store, "redact_expired"):
+            raise AuditStoreError(
+                "fasten.redact_expired: the audit store does not implement "
+                "redact_expired (spec §7.1)"
+            )
+        redacted = list(store.redact_expired(before=before, codes=codes))
+        if not redacted:
+            return []
+        self._ensure_redaction_code()
+        for row_id in redacted:
+            self.emit(
+                code=self._REDACTION_CODE,
+                target=row_id,
+                detail={"reason": reason, "redacted_id": row_id},
+            )
+        return redacted
+
     def _allocate_and_store(self, row: AuditRow) -> AuditRow:
         """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
 

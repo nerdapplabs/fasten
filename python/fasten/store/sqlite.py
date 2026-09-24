@@ -438,7 +438,8 @@ class SQLiteStore:
             conn.commit()
             return cur.rowcount
 
-    def redact_expired(self, *, before: datetime, codes: "Sequence[str]") -> int:
+    def redact_expired(self, *, before: datetime,
+                       codes: "Sequence[str]") -> "list[str]":
         """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
 
         This is what makes ``pii_in_detail`` mean something. Retention policy
@@ -457,10 +458,12 @@ class SQLiteStore:
         Refuses form-"1" rows: their ``detail`` IS hashed, so redacting one
         would change its hash and cascade a re-seal down the rest of the chain.
 
-        Returns the number of rows redacted.
+        Returns the ids of the rows redacted, so the caller can emit one
+        AUDIT_ROW_REDACTED event per row (spec §7.2) — without that, an
+        honest erasure and a quiet redaction are indistinguishable.
         """
         if not codes:
-            return 0
+            return []
         placeholders = ",".join("?" for _ in codes)
         with self._txn():
             conn = self._connect()
@@ -472,11 +475,13 @@ class SQLiteStore:
                 # and the bytes are genuinely gone either way.
                 f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
                 f"WHERE timestamp < ? AND code IN ({placeholders}) "
-                "AND canonical_form_id = '2' AND detail <> 'null'",
+                "AND canonical_form_id = '2' AND detail <> 'null' "
+                "RETURNING id",
                 (_utc_iso(before), *codes),
             )
+            ids = [r[0] for r in cur.fetchall()]
             conn.commit()
-            return int(cur.rowcount)
+            return ids
 
     def _build_where(
         self,
