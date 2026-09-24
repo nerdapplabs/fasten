@@ -81,7 +81,7 @@ func TestStartPurger_RunsImmediatelyAndUsesNowMinusRetention(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startPurger(ctx, retentionParams{
+	startPurger(ctx, nil, retentionParams{
 		stream: "api", store: f, retention: 7 * 24 * time.Hour,
 		checkInterval: 100 * time.Millisecond,
 		nowFn:         func() time.Time { return fixed },
@@ -108,7 +108,7 @@ func TestStartPurger_KeepsRunningAfterError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startPurger(ctx, retentionParams{
+	startPurger(ctx, nil, retentionParams{
 		stream: "sys", store: fail, retention: time.Hour,
 		checkInterval: 50 * time.Millisecond,
 		onError:       func(string, error) { errCount.Add(1) },

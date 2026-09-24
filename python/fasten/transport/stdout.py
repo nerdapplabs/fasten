@@ -21,6 +21,7 @@ import sys
 from typing import Any
 
 from ..context import is_sentinel, mint_sentinel
+from ..redact import Redactor
 from ..store.ring import RingBuffer
 from ..store.stream import StreamStore
 
@@ -33,6 +34,11 @@ class StdoutTransport:
     stream are served from the store so they reach durable history instead of
     a bounded window. Without a store the stream is ring-only — today's
     backward-compatible behaviour.
+
+    Every push (sys, api, drainer sys) runs through the engine redactor
+    before it lands in the ring, the store, and stdout/stderr. An
+    "audit + correlation SDK" that leaked PII on any stream would be a
+    broken promise — the redactor is applied uniformly, not per-stream.
     """
 
     def __init__(
@@ -43,12 +49,17 @@ class StdoutTransport:
         syslog_store: StreamStore | None = None,
         service_id: str = "",
         boot_request_id: str | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._syslog = RingBuffer(maxlen=maxlen)
         self._api = RingBuffer(maxlen=maxlen)
         self._api_store = api_store
         self._syslog_store = syslog_store
         self._service_id = service_id
+        # A default Redactor covers pre-init use (fasten.log.* before init)
+        # and adopter code that constructs its own StdoutTransport; the
+        # engine hands its own configured Redactor at init.
+        self._redactor = redactor if redactor is not None else Redactor()
         # Sentinel invariant: rows written before the first real request belong
         # to one stable boot window; context-less rows after that are orphans.
         # _boot_over needs no lock (unlike Go's bootMu): the GIL makes the
@@ -65,14 +76,28 @@ class StdoutTransport:
         failure is recorded on the store, which degrades the stream's
         completeness flag to ``store-degraded``: reads for a store-backed
         stream never consult the ring, so without that the flag would assert
-        durability for rows that were silently lost."""
+        durability for rows that were silently lost.
+
+        The stderr line reports the error type only — a Postgres INSERT
+        failure message can carry the offending row value (e.g.
+        NotNullViolation cites the column), and stderr is not redacted, so
+        the raw ``str(exc)`` would leak PII. Operators debug the schema
+        mismatch via the (redacted) drainer_sys stream, not stderr."""
         if store is None:
             return
         try:
             store.insert(row)
         except Exception as exc:  # noqa: BLE001 — best-effort durability
             store.note_write_failure()
-            sys.stderr.write(f"fasten: {stream} persist failed: {exc}\n")
+            sys.stderr.write(f"fasten: {stream} persist failed: {type(exc).__name__}\n")
+
+    def _redact(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Return a redacted shallow copy of ``row`` for the sys/api streams.
+        The audit path has its own redaction inside engine.emit; this
+        method is what protects the two non-audit surfaces (both direct
+        push and shim-mediated push) and every downstream sink — stdout,
+        stderr, ring, persistent store — sees the redacted form."""
+        return self._redactor.redact(row)
 
     def _stream_store(self, stream: str) -> StreamStore | None:
         if stream == "api":
@@ -108,16 +133,18 @@ class StdoutTransport:
     # ── syslog ──────────────────────────────────────────────────────────────
 
     def write_syslog(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer (+ persist if configured)."""
+        """Write to stdout AND buffer (+ persist if configured). Redacted."""
         self._stamp_request_id(row)
+        row = self._redact(row)
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
         sys.stdout.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stdout.flush()
 
     def push_syslog(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout (+ persist if configured)."""
+        """Buffer only — no stdout (+ persist if configured). Redacted."""
         self._stamp_request_id(row)
+        row = self._redact(row)
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
 
@@ -142,6 +169,7 @@ class StdoutTransport:
         stdout-backpressure deadlock above.
         """
         self._stamp_request_id(row)
+        row = self._redact(row)
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
@@ -196,16 +224,18 @@ class StdoutTransport:
     # ── api log ─────────────────────────────────────────────────────────────
 
     def write_api(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer (+ persist if configured)."""
+        """Write to stdout AND buffer (+ persist if configured). Redacted."""
         self._stamp_request_id(row)
+        row = self._redact(row)
         self._api.push(row)
         self._persist(self._api_store, row, "api")
         sys.stdout.write(json.dumps({"shape": "api", **row}, default=str) + "\n")
         sys.stdout.flush()
 
     def push_api(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout (+ persist if configured)."""
+        """Buffer only — no stdout (+ persist if configured). Redacted."""
         self._stamp_request_id(row)
+        row = self._redact(row)
         self._api.push(row)
         self._persist(self._api_store, row, "api")
 

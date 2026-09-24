@@ -158,8 +158,6 @@ class Engine:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._seq: int = 0
-        self._prev_hash: str = "genesis"  # P1-23: hash chain
         self._boot_request_id: Optional[str] = None  # sentinel boot-window id
 
         self._service_id: str = ""
@@ -174,6 +172,13 @@ class Engine:
         self._search_enabled: bool = False
         self._stdlib_logger = logging.getLogger("fasten")
 
+        # spec §2.1: fasten-core does not yet allocate monotonic_seq/prev_hash
+        # in the store transaction, so audit rows bypass the FFI drainer. Flip
+        # to True when core lands §2.1.
+        self._unchained_store_logged: bool = False
+        self._audit_chain_unavailable: bool = False
+        self._drainer_allocates: bool = False
+        self._drainer_bypass_logged: bool = False
         self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
         self._drainer_callback: Any = None        # keep ctypes callback alive (GC guard)
         self._drainer_lock = threading.Lock()
@@ -372,28 +377,11 @@ class Engine:
         # previous store's history doesn't apply to this one.
         self._audit_write_swallowed = False
 
-        if self._audit_store is not None and hasattr(self._audit_store, "max_monotonic_seq"):
-            # Seed seq from THIS engine's own (service_id, source_node_id)
-            # sub-chain only — never the global MAX. monotonic_seq is a
-            # per-node counter; seeding from a foreign origin's rows (which
-            # this node may have ingested via ingest_replicated) would break
-            # this node's own tamper chain.
-            with self._lock:
-                self._seq = self._audit_store.max_monotonic_seq(
-                    service_id=cfg.service_id,
-                    source_node_id=cfg.node_id,
-                )
-            # Seed prev_hash for the hash chain from the latest stored row of
-            # THIS node's own sub-chain.
-            try:
-                latest = self._audit_store.query(
-                    source_node_id=cfg.node_id, limit=1,
-                )
-                seed = latest[0].hash if latest and latest[0].hash else "genesis"
-            except Exception:
-                seed = "genesis"
-            with self._lock:
-                self._prev_hash = seed
+        # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
+        # (spec §2.1) and happens inside the insert transaction, so an engine
+        # holds no chain state at all. Seeding here previously cost two store
+        # round trips per init() and — worse — implied the engine owned the
+        # counter, which is the bug P0-9 fixed.
 
         self._redactor = Redactor(
             extra_keys=cfg.extra_redact_keys,
@@ -409,6 +397,7 @@ class Engine:
             syslog_store=self._syslog_store,
             service_id=cfg.service_id,
             boot_request_id=self._boot_request_id,
+            redactor=self._redactor,
         )
         self._failure_strategy = cfg.audit_store_failure_strategy
         self._search_enabled = cfg.search_enabled
@@ -445,8 +434,11 @@ class Engine:
         self._retention_stop = threading.Event()
 
         def _log_err(stream: str, e: Exception) -> None:
+            # Type-only — the exception message can carry the offending
+            # row value (Postgres NotNullViolation cites the column) and
+            # the sys stream is redacted key-pattern only.
             self._drainer_sys_log("error", "retention_purge_failed", {
-                "stream": stream, "error": f"{type(e).__name__}: {e}",
+                "stream": stream, "error_type": type(e).__name__,
             })
 
         for stream, store, dur_s in (
@@ -553,7 +545,7 @@ class Engine:
         row = AuditRow(
             id=f"evt-{uuid.uuid4().hex[:20]}",
             origin_id="",
-            monotonic_seq=0,  # placeholder — replaced under lock
+            monotonic_seq=0,  # placeholder — the store allocates (spec §2.1)
             timestamp=datetime.now(timezone.utc),
             code=code,
             action=meta.action,
@@ -572,29 +564,39 @@ class Engine:
         )
         row = dataclasses.replace(row, origin_id=row.id)
 
-        # Atomically: assign monotonic_seq + seal the hash chain (the ONE
-        # canonical seal path — fasten.chain.seal stamps canonical_form_id,
-        # prev_hash and computes hash).
-        with self._lock:
-            self._seq += 1
-            row = dataclasses.replace(row, monotonic_seq=self._seq)
-            row = seal(self._prev_hash, row)
-            self._prev_hash = row.hash
-
-        # Stdout write before store routing: row reaches the log stream even
-        # if the store path blocks or raises.
+        # monotonic_seq / prev_hash / hash are NOT assigned here. They are
+        # allocated by the store inside the insert transaction (spec §2.1), so
+        # that N engine instances on one node produce ONE chain instead of N
+        # rows all claiming seq 1. Sealing therefore happens at insert time.
+        #
+        # Phase 1 of the two-phase stdout contract (spec §8): write the unsealed
+        # row before store routing, so it reaches the log stream even if the
+        # store path blocks or raises. Phase 2 re-emits it sealed below.
         if self._stdout is not None:
             self._stdout.write_audit(row.to_dict())
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":
+                # The FFI drainer allocates in fasten-core, which does not yet
+                # implement spec §2.1. Routing audit rows through it would leave
+                # them unsealed and unsequenced — silently disabling the chain.
+                # Correctness beats throughput: take the Python allocating path
+                # and say so once. Remove this guard when core lands §2.1.
                 handle = self._drainer_handle
+                if handle is not None and not self._drainer_allocates:
+                    if not self._drainer_bypass_logged:
+                        self._drainer_bypass_logged = True
+                        self._drainer_sys_log(
+                            "warn", "drainer_bypassed_for_chain_allocation",
+                            {"reason": "fasten-core does not implement spec 2.1"},
+                        )
+                    handle = None
                 if handle is not None:
                     row_json = json.dumps(row.to_dict(), default=str)
                     _ffi.drainer_enqueue(handle, row_json)
                 else:
                     try:
-                        self._audit_store.insert(row)
+                        row = self._allocate_and_store(row)
                     except Exception as e:  # noqa: BLE001
                         # Swallowed on the hot path → durable history now has a
                         # hole; degrade the audit completeness flag. Set the
@@ -607,12 +609,13 @@ class Engine:
                         if callable(note):
                             note()
                         self._drainer_sys_log("error", "audit_sync_fallback_failed", {
-                            "error": f"{type(e).__name__}: {e}",
+                            # Type-only — see retention_purge_failed comment.
+                            "error_type": type(e).__name__,
                             "row_id": row.id,
                         })
             else:
                 try:
-                    self._audit_store.insert(row)
+                    row = self._allocate_and_store(row)
                 except Exception as e:  # noqa: BLE001
                     raise AuditStoreError(f"{type(e).__name__}: {e}") from e
         return row
@@ -719,9 +722,6 @@ class Engine:
         constructing a new one. Do not call in production code.
         """
         self._uninstall_drainer()
-        with self._lock:
-            self._seq = 0
-            self._prev_hash = "genesis"
         self._service_id    = ""
         self._node_id       = ""
         self._tenant_id     = None
@@ -736,10 +736,33 @@ class Engine:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _next_seq(self) -> int:
-        with self._lock:
-            self._seq += 1
-            return self._seq
+    def _allocate_and_store(self, row: AuditRow) -> AuditRow:
+        """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
+
+        Falls back to the legacy unallocated insert for adopter repositories that
+        predate the protocol method, so a custom store keeps working (unchained)
+        rather than raising on the hot path.
+        """
+        allocate = getattr(self._audit_store, "allocate_and_insert_originated", None)
+        if not callable(allocate):
+            # This store predates spec §2.1, so rows go in UNSEALED: no seq, no
+            # hash. verify_chain SKIPS hashless rows, so /audit/doctor would
+            # otherwise report verified=true over a completely unchained table.
+            # Say it once, loudly, and set the degrade flag.
+            if not self._unchained_store_logged:
+                self._unchained_store_logged = True
+                self._audit_chain_unavailable = True
+                self._drainer_sys_log("error", "audit_chain_unavailable", {
+                    "store": type(self._audit_store).__name__,
+                    "reason": "store has no allocate_and_insert_originated "
+                              "(spec 2.1); rows are written unsealed",
+                })
+            self._audit_store.insert(row)
+            return row
+        sealed = allocate(row)
+        if self._stdout is not None and sealed.hash:
+            self._stdout.write_audit(sealed.to_dict())
+        return sealed
 
     def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any]) -> None:
         """Route drainer events to stderr (not stdout) to avoid backpressure deadlock."""

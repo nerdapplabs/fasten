@@ -1,0 +1,101 @@
+[
+ {
+  "label": "micros",
+  "row": {
+   "id": "evt-abc123",
+   "origin_id": "evt-abc123",
+   "monotonic_seq": 1,
+   "timestamp": "2026-06-15T10:30:45.123456Z",
+   "code": "ORDER_PLACED",
+   "action": "create",
+   "severity": "info",
+   "service_id": "gateway",
+   "source_node_id": "node-1",
+   "tenant_id": "tenant-x",
+   "actor": "alice",
+   "actor_kind": "user",
+   "target": "order/42",
+   "category": "order",
+   "domain": "sales",
+   "method": "http",
+   "request_id": "req-xyz",
+   "detail": {
+    "qty": 3,
+    "sku": "WIDGET"
+   },
+   "wire_version": "1",
+   "shipped_at": null,
+   "canonical_form_id": "1",
+   "prev_hash": "genesis",
+   "hash": "cbf5a1ee4bb7baeb0b433bedfa60434bdea42627b9671183895970bbff02f9ac",
+   "detail_salt": "8a475fc37d9afa77d4d958ba88e1ee7230e66ed5d00383253b06a34a4c414cb5",
+   "detail_commitment": "0fc16a9691d2197a1909682fbc063f8b437949543618c8db9990337b2c5c476b"
+  }
+ },
+ {
+  "label": "whole_second",
+  "row": {
+   "id": "evt-abc123",
+   "origin_id": "evt-abc123",
+   "monotonic_seq": 1,
+   "timestamp": "2026-06-15T10:30:45.000000Z",
+   "code": "ORDER_PLACED",
+   "action": "create",
+   "severity": "info",
+   "service_id": "gateway",
+   "source_node_id": "node-1",
+   "tenant_id": "tenant-x",
+   "actor": "alice",
+   "actor_kind": "user",
+   "target": "order/42",
+   "category": "order",
+   "domain": "sales",
+   "method": "http",
+   "request_id": "req-xyz",
+   "detail": {
+    "qty": 3,
+    "sku": "WIDGET"
+   },
+   "wire_version": "1",
+   "shipped_at": null,
+   "canonical_form_id": "1",
+   "prev_hash": "genesis",
+   "hash": "a46fa853141de1927faca8316e1f705c31c29a6e322e649d57013b6e45cff6c5",
+   "detail_salt": "ebcf1d74b84a30b5d5cd1215049062a8a1022281a1b21ad4509f2625ccafbf46",
+   "detail_commitment": "7bed5ab6d6d3508dec181fb16f4413247d6895bf3942228c13f99b71637dc3f6"
+  }
+ },
+ {
+  "label": "one_micro",
+  "row": {
+   "id": "evt-abc123",
+   "origin_id": "evt-abc123",
+   "monotonic_seq": 1,
+   "timestamp": "2026-06-15T10:30:45.000001Z",
+   "code": "ORDER_PLACED",
+   "action": "create",
+   "severity": "info",
+   "service_id": "gateway",
+   "source_node_id": "node-1",
+   "tenant_id": "tenant-x",
+   "actor": "alice",
+   "actor_kind": "user",
+   "target": "order/42",
+   "category": "order",
+   "domain": "sales",
+   "method": "http",
+   "request_id": "req-xyz",
+   "detail": {
+    "qty": 3,
+    "sku": "WIDGET"
+   },
+   "wire_version": "1",
+   "shipped_at": null,
+   "canonical_form_id": "1",
+   "prev_hash": "genesis",
+   "hash": "1a3f6b7e56dd8df8191562789f02494509c589379f5b34eb6c42893fac3b6012",
+   "detail_salt": "84e6db47bc0ade4f93c9408184e37471356b4c2f411f7466f722dcc8bdac101c",
+   "detail_commitment": "bc0f49efa3ba71fccaf78c7d0e3252df9e218821ac0abfab0b16f79349a8bb2a"
+  }
+ }
+]

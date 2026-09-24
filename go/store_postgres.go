@@ -324,7 +324,9 @@ func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error
 // Case-insensitive ILIKE substring, since= bounded, hard-capped by limit,
 // newest-first, no ranking. Result rows carry request_id for /correlate.
 // %/_/\ in q are escaped so they match literally under ESCAPE E'\\'.
-func (s *PostgresStore) Search(ctx context.Context, q, since, until string, limit int) ([]Row, error) {
+// Search: `tenantID != ""` scopes the query to one tenant — see SQLiteStore
+// Search for the P1-44 reasoning.
+func (s *PostgresStore) Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error) {
 	esc := escapeLikeLiteral(q)
 	conds := []string{"timestamp >= $1", `detail::text ILIKE $2 ESCAPE E'\\'`}
 	args := []any{since, "%" + esc + "%"}
@@ -332,6 +334,11 @@ func (s *PostgresStore) Search(ctx context.Context, q, since, until string, limi
 	if until != "" {
 		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n))
 		args = append(args, until)
+		n++
+	}
+	if tenantID != "" {
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n))
+		args = append(args, tenantID)
 		n++
 	}
 	args = append(args, limit)

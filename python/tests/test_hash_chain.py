@@ -36,7 +36,14 @@ def test_hash_is_deterministic(initialized):
 def test_hash_excludes_hash_field(initialized):
     row = fasten.emit(code="USER_CREATED", target="u-1")
     # The hash field must not appear in its own preimage.
-    d = {k: v for k, v in row.to_dict().items() if k != "hash"}
+    #
+    # The preimage is the HASHED form (spec §1.2): timestamps carry a "+00:00"
+    # offset, NOT the always-"Z" wire form that to_dict() stamps via
+    # canonical_ts (spec §4.3). Recomputing with the wire form here is what
+    # previously let Python drift away from the Go cross-language vector.
+    from fasten.chain import _FORM_1_EXCLUDED, _to_hashed_form
+    d = _to_hashed_form(
+        {k: v for k, v in row.to_dict().items() if k not in _FORM_1_EXCLUDED})
     expected = hashlib.sha256(
         json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
     ).hexdigest()

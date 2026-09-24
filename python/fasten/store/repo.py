@@ -44,6 +44,15 @@ class AuditRepository(Protocol):
         """Insert a row this node ORIGINATED (origin_id == id)."""
         ...
 
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert atomically (spec §2.1).
+
+        Returns the SEALED row. Implementations MUST serialise concurrent
+        allocations for the same source_node_id, so that N writers on one node
+        produce ONE verifiable chain rather than N rows claiming seq 1.
+        """
+        ...
+
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a sealed row replicated from another origin (after the chain
         verifies in ingest_replicated)."""
@@ -62,7 +71,25 @@ class AuditRepository(Protocol):
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
+        # Declared because the reader passes it UNCONDITIONALLY (router.py
+        # /logs/audit, /correlate, /search). A third-party store implementing
+        # this Protocol without it raises TypeError on every scoped request.
+        tenant_id: str | None = None,
     ) -> list[AuditRow]: ...
+
+    def search(
+        self,
+        *,
+        q: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+        tenant_id: str | None = None,
+    ) -> list[AuditRow]:
+        """Free-text search. Declared because the reader calls it when
+        search is enabled; an undeclared method meant every third-party store
+        either 500'd or silently degraded to "no Search method"."""
+        ...
 
     def count(
         self,
@@ -75,6 +102,10 @@ class AuditRepository(Protocol):
         target: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
+        # Declared because the reader passes it unconditionally
+        # (router.py /audit, /search, /audit/doctor). A store built
+        # to this Protocol without it raises TypeError per request.
+        tenant_id: str | None = None,
     ) -> int:
         """Total rows matching the same filter as query() — for pagination."""
         ...

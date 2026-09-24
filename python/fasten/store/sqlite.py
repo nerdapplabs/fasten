@@ -7,6 +7,7 @@ and uses WAL mode by default.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import re
 import sqlite3
@@ -241,6 +242,65 @@ class SQLiteStore:
             )
         self._insert_row(row)
 
+    def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
+        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+
+        One node, one chain: ``monotonic_seq`` is unique within a
+        ``source_node_id``. Allocating in the engine's memory is non-conformant —
+        two engine instances (two services on one store, a forking supervisor,
+        ``uvicorn --workers``) each mint from 1 and produce two rows at seq 1,
+        which ``verify_chain`` must then report as a duplicate allocation.
+
+        ``BEGIN IMMEDIATE`` takes a RESERVED lock before the read, so two writers
+        cannot both observe the same MAX(seq) and then both insert. Without it
+        this method would be a read-modify-write race that merely moves the bug
+        from memory into SQL.
+
+        Returns the SEALED row actually written.
+        """
+        from ..chain import seal
+
+        if row.origin_id != row.id:
+            raise ValueError(
+                "allocate_and_insert_originated requires origin_id == id "
+                f"(got origin_id={row.origin_id!r}, id={row.id!r})"
+            )
+        with self._txn():
+            conn = self._connect()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # TWO questions, TWO queries — conflating them is a bug.
+                #
+                # seq must be unique across EVERY row on this node, sealed or
+                # not: an unsealed row (pre-upgrade, or stdout-only mode per
+                # §8.1) still occupies its sequence number. Filtering those out
+                # here restarts the counter at 1 and collides with them.
+                #
+                # prev_hash, by contrast, may only chain from a SEALED row —
+                # an empty hash is not a link.
+                cur = conn.execute(
+                    f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
+                    "WHERE source_node_id = ?",
+                    (row.source_node_id,),
+                )
+                next_seq = int(cur.fetchone()[0]) + 1
+                cur = conn.execute(
+                    f"SELECT hash FROM {self._table} "
+                    "WHERE source_node_id = ? AND hash != '' "
+                    "ORDER BY monotonic_seq DESC LIMIT 1",
+                    (row.source_node_id,),
+                )
+                tip = cur.fetchone()
+                prev_hash = tip[0] if tip else "genesis"
+                sealed = seal(prev_hash, dataclasses.replace(
+                    row, monotonic_seq=next_seq))
+                self._insert_row_core(conn, sealed)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return sealed
+
     def insert_replicated(self, row: AuditRow) -> None:
         """Insert a row replicated from another origin. Used by
         ingest_replicated after the chain verifies; the row must be sealed."""
@@ -390,7 +450,10 @@ class SQLiteStore:
         if source_node_id:
             conds.append("source_node_id = ?")
             params.append(source_node_id)
-        if tenant_id:
+        # `is not None`, not truthiness: an empty tenant_id must filter to
+        # nothing, never silently widen the query to every tenant. Matches the
+        # convention already used elsewhere in this file.
+        if tenant_id is not None:
             conds.append("tenant_id = ?")
             params.append(tenant_id)
         if actor:
@@ -491,6 +554,7 @@ class SQLiteStore:
         since: str,
         until: str | None = None,
         limit: int = 50,
+        tenant_id: str | None = None,
     ) -> list[AuditRow]:
         """FR3 free-text search over persisted audit history (§4.1). Substring
         scan over the ``detail`` JSON column (audit's payload equivalent). The
@@ -499,13 +563,21 @@ class SQLiteStore:
         Deliberately constrained: ``since`` is mandatory to bound the linear
         scan; ``%``/``_``/``\\`` in ``q`` are escaped so they match literally
         rather than acting as LIKE wildcards. Newest-first, hard-capped by
-        ``limit`` — no relevance ranking."""
+        ``limit`` — no relevance ranking.
+
+        ``tenant_id`` scopes the search to one tenant when supplied — the
+        reader wires the caller's authenticated tenant into this arg so a
+        multi-tenant shared store doesn't leak substring matches across
+        tenant boundaries (P1-44)."""
         esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:
             conds.append("COALESCE(timestamp, '') <= ?")
             params.append(until)
+        if tenant_id is not None:
+            conds.append("tenant_id = ?")
+            params.append(tenant_id)
         params.append(limit)
         sql = (
             f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "

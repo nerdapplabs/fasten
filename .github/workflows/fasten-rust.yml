@@ -5,10 +5,16 @@ on:
     branches: [main, dev]
     paths:
       - 'rust/**'
+      # fasten-core is Rust and is built by several jobs but tested by none;
+      # path-scoping to rust/** meant a core-only change never ran its tests.
+      - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
   pull_request:
     paths:
       - 'rust/**'
+      # fasten-core is Rust and is built by several jobs but tested by none;
+      # path-scoping to rust/** meant a core-only change never ran its tests.
+      - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
 
 permissions:
@@ -36,6 +42,20 @@ jobs:
 
       - name: Unit tests
         run: cargo test --quiet
+
+      # rust/Cargo.toml pulls fasten-core with default-features = false, so a
+      # `cargo test` in rust/ never compiles store/postgres.rs — tls_tests has
+      # never run. Test the core in its own directory with all features on.
+      - name: Test fasten-core (all features)
+        working-directory: fasten-core
+        # native-tls links OpenSSL, which needs pkg-config + headers. Without
+        # them the job fails at build, which is how tls_tests stayed unrun.
+        # The job runs in `container: rust:1.85` — root, and no sudo binary,
+        # so `sudo apt-get` fails with "sudo: not found". Install directly.
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq pkg-config libssl-dev
+          cargo test --all-features --quiet
 
       - name: Install llvm-tools for coverage
         run: rustup component add llvm-tools-preview

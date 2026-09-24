@@ -56,13 +56,20 @@ def test_init_reads_dsn_from_env(monkeypatch):
 # ── init() seq seeding from store ─────────────────────────────────────────
 
 
-def test_init_seeds_seq_from_store_max(mem_store):
-    """Engine seeds _seq from max_monotonic_seq() so post-restart rows
-    never duplicate (timestamp, seq) with pre-restart rows."""
+def test_post_restart_rows_continue_the_node_sequence(mem_store):
+    """Post-restart rows must never reuse a pre-restart monotonic_seq.
+
+    Previously the Engine seeded a private `_seq` from max_monotonic_seq() at
+    init. It no longer holds chain state at all — the store allocates inside
+    the insert transaction (spec §2.1). The guarantee is unchanged, so this
+    asserts the guarantee rather than the mechanism: it would catch a
+    regression in either implementation.
+    """
     from datetime import datetime, timezone
     from fasten.attrs import AuditRow
+    from fasten.chain import verify_chain
 
-    row = AuditRow(
+    existing = AuditRow(
         id="evt-" + "0" * 16,
         origin_id="evt-" + "0" * 16,
         monotonic_seq=42,
@@ -73,7 +80,7 @@ def test_init_seeds_seq_from_store_max(mem_store):
         category="account", domain="user",
         method="sdk", request_id="r", detail={},
     )
-    mem_store.insert(row)
+    mem_store.insert(existing)
 
     fasten.init(
         service_id="svc",
@@ -81,7 +88,23 @@ def test_init_seeds_seq_from_store_max(mem_store):
         audit_store=mem_store,
         audit_store_failure_strategy="raise",
     )
-    assert _default._seq >= 42
+    row = fasten.emit(code="USER_CREATED", target="after-restart")
+    assert row.monotonic_seq > 42, (
+        f"post-restart row reused seq {row.monotonic_seq}; the node sequence "
+        "did not continue"
+    )
+    # A different service on the same node must also continue it, not restart.
+    fasten.init(
+        service_id="other-svc",
+        node_id="n",
+        audit_store=mem_store,
+        audit_store_failure_strategy="raise",
+    )
+    second = fasten.emit(code="USER_CREATED", target="other-service")
+    assert second.monotonic_seq > row.monotonic_seq
+
+    sealed = [r for r in mem_store.query(limit=100) if r.hash]
+    assert verify_chain(sealed).ok
 
 
 # ── accessors ─────────────────────────────────────────────────────────────
@@ -312,7 +335,7 @@ def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_noti
     assert eng.audit_write_swallowed() is True
 
     app = FastAPI()
-    app.include_router(build_router(), prefix="/api/v1/logs")
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     resp = TestClient(app).get("/api/v1/logs/audit?limit=1")
     assert resp.status_code == 200
     # Was reporting 'store' before the fix — 'store-degraded' proves the
