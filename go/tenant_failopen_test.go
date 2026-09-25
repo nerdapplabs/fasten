@@ -1,6 +1,7 @@
 package fasten
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -130,5 +131,72 @@ func TestNewReader_TwoReadersKeepSeparateScopes(t *testing.T) {
 	}
 	if got := status(a); got == http.StatusUnauthorized {
 		t.Fatal("reader A was 401'd — reader B's scope leaked onto it")
+	}
+}
+
+// spec §2.1 / §8.1 — the engine holds no chain state. The store allocates
+// inside the insert transaction, so two engines on one node share one chain;
+// with no store at all, rows go out unsealed rather than carrying a fabricated
+// in-memory sequence that cannot survive a restart or a second process.
+func TestEngine_StoreAllocatesSequence(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store, cleanup := newMemStore(t, "alloc_shared")
+	defer cleanup()
+	ctx := context.Background()
+
+	a, b := &Engine{}, &Engine{}
+	for _, tc := range []struct {
+		e   *Engine
+		svc string
+	}{{a, "svc-a"}, {b, "svc-b"}} {
+		if err := tc.e.Init(Config{
+			ServiceID: tc.svc, NodeID: "node-1",
+			AuditStore: store, AuditStoreFailureStrategy: "raise",
+		}); err != nil {
+			t.Fatalf("Init %s: %v", tc.svc, err)
+		}
+	}
+
+	r1, err := a.Emit(ctx, "USER_CREATED", Target("u-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := b.Emit(ctx, "USER_CREATED", Target("u-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.MonotonicSeq == r2.MonotonicSeq {
+		t.Fatalf("two engines minted the same seq %d — the P0-9 defect", r1.MonotonicSeq)
+	}
+	if r2.PrevHash != r1.Hash {
+		t.Fatalf("second engine did not chain to the first: prev=%q want %q",
+			r2.PrevHash, r1.Hash)
+	}
+	rows, err := store.Query(ctx, Filter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("chain broken across two engines: %s", res.Reason)
+	}
+}
+
+func TestEngine_NoStoreEmitsUnsealed(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node-1"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := Emit(context.Background(), "USER_CREATED", Target("u-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Hash != "" {
+		t.Fatalf("storeless emit sealed the row (hash=%q); spec §8.1 forbids "+
+			"fabricating a sequence with nothing to allocate against", row.Hash)
+	}
+	if res := VerifyChain([]Row{row}); !res.OK {
+		t.Fatal("VerifyChain must skip hashless rows, not reject them")
 	}
 }
