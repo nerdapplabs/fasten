@@ -146,7 +146,12 @@ func TestEmit_RequiresInit(t *testing.T) {
 func TestEmit_UnknownCode(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+store, cleanup := newMemStore(t, "fasten_audit")
+	t.Cleanup(cleanup)
+	// spec §8.1: with no audit store there is nothing to allocate against, so
+	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
+	// about seq/hash must attach one — as real deployments do.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
 	_, err := Emit(context.Background(), "UNKNOWN_CODE", Target("u-1"))
@@ -158,7 +163,12 @@ func TestEmit_UnknownCode(t *testing.T) {
 func TestEmit_Roundtrip(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-	if err := Init(Config{ServiceID: "svc", NodeID: "node-1"}); err != nil {
+store, cleanup := newMemStore(t, "fasten_audit")
+	t.Cleanup(cleanup)
+	// spec §8.1: with no audit store there is nothing to allocate against, so
+	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
+	// about seq/hash must attach one — as real deployments do.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node-1", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
 	row, err := Emit(context.Background(), "USER_CREATED", Target("u-42"), Actor("alice", "user"))
@@ -197,7 +207,12 @@ func TestEmit_Roundtrip(t *testing.T) {
 func TestEmit_MonotonicSeqIncreases(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+store, cleanup := newMemStore(t, "fasten_audit")
+	t.Cleanup(cleanup)
+	// spec §8.1: with no audit store there is nothing to allocate against, so
+	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
+	// about seq/hash must attach one — as real deployments do.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
 	r1, _ := Emit(context.Background(), "USER_CREATED", Target("u-1"))
@@ -225,7 +240,12 @@ func TestRequestIDFromContext_Empty(t *testing.T) {
 func TestEmit_UsesContextRequestID(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
+store, cleanup := newMemStore(t, "fasten_audit")
+	t.Cleanup(cleanup)
+	// spec §8.1: with no audit store there is nothing to allocate against, so
+	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
+	// about seq/hash must attach one — as real deployments do.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
 	ctx := WithRequestID(context.Background(), "deadbeef1234")

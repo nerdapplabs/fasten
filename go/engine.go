@@ -45,6 +45,10 @@ type Engine struct {
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
 	// assignment so concurrent Emit calls produce a consistent, gapless chain.
+	drainerAllocates      atomic.Bool
+	drainerBypassLogged   atomic.Bool
+	unchainedStoreLogged  atomic.Bool
+	auditChainUnavailable atomic.Bool
 	hashMu   sync.Mutex
 	prevHash string // "genesis" until first Emit
 
@@ -508,17 +512,18 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 	// agree on a single field set (canonical_form_id + pii_in_detail-excluded,
 	// shipped_at:null, prev_hash always present, Python-isoformat timestamps,
 	// sorted keys, non-ASCII \uXXXX-escaped).
-	e.hashMu.Lock()
-	// Under hashMu — plain increment; atomic ops here were belt-and-braces
-	// with no reader (the seq is read only through Query paths that go
-	// through the store, not through e.seq directly). ResetForTests and
-	// Init use atomic.StoreInt64 so the field stays lock-free-safe when
-	// hashMu isn't held (test setup / re-Init).
-	e.seq++
-	row.MonotonicSeq = e.seq
-	row = Seal(e.prevHash, row)
-	e.prevHash = row.Hash
-	e.hashMu.Unlock()
+	// monotonic_seq / prev_hash / hash are NOT assigned here (spec §2.1). The
+	// store allocates them inside the insert transaction, so N engines on one
+	// node produce ONE chain instead of N rows all claiming seq 1 — which
+	// VerifyChain reports as a prev_hash break, a false tamper signal with no
+	// attacker involved.
+	//
+	// With no audit store there is nothing to allocate against, so the row goes
+	// out unsealed (hash "") per spec §8.1. VerifyChain skips hashless rows, so
+	// such a stream verifies vacuously rather than failing. Fabricating an
+	// in-memory sequence here would be the exact non-conformance §2.1 forbids:
+	// it cannot survive a restart or a second process, so it is a chain in
+	// appearance only.
 
 	if e.xport != nil {
 		e.xport.WriteAudit(rowToMap(row))
@@ -526,11 +531,27 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 
 	if e.auditStore != nil {
 		if e.failureStrategy == "queue" {
+			// The drainer inserts asynchronously and cannot allocate, so a row
+			// enqueued there is written unsealed with seq 0 — silently
+			// disabling the chain. Correctness beats throughput: take the
+			// allocating path and say so once. Matches the Python SDK, which
+			// bypasses its FFI drainer for the same reason.
 			d := e.activeDrainer()
+			if d != nil && !e.drainerAllocates.Load() {
+				if e.drainerBypassLogged.CompareAndSwap(false, true) {
+					e.drainerSysLog("warn", "drainer_bypassed_for_chain_allocation",
+						map[string]any{"reason": "drainer cannot allocate monotonic_seq (spec 2.1)"})
+				}
+				d = nil
+			}
 			if d != nil {
 				d.enqueue(row)
 			} else {
-				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
+				sealed, ferr := e.allocateAndStore(ctx, row)
+				if ferr == nil {
+					row = sealed
+				}
+				if ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;
 					// degrade the audit completeness flag. Set the engine flag
 					// unconditionally (adopter stores may not implement
@@ -548,9 +569,13 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 				}
 			}
 		} else {
-			if err := e.auditStore.Insert(ctx, row); err != nil {
+			// "raise" strategy — same allocating path as the queue branch
+			// (spec §2.1); only the error handling differs.
+			sealed, err := e.allocateAndStore(ctx, row)
+			if err != nil {
 				return row, &AuditStoreError{Err: err}
 			}
+			row = sealed
 		}
 	}
 	return row, nil
@@ -714,6 +739,37 @@ func (e *Engine) activeDrainer() *cFastenDrainer {
 }
 
 // drainerSysLog bridges drainer events to the sys stream via stderr.
+// allocateAndStore performs the store-allocated seal (spec §2.1) and the
+// phase-2 stdout write (spec §8).
+//
+// Falls back to the legacy unallocated Insert for adopter stores that predate
+// the interface — and says so once, because VerifyChain SKIPS hashless rows and
+// would otherwise report verified over a fully unchained table.
+func (e *Engine) allocateAndStore(ctx context.Context, row Row) (Row, error) {
+	type allocator interface {
+		AllocateAndInsertOriginated(context.Context, Row) (Row, error)
+	}
+	a, ok := e.auditStore.(allocator)
+	if !ok {
+		if e.unchainedStoreLogged.CompareAndSwap(false, true) {
+			e.auditChainUnavailable.Store(true)
+			e.drainerSysLog("error", "audit_chain_unavailable", map[string]any{
+				"store":  fmt.Sprintf("%T", e.auditStore),
+				"reason": "store has no AllocateAndInsertOriginated (spec 2.1); rows written unsealed",
+			})
+		}
+		return row, e.auditStore.Insert(ctx, row)
+	}
+	sealed, err := a.AllocateAndInsertOriginated(ctx, row)
+	if err != nil {
+		return row, err
+	}
+	if e.xport != nil && sealed.Hash != "" {
+		e.xport.WriteAudit(rowToMap(sealed))
+	}
+	return sealed, nil
+}
+
 func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,

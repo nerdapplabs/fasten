@@ -15,7 +15,7 @@ import logging
 import re
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, Sequence, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS {table} (
     shipped_at       TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
+    -- can be destroyed for retention without moving the row hash. Nullable:
+    -- NULL on form-"1" rows, and NULL again once redacted.
+    detail_salt       TEXT,
+    detail_commitment TEXT
 )
 """
 
@@ -68,6 +73,10 @@ _MIGRATION_HASH_CHAIN = """
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
+-- P1-47: form "2" commitment columns. Nullable with no default, so existing
+-- rows are untouched and their form-"1" hashes still verify.
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_salt TEXT;
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_commitment TEXT;
 """
 
 _INDEXES = [
@@ -228,8 +237,8 @@ class PostgresStore:
         "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
         "service_id,source_node_id,tenant_id,actor,actor_kind,"
         "target,category,domain,method,request_id,detail,shipped_at,"
-        "prev_hash,hash,canonical_form_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "prev_hash,hash,canonical_form_id,detail_salt,detail_commitment) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (id) DO NOTHING"
     )
 
@@ -248,6 +257,8 @@ class PostgresStore:
             row.prev_hash,
             row.hash,
             row.canonical_form_id,
+            row.detail_salt,
+            row.detail_commitment,
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
@@ -473,6 +484,44 @@ class PostgresStore:
             rejected_from_seq=rejected_from_seq,
             reason=reason or None,
         )
+
+    def redact_expired(self, *, before: datetime,
+                       codes: "Sequence[str]") -> "list[str]":
+        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
+
+        See the SQLite implementation for the rationale. In short: DELETE would
+        remove rows from the MIDDLE of the chain, which ``verify_chain`` is
+        built to detect as tampering. Under form "2" the hash covers
+        ``detail_commitment``, so nulling ``detail`` and its salt destroys the
+        data while leaving ``hash`` / ``prev_hash`` / ``monotonic_seq`` intact.
+
+        ``detail`` is ``TEXT NOT NULL`` here as it is on SQLite, so this writes
+        the JSON literal ``'null'`` rather than a SQL NULL. ``json.loads`` turns
+        it back into Python ``None``, so the row reads exactly as spec §7.1
+        requires and the bytes are gone either way.
+
+        Returns the ids of the rows redacted, so the caller can emit one
+        AUDIT_ROW_REDACTED event per row (spec §7.2) — without that, an
+        honest erasure and a quiet redaction are indistinguishable.
+        """
+        if not codes:
+            return []
+
+        def _run(conn: Any) -> "list[str]":
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {self._table} "
+                    "SET detail = 'null', detail_salt = NULL "
+                    "WHERE timestamp < %s AND code = ANY(%s) "
+                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "RETURNING id",
+                    (_utc_iso(before), list(codes)),
+                )
+                ids = [r[0] for r in cur.fetchall()]
+            conn.commit()
+            return ids
+
+        return cast("list[str]", self._execute_with_retry(_run))
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"
@@ -738,4 +787,9 @@ class PostgresStore:
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
             canonical_form_id=r[21] if len(r) > 21 else "1",
+            # SELECT * — positional. detail_salt / detail_commitment follow
+            # canonical_form_id both in the fresh DDL and when appended by
+            # ALTER TABLE on a migrated table, so the index is stable.
+            detail_salt=r[22] if len(r) > 22 else None,
+            detail_commitment=r[23] if len(r) > 23 else None,
         )

@@ -247,6 +247,71 @@ func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
+// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
+// atomically (spec §2.1).
+//
+// One node, one chain: monotonic_seq is unique within a source_node_id.
+// Allocating in engine memory is non-conformant — two engine instances (two
+// services on one store, a forking supervisor, several workers) each mint from
+// 1 and produce two rows at seq 1, which VerifyChain then reports as a
+// prev_hash break: a false tamper signal with no attacker involved.
+//
+// BEGIN IMMEDIATE takes a RESERVED lock BEFORE the read, so two writers cannot
+// both observe the same tip and then both insert. Without it this is a
+// read-modify-write race that merely moves the bug from memory into SQL.
+//
+// Returns the SEALED row actually written.
+func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	if row.OriginID != row.ID {
+		return Row{}, fmt.Errorf(
+			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
+			row.OriginID, row.ID)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Row{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		// Already inside a tx on some drivers; the BeginTx above is the lock.
+		_ = err
+	}
+
+	// TWO questions, TWO queries. seq must span EVERY row on this node, sealed
+	// or not: an unsealed row (pre-upgrade, or stdout-only mode) still occupies
+	// its number, and filtering those out restarts the counter and collides.
+	// prev_hash, by contrast, may only chain from a SEALED row.
+	var nextSeq int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = ?",
+		row.SourceNodeID).Scan(&nextSeq); err != nil {
+		return Row{}, err
+	}
+	nextSeq++
+
+	prevHash := "genesis"
+	var tip string
+	err = tx.QueryRowContext(ctx,
+		"SELECT hash FROM "+s.table+" WHERE source_node_id = ? AND hash != '' "+
+			"ORDER BY monotonic_seq DESC LIMIT 1", row.SourceNodeID).Scan(&tip)
+	if err == nil && tip != "" {
+		prevHash = tip
+	} else if err != nil && err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	row.MonotonicSeq = nextSeq
+	sealed := Seal(prevHash, row)
+	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+		return Row{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Row{}, err
+	}
+	return sealed, nil
+}
+
 // InsertReplicated inserts a sealed row replicated from another origin. Used by
 // IngestReplicated after the chain verifies (autocommit single-row path).
 func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {

@@ -81,7 +81,12 @@ func itoa(i int) string {
 func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
-	if err := Init(Config{ServiceID: "svc-1", NodeID: "node-1"}); err != nil {
+store, cleanup := newMemStore(t, "fasten_audit")
+	t.Cleanup(cleanup)
+	// spec §8.1: with no audit store there is nothing to allocate against, so
+	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
+	// about seq/hash must attach one — as real deployments do.
+	if err := Init(Config{ServiceID: "svc-1", NodeID: "node-1", AuditStore: store}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 

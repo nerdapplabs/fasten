@@ -96,9 +96,6 @@ def test_form_1_rows_still_verify():
 
 # ── form "2" behaviour ────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(reason="P1-47: form \"2\" not stamped until the store has "
-                          "detail_salt / detail_commitment columns",
-                   strict=True)
 def test_seal_stamps_form_2_and_commits():
     sealed = seal("genesis", _row())
     assert sealed.canonical_form_id == "2"
@@ -317,3 +314,34 @@ def test_legacy_fallback_is_scoped_to_form_1():
     sealed = _seal2("genesis", _row())
     broken = dataclasses.replace(sealed, target="u/999")
     assert not verify_chain([broken]).ok
+
+
+def test_tampering_with_detail_is_detected_under_form_2():
+    """SECURITY: form "2" hashes detail_commitment, not detail.
+
+    Without re-checking the commitment on read, an attacker could rewrite
+    detail and leave the commitment intact — the row hash would still match
+    and verify_chain would pass over altered audit content.
+    """
+    sealed = _seal2("genesis", _row())
+    tampered = dataclasses.replace(sealed, detail={"qty": 999, "sku": "STOLEN"})
+    result = verify_chain([tampered])
+    assert not result.ok
+    assert "commitment" in (result.reason or "")
+
+
+def test_redacted_row_skips_the_commitment_check():
+    """Once detail and salt are gone there is nothing to recompute."""
+    gone = redact(_seal2("genesis", _row()))
+    assert gone.detail is None and gone.detail_salt is None
+    assert verify_chain([gone]).ok
+
+
+def test_clearing_the_salt_does_not_skip_verification():
+    """SECURITY: the salt is not a switch for disabling the commitment check."""
+    sealed = _seal2("genesis", _row())
+    attack = dataclasses.replace(
+        sealed, detail={"qty": 999, "sku": "STOLEN"}, detail_salt=None)
+    result = verify_chain([attack])
+    assert not result.ok
+    assert "detail_salt" in (result.reason or "")
