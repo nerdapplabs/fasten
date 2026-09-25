@@ -746,14 +746,11 @@ class Engine:
         # Check the RETURN VALUE. meta_of() yields None for an unknown code
         # rather than raising, so `try: meta_of(); return` skipped registration
         # every time and emit() then failed with "unknown audit code".
-        try:
-            if meta_of(self._REDACTION_CODE) is not None:
-                return
-        except Exception:
-            pass
+        if meta_of(self._REDACTION_CODE) is not None:
+            return
         register(self._REDACTION_DOMAIN, {self._REDACTION_CODE: Meta(
             domain=self._REDACTION_DOMAIN, category="retention", action="redact",
-            severity=Severity.WARN if hasattr(Severity, "WARN") else list(Severity)[0],
+            severity=Severity.WARN,
             description="Audit row detail destroyed under a retention policy",
             emitter="fasten",
             retention_class=RetentionClass.LONG,
@@ -782,10 +779,16 @@ class Engine:
                 "fasten.redact_expired: the audit store does not implement "
                 "redact_expired (spec §7.1)"
             )
+        # ORDER MATTERS. Registering the code and emitting AFTER the redaction
+        # meant a failure at either step destroyed data with no record, and a
+        # retry could not repair it — the rows are already gone. Register
+        # first, so the only remaining failure mode is an emit that fails after
+        # the delete, which at least leaves the data destroyed for a recorded
+        # reason rather than silently.
+        self._ensure_redaction_code()
         redacted = list(store.redact_expired(before=before, codes=codes))
         if not redacted:
             return []
-        self._ensure_redaction_code()
         for row_id in redacted:
             self.emit(
                 code=self._REDACTION_CODE,

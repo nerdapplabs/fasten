@@ -126,3 +126,28 @@ def test_store_without_redact_support_raises(eng):
     e._audit_store = object()
     with pytest.raises(AuditStoreError, match="redact_expired"):
         e.redact_expired(before=datetime.now(timezone.utc), codes=["REDACT_USER_EXPORTED"])
+
+
+def test_redaction_code_is_registered_before_any_data_is_destroyed():
+    """The event code must exist BEFORE the delete.
+
+    Registering after meant a failure there destroyed data with no record, and
+    a retry could not repair it — the rows were already gone.
+    """
+    from fasten.codes import meta_of
+    from fasten.store.sqlite import SQLiteStore
+
+    calls = []
+
+    class Probe(SQLiteStore):
+        def redact_expired(self, *, before, codes):
+            # By the time any data is touched, the code must be registered.
+            calls.append(meta_of("AUDIT_ROW_REDACTED") is not None)
+            return []
+
+    db = os.path.join(tempfile.mkdtemp(), "audit.db")
+    e = Engine()
+    e.init(service_id="svc", node_id="node-1", audit_store=Probe(db),
+           audit_store_failure_strategy="raise")
+    e.redact_expired(before=datetime.now(timezone.utc), codes=["X"])
+    assert calls == [True], "code was not registered before the redaction ran"
