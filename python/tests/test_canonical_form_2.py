@@ -335,3 +335,13 @@ def test_redacted_row_skips_the_commitment_check():
     gone = redact(_seal2("genesis", _row()))
     assert gone.detail is None and gone.detail_salt is None
     assert verify_chain([gone]).ok
+
+
+def test_clearing_the_salt_does_not_skip_verification():
+    """SECURITY: the salt is not a switch for disabling the commitment check."""
+    sealed = _seal2("genesis", _row())
+    attack = dataclasses.replace(
+        sealed, detail={"qty": 999, "sku": "STOLEN"}, detail_salt=None)
+    result = verify_chain([attack])
+    assert not result.ok
+    assert "detail_salt" in (result.reason or "")

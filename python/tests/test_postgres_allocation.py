@@ -2,7 +2,7 @@
 
 This path was written, reviewed and shipped twice without ever executing.
 It is the one place a bug of the same shape as the SQLite unsealed-row defect
-would not have been caught. Requires FASTEN_TEST_PG_DSN.
+would not have been caught. Requires FASTEN_TEST_POSTGRES_DSN (the name CI sets).
 """
 import os
 from datetime import datetime, timezone
@@ -12,8 +12,8 @@ import pytest
 from fasten.attrs import AuditRow
 from fasten.chain import verify_chain
 
-DSN = os.environ.get("FASTEN_TEST_PG_DSN")
-pytestmark = pytest.mark.skipif(not DSN, reason="set FASTEN_TEST_PG_DSN")
+DSN = os.environ.get("FASTEN_TEST_POSTGRES_DSN")
+pytestmark = pytest.mark.skipif(not DSN, reason="set FASTEN_TEST_POSTGRES_DSN")
 
 
 def _row(i: int, *, service_id: str = "svc-a", node: str = "node-1") -> AuditRow:

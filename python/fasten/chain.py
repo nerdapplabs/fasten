@@ -292,7 +292,21 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
             # still present, recompute the commitment and compare. Once the row
             # is redacted (both NULL, spec §7.1) there is nothing left to check
             # and the commitment stands on its own.
-            if form_id == "2" and row.detail is not None and row.detail_salt:
+            if form_id == "2" and row.detail is not None:
+                # detail present means the commitment MUST be checkable. An
+                # attacker who rewrites detail and clears detail_salt would
+                # otherwise skip this branch entirely and the row would verify
+                # — the salt is not a switch for turning verification off.
+                # Redaction clears detail AND salt together (spec §7.1), so a
+                # legitimately redacted row never reaches here.
+                if not row.detail_salt:
+                    return ChainVerifyResult(
+                        ok=False,
+                        total_rows=len(rows),
+                        first_break_at=row.monotonic_seq,
+                        reason=(f"row {row.id}: detail present but detail_salt "
+                                "is missing — commitment cannot be verified"),
+                    )
                 recomputed = detail_commitment(row.detail_salt, row.detail)
                 if recomputed != (row.detail_commitment or ""):
                     return ChainVerifyResult(
