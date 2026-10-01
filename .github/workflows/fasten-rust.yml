@@ -70,7 +70,7 @@ jobs:
         run: apt-get update -qq && apt-get install -y --no-install-recommends gpg
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: rust/coverage.lcov
           flags: rust
