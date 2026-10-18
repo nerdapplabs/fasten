@@ -44,7 +44,7 @@ jobs:
 
       - name: Build fasten-core (.so)
         working-directory: fasten-core
-        run: cargo build --release --features all
+        run: cargo build --release --locked --features all
 
       - name: Set up Go 1.22
         uses: actions/setup-go@v5
