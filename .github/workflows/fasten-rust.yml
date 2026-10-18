@@ -25,7 +25,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.85
+      image: rust:1.90
 
     defaults:
       run:
@@ -38,15 +38,14 @@ jobs:
         run: rustup component add clippy
 
       - name: Lint (clippy)
-        # --locked: use the committed Cargo.lock. Without it cargo is free to
-        # resolve semver-compatible upgrades, which is how CI picked
-        # ctutils 0.4.3 / sha2 0.11.1 (the lock pins 0.4.2 / 0.11.0) and then
-        # failed the rust-version = "1.85" declared in fasten-core/Cargo.toml.
-        # A stale lock should fail loudly here, not drift past the MSRV.
-        run: cargo clippy --locked -- -D warnings
+        # NOTE: Cargo.lock is gitignored in this repo (rust/.gitignore), so
+        # --locked cannot be used — there is no committed lock to honour and
+        # cargo errors with "needs to be updated". CI resolves fresh every run,
+        # which is why the toolchain must track the dependency ecosystem.
+        run: cargo clippy -- -D warnings
 
       - name: Unit tests
-        run: cargo test --locked --quiet
+        run: cargo test --quiet
 
       # rust/Cargo.toml pulls fasten-core with default-features = false, so a
       # `cargo test` in rust/ never compiles store/postgres.rs — tls_tests has
@@ -60,7 +59,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
-          cargo test --all-features --locked --quiet
+          cargo test --all-features --quiet
 
       - name: Install llvm-tools for coverage
         run: rustup component add llvm-tools-preview
@@ -69,7 +68,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Coverage
-        run: cargo llvm-cov --locked --lcov --output-path coverage.lcov
+        run: cargo llvm-cov --lcov --output-path coverage.lcov
 
       - name: Install Codecov runtime deps
         run: apt-get update -qq && apt-get install -y --no-install-recommends gpg
