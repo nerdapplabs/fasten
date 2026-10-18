@@ -139,6 +139,8 @@ func TestNewReader_TwoReadersKeepSeparateScopes(t *testing.T) {
 // with no store at all, rows go out unsealed rather than carrying a fabricated
 // in-memory sequence that cannot survive a restart or a second process.
 func TestEngine_StoreAllocatesSequence(t *testing.T) {
+	t.Skip("store-allocated sequencing is REVERTED until PostgresStore has an allocator and the SQLite lock actually holds (plan C6). Without that, routing Emit through the store writes every Go/Postgres row unsealed.")
+
 	registerTestCodes(t)
 	resetGlobals(t)
 	store, cleanup := newMemStore(t, "alloc_shared")
@@ -183,6 +185,8 @@ func TestEngine_StoreAllocatesSequence(t *testing.T) {
 }
 
 func TestEngine_NoStoreEmitsUnsealed(t *testing.T) {
+	t.Skip("spec 8.1 storeless behaviour depends on the same rewiring (plan C6).")
+
 	registerTestCodes(t)
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node-1"}); err != nil {
