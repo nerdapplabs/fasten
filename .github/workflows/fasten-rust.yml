@@ -34,6 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Toolchain declarations agree
+        run: |
+          tc=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
+          mv=$(grep -oE 'rust-version = "[0-9.]+"' fasten-core/Cargo.toml | grep -oE '[0-9.]+')
+          echo "rust-toolchain.toml=$tc  fasten-core rust-version=$mv"
+          [ "$tc" = "$mv" ] || { echo "::error::toolchain and rust-version disagree"; exit 1; }
+
       - name: Install clippy
         run: rustup component add clippy
 
@@ -52,7 +59,7 @@ jobs:
         working-directory: fasten-core
         # native-tls links OpenSSL, which needs pkg-config + headers. Without
         # them the job fails at build, which is how tls_tests stayed unrun.
-        # The job runs in `container: rust:1.85` — root, and no sudo binary,
+        # The job runs in a rust container — root, and no sudo binary,
         # so `sudo apt-get` fails with "sudo: not found". Install directly.
         run: |
           apt-get update -qq

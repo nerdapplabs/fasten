@@ -1,0 +1,12 @@
+# SINGLE SOURCE OF TRUTH for the Rust toolchain.
+#
+# Four workflows build fasten-core and each pinned its own version
+# (dtolnay/rust-toolchain@1.85 in go/py/cpp, container rust:1.85 in rust).
+# Bumping one left the other three on 1.85, which is how
+# "rustc 1.85.1 is not supported" survived several fixes.
+#
+# Keep this in step with fasten-core/Cargo.toml rust-version. CI asserts they
+# match (see .github/workflows/fasten-rust.yml).
+[toolchain]
+channel = "1.90"
+components = ["clippy", "rustfmt"]

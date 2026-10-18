@@ -39,8 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85
+      - name: Install Rust (rust-toolchain.toml)
+        # Version comes from rust-toolchain.toml at the repo root — do not
+        # pin it here. Four workflows build fasten-core and divergent pins
+        # are what kept CI on 1.85 through several fixes.
+        uses: dtolnay/rust-toolchain@master
 
       - name: Build fasten-core (.so)
         working-directory: fasten-core
