@@ -78,6 +78,12 @@ def start_purger(
     store: Any,
     stream: str,
     retention: timedelta,
+    # Shorter horizon for codes carrying personal data. None keeps the old
+    # behaviour (age-only purge). When set, every tick ALSO redacts rows whose
+    # code is in codes.pii_codes() and is older than this — the thing that
+    # makes pii_in_detail=True mean something at runtime instead of being a
+    # comment that only forces retention_class.
+    pii_retention: Optional[timedelta] = None,
     check_interval: timedelta = timedelta(hours=1),
     stop_event: Optional[threading.Event] = None,
     on_error: Optional[Callable[[str, Exception], None]] = None,
@@ -100,8 +106,20 @@ def start_purger(
                     return
             first = False
             try:
-                cutoff = _cutoff_iso(now_fn(), retention)
-                store.purge(before=cutoff)
+                now = now_fn()
+                # PII first: redact before the age purge, so a row that is past
+                # BOTH horizons has its detail destroyed rather than being
+                # deleted outright. Deleting it would remove a row from the
+                # middle of the chain, which verify_chain is built to detect as
+                # tampering (spec §7.1).
+                if pii_retention is not None:
+                    redact = getattr(store, "redact_expired", None)
+                    if callable(redact):
+                        from .codes import pii_codes
+                        codes_ = pii_codes()
+                        if codes_:
+                            redact(before=now - pii_retention, codes=codes_)
+                store.purge(before=_cutoff_iso(now, retention))
             except Exception as e:  # noqa: BLE001
                 # Never propagate — a transient DB blip must not stop the
                 # loop. Log via the caller's on_error hook so the retention

@@ -190,6 +190,25 @@ def registry() -> dict[str, Meta]:
     return dict(_registry)
 
 
+def pii_codes() -> list[str]:
+    """Codes whose rows may carry personal data in ``detail``.
+
+    This is what makes ``pii_in_detail=True`` mean something at runtime. The
+    flag forces ``retention_class`` to SHORT at registration, but nothing acted
+    on that: ``purge()`` filters on age alone, so an operator had to hand-pass
+    a list of codes to ``redact_expired`` and the flag was effectively a
+    comment.
+
+    Includes a code if EITHER it declares ``pii_in_detail`` or it is classified
+    SHORT — the forcing makes the first imply the second, and an adopter who
+    sets SHORT directly has said the same thing about retention.
+    """
+    return sorted(
+        name for name, meta in registry().items()
+        if meta.pii_in_detail or str(meta.retention_class) == "short"
+    )
+
+
 def dump() -> str:
     """`id,domain,severity` sorted one-per-line — feeds cross-language consistency gate."""
     rows = sorted(
