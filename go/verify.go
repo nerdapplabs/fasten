@@ -33,6 +33,7 @@ const currentCanonicalFormID = "1"
 // Seal, and VerifyChain dispatches automatically.
 var hashFnByForm = map[string]func(Row) string{
 	"1": rowHashPyCompat,
+	"2": rowHashForm2,
 }
 
 // Seal returns a copy of row sealed into the chain: it stamps the current
@@ -107,6 +108,34 @@ func VerifyChain(rows []Row) VerifyResult {
 				Reason:       fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID),
 			}
 		}
+		// Form "2" hashes detail_commitment, NOT detail. The hash therefore
+		// does not protect detail on its own: an attacker could rewrite detail
+		// and leave the commitment intact. Whenever detail is present the
+		// commitment MUST be recomputable and must match — and a missing salt
+		// is a break, not a skip, or clearing it would disable the check.
+		// Redaction clears detail AND salt together (spec §7.1), so a
+		// legitimately redacted row never reaches here.
+		if formID == "2" && row.Detail != nil {
+			if row.DetailSalt == "" {
+				return VerifyResult{
+					OK:           false,
+					TotalRows:    total,
+					FirstBreakAt: row.MonotonicSeq,
+					Reason: fmt.Sprintf(
+						"row %s: detail present but detail_salt is missing — commitment cannot be verified",
+						row.ID),
+				}
+			}
+			if detailCommitment(row.DetailSalt, row.Detail) != row.DetailCommitment {
+				return VerifyResult{
+					OK:           false,
+					TotalRows:    total,
+					FirstBreakAt: row.MonotonicSeq,
+					Reason:       fmt.Sprintf("row %s: detail does not match its commitment", row.ID),
+				}
+			}
+		}
+
 		expected := hashFn(row)
 		if expected != row.Hash {
 			return VerifyResult{
@@ -151,6 +180,41 @@ func rowHashPyCompat(row Row) string {
 	d := pyCanonicalRowMap(row)
 	b := canonicalJSON(d)
 	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// detailCommitment is the salted commitment to detail (spec §1.4):
+// sha256(salt || canonical_json(detail)). Must match
+// python/fasten/chain.py::detail_commitment byte for byte.
+//
+// The salt is what makes the commitment hiding. An unsalted digest of a
+// low-entropy value is a dictionary attack away from the original, so
+// redaction drops the salt along with the payload.
+func detailCommitment(salt string, detail map[string]any) string {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	sum := sha256.Sum256(append([]byte(salt), canonicalJSON(detail)...))
+	return hex.EncodeToString(sum[:])
+}
+
+// rowHashForm2 hashes form "2" (spec §1.4): form "1"'s field set with detail
+// and detail_salt removed and detail_commitment added, and the timestamp taken
+// VERBATIM from the wire form rather than re-rendered.
+//
+// Form "1" hashed "+00:00" while the row carried always-"Z" on the wire, so
+// every SDK needed a second private timestamp renderer used only in the hash
+// path — which is how Go and Python drifted apart inside it (P1-48). Form "2"
+// has one timestamp form, the one already written to the wire.
+func rowHashForm2(row Row) string {
+	d := pyCanonicalRowMap(row)
+	delete(d, "detail")
+	d["detail_commitment"] = row.DetailCommitment
+	d["timestamp"] = canonicalTS(row.Timestamp)
+	if row.ShippedAt != nil {
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+	}
+	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
 }
 

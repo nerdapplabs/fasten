@@ -141,6 +141,14 @@ type Row struct {
 	// empty strings; verify_chain skips them.
 	PrevHash string `json:"prev_hash,omitempty"`
 	Hash     string `json:"hash,omitempty"`
+
+	// Canonical form "2" (spec §1.4): detail is COMMITTED to rather than
+	// hashed directly, so it can be destroyed for retention without moving the
+	// row hash. Both are STORED but NOT hashed — DetailCommitment is what
+	// enters the hashed field set, in place of detail. Empty on form-"1" rows
+	// and empty again once the row is redacted.
+	DetailSalt       string `json:"detail_salt,omitempty"`
+	DetailCommitment string `json:"detail_commitment,omitempty"`
 }
 
 // UnmarshalJSON decodes a Row, preserving the EXACT numeric tokens in Detail.
