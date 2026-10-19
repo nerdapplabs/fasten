@@ -118,6 +118,11 @@ CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
+-- One node, one chain (spec §2): monotonic_seq is unique within a
+-- source_node_id. Enforced here so a duplicate allocation fails at WRITE
+-- rather than being discovered later by verify_chain, where it is
+-- indistinguishable from tampering.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 `, s.table,
 		s.table, s.table,
@@ -125,6 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		s.table, s.table,
 		s.table, s.table,
 		s.table, s.table,
+		s.table, s.table, // uq_<table>_node_seq
 	)
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -267,23 +273,37 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
 			row.OriginID, row.ID)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	// A REAL lock. The previous version did BeginTx + ExecContext("BEGIN
+	// IMMEDIATE") and discarded the error: BeginTx already opened a deferred
+	// transaction, so the nested BEGIN failed and the RESERVED lock was never
+	// taken. Two writers could then both read the same tip.
+	//
+	// The store is handed a *sql.DB by the caller, so it cannot put
+	// _txlock=immediate on the DSN. Instead take a dedicated connection and
+	// drive the transaction by hand, which lets BEGIN IMMEDIATE be the first
+	// statement on it and actually acquire RESERVED before the read.
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return Row{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer conn.Close()
 
-	if _, err := tx.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		// Already inside a tx on some drivers; the BeginTx above is the lock.
-		_ = err
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Row{}, fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
 
 	// TWO questions, TWO queries. seq must span EVERY row on this node, sealed
-	// or not: an unsealed row (pre-upgrade, or stdout-only mode) still occupies
-	// its number, and filtering those out restarts the counter and collides.
-	// prev_hash, by contrast, may only chain from a SEALED row.
+	// or not — an unsealed row still occupies its number, and filtering those
+	// out restarts the counter and collides with them. prev_hash, by contrast,
+	// may only chain from a SEALED row.
 	var nextSeq int64
-	if err := tx.QueryRowContext(ctx,
+	if err := conn.QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = ?",
 		row.SourceNodeID).Scan(&nextSeq); err != nil {
 		return Row{}, err
@@ -292,7 +312,7 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 
 	prevHash := "genesis"
 	var tip string
-	err = tx.QueryRowContext(ctx,
+	err = conn.QueryRowContext(ctx,
 		"SELECT hash FROM "+s.table+" WHERE source_node_id = ? AND hash != '' "+
 			"ORDER BY monotonic_seq DESC LIMIT 1", row.SourceNodeID).Scan(&tip)
 	if err == nil && tip != "" {
@@ -303,12 +323,13 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 
 	row.MonotonicSeq = nextSeq
 	sealed := Seal(prevHash, row)
-	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+	if err := s.insertRowExec(ctx, conn, sealed); err != nil {
 		return Row{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return Row{}, err
 	}
+	committed = true
 	return sealed, nil
 }
 

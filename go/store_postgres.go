@@ -103,6 +103,9 @@ CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
+-- One node, one chain (spec §2). A duplicate allocation fails at WRITE
+-- rather than surfacing later in verify_chain as a false tamper signal.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
 `, s.table,
@@ -248,6 +251,86 @@ func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 
 // InsertReplicated inserts a sealed row replicated from another origin
 // (autocommit single-row path).
+// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
+// atomically (spec §2.1). Mirrors SQLiteStore's implementation and Python's.
+//
+// Serialisation uses pg_advisory_xact_lock keyed on the node, NOT
+// SELECT … FOR UPDATE on the tip row: with an empty table there is no tip row
+// to lock, so FOR UPDATE would let every concurrent writer through to allocate
+// seq 1 — the exact defect this closes.
+//
+// Returns the SEALED row actually written.
+func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	if row.OriginID != row.ID {
+		return Row{}, fmt.Errorf(
+			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
+			row.OriginID, row.ID)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Row{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Idempotence under retry: the caller may re-run this after a lost ack, and
+	// the first attempt may well have committed. Re-running would allocate a
+	// fresh seq, hit ON CONFLICT DO NOTHING on the id, and hand back a sealed
+	// row that is not the one in the store. Check first.
+	var (
+		exSeq  int64
+		exPrev, exHash, exForm string
+	)
+	err = tx.QueryRowContext(ctx,
+		"SELECT monotonic_seq, prev_hash, hash, canonical_form_id FROM "+s.table+
+			" WHERE id = $1", row.ID).Scan(&exSeq, &exPrev, &exHash, &exForm)
+	if err == nil {
+		row.MonotonicSeq, row.PrevHash, row.Hash, row.CanonicalFormID = exSeq, exPrev, exHash, exForm
+		if cerr := tx.Commit(); cerr != nil {
+			return Row{}, cerr
+		}
+		return row, nil
+	} else if err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", row.SourceNodeID); err != nil {
+		return Row{}, err
+	}
+
+	// TWO questions, TWO queries — see the SQLite implementation. seq spans
+	// EVERY row on the node (an unsealed row still holds its number);
+	// prev_hash chains only from a sealed one.
+	var nextSeq int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = $1",
+		row.SourceNodeID).Scan(&nextSeq); err != nil {
+		return Row{}, err
+	}
+	nextSeq++
+
+	prevHash := "genesis"
+	var tip string
+	err = tx.QueryRowContext(ctx,
+		"SELECT hash FROM "+s.table+" WHERE source_node_id = $1 AND hash <> '' "+
+			"ORDER BY monotonic_seq DESC LIMIT 1", row.SourceNodeID).Scan(&tip)
+	if err == nil && tip != "" {
+		prevHash = tip
+	} else if err != nil && err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	row.MonotonicSeq = nextSeq
+	sealed := Seal(prevHash, row)
+	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+		return Row{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Row{}, err
+	}
+	return sealed, nil
+}
+
 func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)

@@ -139,7 +139,7 @@ func TestNewReader_TwoReadersKeepSeparateScopes(t *testing.T) {
 // with no store at all, rows go out unsealed rather than carrying a fabricated
 // in-memory sequence that cannot survive a restart or a second process.
 func TestEngine_StoreAllocatesSequence(t *testing.T) {
-	t.Skip("store-allocated sequencing is REVERTED until PostgresStore has an allocator and the SQLite lock actually holds (plan C6). Without that, routing Emit through the store writes every Go/Postgres row unsealed.")
+	t.Skip("C6 piece 4 (engine rewiring) is not landed: re-landing panics with a nil pointer in MaxMonotonicSeq because e.auditStore can hold a TYPED NIL (*SQLiteStore)(nil), so the interface is non-nil and the method call dereferences 0x0. Stores now allocate correctly; the engine wiring needs that typed-nil guard first.")
 
 	registerTestCodes(t)
 	resetGlobals(t)
@@ -185,7 +185,7 @@ func TestEngine_StoreAllocatesSequence(t *testing.T) {
 }
 
 func TestEngine_NoStoreEmitsUnsealed(t *testing.T) {
-	t.Skip("spec 8.1 storeless behaviour depends on the same rewiring (plan C6).")
+	t.Skip("Depends on the same engine rewiring (C6 piece 4).")
 
 	registerTestCodes(t)
 	resetGlobals(t)
