@@ -35,6 +35,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Toolchain declarations agree
+        # Override the job default (working-directory: rust) — both files being
+        # compared live at the REPO ROOT, and the inherited default made this
+        # step grep from rust/ and fail with "No such file or directory".
+        working-directory: ${{ github.workspace }}
         run: |
           tc=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
           mv=$(grep -oE 'rust-version = "[0-9.]+"' fasten-core/Cargo.toml | grep -oE '[0-9.]+')

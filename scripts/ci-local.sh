@@ -62,6 +62,49 @@ done
 [ "$ORDER_OK" -eq 1 ] && pass "checkout precedes the toolchain reader" \
                       || bad "a toolchain reader runs before checkout"
 
+# Every `run:` step that reads a repo-root file must either override the job
+# default working-directory or use a path relative to it. The rust job defaults
+# to working-directory: rust, which made the drift check grep rust-toolchain.toml
+# from rust/ and fail with "No such file or directory". ci-local.sh runs from the
+# root, so it cannot see this class of bug by running commands — it has to be
+# checked structurally.
+# Run in Docker: the host python3 may not have pyyaml, and this check must not
+# silently degrade — a FAIL here previously just meant "pyyaml missing".
+if docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c '
+  pip install -q pyyaml >/dev/null 2>&1
+  python3 - <<PY
+import glob, sys, yaml
+bad = []
+for f in sorted(glob.glob(".github/workflows/*.yml")):
+    try:
+        d = yaml.safe_load(open(f))
+    except Exception:
+        continue
+    for jn, j in (d.get("jobs") or {}).items():
+        dflt = ((j.get("defaults") or {}).get("run") or {}).get("working-directory")
+        if not dflt:
+            continue
+        for st in j.get("steps") or []:
+            run = st.get("run") or ""
+            if not run or st.get("working-directory") is not None:
+                continue
+            # Only files genuinely read from the repo root. Patterns like
+            # "spec/" substring-match legitimate relative paths such as
+            # "../spec/", and a check that cries wolf gets ignored.
+            for root in ("rust-toolchain.toml",):
+                if root in run:
+                    bad.append(f"{f}/{jn}: step {st.get(\"name\",\"?\")!r} reads {root} but inherits working-directory: {dflt}")
+                    break
+for b in bad:
+    print(b)
+sys.exit(1 if bad else 0)
+PY' >/dev/null 2>&1
+then
+  pass "no step reads a repo-root path from a subdirectory default"
+else
+  bad "a step reads a repo-root path but inherits a subdirectory working-directory"
+fi
+
 # Lockfiles must be tracked or --locked cannot work.
 if git ls-files --error-unmatch rust/Cargo.lock fasten-core/Cargo.lock >/dev/null 2>&1; then
   pass "both Cargo.lock files are tracked"

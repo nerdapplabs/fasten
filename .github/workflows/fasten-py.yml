@@ -45,6 +45,10 @@ jobs:
 
       - name: Read toolchain from rust-toolchain.toml
         id: rust-toolchain-file
+        # Override the job default (working-directory: python) — the file is at
+        # the REPO ROOT, and the inherited default makes grep fail with
+        # "No such file or directory".
+        working-directory: ${{ github.workspace }}
         run: |
           ch=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
           [ -n "$ch" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
