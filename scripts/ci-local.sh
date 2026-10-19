@@ -36,6 +36,32 @@ else
   bad "divergent toolchain pins: $(echo $STRAY)"
 fi
 
+# dtolnay/rust-toolchain@master REQUIRES a toolchain input; it does not read
+# rust-toolchain.toml. Omitting it fails with "'toolchain' is a required
+# input" — a failure the pin check above cannot see, because there is no pin.
+MASTER=$(grep -rlE "dtolnay/rust-toolchain@master" .github/workflows/ 2>/dev/null)
+missing=""
+for f in $MASTER; do
+  grep -q "outputs.channel }}" "$f" || missing="$missing $(basename "$f")"
+done
+if [ -z "$MASTER" ]; then
+  pass "no @master toolchain actions to check"
+elif [ -z "$missing" ]; then
+  pass "every @master toolchain action receives a toolchain input"
+else
+  bad "@master without a toolchain input:$missing"
+fi
+
+# The reader step greps rust-toolchain.toml, so checkout must precede it.
+ORDER_OK=1
+for f in $MASTER; do
+  ck=$(grep -n "actions/checkout" "$f" | head -1 | cut -d: -f1)
+  rd=$(grep -n "Read toolchain from rust-toolchain.toml" "$f" | head -1 | cut -d: -f1)
+  [ -n "$ck" ] && [ -n "$rd" ] && [ "$ck" -lt "$rd" ] || ORDER_OK=0
+done
+[ "$ORDER_OK" -eq 1 ] && pass "checkout precedes the toolchain reader" \
+                      || bad "a toolchain reader runs before checkout"
+
 # Lockfiles must be tracked or --locked cannot work.
 if git ls-files --error-unmatch rust/Cargo.lock fasten-core/Cargo.lock >/dev/null 2>&1; then
   pass "both Cargo.lock files are tracked"
@@ -85,6 +111,42 @@ if docker run --rm --memory=6g -v "$PWD":/w -w /w/go \
   pass "go tests"
 else
   bad "go tests"
+fi
+
+echo
+echo "== postgres (local only; CI is SQLite-only by decision) =="
+PGC=fasten-ci-local-pg
+docker rm -f "$PGC" >/dev/null 2>&1
+if docker run -d --name "$PGC" -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=fasten \
+     -p 55433:5432 postgres:16-alpine >/dev/null 2>&1; then
+  i=0; until docker exec "$PGC" pg_isready -U postgres >/dev/null 2>&1 || [ $i -ge 40 ]; do
+    i=$((i+1)); sleep 1; done
+  DSN="postgresql://postgres:pw@127.0.0.1:55433/fasten"
+  if docker run --rm --network host -v "$PWD":/w -w /w/python \
+       -e FASTEN_CORE_LIB=/w/fasten-core/target/release/libfasten_core.so \
+       -e FASTEN_TEST_POSTGRES_DSN="$DSN" python:3.12-slim sh -c \
+       "pip install -q -e '.[sqlite,postgres,fastapi,dev]' && \
+        python -m pytest tests/test_postgres_allocation.py -q" >/dev/null 2>&1; then
+    pass "python postgres allocation"
+  else
+    bad "python postgres allocation"
+  fi
+  # Go PG tests are behind //go:build integration, like the rest of the Go
+  # Postgres suite. Without this the Go allocator, its advisory lock and the
+  # UNIQUE index were never executed anywhere — the same gap that let Go write
+  # every Postgres row unsealed while every SQLite test passed.
+  if docker run --rm --network host --memory=6g -v "$PWD":/w -w /w/go \
+       -e LD_LIBRARY_PATH=/w/fasten-core/target/release \
+       -e FASTEN_TEST_POSTGRES_DSN="postgres://postgres:pw@127.0.0.1:55433/fasten?sslmode=disable" \
+       golang:1-bookworm sh -c "go test -vet=off -tags integration -run 'TestPGAlloc' ./..." \
+       >/dev/null 2>&1; then
+    pass "go postgres allocation"
+  else
+    bad "go postgres allocation"
+  fi
+  docker rm -f "$PGC" >/dev/null 2>&1
+else
+  bad "could not start postgres:16"
 fi
 
 echo

@@ -282,6 +282,21 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	// _txlock=immediate on the DSN. Instead take a dedicated connection and
 	// drive the transaction by hand, which lets BEGIN IMMEDIATE be the first
 	// statement on it and actually acquire RESERVED before the read.
+	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
+	// microseconds and ROUNDS anything finer, so a row sealed over Go's
+	// nanosecond precision hashes a timestamp the store cannot hold: the row
+	// comes back with 265373000ns where 265372967ns was hashed, and
+	// VerifyChain reports a hash mismatch on a row nobody touched.
+	//
+	// SQLite does not show this because it stores the rendered ISO string
+	// verbatim, which is why every SQLite test passed. Truncating in both
+	// backends keeps one rule: what we hash is what the store can return.
+	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
+	if row.ShippedAt != nil {
+		t := row.ShippedAt.Truncate(time.Microsecond)
+		row.ShippedAt = &t
+	}
+
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return Row{}, err
@@ -624,31 +639,40 @@ func filterToSQL(f Filter) (string, []any) {
 	var conds []string
 	var args []any
 	if f.RequestID != "" {
-		conds = append(conds, "request_id = ?"); args = append(args, f.RequestID)
+		conds = append(conds, "request_id = ?")
+		args = append(args, f.RequestID)
 	}
 	if f.Code != "" {
-		conds = append(conds, "code = ?"); args = append(args, string(f.Code))
+		conds = append(conds, "code = ?")
+		args = append(args, string(f.Code))
 	}
 	if f.Domain != "" {
-		conds = append(conds, "domain = ?"); args = append(args, string(f.Domain))
+		conds = append(conds, "domain = ?")
+		args = append(args, string(f.Domain))
 	}
 	if f.SourceNodeID != "" {
-		conds = append(conds, "source_node_id = ?"); args = append(args, f.SourceNodeID)
+		conds = append(conds, "source_node_id = ?")
+		args = append(args, f.SourceNodeID)
 	}
 	if f.TenantID != "" {
-		conds = append(conds, "tenant_id = ?"); args = append(args, f.TenantID)
+		conds = append(conds, "tenant_id = ?")
+		args = append(args, f.TenantID)
 	}
 	if f.Actor != "" {
-		conds = append(conds, "actor = ?"); args = append(args, f.Actor)
+		conds = append(conds, "actor = ?")
+		args = append(args, f.Actor)
 	}
 	if f.Target != "" {
-		conds = append(conds, "target = ?"); args = append(args, f.Target)
+		conds = append(conds, "target = ?")
+		args = append(args, f.Target)
 	}
 	if !f.Since.IsZero() {
-		conds = append(conds, "timestamp >= ?"); args = append(args, canonicalTS(f.Since))
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, canonicalTS(f.Since))
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, "timestamp <= ?"); args = append(args, canonicalTS(f.Until))
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, canonicalTS(f.Until))
 	}
 	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
 	// bound, applied in Query so CountFiltered/total stays the full match count.

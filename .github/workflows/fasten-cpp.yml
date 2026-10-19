@@ -23,11 +23,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Read toolchain from rust-toolchain.toml
+        id: rust-toolchain-file
+        run: |
+          ch=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
+          [ -n "$ch" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          echo "channel=$ch" >> "$GITHUB_OUTPUT"
+          echo "toolchain: $ch"
+
       - name: Install Rust (rust-toolchain.toml)
-        # Version comes from rust-toolchain.toml at the repo root — do not
-        # pin it here. Four workflows build fasten-core and divergent pins
-        # are what kept CI on 1.85 through several fixes.
+        # dtolnay/rust-toolchain requires an explicit `toolchain` input — it
+        # does NOT read rust-toolchain.toml. Read the channel from that file
+        # and pass it, so the file stays the single source of truth and the
+        # four workflows that build fasten-core cannot drift apart again.
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain-file.outputs.channel }}
 
       - name: Build fasten-core (.so)
         working-directory: fasten-core

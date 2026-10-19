@@ -109,12 +109,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
 `, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
+		s.bare, s.table, // idx_<t>_req
+		s.bare, s.table, // idx_<t>_code
+		s.bare, s.table, // idx_<t>_ts
+		s.bare, s.table, // idx_<t>_seq
+		s.bare, s.table, // uq_<t>_node_seq
+		s.bare, s.table, // idx_<t>_unshipped
+		s.bare, s.table, // idx_<t>_pii
 	)
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -266,6 +267,21 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
 			row.OriginID, row.ID)
 	}
+	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
+	// microseconds and ROUNDS anything finer, so a row sealed over Go's
+	// nanosecond precision hashes a timestamp the store cannot hold: the row
+	// comes back with 265373000ns where 265372967ns was hashed, and
+	// VerifyChain reports a hash mismatch on a row nobody touched.
+	//
+	// SQLite does not show this because it stores the rendered ISO string
+	// verbatim, which is why every SQLite test passed. Truncating in both
+	// backends keeps one rule: what we hash is what the store can return.
+	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
+	if row.ShippedAt != nil {
+		t := row.ShippedAt.Truncate(time.Microsecond)
+		row.ShippedAt = &t
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Row{}, err
@@ -277,7 +293,7 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 	// fresh seq, hit ON CONFLICT DO NOTHING on the id, and hand back a sealed
 	// row that is not the one in the store. Check first.
 	var (
-		exSeq  int64
+		exSeq                  int64
 		exPrev, exHash, exForm string
 	)
 	err = tx.QueryRowContext(ctx,
@@ -511,31 +527,49 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 	var args []any
 	n := 1
 	if f.RequestID != "" {
-		conds = append(conds, fmt.Sprintf("request_id = $%d", n)); args = append(args, f.RequestID); n++
+		conds = append(conds, fmt.Sprintf("request_id = $%d", n))
+		args = append(args, f.RequestID)
+		n++
 	}
 	if f.Code != "" {
-		conds = append(conds, fmt.Sprintf("code = $%d", n)); args = append(args, string(f.Code)); n++
+		conds = append(conds, fmt.Sprintf("code = $%d", n))
+		args = append(args, string(f.Code))
+		n++
 	}
 	if f.Domain != "" {
-		conds = append(conds, fmt.Sprintf("domain = $%d", n)); args = append(args, string(f.Domain)); n++
+		conds = append(conds, fmt.Sprintf("domain = $%d", n))
+		args = append(args, string(f.Domain))
+		n++
 	}
 	if f.SourceNodeID != "" {
-		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n)); args = append(args, f.SourceNodeID); n++
+		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n))
+		args = append(args, f.SourceNodeID)
+		n++
 	}
 	if f.TenantID != "" {
-		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n)); args = append(args, f.TenantID); n++
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n))
+		args = append(args, f.TenantID)
+		n++
 	}
 	if f.Actor != "" {
-		conds = append(conds, fmt.Sprintf("actor = $%d", n)); args = append(args, f.Actor); n++
+		conds = append(conds, fmt.Sprintf("actor = $%d", n))
+		args = append(args, f.Actor)
+		n++
 	}
 	if f.Target != "" {
-		conds = append(conds, fmt.Sprintf("target = $%d", n)); args = append(args, f.Target); n++
+		conds = append(conds, fmt.Sprintf("target = $%d", n))
+		args = append(args, f.Target)
+		n++
 	}
 	if !f.Since.IsZero() {
-		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n)); args = append(args, f.Since.UTC()); n++
+		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n))
+		args = append(args, f.Since.UTC())
+		n++
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n)); args = append(args, f.Until.UTC()); n++
+		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n))
+		args = append(args, f.Until.UTC())
+		n++
 	}
 	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
 	// bound, applied in Query so CountFiltered/total stays the full match count.
