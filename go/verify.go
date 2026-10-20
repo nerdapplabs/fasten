@@ -2,6 +2,7 @@ package fasten
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,13 +21,26 @@ import (
 // The hashed canonical form is versioned via Row.CanonicalFormID so the choice
 // of bytes is tamper-evident and future forms are additive.
 //
-// Form "1" (the only form today): SHA-256 of the canonical JSON of the row map
-// built by pyCanonicalRowMap (the "hash" key excluded, canonical_form_id
-// INCLUDED), matching Python json.dumps(sort_keys=True, separators=(',',':'),
-// default=str) over AuditRow.to_dict() byte-for-byte. A new form is added by
-// registering a new id in hashFnByForm with its own function; VerifyChain
-// dispatches per row and REJECTS rows carrying an unknown id.
-const currentCanonicalFormID = "1"
+// Form "1": SHA-256 of the canonical JSON of the row map built by
+// pyCanonicalRowMap (the "hash" key excluded, canonical_form_id INCLUDED),
+// matching Python json.dumps(sort_keys=True, separators=(',',':'),
+// default=str) over AuditRow.to_dict() byte-for-byte.
+//
+// Form "2" (spec §1.4, what we seal now): detail_commitment replaces detail in
+// the hashed set, so detail can be destroyed for retention without moving the
+// hash. Form "1" rows still verify under form "1" — old rows are never
+// re-sealed, which would destroy the evidence.
+//
+// This MUST match Python's CURRENT_CANONICAL_FORM_ID. While Go sealed "1" and
+// Python sealed "2", the two SDKs produced different forms for the same row,
+// and the PII horizon (Config.RetentionPII) could never fire on a Go-sealed
+// row: form "1" hashes detail directly, so redacting one breaks the chain.
+// VerifyChain dispatches per row and REJECTS an unknown id.
+const currentCanonicalFormID = "2"
+
+// legacyCanonicalFormID is the form a row carries when canonical_form_id is
+// absent — i.e. it was written before the field existed, which means form "1".
+const legacyCanonicalFormID = "1"
 
 // hashFnByForm maps a canonical_form_id to the function that hashes a row under
 // that form. Adding v2 is purely additive: register a new id here, stamp it in
@@ -37,14 +51,33 @@ var hashFnByForm = map[string]func(Row) string{
 }
 
 // Seal returns a copy of row sealed into the chain: it stamps the current
-// CanonicalFormID, sets PrevHash, and computes the self Hash over the canonical
-// form. This is the ONE canonical way to seal a row — Emit goes through it, so
-// Go Emit, Go VerifyChain and Python seal all agree on a single field set.
+// CanonicalFormID, sets PrevHash, mints the form-"2" salt/commitment, and
+// computes the self Hash. This is the ONE canonical way to seal a row — Emit
+// goes through it, so Go Emit, Go VerifyChain and Python seal agree on a
+// single field set.
 func Seal(prevHash string, row Row) Row {
 	row.CanonicalFormID = currentCanonicalFormID
 	row.PrevHash = prevHash
+	// Mirrors Python chain.seal: reuse a caller-supplied salt (a replicated
+	// row arrives with its own) and mint one otherwise.
+	if row.DetailSalt == "" {
+		row.DetailSalt = newDetailSalt()
+	}
+	row.DetailCommitment = detailCommitment(row.DetailSalt, row.Detail)
 	row.Hash = hashFnByForm[currentCanonicalFormID](row)
 	return row
+}
+
+// newDetailSalt mints a 32-byte salt, hex-encoded — the same shape as Python's
+// secrets.token_hex(32), so a commitment is reproducible across SDKs.
+func newDetailSalt() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is not recoverable: a predictable salt makes the
+		// commitment guessable, which is the one thing it exists to prevent.
+		panic("fasten: crypto/rand unavailable, cannot mint a detail salt: " + err.Error())
+	}
+	return hex.EncodeToString(b)
 }
 
 // VerifyResult is the outcome of VerifyChain.
@@ -97,7 +130,11 @@ func VerifyChain(rows []Row) VerifyResult {
 		}
 		formID := row.CanonicalFormID
 		if formID == "" {
-			formID = currentCanonicalFormID // rows sealed before the field existed
+			// "1", NOT currentCanonicalFormID: a row written before the field
+			// existed IS form "1". Defaulting to "current" silently
+			// re-interpreted every legacy row the moment the SDK started
+			// sealing "2", and they then failed the commitment check.
+			formID = legacyCanonicalFormID
 		}
 		hashFn, ok := hashFnByForm[formID]
 		if !ok {
@@ -240,31 +277,31 @@ func pyCanonicalRowMap(row Row) map[string]any {
 	}
 	formID := row.CanonicalFormID
 	if formID == "" {
-		formID = currentCanonicalFormID
+		formID = legacyCanonicalFormID // see VerifyChain
 	}
 	return map[string]any{
 		"canonical_form_id": formID,
 		"id":                row.ID,
-		"origin_id":      row.OriginID,
-		"monotonic_seq":  row.MonotonicSeq,
-		"timestamp":      pyISOFormat(row.Timestamp),
-		"code":           string(row.Code),
-		"action":         row.Action,
-		"severity":       string(row.Severity),
-		"service_id":     row.ServiceID,
-		"source_node_id": row.SourceNodeID,
-		"tenant_id":      tenant,
-		"actor":          row.Actor,
-		"actor_kind":     row.ActorKind,
-		"target":         row.Target,
-		"category":       row.Category,
-		"domain":         string(row.Domain),
-		"method":         row.Method,
-		"request_id":     row.RequestID,
-		"detail":         detail,
-		"wire_version":   wire,
-		"shipped_at":     shipped,
-		"prev_hash":      row.PrevHash,
+		"origin_id":         row.OriginID,
+		"monotonic_seq":     row.MonotonicSeq,
+		"timestamp":         pyISOFormat(row.Timestamp),
+		"code":              string(row.Code),
+		"action":            row.Action,
+		"severity":          string(row.Severity),
+		"service_id":        row.ServiceID,
+		"source_node_id":    row.SourceNodeID,
+		"tenant_id":         tenant,
+		"actor":             row.Actor,
+		"actor_kind":        row.ActorKind,
+		"target":            row.Target,
+		"category":          row.Category,
+		"domain":            string(row.Domain),
+		"method":            row.Method,
+		"request_id":        row.RequestID,
+		"detail":            detail,
+		"wire_version":      wire,
+		"shipped_at":        shipped,
+		"prev_hash":         row.PrevHash,
 	}
 }
 

@@ -61,7 +61,10 @@ var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id,` +
+	// Form "2" (spec §1.4). Omitting them dropped the salt on every write, so
+	// replicated Python rows failed the commitment check.
+	` detail_salt, detail_commitment`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
@@ -112,7 +115,9 @@ CREATE TABLE IF NOT EXISTS %s (
     wire_version  TEXT NOT NULL DEFAULT '1',
     hash          TEXT NOT NULL DEFAULT '',
     prev_hash     TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT NOT NULL DEFAULT '',
+    detail_commitment TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -151,6 +156,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+		{"detail_salt", "TEXT NOT NULL DEFAULT ''"},
+		{"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if !existing[col.name] {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -221,7 +228,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		formID = "1"
 	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		canonicalTS(row.Timestamp),
 		string(row.Code), row.Action, string(row.Severity),
@@ -233,6 +240,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		piiFlag,
 		shippedAt,
 		wv, row.Hash, row.PrevHash, formID,
+		row.DetailSalt, row.DetailCommitment,
 	)
 	return err
 }
@@ -309,7 +317,9 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	committed := false
 	defer func() {
 		if !committed {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			// NOT ctx: a cancelled ctx skips the ROLLBACK, and Close() then
+			// returns the conn to the pool still holding the write lock.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
 
@@ -700,6 +710,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
+			&r.DetailSalt, &r.DetailCommitment,
 		); err != nil {
 			return nil, err
 		}
@@ -743,4 +754,90 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRedactionCandidates implements RedactionRepository (spec §7.1).
+//
+// Skips form-"1" rows: their detail IS hashed, so redacting one changes its
+// hash and cascades a re-seal down the chain. Counted and logged rather than
+// skipped quietly — on a pre-form-"2" store, silence lets an operator watch
+// redaction "succeed" while the personal data survives.
+func (s *SQLiteStore) ListRedactionCandidates(
+	ctx context.Context, before time.Time, codes []Code,
+) ([]RedactionCandidate, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(codes)+1)
+	args = append(args, canonicalTS(before))
+	ph := ""
+	for i, c := range codes {
+		if i > 0 {
+			ph += ","
+		}
+		ph += "?"
+		args = append(args, string(c))
+	}
+
+	var skipped int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE timestamp < ? AND code IN (%s) "+
+			"AND canonical_form_id <> '2' AND detail <> 'null'", s.table, ph),
+		args...).Scan(&skipped); err != nil {
+		return nil, err
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr,
+			"fasten RedactExpired: %d row(s) past the PII horizon were NOT "+
+				"redacted because canonical_form_id != '2' — their detail is "+
+				"inside the hash, so redacting would break the chain. Personal "+
+				"data in these rows still exists.\n", skipped)
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		"SELECT id, monotonic_seq FROM %s WHERE timestamp < ? AND code IN (%s) "+
+			"AND canonical_form_id = '2' AND detail <> 'null' "+
+			"ORDER BY monotonic_seq", s.table, ph),
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RedactionCandidate
+	for rows.Next() {
+		var c RedactionCandidate
+		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RedactRows implements RedactionRepository (spec §7.1). Destroys detail and
+// detail_salt on an explicit id list; the hash, prev_hash and monotonic_seq are
+// untouched, so the chain still verifies. Idempotent — it targets ids, not a
+// time window, so a retry destroys the same rows and returns the same list.
+func (s *SQLiteStore) RedactRows(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(ids))
+	ph := ""
+	for i, id := range ids {
+		if i > 0 {
+			ph += ","
+		}
+		ph += "?"
+		args = append(args, id)
+	}
+	// 'null' (the JSON literal), not SQL NULL: detail is NOT NULL and dropping
+	// that on SQLite needs a full table rebuild. Reads back as nil either way.
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s SET detail = 'null', detail_salt = '' "+
+			"WHERE id IN (%s) AND canonical_form_id = '2'", s.table, ph),
+		args...); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

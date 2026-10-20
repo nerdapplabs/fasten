@@ -296,7 +296,7 @@ func (e *Engine) Init(cfg Config) error {
 	}
 
 	// FR1 retention (§1). Env-var overrides zero-valued fields.
-	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog); err != nil {
+	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
 		return err
 	}
 	return nil
@@ -377,7 +377,7 @@ func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore
 // hard Init error rather than a silent fall-through — an operator who set
 // FASTEN_RETENTION_SYSLOG=foo needs to hear about it, not have their
 // history grow forever behind a green completeness flag.
-func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
+func (e *Engine) startRetention(apiRet, sysRet, piiRet time.Duration) error {
 	// Env override: only when Config was zero. Empty env = disabled.
 	if apiRet == 0 {
 		if s := envOr("FASTEN_RETENTION_API", ""); s != "" {
@@ -397,6 +397,15 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 			sysRet = d
 		}
 	}
+	if piiRet == 0 {
+		if s := envOr("FASTEN_RETENTION_PII", ""); s != "" {
+			d, err := parseRetentionDuration(s)
+			if err != nil {
+				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_PII: %w", err)
+			}
+			piiRet = d
+		}
+	}
 
 	// Stop any previous generation before starting a new one AND wait for
 	// its goroutines to actually exit — a re-Init on the same Engine leaves
@@ -404,8 +413,10 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 	// drainerSysLog error path races the new Init's e.xport swap.
 	e.stopRetention()
 
-	// Nothing configured on either stream → no goroutine.
-	if (apiRet == 0 || e.apiStore == nil) && (sysRet == 0 || e.syslogStore == nil) {
+	// Nothing configured on any stream → no goroutine.
+	if (apiRet == 0 || e.apiStore == nil) &&
+		(sysRet == 0 || e.syslogStore == nil) &&
+		(piiRet == 0 || e.auditStore == nil) {
 		return nil
 	}
 
@@ -427,6 +438,23 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 	if sysRet > 0 && e.syslogStore != nil {
 		startPurger(ctx, &e.retentionWg, retentionParams{
 			stream: "sys", store: e.syslogStore, retention: sysRet,
+			checkInterval: time.Hour, onError: onErr,
+		})
+	}
+	// P1-55 audit PII horizon. No store/retention: redaction only.
+	if piiRet > 0 && e.auditStore != nil {
+		if _, ok := e.auditStore.(RedactionRepository); !ok {
+			return fmt.Errorf(
+				"fasten.Init: RetentionPII is set but audit store %T does not "+
+					"implement RedactionRepository (spec §7.1) — personal data "+
+					"would never be redacted", e.auditStore)
+		}
+		startPurger(ctx, &e.retentionWg, retentionParams{
+			stream: "audit", piiRetention: piiRet,
+			redactFn: func(ctx context.Context, before time.Time) error {
+				_, err := e.RedactExpired(ctx, before, "retention")
+				return err
+			},
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}

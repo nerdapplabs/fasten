@@ -500,11 +500,75 @@ class PostgresStore:
         it back into Python ``None``, so the row reads exactly as spec §7.1
         requires and the bytes are gone either way.
 
-        Returns the ids of the rows redacted, so the caller can emit one
-        AUDIT_ROW_REDACTED event per row (spec §7.2) — without that, an
-        honest erasure and a quiet redaction are indistinguishable.
+        Convenience wrapper over ``list_redaction_candidates`` + ``redact_rows``
+        for callers with no audit chain to write events into. ``Engine`` drives
+        the two halves separately so it can record before it destroys — prefer
+        ``Engine.redact_expired``, which is what spec §7.2 requires.
+        """
+        candidates = self.list_redaction_candidates(before=before, codes=codes)
+        return self.redact_rows(ids=[cid for cid, _ in candidates])
+
+    def list_redaction_candidates(
+        self, *, before: datetime, codes: "Sequence[str]",
+    ) -> "list[tuple[str, int]]":
+        """``(id, monotonic_seq)`` of rows this store WOULD redact.
+
+        See the SQLite implementation. Split from the destruction so the caller
+        writes its spec §7.2 records BEFORE any data is destroyed, and returns
+        ``monotonic_seq`` because §7.2 specifies ``redacted_seq``.
         """
         if not codes:
+            return []
+
+        def _run(conn: Any) -> "list[tuple[str, int]]":
+            with conn.cursor() as cur:
+                # Count what we are about to NOT redact. Silence here would let
+                # an operator on a pre-form-"2" store watch redaction "succeed"
+                # while the personal data survives. See the SQLite store.
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {self._table} "
+                    "WHERE timestamp < %s AND code = ANY(%s) "
+                    "AND canonical_form_id <> '2' AND detail <> 'null'",
+                    (_utc_iso(before), list(codes)),
+                )
+                skipped = cur.fetchone()[0]
+                if skipped:
+                    logger.warning(
+                        "fasten redact_expired: %d row(s) past the PII horizon "
+                        "were NOT redacted because canonical_form_id != '2' — "
+                        "their detail is inside the hash, so redacting would "
+                        "break the chain. Personal data in these rows still "
+                        "exists. Re-seal under form '2' or erase the chain "
+                        "segment.",
+                        skipped,
+                    )
+                cur.execute(
+                    f"SELECT id, monotonic_seq FROM {self._table} "
+                    "WHERE timestamp < %s AND code = ANY(%s) "
+                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "ORDER BY monotonic_seq",
+                    (_utc_iso(before), list(codes)),
+                )
+                return [(r[0], r[1]) for r in cur.fetchall()]
+
+        # Read-only: safe to retry, nothing is destroyed here.
+        return cast("list[tuple[str, int]]", self._execute_with_retry(_run))
+
+    def redact_rows(self, *, ids: "Sequence[str]") -> "list[str]":
+        """Destroy ``detail`` and ``detail_salt`` on an explicit id list.
+
+        Idempotent by construction: it targets ids, not a time window, so the
+        retry ``_execute_with_retry`` performs after a lost commit
+        acknowledgement destroys the same rows and returns the same list.
+
+        The previous shape derived its return value from ``RETURNING id`` on a
+        window query guarded by ``detail <> 'null'``. Under retry that guard
+        excluded the rows the lost-but-committed attempt had already redacted,
+        so the retry returned ``[]`` and the caller wrote no events for rows it
+        had just destroyed — a silent redaction, which is the one outcome spec
+        §7.2 exists to prevent.
+        """
+        if not ids:
             return []
 
         def _run(conn: Any) -> "list[str]":
@@ -512,14 +576,11 @@ class PostgresStore:
                 cur.execute(
                     f"UPDATE {self._table} "
                     "SET detail = 'null', detail_salt = NULL "
-                    "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id = '2' AND detail <> 'null' "
-                    "RETURNING id",
-                    (_utc_iso(before), list(codes)),
+                    "WHERE id = ANY(%s) AND canonical_form_id = '2'",
+                    (list(ids),),
                 )
-                ids = [r[0] for r in cur.fetchall()]
             conn.commit()
-            return ids
+            return list(ids)
 
         return cast("list[str]", self._execute_with_retry(_run))
 

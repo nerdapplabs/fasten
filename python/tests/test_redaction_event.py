@@ -140,8 +140,11 @@ def test_redaction_code_is_registered_before_any_data_is_destroyed():
     calls = []
 
     class Probe(SQLiteStore):
-        def redact_expired(self, *, before, codes):
-            # By the time any data is touched, the code must be registered.
+        # The hook point is list_redaction_candidates, not redact_expired:
+        # Engine now selects candidates, writes their §7.2 records, and only
+        # then destroys, so this is the first store call in the sequence and
+        # the registration must already have happened by here.
+        def list_redaction_candidates(self, *, before, codes):
             calls.append(meta_of("AUDIT_ROW_REDACTED") is not None)
             return []
 

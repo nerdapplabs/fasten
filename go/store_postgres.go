@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -97,7 +98,9 @@ CREATE TABLE IF NOT EXISTS %s (
     wire_version   TEXT NOT NULL DEFAULT '1',
     hash           TEXT NOT NULL DEFAULT '',
     prev_hash      TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT NOT NULL DEFAULT '',
+    detail_commitment TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
@@ -154,6 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+		{"detail_salt", "TEXT NOT NULL DEFAULT ''"},
+		{"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if _, ok := existing[col.name]; !ok {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -191,7 +196,9 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id,` +
+	// Form "2" (spec §1.4). See auditCols in store.go.
+	` detail_salt, detail_commitment`
 
 // insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
 // execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
@@ -219,7 +226,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		formID = "1"
 	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
+		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
 		string(row.Code), row.Action, string(row.Severity),
@@ -231,6 +238,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		piiFlag,
 		shippedAt,
 		wv, row.Hash, row.PrevHash, formID,
+		row.DetailSalt, row.DetailCommitment,
 	)
 	return err
 }
@@ -599,6 +607,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
+			&r.DetailSalt, &r.DetailCommitment,
 		); err != nil {
 			return nil, err
 		}
@@ -631,4 +640,80 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRedactionCandidates implements RedactionRepository (spec §7.1).
+// See the SQLite implementation for the form-"1" rationale.
+func (s *PostgresStore) ListRedactionCandidates(
+	ctx context.Context, before time.Time, codes []Code,
+) ([]RedactionCandidate, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	// Numbered placeholders, not pq.Array: lib/pq is the caller's driver
+	// choice, not a dependency of this module (see the type doc).
+	placeholders := make([]string, len(codes))
+	args := make([]any, 0, len(codes)+1)
+	args = append(args, before.UTC())
+	for i, c := range codes {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, string(c))
+	}
+	in := strings.Join(placeholders, ",")
+
+	var skipped int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s WHERE timestamp < $1 AND code IN (%s) `+
+			`AND canonical_form_id <> '2' AND detail <> 'null'`, s.table, in),
+		args...).Scan(&skipped); err != nil {
+		return nil, err
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr,
+			"fasten RedactExpired: %d row(s) past the PII horizon were NOT "+
+				"redacted because canonical_form_id != '2' — their detail is "+
+				"inside the hash, so redacting would break the chain. Personal "+
+				"data in these rows still exists.\n", skipped)
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id, monotonic_seq FROM %s WHERE timestamp < $1 AND code IN (%s) `+
+			`AND canonical_form_id = '2' AND detail <> 'null' `+
+			`ORDER BY monotonic_seq`, s.table, in),
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RedactionCandidate
+	for rows.Next() {
+		var c RedactionCandidate
+		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RedactRows implements RedactionRepository (spec §7.1). Idempotent: it targets
+// ids, not a time window, so a retry destroys the same rows and returns the
+// same list.
+func (s *PostgresStore) RedactRows(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, id)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %s SET detail = 'null', detail_salt = '' `+
+			`WHERE id IN (%s) AND canonical_form_id = '2'`,
+		s.table, strings.Join(placeholders, ",")), args...); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

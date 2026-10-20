@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 import threading
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -272,8 +273,16 @@ class PostgresStreamStore:
 
         return self._execute_with_retry(_run)
 
-    def purge(self, *, before: str) -> int:
-        """Age-based retention delete (FR1). NULL timestamps are never purged."""
+    def purge(self, *, before: "datetime | str") -> int:
+        """Age-based retention delete (FR1). NULL timestamps are never purged.
+
+        Accepts a ``datetime`` or an already-canonical string — see
+        ``StreamStore.purge`` for why both families must agree on this.
+        """
+        if not isinstance(before, str):
+            from ..canonical_ts import canonical_ts
+            before = canonical_ts(before)
+
         def _run(conn: Any) -> int:
             with conn.cursor() as cur:
                 cur.execute(f"DELETE FROM {self._table} WHERE timestamp < %s", (before,))

@@ -144,9 +144,9 @@ type Row struct {
 
 	// Canonical form "2" (spec §1.4): detail is COMMITTED to rather than
 	// hashed directly, so it can be destroyed for retention without moving the
-	// row hash. Both are STORED but NOT hashed — DetailCommitment is what
-	// enters the hashed field set, in place of detail. Empty on form-"1" rows
-	// and empty again once the row is redacted.
+	// row hash. DetailCommitment REPLACES detail in the hashed field set;
+	// DetailSalt is stored but never hashed. Both empty on form-"1" rows;
+	// the salt is cleared again once the row is redacted.
 	DetailSalt       string `json:"detail_salt,omitempty"`
 	DetailCommitment string `json:"detail_commitment,omitempty"`
 }
@@ -207,8 +207,9 @@ type Domain string
 //     names: by default the whole map becomes
 //     {"_redacted":"***", "_pii_in_detail": true}. Adopters who genuinely
 //     need fields preserved declare them in DetailPassthroughKeys.
-//  3. Audit rows carry a PiiInDetail bool so retention sweeps and
-//     compliance reports can filter PII rows distinctly.
+//  3. Audit rows carry a PiiInDetail bool, which Config.RetentionPII uses to
+//     expire the stored payload (Engine.RedactExpired, spec §7.1/§7.2), and
+//     compliance reports use to filter PII rows distinctly.
 type Meta struct {
 	ID             Code
 	Domain         Domain
@@ -506,6 +507,13 @@ type Config struct {
 	// day support). Runs the first purge on Init, then every hour.
 	RetentionAPI    time.Duration
 	RetentionSyslog time.Duration
+
+	// P1-55 PII horizon on the audit store: rows whose code declares
+	// PiiInDetail (or is RetShort) have Detail and DetailSalt destroyed once
+	// older than this. Zero disables; also read from FASTEN_RETENTION_PII.
+	// Redaction-only by design — an audit age-purge would delete chain rows,
+	// which VerifyChain reports as tampering (spec §7.1).
+	RetentionPII time.Duration
 
 	// #58 PersistStreams: explicit allowlist of streams the operator has
 	// opted into persisting. When non-nil, Init asserts the set matches the

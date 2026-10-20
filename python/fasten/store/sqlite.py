@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -17,6 +18,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from ..attrs import AuditRow
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .repo import IngestResult
@@ -438,6 +441,84 @@ class SQLiteStore:
             conn.commit()
             return cur.rowcount
 
+    def list_redaction_candidates(
+        self, *, before: datetime, codes: "Sequence[str]",
+    ) -> "list[tuple[str, int]]":
+        """``(id, monotonic_seq)`` of rows this store WOULD redact.
+
+        Split out from the destruction so the caller can write its spec §7.2
+        records BEFORE any data is destroyed. Doing it the other way round —
+        redact, then emit — has a failure window where the rows are already
+        gone and the emit fails, leaving destroyed data with no record and
+        nothing a retry can find.
+
+        Returns ``monotonic_seq`` alongside the id because spec §7.2 specifies
+        ``detail = {"redacted_seq": <n>, ...}``, and the seq is not derivable
+        from the id.
+
+        Skips form-"1" rows: their ``detail`` IS hashed, so redacting one would
+        change its hash and cascade a re-seal down the rest of the chain. They
+        are counted and logged at WARNING rather than skipped quietly — on a
+        store written before the form-"2" upgrade, silence here would let an
+        operator watch redaction "succeed" while the personal data it was
+        supposed to destroy survives untouched.
+        """
+        if not codes:
+            return []
+        placeholders = ",".join("?" for _ in codes)
+        conn = self._connect()
+        skipped = conn.execute(
+            f"SELECT COUNT(*) FROM {self._table} "
+            f"WHERE timestamp < ? AND code IN ({placeholders}) "
+            "AND canonical_form_id <> '2' AND detail <> 'null'",
+            (_utc_iso(before), *codes),
+        ).fetchone()[0]
+        if skipped:
+            logger.warning(
+                "fasten redact_expired: %d row(s) past the PII horizon were "
+                "NOT redacted because canonical_form_id != '2' — their "
+                "detail is inside the hash, so redacting would break the "
+                "chain. Personal data in these rows still exists. "
+                "Re-seal under form '2' or erase the chain segment.",
+                skipped,
+            )
+        rows = conn.execute(
+            f"SELECT id, monotonic_seq FROM {self._table} "
+            f"WHERE timestamp < ? AND code IN ({placeholders}) "
+            "AND canonical_form_id = '2' AND detail <> 'null' "
+            "ORDER BY monotonic_seq",
+            (_utc_iso(before), *codes),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def redact_rows(self, *, ids: "Sequence[str]") -> "list[str]":
+        """Destroy ``detail`` and ``detail_salt`` on an explicit id list.
+
+        Idempotent by construction: it targets ids, not a time window, so a
+        retry after a lost commit acknowledgement destroys the same rows and
+        returns the same list. The previous shape derived its return value from
+        ``RETURNING id`` on a window query guarded by ``detail <> 'null'``, so
+        a retry matched nothing, returned ``[]``, and the caller wrote no
+        events for rows it had just destroyed.
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._txn():
+            conn = self._connect()
+            conn.execute(
+                # 'null' (the JSON literal), not SQL NULL: the detail column is
+                # NOT NULL, and dropping that constraint on SQLite needs a full
+                # table rebuild. json.loads('null') is Python None, so the row
+                # reads back with detail=None exactly as spec §1.4 requires,
+                # and the bytes are genuinely gone either way.
+                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
+                f"WHERE id IN ({placeholders}) AND canonical_form_id = '2'",
+                tuple(ids),
+            )
+            conn.commit()
+            return list(ids)
+
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":
         """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
@@ -455,33 +536,13 @@ class SQLiteStore:
         verifies, and the commitment still proves what the row originally said
         to anyone holding the original.
 
-        Refuses form-"1" rows: their ``detail`` IS hashed, so redacting one
-        would change its hash and cascade a re-seal down the rest of the chain.
-
-        Returns the ids of the rows redacted, so the caller can emit one
-        AUDIT_ROW_REDACTED event per row (spec §7.2) — without that, an
-        honest erasure and a quiet redaction are indistinguishable.
+        Convenience wrapper over ``list_redaction_candidates`` + ``redact_rows``
+        for callers with no audit chain to write events into. ``Engine`` drives
+        the two halves separately so it can record before it destroys — prefer
+        ``Engine.redact_expired``, which is what spec §7.2 requires.
         """
-        if not codes:
-            return []
-        placeholders = ",".join("?" for _ in codes)
-        with self._txn():
-            conn = self._connect()
-            cur = conn.execute(
-                # 'null' (the JSON literal), not SQL NULL: the detail column is
-                # NOT NULL, and dropping that constraint on SQLite needs a full
-                # table rebuild. json.loads('null') is Python None, so the row
-                # reads back with detail=None exactly as spec §1.4 requires,
-                # and the bytes are genuinely gone either way.
-                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
-                f"WHERE timestamp < ? AND code IN ({placeholders}) "
-                "AND canonical_form_id = '2' AND detail <> 'null' "
-                "RETURNING id",
-                (_utc_iso(before), *codes),
-            )
-            ids = [r[0] for r in cur.fetchall()]
-            conn.commit()
-            return ids
+        candidates = self.list_redaction_candidates(before=before, codes=codes)
+        return self.redact_rows(ids=[cid for cid, _ in candidates])
 
     def _build_where(
         self,

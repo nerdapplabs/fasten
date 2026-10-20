@@ -55,7 +55,7 @@ func makeRemoteChain(n int, serviceID, sourceNodeID string) []Row {
 			Detail:   map[string]any{},
 			PrevHash: prev,
 		}
-		r.Hash = rowHashPyCompat(r)
+		r = Seal(r.PrevHash, r)
 		rows = append(rows, r)
 		prev = r.Hash
 	}
@@ -81,7 +81,7 @@ func itoa(i int) string {
 func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
-store, cleanup := newMemStore(t, "fasten_audit")
+	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
 	// spec §8.1: with no audit store there is nothing to allocate against, so
 	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
@@ -102,7 +102,10 @@ store, cleanup := newMemStore(t, "fasten_audit")
 	// A Go-Emit-sealed row must self-verify: recomputing its canonical hash
 	// must reproduce the stored Hash. Before Fix 3 the seal used a different
 	// JSON form than the verifier, so this failed.
-	if got := rowHashPyCompat(r1); got != r1.Hash {
+	// Dispatch on the row's OWN form. Hardcoding rowHashPyCompat asserted
+	// form "1" and broke the moment the SDK started sealing "2", even though
+	// VerifyChain (which dispatches) was fine.
+	if got := hashFnByForm[r1.CanonicalFormID](r1); got != r1.Hash {
 		t.Fatalf("Go-sealed row hash not reproducible by verifier:\n  sealed = %s\n  verify = %s", r1.Hash, got)
 	}
 
@@ -194,7 +197,7 @@ func TestFix1_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 		t.Fatalf("expected 2 hub rows, got %d", len(hubRows))
 	}
 	for _, row := range hubRows {
-		if got := rowHashPyCompat(row); got != row.Hash {
+		if got := hashFnByForm[row.CanonicalFormID](row); got != row.Hash {
 			t.Fatalf("hub row seq=%d hash not reproducible: sealed=%s verify=%s", row.MonotonicSeq, row.Hash, got)
 		}
 	}

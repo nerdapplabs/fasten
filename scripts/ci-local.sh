@@ -68,41 +68,23 @@ done
 # from rust/ and fail with "No such file or directory". ci-local.sh runs from the
 # root, so it cannot see this class of bug by running commands — it has to be
 # checked structurally.
-# Run in Docker: the host python3 may not have pyyaml, and this check must not
-# silently degrade — a FAIL here previously just meant "pyyaml missing".
-if docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c '
-  pip install -q pyyaml >/dev/null 2>&1
-  python3 - <<PY
-import glob, sys, yaml
-bad = []
-for f in sorted(glob.glob(".github/workflows/*.yml")):
-    try:
-        d = yaml.safe_load(open(f))
-    except Exception:
-        continue
-    for jn, j in (d.get("jobs") or {}).items():
-        dflt = ((j.get("defaults") or {}).get("run") or {}).get("working-directory")
-        if not dflt:
-            continue
-        for st in j.get("steps") or []:
-            run = st.get("run") or ""
-            if not run or st.get("working-directory") is not None:
-                continue
-            # Only files genuinely read from the repo root. Patterns like
-            # "spec/" substring-match legitimate relative paths such as
-            # "../spec/", and a check that cries wolf gets ignored.
-            for root in ("rust-toolchain.toml",):
-                if root in run:
-                    bad.append(f"{f}/{jn}: step {st.get(\"name\",\"?\")!r} reads {root} but inherits working-directory: {dflt}")
-                    break
-for b in bad:
-    print(b)
-sys.exit(1 if bad else 0)
-PY' >/dev/null 2>&1
-then
-  pass "no step reads a repo-root path from a subdirectory default"
+# Runs in Docker because the host python3 may not have pyyaml. The checker
+# lives in its own file: the first version was inlined in a heredoc, and the
+# escaped quotes inside an f-string made it a SyntaxError, so it exited 1 on
+# every run and reported a finding it had never actually looked for.
+WDCHECK=scripts/check-workflow-paths.py
+if [ ! -f "$WDCHECK" ]; then
+  bad "missing $WDCHECK"
 else
-  bad "a step reads a repo-root path but inherits a subdirectory working-directory"
+  out=$(docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
+          "pip install -q pyyaml >/dev/null 2>&1 && python3 $WDCHECK" 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    pass "no step reads a repo-root path from a subdirectory default"
+  else
+    bad "repo-root path read under a subdirectory working-directory:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+  fi
 fi
 
 # Lockfiles must be tracked or --locked cannot work.
