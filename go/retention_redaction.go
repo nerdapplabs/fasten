@@ -7,13 +7,18 @@ import (
 	"time"
 )
 
-// PII retention horizon (P1-55), the Go half of P1-47.
+// The PII retention horizon: expiring a stored audit payload without breaking
+// the chain it belongs to (spec §7.1/§7.2).
 //
-// PiiInDetail=true forced RetShort at register-time and force-redacted Detail
-// on Emit, but nothing expired anything: startRetention only ever covered the
-// api and sys streams, and no Go store could destroy a stored payload. An
-// operator could not express "personal data gone at 30 days, operational
-// history kept a year" at all.
+// Two horizons, because one cannot express the policy: operational history is
+// kept by age, while personal data in Detail goes sooner. A single age purge
+// forces a choice between destroying the history too or keeping the personal
+// data as long as the history.
+//
+// Redaction, never deletion — removing a row from a hash-chained stream is
+// what VerifyChain reports as tampering. Under form "2" the hash covers
+// DetailCommitment rather than Detail, so the payload can be destroyed while
+// the hash, PrevHash and MonotonicSeq stay put (P1-55).
 
 // RedactionCandidate is a row that a PII horizon would redact. MonotonicSeq
 // travels with the id because spec §7.2 records redacted_seq, which is not
@@ -106,7 +111,10 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	}
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {
-		if _, err := e.Emit(ctx, CodeAuditRowRedacted,
+		// emitRow(durable=true): queue mode (the default) swallows store
+		// failures and returns normally, so a plain Emit let RedactRows
+		// destroy rows whose record had never persisted.
+		if _, err := e.emitRow(ctx, CodeAuditRowRedacted, true,
 			Target(c.ID),
 			// spec §7.2 shape; redacted_id too, since seq is only unique per
 			// source node.

@@ -474,6 +474,16 @@ func (e *Engine) stopRetention() {
 
 // Emit produces an audit row for a registered code.
 func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
+	return e.emitRow(ctx, code, false, opts...)
+}
+
+// emitRow is Emit with an explicit durability requirement.
+//
+// durable=true means the caller is about to do something irreversible on the
+// strength of this row existing, so a persist failure must reach it: queue
+// mode's swallow and the drainer's fire-and-forget enqueue are both bypassed.
+// Only the spec §7.2 redaction record uses it.
+func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...EmitOption) (Row, error) {
 	if e.serviceID == "" {
 		return Row{}, errors.New("fasten.Init() must be called before Emit()")
 	}
@@ -578,6 +588,10 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 			// allocating path and say so once. Matches the Python SDK, which
 			// bypasses its FFI drainer for the same reason.
 			d := e.activeDrainer()
+			if d != nil && durable {
+				// enqueue reports success before the row is persisted.
+				d = nil
+			}
 			if d != nil && !e.drainerAllocates.Load() {
 				if e.drainerBypassLogged.CompareAndSwap(false, true) {
 					e.drainerSysLog("warn", "drainer_bypassed_for_chain_allocation",
@@ -591,6 +605,9 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 				sealed, ferr := e.allocateAndStore(ctx, row)
 				if ferr == nil {
 					row = sealed
+				}
+				if ferr != nil && durable {
+					return row, &AuditStoreError{Err: ferr}
 				}
 				if ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;

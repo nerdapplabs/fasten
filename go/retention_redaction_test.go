@@ -9,11 +9,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// P1-55 — the Go PII horizon, driven from Config rather than by hand.
+// The retention and redaction contract for the Go SDK.
 //
-// The Python equivalent of this passed for weeks against wiring that did not
-// exist: the mechanism was tested by calling the purger directly with a stream
-// name the Engine never produced. These tests go through Init.
+// Guarantees, in order below: the code set is derived from the catalog; a
+// configured horizon redacts and records; rows are redacted and never deleted;
+// an impossible configuration is rejected at Init; and no payload is destroyed
+// without a durable record, including in queue mode (the default).
+//
+// Every test drives Config through Init rather than calling the purger
+// directly — the Python equivalent passed against wiring that did not exist
+// because it called the purger with a stream name the Engine never produced.
 
 const (
 	piiCode Code = "GOPII_USER_EXPORTED"
@@ -67,7 +72,7 @@ func agedForm2Row(t *testing.T, store *SQLiteStore, code Code, id string, detail
 	return sealed
 }
 
-func TestGoPII_ConfigDestroysPIIAndRecordsIt(t *testing.T) {
+func TestRetention_ConfiguredHorizonRedactsAndRecords(t *testing.T) {
 	registerPIICodes(t)
 	db, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
 	if err != nil {
@@ -146,7 +151,7 @@ func TestGoPII_ConfigDestroysPIIAndRecordsIt(t *testing.T) {
 	}
 }
 
-func TestGoPII_RowsAreRedactedNotDeleted(t *testing.T) {
+func TestRetention_RowsAreRedactedNotDeleted(t *testing.T) {
 	registerPIICodes(t)
 	db, _ := sql.Open("sqlite", t.TempDir()+"/audit.db")
 	defer db.Close()
@@ -200,7 +205,7 @@ func TestGoPII_RowsAreRedactedNotDeleted(t *testing.T) {
 	}
 }
 
-func TestGoPII_InitFailsWhenStoreCannotRedact(t *testing.T) {
+func TestRetention_InitRejectsAStoreThatCannotRedact(t *testing.T) {
 	registerPIICodes(t)
 	// A store with no RedactionRepository: configuring a horizon it cannot
 	// honour must fail at Init, not run a purger that silently does nothing.
@@ -218,7 +223,7 @@ func TestGoPII_InitFailsWhenStoreCannotRedact(t *testing.T) {
 
 type noRedactStore struct{ AuditRepository }
 
-func TestGoPII_CodeSetDerivedFromCatalog(t *testing.T) {
+func TestRetention_CodeSetDerivedFromCatalog(t *testing.T) {
 	registerPIICodes(t)
 	got := piiCodes()
 	var hasPII, hasOps bool
@@ -235,5 +240,69 @@ func TestGoPII_CodeSetDerivedFromCatalog(t *testing.T) {
 	}
 	if hasOps {
 		t.Error("a RetLong non-PII code was swept up")
+	}
+}
+
+// Queue mode is the default and it swallows store failures: Emit catches the
+// insert error, flags the engine degraded and returns nil, so the redaction
+// loop proceeded and RedactRows destroyed rows whose §7.2 record had never
+// persisted.
+type rejectsRedactionEvents struct{ *SQLiteStore }
+
+func (s rejectsRedactionEvents) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	if row.Code == CodeAuditRowRedacted {
+		return Row{}, errTestRejected
+	}
+	return s.SQLiteStore.AllocateAndInsertOriginated(ctx, row)
+}
+
+var errTestRejected = errorString("store rejected the redaction event")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
+
+func TestRetention_QueueModeDoesNotDestroyWithoutARecord(t *testing.T) {
+	registerPIICodes(t)
+	db, _ := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	defer db.Close()
+	inner, err := NewSQLiteStore(db, "fasten_audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pii := agedForm2Row(t, inner, piiCode, "evt-gopii-queue",
+		map[string]any{"email": "a@b.c"}, 40*24*time.Hour)
+
+	e := &Engine{}
+	// No FailureStrategy: queue is the default.
+	if err := e.Init(Config{
+		ServiceID: "svc", NodeID: "node-1",
+		AuditStore: rejectsRedactionEvents{inner},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer e.stopRetention()
+
+	if _, err := e.RedactExpired(context.Background(),
+		time.Now().UTC().Add(-30*24*time.Hour), "retention"); err == nil {
+		t.Fatal("RedactExpired reported success though the record was rejected")
+	}
+
+	rows, err := inner.Query(context.Background(), Filter{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.ID == pii.ID {
+			if r.Detail == nil {
+				t.Fatal("queue mode destroyed a row whose §7.2 record was swallowed")
+			}
+			if r.DetailSalt == "" {
+				t.Fatal("salt destroyed without a record")
+			}
+		}
+		if r.Code == CodeAuditRowRedacted {
+			t.Fatal("a redaction event persisted though the store rejected it")
+		}
 	}
 }

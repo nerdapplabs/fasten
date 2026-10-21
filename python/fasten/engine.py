@@ -535,6 +535,7 @@ class Engine:
         detail: Optional[dict[str, Any]] = None,
         severity: Optional[str | Severity] = None,
         method: Optional[str] = None,
+        _durable: bool = False,
     ) -> AuditRow:
         """
         Emit an audit row. Anchors auto-filled where possible.
@@ -607,6 +608,11 @@ class Engine:
                 # Correctness beats throughput: take the Python allocating path
                 # and say so once. Remove this guard when core lands §2.1.
                 handle = self._drainer_handle
+                if handle is not None and _durable:
+                    # Enqueueing is fire-and-forget: it reports success before
+                    # the row is persisted. A caller that must not proceed
+                    # unless the row is durable takes the synchronous path.
+                    handle = None
                 if handle is not None and not self._drainer_allocates:
                     if not self._drainer_bypass_logged:
                         self._drainer_bypass_logged = True
@@ -622,6 +628,11 @@ class Engine:
                     try:
                         row = self._allocate_and_store(row)
                     except Exception as e:  # noqa: BLE001
+                        if _durable:
+                            # Not hot-path telemetry. The caller is relying on
+                            # this row existing before it does something
+                            # irreversible, so the failure has to reach it.
+                            raise
                         # Swallowed on the hot path → durable history now has a
                         # hole; degrade the audit completeness flag. Set the
                         # engine flag unconditionally (adopter stores may not
@@ -822,6 +833,10 @@ class Engine:
             self.emit(
                 code=self._REDACTION_CODE,
                 target=row_id,
+                # Must persist before redact_rows runs. In queue mode (the
+                # default) a plain emit swallows the store failure and returns
+                # normally, so the rows were destroyed with no record.
+                _durable=True,
                 # spec §7.2 shape; redacted_id too, since seq is only unique
                 # per source node.
                 detail={"redacted_seq": seq, "reason": reason,
