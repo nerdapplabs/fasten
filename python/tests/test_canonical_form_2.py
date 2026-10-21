@@ -405,3 +405,36 @@ def test_redacting_a_go_sealed_row_keeps_the_chain_valid():
     result = verify_chain(rows)
     assert result.ok, \
         f"a redacted Go-sealed row broke the chain: {result.reason}"
+
+
+def test_committed_cross_sdk_vector_matches_current_sealing():
+    """The Go-facing vector must not go stale.
+
+    spec/python-sealed-forms.json is what Go verifies. If Python's sealing
+    changes and the file is not regenerated, Go keeps verifying the OLD rows
+    and the divergence is invisible — the file would silently stop describing
+    this SDK. Regenerating here and comparing makes that a CI failure.
+
+    Regenerate with: python3 scripts/gen_cross_sdk_vectors.py
+    """
+    import subprocess
+    import sys
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, str(repo / "scripts" / "gen_cross_sdk_vectors.py"),
+         "--check"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
+    """Whole-second instants diverge under both halves of the P1-48 defect at
+    once, so a vector without them passes a suffix-only fix."""
+    labels = {c["label"] for c in
+              json.loads((Path(__file__).resolve().parents[2] /
+                          "spec" / "python-sealed-forms.json").read_text())["cases"]}
+    for required in ("form1_micros", "form1_whole_second",
+                     "form1_legacy_Z_micros", "form1_legacy_Z_whole",
+                     "form2_micros", "form2_whole_second"):
+        assert required in labels, f"vector lost coverage: {required}"

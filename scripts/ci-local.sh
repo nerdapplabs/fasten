@@ -87,6 +87,17 @@ else
   fi
 fi
 
+# The cross-SDK vector must describe what Python actually seals. Go verifies
+# the committed file, so if Python's sealing changes and the file is not
+# regenerated, Go keeps verifying stale rows and the divergence is invisible.
+if docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
+     "cd python && pip install -q -e '.[sqlite,dev]' >/dev/null 2>&1 && cd /w && \
+      python3 scripts/gen_cross_sdk_vectors.py --check" >/dev/null 2>&1; then
+  pass "spec/python-sealed-forms.json matches current sealing"
+else
+  bad "spec/python-sealed-forms.json is stale — run scripts/gen_cross_sdk_vectors.py"
+fi
+
 # Lockfiles must be tracked or --locked cannot work.
 if git ls-files --error-unmatch rust/Cargo.lock fasten-core/Cargo.lock >/dev/null 2>&1; then
   pass "both Cargo.lock files are tracked"
