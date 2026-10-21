@@ -106,3 +106,43 @@ func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
 		t.Fatalf("Go cannot verify its own committed vector: %s", res.Reason)
 	}
 }
+
+// spec/python-sealed-forms.json is produced by the Python SDK's own sealing
+// path across both canonical forms and both timestamp shapes. Go must accept
+// every case, including the legacy always-"Z" form-"1" hashes that
+// pre-conformance Python wrote — those rows exist in deployments, verify in
+// Python via its own fallback, and read as tampering here without ours.
+func TestCrossLanguage_GoAcceptsEveryPythonSealedForm(t *testing.T) {
+	raw, err := os.ReadFile("../spec/python-sealed-forms.json")
+	if err != nil {
+		t.Fatalf("read vector: %v", err)
+	}
+	var f struct {
+		CurrentForm string `json:"current_form"`
+		Cases       []struct {
+			Label string          `json:"label"`
+			Row   json.RawMessage `json:"row"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse vector: %v", err)
+	}
+	if f.CurrentForm != currentCanonicalFormID {
+		t.Errorf("SDKs seal different forms: python %q, go %q — cross-SDK rows will not verify",
+			f.CurrentForm, currentCanonicalFormID)
+	}
+	if len(f.Cases) == 0 {
+		t.Fatal("empty vector")
+	}
+	for _, c := range f.Cases {
+		t.Run(c.Label, func(t *testing.T) {
+			var row Row
+			if err := json.Unmarshal(c.Row, &row); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if res := VerifyChain([]Row{row}); !res.OK {
+				t.Fatalf("Go rejects a Python-sealed row: %s", res.Reason)
+			}
+		})
+	}
+}
