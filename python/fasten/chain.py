@@ -42,12 +42,15 @@ if TYPE_CHECKING:
 
 # The canonical_form_id stamped on every row sealed by this SDK version.
 #
-# Form "2" (spec §1.4) is implemented, registered and verifiable, but is NOT yet
-# stamped on new rows: seal() would populate detail_salt / detail_commitment and
-# the store schema has no columns for them, so the fields would be dropped on
-# write and the hash would not recompute on read. Flip to "2" in the same change
-# that adds the columns + migration (P1-47 step 1).
-CURRENT_CANONICAL_FORM_ID = "1"
+# Form "2" (spec §1.4) is now stamped on new rows: the stores carry
+# detail_salt / detail_commitment and migrate existing tables. detail is
+# COMMITTED to rather than hashed, so it can be destroyed for retention without
+# moving the row hash — which is what makes a PII purge possible without
+# breaking the chain (P1-47).
+#
+# Form "1" stays registered forever so every pre-existing row verifies
+# unchanged; verify_chain dispatches per row.
+CURRENT_CANONICAL_FORM_ID = "2"
 
 
 def _canonical_json(d: dict[str, Any]) -> bytes:
@@ -282,6 +285,37 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
                     reason=f'row {row.id}: unknown canonical_form_id "{form_id}"',
                 )
             row_d = {k: v for k, v in row.to_dict().items()}
+
+            # Form "2" hashes detail_commitment, NOT detail. So the hash alone
+            # does not protect detail: an attacker could rewrite detail and
+            # leave the commitment intact. Whenever detail AND its salt are
+            # still present, recompute the commitment and compare. Once the row
+            # is redacted (both NULL, spec §7.1) there is nothing left to check
+            # and the commitment stands on its own.
+            if form_id == "2" and row.detail is not None:
+                # detail present means the commitment MUST be checkable. An
+                # attacker who rewrites detail and clears detail_salt would
+                # otherwise skip this branch entirely and the row would verify
+                # — the salt is not a switch for turning verification off.
+                # Redaction clears detail AND salt together (spec §7.1), so a
+                # legitimately redacted row never reaches here.
+                if not row.detail_salt:
+                    return ChainVerifyResult(
+                        ok=False,
+                        total_rows=len(rows),
+                        first_break_at=row.monotonic_seq,
+                        reason=(f"row {row.id}: detail present but detail_salt "
+                                "is missing — commitment cannot be verified"),
+                    )
+                recomputed = detail_commitment(row.detail_salt, row.detail)
+                if recomputed != (row.detail_commitment or ""):
+                    return ChainVerifyResult(
+                        ok=False,
+                        total_rows=len(rows),
+                        first_break_at=row.monotonic_seq,
+                        reason=f"row {row.id}: detail does not match its commitment",
+                    )
+
             expected = hash_fn(row_d)
             if expected != row.hash and form_id == "1":
                 # Pre-P1-48 Python sealed form "1" over the wire "Z" spelling.

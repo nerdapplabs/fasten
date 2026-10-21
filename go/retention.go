@@ -57,9 +57,17 @@ func parseRetentionDuration(s string) (time.Duration, error) {
 // its store, the retention window, and the tick interval. checkInterval is
 // injected so tests don't have to wait an hour to see the second tick.
 type retentionParams struct {
-	stream        string
-	store         StreamRepository
-	retention     time.Duration
+	stream string
+	// store/retention drive the age purge. Both zero/nil for the audit
+	// stream, which is redaction-only: deleting a row from a hash-chained
+	// stream is what VerifyChain reports as tampering (spec §7.1).
+	store     StreamRepository
+	retention time.Duration
+	// piiRetention/redactFn drive the PII horizon. redactFn is
+	// Engine.RedactExpired, so the spec §7.2 event is written — the store
+	// methods alone destroy the data and record nothing.
+	piiRetention  time.Duration
+	redactFn      func(ctx context.Context, before time.Time) error
 	checkInterval time.Duration
 	// nowFn injects a fixed clock for tests. Nil defaults to time.Now.
 	nowFn func() time.Time
@@ -90,10 +98,20 @@ func startPurger(ctx context.Context, wg *sync.WaitGroup, p retentionParams) {
 			defer wg.Done()
 		}
 		// tick immediately, then every checkInterval
+		// Two horizons, two labels. One shared path would let a redaction
+		// failure skip the age purge, and report both the same way.
 		fire := func() {
-			cutoff := canonicalTS(p.nowFn().Add(-p.retention))
-			if _, err := p.store.Purge(cutoff); err != nil && p.onError != nil {
-				p.onError(p.stream, err)
+			now := p.nowFn()
+			if p.piiRetention > 0 && p.redactFn != nil {
+				if err := p.redactFn(ctx, now.Add(-p.piiRetention)); err != nil && p.onError != nil {
+					p.onError(p.stream+"/pii-redaction", err)
+				}
+			}
+			if p.retention > 0 && p.store != nil {
+				cutoff := canonicalTS(now.Add(-p.retention))
+				if _, err := p.store.Purge(cutoff); err != nil && p.onError != nil {
+					p.onError(p.stream+"/age-purge", err)
+				}
 			}
 		}
 		fire()

@@ -48,7 +48,10 @@ def test_seal_is_public_surface():
 
 def test_emit_stamps_canonical_form_id(initialized):
     row = fasten.emit(code="USER_CREATED", target="u/9")
-    assert row.canonical_form_id == "1"
+    # Form "2" is current (spec §1.4): detail is committed to, not hashed
+    # directly, so a PII purge can destroy it without moving the hash.
+    assert row.canonical_form_id == "2"
+    assert row.detail_commitment and row.detail_salt
     assert verify_chain([row]).ok is True
 
 
@@ -69,7 +72,10 @@ def test_canonical_form_id_round_trips_through_store(initialized, mem_store):
     fasten.emit(code="USER_CREATED", target="u/1")
     rows = mem_store.query(limit=10)
     assert rows
-    assert all(r.canonical_form_id == "1" for r in rows)
+    assert all(r.canonical_form_id == "2" for r in rows)
+    # The commitment columns must survive the store round trip, or the
+    # hash cannot be recomputed on read.
+    assert all(r.detail_commitment and r.detail_salt for r in rows)
 
 
 # ── item 10: replication.ingest decoupled from the Engine ──────────────────────

@@ -39,8 +39,9 @@ func TestSeal_RoundTrip(t *testing.T) {
 	if row.PrevHash != "genesis" {
 		t.Fatalf("PrevHash = %q, want genesis", row.PrevHash)
 	}
-	if row.CanonicalFormID != "1" {
-		t.Fatalf("CanonicalFormID = %q, want 1", row.CanonicalFormID)
+	if row.CanonicalFormID != currentCanonicalFormID {
+		t.Fatalf("CanonicalFormID = %q, want %q",
+			row.CanonicalFormID, currentCanonicalFormID)
 	}
 	if res := VerifyChain([]Row{row}); !res.OK {
 		t.Fatalf("Seal-sealed row must verify, got: %+v", res)

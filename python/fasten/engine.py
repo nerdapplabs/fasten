@@ -76,6 +76,10 @@ class FastenConfig:
     # stores. None disables. Strings are duration tokens ("7d", "24h").
     retention_api: Optional[str]
     retention_syslog: Optional[str]
+    # #90 PII horizon on the audit store: rows in codes.pii_codes() older than
+    # this have detail + detail_salt destroyed. Redaction-only by design — an
+    # audit age-purge would delete chain rows, which reads as tampering (§7.1).
+    retention_pii: Optional[str]
     # #58 persist_streams: explicit allowlist of streams the operator has
     # opted into persisting. When set, start() asserts that the set matches
     # the streams with stores attached (bidirectional — a named stream
@@ -222,6 +226,7 @@ class Engine:
         search_enabled: bool = False,
         retention_api: Optional[str] = None,
         retention_syslog: Optional[str] = None,
+        retention_pii: Optional[str] = None,
         persist_streams: Optional[list[str] | set[str] | frozenset[str]] = None,
     ) -> FastenConfig:
         """Resolve all parameters and environment variables into a FastenConfig.
@@ -285,6 +290,7 @@ class Engine:
         # empty-string counts as unset.
         ret_api = retention_api if retention_api is not None else (os.environ.get("FASTEN_RETENTION_API") or None)
         ret_sys = retention_syslog if retention_syslog is not None else (os.environ.get("FASTEN_RETENTION_SYSLOG") or None)
+        ret_pii = retention_pii if retention_pii is not None else (os.environ.get("FASTEN_RETENTION_PII") or None)
 
         # #58 persist_streams: explicit stream allowlist. Env supports a
         # comma-separated list; empty-string counts as unset. Validated
@@ -327,6 +333,7 @@ class Engine:
             search_enabled=search_on,
             retention_api=ret_api,
             retention_syslog=ret_sys,
+            retention_pii=ret_pii,
             persist_streams=ps,
         )
 
@@ -419,11 +426,13 @@ class Engine:
         # that would still hit disk on a bare ring-only engine.
         self._start_retention_threads(
             api_ret=cfg.retention_api, sys_ret=cfg.retention_syslog,
+            pii_ret=cfg.retention_pii,
         )
         self._last_init_at = datetime.now(timezone.utc)
 
     def _start_retention_threads(
         self, *, api_ret: Optional[str], sys_ret: Optional[str],
+        pii_ret: Optional[str] = None,
     ) -> None:
         """Spawn one purger thread per configured (store, retention) pair.
         Called from start(); the previous set has already been stopped."""
@@ -454,6 +463,19 @@ class Engine:
             )
             self._retention_threads.append(t)
 
+        # #90 audit PII horizon. Separate from the loop above because both
+        # arguments differ: retention=None (redaction only, never delete), and
+        # redact_fn=self.redact_expired rather than the store method, so the
+        # §7.2 AUDIT_ROW_REDACTED row actually gets written.
+        if pii_ret and self._audit_store is not None:
+            pii_retention = parse_duration(pii_ret)   # raises early
+            self._retention_threads.append(start_purger(
+                store=self._audit_store, stream="audit",
+                retention=None, pii_retention=pii_retention,
+                redact_fn=self.redact_expired,
+                stop_event=self._retention_stop, on_error=_log_err,
+            ))
+
     def _stop_retention_threads(self) -> None:
         """Wake and join every purger thread. Idempotent."""
         if not self._retention_threads:
@@ -483,6 +505,7 @@ class Engine:
         search_enabled: bool = False,
         retention_api: str | None = None,
         retention_syslog: str | None = None,
+        retention_pii: str | None = None,
         persist_streams: list[str] | set[str] | frozenset[str] | None = None,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
@@ -497,6 +520,7 @@ class Engine:
             queue_drain_max_attempts=queue_drain_max_attempts,
             search_enabled=search_enabled,
             retention_api=retention_api, retention_syslog=retention_syslog,
+            retention_pii=retention_pii,
             persist_streams=persist_streams,
         ))
 
@@ -511,6 +535,7 @@ class Engine:
         detail: Optional[dict[str, Any]] = None,
         severity: Optional[str | Severity] = None,
         method: Optional[str] = None,
+        _durable: bool = False,
     ) -> AuditRow:
         """
         Emit an audit row. Anchors auto-filled where possible.
@@ -583,6 +608,11 @@ class Engine:
                 # Correctness beats throughput: take the Python allocating path
                 # and say so once. Remove this guard when core lands §2.1.
                 handle = self._drainer_handle
+                if handle is not None and _durable:
+                    # Enqueueing is fire-and-forget: it reports success before
+                    # the row is persisted. A caller that must not proceed
+                    # unless the row is durable takes the synchronous path.
+                    handle = None
                 if handle is not None and not self._drainer_allocates:
                     if not self._drainer_bypass_logged:
                         self._drainer_bypass_logged = True
@@ -598,6 +628,11 @@ class Engine:
                     try:
                         row = self._allocate_and_store(row)
                     except Exception as e:  # noqa: BLE001
+                        if _durable:
+                            # Not hot-path telemetry. The caller is relying on
+                            # this row existing before it does something
+                            # irreversible, so the failure has to reach it.
+                            raise
                         # Swallowed on the hot path → durable history now has a
                         # hole; degrade the audit completeness flag. Set the
                         # engine flag unconditionally (adopter stores may not
@@ -722,6 +757,12 @@ class Engine:
         constructing a new one. Do not call in production code.
         """
         self._uninstall_drainer()
+        # Retention threads outlive the reset otherwise. Harmless while the
+        # only purgers were age-based on api/sys, but an audit PII purger
+        # holds a reference to the old store and keeps redacting into it
+        # after the fixture has moved on — a leaked thread mutating a
+        # previous test's data.
+        self._stop_retention_threads()
         self._service_id    = ""
         self._node_id       = ""
         self._tenant_id     = None
@@ -735,6 +776,80 @@ class Engine:
         self._last_init_at  = None
 
     # ── Internal ──────────────────────────────────────────────────────────
+
+    # spec §7.2: fasten's own code for the redaction event. Registered lazily on
+    # first use so adopters who never redact don't carry it in their catalog.
+    _REDACTION_DOMAIN = "fasten"
+    _REDACTION_CODE = "AUDIT_ROW_REDACTED"
+
+    def _ensure_redaction_code(self) -> None:
+        from .codes import Meta, RetentionClass, Severity, meta_of, register
+        # Check the RETURN VALUE. meta_of() yields None for an unknown code
+        # rather than raising, so `try: meta_of(); return` skipped registration
+        # every time and emit() then failed with "unknown audit code".
+        if meta_of(self._REDACTION_CODE) is not None:
+            return
+        register(self._REDACTION_DOMAIN, {self._REDACTION_CODE: Meta(
+            domain=self._REDACTION_DOMAIN, category="retention", action="redact",
+            severity=Severity.WARN,
+            description="Audit row detail destroyed under a retention policy",
+            emitter="fasten",
+            retention_class=RetentionClass.LONG,
+        )})
+
+    def redact_expired(
+        self,
+        *,
+        before: datetime,
+        codes: "list[str]",
+        reason: str = "retention",
+    ) -> list[str]:
+        """Destroy ``detail`` on expired rows AND record that it happened.
+
+        The store redaction alone leaves an honest erasure and a quiet
+        redaction indistinguishable — both yield a row whose detail is null.
+        Spec §7.2 requires the destruction itself be an originated, chained
+        row, so a verifier can see the suffix was altered *because of a
+        recorded policy action*.
+
+        Returns the ids of the rows redacted.
+        """
+        store = self._audit_store
+        if store is None or not hasattr(store, "list_redaction_candidates"):
+            raise AuditStoreError(
+                "fasten.redact_expired: the audit store does not implement "
+                "list_redaction_candidates / redact_rows (spec §7.1)"
+            )
+        # Record BEFORE destroying. Destroy-then-emit leaves destroyed rows
+        # with no record if the emit fails, and the retry can't find them.
+        # This way an emit failure destroys nothing, and a destroy failure
+        # leaves the data intact under a record the next tick converges on.
+        self._ensure_redaction_code()
+        candidates = list(store.list_redaction_candidates(
+            before=before, codes=codes))
+        if not candidates:
+            return []
+        # One row at a time, record then destroy. Emitting the whole batch
+        # and then destroying it in one call meant a failed destroy left every
+        # row still a candidate, so the next tick re-emitted a record for all
+        # of them — duplicate events scaling with the batch. Per row, only the
+        # row that failed between its own record and its destroy can repeat.
+        redacted: list[str] = []
+        for row_id, seq in candidates:
+            self.emit(
+                code=self._REDACTION_CODE,
+                target=row_id,
+                # Must persist before the destroy. In queue mode (the default)
+                # a plain emit swallows the store failure and returns normally,
+                # so rows were destroyed with no record.
+                _durable=True,
+                # spec §7.2 shape; redacted_id too, since seq is only unique
+                # per source node.
+                detail={"redacted_seq": seq, "reason": reason,
+                        "redacted_id": row_id},
+            )
+            redacted.extend(store.redact_rows(ids=[row_id]))
+        return redacted
 
     def _allocate_and_store(self, row: AuditRow) -> AuditRow:
         """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).

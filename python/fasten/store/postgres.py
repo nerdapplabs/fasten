@@ -15,7 +15,7 @@ import logging
 import re
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, Sequence, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS {table} (
     shipped_at       TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
+    -- can be destroyed for retention without moving the row hash. Nullable:
+    -- NULL on form-"1" rows, and NULL again once redacted.
+    detail_salt       TEXT,
+    detail_commitment TEXT
 )
 """
 
@@ -68,6 +73,10 @@ _MIGRATION_HASH_CHAIN = """
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
+-- P1-47: form "2" commitment columns. Nullable with no default, so existing
+-- rows are untouched and their form-"1" hashes still verify.
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_salt TEXT;
+ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_commitment TEXT;
 """
 
 _INDEXES = [
@@ -228,8 +237,8 @@ class PostgresStore:
         "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
         "service_id,source_node_id,tenant_id,actor,actor_kind,"
         "target,category,domain,method,request_id,detail,shipped_at,"
-        "prev_hash,hash,canonical_form_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "prev_hash,hash,canonical_form_id,detail_salt,detail_commitment) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (id) DO NOTHING"
     )
 
@@ -248,6 +257,8 @@ class PostgresStore:
             row.prev_hash,
             row.hash,
             row.canonical_form_id,
+            row.detail_salt,
+            row.detail_commitment,
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
@@ -473,6 +484,105 @@ class PostgresStore:
             rejected_from_seq=rejected_from_seq,
             reason=reason or None,
         )
+
+    def redact_expired(self, *, before: datetime,
+                       codes: "Sequence[str]") -> "list[str]":
+        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
+
+        See the SQLite implementation for the rationale. In short: DELETE would
+        remove rows from the MIDDLE of the chain, which ``verify_chain`` is
+        built to detect as tampering. Under form "2" the hash covers
+        ``detail_commitment``, so nulling ``detail`` and its salt destroys the
+        data while leaving ``hash`` / ``prev_hash`` / ``monotonic_seq`` intact.
+
+        ``detail`` is ``TEXT NOT NULL`` here as it is on SQLite, so this writes
+        the JSON literal ``'null'`` rather than a SQL NULL. ``json.loads`` turns
+        it back into Python ``None``, so the row reads exactly as spec §7.1
+        requires and the bytes are gone either way.
+
+        Convenience wrapper over ``list_redaction_candidates`` + ``redact_rows``
+        for callers with no audit chain to write events into. ``Engine`` drives
+        the two halves separately so it can record before it destroys — prefer
+        ``Engine.redact_expired``, which is what spec §7.2 requires.
+        """
+        candidates = self.list_redaction_candidates(before=before, codes=codes)
+        return self.redact_rows(ids=[cid for cid, _ in candidates])
+
+    def list_redaction_candidates(
+        self, *, before: datetime, codes: "Sequence[str]",
+    ) -> "list[tuple[str, int]]":
+        """``(id, monotonic_seq)`` of rows this store WOULD redact.
+
+        See the SQLite implementation. Split from the destruction so the caller
+        writes its spec §7.2 records BEFORE any data is destroyed, and returns
+        ``monotonic_seq`` because §7.2 specifies ``redacted_seq``.
+        """
+        if not codes:
+            return []
+
+        def _run(conn: Any) -> "list[tuple[str, int]]":
+            with conn.cursor() as cur:
+                # Count what we are about to NOT redact. Silence here would let
+                # an operator on a pre-form-"2" store watch redaction "succeed"
+                # while the personal data survives. See the SQLite store.
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {self._table} "
+                    "WHERE timestamp < %s AND code = ANY(%s) "
+                    "AND canonical_form_id <> '2' AND detail <> 'null'",
+                    (_utc_iso(before), list(codes)),
+                )
+                skipped = cur.fetchone()[0]
+                if skipped:
+                    logger.warning(
+                        "fasten redact_expired: %d row(s) past the PII horizon "
+                        "were NOT redacted because canonical_form_id != '2' — "
+                        "their detail is inside the hash, so redacting would "
+                        "break the chain. Personal data in these rows still "
+                        "exists. Re-seal under form '2' or erase the chain "
+                        "segment.",
+                        skipped,
+                    )
+                cur.execute(
+                    f"SELECT id, monotonic_seq FROM {self._table} "
+                    "WHERE timestamp < %s AND code = ANY(%s) "
+                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "ORDER BY monotonic_seq",
+                    (_utc_iso(before), list(codes)),
+                )
+                return [(r[0], r[1]) for r in cur.fetchall()]
+
+        # Read-only: safe to retry, nothing is destroyed here.
+        return cast("list[tuple[str, int]]", self._execute_with_retry(_run))
+
+    def redact_rows(self, *, ids: "Sequence[str]") -> "list[str]":
+        """Destroy ``detail`` and ``detail_salt`` on an explicit id list.
+
+        Idempotent by construction: it targets ids, not a time window, so the
+        retry ``_execute_with_retry`` performs after a lost commit
+        acknowledgement destroys the same rows and returns the same list.
+
+        The previous shape derived its return value from ``RETURNING id`` on a
+        window query guarded by ``detail <> 'null'``. Under retry that guard
+        excluded the rows the lost-but-committed attempt had already redacted,
+        so the retry returned ``[]`` and the caller wrote no events for rows it
+        had just destroyed — a silent redaction, which is the one outcome spec
+        §7.2 exists to prevent.
+        """
+        if not ids:
+            return []
+
+        def _run(conn: Any) -> "list[str]":
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {self._table} "
+                    "SET detail = 'null', detail_salt = NULL "
+                    "WHERE id = ANY(%s) AND canonical_form_id = '2'",
+                    (list(ids),),
+                )
+            conn.commit()
+            return list(ids)
+
+        return cast("list[str]", self._execute_with_retry(_run))
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         sql = f"DELETE FROM {self._table} WHERE timestamp < %s"
@@ -738,4 +848,9 @@ class PostgresStore:
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
             canonical_form_id=r[21] if len(r) > 21 else "1",
+            # SELECT * — positional. detail_salt / detail_commitment follow
+            # canonical_form_id both in the fresh DDL and when appended by
+            # ALTER TABLE on a migrated table, so the index is stable.
+            detail_salt=r[22] if len(r) > 22 else None,
+            detail_commitment=r[23] if len(r) > 23 else None,
         )

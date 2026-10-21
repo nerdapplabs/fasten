@@ -97,21 +97,27 @@ CREATE TABLE IF NOT EXISTS %s (
     wire_version   TEXT NOT NULL DEFAULT '1',
     hash           TEXT NOT NULL DEFAULT '',
     prev_hash      TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT NOT NULL DEFAULT '',
+    detail_commitment TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
+-- One node, one chain (spec §2). A duplicate allocation fails at WRITE
+-- rather than surfacing later in verify_chain as a false tamper signal.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
 `, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
-		s.bare, s.table,
+		s.bare, s.table, // idx_<t>_req
+		s.bare, s.table, // idx_<t>_code
+		s.bare, s.table, // idx_<t>_ts
+		s.bare, s.table, // idx_<t>_seq
+		s.bare, s.table, // uq_<t>_node_seq
+		s.bare, s.table, // idx_<t>_unshipped
+		s.bare, s.table, // idx_<t>_pii
 	)
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -150,6 +156,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+		{"detail_salt", "TEXT NOT NULL DEFAULT ''"},
+		{"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if _, ok := existing[col.name]; !ok {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -187,7 +195,9 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id,` +
+	// Form "2" (spec §1.4). See auditCols in store.go.
+	` detail_salt, detail_commitment`
 
 // insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
 // execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
@@ -215,7 +225,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		formID = "1"
 	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
+		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
 		string(row.Code), row.Action, string(row.Severity),
@@ -227,6 +237,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		piiFlag,
 		shippedAt,
 		wv, row.Hash, row.PrevHash, formID,
+		row.DetailSalt, row.DetailCommitment,
 	)
 	return err
 }
@@ -248,6 +259,101 @@ func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 
 // InsertReplicated inserts a sealed row replicated from another origin
 // (autocommit single-row path).
+// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
+// atomically (spec §2.1). Mirrors SQLiteStore's implementation and Python's.
+//
+// Serialisation uses pg_advisory_xact_lock keyed on the node, NOT
+// SELECT … FOR UPDATE on the tip row: with an empty table there is no tip row
+// to lock, so FOR UPDATE would let every concurrent writer through to allocate
+// seq 1 — the exact defect this closes.
+//
+// Returns the SEALED row actually written.
+func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	if row.OriginID != row.ID {
+		return Row{}, fmt.Errorf(
+			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
+			row.OriginID, row.ID)
+	}
+	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
+	// microseconds and ROUNDS anything finer, so a row sealed over Go's
+	// nanosecond precision hashes a timestamp the store cannot hold: the row
+	// comes back with 265373000ns where 265372967ns was hashed, and
+	// VerifyChain reports a hash mismatch on a row nobody touched.
+	//
+	// SQLite does not show this because it stores the rendered ISO string
+	// verbatim, which is why every SQLite test passed. Truncating in both
+	// backends keeps one rule: what we hash is what the store can return.
+	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
+	if row.ShippedAt != nil {
+		t := row.ShippedAt.Truncate(time.Microsecond)
+		row.ShippedAt = &t
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Row{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Idempotence under retry: the caller may re-run this after a lost ack, and
+	// the first attempt may well have committed. Re-running would allocate a
+	// fresh seq, hit ON CONFLICT DO NOTHING on the id, and hand back a sealed
+	// row that is not the one in the store. Check first.
+	var (
+		exSeq                  int64
+		exPrev, exHash, exForm string
+	)
+	err = tx.QueryRowContext(ctx,
+		"SELECT monotonic_seq, prev_hash, hash, canonical_form_id FROM "+s.table+
+			" WHERE id = $1", row.ID).Scan(&exSeq, &exPrev, &exHash, &exForm)
+	if err == nil {
+		row.MonotonicSeq, row.PrevHash, row.Hash, row.CanonicalFormID = exSeq, exPrev, exHash, exForm
+		if cerr := tx.Commit(); cerr != nil {
+			return Row{}, cerr
+		}
+		return row, nil
+	} else if err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", row.SourceNodeID); err != nil {
+		return Row{}, err
+	}
+
+	// TWO questions, TWO queries — see the SQLite implementation. seq spans
+	// EVERY row on the node (an unsealed row still holds its number);
+	// prev_hash chains only from a sealed one.
+	var nextSeq int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = $1",
+		row.SourceNodeID).Scan(&nextSeq); err != nil {
+		return Row{}, err
+	}
+	nextSeq++
+
+	prevHash := "genesis"
+	var tip string
+	err = tx.QueryRowContext(ctx,
+		"SELECT hash FROM "+s.table+" WHERE source_node_id = $1 AND hash <> '' "+
+			"ORDER BY monotonic_seq DESC LIMIT 1", row.SourceNodeID).Scan(&tip)
+	if err == nil && tip != "" {
+		prevHash = tip
+	} else if err != nil && err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	row.MonotonicSeq = nextSeq
+	sealed := Seal(prevHash, row)
+	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+		return Row{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Row{}, err
+	}
+	return sealed, nil
+}
+
 func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
@@ -428,31 +534,49 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 	var args []any
 	n := 1
 	if f.RequestID != "" {
-		conds = append(conds, fmt.Sprintf("request_id = $%d", n)); args = append(args, f.RequestID); n++
+		conds = append(conds, fmt.Sprintf("request_id = $%d", n))
+		args = append(args, f.RequestID)
+		n++
 	}
 	if f.Code != "" {
-		conds = append(conds, fmt.Sprintf("code = $%d", n)); args = append(args, string(f.Code)); n++
+		conds = append(conds, fmt.Sprintf("code = $%d", n))
+		args = append(args, string(f.Code))
+		n++
 	}
 	if f.Domain != "" {
-		conds = append(conds, fmt.Sprintf("domain = $%d", n)); args = append(args, string(f.Domain)); n++
+		conds = append(conds, fmt.Sprintf("domain = $%d", n))
+		args = append(args, string(f.Domain))
+		n++
 	}
 	if f.SourceNodeID != "" {
-		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n)); args = append(args, f.SourceNodeID); n++
+		conds = append(conds, fmt.Sprintf("source_node_id = $%d", n))
+		args = append(args, f.SourceNodeID)
+		n++
 	}
 	if f.TenantID != "" {
-		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n)); args = append(args, f.TenantID); n++
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", n))
+		args = append(args, f.TenantID)
+		n++
 	}
 	if f.Actor != "" {
-		conds = append(conds, fmt.Sprintf("actor = $%d", n)); args = append(args, f.Actor); n++
+		conds = append(conds, fmt.Sprintf("actor = $%d", n))
+		args = append(args, f.Actor)
+		n++
 	}
 	if f.Target != "" {
-		conds = append(conds, fmt.Sprintf("target = $%d", n)); args = append(args, f.Target); n++
+		conds = append(conds, fmt.Sprintf("target = $%d", n))
+		args = append(args, f.Target)
+		n++
 	}
 	if !f.Since.IsZero() {
-		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n)); args = append(args, f.Since.UTC()); n++
+		conds = append(conds, fmt.Sprintf("timestamp >= $%d", n))
+		args = append(args, f.Since.UTC())
+		n++
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n)); args = append(args, f.Until.UTC()); n++
+		conds = append(conds, fmt.Sprintf("timestamp <= $%d", n))
+		args = append(args, f.Until.UTC())
+		n++
 	}
 	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
 	// bound, applied in Query so CountFiltered/total stays the full match count.
@@ -482,6 +606,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
+			&r.DetailSalt, &r.DetailCommitment,
 		); err != nil {
 			return nil, err
 		}
@@ -514,4 +639,73 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRedactionCandidates implements RedactionRepository (spec §7.1).
+// See the SQLite implementation for the form-"1" rationale.
+func (s *PostgresStore) ListRedactionCandidates(
+	ctx context.Context, before time.Time, codes []Code,
+) ([]RedactionCandidate, int, error) {
+	if len(codes) == 0 {
+		return nil, 0, nil
+	}
+	// Numbered placeholders, not pq.Array: lib/pq is the caller's driver
+	// choice, not a dependency of this module (see the type doc).
+	placeholders := make([]string, len(codes))
+	args := make([]any, 0, len(codes)+1)
+	args = append(args, before.UTC())
+	for i, c := range codes {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, string(c))
+	}
+	in := strings.Join(placeholders, ",")
+
+	var skipped int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s WHERE timestamp < $1 AND code IN (%s) `+
+			`AND canonical_form_id <> '2' AND detail <> 'null'`, s.table, in),
+		args...).Scan(&skipped); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id, monotonic_seq FROM %s WHERE timestamp < $1 AND code IN (%s) `+
+			`AND canonical_form_id = '2' AND detail <> 'null' `+
+			`ORDER BY monotonic_seq`, s.table, in),
+		args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []RedactionCandidate
+	for rows.Next() {
+		var c RedactionCandidate
+		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, int(skipped), rows.Err()
+}
+
+// RedactRows implements RedactionRepository (spec §7.1). Idempotent: it targets
+// ids, not a time window, so a retry destroys the same rows and returns the
+// same list.
+func (s *PostgresStore) RedactRows(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, id)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %s SET detail = 'null', detail_salt = '' `+
+			`WHERE id IN (%s) AND canonical_form_id = '2'`,
+		s.table, strings.Join(placeholders, ",")), args...); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

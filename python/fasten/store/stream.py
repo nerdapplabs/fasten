@@ -281,18 +281,31 @@ class StreamStore:
             conn = self._connect()
             return int(conn.execute(f"SELECT COUNT(*) FROM {self._table}").fetchone()[0])
 
-    def purge(self, *, before: str) -> int:
-        """Delete rows older than ``before`` (a canonical UTC ISO-8601 string),
-        returning the number removed. Per-stream retention pruning (FR1): api/sys
-        run 10–100× audit volume, so their history is trimmed by age. Unlike
-        audit, stream rows have no ship/replication lifecycle, so this is an
-        unconditional age-based delete, backed by ``idx_{table}_ts``.
+    def purge(self, *, before: "datetime | str") -> int:
+        """Delete rows older than ``before``, returning the number removed.
+        Per-stream retention pruning (FR1): api/sys run 10–100× audit volume, so
+        their history is trimmed by age. Unlike audit, stream rows have no
+        ship/replication lifecycle, so this is an unconditional age-based
+        delete, backed by ``idx_{table}_ts``.
+
+        Accepts a ``datetime`` or an already-canonical string. ``purge`` is one
+        method name over two store families — the audit stores
+        (``SQLiteStore`` / ``PostgresStore``) declare ``before: datetime``,
+        these stream stores historically declared ``before: str`` — and
+        ``start_purger`` has one call site for both. Taking either here means
+        the caller passes a ``datetime`` uniformly and cannot silently hand the
+        wrong type to the wrong family: that failure surfaced inside the tick,
+        where it was caught and reported, so an age purge that never once
+        succeeded looked like a quiet, healthy loop.
 
         Rows with a NULL/absent timestamp are never purged (``timestamp < ?`` is
         never true for NULL) — the age of a timestamp-less row is unknown, so it
         is kept rather than silently dropped. The comparison is lexicographic,
-        matching the read window; keep ``before`` in the same canonical UTC form
-        as the stored timestamps."""
+        so the cutoff is rendered in the same canonical UTC form as the stored
+        timestamps (spec §4.3)."""
+        if not isinstance(before, str):
+            from ..canonical_ts import canonical_ts
+            before = canonical_ts(before)
         with self._txn():
             conn = self._connect()
             cur = conn.execute(

@@ -1,0 +1,61 @@
+[
+ {
+  "wire_version": "1",
+  "id": "evt-go-1",
+  "origin_id": "evt-go-1",
+  "monotonic_seq": 1,
+  "timestamp": "2026-06-15T10:30:45.123456Z",
+  "code": "ORDER_PLACED",
+  "action": "create",
+  "severity": "info",
+  "service_id": "gateway",
+  "source_node_id": "node-1",
+  "tenant_id": null,
+  "actor": "alice",
+  "actor_kind": "user",
+  "target": "order/42",
+  "category": "order",
+  "domain": "sales",
+  "method": "http",
+  "request_id": "req-xyz",
+  "detail": {
+   "qty": 3,
+   "sku": "WIDGET"
+  },
+  "pii_in_detail": false,
+  "canonical_form_id": "2",
+  "prev_hash": "genesis",
+  "hash": "6fd0c0a8e4db3935190e9619a642c4e49547f6649fd290afe32849cb6505a4be",
+  "detail_salt": "1a87f08e05bba1466e289cb349d6c509beb91afc9e161e94b5f7483c781fbad6",
+  "detail_commitment": "03f9b86c2f42028b3bfa706eefabe78e56850969ac9ab00420d2e2e9a6e98ecd"
+ },
+ {
+  "wire_version": "1",
+  "id": "evt-go-2",
+  "origin_id": "evt-go-2",
+  "monotonic_seq": 2,
+  "timestamp": "2026-06-15T10:30:46.123456Z",
+  "code": "ORDER_PLACED",
+  "action": "create",
+  "severity": "info",
+  "service_id": "gateway",
+  "source_node_id": "node-1",
+  "tenant_id": null,
+  "actor": "alice",
+  "actor_kind": "user",
+  "target": "order/42",
+  "category": "order",
+  "domain": "sales",
+  "method": "http",
+  "request_id": "req-xyz",
+  "detail": {
+   "qty": 1
+  },
+  "pii_in_detail": false,
+  "canonical_form_id": "2",
+  "prev_hash": "6fd0c0a8e4db3935190e9619a642c4e49547f6649fd290afe32849cb6505a4be",
+  "hash": "656d6c6a077bbcdb4f3a742ba9802206e923a916d968b0ef427e3d07678f6ce5",
+  "detail_salt": "c031f8be9ef5f2fd76ec3aa84e5962bba27d18ceb89bb0e9fdcbff61c9efd0d3",
+  "detail_commitment": "dfef6bbf858be8207e4360faaa6656290e696cda66abe7ffb3c4782604c161ca"
+ }
+]

@@ -2,7 +2,7 @@
 
 This path was written, reviewed and shipped twice without ever executing.
 It is the one place a bug of the same shape as the SQLite unsealed-row defect
-would not have been caught. Requires FASTEN_TEST_PG_DSN.
+would not have been caught. Requires FASTEN_TEST_POSTGRES_DSN (the name CI sets).
 """
 import os
 from datetime import datetime, timezone
@@ -12,8 +12,8 @@ import pytest
 from fasten.attrs import AuditRow
 from fasten.chain import verify_chain
 
-DSN = os.environ.get("FASTEN_TEST_PG_DSN")
-pytestmark = pytest.mark.skipif(not DSN, reason="set FASTEN_TEST_PG_DSN")
+DSN = os.environ.get("FASTEN_TEST_POSTGRES_DSN")
+pytestmark = pytest.mark.skipif(not DSN, reason="set FASTEN_TEST_POSTGRES_DSN")
 
 
 def _row(i: int, *, service_id: str = "svc-a", node: str = "node-1") -> AuditRow:
@@ -96,3 +96,53 @@ def test_retry_is_idempotent(store):
     assert again.monotonic_seq == first.monotonic_seq
     assert again.hash == first.hash
     assert len([r for r in store.query(limit=100) if r.id == first.id]) == 1
+
+
+def test_form_2_commitment_round_trips(store):
+    """The commitment columns must survive the store round trip, or the hash
+    cannot be recomputed on read."""
+    sealed = store.allocate_and_insert_originated(_row(11))
+    assert sealed.canonical_form_id == "2"
+    assert sealed.detail_salt and sealed.detail_commitment
+    (back,) = [r for r in store.query(limit=50) if r.id == sealed.id]
+    assert back.detail_salt == sealed.detail_salt
+    assert back.detail_commitment == sealed.detail_commitment
+    assert verify_chain([back]).ok
+
+
+def test_redact_expired_destroys_pii_keeps_ops_and_chain(store):
+    """#90 on Postgres: PII on a short horizon, ops history on its own."""
+    import dataclasses
+    from datetime import timedelta
+    old = datetime.now(timezone.utc) - timedelta(days=40)
+
+    pii = store.allocate_and_insert_originated(dataclasses.replace(
+        _row(21), code="USER_EXPORTED", timestamp=old, detail={"email": "a@b.c"}))
+    ops = store.allocate_and_insert_originated(dataclasses.replace(
+        _row(22), code="SERVICE_PINGED", timestamp=old, detail={"n": 1}))
+
+    redacted = store.redact_expired(
+        before=datetime.now(timezone.utc) - timedelta(days=30),
+        codes=["USER_EXPORTED"])
+    assert redacted == [pii.id]
+
+    rows = {r.id: r for r in store.query(limit=50)}
+    assert rows[pii.id].detail is None
+    assert rows[pii.id].detail_salt is None
+    assert rows[ops.id].detail == {"n": 1}
+    assert rows[pii.id].hash == pii.hash
+    assert verify_chain(list(rows.values())).ok
+
+
+def test_redact_expired_respects_cutoff_and_codes(store):
+    import dataclasses
+    from datetime import timedelta
+    fresh = store.allocate_and_insert_originated(dataclasses.replace(
+        _row(31), code="USER_EXPORTED",
+        timestamp=datetime.now(timezone.utc), detail={"email": "x@y.z"}))
+    assert store.redact_expired(
+        before=datetime.now(timezone.utc) - timedelta(days=30),
+        codes=["USER_EXPORTED"]) == []
+    assert store.redact_expired(before=datetime(2099, 1, 1, tzinfo=timezone.utc),
+                                codes=[]) == []
+    assert {r.id: r for r in store.query(limit=50)}[fresh.id].detail is not None

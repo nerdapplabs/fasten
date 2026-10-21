@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +33,7 @@ type Engine struct {
 	xport           *Transport
 	apiStore        StreamRepository // FR1: opt-in api persistence, nil = ring-only
 	syslogStore     StreamRepository // FR1: opt-in sys persistence, nil = ring-only
-	seq             int64        // accessed via atomic ops
+	seq             int64            // accessed via atomic ops
 	failureStrategy string
 	searchEnabled   bool // FR3: opt-in free-text search (/logs/search, q=)
 
@@ -45,8 +46,12 @@ type Engine struct {
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
 	// assignment so concurrent Emit calls produce a consistent, gapless chain.
-	hashMu   sync.Mutex
-	prevHash string // "genesis" until first Emit
+	drainerAllocates      atomic.Bool
+	drainerBypassLogged   atomic.Bool
+	unchainedStoreLogged  atomic.Bool
+	auditChainUnavailable atomic.Bool
+	hashMu                sync.Mutex
+	prevHash              string // "genesis" until first Emit
 
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
@@ -150,7 +155,19 @@ func (e *Engine) Init(cfg Config) error {
 	if e.serviceID == "" || e.nodeID == "" {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
+	// Normalise a TYPED NIL to a real nil, once, here.
+	//
+	// A caller passing a nil *SQLiteStore gives us an interface that is
+	// non-nil (it carries a type) wrapping a nil pointer. Every `!= nil` check
+	// downstream then passes, type assertions succeed, and the first method
+	// call dereferences 0x0 — which is exactly how re-landing this wiring
+	// panicked in MaxMonotonicSeq. Fixing it at the source beats guarding
+	// every call site, because the next call site added would miss the guard.
 	e.auditStore = cfg.AuditStore
+	if isTypedNil(e.auditStore) {
+		e.auditStore = nil
+		cfg.AuditStore = nil
+	}
 	// Re-init on a fresh store clears the sticky degrade — a hole in the
 	// previous store's history doesn't apply to this one.
 	e.auditWriteSwallowed.Store(false)
@@ -279,7 +296,7 @@ func (e *Engine) Init(cfg Config) error {
 	}
 
 	// FR1 retention (§1). Env-var overrides zero-valued fields.
-	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog); err != nil {
+	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
 		return err
 	}
 	return nil
@@ -360,7 +377,7 @@ func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore
 // hard Init error rather than a silent fall-through — an operator who set
 // FASTEN_RETENTION_SYSLOG=foo needs to hear about it, not have their
 // history grow forever behind a green completeness flag.
-func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
+func (e *Engine) startRetention(apiRet, sysRet, piiRet time.Duration) error {
 	// Env override: only when Config was zero. Empty env = disabled.
 	if apiRet == 0 {
 		if s := envOr("FASTEN_RETENTION_API", ""); s != "" {
@@ -380,6 +397,15 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 			sysRet = d
 		}
 	}
+	if piiRet == 0 {
+		if s := envOr("FASTEN_RETENTION_PII", ""); s != "" {
+			d, err := parseRetentionDuration(s)
+			if err != nil {
+				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_PII: %w", err)
+			}
+			piiRet = d
+		}
+	}
 
 	// Stop any previous generation before starting a new one AND wait for
 	// its goroutines to actually exit — a re-Init on the same Engine leaves
@@ -387,8 +413,10 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 	// drainerSysLog error path races the new Init's e.xport swap.
 	e.stopRetention()
 
-	// Nothing configured on either stream → no goroutine.
-	if (apiRet == 0 || e.apiStore == nil) && (sysRet == 0 || e.syslogStore == nil) {
+	// Nothing configured on any stream → no goroutine.
+	if (apiRet == 0 || e.apiStore == nil) &&
+		(sysRet == 0 || e.syslogStore == nil) &&
+		(piiRet == 0 || e.auditStore == nil) {
 		return nil
 	}
 
@@ -413,6 +441,23 @@ func (e *Engine) startRetention(apiRet, sysRet time.Duration) error {
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
+	// P1-55 audit PII horizon. No store/retention: redaction only.
+	if piiRet > 0 && e.auditStore != nil {
+		if _, ok := e.auditStore.(RedactionRepository); !ok {
+			return fmt.Errorf(
+				"fasten.Init: RetentionPII is set but audit store %T does not "+
+					"implement RedactionRepository (spec §7.1) — personal data "+
+					"would never be redacted", e.auditStore)
+		}
+		startPurger(ctx, &e.retentionWg, retentionParams{
+			stream: "audit", piiRetention: piiRet,
+			redactFn: func(ctx context.Context, before time.Time) error {
+				_, err := e.RedactExpired(ctx, before, "retention")
+				return err
+			},
+			checkInterval: time.Hour, onError: onErr,
+		})
+	}
 	return nil
 }
 
@@ -429,6 +474,16 @@ func (e *Engine) stopRetention() {
 
 // Emit produces an audit row for a registered code.
 func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, error) {
+	return e.emitRow(ctx, code, false, opts...)
+}
+
+// emitRow is Emit with an explicit durability requirement.
+//
+// durable=true means the caller is about to do something irreversible on the
+// strength of this row existing, so a persist failure must reach it: queue
+// mode's swallow and the drainer's fire-and-forget enqueue are both bypassed.
+// Only the spec §7.2 redaction record uses it.
+func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...EmitOption) (Row, error) {
 	if e.serviceID == "" {
 		return Row{}, errors.New("fasten.Init() must be called before Emit()")
 	}
@@ -508,17 +563,18 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 	// agree on a single field set (canonical_form_id + pii_in_detail-excluded,
 	// shipped_at:null, prev_hash always present, Python-isoformat timestamps,
 	// sorted keys, non-ASCII \uXXXX-escaped).
-	e.hashMu.Lock()
-	// Under hashMu — plain increment; atomic ops here were belt-and-braces
-	// with no reader (the seq is read only through Query paths that go
-	// through the store, not through e.seq directly). ResetForTests and
-	// Init use atomic.StoreInt64 so the field stays lock-free-safe when
-	// hashMu isn't held (test setup / re-Init).
-	e.seq++
-	row.MonotonicSeq = e.seq
-	row = Seal(e.prevHash, row)
-	e.prevHash = row.Hash
-	e.hashMu.Unlock()
+	// monotonic_seq / prev_hash / hash are NOT assigned here (spec §2.1). The
+	// store allocates them inside the insert transaction, so N engines on one
+	// node produce ONE chain instead of N rows all claiming seq 1 — which
+	// VerifyChain reports as a prev_hash break, a false tamper signal with no
+	// attacker involved.
+	//
+	// With no audit store there is nothing to allocate against, so the row goes
+	// out unsealed (hash "") per spec §8.1. VerifyChain skips hashless rows, so
+	// such a stream verifies vacuously rather than failing. Fabricating an
+	// in-memory sequence here would be the exact non-conformance §2.1 forbids:
+	// it cannot survive a restart or a second process, so it is a chain in
+	// appearance only.
 
 	if e.xport != nil {
 		e.xport.WriteAudit(rowToMap(row))
@@ -526,11 +582,34 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 
 	if e.auditStore != nil {
 		if e.failureStrategy == "queue" {
+			// The drainer inserts asynchronously and cannot allocate, so a row
+			// enqueued there is written unsealed with seq 0 — silently
+			// disabling the chain. Correctness beats throughput: take the
+			// allocating path and say so once. Matches the Python SDK, which
+			// bypasses its FFI drainer for the same reason.
 			d := e.activeDrainer()
+			if d != nil && durable {
+				// enqueue reports success before the row is persisted.
+				d = nil
+			}
+			if d != nil && !e.drainerAllocates.Load() {
+				if e.drainerBypassLogged.CompareAndSwap(false, true) {
+					e.drainerSysLog("warn", "drainer_bypassed_for_chain_allocation",
+						map[string]any{"reason": "drainer cannot allocate monotonic_seq (spec 2.1)"})
+				}
+				d = nil
+			}
 			if d != nil {
 				d.enqueue(row)
 			} else {
-				if ferr := e.auditStore.Insert(ctx, row); ferr != nil {
+				sealed, ferr := e.allocateAndStore(ctx, row)
+				if ferr == nil {
+					row = sealed
+				}
+				if ferr != nil && durable {
+					return row, &AuditStoreError{Err: ferr}
+				}
+				if ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;
 					// degrade the audit completeness flag. Set the engine flag
 					// unconditionally (adopter stores may not implement
@@ -548,9 +627,13 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 				}
 			}
 		} else {
-			if err := e.auditStore.Insert(ctx, row); err != nil {
+			// "raise" strategy — same allocating path as the queue branch
+			// (spec §2.1); only the error handling differs.
+			sealed, err := e.allocateAndStore(ctx, row)
+			if err != nil {
 				return row, &AuditStoreError{Err: err}
 			}
+			row = sealed
 		}
 	}
 	return row, nil
@@ -714,6 +797,53 @@ func (e *Engine) activeDrainer() *cFastenDrainer {
 }
 
 // drainerSysLog bridges drainer events to the sys stream via stderr.
+// allocateAndStore performs the store-allocated seal (spec §2.1) and the
+// phase-2 stdout write (spec §8).
+//
+// Falls back to the legacy unallocated Insert for adopter stores that predate
+// the interface — and says so once, because VerifyChain SKIPS hashless rows and
+// would otherwise report verified over a fully unchained table.
+func (e *Engine) allocateAndStore(ctx context.Context, row Row) (Row, error) {
+	type allocator interface {
+		AllocateAndInsertOriginated(context.Context, Row) (Row, error)
+	}
+	a, ok := e.auditStore.(allocator)
+	if !ok {
+		if e.unchainedStoreLogged.CompareAndSwap(false, true) {
+			e.auditChainUnavailable.Store(true)
+			e.drainerSysLog("error", "audit_chain_unavailable", map[string]any{
+				"store":  fmt.Sprintf("%T", e.auditStore),
+				"reason": "store has no AllocateAndInsertOriginated (spec 2.1); rows written unsealed",
+			})
+		}
+		return row, e.auditStore.Insert(ctx, row)
+	}
+	sealed, err := a.AllocateAndInsertOriginated(ctx, row)
+	if err != nil {
+		return row, err
+	}
+	if e.xport != nil && sealed.Hash != "" {
+		e.xport.WriteAudit(rowToMap(sealed))
+	}
+	return sealed, nil
+}
+
+// isTypedNil reports whether v is an interface holding a nil pointer, map,
+// slice, func or channel. Such a value is NOT equal to nil as an interface,
+// so a plain `v != nil` check lets it through and the first method call
+// panics.
+func isTypedNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
+}
+
 func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,

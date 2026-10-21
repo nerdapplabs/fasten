@@ -49,12 +49,19 @@ def test_parse_duration_rejects(s):
 # ── purger loop ──────────────────────────────────────────────────────────
 
 class _FakeStore:
-    """Minimal stream-store shim capturing purge() invocations."""
+    """Minimal stream-store shim capturing purge() invocations.
+
+    `before` is a datetime: both store families now take one and canonicalise
+    internally. This shim previously declared `before: str`, which agreed with
+    what the purger passed and disagreed with every real audit store — so the
+    mock made the loop look correct while `SQLiteStore.purge` would have raised
+    on the same argument.
+    """
     def __init__(self, raise_on_calls: list[int] | None = None):
-        self.calls: list[str] = []
+        self.calls: list[datetime] = []
         self._raise_on = set(raise_on_calls or [])
 
-    def purge(self, *, before: str) -> int:
+    def purge(self, *, before: "datetime | str") -> int:
         idx = len(self.calls)
         self.calls.append(before)
         if idx in self._raise_on:
@@ -87,8 +94,8 @@ def test_purger_runs_immediately_and_uses_now_minus_retention():
     t.join(timeout=1.0)
 
     assert store.calls, "purger must fire the first purge before waiting"
-    # Cutoff = now - 7d = 2026-08-14T10:00:00.000+00:00
-    assert store.calls[0].startswith("2026-08-14T10:00:00")
+    # Cutoff = now - 7d, exactly, as a datetime.
+    assert store.calls[0] == datetime(2026, 8, 14, 10, 0, 0, tzinfo=timezone.utc)
 
 
 def test_purger_errors_do_not_stop_the_loop():
@@ -117,7 +124,11 @@ def test_purger_errors_do_not_stop_the_loop():
     t.join(timeout=1.0)
 
     assert len(store.calls) >= 2, "loop must survive a purge failure"
-    assert errors and errors[0][0] == "sys"
+    # The label is phase-qualified ("sys/age-purge") so an operator can tell
+    # which horizon stopped working — a PII redaction failure and an age purge
+    # failure used to arrive under the same bare stream name.
+    assert errors and errors[0][0].startswith("sys")
+    assert errors[0][0] == "sys/age-purge"
 
 
 def test_purger_shuts_down_within_interval_on_stop():

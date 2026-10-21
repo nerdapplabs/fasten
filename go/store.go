@@ -61,7 +61,10 @@ var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
-	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id`
+	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id,` +
+	// Form "2" (spec §1.4). Omitting them dropped the salt on every write, so
+	// replicated Python rows failed the commitment check.
+	` detail_salt, detail_commitment`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
@@ -112,12 +115,19 @@ CREATE TABLE IF NOT EXISTS %s (
     wire_version  TEXT NOT NULL DEFAULT '1',
     hash          TEXT NOT NULL DEFAULT '',
     prev_hash     TEXT NOT NULL DEFAULT '',
-    canonical_form_id TEXT NOT NULL DEFAULT '1'
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT NOT NULL DEFAULT '',
+    detail_commitment TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
+-- One node, one chain (spec §2): monotonic_seq is unique within a
+-- source_node_id. Enforced here so a duplicate allocation fails at WRITE
+-- rather than being discovered later by verify_chain, where it is
+-- indistinguishable from tampering.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 `, s.table,
 		s.table, s.table,
@@ -125,6 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		s.table, s.table,
 		s.table, s.table,
 		s.table, s.table,
+		s.table, s.table, // uq_<table>_node_seq
 	)
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -145,6 +156,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		{"hash", "TEXT NOT NULL DEFAULT ''"},
 		{"prev_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+		{"detail_salt", "TEXT NOT NULL DEFAULT ''"},
+		{"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if !existing[col.name] {
 			if _, err := s.db.Exec(fmt.Sprintf(
@@ -215,7 +228,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		formID = "1"
 	}
 	_, err = exec.ExecContext(ctx,
-		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
+		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		canonicalTS(row.Timestamp),
 		string(row.Code), row.Action, string(row.Severity),
@@ -227,6 +240,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		piiFlag,
 		shippedAt,
 		wv, row.Hash, row.PrevHash, formID,
+		row.DetailSalt, row.DetailCommitment,
 	)
 	return err
 }
@@ -245,6 +259,103 @@ func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
 				"use InsertReplicated for rows from another origin", row.OriginID, row.ID)
 	}
 	return s.insertRow(ctx, row)
+}
+
+// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
+// atomically (spec §2.1).
+//
+// One node, one chain: monotonic_seq is unique within a source_node_id.
+// Allocating in engine memory is non-conformant — two engine instances (two
+// services on one store, a forking supervisor, several workers) each mint from
+// 1 and produce two rows at seq 1, which VerifyChain then reports as a
+// prev_hash break: a false tamper signal with no attacker involved.
+//
+// BEGIN IMMEDIATE takes a RESERVED lock BEFORE the read, so two writers cannot
+// both observe the same tip and then both insert. Without it this is a
+// read-modify-write race that merely moves the bug from memory into SQL.
+//
+// Returns the SEALED row actually written.
+func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	if row.OriginID != row.ID {
+		return Row{}, fmt.Errorf(
+			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
+			row.OriginID, row.ID)
+	}
+	// A REAL lock. The previous version did BeginTx + ExecContext("BEGIN
+	// IMMEDIATE") and discarded the error: BeginTx already opened a deferred
+	// transaction, so the nested BEGIN failed and the RESERVED lock was never
+	// taken. Two writers could then both read the same tip.
+	//
+	// The store is handed a *sql.DB by the caller, so it cannot put
+	// _txlock=immediate on the DSN. Instead take a dedicated connection and
+	// drive the transaction by hand, which lets BEGIN IMMEDIATE be the first
+	// statement on it and actually acquire RESERVED before the read.
+	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
+	// microseconds and ROUNDS anything finer, so a row sealed over Go's
+	// nanosecond precision hashes a timestamp the store cannot hold: the row
+	// comes back with 265373000ns where 265372967ns was hashed, and
+	// VerifyChain reports a hash mismatch on a row nobody touched.
+	//
+	// SQLite does not show this because it stores the rendered ISO string
+	// verbatim, which is why every SQLite test passed. Truncating in both
+	// backends keeps one rule: what we hash is what the store can return.
+	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
+	if row.ShippedAt != nil {
+		t := row.ShippedAt.Truncate(time.Microsecond)
+		row.ShippedAt = &t
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Row{}, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Row{}, fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// NOT ctx: a cancelled ctx skips the ROLLBACK, and Close() then
+			// returns the conn to the pool still holding the write lock.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
+
+	// TWO questions, TWO queries. seq must span EVERY row on this node, sealed
+	// or not — an unsealed row still occupies its number, and filtering those
+	// out restarts the counter and collides with them. prev_hash, by contrast,
+	// may only chain from a SEALED row.
+	var nextSeq int64
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = ?",
+		row.SourceNodeID).Scan(&nextSeq); err != nil {
+		return Row{}, err
+	}
+	nextSeq++
+
+	prevHash := "genesis"
+	var tip string
+	err = conn.QueryRowContext(ctx,
+		"SELECT hash FROM "+s.table+" WHERE source_node_id = ? AND hash != '' "+
+			"ORDER BY monotonic_seq DESC LIMIT 1", row.SourceNodeID).Scan(&tip)
+	if err == nil && tip != "" {
+		prevHash = tip
+	} else if err != nil && err != sql.ErrNoRows {
+		return Row{}, err
+	}
+
+	row.MonotonicSeq = nextSeq
+	sealed := Seal(prevHash, row)
+	if err := s.insertRowExec(ctx, conn, sealed); err != nil {
+		return Row{}, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return Row{}, err
+	}
+	committed = true
+	return sealed, nil
 }
 
 // InsertReplicated inserts a sealed row replicated from another origin. Used by
@@ -538,31 +649,40 @@ func filterToSQL(f Filter) (string, []any) {
 	var conds []string
 	var args []any
 	if f.RequestID != "" {
-		conds = append(conds, "request_id = ?"); args = append(args, f.RequestID)
+		conds = append(conds, "request_id = ?")
+		args = append(args, f.RequestID)
 	}
 	if f.Code != "" {
-		conds = append(conds, "code = ?"); args = append(args, string(f.Code))
+		conds = append(conds, "code = ?")
+		args = append(args, string(f.Code))
 	}
 	if f.Domain != "" {
-		conds = append(conds, "domain = ?"); args = append(args, string(f.Domain))
+		conds = append(conds, "domain = ?")
+		args = append(args, string(f.Domain))
 	}
 	if f.SourceNodeID != "" {
-		conds = append(conds, "source_node_id = ?"); args = append(args, f.SourceNodeID)
+		conds = append(conds, "source_node_id = ?")
+		args = append(args, f.SourceNodeID)
 	}
 	if f.TenantID != "" {
-		conds = append(conds, "tenant_id = ?"); args = append(args, f.TenantID)
+		conds = append(conds, "tenant_id = ?")
+		args = append(args, f.TenantID)
 	}
 	if f.Actor != "" {
-		conds = append(conds, "actor = ?"); args = append(args, f.Actor)
+		conds = append(conds, "actor = ?")
+		args = append(args, f.Actor)
 	}
 	if f.Target != "" {
-		conds = append(conds, "target = ?"); args = append(args, f.Target)
+		conds = append(conds, "target = ?")
+		args = append(args, f.Target)
 	}
 	if !f.Since.IsZero() {
-		conds = append(conds, "timestamp >= ?"); args = append(args, canonicalTS(f.Since))
+		conds = append(conds, "timestamp >= ?")
+		args = append(args, canonicalTS(f.Since))
 	}
 	if !f.Until.IsZero() {
-		conds = append(conds, "timestamp <= ?"); args = append(args, canonicalTS(f.Until))
+		conds = append(conds, "timestamp <= ?")
+		args = append(args, canonicalTS(f.Until))
 	}
 	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
 	// bound, applied in Query so CountFiltered/total stays the full match count.
@@ -590,6 +710,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
+			&r.DetailSalt, &r.DetailCommitment,
 		); err != nil {
 			return nil, err
 		}
@@ -633,4 +754,83 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRedactionCandidates implements RedactionRepository (spec §7.1).
+//
+// Skips form-"1" rows: their detail IS hashed, so redacting one changes its
+// hash and cascades a re-seal down the chain. Counted and logged rather than
+// skipped quietly — on a pre-form-"2" store, silence lets an operator watch
+// redaction "succeed" while the personal data survives.
+func (s *SQLiteStore) ListRedactionCandidates(
+	ctx context.Context, before time.Time, codes []Code,
+) ([]RedactionCandidate, int, error) {
+	if len(codes) == 0 {
+		return nil, 0, nil
+	}
+	args := make([]any, 0, len(codes)+1)
+	args = append(args, canonicalTS(before))
+	ph := ""
+	for i, c := range codes {
+		if i > 0 {
+			ph += ","
+		}
+		ph += "?"
+		args = append(args, string(c))
+	}
+
+	var skipped int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE timestamp < ? AND code IN (%s) "+
+			"AND canonical_form_id <> '2' AND detail <> 'null'", s.table, ph),
+		args...).Scan(&skipped); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		"SELECT id, monotonic_seq FROM %s WHERE timestamp < ? AND code IN (%s) "+
+			"AND canonical_form_id = '2' AND detail <> 'null' "+
+			"ORDER BY monotonic_seq", s.table, ph),
+		args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []RedactionCandidate
+	for rows.Next() {
+		var c RedactionCandidate
+		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, int(skipped), rows.Err()
+}
+
+// RedactRows implements RedactionRepository (spec §7.1). Destroys detail and
+// detail_salt on an explicit id list; the hash, prev_hash and monotonic_seq are
+// untouched, so the chain still verifies. Idempotent — it targets ids, not a
+// time window, so a retry destroys the same rows and returns the same list.
+func (s *SQLiteStore) RedactRows(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(ids))
+	ph := ""
+	for i, id := range ids {
+		if i > 0 {
+			ph += ","
+		}
+		ph += "?"
+		args = append(args, id)
+	}
+	// 'null' (the JSON literal), not SQL NULL: detail is NOT NULL and dropping
+	// that on SQLite needs a full table rebuild. Reads back as nil either way.
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s SET detail = 'null', detail_salt = '' "+
+			"WHERE id IN (%s) AND canonical_form_id = '2'", s.table, ph),
+		args...); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

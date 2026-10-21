@@ -1,2 +1,4 @@
 target/
-Cargo.lock
+# Cargo.lock IS committed: CI resolves fresh otherwise and an unrelated
+# transitive MSRV bump breaks the build (ctutils/sha2/uuid, Oct 2026).
+# Committing it makes builds reproducible and rust-version enforceable.
