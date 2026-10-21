@@ -33,7 +33,11 @@ type RedactionCandidate struct {
 // order has a window where the rows are gone and the record fails, leaving no
 // trace and nothing a retry can find.
 type RedactionRepository interface {
-	ListRedactionCandidates(ctx context.Context, before time.Time, codes []Code) ([]RedactionCandidate, error)
+	// The int is the number of form-"1" rows past the horizon that were NOT
+	// returned because their detail is inside the hash. Reported by the
+	// caller, which has the sys stream; a store writing to stderr puts a
+	// privacy-relevant miss somewhere nothing is monitoring.
+	ListRedactionCandidates(ctx context.Context, before time.Time, codes []Code) ([]RedactionCandidate, int, error)
 	RedactRows(ctx context.Context, ids []string) ([]string, error)
 }
 
@@ -99,9 +103,17 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	if err := ensureRedactionCode(); err != nil {
 		return nil, err
 	}
-	candidates, err := store.ListRedactionCandidates(ctx, before, codes)
+	candidates, skippedForm1, err := store.ListRedactionCandidates(ctx, before, codes)
 	if err != nil {
 		return nil, err
+	}
+	if skippedForm1 > 0 {
+		e.drainerSysLog("warn", "pii_redaction_skipped_legacy_form", map[string]any{
+			"rows": skippedForm1,
+			"reason": "canonical_form_id != 2; detail is inside the hash, " +
+				"so redacting would break the chain. The personal data in " +
+				"these rows still exists.",
+		})
 	}
 	if len(candidates) == 0 {
 		return nil, nil
@@ -109,11 +121,16 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	if reason == "" {
 		reason = "retention"
 	}
-	ids := make([]string, 0, len(candidates))
+	// One row at a time, record then destroy. Emitting the whole batch and
+	// then destroying it in one call meant a failed destroy left every row
+	// still a candidate, so the next tick re-emitted a record for all of them
+	// — duplicate events scaling with the batch. Per row, only the row that
+	// failed between its own record and its destroy can repeat.
+	redacted := make([]string, 0, len(candidates))
 	for _, c := range candidates {
 		// emitRow(durable=true): queue mode (the default) swallows store
-		// failures and returns normally, so a plain Emit let RedactRows
-		// destroy rows whose record had never persisted.
+		// failures and returns normally, so a plain Emit let the destroy
+		// proceed for rows whose record had never persisted.
 		if _, err := e.emitRow(ctx, CodeAuditRowRedacted, true,
 			Target(c.ID),
 			// spec §7.2 shape; redacted_id too, since seq is only unique per
@@ -124,9 +141,13 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 				"redacted_id":  c.ID,
 			}),
 		); err != nil {
-			return nil, fmt.Errorf("fasten.RedactExpired: recording the §7.2 event for %s failed, nothing destroyed: %w", c.ID, err)
+			return redacted, fmt.Errorf("fasten.RedactExpired: recording the §7.2 event for %s failed, nothing destroyed for it: %w", c.ID, err)
 		}
-		ids = append(ids, c.ID)
+		done, err := store.RedactRows(ctx, []string{c.ID})
+		if err != nil {
+			return redacted, err
+		}
+		redacted = append(redacted, done...)
 	}
-	return store.RedactRows(ctx, ids)
+	return redacted, nil
 }

@@ -8,13 +8,15 @@ indistinguishable from tampering.
 These are also the golden vectors the other five SDKs get implemented against.
 """
 import dataclasses
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from fasten.attrs import AuditRow
+from fasten.canonical_ts import parse_canonical
 from fasten.chain import (
-    CURRENT_CANONICAL_FORM_ID,
     _row_hash_form_1,
     detail_commitment,
     redact,
@@ -345,3 +347,61 @@ def test_clearing_the_salt_does_not_skip_verification():
     result = verify_chain([attack])
     assert not result.ok
     assert "detail_salt" in (result.reason or "")
+
+
+# ── Cross-SDK: Go seals, Python verifies ─────────────────────────────────────
+#
+# The existing vector (go/xlang_form2.json) runs one direction only: Python
+# seals, Go verifies. Nothing checked the reverse, so Go could have sealed rows
+# no other SDK accepted — which is exactly the divergence that existed while Go
+# sealed form "1" and Python sealed "2". spec/go-sealed-form2.json is produced
+# by Go's Seal() and read here.
+
+GO_VECTOR = Path(__file__).resolve().parents[2] / "spec" / "go-sealed-form2.json"
+
+
+def _rows_from_go_vector() -> list[AuditRow]:
+    raw = json.loads(GO_VECTOR.read_text())
+    out = []
+    for d in raw:
+        for field in ("timestamp", "shipped_at"):
+            if isinstance(d.get(field), str):
+                d[field] = parse_canonical(d[field])
+        out.append(AuditRow(**{
+            k: d[k] for k in AuditRow.__dataclass_fields__ if k in d
+        }))
+    return out
+
+
+def test_python_verifies_a_go_sealed_form_2_chain():
+    rows = _rows_from_go_vector()
+    assert len(rows) == 2
+    assert all(r.canonical_form_id == "2" for r in rows)
+    assert all(r.detail_salt and r.detail_commitment for r in rows)
+    result = verify_chain(rows)
+    assert result.ok, f"Python rejects a Go-sealed form-2 chain: {result.reason}"
+
+
+def test_go_sealed_commitment_recomputes_under_python():
+    """Both SDKs must agree on sha256(salt || canonical_json(detail))."""
+    for row in _rows_from_go_vector():
+        assert row.detail_salt is not None
+        assert detail_commitment(row.detail_salt, row.detail) == \
+            row.detail_commitment, \
+            f"commitment disagrees across SDKs for {row.id}"
+
+
+def test_go_sealed_row_detail_tampering_is_caught_by_python():
+    rows = _rows_from_go_vector()
+    attacked = [dataclasses.replace(rows[0], detail={"qty": 999})] + rows[1:]
+    assert not verify_chain(attacked).ok, \
+        "Python accepted tampered detail on a Go-sealed row"
+
+
+def test_redacting_a_go_sealed_row_keeps_the_chain_valid():
+    """The whole purpose: destroy the payload, keep the evidence."""
+    rows = _rows_from_go_vector()
+    rows[0] = dataclasses.replace(rows[0], detail=None, detail_salt=None)
+    result = verify_chain(rows)
+    assert result.ok, \
+        f"a redacted Go-sealed row broke the chain: {result.reason}"

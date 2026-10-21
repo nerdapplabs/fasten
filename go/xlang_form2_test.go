@@ -73,3 +73,36 @@ func TestForm2_DetailTamperingDetected(t *testing.T) {
 		})
 	}
 }
+
+// spec/go-sealed-form2.json is the Go->Python direction: Python's
+// test_canonical_form_2.py verifies this exact chain. Pinned here so a change
+// to Seal that alters the bytes fails in Go rather than surfacing as an
+// unexplained Python failure.
+func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
+	raw, err := os.ReadFile("../spec/go-sealed-form2.json")
+	if err != nil {
+		t.Fatalf("read vector: %v", err)
+	}
+	var rows []Row
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("parse vector: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d want 2", len(rows))
+	}
+	for _, r := range rows {
+		if r.CanonicalFormID != "2" {
+			t.Errorf("%s: form = %q want 2", r.ID, r.CanonicalFormID)
+		}
+		if got := detailCommitment(r.DetailSalt, r.Detail); got != r.DetailCommitment {
+			t.Errorf("%s: commitment drifted:\n got %s\nwant %s", r.ID, got, r.DetailCommitment)
+		}
+		if got := hashFnByForm[r.CanonicalFormID](r); got != r.Hash {
+			t.Errorf("%s: hash drifted — regenerate the vector and update Python:\n got %s\nwant %s",
+				r.ID, got, r.Hash)
+		}
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("Go cannot verify its own committed vector: %s", res.Reason)
+	}
+}

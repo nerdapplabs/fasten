@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -646,9 +645,9 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 // See the SQLite implementation for the form-"1" rationale.
 func (s *PostgresStore) ListRedactionCandidates(
 	ctx context.Context, before time.Time, codes []Code,
-) ([]RedactionCandidate, error) {
+) ([]RedactionCandidate, int, error) {
 	if len(codes) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	// Numbered placeholders, not pq.Array: lib/pq is the caller's driver
 	// choice, not a dependency of this module (see the type doc).
@@ -666,14 +665,7 @@ func (s *PostgresStore) ListRedactionCandidates(
 		`SELECT COUNT(*) FROM %s WHERE timestamp < $1 AND code IN (%s) `+
 			`AND canonical_form_id <> '2' AND detail <> 'null'`, s.table, in),
 		args...).Scan(&skipped); err != nil {
-		return nil, err
-	}
-	if skipped > 0 {
-		fmt.Fprintf(os.Stderr,
-			"fasten RedactExpired: %d row(s) past the PII horizon were NOT "+
-				"redacted because canonical_form_id != '2' — their detail is "+
-				"inside the hash, so redacting would break the chain. Personal "+
-				"data in these rows still exists.\n", skipped)
+		return nil, 0, err
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
@@ -682,18 +674,18 @@ func (s *PostgresStore) ListRedactionCandidates(
 			`ORDER BY monotonic_seq`, s.table, in),
 		args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []RedactionCandidate
 	for rows.Next() {
 		var c RedactionCandidate
 		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	return out, int(skipped), rows.Err()
 }
 
 // RedactRows implements RedactionRepository (spec §7.1). Idempotent: it targets

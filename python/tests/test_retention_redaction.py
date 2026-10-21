@@ -379,6 +379,55 @@ class TestRecordBeforeDestroy:
         finally:
             e.reset_for_tests()
 
+    def test_a_retry_after_a_failed_destroy_does_not_duplicate_events(self) -> None:
+        """Record and destroy per row, so a retry re-records at most one.
+
+        Emitting the whole batch and then destroying it in one call left every
+        row still a candidate when the destroy failed, so the next tick
+        re-recorded all of them.
+        """
+        db = new_db()
+        seed = SQLiteStore(db)
+        ids = [aged(seed, PII, {"email": f"{i}@x.y"}, 40).id for i in range(3)]
+
+        fail = {"on": True}
+
+        class DestroyFailsOnce(SQLiteStore):
+            def redact_rows(self, *, ids):  # type: ignore[no-untyped-def]
+                if fail["on"]:
+                    raise RuntimeError("destroy unavailable")
+                return super().redact_rows(ids=ids)
+
+        e = engine_with(db, store=DestroyFailsOnce(db),
+                        audit_store_failure_strategy="raise")
+        try:
+            with pytest.raises(RuntimeError):
+                e.redact_expired(
+                    before=datetime.now(timezone.utc) - timedelta(days=30),
+                    codes=[PII])
+            # The first row was recorded, then its destroy failed; the loop
+            # stopped there rather than recording the other two.
+            after_failure = redactions(rows_by_id(db).values())
+            assert len(after_failure) == 1, (
+                "a failed destroy recorded rows it never reached: "
+                f"{len(after_failure)} events for 3 candidates"
+            )
+
+            fail["on"] = False
+            e.redact_expired(
+                before=datetime.now(timezone.utc) - timedelta(days=30),
+                codes=[PII])
+
+            events = redactions(rows_by_id(db).values())
+            targets = [ev.target for ev in events]
+            assert sorted(set(targets)) == sorted(ids), "not every row recorded"
+            dupes = [t for t in set(targets) if targets.count(t) > 1]
+            assert len(dupes) <= 1, \
+                f"retry duplicated records for {len(dupes)} rows: {dupes}"
+            assert verify_chain(list(rows_by_id(db).values())).ok
+        finally:
+            e.reset_for_tests()
+
     def test_a_failed_event_destroys_nothing_in_raise_mode(self) -> None:
         db = new_db()
         pii = aged(SQLiteStore(db), PII, {"email": "a@b.c"}, 40)

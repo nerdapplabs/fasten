@@ -829,20 +829,27 @@ class Engine:
             before=before, codes=codes))
         if not candidates:
             return []
+        # One row at a time, record then destroy. Emitting the whole batch
+        # and then destroying it in one call meant a failed destroy left every
+        # row still a candidate, so the next tick re-emitted a record for all
+        # of them — duplicate events scaling with the batch. Per row, only the
+        # row that failed between its own record and its destroy can repeat.
+        redacted: list[str] = []
         for row_id, seq in candidates:
             self.emit(
                 code=self._REDACTION_CODE,
                 target=row_id,
-                # Must persist before redact_rows runs. In queue mode (the
-                # default) a plain emit swallows the store failure and returns
-                # normally, so the rows were destroyed with no record.
+                # Must persist before the destroy. In queue mode (the default)
+                # a plain emit swallows the store failure and returns normally,
+                # so rows were destroyed with no record.
                 _durable=True,
                 # spec §7.2 shape; redacted_id too, since seq is only unique
                 # per source node.
                 detail={"redacted_seq": seq, "reason": reason,
                         "redacted_id": row_id},
             )
-        return list(store.redact_rows(ids=[cid for cid, _ in candidates]))
+            redacted.extend(store.redact_rows(ids=[row_id]))
+        return redacted
 
     def _allocate_and_store(self, row: AuditRow) -> AuditRow:
         """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).

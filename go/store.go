@@ -764,9 +764,9 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 // redaction "succeed" while the personal data survives.
 func (s *SQLiteStore) ListRedactionCandidates(
 	ctx context.Context, before time.Time, codes []Code,
-) ([]RedactionCandidate, error) {
+) ([]RedactionCandidate, int, error) {
 	if len(codes) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	args := make([]any, 0, len(codes)+1)
 	args = append(args, canonicalTS(before))
@@ -784,14 +784,7 @@ func (s *SQLiteStore) ListRedactionCandidates(
 		"SELECT COUNT(*) FROM %s WHERE timestamp < ? AND code IN (%s) "+
 			"AND canonical_form_id <> '2' AND detail <> 'null'", s.table, ph),
 		args...).Scan(&skipped); err != nil {
-		return nil, err
-	}
-	if skipped > 0 {
-		fmt.Fprintf(os.Stderr,
-			"fasten RedactExpired: %d row(s) past the PII horizon were NOT "+
-				"redacted because canonical_form_id != '2' — their detail is "+
-				"inside the hash, so redacting would break the chain. Personal "+
-				"data in these rows still exists.\n", skipped)
+		return nil, 0, err
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
@@ -800,18 +793,18 @@ func (s *SQLiteStore) ListRedactionCandidates(
 			"ORDER BY monotonic_seq", s.table, ph),
 		args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []RedactionCandidate
 	for rows.Next() {
 		var c RedactionCandidate
 		if err := rows.Scan(&c.ID, &c.MonotonicSeq); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	return out, int(skipped), rows.Err()
 }
 
 // RedactRows implements RedactionRepository (spec §7.1). Destroys detail and
