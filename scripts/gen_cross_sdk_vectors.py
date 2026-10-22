@@ -35,7 +35,7 @@ from fasten.chain import (                                           # noqa: E40
 OUT = REPO / "spec" / "python-sealed-forms.json"
 
 # Two instants: microseconds present, and a whole second. The whole-second case
-# is the one that diverges under both halves of the P1-48 defect at once (the
+# is the one that diverges under both halves of the #91 defect at once (the
 # offset spelling AND the omitted fractional part), so it must be covered
 # explicitly — a suffix-only fix still passes the microsecond case.
 MICROS = datetime(2026, 6, 15, 10, 30, 45, 123456, tzinfo=timezone.utc)

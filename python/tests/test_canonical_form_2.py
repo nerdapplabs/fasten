@@ -237,7 +237,7 @@ def test_redacted_row_round_trips_through_sqlite():
 # ── one timestamp renderer (spec §1.4) ───────────────────────────────────────
 
 def test_form_2_hashes_the_wire_timestamp_verbatim():
-    """REGRESSION for the two-renderer hazard (P1-48).
+    """REGRESSION for the two-renderer hazard (#91).
 
     Form "1" hashed "+00:00" while the row carried "Z", so every SDK needed a
     second private timestamp renderer in the hash path — and Go and Python
@@ -278,7 +278,7 @@ def test_form_2_whole_second_and_zero_micros():
 
 
 def test_pre_upgrade_form_1_rows_still_verify():
-    """REGRESSION: the P1-48 fix must not orphan rows Python already sealed.
+    """REGRESSION: the #91 fix must not orphan rows Python already sealed.
 
     Python once hashed form "1" over the wire "Z" spelling. Making it
     spec-conformant (+00:00) changed every hash it had written, so a
@@ -429,7 +429,7 @@ def test_committed_cross_sdk_vector_matches_current_sealing():
 
 
 def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
-    """Whole-second instants diverge under both halves of the P1-48 defect at
+    """Whole-second instants diverge under both halves of the #91 defect at
     once, so a vector without them passes a suffix-only fix."""
     labels = {c["label"] for c in
               json.loads((Path(__file__).resolve().parents[2] /

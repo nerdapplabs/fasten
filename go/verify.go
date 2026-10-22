@@ -176,8 +176,8 @@ func VerifyChain(rows []Row) VerifyResult {
 		expected := hashFn(row)
 		if expected != row.Hash && formID == "1" {
 			// Pre-conformance Python hashed the wire timestamp verbatim
-			// (always-"Z") while the spec and Go use "+00:00" — the P1-48
-			// divergence. Those rows exist in deployments and are not
+			// (always-"Z") while the spec and Go use "+00:00" — the
+			// divergence in #91. Those rows exist in deployments and are not
 			// tampered; without this they verify in Python (which has the
 			// same fallback) and fail here, which reads as tampering.
 			// Delete with form "1".
@@ -265,7 +265,7 @@ func rowHashForm1LegacyZ(row Row) string {
 //
 // Form "1" hashed "+00:00" while the row carried always-"Z" on the wire, so
 // every SDK needed a second private timestamp renderer used only in the hash
-// path — which is how Go and Python drifted apart inside it (P1-48). Form "2"
+// path — which is how Go and Python drifted apart inside it (#91). Form "2"
 // has one timestamp form, the one already written to the wire.
 func rowHashForm2(row Row) string {
 	d := pyCanonicalRowMap(row)

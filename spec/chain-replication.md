@@ -105,7 +105,7 @@ unchanged.
 **Why (2).** Form `"1"` hashed a *different* timestamp spelling from the one the
 row carries on the wire, so every SDK needed a second, private timestamp renderer
 used only in the hash path. Two renderers for one value is how Go and Python
-drifted apart (P1-48): both were correct about the instant and disagreed about the
+drifted apart (#91): both were correct about the instant and disagreed about the
 bytes. Form `"2"` has exactly one timestamp form, the one already written to the
 wire and already pinned by the §4.3 conformance tests. `Z` is also the spelling
 RFC 3339 examples, JSON Schema `date-time` and OpenAPI use, so it is the less

@@ -123,7 +123,7 @@ def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
     """Form "1" as Python ACTUALLY sealed it before the §1.2 conformance fix.
 
     Python hashed the wire timestamp verbatim (always-``Z``) while the spec and
-    Go used ``+00:00`` — the P1-48 divergence. Fixing it changed every hash
+    Go used ``+00:00`` — the divergence in #91. Fixing it changed every hash
     Python had already written, so a pre-upgrade row fails against the
     conformant function and is reported as "hash mismatch" — which reads as
     tampering, the exact false signal this chain exists to avoid.
@@ -318,7 +318,7 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
 
             expected = hash_fn(row_d)
             if expected != row.hash and form_id == "1":
-                # Pre-P1-48 Python sealed form "1" over the wire "Z" spelling.
+                # Before #91, Python sealed form "1" over the wire "Z" spelling.
                 # Accept it rather than report our own spec fix as tampering.
                 if _row_hash_form_1_legacy_z(row_d) == row.hash:
                     expected = row.hash
