@@ -237,7 +237,7 @@ def test_redacted_row_round_trips_through_sqlite():
 # ── one timestamp renderer (spec §1.4) ───────────────────────────────────────
 
 def test_form_2_hashes_the_wire_timestamp_verbatim():
-    """REGRESSION for the two-renderer hazard (P1-48).
+    """REGRESSION for the two-renderer hazard (#91).
 
     Form "1" hashed "+00:00" while the row carried "Z", so every SDK needed a
     second private timestamp renderer in the hash path — and Go and Python
@@ -278,7 +278,7 @@ def test_form_2_whole_second_and_zero_micros():
 
 
 def test_pre_upgrade_form_1_rows_still_verify():
-    """REGRESSION: the P1-48 fix must not orphan rows Python already sealed.
+    """REGRESSION: the #91 fix must not orphan rows Python already sealed.
 
     Python once hashed form "1" over the wire "Z" spelling. Making it
     spec-conformant (+00:00) changed every hash it had written, so a
@@ -405,3 +405,65 @@ def test_redacting_a_go_sealed_row_keeps_the_chain_valid():
     result = verify_chain(rows)
     assert result.ok, \
         f"a redacted Go-sealed row broke the chain: {result.reason}"
+
+
+def test_committed_cross_sdk_vector_matches_current_sealing():
+    """The Go-facing vector must not go stale.
+
+    spec/python-sealed-forms.json is what Go verifies. If Python's sealing
+    changes and the file is not regenerated, Go keeps verifying the OLD rows
+    and the divergence is invisible — the file would silently stop describing
+    this SDK. Regenerating here and comparing makes that a CI failure.
+
+    Regenerate with: python3 scripts/gen_cross_sdk_vectors.py
+    """
+    import subprocess
+    import sys
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, str(repo / "scripts" / "gen_cross_sdk_vectors.py"),
+         "--check"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
+    """Whole-second instants diverge under both halves of the #91 defect at
+    once, so a vector without them passes a suffix-only fix."""
+    labels = {c["label"] for c in
+              json.loads((Path(__file__).resolve().parents[2] /
+                          "spec" / "python-sealed-forms.json").read_text())["cases"]}
+    for required in ("form1_micros", "form1_whole_second",
+                     "form1_legacy_Z_micros", "form1_legacy_Z_whole",
+                     "form2_micros", "form2_whole_second"):
+        assert required in labels, f"vector lost coverage: {required}"
+
+
+def test_legacy_fallback_reproduces_a_real_pre_fix_release_hash():
+    """The one non-circular check on the legacy fallback.
+
+    Every other legacy-Z case in the vector is built by
+    _row_hash_form_1_legacy_z, so together they only prove both SDKs agree with
+    today's reconstruction. If that reconstruction drifted from what the old
+    release actually wrote, nothing would notice and rows in real deployments
+    would stop verifying.
+
+    The row and hash here are literals captured from commit 99bd8f4 — the
+    parent of the commit that introduced the spec 1.2 hashed form. Nothing
+    recomputes them.
+
+    If this fails, the fallback has stopped accepting real legacy rows. Fix the
+    fallback; do not update the constant.
+    """
+    from fasten.chain import _row_hash_form_1_legacy_z
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from gen_cross_sdk_vectors import FROZEN_PREFIX_ROW
+
+    d = dict(FROZEN_PREFIX_ROW)
+    expected = d.pop("hash")
+    assert _row_hash_form_1_legacy_z(d) == expected, (
+        "the legacy fallback no longer reproduces what a real pre-fix release "
+        "wrote — rows sealed by that release will now read as tampering"
+    )

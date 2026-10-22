@@ -87,6 +87,24 @@ else
   fi
 fi
 
+# The cross-SDK vector must describe what Python actually seals. Go verifies
+# the committed file, so if Python's sealing changes and the file is not
+# regenerated, Go keeps verifying stale rows and the divergence is invisible.
+# Exit 1 means stale; anything else means the step could not run. Collapsing
+# both into "stale" sends you to regenerate a file that was never compared.
+vout=$(docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
+        "cd python && pip install -q -e '.[sqlite,dev]' && cd /w && \
+         python3 scripts/gen_cross_sdk_vectors.py --check" 2>&1)
+vrc=$?
+if [ $vrc -eq 0 ]; then
+  pass "spec/python-sealed-forms.json matches current sealing"
+elif [ $vrc -eq 1 ]; then
+  bad "spec/python-sealed-forms.json is stale — run scripts/gen_cross_sdk_vectors.py"
+else
+  bad "vector check could not run (exit $vrc) — setup failed, the file was NOT compared:"
+  printf '%s\n' "$vout" | tail -4 | sed 's/^/        /'
+fi
+
 # Lockfiles must be tracked or --locked cannot work.
 if git ls-files --error-unmatch rust/Cargo.lock fasten-core/Cargo.lock >/dev/null 2>&1; then
   pass "both Cargo.lock files are tracked"
