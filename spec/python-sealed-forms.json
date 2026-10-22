@@ -197,6 +197,37 @@
     "timestamp": "2026-06-15T10:30:45.000000Z",
     "wire_version": "1"
    }
+  },
+  {
+   "label": "form1_real_prefix_release",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "domain": "sales",
+    "hash": "10336c91db970616bacee23bf25b06c85b7e85c03bf0c8e10a3f69d6284f02ea",
+    "id": "evt-real-prefix",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-real-prefix",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
   }
  ],
  "current_form": "2"

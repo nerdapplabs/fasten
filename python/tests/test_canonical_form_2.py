@@ -438,3 +438,32 @@ def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
                      "form1_legacy_Z_micros", "form1_legacy_Z_whole",
                      "form2_micros", "form2_whole_second"):
         assert required in labels, f"vector lost coverage: {required}"
+
+
+def test_legacy_fallback_reproduces_a_real_pre_fix_release_hash():
+    """The one non-circular check on the legacy fallback.
+
+    Every other legacy-Z case in the vector is built by
+    _row_hash_form_1_legacy_z, so together they only prove both SDKs agree with
+    today's reconstruction. If that reconstruction drifted from what the old
+    release actually wrote, nothing would notice and rows in real deployments
+    would stop verifying.
+
+    The row and hash here are literals captured from commit 99bd8f4 — the
+    parent of the commit that introduced the spec 1.2 hashed form. Nothing
+    recomputes them.
+
+    If this fails, the fallback has stopped accepting real legacy rows. Fix the
+    fallback; do not update the constant.
+    """
+    from fasten.chain import _row_hash_form_1_legacy_z
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from gen_cross_sdk_vectors import FROZEN_PREFIX_ROW
+
+    d = dict(FROZEN_PREFIX_ROW)
+    expected = d.pop("hash")
+    assert _row_hash_form_1_legacy_z(d) == expected, (
+        "the legacy fallback no longer reproduces what a real pre-fix release "
+        "wrote — rows sealed by that release will now read as tampering"
+    )

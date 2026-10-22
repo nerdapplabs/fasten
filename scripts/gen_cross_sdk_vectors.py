@@ -41,6 +41,48 @@ OUT = REPO / "spec" / "python-sealed-forms.json"
 MICROS = datetime(2026, 6, 15, 10, 30, 45, 123456, tzinfo=timezone.utc)
 WHOLE = datetime(2026, 6, 15, 10, 30, 45, 0, tzinfo=timezone.utc)
 
+# A row sealed by a REAL pre-conformance release, captured once and frozen.
+#
+# Every other legacy-Z case here is built by today's _row_hash_form_1_legacy_z,
+# so on its own it only proves both SDKs agree with the current reconstruction.
+# If that reconstruction drifted from what the old release actually wrote, the
+# vector would not notice. This row and its hash are LITERALS — nothing here
+# recomputes them — so the test that compares them to today's function is the
+# one non-circular check in the file.
+#
+# Provenance: sealed on commit 99bd8f4 (parent of 5a8f684, which introduced the
+# spec 1.2 hashed form). To re-capture, check out that tree and call
+# chain._row_hash on the row below with "hash" removed.
+#
+# Do NOT regenerate this. If today's reconstruction stops reproducing this hash,
+# the fallback has stopped accepting real legacy rows — that is a defect, not a
+# reason to update the constant.
+FROZEN_PREFIX_ROW = {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {"qty": 3, "sku": "WIDGET"},
+    "domain": "sales",
+    "hash": "10336c91db970616bacee23bf25b06c85b7e85c03bf0c8e10a3f69d6284f02ea",
+    "id": "evt-real-prefix",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-real-prefix",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": None,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": None,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1",
+}
+
 PINNED_SALT = "b" * 64
 
 
@@ -89,6 +131,10 @@ def build() -> dict:
         r = dataclasses.replace(_row(f"evt-{label}", ts),
                                 detail_salt=PINNED_SALT)
         add(label, seal("genesis", r))
+
+    # The frozen real-release row, passed through verbatim.
+    cases.append({"label": "form1_real_prefix_release",
+                  "row": dict(FROZEN_PREFIX_ROW)})
 
     return {"current_form": CURRENT_CANONICAL_FORM_ID, "cases": cases}
 
