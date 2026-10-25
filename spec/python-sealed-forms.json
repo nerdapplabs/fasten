@@ -1,0 +1,234 @@
+{
+ "cases": [
+  {
+   "label": "form1_micros",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "5c7b0173386a35c6d1e2ed20aacb25f2ef2675ff4f4ab40f7b08bd86c0604576",
+    "id": "evt-form1_micros",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_micros",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form1_whole_second",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "0d510ae481b1bb624ff98d0e3d9ebc2495a900be00271984de8e0f8588677069",
+    "id": "evt-form1_whole_second",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_whole_second",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.000000Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form1_legacy_Z_micros",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "c0d880278f49dc5ea5ce7005ce0746f142ed89a3ab974b761e7a7ce841623748",
+    "id": "evt-form1_legacy_Z_micros",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_legacy_Z_micros",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form1_legacy_Z_whole",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "0b4d8d71264358c8cccfe2ebf72711baa75dde29e3117e906c1bf72a5957c7a2",
+    "id": "evt-form1_legacy_Z_whole",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_legacy_Z_whole",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.000000Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form2_micros",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "2",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": "f539a999e9d125e1097ffaf48dc5034d46eda02f8ee2620ee0b896ebf9cd3dfd",
+    "detail_salt": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "domain": "sales",
+    "hash": "4f69557e9d0701b7e01a0493525c11fded3bf67d13386d9b87e3dfa246ade13b",
+    "id": "evt-form2_micros",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form2_micros",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form2_whole_second",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "2",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": "f539a999e9d125e1097ffaf48dc5034d46eda02f8ee2620ee0b896ebf9cd3dfd",
+    "detail_salt": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "domain": "sales",
+    "hash": "dd8cd423a2bacfc287f718a628afc968d4ba6b1b0ab7b3644899e9ac5b52b7ba",
+    "id": "evt-form2_whole_second",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form2_whole_second",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.000000Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form1_real_prefix_release",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "domain": "sales",
+    "hash": "10336c91db970616bacee23bf25b06c85b7e85c03bf0c8e10a3f69d6284f02ea",
+    "id": "evt-real-prefix",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-real-prefix",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  }
+ ],
+ "current_form": "2"
+}

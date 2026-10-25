@@ -174,6 +174,15 @@ func VerifyChain(rows []Row) VerifyResult {
 		}
 
 		expected := hashFn(row)
+		if expected != row.Hash && formID == "1" {
+			// Pre-conformance Python hashed the wire timestamp verbatim
+			// (always-"Z") while the spec and Go use "+00:00" — the
+			// divergence in #91. Those rows exist in deployments and are not
+			// tampered; without this they verify in Python (which has the
+			// same fallback) and fail here, which reads as tampering.
+			// Delete with form "1".
+			expected = rowHashForm1LegacyZ(row)
+		}
 		if expected != row.Hash {
 			return VerifyResult{
 				OK:           false,
@@ -235,13 +244,28 @@ func detailCommitment(salt string, detail map[string]any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// rowHashForm1LegacyZ is form "1" as pre-conformance Python actually sealed
+// it: the always-"Z" wire timestamp hashed verbatim, instead of the spec §1.2
+// "+00:00" variable-width rendering. Mirrors Python's
+// _row_hash_form_1_legacy_z. Verification fallback only — never used to seal.
+func rowHashForm1LegacyZ(row Row) string {
+	d := pyCanonicalRowMap(row)
+	delete(d, "hash")
+	d["timestamp"] = canonicalTS(row.Timestamp)
+	if row.ShippedAt != nil {
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+	}
+	sum := sha256.Sum256(canonicalJSON(d))
+	return hex.EncodeToString(sum[:])
+}
+
 // rowHashForm2 hashes form "2" (spec §1.4): form "1"'s field set with detail
 // and detail_salt removed and detail_commitment added, and the timestamp taken
 // VERBATIM from the wire form rather than re-rendered.
 //
 // Form "1" hashed "+00:00" while the row carried always-"Z" on the wire, so
 // every SDK needed a second private timestamp renderer used only in the hash
-// path — which is how Go and Python drifted apart inside it (P1-48). Form "2"
+// path — which is how Go and Python drifted apart inside it (#91). Form "2"
 // has one timestamp form, the one already written to the wire.
 func rowHashForm2(row Row) string {
 	d := pyCanonicalRowMap(row)
