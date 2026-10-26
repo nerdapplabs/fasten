@@ -1,13 +1,24 @@
-# fasten — C++14
+# fasten for C++14
 
-Audit + correlation SDK for C++14+. Single-header, **zero external
-dependencies**. v1.0.0-beta.
+Audit and correlation SDK for C++14 and later. v1.0.0-beta.
+
+The SDK is header-only. Redaction, the code catalog and the audit queue live
+in `libfasten_core` (the Rust library in [`fasten-core/`](../fasten-core)),
+so programs must link with `-lfasten_core`.
 
 ## Install
 
-Copy [`include/fasten.hpp`](include/fasten.hpp) into your project. That's
-it. (Optional: `include/fasten/codes_yaml.hpp` for YAML-loaded code
-catalogs — adds a libyaml-cpp dep only when included.)
+1. Build `libfasten_core`:
+
+   ```bash
+   cd fasten-core && cargo build --release --features all
+   ```
+
+2. Copy [`include/fasten.hpp`](include/fasten.hpp) into your project and
+   link against `fasten-core/target/release/libfasten_core`.
+
+Optional: `include/fasten/codes_yaml.hpp` loads code catalogs from YAML. It
+adds a libyaml-cpp dependency only when you include it.
 
 ## Quickstart
 
@@ -42,19 +53,21 @@ int main() {
 }
 ```
 
-Both lines stream NDJSON to stdout under the same `request_id`.
+Both lines go to stdout as NDJSON with the same `request_id`.
 
 ## Worked examples
 
-Two complete examples in [`examples/`](examples/):
+Two complete examples are in [`examples/`](examples/):
 
-- [`connector.cpp`](examples/connector.cpp) — Modbus TCP stub showing
-  `RequestScope`, `emit`, retry-with-context wiring.
-- [`reader_example.cpp`](examples/reader_example.cpp) — full reader
-  endpoint demo backed by `FastenReader` (use the bundled
-  `reader_simplehttp_main.cpp` to wire it to a real HTTP server).
+- [`connector.cpp`](examples/connector.cpp): a Modbus TCP stub showing
+  `RequestScope`, `emit`, and retry-with-context wiring.
+- [`reader_example.cpp`](examples/reader_example.cpp): the reader
+  endpoints backed by `FastenReader`. To serve them over HTTP, use
+  [`include/fasten_reader_simplehttp.hpp`](include/fasten_reader_simplehttp.hpp),
+  the Simple-Web-Server adapter.
 
-Build either with the project's CMakeLists:
+Build them with the project's CMakeLists, after building `libfasten_core`.
+`FASTEN_CORE_LIB_DIR` defaults to `../fasten-core/target/release`:
 
 ```bash
 cd cpp && mkdir -p build && cd build
@@ -63,36 +76,50 @@ cmake --build .
 ./connector
 ```
 
-Or single-file (no CMake):
+Or as a single file, without CMake:
 
 ```bash
-g++ -std=c++14 -O2 -I include examples/connector.cpp -o connector
+g++ -std=c++14 -O2 -I include examples/connector.cpp \
+    -L ../fasten-core/target/release -lfasten_core -lpthread -o connector
 FASTEN_SERVICE_ID=modbus-tcp FASTEN_NODE_ID=edge-01 ./connector
 ```
 
-## P1-15: audit-store failure handling
+On Linux, add `fasten-core/target/release` to `LD_LIBRARY_PATH` when running.
 
-When you register an audit sink and call `fasten::init()` with the
-default `audit_store_failure_strategy = "queue"`, fasten spawns a
-background `std::thread` that drains the queue with exponential
-backoff (100 ms → 60 s, ±20 % jitter). Sink exceptions stay off the
-request path. Set `audit_store_failure_strategy = "raise"` to opt
-into synchronous semantics with `fasten::AuditStoreError`.
-`fasten::queue_stats()` and `fasten::flush(timeout)` complete the
-public surface.
+## Audit-store failure handling
+
+When you register an audit sink and call `fasten::init()` with the default
+`audit_store_failure_strategy = "queue"`, fasten starts a background
+`std::thread` that drains the queue with exponential backoff (100 ms to
+60 s, plus or minus 20 % jitter). Sink exceptions stay off the request
+path. Set `audit_store_failure_strategy = "raise"` for synchronous writes
+that throw `fasten::AuditStoreError`. `fasten::queue_stats()` and
+`fasten::flush(timeout)` complete the public surface.
 
 ## Tests
 
+The same steps CI runs (see
+[`fasten-cpp.yml`](../.github/workflows/fasten-cpp.yml)), from the repo
+root:
+
 ```bash
-docker run --rm -v $PWD/cpp:/work gcc:14-bookworm sh -c \
-  "apt-get update && apt-get install -y cmake libyaml-cpp-dev && \
-   mkdir -p /work/build && cd /work/build && \
-   cmake /work -DFASTEN_BUILD_TESTS=ON && cmake --build . && ctest"
+(cd fasten-core && cargo build --release --locked --features all)
+sudo apt-get install -y cmake g++ libyaml-cpp-dev libsqlite3-dev
+cd cpp
+cmake -S . -B build -DFASTEN_BUILD_TESTS=ON -DFASTEN_BUILD_EXAMPLES=ON \
+  -DFASTEN_CORE_LIB_DIR=$PWD/../fasten-core/target/release
+cmake --build build --parallel
+LD_LIBRARY_PATH=$PWD/../fasten-core/target/release \
+  ctest --test-dir build --output-on-failure
 ```
 
-Current: 3/3 ctest suites pass (pii_in_detail, redact_substring, codes_yaml).
+ctest suites: `pii_in_detail_smoke`, `redact_substring_smoke`,
+`redact_env_keys_smoke`, `redact_conformance_smoke`, `shim_spdlog_smoke`,
+`shim_glog_smoke`, and, when their dependencies are found,
+`sqlite_store_smoke`, `postgres_store_smoke`, `codes_yaml_smoke` and
+`shim_boost_log_smoke`.
 
-## Docs + design
+## Docs and design
 
-Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/) ·
-Design + cross-language design: [README.md](../README.md).
+Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/).
+Design and cross-language design: [README.md](../README.md).

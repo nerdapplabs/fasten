@@ -1,24 +1,29 @@
-# fasten — Rust
+# fasten for Rust
 
-Audit + correlation SDK for Rust services. v1.0.0-beta.
+Audit and correlation SDK for Rust services. v1.0.0-beta.
 
 ## Install
 
-From source today (crates.io publish lands with the v1.0 GA tag):
+Install from source for now; the crate will be published to crates.io with
+the v1.0 GA tag.
 
 ```toml
 [dependencies]
 fasten = { path = "../fasten/rust" }     # local clone
-# or, when published:
+# or, once published:
 fasten = "1.0.0-beta"
 ```
+
+The crate depends on [`fasten-core`](../fasten-core) by path, so build from
+a full clone of the repo. `fasten-core` sets `rust-version = "1.90"`, which
+is the minimum toolchain (see [`rust-toolchain.toml`](../rust-toolchain.toml)).
 
 Optional features: `async`, `store-sqlite`, `store-postgres`,
 `shim-tracing`, `codes-yaml`.
 
 ## Quickstart
 
-Verified to compile + run on Rust 1.85+:
+Verified to compile and run on Rust 1.90+:
 
 ```rust
 use fasten::{init, register, Config, EmitBuilder, Meta, Severity, RetentionClass};
@@ -59,11 +64,11 @@ fn main() -> Result<(), fasten::Error> {
 }
 ```
 
-## Worked example — tiny_http service
+## Worked example: tiny_http service
 
-A minimal HTTP service with `X-Request-ID` propagation, an audit row
-per request: see [`examples/server.rs`](examples/server.rs). Sync-only
-(no tokio); uses the single `tiny_http` dev-dependency.
+A minimal HTTP service with `X-Request-ID` propagation and one audit row per
+request: see [`examples/server.rs`](examples/server.rs). It is sync-only (no
+tokio) and uses the single `tiny_http` dev-dependency.
 
 ```bash
 cd rust
@@ -73,27 +78,28 @@ curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 curl http://localhost:8080/users/u-42
 ```
 
-## P1-15: audit-store failure handling
+## Audit-store failure handling
 
-`EmitBuilder::submit()` defaults to **queue mode** — rows are pushed
-onto a bounded queue, drained by an `std::thread` with exponential
-backoff (100 ms → 60 s, ±20 % jitter). Store failures stay off the
-request path. Set `Config::audit_store_failure_strategy =
-Some("raise".into())` to opt into synchronous semantics with
-`AuditStoreError`. `fasten::queue_stats()` and `fasten::flush(timeout)`
-complete the public surface.
+`EmitBuilder::submit()` defaults to **queue mode**: rows go onto a bounded
+queue, drained by a `std::thread` with exponential backoff (100 ms to 60 s,
+plus or minus 20 % jitter). Store failures stay off the request path. Set
+`Config::audit_store_failure_strategy = Some("raise".into())` for
+synchronous writes that return `AuditStoreError`. `fasten::queue_stats()`
+and `fasten::flush(timeout)` complete the public surface.
 
 ## Tests
 
+From the repo root (the crate needs `../fasten-core`):
+
 ```bash
-docker run --rm -v $PWD/rust:/work -w /work rust:1.85-alpine \
+docker run --rm -v $PWD:/work -w /work/rust rust:1.90 \
   cargo test -- --test-threads=1
 ```
 
-Current: 18 passed. `--test-threads=1` because integration tests
-share global config + drainer.
+`--test-threads=1` because the integration tests share the global config
+and drainer.
 
-## Docs + design
+## Docs and design
 
-Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/) ·
-Design + cross-language design: [README.md](../README.md).
+Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/).
+Design and cross-language design: [README.md](../README.md).

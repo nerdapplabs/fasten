@@ -2,49 +2,51 @@
 
 **Version:** 1.1  
 **Date:** 2026-05-14  
-**Status:** Normative — all SDK drainer implementations MUST conform.
+**Status:** Normative. All SDK drainer implementations MUST conform.
 
 ---
 
 ## Purpose
 
-All SDKs expose the same bounded-queue / exponential-backoff / sys-event
-drainer surface to adopters.  The drainer implementation is provided by
-the shared `fasten-core` C ABI (`libfasten_core.so` / `.dylib`).
-Python, Go, and C++ bind to it via FFI (ctypes / cgo / `extern "C"`);
-Rust implements it natively as the authoritative reference.
-JS and Swift run spec-conformant pure-language in-process drainer loops
-(zero Rust dependency; P1-25 complete, P1-26 closed).
+Every SDK gives adopters the same drainer: a bounded queue, exponential
+backoff on insert failures, and sys events that report its state.
+
+- The shared `fasten-core` C ABI (`libfasten_core.so` / `.dylib`) provides
+  the implementation.
+- Python, Go and C++ bind to it over FFI (ctypes, cgo, `extern "C"`).
+- Rust implements it natively and is the reference implementation.
+- JS and Swift each run their own in-process drainer loop in the host
+  language, with no Rust dependency, conforming to this spec.
 
 This document is the single source of truth for the externally visible
-drainer contract.  When an SDK deviates from it, the spec wins.
+drainer contract. Where an SDK differs from it, the spec wins.
 
-Each SDK's test suite SHOULD include the test vectors in §7 to prevent
-silent re-divergence.
+Each SDK's test suite SHOULD include the test vectors in §7 so the SDKs
+do not drift apart again unnoticed.
 
 ---
 
 ## §1 Concepts
 
-**Queue** — a bounded in-memory FIFO that holds audit `Row` objects
-awaiting durable insertion.
+**Queue.** A bounded in-memory FIFO of audit `Row` objects waiting to be
+inserted into the store.
 
-**Drainer thread** — a single long-lived background thread (goroutine /
-Worker thread) that pops rows from the queue and calls `store.insert(row)`.
+**Drainer thread.** One long-lived background thread (goroutine, Worker
+thread) that pops rows from the queue and calls `store.insert(row)`.
 
-**Slot** — one unit of capacity.  A slot is _occupied_ from the moment
-`put()` acquires it until `store.insert` succeeds (or the row is
-dead-lettered / abandoned).  This means a row in retry backoff still
-occupies a slot; `capacity` therefore represents the maximum number of
-rows in-flight across the whole audit pipeline, not just queue depth.
+**Slot.** One unit of capacity. A slot is _occupied_ from the moment
+`put()` acquires it until `store.insert` succeeds, or until the row is
+dead-lettered or abandoned. A row waiting in retry backoff still holds its
+slot. `capacity` is therefore the maximum number of rows in flight across
+the whole audit pipeline, not just the queue depth.
 
-**`depth`** — the count of occupied slots at a given instant
+**`depth`.** The number of occupied slots at a given instant
 (`queued + in-flight`).
 
-**Backoff window** — the current sleep duration the drainer observes
-between consecutive failed insert attempts.  Starts at `retry_initial`
-(default 100 ms), doubles on each failure, caps at `retry_max`
-(default 60 s), with optional ±20 % jitter.
+**Backoff window.** How long the drainer sleeps between two failed insert
+attempts. It starts at `retry_initial` (default 100 ms), doubles after
+each failure, is capped at `retry_max` (default 60 s), and optionally has
++/-20 % jitter applied.
 
 ---
 
@@ -55,79 +57,69 @@ between consecutive failed insert attempts.  Starts at `retry_initial`
 | `capacity` | int | 100 | Maximum occupied slots (queued + in-flight) |
 | `retry_initial` | duration | 100 ms | First backoff window |
 | `retry_max` | duration | 60 s | Maximum backoff window |
-| `retry_jitter` | bool | true | ±20 % uniform jitter on each window |
-| `max_attempts` | int | 50 | Insert attempts before dead-lettering a row |
+| `retry_jitter` | bool | true | +/-20 % uniform jitter on each window |
+| `max_attempts` | int | 50 | Insert attempts before a row is dead-lettered |
 
 ---
 
 ## §3 State machine
 
 ```
-                        ┌──────────────────────────────────────────────────────┐
-  emit()                │                 DRAINER THREAD                        │
-  ─────                 │                                                        │
-  [stop set]──►emit abandons (audit_drain_abandoned)                            │
-                        │                                                        │
-  [slot free] ──acquire─►──────────────► pop row from queue                    │
-  [slot full] ──block──►                      │                                 │
-  (unblocks when        │                      ▼                                │
-   slot is released)    │              call store.insert(row)                   │
-                        │                      │                                │
-                        │          ┌───────────┴────────────┐                  │
-                        │          │ success                 │ failure          │
-                        │          ▼                         ▼                  │
-                        │    _on_success()           attempt < max_attempts?    │
-                        │    release slot                     │                 │
-                        │    (→ HEALTHY                  yes  │  no             │
-                        │     if recovering)              │   │                 │
-                        │                                 ▼   ▼                 │
-                        │                         _on_failure()  _on_dead_letter()│
-                        │                         wait_backoff()  release slot  │
-                        │                         (→ retry)    (dead-letter)    │
-                        └──────────────────────────────────────────────────────┘
+emit()
+  stop set    -> abandon the row (audit_drain_abandoned)
+  slot full   -> block until a slot is released
+  slot free   -> acquire a slot, push the row onto the queue
+
+drainer thread
+  pop row from queue
+  store.insert(row)
+    success                           -> _on_success(): release slot
+                                         (HEALTHY again if recovering)
+    failure, attempt <  max_attempts  -> _on_failure(), wait_backoff(), retry
+    failure, attempt >= max_attempts  -> _on_dead_letter(): release slot
 ```
 
 ### States
 
 | State | Entry condition | Sys event emitted |
 |---|---|---|
-| **HEALTHY** | Initial; or `retry_count` drops to 0 after a success | `audit_drain_recovered` (only when recovering _from_ a failure burst) |
-| **FAILING** | First insert failure in a burst (`retry_count` goes 0 → 1) | `audit_drain_failed` |
+| **HEALTHY** | Initial state, or `retry_count` returns to 0 after a success | `audit_drain_recovered`, only when recovering from a failure burst |
+| **FAILING** | First insert failure in a burst (`retry_count` goes from 0 to 1) | `audit_drain_failed` |
 | **DEGRADED** | `retry_count` reaches `DEGRADED_AFTER = 5` within the same burst | `audit_drain_degraded` |
-| **STOPPED** | `stop()` called | — |
+| **STOPPED** | `stop()` called | none |
 
 The degraded flag (`_degraded_emitted`) resets to `false` on every
-successful insert so the next failure burst can re-emit `audit_drain_degraded`.
+successful insert, so the next failure burst can emit
+`audit_drain_degraded` again.
 
 ---
 
 ## §4 Sys-stream events
 
-All events MUST be written to **stderr** (not stdout).  Writing to
-stdout risks deadlock: a slow stdout consumer stalls the drainer thread,
-which fills the queue, which blocks every `emit()`.
+All events MUST be written to **stderr**, not stdout. A slow stdout
+consumer would stall the drainer thread, the queue would fill, and every
+`emit()` would block.
 
-Events are JSON objects with `shape:"sys"` (same shape as the structured
-log output), emitted via the `sys_log` callback injected at drainer
-construction time.
+Events are JSON objects with `shape:"sys"`, the same shape as the
+structured log output. They are emitted through the `sys_log` callback
+passed in when the drainer is constructed.
 
 ### Capacity threshold events
 
-Fired from `put()` immediately after the slot is acquired and the
-counter is incremented.
+Fired from `put()` right after the slot is acquired and the counter is
+incremented.
 
 | Event | Level | Condition | Reset condition |
 |---|---|---|---|
 | `audit_queue_high_water` | `warn` | `depth / capacity >= 0.50` | `depth / capacity < 0.50` |
 | `audit_queue_near_full` | `error` | `depth / capacity >= 0.80` | (same reset as above) |
 
-**Debouncing:** each threshold fires AT MOST ONCE per crossing.  The
-crossing flag is reset when `depth` drops back below 50 % so a new
-surge re-emits the leading-indicator warning.  The two flags share one
-reset condition (below 50 %) so a brief dip between 50–80 % re-arms
-both.
+**Debouncing.** Each threshold fires AT MOST ONCE per crossing. Both flags
+reset only when `depth` drops below 50 %, so the next surge emits the
+early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 
-**Fields** (in addition to standard `shape/level/event/timestamp`):
+**Fields**, in addition to the standard `shape`, `level`, `event` and
+`timestamp`:
 
 ```json
 { "depth": <int>, "capacity": <int> }
@@ -137,11 +129,11 @@ both.
 
 | Event | Level | When |
 |---|---|---|
-| `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` 0→1) |
+| `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` goes from 0 to 1) |
 | `audit_drain_degraded` | `error` | `retry_count` reaches 5 within the burst |
-| `audit_drain_recovered` | `info` | Insert succeeds after one or more failures |
-| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts` |
-| `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
+| `audit_drain_recovered` | `info` | An insert succeeds after one or more failures |
+| `audit_drain_dead_letter` | `error` | A row uses up `max_attempts` |
+| `audit_drain_abandoned` | `error` | `put()` is called after the drainer has stopped |
 
 **`audit_drain_failed` fields:**
 
@@ -186,24 +178,24 @@ both.
 ## §5 `queue_stats()` shape
 
 `queue_stats()` MUST return `null` / `None` when the failure strategy is
-`raise` (no drainer).  Otherwise it returns a snapshot with the
-following fields:
+`raise`, since there is no drainer. Otherwise it returns a snapshot with
+these fields:
 
 | Field | Type | Description |
 |---|---|---|
 | `depth` | int | Occupied slots at snapshot time (queued + in-flight) |
 | `capacity` | int | Configured maximum |
-| `high_water` | int | Peak `depth` since drainer started (monotonic) |
-| `drained_total` | int | Cumulative successful inserts |
+| `high_water` | int | Peak `depth` since the drainer started (monotonic) |
+| `drained_total` | int | Total successful inserts |
 | `retry_count_active` | int | Consecutive failures in the current burst (0 = healthy) |
-| `in_backoff_seconds` | float | Remaining backoff sleep, 3 decimal places (0 = not in backoff) |
+| `in_backoff_seconds` | float | Backoff sleep remaining, 3 decimal places (0 = not in backoff) |
 | `last_error` | string\|null | Error string from the most recent failure, null when healthy |
-| `dead_lettered_total` | int | Cumulative rows moved to the DLQ |
+| `dead_lettered_total` | int | Total rows moved to the DLQ |
 | `dead_letter_depth` | int | Rows currently in the DLQ ring |
-| `capacity_semantics` | string | `"block"` — `put()` blocks when full (all SDKs except JS) |
+| `capacity_semantics` | string | `"block"`: `put()` blocks when full. All SDKs except JS, which reports `"warn_only"` and never blocks. |
 
-The `dead_letter_depth` is bounded by an internal ring of size 10; the
-oldest entry falls off automatically once the ring is full.
+`dead_letter_depth` is bounded by an internal ring of 10 entries. Once the
+ring is full, the oldest entry is dropped.
 
 ---
 
@@ -211,15 +203,15 @@ oldest entry falls off automatically once the ring is full.
 
 `flush(timeout)` MUST use **snapshot semantics**:
 
-1. Under the stats lock, snapshot `target = drained_total + depth`.
-2. Poll (≤ 10 ms interval) until `drained_total >= target` or timeout
-   elapses.
-3. Return `true` iff the target was reached.
+1. Under the stats lock, take `target = drained_total + depth`.
+2. Poll (at most every 10 ms) until `drained_total >= target` or the
+   timeout elapses.
+3. Return `true` if and only if the target was reached.
 
-**Rationale:** a steady incoming rate ≥ drain rate would keep a
-naïve "wait until queue empty" blocked indefinitely.  Snapshot semantics
-guarantee `flush()` terminates as long as the rows pending at call time
-eventually succeed (or are dead-lettered).
+**Why.** If rows keep arriving at least as fast as they drain, a plain
+"wait until the queue is empty" never returns. With a snapshot,
+`flush()` returns once the rows that were pending at call time succeed
+(or are dead-lettered).
 
 `flush()` MUST return `true` immediately (no-op) when the failure
 strategy is `raise`.
@@ -228,9 +220,9 @@ strategy is `raise`.
 
 ## §7 Test vectors
 
-These test scenarios are the normative conformance corpus.  Each SDK's
-test suite SHOULD cover all of them.  See
-`python/tests/test_audit_queue.py` for the reference implementation.
+These scenarios are the normative conformance corpus. Each SDK's test
+suite SHOULD cover all of them. The reference implementation is
+`python/tests/test_audit_queue.py`.
 
 ### V-1 Happy path: queue mode drains within 1 second
 
@@ -405,21 +397,21 @@ if jitter:
   delay(n) = max(0, delay(n) + uniform(-0.2 × delay(n), +0.2 × delay(n)))
 ```
 
-When `jitter=false` the first five delays (with `retry_initial=100ms`,
-`retry_max=60000ms`) are: 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms.
+With `jitter=false`, `retry_initial=100ms` and `retry_max=60000ms`, the
+first five delays are 100 ms, 200 ms, 400 ms, 800 ms and 1600 ms.
 
 ---
 
 ## §9 Thread-safety requirements
 
-- `put()` and `stats()` MUST be safe to call from multiple concurrent
-  threads.
+- `put()` and `stats()` MUST be safe to call from multiple threads at
+  once.
 - `flush()` MUST be safe to call concurrently with `put()`.
-- Slot accounting MUST NOT race: `used_slots_count` MUST be decremented
-  _before_ the semaphore/permit is released so a concurrent `put()` that
+- Slot accounting MUST NOT race. `used_slots_count` MUST be decremented
+  _before_ the semaphore/permit is released, so a concurrent `put()` that
   wakes on the freed permit reads the correct count.
-- `high_water` and threshold flags MUST be updated under the same lock
-  to prevent duplicate sys events under concurrent puts (see V-8).
+- `high_water` and the threshold flags MUST be updated under the same
+  lock, so concurrent puts cannot emit duplicate sys events (see V-8).
 
 ---
 
@@ -428,15 +420,15 @@ When `jitter=false` the first five delays (with `retry_initial=100ms`,
 `stop()` / `shutdown()`:
 
 1. Set the stop signal.
-2. Interrupt any in-progress backoff sleep immediately.
-3. Drain remaining queue entries with at most one attempt each
-   (no retry in shutdown path).
+2. Interrupt any backoff sleep in progress immediately.
+3. Drain the remaining queue entries with at most one attempt each. There
+   is no retry on the shutdown path.
 4. Join the drainer thread with a short timeout.
 
 `install_drainer()` / `init()` on a running engine MUST:
 
 1. Build the new drainer first.
-2. Atomically swap the slot (under a mutex).
-3. Flush the old drainer (outside the mutex) then stop it.
+2. Swap it into the slot atomically, under a mutex.
+3. Flush the old drainer, outside the mutex, then stop it.
 
-This race-safe swap prevents dropping in-flight rows during re-init.
+This order means no in-flight rows are dropped during re-init.
