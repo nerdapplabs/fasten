@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-spec/codegen.py — generate enum/constant blocks for all fasten language adapters.
-
-Single source of truth: spec/row-schema.json
+Generate the enum constants and redact patterns in each SDK from
+spec/row-schema.json, between the FASTEN GENERATED markers.
 
 Usage:
     python spec/codegen.py --write   update adapter files in place
-    python spec/codegen.py --check   exit 1 if any adapter is out of date (CI gate)
+    python spec/codegen.py --check   exit 1 if any adapter is out of date
 
-Scope: enum constants + redact patterns only. Row struct generation and
-wire-shape serializers are deferred to a post-1.0 tooling pass — the
-enum vocabulary changes rarely and the current output is sufficient for
-v1.0. Expanding scope is tracked in ARCHITECTURE-REVIEW.md.
+Covers the Python, Go, JS, Rust and C++ SDKs. gen_java is not in ADAPTERS, so
+the generated block in java/ is not checked.
 """
 from __future__ import annotations
 
@@ -27,8 +24,6 @@ SCHEMA = ROOT / "spec" / "row-schema.json"
 
 MARK_B = "── FASTEN GENERATED"
 MARK_E = "── END FASTEN GENERATED"
-
-# ── Spec helpers ──────────────────────────────────────────────────────────────
 
 def load_spec() -> dict:
     return json.loads(SCHEMA.read_text())
@@ -53,15 +48,13 @@ def vals(defn: dict) -> list[tuple[str, str]]:
 def redact(spec: dict) -> dict:
     return spec["x-fasten-redact"]
 
-# ── Name helpers ──────────────────────────────────────────────────────────────
-
 def upper(s: str) -> str:
     return s.upper()
 
 def pascal(s: str) -> str:
     return "".join(w.capitalize() for w in s.split("_"))
 
-# Go treats short all-caps tokens as acronyms per effective-go conventions.
+# Go style writes acronyms in all caps (MethodHTTP, not MethodHttp).
 _GO_ACRONYMS = {"http", "mqtt", "cli", "ui", "sdk"}
 
 def go_pascal(s: str) -> str:
@@ -72,8 +65,7 @@ def dquote(s: str) -> str:
     """Return s as a double-quoted string literal (valid in Go, Rust, C++, Java)."""
     return json.dumps(s)
 
-# ── Language generators ───────────────────────────────────────────────────────
-# Each returns the *content* between the markers (no marker lines).
+# Each generator returns the lines between the markers, without the markers.
 
 def gen_python(spec: dict) -> str:
     L: list[str] = []
@@ -313,8 +305,6 @@ def gen_cpp(spec: dict) -> str:
     L.append("}")
     return "\n".join(L)
 
-
-# ── File injection ────────────────────────────────────────────────────────────
 
 class Adapter:
     def __init__(self, lang: str, path: pathlib.Path,

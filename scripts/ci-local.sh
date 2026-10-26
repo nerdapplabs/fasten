@@ -1,10 +1,5 @@
 #!/bin/sh
-# Run what CI runs, locally, in one shot.
-#
-# Written after "rustc 1.85.1 is not supported" survived several pushes: four
-# workflows pinned the Rust toolchain independently and each fix touched one of
-# them. Every failure in that round was discoverable locally; none of them were
-# discovered locally.
+# Run the CI checks locally (most in Docker) before pushing.
 #
 # Usage:  ./scripts/ci-local.sh
 # Exit 0 only when every job a push would run is green.
@@ -27,7 +22,7 @@ else
   bad "rust-toolchain.toml=$TC != fasten-core rust-version=$MV"
 fi
 
-# Any workflow pinning its own version is how the 1.85 failure persisted.
+# Workflows must take the toolchain from rust-toolchain.toml, not pin their own.
 STRAY=$(grep -rhoE "dtolnay/rust-toolchain@[0-9][0-9.]*|image: rust:[0-9][0-9.]*" \
           .github/workflows/ 2>/dev/null | grep -v "rust:$TC" | sort -u)
 if [ -z "$STRAY" ]; then
@@ -36,9 +31,8 @@ else
   bad "divergent toolchain pins: $(echo $STRAY)"
 fi
 
-# dtolnay/rust-toolchain@master REQUIRES a toolchain input; it does not read
-# rust-toolchain.toml. Omitting it fails with "'toolchain' is a required
-# input" — a failure the pin check above cannot see, because there is no pin.
+# dtolnay/rust-toolchain@master needs a toolchain input and does not read
+# rust-toolchain.toml, so each use must be passed the channel read from it.
 MASTER=$(grep -rlE "dtolnay/rust-toolchain@master" .github/workflows/ 2>/dev/null)
 missing=""
 for f in $MASTER; do
@@ -62,16 +56,10 @@ done
 [ "$ORDER_OK" -eq 1 ] && pass "checkout precedes the toolchain reader" \
                       || bad "a toolchain reader runs before checkout"
 
-# Every `run:` step that reads a repo-root file must either override the job
-# default working-directory or use a path relative to it. The rust job defaults
-# to working-directory: rust, which made the drift check grep rust-toolchain.toml
-# from rust/ and fail with "No such file or directory". ci-local.sh runs from the
-# root, so it cannot see this class of bug by running commands — it has to be
-# checked structurally.
-# Runs in Docker because the host python3 may not have pyyaml. The checker
-# lives in its own file: the first version was inlined in a heredoc, and the
-# escaped quotes inside an f-string made it a SyntaxError, so it exited 1 on
-# every run and reported a finding it had never actually looked for.
+# A step that reads a repo-root file must not inherit a subdirectory
+# working-directory. This script runs from the root and can't catch that by
+# running the commands, so the workflow files are checked instead. In Docker
+# because the host python3 may not have pyyaml.
 WDCHECK=scripts/check-workflow-paths.py
 if [ ! -f "$WDCHECK" ]; then
   bad "missing $WDCHECK"
@@ -87,11 +75,9 @@ else
   fi
 fi
 
-# The cross-SDK vector must describe what Python actually seals. Go verifies
-# the committed file, so if Python's sealing changes and the file is not
-# regenerated, Go keeps verifying stale rows and the divergence is invisible.
-# Exit 1 means stale; anything else means the step could not run. Collapsing
-# both into "stale" sends you to regenerate a file that was never compared.
+# Go's tests verify the committed spec/python-sealed-forms.json, so it must
+# match what Python seals today. Exit 1 means stale; any other non-zero exit
+# means the check itself could not run.
 vout=$(docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
         "cd python && pip install -q -e '.[sqlite,dev]' && cd /w && \
          python3 scripts/gen_cross_sdk_vectors.py --check" 2>&1)
@@ -99,9 +85,9 @@ vrc=$?
 if [ $vrc -eq 0 ]; then
   pass "spec/python-sealed-forms.json matches current sealing"
 elif [ $vrc -eq 1 ]; then
-  bad "spec/python-sealed-forms.json is stale — run scripts/gen_cross_sdk_vectors.py"
+  bad "spec/python-sealed-forms.json is stale: run scripts/gen_cross_sdk_vectors.py"
 else
-  bad "vector check could not run (exit $vrc) — setup failed, the file was NOT compared:"
+  bad "vector check could not run (exit $vrc): setup failed, the file was NOT compared:"
   printf '%s\n' "$vout" | tail -4 | sed 's/^/        /'
 fi
 
@@ -109,7 +95,7 @@ fi
 if git ls-files --error-unmatch rust/Cargo.lock fasten-core/Cargo.lock >/dev/null 2>&1; then
   pass "both Cargo.lock files are tracked"
 else
-  bad "a Cargo.lock is untracked — --locked will error 'needs to be updated'"
+  bad "a Cargo.lock is untracked: --locked will error 'needs to be updated'"
 fi
 
 echo
@@ -146,8 +132,8 @@ fi
 
 echo
 echo "== go =="
-# 6GB: the Docker default OOM-kills the compile of modernc.org/sqlite, and the
-# failure reads as "build failed" rather than out-of-memory.
+# Compiling modernc.org/sqlite needs more memory than Docker's default; when
+# it runs out the error reads "build failed", not out-of-memory.
 if docker run --rm --memory=6g -v "$PWD":/w -w /w/go \
      -e LD_LIBRARY_PATH=/w/fasten-core/target/release golang:1-bookworm \
      sh -c "go test -vet=off ./..." >/dev/null 2>&1; then
@@ -174,10 +160,9 @@ if docker run -d --name "$PGC" -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=fasten \
   else
     bad "python postgres allocation"
   fi
-  # Go PG tests are behind //go:build integration, like the rest of the Go
-  # Postgres suite. Without this the Go allocator, its advisory lock and the
-  # UNIQUE index were never executed anywhere — the same gap that let Go write
-  # every Postgres row unsealed while every SQLite test passed.
+  # The Go Postgres tests need -tags integration. Without this step nothing
+  # else in this script runs the Go allocator, its advisory lock or the
+  # UNIQUE index against Postgres.
   if docker run --rm --network host --memory=6g -v "$PWD":/w -w /w/go \
        -e LD_LIBRARY_PATH=/w/fasten-core/target/release \
        -e FASTEN_TEST_POSTGRES_DSN="postgres://postgres:pw@127.0.0.1:55433/fasten?sslmode=disable" \

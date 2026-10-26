@@ -31,8 +31,7 @@ func main() {
 	// 1. sys row
 	fasten.LogInfo(ctx, "startup_ok", "lang", "go")
 
-	// 2. audit row with PII detail — Emit() applies RedactDetail before
-	//    writing to stdout / inserting into store.
+	// 2. audit row with PII detail. Emit() redacts it before writing.
 	if _, err := fasten.Emit(ctx, "USER_CREATED",
 		fasten.Target("u-42"),
 		fasten.Actor("admin", "user"),

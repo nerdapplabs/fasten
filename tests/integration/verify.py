@@ -5,26 +5,27 @@ Verify a language SDK's stdout against the fasten wire contract.
 Reads NDJSON lines from stdin (whatever a smoke program emitted) and
 asserts:
 
-  1. At least one {shape: "audit"}, {shape: "sys"}, and {shape: "api"} row appear.
-  2. Audit row carries the required wire fields.
-  3. Audit detail redaction worked: api_key and nested.token are "***",
-     email is preserved.
-  4. request_id is a 12-char hex string (or empty for sys before any emit).
-  5. Sys row has the canonical level/event/timestamp shape.
-  6. Api row carries method, path, status, request_id, timestamp.
+  1. At least one {shape: "audit"} and one {shape: "sys"} row appear, plus
+     an {shape: "api"} row when FASTEN_VERIFY_REQUIRE_API=1.
+  2. The audit row carries the required wire fields.
+  3. Redaction worked: api_key, customer_token and nested.token (if present)
+     are "***"; email is unchanged.
+  4. Audit and api request_id values are 12 hex chars.
+  5. The sys row has level, event, request_id and timestamp.
+  6. An api row, if any, has method, path, status, request_id, timestamp.
 
-Exit 0 if all assertions pass, non-zero with a readable diff otherwise.
+Exits 0 if every check passes, else 1 with the failed check on stderr.
 
 Usage:
 
     docker run --rm fasten-itest-python | python tests/integration/verify.py
 
-Each SDK must emit (in any order):
+Each smoke emits, in any order:
 
-    log.info("startup_ok", {extra_field: 1})
+    log.info("startup_ok", {lang: ...})
     emit(code="USER_CREATED", target="u-42", actor="admin",
-         detail={email, api_key, nested.token})
-    write_api({method, path, status, ms, request_id, timestamp})
+         detail={email, api_key, customer_token, nested.token})
+    write_api({method, path, status, ms, request_id, timestamp})  # Python only
 """
 from __future__ import annotations
 
@@ -44,21 +45,11 @@ REQUIRED_AUDIT_FIELDS = {
 REQUIRED_SYS_FIELDS = {"shape", "level", "event", "request_id", "timestamp"}
 REQUIRED_API_FIELDS = {"shape", "method", "path", "status", "request_id", "timestamp"}
 
-# Two distinct correlation surfaces — different fields, different formats:
-#
-#   ID_RE      — audit.id and audit.origin_id. Per-event unique ID, format
-#                "evt-<20 hex>". 80 bits of entropy; the dedup key when rows
-#                replicate across nodes. Earlier the gate accepted 16-32 hex
-#                to be lenient — that masked any SDK silently emitting a
-#                different length, which would break dedup downstream.
-#                Tightened to the spec (spec/row-schema.json properties.id
-#                .pattern).
-#   REQ_ID_RE  — request_id on EVERY shape (audit / sys / api). Per-request
-#                correlation ID, 12 hex chars (no prefix). Same value across
-#                all 3 streams for one request, so adopters can `grep $rid`
-#                and pull the full request story out of mixed log streams.
-#                Shorter than ID_RE on purpose: stays readable inline in
-#                log lines.
+# ID_RE: audit.id, "evt-" plus 20 hex chars, as in spec/row-schema.json
+# properties.id.pattern. It is the dedup key when rows replicate, so any other
+# length is a failure.
+# REQ_ID_RE: request_id, 12 hex chars with no prefix. The same value appears
+# on audit, sys and api rows for one request, so it can be grepped across logs.
 ID_RE = re.compile(r"^evt-[0-9a-f]{20}$")
 REQ_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
@@ -71,9 +62,8 @@ def fail(msg: str, ctx: Any = None) -> None:
 
 
 def main() -> None:
-    # Set by the Python smoke only. Other SDKs don't emit api rows today
-    # (api stream is Python-only until HTTP shims stabilise — see README
-    # tests/integration/README.md §api-stream and P1-20).
+    # Set for the Python smoke only; the other SDKs don't write api rows
+    # (see tests/integration/README.md).
     require_api = os.environ.get("FASTEN_VERIFY_REQUIRE_API", "0") == "1"
 
     audit_rows: list[dict] = []
@@ -104,7 +94,6 @@ def main() -> None:
     if not sys_rows:
         fail("no {shape: 'sys'} row produced")
 
-    # --- Audit checks ---
     audit = audit_rows[0]
     missing = REQUIRED_AUDIT_FIELDS - set(audit.keys())
     if missing:
@@ -128,21 +117,16 @@ def main() -> None:
         fail("audit.detail.email lost or mutated", detail)
     if detail.get("api_key") != "***":
         fail("audit.detail.api_key was NOT redacted", detail)
-    # Substring match — `customer_token` should redact because `token` matches.
-    # Guards against the C++ anchored-regex regression (REVIEW.md item #1):
-    # Python / JS use `re.search` semantics, so customer_token / user_password /
-    # auth_header_value should all redact in every SDK.
+    # Key patterns match anywhere in the key, so customer_token is redacted
+    # because it contains "token". An anchored regex would miss it.
     if detail.get("customer_token") != "***":
         fail("audit.detail.customer_token was NOT redacted (substring on 'token')", detail)
-    # Nested redaction is checked only where the SDK supports nested detail
-    # values (Python / JS / Rust / Go). C++ uses flat Fields and does not
-    # carry a 'nested' key — skip silently if absent.
+    # C++ detail is flat and has no "nested" key; the other smokes send one.
     nested = detail.get("nested")
     if isinstance(nested, dict):
         if nested.get("token") != "***":
             fail("audit.detail.nested.token was NOT redacted", detail)
 
-    # --- Sys checks ---
     sys_row = sys_rows[0]
     missing = REQUIRED_SYS_FIELDS - set(sys_row.keys())
     if missing:
@@ -152,10 +136,6 @@ def main() -> None:
     if sys_row["event"] != "startup_ok":
         fail(f"sys.event expected startup_ok, got {sys_row['event']}")
 
-    # --- Api checks ---
-    # api rows are Python-only today; non-Python smokes are not required to
-    # emit them (FASTEN_VERIFY_REQUIRE_API=1 is set only for the Python target
-    # in tests/integration/Makefile).
     if require_api and not api_rows:
         fail("no {shape: 'api'} row produced")
     if api_rows:
