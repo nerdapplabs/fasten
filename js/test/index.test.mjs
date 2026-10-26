@@ -12,11 +12,15 @@
 import { test, before, beforeEach, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    init, emit, register, metaOf, dump, mintID,
+    init, emit, register, metaOf, dump, mintID, log, defaultEngine,
     withRequestID, currentRequestID,
     REDACT_REPLACEMENT, Severity, RetentionClass,
 } from '../src/index.js';
 import * as auditQueue from '../src/audit_queue.js';
+
+// Outer redaction settings would change what these tests expect.
+delete process.env.FASTEN_REDACT_KEYS;
+delete process.env.FASTEN_REDACT_REPLACEMENT;
 
 // ── shared test codes ──────────────────────────────────────────────────────
 
@@ -441,4 +445,67 @@ describe('dump', () => {
             assert.equal(parts.length, 3, `expected id,domain,severity got: ${line}`);
         }
     });
+});
+
+describe('log', () => {
+    function capture(stream, fn) {
+        const orig = stream.write;
+        const lines = [];
+        stream.write = (chunk) => { lines.push(String(chunk)); return true; };
+        try { fn(); } finally { stream.write = orig; }
+        return lines.map((l) => JSON.parse(l));
+    }
+    const captureStdout = (fn) => capture(process.stdout, fn);
+
+    test('fields go through the redactor', () => {
+        initTestSDK();
+        const [line] = captureStdout(() =>
+            log.info('login', { user: 'u-1', password: 'hunter2', note: 'ok' }));
+        assert.equal(line.event, 'login');
+        assert.equal(line.user, 'u-1');
+        assert.equal(line.password, REDACT_REPLACEMENT);
+        assert.equal(line.note, 'ok');
+    });
+
+    test('extra redact keys and replacement apply', () => {
+        initTestSDK({ extraRedactKeys: ['ssn'], redactReplacement: '[x]' });
+        const [line] = captureStdout(() => log.warn('check', { ssn: '123', api_key: 'k' }));
+        assert.equal(line.ssn, '[x]');
+        assert.equal(line.api_key, '[x]');
+    });
+
+    test('extra keys are matched literally', () => {
+        initTestSDK({ extraRedactKeys: ['card(', 'ssn'] });
+        const [line] = captureStdout(() => log.info('x', { 'card(no': '1', ssn: '2' }));
+        assert.equal(line['card(no'], REDACT_REPLACEMENT);
+        assert.equal(line.ssn, REDACT_REPLACEMENT);
+    });
+
+    test('no fields, or fields that are not JSON, still log', () => {
+        initTestSDK();
+        const lines = captureStdout(() => {
+            log.info('bare');
+            log.info('fn', () => 1);
+        });
+        assert.deepEqual(lines.map((l) => l.event), ['bare', 'fn']);
+    });
+
+    test('drainer sys lines on stderr are redacted', () => {
+        initTestSDK();
+        const [line] = capture(process.stderr, () =>
+            defaultEngine._drainerSysLog('error', 'audit_drain_failed', { token: 't', depth: 1 }));
+        assert.equal(line.token, REDACT_REPLACEMENT);
+        assert.equal(line.depth, 1);
+    });
+});
+
+test('emit keeps a null detail as null', () => {
+    initTestSDK();
+    const row = emit({ code: 'USER_CREATED', target: 'u', detail: null });
+    assert.equal(row.detail, null);
+});
+
+test('emit still rejects a detail that is not JSON', () => {
+    initTestSDK();
+    assert.throws(() => emit({ code: 'USER_CREATED', target: 'u', detail: () => 1 }));
 });

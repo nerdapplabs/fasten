@@ -115,21 +115,20 @@ export function coreRedact(inJson) {
 	return JSON.stringify(_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT));
 }
 
+function _escapeRe(s) {
+	return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * Redact with optional extra key patterns and a custom replacement string.
- * extraKeysJson: JSON array of regex strings (e.g. '["my_secret","ssn"]')
+ * extraKeysJson: JSON array of plain strings, matched literally (e.g. '["my_secret","ssn"]')
  * replacement:   string to substitute (null → "***")
  */
 export function coreRedactFull(inJson, extraKeysJson, replacement) {
 	const rep = replacement ?? REDACT_REPLACEMENT;
-	let extra = [];
-	if (extraKeysJson) {
-		try {
-			extra = JSON.parse(extraKeysJson).map((k) => new RegExp(k, "i"));
-		} catch {
-			/* ignore malformed extra keys */
-		}
-	}
+	const extra = extraKeysJson
+		? JSON.parse(extraKeysJson).map((k) => new RegExp(_escapeRe(k), "i"))
+		: [];
 	const patterns = [..._DEFAULT_PATTERNS, ...extra];
 	const obj = JSON.parse(inJson);
 	return JSON.stringify(_redactObj(obj, patterns, rep));
