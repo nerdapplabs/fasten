@@ -10,13 +10,13 @@ import java.nio.file.Path;
 import java.util.Map;
 
 /**
- * JNA interface declaration — maps directly to libfasten_store_core symbols.
+ * JNA mapping of the libfasten_store_core symbols.
  *
  * <p>Internal; use {@link FastenStore} instead of this interface directly.
  *
  * <p>Library loading order:
  * <ol>
- *   <li>{@code FASTEN_STORE_CORE_LIB} env var — full path to the .so/.dylib/.dll</li>
+ *   <li>{@code FASTEN_STORE_CORE_LIB} env var: full path to the .so/.dylib/.dll</li>
  *   <li>{@code jna.library.path} / {@code LD_LIBRARY_PATH} / system paths</li>
  * </ol>
  */
@@ -24,7 +24,7 @@ interface FastenStoreLib extends Library {
 
     FastenStoreLib INSTANCE = load();
 
-    // ── C ABI ─────────────────────────────────────────────────────────────────
+    // C ABI
 
     Pointer fasten_store_open(
         String backend,
@@ -43,7 +43,7 @@ interface FastenStoreLib extends Library {
 
     String fasten_store_version();
 
-    // ── Loading ───────────────────────────────────────────────────────────────
+    // Loading
 
     private static FastenStoreLib load() {
         String explicit = System.getenv("FASTEN_STORE_CORE_LIB");

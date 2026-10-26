@@ -6,33 +6,24 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * fasten — audit + correlation SDK for Java services.
+ * fasten: audit and request correlation SDK for Java services.
  *
- * <p>Same shape as Python / Go / Node.js / Rust references: 6 audit anchors
- * (5 Ws + H) + correlation, opt-in shims per transport, pluggable store +
- * transport, mountable reader.
+ * <p>Not implemented yet. Every public method throws
+ * {@link UnsupportedOperationException}, so callers find out at the first
+ * call rather than at emit(). Use the Python, Go, JS, Rust or C++ SDK for
+ * now; they share the wire format in {@code spec/row-schema.json}.
  *
- * <p><b>v1.0-beta status: PLACEHOLDER.</b> Every public method below
- * throws {@link UnsupportedOperationException} so adopters get a loud
- * fix-it message at the first call site instead of silently no-op'ing
- * through {@code register} / {@code init} / {@code metaOf} / {@code dump}
- * and only failing later at emit time. Use Python, Go, JS, Rust, or C++
- * SDKs in the meantime; their wire format is the same one defined in
- * {@code spec/row-schema.json}.
- *
- * <p>Type definitions ({@link Row}, {@link Meta}, {@link Filter},
+ * <p>The types below ({@link Row}, {@link Meta}, {@link Filter},
  * {@link Config}, {@link AuditRepository}, {@link AuditOutboxRepository})
- * are wire-compatible with the spec — adopters can build adapters
- * against them today, knowing they will keep their shape when the
- * runtime lands.
+ * are meant to keep their shape when the runtime is written.
  *
- * <p>See {@code ../README.md} for the full design.
+ * <p>See {@code java/README.md}.
  */
 public final class Fasten {
 
     private static final String NOT_IMPLEMENTED =
         "fasten-java is a v1.0-beta placeholder; runtime is not implemented. "
-        + "Use the Python, Go, JS, Rust, or C++ SDK in the meantime — their "
+        + "Use the Python, Go, JS, Rust, or C++ SDK in the meantime; their "
         + "wire format is compatible (one shared spec/row-schema.json across "
         + "all SDKs). Track progress at https://github.com/nerdapplabs/fasten/issues.";
 
@@ -99,16 +90,13 @@ public final class Fasten {
     };
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
-    // ---------------------------------------------------------------------
-    // Wire-compatible type definitions (no runtime impl yet).
-    //
-    // Field names match spec/row-schema.json so adapters built against
-    // these records will not need to be retrofitted when the runtime
-    // lands. Domain is a free string per spec (adopter-defined, e.g.
-    // "user", "billing", "node") — not a closed enum.
-    // ---------------------------------------------------------------------
+    // Field names follow spec/row-schema.json. Domain is a free string chosen
+    // by the adopter ("user", "billing", ...), not an enum.
 
-    /** Canonical audit row — wire shape matches spec/row-schema.json. */
+    /**
+     * Audit row. Covers most of spec/row-schema.json; wire_version, shape,
+     * prev_hash and hash are not modelled yet.
+     */
     public record Row(
             String id,
             String originId,
@@ -167,7 +155,7 @@ public final class Fasten {
             Optional<AuditRepository> apiStore
     ) {}
 
-    /** Long-term audit store — adopter implements per chosen backend. */
+    /** Audit store. Adopters implement one per backend. */
     public interface AuditRepository {
         void insert(Row row);
         List<Row> query(Filter filter);
@@ -176,7 +164,7 @@ public final class Fasten {
         int purge(Instant before, boolean respectUnshipped);
     }
 
-    /** Drain-to-remote outbox — edge-sync, relay patterns. */
+    /** Outbox of rows waiting to be shipped to a remote store. */
     public interface AuditOutboxRepository {
         void enqueue(Row row);
         List<Row> nextBatch(int n);
@@ -184,10 +172,6 @@ public final class Fasten {
         void requeue(List<String> ids);
         int depth();
     }
-
-    // ---------------------------------------------------------------------
-    // Public API — every entry point throws until the runtime lands.
-    // ---------------------------------------------------------------------
 
     /** Initialise fasten. Call once at startup. */
     public static void init(Config cfg) {
@@ -204,19 +188,13 @@ public final class Fasten {
         throw new UnsupportedOperationException(NOT_IMPLEMENTED);
     }
 
-    /** {@code id,domain,severity} sorted — feeds the cross-language consistency gate. */
+    /** Registered codes as sorted {@code id,domain,severity} lines, for comparing catalogs across SDKs. */
     public static String dump() {
         throw new UnsupportedOperationException(NOT_IMPLEMENTED);
     }
 
-    // ---------------------------------------------------------------------
-    // Correlation context.
-    //
-    // The request-id helpers throw too: a working request_id mint /
-    // get / set surface without a working emit() implies "you can use
-    // it" — exactly the wrong-thing-says-correct trap this placeholder
-    // is meant to avoid. They land together when the runtime lands.
-    // ---------------------------------------------------------------------
+    // The request_id helpers throw too, since working ones would suggest the
+    // SDK is usable without emit().
 
     public static String mintId() {
         throw new UnsupportedOperationException(NOT_IMPLEMENTED);
@@ -239,14 +217,8 @@ public final class Fasten {
         throw new UnsupportedOperationException(NOT_IMPLEMENTED);
     }
 
-    // ---------------------------------------------------------------------
-    // Emit factory.
-    //
-    // No fluent {@code Emit} builder is exposed: returning a builder
-    // that can never write() would still let adopters chain configure
-    // calls before failing — exactly the half-implemented experience
-    // this placeholder is meant to avoid.
-    // ---------------------------------------------------------------------
+    // No fluent Emit builder yet: one that can never write() would let callers
+    // chain calls before anything fails.
 
     public static void emit(String code, String target) {
         throw new UnsupportedOperationException(NOT_IMPLEMENTED);

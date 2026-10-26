@@ -10,7 +10,7 @@
     <packaging>jar</packaging>
 
     <name>fasten</name>
-    <description>Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport</description>
+    <description>Audit + correlation SDK: 5 Ws + H anchors, one request_id across every transport</description>
     <url>https://fasten.sh</url>
 
     <licenses>
