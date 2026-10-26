@@ -3,14 +3,12 @@ import CFastenStoreCore
 
 /// Thread-safe audit store backed by libfasten_core.
 ///
-/// Build the Rust library first, then link it:
+/// Build the Rust library first, then link it (see Package.swift):
 /// ```sh
-/// cd fasten/fasten-core
-/// cargo build --release --features all
-/// swift build -Xlinker -L./target/release
+/// cd fasten-core && cargo build --release --features all
+/// cd bindings/swift && swift build -Xlinker -L../../target/release
 /// ```
 ///
-/// Usage:
 /// ```swift
 /// let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
 /// defer { store.close() }
@@ -49,10 +47,8 @@ public final class FastenStore {
         // Callers should discard the reference after close().
     }
 
-    // ── Write path ────────────────────────────────────────────────────────────
-
-    /// Insert one audit row.  Accepts any `Encodable` value.
-    /// Duplicate IDs are silently ignored.
+    /// Insert one audit row from any `Encodable` value. A row whose id is
+    /// already stored is ignored.
     public func insert(_ row: some Encodable) throws {
         let data = try JSONEncoder().encode(row)
         guard let json = String(data: data, encoding: .utf8) else {
@@ -81,8 +77,6 @@ public final class FastenStore {
         }
     }
 
-    // ── Health ────────────────────────────────────────────────────────────────
-
     /// Verify the backend is reachable (runs `SELECT 1`).
     public func ping() throws {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
@@ -93,8 +87,6 @@ public final class FastenStore {
             throw FastenStoreError(msg)
         }
     }
-
-    // ── Metadata ──────────────────────────────────────────────────────────────
 
     /// Return the library version string, e.g. `"0.1.0"`.
     public static var version: String {

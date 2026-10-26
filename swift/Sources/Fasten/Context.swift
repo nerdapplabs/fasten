@@ -1,19 +1,20 @@
 import Foundation
 
-/// request_id propagation via Swift's structured concurrency (@TaskLocal).
+/// Holds the request_id for async code. Synchronous code uses RequestScope,
+/// which stores it in the current thread's dictionary.
 ///
-/// Usage:
-///   Fasten.withRequestID("req-abc") {
-///       await Fasten.emit("USER_CREATED", target: "u-42", actor: "admin")
+///   try await Fasten.withRequestID("req-abc") {
+///       try await handle(request)  // emit() calls in here get "req-abc"
 ///   }
-///   // or in synchronous code via RequestScope:
+///
 ///   let scope = RequestScope(id: Fasten.mintID())
 ///   defer { scope.end() }
 enum FastenContext {
     @TaskLocal static var requestID: String? = nil
 }
 
-/// Synchronous RAII scope for request_id — for code that can't use async/await.
+/// Sets the request_id on the current thread until end() or deinit restores
+/// the previous value. For code that doesn't use async/await.
 public final class RequestScope {
     private let previous: String?
 
@@ -34,7 +35,7 @@ public final class RequestScope {
 }
 
 func _currentRequestID() -> String? {
-    // Prefer async TaskLocal; fall back to thread-local for sync callers.
+    // The TaskLocal wins; fall back to the thread dictionary for sync callers.
     if let id = FastenContext.requestID { return id }
     return Thread.current.threadDictionary["fasten.request_id"] as? String
 }

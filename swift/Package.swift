@@ -14,8 +14,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     ],
     targets: [
-        // Linux system SQLite3 wrapper.  On Apple platforms the SDK-provided
-        // SQLite3 module is used directly; this target is only active on Linux.
+        // Links the system libsqlite3 on Linux. Apple platforms import the SDK's
+        // SQLite3 module instead.
         .target(
             name: "CSQLite3",
             path: "Sources/CSQLite3",

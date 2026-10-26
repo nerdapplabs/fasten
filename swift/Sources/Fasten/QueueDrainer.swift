@@ -1,15 +1,16 @@
 import Foundation
 
-/// What the engine does when the audit store rejects a write.
-/// (Previously defined in CFastenDrainer.swift, removed in the pure-Swift port.)
+/// How emit() writes to the store: `.queue` hands rows to a background
+/// QueueDrainer, `.raise` inserts inline and rethrows store errors.
 public enum FailureStrategy { case queue, raise }
 
 private let DEGRADED_AFTER = 5
 
-/// Pure Swift bounded-queue drainer — spec-conformant (drainer-conformance.md v1.1).
+/// Bounded queue plus a background thread that writes rows to the store,
+/// retrying with exponential backoff (spec/drainer-conformance.md).
 ///
-/// `enqueue()` blocks the caller when depth ≥ capacity (capacity > 0), matching
-/// the `"block"` capacity_semantics used by Python / Go / C++.
+/// When capacity > 0, `enqueue()` blocks while the queue is full, like the
+/// Python, Go and C++ drainers ("block" capacity_semantics).
 final class QueueDrainer: @unchecked Sendable {
 
     private let store:          any AuditStore
@@ -56,7 +57,6 @@ final class QueueDrainer: @unchecked Sendable {
 
     func enqueue(_ row: AuditRow) {
         cond.lock()
-        // Block until space is available (capacity > 0 semantics = "block")
         while capacity > 0 && (q.count + inFlight) >= capacity && !stopped {
             cond.wait(until: Date().addingTimeInterval(0.05))
         }
@@ -70,7 +70,8 @@ final class QueueDrainer: @unchecked Sendable {
 
     @discardableResult
     func flush(timeout: TimeInterval) -> Bool {
-        // Snapshot semantics §6: target locked at call time
+        // Wait only for rows queued before this call (spec §6), so new rows
+        // can't keep flush() waiting forever.
         cond.lock()
         let target = drainedTotal + q.count + inFlight
         let alreadyDone = drainedTotal >= target
@@ -144,7 +145,7 @@ final class QueueDrainer: @unchecked Sendable {
             if q.isEmpty            { cond.unlock(); continue }
             let row = q.removeFirst()
             inFlight += 1
-            cond.broadcast()    // signal enqueue() that space freed
+            cond.broadcast()    // wake enqueue() callers waiting for space
             cond.unlock()
 
             _drainOne(row)

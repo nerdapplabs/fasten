@@ -1,10 +1,9 @@
 import XCTest
 @testable import Fasten
 
-// Redact conformance — loads spec/redact-conformance.json, runs every case.
-//
-// The spec is the single source of truth; fasten-core/src/redact.rs is canonical.
-// All SDKs must pass every case; failures indicate a divergence from the Rust impl.
+// Runs every case in spec/redact-conformance.json. The Rust implementation in
+// fasten-core/src/redact.rs passes them all, so a failure here means the Swift
+// redactor differs from it.
 final class RedactConformanceTests: XCTestCase {
 
     private struct ConformanceCase: Decodable {
@@ -14,7 +13,7 @@ final class RedactConformanceTests: XCTestCase {
         let expected: AnyCodable
     }
 
-    // AnyCodable: thin wrapper that decodes arbitrary JSON into Any.
+    // Decodes arbitrary JSON into Any.
     private struct AnyCodable: Decodable {
         let value: Any
 
@@ -37,21 +36,21 @@ final class RedactConformanceTests: XCTestCase {
     }
 
     private func loadCases() throws -> [ConformanceCase] {
-        // Walk up from Tests/FastenTests/ to fasten/ then into spec/.
+        // Walk up from Tests/FastenTests/ to the repo root, then into spec/.
         let here = URL(fileURLWithPath: #file)
         let specURL = here
             .deletingLastPathComponent()   // FastenTests/
             .deletingLastPathComponent()   // Tests/
             .deletingLastPathComponent()   // swift/
-            .deletingLastPathComponent()   // fasten/   (repo root)
+            .deletingLastPathComponent()   // repo root
             .appendingPathComponent("spec/redact-conformance.json")
         let data = try Data(contentsOf: specURL)
         struct Spec: Decodable { let cases: [ConformanceCase] }
         return try JSONDecoder().decode(Spec.self, from: data).cases
     }
 
-    // Stripe live key — constructed at runtime so the literal sk_live_<24+ chars>
-    // never appears in source (GitHub push-protection false-positive).
+    // Built at runtime so no sk_live_ literal appears in source, which GitHub
+    // push protection would flag.
     func testStripeLiveKey() {
         let key = "sk" + "_live_" + String(repeating: "A", count: 24)
         let r = Redactor()

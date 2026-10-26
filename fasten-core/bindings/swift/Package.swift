@@ -1,25 +1,14 @@
 // swift-tools-version: 5.9
 //
-// Build instructions
-// ------------------
-// 1. Build the Rust library:
-//      cd fasten/fasten-core
-//      cargo build --release --features all
+// Build the Rust library, then build and test against it (from the repo root):
+//      cd fasten-core && cargo build --release --features all
+//      cd bindings/swift
+//      swift build -Xlinker -L../../target/release
+//      swift test  -Xlinker -L../../target/release
 //
-// 2. Build + test (macOS / Linux):
-//      cd fasten/fasten-core/bindings/swift
-//      swift build  -Xlinker -L../../../../target/release
-//      swift test   -Xlinker -L../../../../target/release
+// Pass a different -L to link a library built elsewhere.
 //
-//    Override the library directory:
-//      FASTEN_STORE_CORE_LIB_DIR=/custom/path swift test \
-//        -Xlinker -L$FASTEN_STORE_CORE_LIB_DIR
-//
-// Architecture support
-// --------------------
-// The Rust crate is built separately for each target; pass the appropriate
-// --target flag to cargo (e.g. aarch64-apple-darwin, x86_64-unknown-linux-gnu).
-// For a macOS universal binary:
+// Cargo builds one architecture per --target. For a macOS universal binary:
 //      cargo build --release --features all --target aarch64-apple-darwin
 //      cargo build --release --features all --target x86_64-apple-darwin
 //      lipo -create target/aarch64-apple-darwin/release/libfasten_core.dylib \
@@ -37,9 +26,8 @@ let package = Package(
         .library(name: "FastenStore", targets: ["FastenStore"]),
     ],
     targets: [
-        // Wraps the C header in a Swift-importable module.
-        // The module.modulemap + header live in Sources/CFastenStoreCore/.
-        // At link time the caller must supply -L<dir containing libfasten_core>.
+        // Exposes the C header in Sources/CFastenStoreCore/ as a Swift module.
+        // The caller supplies -L<dir> for the native library at link time.
         .systemLibrary(
             name: "CFastenStoreCore",
             path: "Sources/CFastenStoreCore"

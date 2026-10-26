@@ -1,7 +1,7 @@
 import Foundation
 import Crypto
 
-/// Thread-safe fasten engine — all SDK state lives here.
+/// Holds all SDK state. The Fasten enum forwards to a shared instance.
 final class Engine: @unchecked Sendable {
 
     var serviceID:  String = ""
@@ -28,7 +28,7 @@ final class Engine: @unchecked Sendable {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
-        // Flush + stop old drainer before reconfiguring so in-flight rows are not dropped.
+        // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
         if let old = drainer {
             old.flush(timeout: 5.0)
             old.close()
@@ -76,12 +76,12 @@ final class Engine: @unchecked Sendable {
         let ts        = isoNow()
         let sev       = severity ?? meta.severity
 
-        // Compute hash chain under lock.
+        // seq and prevHash must advance together, so both happen under the lock.
         let (nextSeq, ph, rowHash) = lock.withLock { () -> (Int, String, String) in
             seq += 1
             let s = seq
             let ph = prevHash
-            // Canonical JSON for hashing (sorted keys, no whitespace).
+            // Hash input: these fields as JSON with sorted keys and no whitespace.
             let canonical: [String: Any] = [
                 "id": rowID, "code": code, "monotonic_seq": s,
                 "timestamp": ts, "actor": actor, "target": target,
@@ -160,10 +160,10 @@ final class Engine: @unchecked Sendable {
     }
 }
 
-/// Shared default engine — module-level functions delegate here.
+/// The engine behind the static Fasten API.
 let _defaultEngine = Engine()
 
-/// FastenError wraps any fasten-specific failure.
+/// Error thrown by fasten itself (unknown code, bad table name, SQLite errors).
 public struct FastenError: Error, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }
