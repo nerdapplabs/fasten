@@ -23,6 +23,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs, quote_plus, unquote, urlsplit
 
 
 @dataclass
@@ -31,6 +32,52 @@ class CheckResult:
     status: str       # "ok" | "warn" | "fail"
     message: str
     detail: dict[str, Any] | None = None
+
+
+def _describe(dsn: str, is_postgres: bool) -> str:
+    """Backend and, for SQLite, the file path. Never the DSN itself."""
+    if is_postgres:
+        return "postgres"
+    if "@" in dsn:
+        return "sqlite (path hidden: the DSN has credentials)"
+    try:
+        path = urlsplit(dsn).path
+    except ValueError:
+        return "unparseable DSN"
+    return f"sqlite {path or '(no path)'}"
+
+
+def _error_text(e: Exception, dsn: str) -> str:
+    """``type: message``, unless the message may contain a DSN secret."""
+    try:
+        u = urlsplit(dsn)
+        secrets = [u.password or ""] + [
+            v for k, vs in parse_qs(u.query).items()
+            if k.lower() in ("password", "sslpassword") for v in vs]
+    except ValueError:
+        u, secrets = None, []
+    rest = dsn.partition("://")[2]
+    # With no password or a raw @ in it, drivers may split it differently.
+    unknown = u is None or (not u.password and "@" in rest) or rest.count("@") > 1
+    text = f"{type(e).__name__}: {e}"
+    forms = {f for s in secrets if s
+             for f in (s, unquote(s), quote_plus(s), repr(s)[1:-1])}
+    if unknown or any(f in text for f in forms):
+        return f"{type(e).__name__} (details hidden: they may include the DSN password)"
+    return text.replace(dsn, "<dsn>")
+
+
+def _check_store(name: str, dsn: str, open_store: Any, is_postgres: bool) -> CheckResult:
+    backend = _describe(dsn, is_postgres)
+    try:
+        rows = open_store(dsn).query(limit=1)
+    except Exception as e:  # noqa: BLE001 — diagnostic context, all failures relevant
+        return CheckResult(name=name, status="fail", message=f"{backend}: {_error_text(e, dsn)}")
+    return CheckResult(
+        name=name, status="ok",
+        message=f"{backend} (connected, sample query returned {len(rows)} row[s])",
+        detail={"backend": backend, "sample_rows": len(rows)},
+    )
 
 
 def _glyph(status: str) -> str:
@@ -62,24 +109,12 @@ def _check_audit_dsn() -> CheckResult:
         return CheckResult(
             name="audit_dsn",
             status="fail",
-            message="not set — fasten.init() will REFUSE TO START. Set FASTEN_AUDIT_DSN to durable storage.",
+            message="not set: audit rows go to stdout only. Set FASTEN_AUDIT_DSN for durable storage.",
         )
-    try:
-        from ..store.sqlite import SQLiteStore
-        store = SQLiteStore.from_dsn(dsn)
-        rows = store.query(limit=1)
-        return CheckResult(
-            name="audit_dsn",
-            status="ok",
-            message=f"{dsn} (connected, table accessible, sample query returned {len(rows)} row[s])",
-            detail={"dsn": dsn, "sample_rows": len(rows)},
-        )
-    except Exception as e:  # noqa: BLE001 — diagnostic context, all failures relevant
-        return CheckResult(
-            name="audit_dsn",
-            status="fail",
-            message=f"{dsn} → {type(e).__name__}: {e}",
-        )
+    from ..engine import _store_from_dsn
+    # Same scheme tests as the engine's store builders.
+    return _check_store("audit_dsn", dsn, _store_from_dsn,
+                        dsn.startswith(("postgres://", "postgresql://")))
 
 
 def _check_api_dsn() -> CheckResult:
@@ -90,18 +125,13 @@ def _check_api_dsn() -> CheckResult:
             status="ok",
             message="not configured — ring-buffer only (default; persist via FASTEN_API_DSN if needed)",
         )
+    from ..engine import _stream_store_from_dsn
     try:
-        from ..store.sqlite import SQLiteStore
-        store = SQLiteStore.from_dsn(dsn)
-        rows = store.query(limit=1)
-        return CheckResult(
-            name="api_dsn",
-            status="ok",
-            message=f"{dsn} (connected, accessible, {len(rows)} sample row[s])",
-            detail={"dsn": dsn},
-        )
-    except Exception as e:  # noqa: BLE001
-        return CheckResult(name="api_dsn", status="fail", message=f"{dsn} → {type(e).__name__}: {e}")
+        is_postgres = urlsplit(dsn).scheme.lower() in ("postgres", "postgresql")
+    except ValueError:
+        is_postgres = False
+    return _check_store("api_dsn", dsn, lambda d: _stream_store_from_dsn(d, "api_log"),
+                        is_postgres)
 
 
 def _check_catalog() -> CheckResult:
