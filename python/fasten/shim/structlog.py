@@ -114,7 +114,7 @@ def configure(
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
-        _redactor().as_structlog_processor(),
+        _redactor().with_extra_keys(extra_redact_keys).as_structlog_processor(),
         make_fasten_processor(),
     ]
     if extra_processors:

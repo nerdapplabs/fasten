@@ -174,6 +174,16 @@ class Redactor:
         except Exception:  # noqa: BLE001 — deep nesting, invalid utf, or core failure
             return _unredactable_marker(value)
 
+    def with_extra_keys(self, keys: Optional[list[str]]) -> "Redactor":
+        """Copy of this Redactor with ``keys`` added to the key patterns."""
+        if not keys:
+            return self
+        return Redactor(
+            extra_keys=[*self._extra_keys, *keys],
+            replacement=self._replacement,
+            extra_value_patterns=[("", pat, repl) for pat, repl in self._extra_vp],
+        )
+
     def as_structlog_processor(self) -> Callable[..., Any]:
         """Return a structlog processor that redacts sensitive keys from event_dict.
 
