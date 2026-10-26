@@ -1,9 +1,7 @@
-"""Read endpoints bound ``limit`` at ge=1.
+"""Read endpoints reject a non-positive or over-cap limit.
 
-A negative limit is not just invalid input: it reaches SQLite as ``LIMIT -1``,
-which SQLite reads as *no limit* and dumps the whole table/ring on an admin
-endpoint (and Postgres rejects it with a 500). The router must refuse it up
-front rather than pass it down the query path.
+SQLite reads ``LIMIT -1`` as no limit and Postgres rejects it with a 500, so
+the router refuses non-positive values with a 422.
 """
 import pytest
 
@@ -56,8 +54,6 @@ def test_over_cap_limit_rejected(base):
 
 
 def test_valid_limit_returns_bounded_rows():
-    """A negative limit used to return the whole ring; a bounded limit returns
-    at most that many rows."""
     _init()
     rid = "req-bound"
     t = fasten.transport()

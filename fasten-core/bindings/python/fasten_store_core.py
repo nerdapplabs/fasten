@@ -1,15 +1,14 @@
 """
-fasten_core — Python binding for libfasten_core.
+Python binding for libfasten_core.
 
-Uses cffi (ABI mode) so no compilation step is needed; the shared library
-is loaded at import time. cffi is a pure-Python package available on all
-CPython / PyPy versions ≥ 3.8.
+Uses cffi in ABI mode, so nothing is compiled; the shared library is
+loaded at import time.
 
 Install:  pip install cffi
 Build lib: cd fasten/fasten-core && cargo build --release --features all
 
 Usage:
-    from fasten_core import FastenStore
+    from fasten_store_core import FastenStore
     store = FastenStore.open("sqlite", "audit.db", "audit_log")
     store.insert(row_dict)   # row_dict matches the fasten JSON wire schema
     store.ping()
@@ -27,7 +26,7 @@ from typing import Any
 
 import cffi
 
-# ── Library location ──────────────────────────────────────────────────────────
+# Library location
 
 def _lib_name() -> str:
     system = platform.system()
@@ -63,7 +62,7 @@ def _find_lib() -> str:
     )
 
 
-# ── FFI declarations ──────────────────────────────────────────────────────────
+# FFI declarations
 
 _ffi = cffi.FFI()
 _ffi.cdef("""
@@ -85,7 +84,7 @@ _ffi.cdef("""
 _lib = _ffi.dlopen(_find_lib())
 
 
-# ── Helper: read + free an error string ──────────────────────────────────────
+# Helper: read + free an error string
 
 def _take_error(out_err_p) -> str:
     """Read the error string from *out_err_p and free it."""
@@ -98,7 +97,7 @@ def _take_error(out_err_p) -> str:
     return msg
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# Public API
 
 class FastenStoreError(RuntimeError):
     """Raised when the store backend returns an error."""
@@ -110,7 +109,7 @@ class FastenStore:
     def __init__(self, _handle) -> None:
         self._handle = _handle
 
-    # ── Constructors ──────────────────────────────────────────────────────────
+    # Constructors
 
     @classmethod
     def open(
@@ -138,7 +137,7 @@ class FastenStore:
             raise FastenStoreError(_take_error(out_err_p))
         return cls(handle)
 
-    # ── Write path ────────────────────────────────────────────────────────────
+    # Write path
 
     def insert(self, row: dict[str, Any]) -> None:
         """Insert one audit row (dict matching the fasten wire schema)."""
@@ -157,7 +156,7 @@ class FastenStore:
         if rc != 0:
             raise FastenStoreError(_take_error(out_err_p))
 
-    # ── Health ────────────────────────────────────────────────────────────────
+    # Health
 
     def ping(self) -> None:
         """Raise FastenStoreError if the backend is unreachable."""
@@ -166,7 +165,7 @@ class FastenStore:
         if rc != 0:
             raise FastenStoreError(_take_error(out_err_p))
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # Lifecycle
 
     def close(self) -> None:
         """Release all resources. The store is unusable after this call."""
@@ -183,7 +182,7 @@ class FastenStore:
     def __del__(self) -> None:
         self.close()
 
-    # ── Metadata ──────────────────────────────────────────────────────────────
+    # Metadata
 
     @staticmethod
     def version() -> str:

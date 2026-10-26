@@ -1,13 +1,8 @@
-"""P0-9 — one node, one chain (spec §2).
+"""One node, one chain (spec §2).
 
-`monotonic_seq` is unique within a `source_node_id`. Two engine instances that
-allocate independently (spec §2.1 non-conformance) mint duplicate seq values;
-`verify_chain` MUST report that rather than tolerate it, because a chain with
-two rows at seq 1 is not a chain.
-
-These are regression tests for the class of bug where the allocation grain and
-the verification grain disagree. If the allocator is ever moved back in-memory,
-`test_duplicate_seq_on_one_node_is_rejected` fails loudly.
+`monotonic_seq` is unique within a `source_node_id`. Two engines that allocate
+independently (not conformant with spec §2.1) mint duplicate seq values, and
+`verify_chain` reports that as a duplicate allocation.
 """
 import dataclasses
 from datetime import datetime, timezone
@@ -32,7 +27,7 @@ def _row(service_id: str, seq: int, *, node: str = "node-1") -> AuditRow:
 
 
 def _chain(*specs, node: str = "node-1") -> list[AuditRow]:
-    """Seal (service_id, seq) pairs into ONE node chain, in the order given."""
+    """Seal (service_id, seq) pairs into one node chain, in the order given."""
     out: list[AuditRow] = []
     prev = "genesis"
     for service_id, seq in specs:
@@ -42,13 +37,11 @@ def _chain(*specs, node: str = "node-1") -> list[AuditRow]:
     return out
 
 
-# ── the conformant case ───────────────────────────────────────────────────────
+# Conformant case
 
 def test_two_services_share_one_node_chain():
-    """Different services interleave into ONE sequence with unique seq values.
-
-    This is what store-allocated sequencing (spec §2.1) produces.
-    """
+    """Services interleave into one sequence, as store-allocated sequencing
+    (spec §2.1) produces."""
     rows = _chain(("svc-a", 1), ("svc-b", 2), ("svc-a", 3), ("svc-b", 4))
     result = verify_chain(rows)
     assert result.ok, result.reason
@@ -68,22 +61,18 @@ def test_two_nodes_are_independent_chains():
     assert verify_chain(rows).ok
 
 
-# ── the regression this file exists for ───────────────────────────────────────
+# Duplicate allocation
 
 def test_duplicate_seq_on_one_node_is_rejected():
-    """THE P0-9 REGRESSION GUARD.
-
-    Two engines allocating in memory both start at seq 1. Before the fix this
-    surfaced as a prev_hash break — a false tamper signal. It must now be named
-    for what it is: a duplicate allocation.
-    """
+    """Two engines allocating in memory both start at seq 1. This is reported
+    as a duplicate allocation, not as a prev_hash break."""
     a = seal("genesis", _row("svc-a", 1))
     b = seal("genesis", _row("svc-b", 1))   # second engine, also seq 1
     result = verify_chain([a, b])
     assert not result.ok
     assert result.first_break_at == 1
     assert "duplicate monotonic_seq" in (result.reason or "")
-    # and it must NOT be misreported as tampering
+    # and not as tampering
     assert "prev_hash does not match" not in (result.reason or "")
 
 
@@ -131,12 +120,8 @@ def test_empty_and_single():
 
 
 def test_two_engines_one_store_produce_one_chain():
-    """END-TO-END P0-9 GUARD.
-
-    Two Engines, two services, one node, one store. Before store-allocated
-    sequencing both minted seq 1 and verify_chain reported a prev_hash break —
-    a false tamper signal. Now they share one sequence and the chain verifies.
-    """
+    """Two Engines, two services, one node, one store: they share one
+    sequence and the chain verifies."""
     import os, tempfile, time
     from fasten import codes
     from fasten.codes import Severity

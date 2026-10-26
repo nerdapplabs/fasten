@@ -1,26 +1,19 @@
-"""
-Rich-based multi-pane live feed with interactive controls.
+"""Multi-pane live view built on rich.
 
-Layout:
     ┌─ fasten tui · http://… · req=<id|all> ─────────────────────────────┐
     │ AUDIT (primary pane) — code · actor · target · request_id           │
     ├──────────────────────────────────┬──────────────────────────────────┤
     │ SYS  (compact)                   │ API  (compact)                   │
     └─ [L] live ● · [/] filter · [tab] pane · [q] quit ─────────────────┘
 
-Interactive controls (no mouse needed; works over SSH):
-  L / space  — toggle live polling on/off  (default: on)
-  /          — open request_id picker (fuzzy search over recent IDs;
-               Esc or blank = clear filter; pre-selects current filter)
-  Tab        — rotate primary pane: audit → sys → api → audit
-  q / Ctrl-C — quit
+Keys:
+  L, space    toggle live polling (on by default)
+  /           pick a request_id to filter on
+  Tab         cycle the primary pane: audit, sys, api
+  q, Ctrl-C   quit
 
-request_id picker UX:
-  - Fetches ≤200 recent audit rows, extracts unique request_ids.
-  - Type to filter (prefix/substring); ↑ ↓ to move cursor; Enter to select.
-  - Esc or empty Enter → clear filter (watch all streams).
-  - If --request-id <id> is given via arg, that ID is pre-selected in the
-    picker (user can still change it from inside the live view).
+The picker lists request_ids from up to 200 recent audit rows. Type to filter,
+Up/Down to move, Enter to select; Esc or an empty selection clears the filter.
 """
 from __future__ import annotations
 
@@ -43,8 +36,7 @@ DEFAULT_URL = "http://localhost:9000/api/v1/logs"
 STREAMS = ("audit", "sys", "api")
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
-
+# HTTP helpers
 def _fetch(base_url: str, stream: str, request_id: str | None, limit: int) -> list[dict[str, Any]]:
     params: dict[str, str] = {"limit": str(limit)}
     if request_id:
@@ -69,8 +61,7 @@ def _fetch_recent_ids(base_url: str, limit: int = 200) -> list[str]:
     return list(seen.keys())
 
 
-# ── Terminal key reader (background thread) ───────────────────────────────────
-
+# Terminal key reader (background thread)
 def _key_reader(key_q: "queue.Queue[bytes]", stop: threading.Event) -> None:
     """Read raw keypresses and push them to key_q.  Runs in a daemon thread."""
     fd = sys.stdin.fileno()
@@ -92,8 +83,7 @@ def _key_reader(key_q: "queue.Queue[bytes]", stop: threading.Event) -> None:
             pass
 
 
-# ── Interactive request_id picker ─────────────────────────────────────────────
-
+# Interactive request_id picker
 def _run_picker(
     base_url: str,
     current: str | None,
@@ -172,11 +162,11 @@ def _run_picker(
                 if not ch:
                     continue
 
-                if ch in (b"\x1b", b"\x03"):      # Esc / Ctrl-C → clear filter
+                if ch in (b"\x1b", b"\x03"):      # Esc / Ctrl-C: clear filter
                     selected = None
                     escaped = True
                     break
-                elif ch == b"\r":                   # Enter → commit selection
+                elif ch == b"\r":                   # Enter: commit selection
                     fil = _filtered()
                     selected = fil[cursor] if fil else None
                     break
@@ -207,8 +197,7 @@ def _run_picker(
     return selected
 
 
-# ── Renderers ─────────────────────────────────────────────────────────────────
-
+# Renderers
 def _render_audit(rows: list[dict[str, Any]], primary: bool) -> Any:
     from rich.table import Table
 
@@ -321,8 +310,7 @@ def _build_view(
     return layout
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
+# Main loop
 def run(
     url: str = DEFAULT_URL,
     stream: str = "audit",

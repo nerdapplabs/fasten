@@ -1,20 +1,8 @@
-"""
-ctypes binding to libfasten_core — the shared Rust engine.
+"""ctypes bindings to libfasten_core (redaction, code catalog, audit queue).
 
-Loads the compiled .so / .dylib / .dll and exposes thin Python wrappers around:
-  - fasten_redact / fasten_redact_full  — secret redaction
-  - fasten_register_codes               — code catalog registration
-  - fasten_meta_of                      — single-code lookup
-  - fasten_registry_dump                — sorted CSV dump
-  - fasten_registry_clear               — clear global registry (tests)
-  - fasten_store_free_str               — free library-allocated strings
-
-Library location (tried in order):
-  1. FASTEN_CORE_LIB env var — explicit path for CI / custom installs.
-  2. Adjacent to this file — when the .so is bundled in the wheel.
-  3. ctypes.util.find_library("fasten_core") — system-installed.
-  4. Development path relative to this file:
-       ../../fasten-core/target/release/libfasten_core.{so,dylib}
+The library is looked up in this order: FASTEN_CORE_LIB, next to this file
+(wheel), ctypes.util.find_library("fasten_core"), then
+fasten-core/target/release/ in a source checkout.
 """
 from __future__ import annotations
 
@@ -26,25 +14,20 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# ── Library loading ───────────────────────────────────────────────────────────
-
 def _find_lib() -> str:
-    # 1. Explicit override
     if (env := os.environ.get("FASTEN_CORE_LIB")):
         return env
 
-    # 2. Bundled alongside this file (wheel layout)
     here = Path(__file__).parent
     suffix = ".dylib" if sys.platform == "darwin" else ".dll" if sys.platform == "win32" else ".so"
     bundled = here / f"libfasten_core{suffix}"
     if bundled.exists():
         return str(bundled)
 
-    # 3. System linker path
     if (found := ctypes.util.find_library("fasten_core")):
         return found
 
-    # 4. Development path (monorepo: python/fasten/ → fasten-core/target/release/)
+    # Source checkout: python/fasten/ next to fasten-core/.
     dev = here.parent.parent / "fasten-core" / "target" / "release" / f"libfasten_core{suffix}"
     if dev.exists():
         return str(dev)
@@ -127,17 +110,12 @@ def get_lib() -> ctypes.CDLL:
     return _lib
 
 
-# ── Low-level call helpers ────────────────────────────────────────────────────
-
 _FASTEN_OK = 0
 
 
 def _call_out_str(fn: Any, *args: Any) -> str:
-    """Call an FFI function that writes one output string.
-
-    Interprets the last two argtypes as `*out_str, *out_err`.
-    Returns the output string on success; raises `RuntimeError` on error.
-    """
+    """Call a function whose last two arguments are ``*out_str, *out_err``
+    and return the output string. Raises on a nonzero return code."""
     lib  = get_lib()
     out  = ctypes.c_char_p(None)
     err  = ctypes.c_char_p(None)
@@ -165,7 +143,7 @@ def _call_no_out(fn: Any, *args: Any) -> None:
         raise _rc_to_error(rc, msg)
 
 
-# Error code mapping (mirrors FastenErrorCode in error.rs)
+# Catalog error codes from FastenErrorCode in fasten-core/src/error.rs.
 _CATALOG_CODES = {6, 7, 8, 9}
 
 
@@ -175,8 +153,6 @@ def _rc_to_error(rc: int, msg: str) -> Exception:
         return AuditCatalogError(msg)
     return RuntimeError(msg)
 
-
-# ── Public helpers ────────────────────────────────────────────────────────────
 
 def redact_json(in_json: str) -> str:
     """Redact a JSON string using global default patterns."""
@@ -202,7 +178,7 @@ def redact_json_full(
 
 
 def register_codes(domain: str, codes_json: str) -> None:
-    """Validate + register codes (JSON dict) into the global Rust registry."""
+    """Validate and register a JSON dict of codes in fasten-core's registry."""
     lib = get_lib()
     _call_no_out(lib.fasten_register_codes, domain.encode(), codes_json.encode())
 
@@ -220,11 +196,11 @@ def registry_dump() -> str:
 
 
 def registry_clear() -> None:
-    """Clear the global Rust registry (for tests / re-init)."""
+    """Clear fasten-core's registry. For tests."""
     get_lib().fasten_registry_clear()
 
 
-# ── Drainer C ABI ─────────────────────────────────────────────────────────────
+# Audit queue drainer
 
 def store_from_callback(cb: "ctypes._FuncPointer") -> ctypes.c_void_p:
     """Create a FastenStore* backed by a Python insert callback."""

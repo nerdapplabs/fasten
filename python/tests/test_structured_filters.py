@@ -1,8 +1,7 @@
-"""§3.4 — indexed structured-field filters on the sys/api reader endpoints.
+"""Structured filters on the sys and api endpoints (spec §3.4).
 
-event (sys), status (api), and since/until time windows are honoured
-identically whether the stream is ring-only or persisted, so discovery by a
-field an operator already knows works the same in both modes.
+event (sys), status (api) and since/until behave the same whether the stream
+is ring-only or persisted.
 """
 import pytest
 
@@ -23,9 +22,7 @@ def _client():
 
 
 def _init(**stores):
-# service_id / node_id are passed explicitly to fasten.init below; the
-    # earlier os.environ writes were dead code that leaked env across tests.
-        fasten.init(
+    fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
@@ -41,7 +38,7 @@ def _seed():
     t.push_api({"method": "GET", "path": "/health", "status": 200, "request_id": "r3", "timestamp": "2026-06-25T12:00:00Z"})
 
 
-# ── ring-only (no persistence) ────────────────────────────────────────────
+# Ring only
 
 def test_event_filter_on_sys_ring():
     _init()
@@ -66,7 +63,7 @@ def test_since_until_window_on_api_ring():
     assert [r["event"] for r in rows] == ["db.timeout"]  # only the 10:00 row
 
 
-# ── persisted: store path must filter identically ─────────────────────────
+# Persisted
 
 def test_filters_agree_between_store_and_ring():
     _init(
@@ -75,14 +72,11 @@ def test_filters_agree_between_store_and_ring():
     )
     _seed()
     c = _client()
-    # event on persisted sys
     sys = c.get("/api/v1/logs/sys?event=cache.miss").json()
     assert sys["completeness"] == {"sys": "store"}
     assert [r["event"] for r in sys["rows"]] == ["cache.miss"]
-    # status on persisted api
     api = c.get("/api/v1/logs/api?status=502").json()
     assert api["completeness"] == {"api": "store"}
     assert [r["status"] for r in api["rows"]] == [502]
-    # since on persisted api
     win = c.get("/api/v1/logs/api?since=2026-06-25T11:00:00Z").json()["rows"]
     assert [r["path"] for r in win] == ["/health"]

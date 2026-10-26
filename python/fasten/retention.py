@@ -1,29 +1,12 @@
-"""FR1 retention — background purger for per-stream stores.
+"""Background retention threads.
 
-Spec §1 lists ``retention.api`` / ``retention.sys`` in FR1's body. The stream
-stores already expose ``purge(before=...)`` (age-based delete backed by
-``idx_{table}_ts``), but nothing in the library called it — hosted deployments
-grew unbounded stream tables. This module is the driver.
+Each thread wakes every ``check_interval`` (default 1h). It deletes stream
+rows older than ``retention`` with ``store.purge(before=...)`` and, if a PII
+horizon is set, redacts audit rows of pii codes. Errors are reported through
+``on_error`` and the loop carries on. Setting ``stop_event`` stops the thread.
 
-Contract
-========
-
-- One background thread per configured stream (``api`` / ``sys``).
-- Wakes every ``check_interval`` (default 1 h), computes ``cutoff = now - retention``,
-  calls ``store.purge(before=cutoff_iso)``.
-- Never raises on the caller's thread. Purge errors are logged via the
-  drainer sys stream (``retention_purge_failed``) and the loop keeps
-  running, so a transient database blip doesn't stop the purger from
-  catching up on the next tick.
-- Shutdown is cooperative: ``stop_event.set()`` on Engine reset / atexit
-  makes the sleep wake early and the loop exit before the next purge.
-
-Duration syntax
-===============
-
-A small, forgiving parser: ``"7d"``, ``"24h"``, ``"90m"``, ``"3600s"``.
-No compound forms (``"1d12h"`` — reject). No negatives. Empty / None disables
-retention on that stream.
+Durations are a positive integer and one unit: ``"7d"``, ``"24h"``, ``"90m"``,
+``"3600s"``.
 """
 from __future__ import annotations
 
@@ -43,10 +26,8 @@ _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def parse_duration(s: str) -> timedelta:
-    """Parse a duration string like ``"7d"`` / ``"24h"`` / ``"90m"`` / ``"3600s"``.
-
-    Raises RetentionConfigError on anything else (empty, unknown unit,
-    non-positive, compound). Returned timedelta is strictly positive."""
+    """Parse ``"7d"``, ``"24h"``, ``"90m"`` or ``"3600s"`` into a positive
+    timedelta. Raises RetentionConfigError for anything else."""
     if not s or not isinstance(s, str):
         raise RetentionConfigError(f"retention duration must be a non-empty string (got {s!r})")
     token = s.strip().lower()
@@ -66,9 +47,7 @@ def parse_duration(s: str) -> timedelta:
 
 
 def _cutoff_iso(now: datetime, retention: timedelta) -> str:
-    """Cutoff = now - retention, stamped in the canonical form so the
-    lexicographic compare against the stream stores' `timestamp` column
-    agrees byte-for-byte with the writer format (spec §4.3)."""
+    """``now - retention`` as a canonical timestamp string."""
     from .canonical_ts import canonical_ts
     return canonical_ts(now - retention)
 
@@ -77,37 +56,25 @@ def start_purger(
     *,
     store: Any,
     stream: str,
-    # None means REDACTION-ONLY: tick the PII horizon but never age-delete.
-    # That is the audit stream's mode — removing a row from a hash-chained
-    # stream is the tampering signature verify_chain exists to detect (spec
-    # §7.1), so the audit store must never be handed an age purge.
+    # None means no deletes, only PII redaction. Used for the audit store,
+    # where deleting rows would break the chain (spec 7.1).
     retention: Optional[timedelta] = None,
-    # Shorter horizon for codes carrying personal data. None keeps the old
-    # behaviour (age-only purge). When set, every tick ALSO redacts rows whose
-    # code is in codes.pii_codes() and is older than this — the thing that
-    # makes pii_in_detail=True mean something at runtime instead of being a
-    # comment that only forces retention_class.
+    # Rows with a code in codes.pii_codes() older than this are redacted.
     pii_retention: Optional[timedelta] = None,
-    # How to redact. Defaults to store.redact_expired, which destroys the data
-    # but emits nothing. Engine passes Engine.redact_expired so the spec §7.2
-    # AUDIT_ROW_REDACTED row is written — without it an honest erasure and a
-    # quiet redaction are indistinguishable, which is most of the reason to
-    # redact rather than DELETE.
+    # Defaults to store.redact_expired, which writes no record. Engine passes
+    # Engine.redact_expired so AUDIT_ROW_REDACTED rows are written (spec 7.2).
     redact_fn: Optional[Callable[..., Any]] = None,
     check_interval: timedelta = timedelta(hours=1),
     stop_event: Optional[threading.Event] = None,
     on_error: Optional[Callable[[str, Exception], None]] = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> threading.Thread:
-    """Spawn a daemon thread that periodically purges rows older than
-    ``retention`` from ``store``. Returns the started thread; the caller
-    owns ``stop_event`` and must call ``stop_event.set()`` to shut it down.
+    """Start a daemon thread that purges or redacts ``store`` once right
+    away, then every ``check_interval``. Set ``stop_event`` to stop it.
 
-    The first purge runs immediately (so operators see the effect on init
-    without waiting a full interval), then every ``check_interval``."""
+    Raises ValueError if neither ``retention`` nor ``pii_retention`` is set.
+    """
     if retention is None and pii_retention is None:
-        # A thread that ticks forever and does nothing is a configuration
-        # error, not a default. Fail at the call, not silently at 3am.
         raise ValueError(
             "fasten.start_purger: at least one of retention (age purge) or "
             "pii_retention (PII redaction) must be set"
@@ -125,16 +92,12 @@ def start_purger(
             try:
                 now = now_fn()
             except Exception:  # noqa: BLE001
-                # now_fn is caller-supplied; a raise here must not kill the
-                # thread any more than a store blip does.
                 logger.exception("fasten retention now_fn raised")
                 continue
 
             def _report(label: str, e: BaseException) -> None:
-                """Never propagate — a transient DB blip must not stop the
-                loop. Report via the caller's on_error hook so the miss lands
-                in the sys stream (drainer_sys_log), not just stderr, and
-                shows up on /logs/sys under existing monitoring."""
+                """Report through on_error (the Engine logs it to the sys
+                stream), or the module logger if there is none."""
                 if on_error is not None:
                     try:
                         on_error(label, e)  # type: ignore[arg-type]
@@ -146,15 +109,12 @@ def start_purger(
                         label, type(e).__name__, e,
                     )
 
-            # Two horizons, two try blocks, two labels: a shared try let a
-            # redaction failure skip the age purge, under one error label.
-            # PII runs first — its rows sit mid-chain, where only redaction is
-            # safe; the age purge below only ever removes a prefix.
+            # Separate try blocks so a redaction failure does not skip the
+            # purge.
             if pii_retention is not None:
                 try:
                     redact = redact_fn or getattr(store, "redact_expired", None)
                     if not callable(redact):
-                        # Configured but impossible — don't do that silently.
                         logger.warning(
                             "fasten retention [%s]: a PII horizon is configured "
                             "but the store exposes no redact_expired — personal "
@@ -170,11 +130,8 @@ def start_purger(
                 except Exception as e:  # noqa: BLE001
                     _report(f"{stream}/pii-redaction", e)
 
-            # retention is None for the audit stream: redact, never delete.
             if retention is not None:
                 try:
-                    # A datetime: both store families take one and
-                    # canonicalise internally, so there is one representation.
                     store.purge(before=now - retention)
                 except Exception as e:  # noqa: BLE001
                     _report(f"{stream}/age-purge", e)

@@ -1,10 +1,8 @@
 """
 Minimal FastAPI service wired to fasten.
 
-What it shows in 60 lines:
-
-  - fasten.init() reading env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID,
-    FASTEN_AUDIT_DSN) — required for every adopter app.
+  - fasten.init() reading FASTEN_SERVICE_ID, FASTEN_NODE_ID and
+    FASTEN_AUDIT_DSN.
   - One audit code (USER_CREATED) registered at startup.
   - RequestIDMiddleware mints / honours X-Request-ID per request.
   - APILogger pushes one api-log row per request (no extra wiring).
@@ -38,7 +36,7 @@ from fasten.reader import router as reader_router
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-# ── Code catalog (register once at startup) ────────────────────────────────
+# Code catalog, registered once at startup
 
 register("user", {
     "USER_CREATED": Meta(
@@ -59,11 +57,10 @@ register("user", {
 
 fasten.init()  # reads FASTEN_SERVICE_ID / FASTEN_NODE_ID / FASTEN_AUDIT_DSN
 
-# ── Auth on the reader router ──────────────────────────────────────────────
-# The reader endpoints (/logs/audit, /sys, /api, /audit/doctor) return audit
-# rows + tenant identity + queue stats. They MUST be gated. Adopters wire
-# whatever auth their app already runs (see docs §"Wire your existing auth").
-# Stub below: replace require_admin with your real auth dependency.
+# Auth on the reader router.
+# The reader endpoints return audit rows, tenant ids and queue stats, so put
+# them behind your app's own auth (see docs §"Wire your existing auth").
+# Replace require_admin with your real auth dependency.
 _bearer = HTTPBearer(auto_error=False)
 def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
     expected = os.environ.get("DEMO_READER_TOKEN", "demo-token")
@@ -77,7 +74,7 @@ app = FastAPI(title="fasten demo")
 app.add_middleware(RequestIDMiddleware)                       # mints / honours X-Request-ID
 app.add_middleware(APILogger, skip={"/health", "/metrics"})   # one api-log row per req
 app.include_router(
-    reader_router(dependencies=[Depends(require_admin)]),     # gated; honors docs guidance
+    reader_router(dependencies=[Depends(require_admin)]),
     prefix="/logs",
 )
 
@@ -90,7 +87,7 @@ async def create_user(req: Request):
     fasten.emit(
         code="USER_CREATED",
         target=user_id,
-        actor="admin",                              # adopter-supplied; usually from auth
+        actor="admin",                              # usually from auth
         detail={"email": email},                    # PII redacted by default rules
     )
     return {"user_id": user_id}

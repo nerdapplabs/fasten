@@ -1,11 +1,10 @@
-"""P1-47 / spec §1.4, §7 — canonical form "2" (committed detail) + redaction.
+"""Canonical form "2" (committed detail) and redaction, spec §1.4 and §7.
 
-The point of form "2" is that `detail` can be destroyed for retention WITHOUT
-moving the row hash. If it moved, the successor's `prev_hash` would no longer
-match, forcing a re-seal of every following row — an O(n) rewrite that is
-indistinguishable from tampering.
+Form "2" lets `detail` be destroyed for retention without moving the row
+hash. If the hash moved, the successor's `prev_hash` would no longer match and
+every following row would need re-sealing.
 
-These are also the golden vectors the other five SDKs get implemented against.
+These are also the golden vectors the other SDKs are implemented against.
 """
 import dataclasses
 import json
@@ -43,9 +42,9 @@ def _row(seq: int = 1, detail=None) -> AuditRow:
 def _seal2(prev: str, row: AuditRow, salt: str | None = None) -> AuditRow:
     """Seal explicitly under form "2".
 
-    seal() stamps CURRENT_CANONICAL_FORM_ID, which is gated to "1" until the
-    store has detail_salt / detail_commitment columns (P1-47). These tests
-    exercise form "2" directly so they stay meaningful while it is gated.
+    seal() stamps CURRENT_CANONICAL_FORM_ID, which may be gated to "1" until
+    the store has detail_salt / detail_commitment columns. These tests use
+    form "2" directly so they do not depend on that gate.
     """
     import secrets
     from fasten.chain import _row_hash_form_2
@@ -56,15 +55,14 @@ def _seal2(prev: str, row: AuditRow, salt: str | None = None) -> AuditRow:
     return dataclasses.replace(r, hash=_row_hash_form_2(r.to_dict()))
 
 
-# ── backward compatibility: form "1" hashes must not move ────────────────────
+# Backward compatibility: form "1" hashes must not move
 
 def test_form_1_hash_unchanged_by_new_fields():
-    """THE COMPAT GUARD — the real cross-language vector.
+    """Cross-language vector for form "1".
 
-    Adding detail_salt / detail_commitment to AuditRow must not move any
-    existing form-"1" hash. This is the exact row pinned in
-    go/verify_test.go:pyVectorRow(); if this drifts, every Go aggregator
-    verifying a Python-sealed chain breaks.
+    detail_salt / detail_commitment on AuditRow must not move a form-"1" hash.
+    This is the row pinned in go/verify_test.go:pyVectorRow(); if it drifts,
+    Go can no longer verify a Python-sealed chain.
     """
     row = AuditRow(
         id="evt-abc123", origin_id="evt-abc123", monotonic_seq=1,
@@ -96,7 +94,7 @@ def test_form_1_rows_still_verify():
     assert verify_chain([r]).ok
 
 
-# ── form "2" behaviour ────────────────────────────────────────────────────────
+# Form "2" behaviour
 
 def test_seal_stamps_form_2_and_commits():
     sealed = seal("genesis", _row())
@@ -127,10 +125,9 @@ def test_commitment_is_covered_by_the_hash():
     assert not verify_chain([tampered]).ok
 
 
-# ── redaction: the whole point ───────────────────────────────────────────────
+# Redaction
 
 def test_redaction_does_not_move_the_hash():
-    """THE P1-47 GUARD."""
     sealed = _seal2("genesis", _row())
     gone = redact(sealed)
     assert gone.detail is None
@@ -157,8 +154,8 @@ def test_chain_verifies_after_redacting_a_middle_row():
 
 
 def test_commitment_still_proves_the_original():
-    """A party holding the original detail + salt can demonstrate the row was
-    not altered — the commitment survives redaction."""
+    """The commitment survives redaction, so whoever holds the original detail
+    and salt can still show the row was not altered."""
     sealed = _seal2("genesis", _row())
     original_detail, salt = sealed.detail, sealed.detail_salt
     gone = redact(sealed)
@@ -179,10 +176,10 @@ def test_redaction_is_idempotent():
     assert redact(once).hash == once.hash
 
 
-# ── golden vectors for the other SDKs ────────────────────────────────────────
+# Golden vectors for the other SDKs
 
 def test_form_2_golden_vector():
-    """Fixed salt + fixed row → fixed hash. Any SDK MUST reproduce these."""
+    """Fixed salt and row give a fixed hash. Every SDK must reproduce it."""
     row = dataclasses.replace(
         _row(), canonical_form_id="2", prev_hash="genesis",
         detail_salt=VECTOR_SALT,
@@ -208,11 +205,7 @@ def test_whole_number_float_vector_under_form_2():
 
 
 def test_redacted_row_survives_to_dict_and_cloud_event():
-    """A redacted row has detail=None. Anything that reads detail must cope.
-
-    `to_cloud_event` unpacked `**self.detail` unguarded, so a redacted row
-    raised TypeError there — found by making the field Optional.
-    """
+    """A redacted row has detail=None. Anything that reads detail must cope."""
     gone = redact(_seal2("genesis", _row()))
     assert gone.to_dict()["detail"] is None
     ev = gone.to_cloud_event()
@@ -234,15 +227,14 @@ def test_redacted_row_round_trips_through_sqlite():
     assert back.detail is None
 
 
-# ── one timestamp renderer (spec §1.4) ───────────────────────────────────────
+# One timestamp renderer (spec §1.4)
 
 def test_form_2_hashes_the_wire_timestamp_verbatim():
-    """REGRESSION for the two-renderer hazard (#91).
+    """Form "2" hashes the timestamp exactly as serialised.
 
-    Form "1" hashed "+00:00" while the row carried "Z", so every SDK needed a
-    second private timestamp renderer in the hash path — and Go and Python
-    drifted apart inside it. Form "2" hashes the timestamp exactly as
-    serialised. If anyone reintroduces a conversion, this fails.
+    Form "1" hashes "+00:00" while the row carries "Z", so each SDK needs a
+    second timestamp renderer in its hash path (#91). This fails if a
+    conversion is added to form "2".
     """
     import hashlib
     from fasten.chain import _FORM_2_EXCLUDED, _canonical_json, _row_hash_form_2
@@ -259,10 +251,10 @@ def test_form_2_hashes_the_wire_timestamp_verbatim():
 
 
 def test_form_2_whole_second_and_zero_micros():
-    """micros==0 takes the branch that variable-width rendering got wrong.
+    """micros==0 is the case variable-width rendering gets wrong.
 
-    Under form "2" the width is fixed, so a whole second and a 1-microsecond
-    instant must both round-trip and differ from each other.
+    Form "2" uses a fixed width, so a whole second and a 1-microsecond instant
+    must both round-trip and differ from each other.
     """
     whole = dataclasses.replace(
         _row(), timestamp=datetime(2026, 6, 15, 10, 30, 45, 0, tzinfo=timezone.utc))
@@ -349,13 +341,10 @@ def test_clearing_the_salt_does_not_skip_verification():
     assert "detail_salt" in (result.reason or "")
 
 
-# ── Cross-SDK: Go seals, Python verifies ─────────────────────────────────────
+# Cross-SDK: Go seals, Python verifies.
 #
-# The existing vector (go/xlang_form2.json) runs one direction only: Python
-# seals, Go verifies. Nothing checked the reverse, so Go could have sealed rows
-# no other SDK accepted — which is exactly the divergence that existed while Go
-# sealed form "1" and Python sealed "2". spec/go-sealed-form2.json is produced
-# by Go's Seal() and read here.
+# go/xlang_form2.json covers the other direction (Python seals, Go verifies).
+# spec/go-sealed-form2.json is produced by Go's Seal() and read here.
 
 GO_VECTOR = Path(__file__).resolve().parents[2] / "spec" / "go-sealed-form2.json"
 
@@ -408,12 +397,8 @@ def test_redacting_a_go_sealed_row_keeps_the_chain_valid():
 
 
 def test_committed_cross_sdk_vector_matches_current_sealing():
-    """The Go-facing vector must not go stale.
-
-    spec/python-sealed-forms.json is what Go verifies. If Python's sealing
-    changes and the file is not regenerated, Go keeps verifying the OLD rows
-    and the divergence is invisible — the file would silently stop describing
-    this SDK. Regenerating here and comparing makes that a CI failure.
+    """spec/python-sealed-forms.json, which Go verifies, must match what
+    Python seals today.
 
     Regenerate with: python3 scripts/gen_cross_sdk_vectors.py
     """

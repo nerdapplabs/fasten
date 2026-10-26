@@ -1,23 +1,13 @@
-"""
-stdlib logging bridge — push every ``import logging`` record into fasten's
-syslog ring + apply secret redaction.
+"""Send stdlib ``logging`` records to fasten's sys stream, redacted.
 
-Without this, code that uses ``logging.getLogger("foo").info(...)`` writes
-to whatever stdlib handler is configured but never reaches fasten's ring,
-so ``GET /logs/sys`` queries miss it. Most upstream library code uses
-stdlib logging — adopters don't get to choose.
-
-Usage standalone (when not using ``fasten.shim.structlog.configure()``):
+``fasten.shim.structlog.configure()`` installs this. To use it on its own:
 
     import logging
     from fasten.shim.stdlib import LoggingHandler
 
     logging.getLogger().addHandler(LoggingHandler())
 
-Auto-installed by ``fasten.shim.structlog.configure()``.
-
-Mirrors Go's ``fasten.NewSlogHandler(base)`` — every log record reaches
-the same destination regardless of which logging library produced it.
+Go's equivalent is ``fasten.NewSlogHandler``.
 """
 from __future__ import annotations
 
@@ -34,15 +24,8 @@ _FASTEN_RECORD_TAG = "_fasten_internal"
 
 
 class LoggingHandler(logging.Handler):
-    """Push every stdlib ``LogRecord`` into fasten's syslog ring buffer.
-
-    The handler is intentionally side-effect-only: it does NOT write to
-    stdout. The adopter's existing stdlib handlers (StreamHandler,
-    FileHandler, etc.) keep their stdout/file behaviour. fasten's ring is
-    the addition.
-
-    If ``fasten.init()`` has not been called, the handler is a no-op.
-    """
+    """Push stdlib log records to fasten's sys stream. Writes nothing to
+    stdout; other handlers keep doing that. Does nothing before init()."""
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: A003
         try:

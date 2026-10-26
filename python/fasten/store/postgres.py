@@ -1,11 +1,7 @@
-"""
-PostgreSQL implementation of AuditRepository (psycopg v3).
+"""PostgreSQL AuditRepository (psycopg 3). Needs ``pip install "fasten[postgres]"``.
 
-Parses ``postgres[ql]://user:pass@host/db?table=X`` DSN, strips the
-``table`` query-param before handing the DSN to psycopg (libpq rejects
-unknown params), and creates the table on first use.
-
-Install the optional dep:  pip install "fasten[postgres]"
+DSN: ``postgres[ql]://user:pass@host/db?table=X``. The table is created on
+first use.
 """
 from __future__ import annotations
 
@@ -32,7 +28,7 @@ _SAFE_IDENTIFIER = re.compile(
 
 
 def _utc_iso(dt: datetime) -> str:
-    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``)."""
+    """Canonical timestamp string; see canonical_ts."""
     from ..canonical_ts import canonical_ts
     return canonical_ts(dt)
 
@@ -61,9 +57,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT '',
     canonical_form_id TEXT NOT NULL DEFAULT '1',
-    -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
-    -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, and NULL again once redacted.
+    -- Form "2" columns (spec 1.4). NULL on form "1" rows, and detail_salt is
+    -- cleared on redaction.
     detail_salt       TEXT,
     detail_commitment TEXT
 )
@@ -73,8 +68,7 @@ _MIGRATION_HASH_CHAIN = """
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash      TEXT NOT NULL DEFAULT '';
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
--- P1-47: form "2" commitment columns. Nullable with no default, so existing
--- rows are untouched and their form-"1" hashes still verify.
+-- Form "2" columns. Nullable, so existing rows are unchanged.
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_salt TEXT;
 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_commitment TEXT;
 """
@@ -90,11 +84,10 @@ _INDEXES = [
 
 
 class PostgresStore:
-    """Thread-safe PostgreSQL-backed AuditRepository (psycopg v3).
+    """Thread-safe PostgreSQL AuditRepository with one connection per thread.
 
-    Opens one connection per thread via threading.local. Each connection
-    is independent; Postgres serialises concurrent writers at the server
-    level, so no additional locking is needed here.
+    Chain allocation is serialised with an advisory lock per node; see
+    allocate_and_insert_originated.
     """
 
     def __init__(self, dsn: str, table: str = "audit_log") -> None:
@@ -105,26 +98,20 @@ class PostgresStore:
             )
         self._dsn = dsn
         self._table = table  # full ref used in SQL (may be "schema.table")
-        # Swallowed persist-failure counter (mirrors StreamStore). At least one
-        # means durable audit history has a known hole → "store-degraded". Sticky.
+        # Failed inserts the caller dropped. Any makes the reader report
+        # "store-degraded"; it never resets.
         self._write_failures = 0
-        # Bare table name for index identifiers — dots are not allowed there.
+        # Bare table name for index names, which cannot contain dots.
         self._idx_prefix = table.split(".")[-1]
         self._schema = table.split(".")[0] if "." in table else None
         self._tls = threading.local()
-        # Bootstrap DDL once on the calling thread; every other thread that
-        # subsequently opens its own connection will see the table already present.
+        # Create the table before other threads connect.
         conn = self._connect()
         with conn.cursor() as cur:
-            # Serialise bootstrap across PROCESSES. "IF NOT EXISTS" is not a
-            # concurrency primitive: N workers starting together each take an
-            # AccessExclusiveLock for CREATE TABLE / CREATE INDEX and deadlock
-            # against each other. Verified against a real server — 12 concurrent
-            # from_dsn() calls raised DeadlockDetected before this lock existed.
-            #
-            # Session-scoped (not xact) so it spans the whole DDL block, and
-            # released explicitly below. Keyed on the qualified table name so
-            # two different tables never block one another.
+            # Serialise bootstrap across processes: workers starting together
+            # each take AccessExclusiveLock for CREATE TABLE/INDEX and can
+            # deadlock, IF NOT EXISTS notwithstanding. Session-scoped so it
+            # covers the whole block; keyed on the table name.
             cur.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))",
                         (f"fasten.bootstrap.{self._table}",))
             if self._schema:
@@ -132,17 +119,13 @@ class PostgresStore:
             cur.execute(_DDL.format(table=self._table))
             for sql in _INDEXES:
                 cur.execute(sql.format(t=self._table, p=self._idx_prefix))
-            # Migration: add hash chain columns to pre-existing tables (no-op on new tables).
+            # Add columns missing from older tables.
             for stmt in _MIGRATION_HASH_CHAIN.format(table=self._table).strip().split(";"):
                 if stmt.strip():
                     cur.execute(stmt)
             cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
                         (f"fasten.bootstrap.{self._table}",))
         conn.commit()
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
 
     def _connect(self) -> Any:
         import psycopg
@@ -168,21 +151,14 @@ class PostgresStore:
         return conn
 
     def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
-        """Run fn(conn) once; on stale-connection error reconnect and retry once.
+        """Run fn(conn), reconnecting and retrying once on a dropped connection.
 
-        Whether fn returns or raises, release any transaction it left open so the
-        connection is never parked holding locks. A write fn ``commit()``s itself
-        (leaving the connection IDLE — untouched here). A read fn runs a bare
-        ``SELECT`` and returns, leaving the connection *idle in transaction*
-        (INTRANS); a read that *raises* (e.g. a bad column during a concurrent
-        ``ALTER``) leaves it INERROR — both still hold any lock the statement
-        took (``ACCESS SHARE``) until the transaction ends, and INERROR also
-        poisons the connection for reuse. Either would let the engine's startup
-        hash-chain seed reads block a concurrent store-init ``ALTER TABLE``
-        (``ACCESS EXCLUSIVE``) indefinitely — the audit-store deadlock. The
-        cleanup rollback is itself guarded so that, on an already-dead
-        connection, it can't mask the in-flight stale-connection error the retry
-        below needs to see."""
+        Afterwards any open transaction is rolled back. Writes commit
+        themselves, but a plain read leaves the connection idle in
+        transaction (or in error, if it raised), still holding ACCESS SHARE
+        locks that would block another process's ALTER TABLE at startup.
+        The rollback ignores errors from a dead connection so the original
+        error reaches the retry."""
         import psycopg
 
         def _call(conn: Any) -> Any:
@@ -211,26 +187,15 @@ class PostgresStore:
             conn.close()
         self._tls.conn = None
 
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
     @classmethod
     def from_dsn(cls, dsn: str) -> "PostgresStore":
-        """Parse a ``postgres[ql]://...?table=X`` DSN.
-
-        Strips the fasten-specific ``table`` param before handing the DSN
-        to psycopg — libpq raises an error on unrecognised parameters.
-        """
+        """Build a store from a ``postgres[ql]://...?table=X`` DSN. ``table`` is
+        removed before connecting, since libpq rejects unknown parameters."""
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         table = q.pop("table", "audit_log")
         pg_dsn = urlunparse(u._replace(query=urlencode(q)))
         return cls(dsn=pg_dsn, table=table)
-
-    # ------------------------------------------------------------------
-    # AuditRepository protocol
-    # ------------------------------------------------------------------
 
     _INSERT_SQL = (
         "INSERT INTO {table} "
@@ -262,15 +227,12 @@ class PostgresStore:
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
-        """Execute the idempotent insert on ``cur`` WITHOUT committing — the
-        transaction boundary belongs to the caller (per-row in _insert_row, one
-        BEGIN/COMMIT in ingest_replicated)."""
+        """Insert one row on ``cur`` (ON CONFLICT DO NOTHING) without
+        committing; the caller owns the transaction."""
         cur.execute(self._INSERT_SQL.format(table=self._table), self._insert_params(row))
 
     def _insert_row(self, row: AuditRow) -> None:
-        """Idempotent ON CONFLICT DO NOTHING insert of a single row, committed
-        immediately. Shared by the originated and replicated entry points —
-        identical SQL; the intent split is enforced by the wrappers."""
+        """Insert and commit one row. The public insert methods do the checks."""
         def _run(conn: Any) -> None:
             with conn.cursor() as cur:
                 self._insert_row_core(cur, row)
@@ -279,7 +241,7 @@ class PostgresStore:
         self._execute_with_retry(_run)
 
     def insert_originated(self, row: AuditRow) -> None:
-        """Insert a row this node ORIGINATED (origin_id == id). Engine emit path."""
+        """Insert a row this node originated (origin_id == id)."""
         if row.origin_id != row.id:
             raise ValueError(
                 "insert_originated requires origin_id == id "
@@ -289,20 +251,12 @@ class PostgresStore:
         self._insert_row(row)
 
     def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
-        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+        """Allocate monotonic_seq and prev_hash, seal, and insert in one
+        transaction (spec 2.1). Returns the sealed row as stored.
 
-        One node, one chain: ``monotonic_seq`` is unique within a
-        ``source_node_id``. Allocating in engine memory is non-conformant — two
-        engine instances on one node each mint from 1 and produce two rows at
-        seq 1, which ``verify_chain`` reports as a duplicate allocation.
-
-        Serialisation uses ``pg_advisory_xact_lock`` keyed on the node, NOT
-        ``SELECT … FOR UPDATE`` on the tip row: with an empty table there is no
-        tip row to lock, so FOR UPDATE would let every concurrent writer through
-        to allocate seq 1. The advisory lock is transaction-scoped and released
-        on commit or rollback.
-
-        Returns the SEALED row actually written.
+        Writers for a node are serialised with ``pg_advisory_xact_lock`` on
+        the node id. ``SELECT ... FOR UPDATE`` on the latest row would not
+        work for the first row, when there is nothing to lock.
         """
         from ..chain import seal
 
@@ -315,13 +269,9 @@ class PostgresStore:
         def _run(conn: Any) -> AuditRow:
             try:
                 with conn.cursor() as cur:
-                    # IDEMPOTENCE under retry. _execute_with_retry re-runs this
-                    # whole function when an ack is lost, but the first attempt
-                    # may well have COMMITTED. Re-running would allocate a fresh
-                    # seq, hit ON CONFLICT DO NOTHING on the id, and hand the
-                    # caller a sealed row that is not the one in the store.
-                    # Check first: if this id already landed, return what was
-                    # actually persisted.
+                    # _execute_with_retry may rerun this after a commit whose
+                    # ack was lost. If the row is already there, return it as
+                    # stored rather than sealing a new seq that never lands.
                     cur.execute(
                         f"SELECT monotonic_seq, prev_hash, hash, canonical_form_id "
                         f"FROM {self._table} WHERE id = %s",
@@ -339,9 +289,8 @@ class PostgresStore:
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (row.source_node_id,),
                     )
-                    # See the SQLite implementation: seq must span ALL rows on
-                    # the node (an unsealed row still holds its number), while
-                    # prev_hash may only chain from a sealed one.
+                    # The seq counts every row on the node, sealed or not;
+                    # prev_hash may only come from a sealed row.
                     cur.execute(
                         f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
                         "WHERE source_node_id = %s",
@@ -368,8 +317,7 @@ class PostgresStore:
         return cast(AuditRow, self._execute_with_retry(_run))
 
     def insert_replicated(self, row: AuditRow) -> None:
-        """Insert a row replicated from another origin. ingest_replicated path;
-        the row must be sealed."""
+        """Insert a sealed row replicated from another origin."""
         if not row.hash:
             raise ValueError(
                 "insert_replicated requires a sealed row (non-empty hash); "
@@ -378,12 +326,11 @@ class PostgresStore:
         self._insert_row(row)
 
     def insert(self, row: AuditRow) -> None:
-        """Thin alias for insert_originated — the engine emit/drainer path."""
+        """Same as insert_originated(). Used by the drainer."""
         self.insert_originated(row)
 
     def note_write_failure(self) -> None:
-        """Record a swallowed persist failure (durable history has a hole).
-        Callers that surface the insert() error don't mark the store degraded."""
+        """Record an insert failure the caller dropped instead of raising."""
         self._write_failures += 1
 
     @property
@@ -392,8 +339,7 @@ class PostgresStore:
 
     @property
     def degraded(self) -> bool:
-        """True once at least one persist failure was swallowed. Drives the
-        ``store-degraded`` completeness flag."""
+        """True once any write failure has been recorded."""
         return self._write_failures > 0
 
     def list_unshipped(
@@ -402,13 +348,8 @@ class PostgresStore:
         service_id: str | None = None,
         source_node_id: str | None = None,
     ) -> list[AuditRow]:
-        """Unshipped rows oldest-first.
-
-        Scoped to rows this engine ORIGINATED (``origin_id = id`` AND matching
-        identity) when both ``service_id`` and ``source_node_id`` are given, so
-        replicated rows from another origin are never re-shipped upstream. See
-        SQLiteStore.list_unshipped for the rationale.
-        """
+        """Unshipped rows, oldest first. With both ``service_id`` and
+        ``source_node_id``, only rows originated by that identity."""
         scoped = service_id is not None and source_node_id is not None
 
         def _run(conn: Any) -> list[AuditRow]:
@@ -444,16 +385,10 @@ class PostgresStore:
         self._execute_with_retry(_run)
 
     def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
-        """Verify the chain of replicated rows, then insert the verified prefix.
-
-        The longest verified prefix (rows before the first chain break) is
-        inserted in ONE transaction: all inserts run on a single connection and a
-        single ``conn.commit()`` seals them, with ``conn.rollback()`` on any
-        error, so a failure mid-batch commits nothing (real all-or-nothing).
-        Never raises on a chain break — rejected rows surface via
-        ``rejected_from_seq`` so the sender resyncs from the break. Idempotent
-        (ON CONFLICT (id) DO NOTHING): a retry after a successful commit is a
-        no-op; a retry after a rolled-back failure re-inserts cleanly.
+        """Verify a replicated batch and insert its verified prefix in one
+        transaction. A chain break does not raise; it is reported in
+        ``rejected_from_seq``. Inserts use ON CONFLICT DO NOTHING, so retries
+        are safe.
         """
         from .repo import IngestResult, verified_prefix
 
@@ -487,23 +422,11 @@ class PostgresStore:
 
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":
-        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
+        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec 7.1).
 
-        See the SQLite implementation for the rationale. In short: DELETE would
-        remove rows from the MIDDLE of the chain, which ``verify_chain`` is
-        built to detect as tampering. Under form "2" the hash covers
-        ``detail_commitment``, so nulling ``detail`` and its salt destroys the
-        data while leaving ``hash`` / ``prev_hash`` / ``monotonic_seq`` intact.
-
-        ``detail`` is ``TEXT NOT NULL`` here as it is on SQLite, so this writes
-        the JSON literal ``'null'`` rather than a SQL NULL. ``json.loads`` turns
-        it back into Python ``None``, so the row reads exactly as spec §7.1
-        requires and the bytes are gone either way.
-
-        Convenience wrapper over ``list_redaction_candidates`` + ``redact_rows``
-        for callers with no audit chain to write events into. ``Engine`` drives
-        the two halves separately so it can record before it destroys — prefer
-        ``Engine.redact_expired``, which is what spec §7.2 requires.
+        Same as SQLiteStore.redact_expired: rows are kept and ``detail`` is set
+        to the JSON literal ``'null'`` (the column is NOT NULL). Writes no
+        AUDIT_ROW_REDACTED records; ``Engine.redact_expired`` does.
         """
         candidates = self.list_redaction_candidates(before=before, codes=codes)
         return self.redact_rows(ids=[cid for cid, _ in candidates])
@@ -511,12 +434,8 @@ class PostgresStore:
     def list_redaction_candidates(
         self, *, before: datetime, codes: "Sequence[str]",
     ) -> "list[tuple[str, int]]":
-        """``(id, monotonic_seq)`` of rows this store WOULD redact.
-
-        See the SQLite implementation. Split from the destruction so the caller
-        writes its spec §7.2 records BEFORE any data is destroyed, and returns
-        ``monotonic_seq`` because §7.2 specifies ``redacted_seq``.
-        """
+        """``(id, monotonic_seq)`` of the rows redact_rows() should destroy.
+        See SQLiteStore.list_redaction_candidates."""
         if not codes:
             return []
 
@@ -551,23 +470,13 @@ class PostgresStore:
                 )
                 return [(r[0], r[1]) for r in cur.fetchall()]
 
-        # Read-only: safe to retry, nothing is destroyed here.
         return cast("list[tuple[str, int]]", self._execute_with_retry(_run))
 
     def redact_rows(self, *, ids: "Sequence[str]") -> "list[str]":
-        """Destroy ``detail`` and ``detail_salt`` on an explicit id list.
-
-        Idempotent by construction: it targets ids, not a time window, so the
-        retry ``_execute_with_retry`` performs after a lost commit
-        acknowledgement destroys the same rows and returns the same list.
-
-        The previous shape derived its return value from ``RETURNING id`` on a
-        window query guarded by ``detail <> 'null'``. Under retry that guard
-        excluded the rows the lost-but-committed attempt had already redacted,
-        so the retry returned ``[]`` and the caller wrote no events for rows it
-        had just destroyed — a silent redaction, which is the one outcome spec
-        §7.2 exists to prevent.
-        """
+        """Destroy ``detail`` and ``detail_salt`` on the given form "2" rows.
+        Ids that are not form "2" are left alone but still returned. Returns
+        ``ids`` as given, so a retry after a lost commit returns the same
+        list."""
         if not ids:
             return []
 
@@ -666,10 +575,7 @@ class PostgresStore:
             actor=actor, target=target,
             since=since, until=until,
         )
-        # Cursor pagination (canonical): rows are newest-first, so paging forward
-        # means older rows — monotonic_seq < after_seq. Applied here, not in
-        # _build_where, so count()/total stays the full filtered count
-        # independent of the cursor. Mirrors the Go audit store.
+        # Cursor paging; see SQLiteStore.query.
         if after_seq > 0:
             where = f"{where} AND monotonic_seq < %s" if where else "WHERE monotonic_seq < %s"
             params = [*params, after_seq]
@@ -677,9 +583,8 @@ class PostgresStore:
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
                 cur.execute(
-                    # Wall-clock first: monotonic_seq is a per-(service_id,
-                    # source_node_id) counter, meaningless across sub-chains —
-                    # it stays as the same-timestamp tie-breaker only (#68).
+                    # Timestamp first: monotonic_seq is per node, so it only
+                    # breaks ties (#68).
                     f"SELECT * FROM {self._table} {where} "
                     "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s OFFSET %s",
                     (*params, limit, offset),
@@ -724,15 +629,12 @@ class PostgresStore:
         limit: int = 50,
         tenant_id: str | None = None,
     ) -> list[AuditRow]:
-        """FR3 free-text search over persisted audit history (§4.1). Case-
-        insensitive substring scan over the ``detail`` JSON column via
-        ILIKE + ESCAPE E'\\\\'. Result carries request_id for ``/correlate``.
-
-        ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally.
-        Newest-first, hard-capped by ``limit``, no ranking.
+        """Case-insensitive substring search of the ``detail`` JSON (ILIKE),
+        newest first, at most ``limit`` rows. ``%``, ``_`` and ``\\`` in
+        ``q`` match literally.
 
         ``tenant_id`` scopes the search to one tenant when supplied — see
-        SQLiteStore.search for the P1-44 reasoning."""
+        SQLiteStore.search for the reasoning."""
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["timestamp >= %s", "detail::text ILIKE %s ESCAPE E'\\\\'"]
         params: list[Any] = [since, f"%{esc}%"]
@@ -761,13 +663,8 @@ class PostgresStore:
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Fleet topology, aggregated from the rows already recorded.
-
-        Groups by ``(source_node_id, service_id, tenant_id)`` and returns
-        one entry per distinct emitting source with its row count and
-        first/last-seen timestamps. Mirrors ``SQLiteStore.sources``; see
-        that method for the rationale.
-        """
+        """Row count and first/last seen time per ``(source_node_id,
+        service_id, tenant_id)``, busiest first."""
         where, params = self._build_where(since=since, until=until)
 
         def _run(conn: Any) -> list[dict[str, Any]]:
@@ -801,15 +698,8 @@ class PostgresStore:
         service_id: str | None = None,
         source_node_id: str | None = None,
     ) -> int:
-        """Return MAX(monotonic_seq); 0 if no rows.
-
-        Scoped to ``(service_id, source_node_id)`` when both are provided —
-        the tamper chain is per-node and ``monotonic_seq`` is a per-node
-        counter, so seeding the engine's seq from an unscoped global MAX would
-        break this node's own chain once it has ingested replicated rows from
-        another origin. See SQLiteStore.max_monotonic_seq for the full
-        rationale.
-        """
+        """MAX(monotonic_seq), or 0 with no rows. See
+        SQLiteStore.max_monotonic_seq."""
         scoped = service_id is not None and source_node_id is not None
 
         def _run(conn: Any) -> int:
@@ -826,17 +716,11 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
-    # ------------------------------------------------------------------
-    # Row deserialisation
-    # ------------------------------------------------------------------
-
     def _row(self, r: tuple) -> AuditRow:
         from ..canonical_ts import parse_canonical
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            # Strict canonical parse (spec §4.3). Every row in this table was
-            # written by _utc_iso → canonical_ts, so anything else is a bug at
-            # the source and must fail loudly instead of round-tripping.
+            # Strict: every row was written by _utc_iso().
             timestamp=parse_canonical(r[3]),
             code=r[4], action=r[5], severity=r[6],
             service_id=r[7], source_node_id=r[8], tenant_id=r[9],
@@ -848,9 +732,8 @@ class PostgresStore:
             prev_hash=r[19] if len(r) > 19 else "genesis",
             hash=r[20] if len(r) > 20 else "",
             canonical_form_id=r[21] if len(r) > 21 else "1",
-            # SELECT * — positional. detail_salt / detail_commitment follow
-            # canonical_form_id both in the fresh DDL and when appended by
-            # ALTER TABLE on a migrated table, so the index is stable.
+            # SELECT * is positional. The new DDL and the migrations both put
+            # detail_salt and detail_commitment after canonical_form_id.
             detail_salt=r[22] if len(r) > 22 else None,
             detail_commitment=r[23] if len(r) > 23 else None,
         )

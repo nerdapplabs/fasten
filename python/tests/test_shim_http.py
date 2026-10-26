@@ -1,4 +1,4 @@
-"""Tests for fasten.shim.http — RequestIDMiddleware + APILogger."""
+"""fasten.shim.http: RequestIDMiddleware and APILogger."""
 import asyncio
 
 
@@ -6,7 +6,7 @@ import fasten
 from fasten.shim.http import APILogger, RequestIDMiddleware
 
 
-# ── ASGI test harness ─────────────────────────────────────────────────────
+# ASGI harness
 
 class _Echo:
     """Minimal ASGI app that returns 200 with no body."""
@@ -40,7 +40,7 @@ def _send_recorder():
     return sent, send
 
 
-# ── RequestIDMiddleware (existing, sanity check) ──────────────────────────
+# RequestIDMiddleware
 
 def test_request_id_middleware_mints_when_absent(initialized):
     app = RequestIDMiddleware(_Echo())
@@ -52,7 +52,7 @@ def test_request_id_middleware_mints_when_absent(initialized):
     assert len(rid_headers[0][1].decode()) == 12
 
 
-# ── APILogger ─────────────────────────────────────────────────────────────
+# APILogger
 
 def test_api_logger_writes_row_to_transport(initialized):
     app = APILogger(_Echo(status=201))
@@ -68,7 +68,7 @@ def test_api_logger_writes_row_to_transport(initialized):
     assert last["status"] == 201
     assert "duration_ms" in last
     assert "timestamp" in last
-    assert "request_id" in last  # may be empty pre-RequestIDMiddleware
+    assert "request_id" in last  # a sentinel without RequestIDMiddleware
 
 
 def test_api_logger_skips_configured_paths(initialized):

@@ -1,11 +1,4 @@
-"""
-MQTT shim — correlation over pub/sub via reserved `_req` field in payload.
-
-Publish helper injects `_req = current_request_id()`; subscriber helper
-reads `_req` into the ambient ctx before invoking the handler.
-
-Wire convention: JSON payloads only. Binary payload support is not implemented.
-"""
+"""Carry the request_id over MQTT in a ``_req`` field of JSON payloads."""
 from __future__ import annotations
 
 import json
@@ -15,17 +8,16 @@ from ..context import mint_id, with_request_id, current_request_id
 
 
 async def publish(client: Any, topic: str, payload: dict[str, Any]) -> None:
-    """Publish with `_req` injected from ctx (mint if absent)."""
+    """Publish ``payload`` with ``_req`` set to the current request_id
+    (minting one if unset)."""
     rid = current_request_id() or mint_id()
     enriched = {**payload, "_req": rid}
     await client.publish(topic, json.dumps(enriched))
 
 
 def handler(topic: str) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
-    """
-    Decorator — reads `_req` from incoming payload, sets ctx for the handler.
+    """Decorator that runs the handler with the request_id from ``_req``.
 
-    Usage:
         @mqtt_shim.handler("cmd/+/config/updated")
         async def on_cmd(msg, ctx):  # ctx.request_id is set
             ...

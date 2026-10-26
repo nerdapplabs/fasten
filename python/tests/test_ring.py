@@ -53,7 +53,7 @@ def test_query_filter_method():
     rb = RingBuffer()
     rb.push({"method": "GET", "path": "/health"})
     rb.push({"method": "POST", "path": "/api/users"})
-    # exact-match (parity with the store + the Go SDK); not case-folded
+    # Exact match, not case-folded, same as the stores.
     results = rb.query(method="POST")
     assert len(results) == 1
     assert results[0]["path"] == "/api/users"
@@ -64,7 +64,7 @@ def test_query_filter_path_exact():
     rb = RingBuffer()
     rb.push({"method": "GET", "path": "/api/users/42"})
     rb.push({"method": "GET", "path": "/health"})
-    # exact-match; a partial path no longer substring-matches
+    # Exact match; a prefix does not match.
     assert rb.query(path="/api/users/42")[0]["path"] == "/api/users/42"
     assert rb.query(path="/api") == []
 
@@ -89,7 +89,7 @@ def test_thread_safe_concurrent_push():
     assert len(rb) == 1000
 
 
-# ── StdoutTransport integration ────────────────────────────────────────────
+# StdoutTransport
 
 def test_push_syslog_no_stdout(capsys):
     transport = StdoutTransport()

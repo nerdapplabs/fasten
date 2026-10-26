@@ -1,9 +1,5 @@
-"""
-The 6 audit anchors (5 Ws + H) + correlation, as a typed row.
-
-An emission refuses to construct without the required anchors.
-Most are auto-filled from ctx/config; caller supplies code + target + detail.
-"""
+"""The audit row type and its anchors (who, what, when, where, whom, how,
+and the correlating request_id)."""
 from __future__ import annotations
 
 import dataclasses
@@ -14,14 +10,14 @@ from typing import Any, Optional
 
 
 class Anchor(str, Enum):
-    """Classical audit vocabulary — 5 Ws + H + correlation."""
+    """Audit anchors and the row fields that carry them."""
 
     WHO         = "who"          # actor, actor_kind
     WHAT        = "what"         # code, action
     WHEN        = "when"         # timestamp, monotonic_seq
     WHERE       = "where"        # source_node_id, service_id, tenant_id
     WHOM        = "whom"         # target, category, domain
-    HOW         = "how"          # method ∈ {http, mqtt, cli, scheduler, ui, agent_tool, sdk}
+    HOW         = "how"          # method
     CORRELATION = "correlation"  # request_id
 
     def __str__(self) -> str:
@@ -30,12 +26,9 @@ class Anchor(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class AuditRow:
-    """
-    Canonical audit row — the shape every AuditRepository returns.
-
-    Lossless conversion to CloudEvent and OpenTelemetry LogRecord; see
-    README.md §2.3 for the bridges.
-    """
+    """An audit row, as written by emit() and returned by every
+    AuditRepository. Construction fails without code, request_id,
+    service_id and source_node_id."""
 
     # ordering / identity
     id: str            # UUID4-based event id, prefixed "evt-"
@@ -43,7 +36,7 @@ class AuditRow:
     monotonic_seq: int # per-node counter; resolves same-ms ties
 
     # WHEN
-    timestamp: datetime  # UTC, ms precision
+    timestamp: datetime  # UTC, microsecond precision
 
     # WHAT
     code: str      # SCREAMING_SNAKE
@@ -70,36 +63,26 @@ class AuditRow:
     # CORRELATION
     request_id: str = ""
 
-    # payload
-    # Optional because redaction sets it to null (spec §1.4/§7.1):
-    # under canonical form "2" the hash covers detail_commitment,
-    # not detail, so the payload can be destroyed for retention
-    # without moving the row hash.
+    # None after redaction (spec 7.1).
     detail: Optional[dict[str, Any]] = field(default_factory=dict)
 
-    # wire schema version — readers MUST tolerate higher values on best-effort
+    # Readers should accept higher versions on a best-effort basis.
     wire_version: str = "1"
 
     # replication marker (edge only)
     shipped_at: Optional[datetime] = None
 
-    # canonical_form_id: which hashed canonical form sealed this row. "1" is the
-    # current (and only) form. Included in the hashed bytes so the form choice is
-    # itself tamper-evident; verify_chain dispatches on it and rejects unknown
-    # ids. See fasten.chain for the form definitions.
+    # Hash form this row was sealed with. seal() stamps the current form
+    # ("2"); the default only applies to unsealed rows. See fasten.chain.
     canonical_form_id: str = "1"
 
-    # P1-23: tamper-evidence hash chain.
-    # prev_hash: hex sha256 of the preceding row in this (service_id, source_node_id) chain,
-    #            or the sentinel "genesis" for the first row.
-    # hash:      hex sha256 of canonical JSON of this row (all fields except `hash` itself).
+    # prev_hash: hash of the previous row from the same source_node_id, or
+    # "genesis" for the first. hash: sha256 of this row in its canonical form.
     prev_hash: str = "genesis"
     hash: str = ""
 
-    # spec §1.4 (form "2"): detail is committed to, not hashed directly, so it
-    # can be destroyed for retention without moving the row hash. Both fields
-    # are STORED but NOT hashed — detail_commitment is what enters the hash.
-    # Set to None on a redacted row; None on form-"1" rows, which predate them.
+    # Form "2" hashes detail_commitment instead of detail (spec 1.4).
+    # detail_salt is cleared on redaction; both are None on form "1" rows.
     detail_salt: Optional[str] = None
     detail_commitment: Optional[str] = None
 
@@ -112,8 +95,7 @@ class AuditRow:
             raise ValueError("audit row requires WHERE: service_id + source_node_id")
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable dict — datetimes in the canonical
-        cross-SDK UTC form (spec §4.3)."""
+        """JSON-serialisable dict, with timestamps from canonical_ts()."""
         from .canonical_ts import canonical_ts
         d = dataclasses.asdict(self)
         d["timestamp"] = canonical_ts(self.timestamp)
@@ -122,7 +104,7 @@ class AuditRow:
         return d
 
     def to_cloud_event(self) -> dict[str, Any]:
-        """CloudEvent 1.0 shape — id / source / type / time / data."""
+        """The row as a CloudEvents 1.0 dict."""
         from .canonical_ts import canonical_ts
         return {
             "specversion": "1.0",
@@ -131,7 +113,7 @@ class AuditRow:
             "type": self.code,
             "time": canonical_ts(self.timestamp),
             "data": {
-                # `or {}` — detail is None on a redacted row (spec §7.1).
+                # detail is None on a redacted row.
                 **(self.detail or {}),
                 "actor": self.actor,
                 "actor_kind": self.actor_kind,

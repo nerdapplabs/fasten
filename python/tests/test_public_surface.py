@@ -1,13 +1,4 @@
-"""Tests for the public-API parity additions in P1-8.
-
-Covers:
-  #1 — fasten.transport() accessor
-  #2 — fasten.redactor() accessor
-  #4 — reader.router() lazy-fetches store + transport from fasten.init()
-  #7 — reader docstring auth pattern (read-only assertion that example mentions Depends)
-  #8 — actor / target filters + offset / total on /audit
-  #9 — fasten.init() docstring lists FASTEN_AUDIT_DSN
-"""
+"""Public accessors, reader defaults, /audit filters and pagination, and docstrings."""
 import pytest
 
 import fasten  # noqa: F401  (used by fixtures)
@@ -16,7 +7,7 @@ from fasten.redact import Redactor
 from fasten.transport.stdout import StdoutTransport
 
 
-# ── #1 transport() ────────────────────────────────────────────────────────
+# transport()
 
 def test_transport_returns_active_stdout(initialized):
     t = fasten.transport()
@@ -29,7 +20,7 @@ def test_transport_pre_init_returns_none():
     assert fasten.transport() is None
 
 
-# ── #2 redactor() ─────────────────────────────────────────────────────────
+# redactor()
 
 def test_redactor_returns_active_instance(initialized):
     r = fasten.redactor()
@@ -44,7 +35,7 @@ def test_redactor_round_trip(initialized):
     assert out["api_key"] == "***"
 
 
-# ── #4 reader auto-init from globals ──────────────────────────────────────
+# Reader picks up the store from fasten.init()
 
 def test_router_lazy_fetches_store_from_globals(initialized, mem_store):
     """router() must work without a separate init_reader(store, transport)."""
@@ -69,7 +60,7 @@ def test_router_lazy_fetches_store_from_globals(initialized, mem_store):
     assert "offset" in body and body["offset"] == 0
 
 
-# ── #7 reader docstring shows Depends pattern as the lead-with example ────
+# Reader docstring
 
 def test_router_docstring_leads_with_depends_example():
     from fasten.reader import router as router_mod
@@ -80,7 +71,7 @@ def test_router_docstring_leads_with_depends_example():
     assert "trusted-network" in doc.lower() or "no-auth" in doc.lower()
 
 
-# ── #8 /audit filters + pagination ────────────────────────────────────────
+# /audit filters and pagination
 
 def test_audit_filter_by_actor(initialized):
     pytest.importorskip("fastapi")
@@ -141,12 +132,11 @@ def test_audit_pagination_offset_and_total(initialized):
     assert page1["total"] == 7 and len(page1["rows"]) == 3
     assert page2["total"] == 7 and len(page2["rows"]) == 3
     assert page3["total"] == 7 and len(page3["rows"]) == 1
-    # Pages must be disjoint by id.
     ids = {r["id"] for r in page1["rows"] + page2["rows"] + page3["rows"]}
     assert len(ids) == 7
 
 
-# ── #9 init() docstring lists FASTEN_AUDIT_DSN ────────────────────────────
+# init() docstring
 
 def test_init_docstring_documents_required_env_vars():
     doc = fasten.init.__doc__ or ""
@@ -154,7 +144,7 @@ def test_init_docstring_documents_required_env_vars():
         assert name in doc, f"init() docstring must mention {name}"
 
 
-# ── SQLiteStore.query / count: filter parity ──────────────────────────────
+# SQLiteStore.query / count filters
 
 def test_sqlite_query_actor_target_offset(mem_store):
     from datetime import datetime, timezone

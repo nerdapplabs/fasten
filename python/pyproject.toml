@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fasten"
 version = "1.0.0b0"
-description = "Audit + correlation SDK — 5 Ws + H anchors, one request_id across every transport"
+description = "Audit + correlation SDK: 5 Ws + H anchors, one request_id across every transport"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "nerdAppLabs", email = "praveen.garg@nerdapplabs.com" }]
@@ -50,11 +50,8 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-# Pin the rule set explicitly so lint is deterministic across ruff versions.
-# This is ruff's historical stable default (pyflakes + core pycodestyle) — the
-# standard this codebase was written to. Without it, a newer ruff silently
-# turns on style/modernization rules (UP/B/S/I…) the project never adopted —
-# e.g. B008, which flags every FastAPI `Query()` default that FastAPI requires.
+# Pin ruff's old default rule set so a newer ruff doesn't turn on rules the
+# project never adopted (e.g. B008 flags every FastAPI `Query()` default).
 select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]

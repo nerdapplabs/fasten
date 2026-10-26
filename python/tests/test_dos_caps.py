@@ -1,12 +1,10 @@
-"""
-P1-46 DoS caps — pins the three fail-closed guards:
+"""Size and depth caps:
 
-  1) Per-row byte cap (FASTEN_MAX_DETAIL_BYTES, default 64 KiB).
-     Oversize payloads never enter the ring / store as-is; they get
-     a `_truncated: true` marker.
-  2) Deep-nesting graceful degrade. A 129+ nested dict must not
-     crash emit(); it must land as `<unredactable>`.
-  3) `q=` max_length on /sys, /api, /search — 422 on >1024 chars.
+  1) Per-row byte cap (FASTEN_MAX_DETAIL_BYTES, default 64 KiB). Oversize
+     payloads are replaced with a `_truncated: true` marker.
+  2) A dict nested 129+ deep does not crash emit(); it is stored as
+     `<unredactable>`.
+  3) `q=` max_length on /sys, /api, /search: 422 above 1024 chars.
 """
 from __future__ import annotations
 
@@ -16,7 +14,7 @@ import fasten
 from fasten.redact import Redactor
 
 
-# ── 1) byte cap ───────────────────────────────────────────────────────────
+# 1) byte cap
 
 def test_redact_returns_truncated_marker_for_oversize_dict():
     r = Redactor()
@@ -42,7 +40,7 @@ def test_redact_leaves_small_payload_alone():
     assert out == {"user": "alice", "action": "login"}
 
 
-# ── 2) deep-nesting degrade ────────────────────────────────────────────────
+# 2) deep nesting
 
 def _nested(depth: int) -> dict:
     root = {}
@@ -57,7 +55,7 @@ def _nested(depth: int) -> dict:
 
 def test_redact_returns_unredactable_on_deep_nesting():
     r = Redactor()
-    # 200 > serde_json's 128 recursion limit — Rust core Errs.
+    # 200 > serde_json's 128 recursion limit, so fasten-core returns an error.
     out = r.redact(_nested(200))
     assert out.get("_redact_failed") is True
     assert out.get("_summary") == "<unredactable>"
@@ -75,12 +73,11 @@ def test_emit_survives_deep_nesting_and_stores_marker():
         code="USER_CREATED", target="u-1", actor="op",
         detail=_nested(200),
     )
-    # emit must not raise; the row must carry the fail-closed marker
-    # rather than the original 200-deep nested payload.
+    # emit does not raise, and the row carries the marker instead of the payload.
     assert row.detail.get("_redact_failed") is True
 
 
-# ── 3) q= max_length on reader endpoints ──────────────────────────────────
+# 3) q= max_length on reader endpoints
 
 def _client_search_enabled():
     pytest.importorskip("fastapi")
@@ -118,9 +115,8 @@ def test_search_q_over_1024_returns_422():
 
 
 def test_api_q_over_1024_returns_422():
-    # /api rejects q= entirely with 400 — but only after FastAPI's query
-    # validation. Oversized q must fail at validation (422), not slip
-    # through to the "q= not supported on /api" 400 that comes after.
+    # /api rejects any q= with 400, but FastAPI's query validation runs
+    # first, so an oversized q gets 422.
     c = _client_search_enabled()
     q = "x" * 1025
     r = c.get(f"/api/v1/logs/api?q={q}")
@@ -131,5 +127,5 @@ def test_sys_q_at_limit_accepted():
     c = _client_search_enabled()
     q = "x" * 1024
     r = c.get(f"/api/v1/logs/sys?q={q}&since=2020-01-01T00:00:00Z")
-    # 200 (no matches) — not 422. The cap is inclusive of 1024.
+    # 200 with no matches. The cap includes 1024.
     assert r.status_code == 200

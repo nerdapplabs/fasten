@@ -1,18 +1,8 @@
-"""Query translation — natural-language / smart-box input to structured chips.
+"""Turn search box text into the reader's query parameters.
 
-Per the §3.7 design, discovery input (structured chips, the smart search box, or
-plain-English prose) is translated into the SAME small set of primitives the
-reader already exposes: structured field filters, a correlation ``request_id``,
-and the bounded free-text ``q=`` escape hatch. The translator is an interpreter
-one layer above the reader — **not a fourth query surface** — and it never
-invents semantics the store does not support (an unknown ``field:value`` becomes
-search text, not a fake filter).
-
-OSS ships this interface plus a deterministic reference parser
-(:class:`RuleTranslator`, the §6.3 smart-box rules). A richer plain-English
-model (the fasten-cloud ``/investigate`` surface) implements the same
-:class:`Translator` protocol and returns the same :class:`Chips`, so the UI and
-store contract are identical whether the prose was parsed by rules or a model.
+The result (:class:`Chips`) only uses what the reader already supports: field
+filters, a ``request_id`` to correlate on, and free-text ``q``. Other
+:class:`Translator` implementations return the same type.
 """
 from __future__ import annotations
 
@@ -22,30 +12,25 @@ from typing import Protocol, runtime_checkable
 
 from .context import is_sentinel
 
-# Structured filter fields the reader actually supports (audit + stream reads).
-# A field:value chip is only produced for one of these; anything else is treated
-# as literal search text so the translator never fabricates a filter the store
-# would ignore.
+# Fields the reader can filter on. Any other field:value is search text.
 KNOWN_FIELDS = frozenset({
     "request_id", "code", "domain", "source_node_id", "tenant_id",
     "actor", "target", "method", "path", "status", "service_id",
     "event", "level", "since", "until",
 })
 
-# A bare token that looks like a correlation id → pivot straight to /correlate.
-# fasten's own mint_id() is 12 hex chars; require >= 8 to avoid matching short
-# words. Sentinel ids (boot-/orphan-/...) are correlation ids too.
+# A bare token that looks like a request id (mint_id() gives 12 hex chars;
+# 8 or more avoids short words) or a sentinel id is treated as one.
 _HEXID = re.compile(r"^[0-9a-f]{8,}$")
 _QUOTED = re.compile(r'"([^"]*)"')
 
 
 @dataclasses.dataclass
 class Chips:
-    """The translated query: the three reader primitives, side by side.
+    """A translated query.
 
-    ``request_id`` is the correlation pivot (exclusive — when set the consumer
-    should correlate, not filter). ``filters`` are structured field chips
-    (exact-match, composed with AND). ``q`` is the bounded free-text fallback.
+    When ``request_id`` is set the caller should correlate on it rather than
+    filter. ``filters`` are exact matches combined with AND; ``q`` is free text.
     """
     request_id: str | None = None
     filters: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -54,24 +39,21 @@ class Chips:
 
 @runtime_checkable
 class Translator(Protocol):
-    """Anything that turns query text into :class:`Chips`. The OSS
-    :class:`RuleTranslator` and a cloud NL model are interchangeable behind it."""
+    """Anything that turns query text into :class:`Chips`."""
 
     def translate(self, text: str) -> Chips: ...
 
 
 class RuleTranslator:
-    """Deterministic reference translator — the §6.3 smart-box rules.
+    """Rule-based translator.
 
-    - ``"quoted text"``           → ``q`` (bounded free-text)
-    - ``field:value`` (known)     → structured filter chip
-    - ``request_id:X`` / bare id  → correlation ``request_id``
-    - a long hex / sentinel token → correlation ``request_id``
-    - anything else               → accumulated into ``q``
+    - ``"quoted text"`` goes to ``q``
+    - ``field:value`` for a known field becomes a filter
+    - ``request_id:X``, a long hex token or a sentinel id sets ``request_id``
+    - anything else is added to ``q``
 
-    An ``ask:`` prefix is stripped and the remainder parsed by the same rules.
-    Prose like "yesterday 2pm" is left to a cloud NL model — this parser does not
-    guess time ranges it cannot ground.
+    An ``ask:`` prefix is ignored. Time phrases like "yesterday 2pm" are not
+    interpreted.
     """
 
     def translate(self, text: str) -> Chips:
@@ -82,7 +64,7 @@ class RuleTranslator:
         chips = Chips()
         q_parts: list[str] = []
 
-        # Quoted spans are free-text, verbatim (spaces preserved).
+        # Quoted text goes to q as is, spaces included.
         def _lift_quote(m: re.Match[str]) -> str:
             q_parts.append(m.group(1))
             return " "

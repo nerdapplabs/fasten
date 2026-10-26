@@ -1,13 +1,9 @@
-"""
-Shims — opt-in per transport. Each shim does one thing: read an id from the
-wire, set it as ambient context, call downstream. ~10 lines each.
+"""Optional integrations that carry the request id across a transport, or
+feed other logging libraries into fasten.
 
-Bundled:
-  - http             (X-Request-ID)
-  - mqtt             (_req in payload)
-  - scheduler        (mint scheduler-<run_id>)
-  - deploy_pipeline  (X-Deploy-ID piggyback)
-  - agent_tool       (AI agent tool-call ctx)
-
-Adopters on other wires (gRPC, NATS, AMQP, …) write the same 10-line pattern.
+  http        X-Request-ID middleware and the api log middleware
+  mqtt        ``_req`` field in JSON payloads
+  scheduler   a ``scheduler-<run_id>`` id per job run
+  stdlib      ``logging`` handler
+  structlog   structlog processor and setup
 """

@@ -22,14 +22,9 @@ def mem_store():
 def initialized(mem_store, monkeypatch):
     """Initialised SDK with an in-memory store.
 
-    Uses ``raise`` failure strategy so the legacy "emit then read store"
-    test pattern stays synchronous. Tests that need to exercise the
-    default ``queue`` drainer set the strategy explicitly.
-
-    Env vars are set via ``monkeypatch.setenv`` so pytest restores them
-    automatically at teardown — even if the test raises before the yield
-    return path can hand-restore them (the earlier ``del os.environ[...]``
-    would silently fail on that path)."""
+    Uses the ``raise`` failure strategy so emit writes synchronously and a
+    test can read the store straight after. Tests of the ``queue`` drainer
+    set the strategy themselves."""
     monkeypatch.setenv("FASTEN_SERVICE_ID", "test-svc")
     monkeypatch.setenv("FASTEN_NODE_ID", "test-node")
     import fasten

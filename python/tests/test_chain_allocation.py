@@ -1,9 +1,7 @@
-"""P0-9 — store-allocated sequencing (spec §2.1).
+"""Store-allocated sequencing (spec §2.1).
 
-monotonic_seq and prev_hash are allocated inside the insert transaction, so N
-concurrent writers on one node still produce ONE verifiable chain. These tests
-are the regression guard: if allocation ever moves back into engine memory,
-`test_concurrent_threads_produce_one_verifiable_chain` fails.
+monotonic_seq and prev_hash are allocated inside the insert transaction, so
+concurrent writers on one node still produce one verifiable chain.
 """
 import os
 import tempfile
@@ -18,7 +16,7 @@ from fasten.store.sqlite import SQLiteStore
 
 
 def _unsealed(i: int, *, service_id: str = "svc-a", node: str = "node-1") -> AuditRow:
-    """A row as emit() now produces it: no seq, no prev_hash, no hash."""
+    """A row as emit() produces it: no seq, no prev_hash, no hash."""
     return AuditRow(
         id=f"evt-{service_id}-{i}", origin_id=f"evt-{service_id}-{i}",
         monotonic_seq=0,
@@ -53,7 +51,7 @@ def test_sequence_increments_and_links(store):
 
 
 def test_two_services_share_one_node_sequence(store):
-    """THE P0-9 GUARD. Different services on one node must NOT both get seq 1."""
+    """Different services on one node must not both get seq 1."""
     a = store.allocate_and_insert_originated(_unsealed(1, service_id="svc-a"))
     b = store.allocate_and_insert_originated(_unsealed(1, service_id="svc-b"))
     assert a.monotonic_seq == 1
@@ -123,25 +121,21 @@ def test_rollback_leaves_no_gap(store):
 
 
 def test_unsealed_rows_still_occupy_their_sequence(store):
-    """REGRESSION: allocation must count UNSEALED rows too.
+    """Allocation must count unsealed rows too.
 
     A pre-upgrade row, or one written in stdout-only mode (spec §8.1), has
-    hash="". It still occupies its monotonic_seq. An allocator that filters on
-    `hash != ''` when computing MAX(seq) restarts the counter at 1 and mints
-    duplicates against those rows — silently, until verify_chain reports a
-    duplicate allocation.
-
-    seq spans ALL rows on the node; prev_hash chains only from sealed ones.
+    hash="" but still occupies its monotonic_seq. seq spans all rows on the
+    node; prev_hash chains only from sealed ones.
     """
     import dataclasses
     unsealed = dataclasses.replace(_unsealed(99), monotonic_seq=42)
     assert unsealed.hash == ""
-    store._insert_row(unsealed)                       # bypass sealing entirely
+    store._insert_row(unsealed)                       # no sealing
 
     nxt = store.allocate_and_insert_originated(_unsealed(1))
     assert nxt.monotonic_seq == 43, (
         f"allocated seq {nxt.monotonic_seq} against an existing unsealed row at "
-        "42 — the counter restarted"
+        "42, the counter restarted"
     )
     # No sealed predecessor exists, so this row legitimately starts the chain.
     assert nxt.prev_hash == "genesis"
@@ -159,8 +153,8 @@ def test_prev_hash_skips_unsealed_tip(store):
 
 
 def test_redact_expired_destroys_pii_and_keeps_the_chain(store):
-    """#90: the whole point — PII on a SHORT horizon, ops history on a LONG one,
-    without DELETE breaking the chain."""
+    """PII goes on a short horizon and ops history on a long one, without a
+    DELETE breaking the chain (#90)."""
     import dataclasses
     from datetime import timedelta
     old = datetime.now(timezone.utc) - timedelta(days=40)

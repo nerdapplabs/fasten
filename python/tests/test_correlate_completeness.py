@@ -1,10 +1,8 @@
-"""FR4 completeness gaps from the gh_issues_58 review:
+"""/correlate completeness: each stream reports its own class, and a
+per-stream `truncated` flag.
 
-- mixed-class /correlate composition (each stream reports its own class)
-- /correlate per-stream `truncated` boolean (counts < totals)
-
-(The sticky-through-recovery gap for store-degraded is covered by
-test_phase1_review.test_persist_failure_degrades_completeness_flag.)
+store-degraded staying set after recovery is covered by
+test_stream_write_through.test_persist_failure_degrades_completeness_flag.
 """
 import pytest
 
@@ -26,9 +24,7 @@ def _client():
 
 
 def _init(**stores):
-# service_id / node_id are passed explicitly to fasten.init below; the
-    # earlier os.environ writes were dead code that leaked env across tests.
-        fasten.init(
+    fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
@@ -37,14 +33,10 @@ def _init(**stores):
 
 
 def test_correlate_mixed_durability_classes(monkeypatch, capsys):
-    """FR4-3: /correlate reports each stream's own class when they differ —
-    audit=store, api=store-degraded, sys=ring in one response."""
+    """audit=store, api=store-degraded and sys=ring in one response."""
     api = StreamStore(":memory:", table="api_mix")
     _init(api_store=api)  # audit store-backed; no sys store -> ring
-    # Degrade the api stream via a swallowed persist failure. monkeypatch.setattr
-    # so the patched insert is restored at teardown even if a downstream assert
-    # raises — the earlier raw `api.insert = lambda ...` leaked the broken
-    # method into any test that reused this StreamStore instance.
+    # Degrade the api stream with a persist failure.
     def _boom(row):
         raise RuntimeError("disk full")
     monkeypatch.setattr(api, "insert", _boom)
@@ -56,9 +48,7 @@ def test_correlate_mixed_durability_classes(monkeypatch, capsys):
         "api": "store-degraded",
         "sys": "ring",
     }
-    # The swallow logs to sys drainer — capture stderr so the "swallowed
-    # persist failure" log line goes through capsys instead of leaking into
-    # test output unasserted (the review flagged this exact hygiene gap).
+    # The persist failure is logged to stderr.
     err = capsys.readouterr().err
     assert "disk full" in err or "api" in err or err == "", (
         f"stderr should be captured (empty or contain the failure); got {err!r}"
@@ -66,8 +56,7 @@ def test_correlate_mixed_durability_classes(monkeypatch, capsys):
 
 
 def test_correlate_truncated_flag():
-    """FR4-4: /correlate exposes a per-stream `truncated` boolean (counts <
-    totals) so callers don't re-derive the inequality."""
+    """`truncated` is true for a stream when its count is below its total."""
     _init()
     with with_request_id("rq"):
         for _ in range(3):

@@ -48,7 +48,7 @@ def test_insert_and_query_by_request_id(store):
 def test_insert_idempotent(store):
     row = make_row()
     store.insert(row)
-    store.insert(row)  # duplicate — INSERT OR IGNORE
+    store.insert(row)  # duplicate, INSERT OR IGNORE
     assert len(store.query()) == 1
 
 
@@ -91,22 +91,15 @@ def test_query_by_code(store):
 
 
 def test_query_naive_datetime_normalised_to_utc(tmp_path):
-    """REVIEW #16: a naive datetime passed to since/until must compare
-    correctly against the UTC-aware ISO strings stored on disk.
-
-    Earlier `since.isoformat()` on a naive datetime produced a string
-    without offset, so lexicographic compare against
-    '2026-01-01T...+00:00' silently misorders.
-    """
+    """A naive since/until is treated as UTC when compared with stored timestamps."""
     s = SQLiteStore(str(tmp_path / "naive.db"))
     aware_now = datetime.now(timezone.utc)
     s.insert(make_row(timestamp=aware_now))
-    # Same instant, but naive. After the fix, since=naive matches.
+    # Same instant, but naive.
     naive_now = aware_now.replace(tzinfo=None)
     earlier_naive = naive_now - timedelta(seconds=10)
     later_naive = naive_now + timedelta(seconds=10)
     assert len(s.query(since=earlier_naive, until=later_naive)) == 1
-    # Symmetric: aware boundary still works.
     assert len(s.query(
         since=aware_now - timedelta(seconds=10),
         until=aware_now + timedelta(seconds=10),
@@ -114,13 +107,7 @@ def test_query_naive_datetime_normalised_to_utc(tmp_path):
 
 
 def test_per_thread_connection(tmp_path):
-    """REVIEW #15: file-backed store opens one connection per thread.
-
-    Earlier the store shared a single connection via
-    check_same_thread=False, which silenced the safety assertion but
-    left the underlying sqlite3 cursor protocol unsafe under
-    concurrent drainer + reader access.
-    """
+    """A file-backed store opens one connection per thread."""
     s = SQLiteStore(str(tmp_path / "perthread.db"))
 
     seen_conns: set[int] = set()
@@ -128,7 +115,6 @@ def test_per_thread_connection(tmp_path):
 
     def worker(idx: int):
         barrier.wait()
-        # Each worker triggers a connection open by doing one read.
         s.query(limit=1)
         seen_conns.add(id(s._connect()))
 
@@ -137,13 +123,12 @@ def test_per_thread_connection(tmp_path):
         t.start()
     for t in threads:
         t.join()
-    # Four worker threads → at least four distinct connection objects.
     assert len(seen_conns) >= 4
 
 
 def test_memory_store_serialises_compound_ops(tmp_path):
-    """`:memory:` falls back to single connection + RLock; compound ops
-    from multiple threads must complete without sqlite cursor errors."""
+    """`:memory:` uses one connection behind an RLock, so concurrent writers
+    don't hit sqlite cursor errors."""
     s = SQLiteStore(":memory:")
     errors: list[Exception] = []
 
