@@ -111,4 +111,10 @@ jobs:
           fail_ci_if_error: false
 
       - name: Audit (pip-audit)
-        run: pip-audit
+        # Run pip-audit from its own env so it audits the project venv and
+        # not its own dependencies (filelock has no fixed release for 3.10).
+        # Fail if site-packages isn't found; --path on a missing dir passes.
+        run: |
+          sp=$(echo .venv/lib/python3*/site-packages)
+          test -d "$sp" || { echo "::error::site-packages not found at $sp, audit would pass without checking anything"; exit 1; }
+          uvx pip-audit@2.10.1 --path "$sp"
