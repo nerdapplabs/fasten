@@ -18,7 +18,8 @@ import CFastenStoreCore
 /// ```
 public final class FastenStore {
 
-    private var handle: OpaquePointer
+    private var handle: OpaquePointer?
+    private let lock = RWLock()
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -39,14 +40,26 @@ public final class FastenStore {
         handle = h
     }
 
-    deinit { fasten_store_close(handle) }
+    deinit { close() }
 
     /// Release resources immediately.  The store is unusable after this call.
-    /// Calling `close()` makes subsequent operations throw.
+    /// Calling `close()` again is a no-op; other operations throw.
     public func close() {
-        fasten_store_close(handle)
-        // Note: after close the handle is dangling; subsequent calls will crash.
-        // Callers should discard the reference after close().
+        lock.writeLock()
+        defer { lock.unlock() }
+        if let h = handle {
+            handle = nil
+            fasten_store_close(h)
+        }
+    }
+
+    // Calls share the read lock so they still run concurrently; close()
+    // takes the write lock and waits for them to finish.
+    private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+        lock.readLock()
+        defer { lock.unlock() }
+        guard let h = handle else { throw FastenStoreError("store is closed") }
+        return try body(h)
     }
 
     // ── Write path ────────────────────────────────────────────────────────────
@@ -73,7 +86,7 @@ public final class FastenStore {
     /// Insert from a pre-serialised JSON string.
     public func insertJSON(_ json: String) throws {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
-        let rc = fasten_store_insert(handle, json, &errPtr)
+        let rc = try withHandle { fasten_store_insert($0, json, &errPtr) }
         guard rc == 0 else {
             let msg = errPtr.map { String(cString: $0) } ?? "insert failed"
             errPtr.map { fasten_store_free_str($0) }
@@ -86,7 +99,7 @@ public final class FastenStore {
     /// Verify the backend is reachable (runs `SELECT 1`).
     public func ping() throws {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
-        let rc = fasten_store_ping(handle, &errPtr)
+        let rc = try withHandle { fasten_store_ping($0, &errPtr) }
         guard rc == 0 else {
             let msg = errPtr.map { String(cString: $0) } ?? "ping failed"
             errPtr.map { fasten_store_free_str($0) }
@@ -100,4 +113,19 @@ public final class FastenStore {
     public static var version: String {
         String(cString: fasten_store_version())
     }
+}
+
+private final class RWLock {
+    private let rw = UnsafeMutablePointer<pthread_rwlock_t>.allocate(capacity: 1)
+
+    init() { pthread_rwlock_init(rw, nil) }
+
+    deinit {
+        pthread_rwlock_destroy(rw)
+        rw.deallocate()
+    }
+
+    func readLock() { pthread_rwlock_rdlock(rw) }
+    func writeLock() { pthread_rwlock_wrlock(rw) }
+    func unlock() { pthread_rwlock_unlock(rw) }
 }

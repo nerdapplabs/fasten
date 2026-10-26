@@ -92,6 +92,24 @@ final class SQLiteTests: XCTestCase {
             XCTAssertTrue(error is FastenStoreError)
         }
     }
+
+    func testCloseThenDeinit() throws {
+        do {
+            let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+            defer { store.close() }
+            try store.ping()
+        }
+    }
+
+    func testCloseTwiceAndUseAfterCloseThrows() throws {
+        let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+        store.close()
+        store.close()
+        XCTAssertThrowsError(try store.ping()) { error in
+            XCTAssertTrue(error is FastenStoreError)
+        }
+        XCTAssertThrowsError(try store.insert(makeRow("evt-after-close")))
+    }
 }
 
 // ── PostgreSQL ────────────────────────────────────────────────────────────────
