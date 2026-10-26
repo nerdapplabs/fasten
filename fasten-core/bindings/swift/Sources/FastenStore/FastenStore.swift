@@ -44,6 +44,7 @@ public final class FastenStore {
 
     /// Release resources immediately.  The store is unusable after this call.
     /// Calling `close()` again is a no-op; other operations throw.
+    /// Waits for calls already in progress, so a slow insert delays it.
     public func close() {
         lock.writeLock()
         defer { lock.unlock() }
@@ -118,14 +119,19 @@ public final class FastenStore {
 private final class RWLock {
     private let rw = UnsafeMutablePointer<pthread_rwlock_t>.allocate(capacity: 1)
 
-    init() { pthread_rwlock_init(rw, nil) }
+    init() { check(pthread_rwlock_init(rw, nil)) }
 
     deinit {
         pthread_rwlock_destroy(rw)
         rw.deallocate()
     }
 
-    func readLock() { pthread_rwlock_rdlock(rw) }
-    func writeLock() { pthread_rwlock_wrlock(rw) }
-    func unlock() { pthread_rwlock_unlock(rw) }
+    func readLock() { check(pthread_rwlock_rdlock(rw)) }
+    func writeLock() { check(pthread_rwlock_wrlock(rw)) }
+    func unlock() { check(pthread_rwlock_unlock(rw)) }
+
+    // Call first, then check, so the call still runs in -Ounchecked builds.
+    private func check(_ rc: Int32) {
+        precondition(rc == 0, "pthread_rwlock failed: \(rc)")
+    }
 }

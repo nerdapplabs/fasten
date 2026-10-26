@@ -105,10 +105,41 @@ final class SQLiteTests: XCTestCase {
         let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
         store.close()
         store.close()
-        XCTAssertThrowsError(try store.ping()) { error in
-            XCTAssertTrue(error is FastenStoreError)
+        assertClosed { try store.ping() }
+        assertClosed { try store.insert(makeRow("evt-after-close")) }
+        assertClosed { try store.insertJSON("{}") }
+    }
+
+    func testInsertsWhileClosing() throws {
+        let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+        let lock = NSLock()
+        var unexpected: [String] = []
+        DispatchQueue.concurrentPerform(iterations: 5) { worker in
+            if worker == 0 {
+                usleep(1_000)
+                store.close()
+                return
+            }
+            for i in 0..<200 {
+                do {
+                    try store.insert(makeRow("evt-close-\(worker)-\(i)"))
+                } catch let e as FastenStoreError where e.message == "store is closed" {
+                    break
+                } catch {
+                    lock.lock()
+                    unexpected.append("\(error)")
+                    lock.unlock()
+                }
+            }
         }
-        XCTAssertThrowsError(try store.insert(makeRow("evt-after-close")))
+        XCTAssertTrue(unexpected.isEmpty, "\(unexpected)")
+        assertClosed { try store.ping() }
+    }
+
+    private func assertClosed(_ body: () throws -> Void, line: UInt = #line) {
+        XCTAssertThrowsError(try body(), line: line) { error in
+            XCTAssertEqual((error as? FastenStoreError)?.message, "store is closed", line: line)
+        }
     }
 }
 
