@@ -138,7 +138,7 @@ final class Engine: @unchecked Sendable {
         transport.log(level: level, event: event,
                       serviceID: serviceID.isEmpty ? nil : serviceID,
                       nodeID: nodeID.isEmpty ? nil : nodeID,
-                      requestID: requestID, fields: fields)
+                      requestID: requestID, fields: redactor.redact(fields))
     }
 
     func flush(timeout: TimeInterval) -> Bool {

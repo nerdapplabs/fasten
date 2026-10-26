@@ -265,3 +265,33 @@ final class QueueTests: XCTestCase {
         XCTAssertEqual(store.all().count, 1)
     }
 }
+
+// MARK: - Log
+
+final class LogTests: XCTestCase {
+    override func setUp() { Fasten._resetForTests() }
+
+    private func captureStdout(_ body: () -> Void) -> String {
+        fflush(stdout)
+        let pipe = Pipe()
+        let saved = dup(STDOUT_FILENO)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+        body()
+        fflush(stdout)
+        dup2(saved, STDOUT_FILENO)
+        close(saved)
+        pipe.fileHandleForWriting.closeFile()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
+
+    func testLogFieldsAreRedacted() throws {
+        try Fasten.configure(serviceID: "svc", nodeID: "node",
+                             extraRedactKeys: ["ssn"], redactReplacement: "[x]")
+        let out = captureStdout {
+            Fasten.log.info("login", fields: ["user": "u-1", "password": "hunter2", "ssn": "123"])
+        }
+        XCTAssertTrue(out.contains("\"user\":\"u-1\""), out)
+        XCTAssertTrue(out.contains("\"password\":\"[x]\""), out)
+        XCTAssertTrue(out.contains("\"ssn\":\"[x]\""), out)
+    }
+}
