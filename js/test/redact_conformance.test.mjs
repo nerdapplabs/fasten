@@ -1,9 +1,4 @@
-/**
- * Redact conformance — loads spec/redact-conformance.json, runs every case.
- *
- * The spec is the single source of truth; fasten-core/src/redact.rs is canonical.
- * All SDKs must pass every case; failures indicate a divergence from the Rust impl.
- */
+// Runs every case in spec/redact-conformance.json.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -25,8 +20,7 @@ describe('redact conformance', () => {
         });
     }
 
-    // Stripe live key — constructed at runtime so the literal sk_live_<24+ chars>
-    // never appears in source (GitHub push-protection false-positive).
+    // Built at runtime so GitHub push protection doesn't flag the literal.
     test('value_stripe_live', () => {
         const key = 'sk' + '_live_' + 'A'.repeat(24);
         const got = JSON.parse(coreRedact(JSON.stringify({ note: key })));

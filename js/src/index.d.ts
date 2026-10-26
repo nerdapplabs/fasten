@@ -1,21 +1,9 @@
-/**
- * fasten — TypeScript types for the Node.js package.
- *
- * The Row interface uses **snake_case** to match the wire format
- * defined in spec/row-schema.json (the same shape Python / Go / Rust /
- * C++ emit). The earlier camelCase declarations contradicted the
- * runtime: TS adopters reading `row.serviceId` got `undefined` because
- * the runtime emits `service_id`. The call-site API surface (init,
- * emit input) stays camelCase because that is what the JS runtime
- * actually accepts.
- */
+// Types for fasten. Row fields are snake_case, as on the wire
+// (spec/row-schema.json). Options passed to init() and emit() are camelCase.
 
 // --- Enums ---------------------------------------------------------------
 
-// Domain is adopter-defined per spec/row-schema.json (e.g. node, user,
-// billing). It is intentionally NOT a closed enum — declaring it as
-// one would silently fail TS adopters whose domain string is valid at
-// runtime but not in the type.
+// Any string the adopter chooses (e.g. "user", "billing").
 export type Domain = string;
 
 export type Severity = "debug" | "info" | "warn" | "error" | "critical";
@@ -57,9 +45,7 @@ export function dump(): string;
 
 // --- Row -----------------------------------------------------------------
 
-// Wire row — snake_case, matches spec/row-schema.json. Emitted as the
-// `audit` shape on stdout; callers reading rows back from stdout NDJSON
-// or from a store get this exact shape.
+// The row as emitted on stdout and stored.
 export interface Row {
 	id: string; // evt-<20 hex chars>
 	origin_id: string; // dedup key for replication
@@ -101,7 +87,6 @@ export interface InitOptions {
 	auditStore?: AuditRepository | null;
 	apiStore?: AuditRepository | null;
 	extraRedactKeys?: string[];
-	// P1-15: audit-store failure handling.
 	auditStoreFailureStrategy?: "queue" | "raise";
 	queueCapacity?: number;
 	queueRetryInitialMs?: number;
@@ -132,7 +117,7 @@ export interface Logger {
 
 export const log: Logger;
 
-// --- P1-15 audit-store failure handling ----------------------------------
+// --- Store failure handling ----------------------------------------------
 
 export class AuditStoreError extends Error {
 	constructor(cause: unknown);
@@ -152,8 +137,8 @@ export interface QueueStats {
 // Returns null in raise mode (no drainer running).
 export function queueStats(): QueueStats | null;
 
-// Block until pending audit rows drain or timeout. Returns true iff
-// drained. No-op + true in raise mode.
+// Wait for queued rows to be written. Returns false on timeout, and true
+// right away in raise mode.
 export function flush(timeoutMs?: number): Promise<boolean>;
 
 // --- Store interfaces ----------------------------------------------------

@@ -1,9 +1,4 @@
-/**
- * fasten JS codes-yaml tests (P1-11) — node:test, runs in node:20-alpine.
- *
- * Covers the optional yaml catalog: load(), reload() with atomic + fault-
- * tolerant semantics, programmatic-preservation across reload.
- */
+// codes.load() and codes.reload().
 import { test, before, beforeEach, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -12,7 +7,7 @@ import os from 'node:os';
 
 import {
     register, metaOf, registry, codes, _yamlCodes, _resetRegistryForReload,
-    _clearRustRegistry,
+    _clearCoreRegistry,
 } from '../src/index.js';
 import { _loadedPaths } from '../src/codes_yaml.js';
 
@@ -46,7 +41,7 @@ async function writeFile(name, contents) {
 }
 
 function resetState() {
-    _clearRustRegistry();
+    _clearCoreRegistry();
     registry().clear();
     _yamlCodes.clear();
     _loadedPaths.length = 0;
@@ -113,7 +108,7 @@ codes:
         assert.ok(metaOf('FLEET_NODE_REGISTERED'));
     });
 
-    test('reload fault-tolerant — bad yaml leaves previous catalog active', async () => {
+    test('reload with bad yaml keeps the previous catalog', async () => {
         const p = await writeFile('reload-bad.yaml', FLEET_YAML);
         await codes.load(p);
         const before = registry().size;
@@ -136,7 +131,7 @@ codes:
         const p = await writeFile('reload-prog.yaml', FLEET_YAML);
         await codes.load(p);
 
-        // Programmatic register — different domain, not in yaml
+        // Added with register(), different domain
         register('extra', {
             EXTRA_PROG_CODE: { domain: 'extra', category: 'x', action: 'x',
                                 severity: 'info', description: 'x', emitter: 't' },
