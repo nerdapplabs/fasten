@@ -1,14 +1,11 @@
-//! Minimal tiny_http service wired to fasten — sync, no tokio.
+//! Minimal tiny_http service using fasten (sync, no tokio).
 //!
-//! What it shows in ~80 lines:
-//!
-//!   - fasten::init() reading env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID).
-//!   - One audit code (USER_CREATED) registered at startup.
-//!   - per-request with_request_id() — mints / honours X-Request-ID and
-//!     stashes it in the per-thread context for downstream submit / log.
-//!   - POST /users emits an audit row with the in-context request_id.
-//!   - GET  /users/<id> emits a read-side audit row + a structured sys log.
-//!   - On Ctrl-C, fasten::flush() drains pending audit rows.
+//!   - fasten::init() with FASTEN_SERVICE_ID and FASTEN_NODE_ID from the env.
+//!   - Two audit codes (USER_CREATED, USER_VIEWED) registered at startup.
+//!   - with_request_id() per request: uses X-Request-ID or mints one, and
+//!     sets it for the thread so submit() and log lines pick it up.
+//!   - POST /users emits an audit row with that request_id.
+//!   - GET  /users/<id> emits a read audit row and a sys log line.
 //!
 //! Run:
 //!
@@ -22,7 +19,7 @@ use fasten::{
     RetentionClass, Severity,
 };
 use std::collections::HashMap;
-use std::io::Read;  // for req.as_reader().read_to_string in handler
+use std::io::Read;
 use tiny_http::{Header, Response, Server};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,7 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = Server::http("0.0.0.0:8080")?;
     println!("listening on :8080");
 
-    // Ctrl-C handler — flush before exit.
     ctrlc_handler();
 
     for mut req in server.incoming_requests() {
@@ -123,7 +119,7 @@ fn handle(method: &str, url: &str, body: &str) -> (u16, String) {
 }
 
 fn parse_email(body: &str) -> String {
-    // Crude but dependency-free; real apps use serde_json
+    // Crude string scan; a real app would parse the JSON.
     body.split("\"email\"").nth(1)
         .and_then(|s| s.split('"').nth(1))
         .unwrap_or("")
@@ -131,9 +127,7 @@ fn parse_email(body: &str) -> String {
 }
 
 fn ctrlc_handler() {
-    // Real apps wire a proper signal handler (e.g. via the `ctrlc`
-    // crate, or libc::signal). For the demo we rely on the OS killing
-    // the process on Ctrl-C; the drainer best-effort drains via its
-    // shutdown path. Adopters running this in Docker typically call
-    // fasten::flush() from their own preStop hook before SIGTERM.
+    // Left empty: Ctrl-C just kills the demo. A real service with an audit
+    // store calls fasten::flush() from a signal handler (e.g. the `ctrlc`
+    // crate) or a preStop hook so queued rows are written before exit.
 }

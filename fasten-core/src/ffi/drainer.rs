@@ -17,7 +17,7 @@ use crate::{
 use super::{FastenStoreHandle, guarded, result_to_rc};
 use super::util::set_error;
 
-// Thin newtype so we can pass an Arc<dyn Store> as a Box<dyn Store>.
+// Lets the drainer's Box<dyn Store> share the handle's Arc<dyn Store>.
 struct ArcStoreShim(Arc<dyn Store>);
 
 impl Store for ArcStoreShim {
@@ -36,12 +36,12 @@ impl Store for ArcStoreShim {
 /// Must be called before any `fasten_drainer_enqueue` call. The drainer
 /// uses the store already associated with `handle` to write rows.
 ///
-/// `capacity`         — maximum queued + in-flight slots (default 100 when 0).
-/// `retry_initial_ms` — first backoff window in ms (default 100 when 0).
-/// `retry_max_ms`     — backoff ceiling in ms (default 60 000 when 0).
-/// `retry_jitter`     — non-zero = apply ±20% uniform jitter.
-/// `max_attempts`     — dead-letter threshold (default 50 when 0).
-/// `out_err`          — set on error; may be NULL.
+/// `capacity`:          maximum queued + in-flight slots (default 100 when 0).
+/// `retry_initial_ms`:  first backoff window in ms (default 100 when 0).
+/// `retry_max_ms`:      backoff ceiling in ms (default 60 000 when 0).
+/// `retry_jitter`:      non-zero = apply +/-20% uniform jitter.
+/// `max_attempts`:      dead-letter threshold (default 50 when 0).
+/// `out_err`:           set on error; may be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_install(
     handle: *mut FastenStoreHandle,
@@ -63,17 +63,11 @@ pub unsafe extern "C" fn fasten_drainer_install(
             retry_jitter: retry_jitter != 0,
             max_attempts: if max_attempts == 0 { 50 } else { max_attempts as usize },
         };
-        // We need to reconstruct the store reference for the drainer.
-        // The handle owns a Box<dyn Store>; to share it with the drainer
-        // we wrap it in an Arc via an indirection.
         let h = &mut *handle;
-        // Stop existing drainer if any.
         if let Some(old) = h.drainer.take() {
             old.stop(Duration::from_secs(2));
         }
-        // Clone the Arc so both the handle and the drainer share the store.
         let store = Arc::clone(&h.store);
-        // Drainer::new takes Box<dyn Store>; wrap the Arc in a newtype shim.
         let store_box = Box::new(ArcStoreShim(store));
         h.drainer = Some(Drainer::new(store_box, cfg));
         Ok(())
@@ -83,9 +77,8 @@ pub unsafe extern "C" fn fasten_drainer_install(
 
 /// Enqueue a row JSON for asynchronous insertion.
 ///
-/// Blocks if the queue is full (back-pressure). Returns
-/// `FASTEN_ERR_DRAINER_STOPPED` if no drainer is installed or if it
-/// has been shut down.
+/// Blocks while the queue is full. Returns `FASTEN_ERR_NULL_ARG` if no
+/// drainer is installed.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_enqueue(
     handle: *mut FastenStoreHandle,
@@ -112,8 +105,8 @@ pub unsafe extern "C" fn fasten_drainer_enqueue(
 
 /// Block until all currently-queued rows have drained, or `timeout_ms` elapses.
 ///
-/// `timeout_ms`       — 0 = no-timeout (practical ceiling: 30 days).
-/// `out_fully_drained`— set to 1 if fully drained, 0 if timed out. May be NULL.
+/// `timeout_ms`:        0 = no timeout (practical ceiling: 30 days).
+/// `out_fully_drained`: set to 1 if fully drained, 0 if timed out. May be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_flush(
     handle: *mut FastenStoreHandle,
@@ -127,10 +120,10 @@ pub unsafe extern "C" fn fasten_drainer_flush(
         }
         let h = &*handle;
         let drained = match &h.drainer {
-            None => true, // no drainer = raise mode = trivially drained
+            None => true, // nothing queued without a drainer
             Some(d) => {
                 let timeout = if timeout_ms == 0 {
-                    Duration::from_secs(30 * 24 * 3600) // 30-day practical ceiling
+                    Duration::from_secs(30 * 24 * 3600)
                 } else {
                     Duration::from_millis(timeout_ms)
                 };
@@ -155,7 +148,7 @@ pub unsafe extern "C" fn fasten_drainer_flush(
 
 /// Return queue stats as a JSON string.
 ///
-/// Returns an empty JSON object `{}` when no drainer is installed.
+/// Writes the JSON text "null" when no drainer is installed.
 /// Free the result with `fasten_store_free_str`.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_stats_json(

@@ -1,8 +1,7 @@
-//! fasten — audit + correlation SDK for Rust services.
+//! fasten: audit and correlation SDK for Rust services.
 //!
-//! Same shape as Python / Go / Node.js / C++ references: 6 audit anchors
-//! (5 Ws + H) + correlation, opt-in shims per transport, pluggable store,
-//! mountable reader. v0.1 / beta — sync core, optional async/store features.
+//! Audit rows carry the 5 Ws + H anchors and a request_id for correlation.
+//! The core is sync; stores and yaml catalogs are optional features.
 //!
 //! See `../README.md` for the full design.
 
@@ -17,8 +16,6 @@ use std::time::Duration;
 pub mod engine;
 pub use engine::{Engine, DEFAULT};
 
-// ── P1-15 drainer public surface ─────────────────────────────────────────────
-
 /// Snapshot of the active drainer state. Re-exported from fasten-core.
 pub use fasten_core::drainer::QueueStats;
 
@@ -31,10 +28,10 @@ pub struct AuditStoreError {
 }
 
 /// Block until pending audit rows drain (or `timeout` elapses).
-/// No-op + returns `true` in `raise` mode.
+/// Returns `true` at once when no drainer is installed.
 pub fn flush(timeout: std::time::Duration) -> bool { DEFAULT.flush(timeout) }
 
-/// Snapshot of the active drainer, or `None` in `raise` mode.
+/// Snapshot of the active drainer, or `None` when none is installed.
 pub fn queue_stats() -> Option<QueueStats> { DEFAULT.queue_stats() }
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
@@ -110,10 +107,8 @@ pub const REDACT_PATTERNS: &[&str] = &[
 ];
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
-// --- Defaults for codegen enums ------------------------------------------
-//
-// Codegen output has no Default derives; impl them here so Meta { ..Default::default() }
-// works for adopters who only set a few fields. Sensible defaults: INFO + MEDIUM.
+// The generated enums have no Default derive; these let callers write
+// `Meta { ..Default::default() }`.
 
 #[allow(clippy::derivable_impls)]
 impl Default for Severity {
@@ -125,13 +120,8 @@ impl Default for RetentionClass {
     fn default() -> Self { RetentionClass::Medium }
 }
 
-// --- Domain --------------------------------------------------------------
-//
-// Plain string — adopters define their own vocabulary (e.g. "user",
-// "billing", "node"). Matches Python / JS / C++ adapters; no built-in enum.
+// A plain string; each service defines its own domains ("user", "billing").
 pub type Domain = String;
-
-// --- 6 audit anchors as typed row ----------------------------------------
 
 /// Classical audit dimensions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -145,7 +135,7 @@ pub enum Anchor {
     Correlation, // request_id
 }
 
-/// Canonical audit row — wire shape matches spec/row-schema.json.
+/// Audit row; the wire shape is spec/row-schema.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub wire_version: String,
@@ -184,13 +174,10 @@ pub struct Row {
     pub shipped_at: Option<DateTime<Utc>>,
 }
 
-// --- Code catalog --------------------------------------------------------
-
 /// Per-code metadata.
 ///
-/// `id` is optional in adopter code — `register()` fills it from the
-/// tuple key. Setting `id` explicitly is allowed but must match the
-/// key (mismatch is a typo, never a feature).
+/// `id` may be left empty; `register()` fills it from the key. If set, it
+/// must match the key.
 #[derive(Debug, Clone, Default)]
 pub struct Meta {
     pub id: String,
@@ -245,12 +232,9 @@ pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
 
 /// Register a batch of codes for a domain.
 ///
-/// Validation (key shape, id-match, domain-match, pii_in_detail forcing) is
-/// delegated to a fresh `fasten_core::catalog::CodeRegistry` so the
-/// rules stay in one place.  The validated codes are then committed to the
-/// SDK's own typed registry.
-///
-/// Drop `Meta.id` in new code; the tuple key is the single source of truth.
+/// The codes are validated by a fresh `fasten_core::catalog::CodeRegistry`
+/// so the rules live in one place, then added to this SDK's registry.
+/// Nothing is added if any code fails.
 pub fn register<I>(domain: Domain, codes: I) -> Result<(), Error>
 where
     I: IntoIterator<Item = (String, Meta)>,
@@ -258,13 +242,12 @@ where
     use fasten_core::catalog::CodeRegistry as CoreReg;
     let codes: Vec<(String, Meta)> = codes.into_iter().collect();
 
-    // Validate via a throw-away fasten-core registry — handles all rules
-    // without touching the global singleton (safe to call from tests).
+    // A throw-away registry, so the global one in fasten-core is untouched.
     let core_map: HashMap<String, fasten_core::catalog::Meta> =
         codes.iter().map(|(id, m)| (id.clone(), to_core_meta(m))).collect();
     CoreReg::new().register(&domain, core_map).map_err(map_core_catalog_err)?;
 
-    // Cross-batch duplicate check against the already-registered SDK codes.
+    // Reject codes registered by earlier calls.
     let mut guard = registry().write().expect("registry poisoned");
     for (id, _) in &codes {
         if guard.contains_key(id.as_str()) {
@@ -272,7 +255,6 @@ where
         }
     }
 
-    // Commit with filled/normalised fields.
     for (id, mut meta) in codes {
         if meta.id.is_empty() { meta.id = id.clone(); }
         if meta.pii_in_detail && meta.retention_class != RetentionClass::Short {
@@ -321,7 +303,8 @@ pub fn meta_of(code: &str) -> Option<Meta> {
     registry().read().expect("registry poisoned").get(code).cloned()
 }
 
-/// Dump `id,domain,severity` sorted one-per-line — feeds cross-language gate.
+/// `id,domain,severity`, sorted, one per line. Used by the cross-language
+/// consistency check.
 pub fn dump() -> String {
     let guard = registry().read().expect("registry poisoned");
     // Sort by stringified severity so we don't need Ord on the codegen enum.
@@ -336,25 +319,16 @@ pub fn dump() -> String {
         .join("\n")
 }
 
-// --- Correlation context -------------------------------------------------
-//
-// Thread-local for sync + same-task async use.
-//
-// ⚠️  ASYNC FOOTGUN: `with_request_id` uses a `thread_local!` which does NOT
-// propagate across `tokio::spawn` task boundaries. Code like this silently
-// loses the correlation id:
+// The request id is thread-local, so it does not follow `tokio::spawn`:
 //
 //     with_request_id("abc".into(), || {
 //         tokio::spawn(async move {
-//             // current_request_id() returns None here — wrong thread-local slot
-//             fasten::emit().submit().unwrap();
+//             // current_request_id() is None here
+//             fasten::EmitBuilder::new("CODE", "target").submit().unwrap();
 //         });
 //     });
 //
-// Workaround: capture the id before spawn and call `with_request_id` again
-// inside the spawned task, or pass it explicitly via the builder (.detail).
-// Cross-task propagation via `tokio::task_local!` is tracked for a future
-// "async" feature flag.
+// Read the id before spawning and call `with_request_id` again inside the task.
 
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -383,11 +357,9 @@ where
     out
 }
 
-// --- Built-in structured log (sys stream) --------------------------------
-//
-// Adopters get NDJSON sys lines without bringing `tracing` or `log`.
-// Auto-stamps request_id from current_request_id() and service_id from
-// the active config. Falls back to bare line if init() not yet called.
+// NDJSON sys lines on stdout without needing `tracing` or `log`. Each line
+// gets request_id from current_request_id() and service_id from the config
+// (empty before init()).
 
 pub mod log {
     use serde::Serialize;
@@ -409,8 +381,6 @@ pub mod log {
     }
 }
 
-// --- Redaction -----------------------------------------------------------
-
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
@@ -418,8 +388,8 @@ fn redact_detail(
 ) -> HashMap<String, serde_json::Value> {
     use fasten_core::redact::{Redactor, REDACTOR};
     let v = serde_json::Value::Object(detail.into_iter().collect());
-    // "" → Redactor falls back to the built-in "***". Use a custom Redactor
-    // when extra keys OR a custom replacement is set, else the shared default.
+    // An empty replacement means the built-in "***". Build a custom Redactor
+    // only when there are extra keys or a custom replacement.
     let repl = replacement.unwrap_or("");
     let has_extra = extra.is_some_and(|k| !k.is_empty());
     let redacted = if has_extra || !repl.is_empty() {
@@ -436,8 +406,6 @@ fn redact_detail(
     }
 }
 
-// --- Init + Emit ---------------------------------------------------------
-
 /// Adopter-supplied store. Sync trait so the core compiles without tokio.
 pub trait AuditStore: Send + Sync {
     fn insert(&self, row: &Row) -> Result<(), Error>;
@@ -449,13 +417,12 @@ pub struct Config {
     pub node_id: String,
     pub tenant_id: Option<String>,
     pub extra_redact_keys: Option<Vec<String>>,
-    /// Custom redaction replacement token (None → the built-in "***"). Also
-    /// read from FASTEN_REDACT_REPLACEMENT by `config_from_env`.
+    /// Custom redaction replacement token (None means the built-in "***").
+    /// `config_from_env` reads it from FASTEN_REDACT_REPLACEMENT.
     pub redact_replacement: Option<String>,
-    /// P1-15: durable audit store. When set together with
-    /// `audit_store_failure_strategy = "queue"`, `EmitBuilder::submit()`
-    /// pushes rows onto a bounded in-memory queue drained in the
-    /// background.
+    /// Durable audit store. With `audit_store_failure_strategy = "queue"`,
+    /// `EmitBuilder::submit()` puts rows on a bounded in-memory queue that is
+    /// drained in the background.
     pub audit_store: Option<Arc<dyn AuditStore>>,
     /// "queue" (default) or "raise". `raise` makes `submit()` call
     /// `insert` synchronously and wrap errors in `AuditStoreError`.
@@ -467,7 +434,7 @@ pub struct Config {
     pub queue_retry_initial: Option<Duration>,
     /// Cap on retry delay. Default: 60 s.
     pub queue_retry_max: Option<Duration>,
-    /// Disable ±20 % jitter (default: jitter ON).
+    /// Disable the +/-20% retry jitter (on by default).
     pub disable_queue_jitter: bool,
     /// Max insert attempts before a row is dead-lettered. Default: 50.
     pub queue_drain_max_attempts: Option<usize>,
@@ -501,9 +468,9 @@ pub fn config_from_env() -> Result<Config, Error> {
 
 /// Initialise fasten with a Config. Required before `emit()`.
 ///
-/// When `cfg.audit_store` is provided and `cfg.audit_store_failure_strategy`
-/// is `"queue"` (default), this installs the shared fasten-core background
-/// drainer thread (see `fasten_core::drainer` for the full P1-15 contract).
+/// When `cfg.audit_store` is set and the strategy is `"queue"` (the
+/// default), this starts the fasten-core drainer thread (see
+/// `fasten_core::drainer`).
 pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
 
 /// Fluent-style Emit builder. Caller supplies `code`, `target`, optional
@@ -552,27 +519,21 @@ impl EmitBuilder {
         self
     }
 
-    /// Submit using the init-time globals (P1-15). In `queue` mode the
-    /// row goes to the in-process drainer; in `raise` mode it's
-    /// inserted synchronously and any error is wrapped in
-    /// [`AuditStoreError`].
+    /// Build the row and send it to the configured store. In `queue` mode
+    /// it goes to the drainer; in `raise` mode it is inserted synchronously
+    /// and errors are wrapped in [`AuditStoreError`].
     ///
-    /// Mirrors the row to stdout (`{"shape":"audit",...}`) regardless
-    /// of mode so adopters always see the audit on the log stream.
+    /// The row is also written to stdout (`{"shape":"audit",...}`) in
+    /// either mode.
     pub fn submit(self) -> Result<Row, AuditStoreError> {
         let cfg = DEFAULT.current_config().map_err(|e| AuditStoreError { source: e })?;
         let row = self
             .build_row(&cfg)
             .map_err(|e| AuditStoreError { source: e })?;
 
-        // Stdout write happens BEFORE any store routing. Two reasons:
-        //   1. Under sustained queue-full outage, drainer.put() blocks
-        //      on the slot semaphore. If stdout came after, even
-        //      Docker / journald log capture stalls — adopters lose the
-        //      recoverable audit trail at the worst possible moment.
-        //   2. In raise mode, the row should still reach stdout even
-        //      if the sync insert errors — preserves the "stdout is
-        //      always honest" contract.
+        // Write stdout first: enqueue() blocks while the queue is full, and
+        // in raise mode the insert may fail. Either way the row should
+        // still reach the log stream.
         Self::write_audit_stdout(&row);
 
         let strategy = cfg
@@ -584,8 +545,8 @@ impl EmitBuilder {
                 let core_row = crate::engine::sdk_row_to_core(&row);
                 d.enqueue(core_row);
             } else if let Some(s) = cfg.audit_store.as_ref() {
-                // Defensive fallback — strategy says queue but drainer
-                // isn't installed. Sync insert so the row isn't dropped.
+                // No drainer installed; insert synchronously rather than
+                // drop the row.
                 if let Err(e) = s.insert(&row) {
                     return Err(AuditStoreError { source: e });
                 }
@@ -663,8 +624,6 @@ impl EmitBuilder {
 
 }
 
-// --- Query filter --------------------------------------------------------
-
 /// Query filter for reader implementations.
 #[derive(Debug, Default, Clone)]
 pub struct Filter {
@@ -717,16 +676,16 @@ mod tests {
     #[test]
     fn redact_custom_replacement_and_extra_keys() {
         let mut d = HashMap::new();
-        d.insert("password".into(), serde_json::json!("p")); // built-in key
-        d.insert("badge".into(), serde_json::json!("b"));    // extra key
+        d.insert("password".into(), serde_json::json!("p"));
+        d.insert("badge".into(), serde_json::json!("b"));
         d.insert("ok".into(), serde_json::json!("v"));
         let extra = vec!["badge".to_string()];
         let out = redact_detail(d, Some(&extra), Some("[X]"));
-        assert_eq!(out["password"], serde_json::json!("[X]")); // built-in, custom token
-        assert_eq!(out["badge"], serde_json::json!("[X]"));    // extra key
+        assert_eq!(out["password"], serde_json::json!("[X]"));
+        assert_eq!(out["badge"], serde_json::json!("[X]"));
         assert_eq!(out["ok"], serde_json::json!("v"));
 
-        // custom replacement alone (no extra keys) still redacts built-ins
+        // A custom replacement without extra keys.
         let mut d2 = HashMap::new();
         d2.insert("secret".into(), serde_json::json!("s"));
         d2.insert("ok".into(), serde_json::json!("v"));
@@ -745,15 +704,14 @@ mod tests {
         assert!(dump.contains("CODE_A,test_dom,info"));
     }
 
-    // P1-10: id is filled from the key when omitted.
     #[test]
     fn register_fills_id_from_key() {
         register(
-            "p1_10".into(),
+            "fill_id".into(),
             [(
-                "P1_10_FILLED".into(),
+                "FILLED_FROM_KEY".into(),
                 Meta {
-                    domain: "p1_10".into(),
+                    domain: "fill_id".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -764,20 +722,19 @@ mod tests {
             )],
         )
         .unwrap();
-        let m = meta_of("P1_10_FILLED").unwrap();
-        assert_eq!(m.id, "P1_10_FILLED");
+        let m = meta_of("FILLED_FROM_KEY").unwrap();
+        assert_eq!(m.id, "FILLED_FROM_KEY");
     }
 
-    // P1-10: explicit id that disagrees with the key raises IdMismatch.
     #[test]
     fn register_id_mismatch_raises() {
         let result = register(
-            "p1_10b".into(),
+            "id_mismatch".into(),
             [(
-                "P1_10_MISMATCH".into(),
+                "ID_MISMATCH_KEY".into(),
                 Meta {
                     id: "WRONG_ID".into(),
-                    domain: "p1_10b".into(),
+                    domain: "id_mismatch".into(),
                     severity: Severity::Info,
                     ..Default::default()
                 },
@@ -785,22 +742,21 @@ mod tests {
         );
         match result {
             Err(Error::IdMismatch { key, got }) => {
-                assert_eq!(key, "P1_10_MISMATCH");
+                assert_eq!(key, "ID_MISMATCH_KEY");
                 assert_eq!(got, "WRONG_ID");
             }
             other => panic!("expected IdMismatch, got {:?}", other),
         }
     }
 
-    // P1-10: lowercase / invalid key shape raises InvalidKey.
     #[test]
     fn register_invalid_key_shape_raises() {
         let result = register(
-            "p1_10c".into(),
+            "bad_key".into(),
             [(
                 "lowercase_bad".into(),
                 Meta {
-                    domain: "p1_10c".into(),
+                    domain: "bad_key".into(),
                     severity: Severity::Info,
                     ..Default::default()
                 },
@@ -812,17 +768,14 @@ mod tests {
         }
     }
 
-    // ── P1-5: pii_in_detail enforcement ───────────────────────────────────
-
-    // #1 register() forces RetentionClass::Short for PII codes.
     #[test]
-    fn p1_5_register_forces_short() {
+    fn pii_register_forces_short() {
         register(
-            "p1_5_force".into(),
+            "pii_force".into(),
             [(
-                "P1_5_PII_FORCE_SHORT".into(),
+                "PII_FORCE_SHORT".into(),
                 Meta {
-                    domain: "p1_5_force".into(),
+                    domain: "pii_force".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -835,19 +788,18 @@ mod tests {
             )],
         )
         .expect("register");
-        let m = meta_of("P1_5_PII_FORCE_SHORT").expect("meta");
+        let m = meta_of("PII_FORCE_SHORT").expect("meta");
         assert_eq!(m.retention_class, RetentionClass::Short);
     }
 
-    // Non-PII code keeps adopter-set retention.
     #[test]
-    fn p1_5_non_pii_keeps_retention() {
+    fn non_pii_keeps_retention() {
         register(
-            "p1_5_nonpii".into(),
+            "nonpii".into(),
             [(
-                "P1_5_NON_PII_LONG".into(),
+                "NON_PII_LONG".into(),
                 Meta {
-                    domain: "p1_5_nonpii".into(),
+                    domain: "nonpii".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -861,20 +813,20 @@ mod tests {
         )
         .expect("register");
         assert_eq!(
-            meta_of("P1_5_NON_PII_LONG").unwrap().retention_class,
+            meta_of("NON_PII_LONG").unwrap().retention_class,
             RetentionClass::Long
         );
     }
 
-    // #2 emit() force-redacts whole detail; passthrough keys survive.
+    // A PII code's detail is dropped except passthrough keys.
     #[test]
-    fn p1_5_emit_force_redacts_with_passthrough() {
+    fn pii_emit_keeps_only_passthrough() {
         register(
-            "p1_5_emit".into(),
+            "pii_emit".into(),
             [(
-                "P1_5_PII_PARTIAL".into(),
+                "PII_PARTIAL".into(),
                 Meta {
-                    domain: "p1_5_emit".into(),
+                    domain: "pii_emit".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -900,35 +852,31 @@ mod tests {
         detail.insert("region".into(), serde_json::json!("MH"));
         detail.insert("api_key".into(), serde_json::json!("sk-secret"));
 
-        let row = EmitBuilder::new("P1_5_PII_PARTIAL", "u-42")
+        let row = EmitBuilder::new("PII_PARTIAL", "u-42")
             .detail(detail)
             .submit()
             .expect("emit");
 
-        // PII flag mirrored on the row.
         assert!(row.pii_in_detail, "row.pii_in_detail must be true for PII codes");
-        // Passthrough survives.
         assert_eq!(row.detail.get("region"), Some(&serde_json::json!("MH")));
-        // Non-passthrough stripped.
         assert!(!row.detail.contains_key("city"), "city must not survive force-redact");
         assert!(
             !row.detail.contains_key("api_key"),
-            "api_key not in passthrough — must not survive"
+            "api_key is not a passthrough key"
         );
-        // Markers present.
         assert_eq!(row.detail.get("_redacted"), Some(&serde_json::json!("***")));
         assert_eq!(row.detail.get("_pii_in_detail"), Some(&serde_json::json!(true)));
     }
 
-    // #2 passthrough that names a secret key is still redacted by the secret-key scrubber.
+    // A passthrough key that looks like a secret is still redacted.
     #[test]
-    fn p1_5_passthrough_secret_still_redacted() {
+    fn pii_passthrough_secret_still_redacted() {
         register(
-            "p1_5_pthsec".into(),
+            "pii_pthsec".into(),
             [(
-                "P1_5_PII_PASSTHROUGH_SECRET".into(),
+                "PII_PASSTHROUGH_SECRET".into(),
                 Meta {
-                    domain: "p1_5_pthsec".into(),
+                    domain: "pii_pthsec".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -951,22 +899,21 @@ mod tests {
         let mut detail: HashMap<String, serde_json::Value> = HashMap::new();
         detail.insert("api_key".into(), serde_json::json!("sk-secret"));
 
-        let row = EmitBuilder::new("P1_5_PII_PASSTHROUGH_SECRET", "u-42")
+        let row = EmitBuilder::new("PII_PASSTHROUGH_SECRET", "u-42")
             .detail(detail)
             .submit()
             .expect("emit");
         assert_eq!(row.detail.get("api_key"), Some(&serde_json::json!("***")));
     }
 
-    // Non-PII code keeps detail; only secret keys get redacted.
     #[test]
-    fn p1_5_non_pii_keeps_detail() {
+    fn non_pii_keeps_detail() {
         register(
-            "p1_5_nonpii_detail".into(),
+            "nonpii_detail".into(),
             [(
-                "P1_5_NON_PII_BASIC".into(),
+                "NON_PII_BASIC".into(),
                 Meta {
-                    domain: "p1_5_nonpii_detail".into(),
+                    domain: "nonpii_detail".into(),
                     category: "x".into(),
                     action: "x".into(),
                     severity: Severity::Info,
@@ -989,7 +936,7 @@ mod tests {
         detail.insert("city".into(), serde_json::json!("Mumbai"));
         detail.insert("api_key".into(), serde_json::json!("sk-secret"));
 
-        let row = EmitBuilder::new("P1_5_NON_PII_BASIC", "u-42")
+        let row = EmitBuilder::new("NON_PII_BASIC", "u-42")
             .detail(detail)
             .submit()
             .expect("emit");
@@ -1006,10 +953,7 @@ pub mod postgres_store;
 #[cfg(feature = "store-postgres")]
 pub use postgres_store::PostgresStore;
 
-// ── Catalog yaml (P1-11) ─────────────────────────────────────────────────
-//
-// Optional feature, gated behind the `codes-yaml` cargo feature so adopters
-// who stay on programmatic register() never pull in serde_yaml.
+// Yaml catalogs, behind the `codes-yaml` feature:
 //
 //   fasten = { version = "1", features = ["codes-yaml"] }
 //   fasten::codes::load("fleet.codes.yaml")?;

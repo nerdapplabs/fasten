@@ -1,4 +1,4 @@
-//! C ABI — redaction functions.
+//! C ABI: redaction functions.
 
 use std::os::raw::c_char;
 
@@ -13,10 +13,10 @@ use crate::{
 
 /// Redact a JSON value using the global default key-pattern + value-shape rules.
 ///
-/// `in_json`   — UTF-8 JSON string (object, array, or scalar).
-/// `out_json`  — set to a heap-allocated UTF-8 JSON string on success.
+/// `in_json`:    UTF-8 JSON string (object, array, or scalar).
+/// `out_json`:   set to a heap-allocated UTF-8 JSON string on success.
 ///               Free with `fasten_store_free_str`. May be NULL if unneeded.
-/// `out_err`   — set on error; may be NULL.
+/// `out_err`:    set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -40,8 +40,6 @@ pub unsafe extern "C" fn fasten_redact(
         }
     }
 }
-
-// ── Buffer-based variants (no heap allocation) ────────────────────────────────
 
 /// Buffer-based variant of `fasten_redact`.
 ///
@@ -70,9 +68,9 @@ pub unsafe extern "C" fn fasten_redact_buf(
 
 /// Buffer-based variant of `fasten_redact_full`.
 ///
-/// `extra_keys_json`           — JSON array of key strings (e.g. `"[]"`), never NULL.
-/// `replacement`               — replacement token; empty string → use default `"***"`.
-/// `extra_value_patterns_json` — JSON array of pattern objects (e.g. `"[]"`), never NULL.
+/// `extra_keys_json`:            JSON array of key strings (e.g. `"[]"`), never NULL.
+/// `replacement`:                replacement token; empty string means the default `"***"`.
+/// `extra_value_patterns_json`:  JSON array of pattern objects (e.g. `"[]"`), never NULL.
 ///
 /// Returns bytes written (exclusive of NUL) on success.
 /// Returns `-(FastenErrorCode as i32)` on error.
@@ -116,8 +114,6 @@ pub unsafe extern "C" fn fasten_redact_full_buf(
     }
 }
 
-// ── Custom-pattern redaction ──────────────────────────────────────────────────
-
 /// JSON shape for an extra value-shape pattern passed to `fasten_redact_full`.
 #[derive(Deserialize)]
 struct ExtraValuePattern {
@@ -128,17 +124,17 @@ struct ExtraValuePattern {
 /// Redact a JSON value with fully-custom key patterns, replacement token, and
 /// extra value-shape patterns.
 ///
-/// `in_json`                   — UTF-8 JSON string.
-/// `extra_keys_json`           — nullable: JSON array of plain key strings.
+/// `in_json`:                    UTF-8 JSON string.
+/// `extra_keys_json`:            nullable: JSON array of plain key strings.
 ///                               NULL = no extra key patterns.
-/// `replacement`               — nullable: replacement token for key-pattern hits.
+/// `replacement`:                nullable: replacement token for key-pattern hits.
 ///                               NULL = use default `"***"`.
-/// `extra_value_patterns_json` — nullable: JSON array of objects:
+/// `extra_value_patterns_json`:  nullable: JSON array of objects:
 ///                               `[{"pattern":"<regex>","replacement":"***X***"},...]`
 ///                               Appended after built-in value patterns. NULL = none.
-/// `out_json`                  — set to heap-allocated redacted JSON on success.
+/// `out_json`:                   set to heap-allocated redacted JSON on success.
 ///                               Free with `fasten_store_free_str`. May be NULL.
-/// `out_err`                   — set on error; may be NULL.
+/// `out_err`:                    set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]

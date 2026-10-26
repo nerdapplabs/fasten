@@ -1,8 +1,5 @@
-//! Drainer conformance tests (spec/drainer-conformance.md §7).
-//!
-//! These are the CANONICAL tests for the shared drainer state machine.
-//! Per-SDK tests for drainer behaviour are deleted; this suite runs via
-//! `cargo test` in fasten-core and covers all 12 state transitions.
+//! Drainer conformance tests (spec/drainer-conformance.md §7) for the
+//! shared drainer that the SDKs use through the C ABI.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,8 +9,6 @@ use fasten_core::drainer::{Drainer, DrainerConfig};
 use fasten_core::error::Error;
 use fasten_core::row::Row;
 use fasten_core::store::{Filter, Store};
-
-// ── Stub stores ───────────────────────────────────────────────────────────────
 
 #[derive(Default, Clone)]
 struct RecordingStore {
@@ -87,8 +82,6 @@ impl Store for FlakyStore {
     fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
 }
 
-// ── Helper: minimal Row ─────────────────────────────────────────────��─────────
-
 fn make_row(id: &str) -> Row {
     serde_json::from_value(serde_json::json!({
         "id": id,
@@ -122,8 +115,6 @@ fn fast_cfg() -> DrainerConfig {
         max_attempts: 50,
     }
 }
-
-// ── §1 happy path ─────────────────────────────────────────────────────────────
 
 #[test]
 fn happy_path_drains_within_one_second() {
@@ -163,8 +154,6 @@ fn emit_returns_immediately_under_slow_store() {
     assert!(d.flush(Duration::from_secs(5)));
 }
 
-// ── §3 outage + recovery ──────────────────────────────────────────────────────
-
 #[test]
 fn outage_then_recovery_drains_pending() {
     let store = FlakyStore::new(2);
@@ -182,13 +171,11 @@ fn outage_then_recovery_drains_pending() {
     assert!(*atts.lock().unwrap() >= 3);
 }
 
-// ── §4 queue full blocks ──────────────────────────────────────────────────────
-
 #[test]
 fn queue_full_blocks_emit_does_not_drop() {
     let d = Arc::new(Drainer::new(Box::new(BrokenStore), DrainerConfig {
         capacity: 2,
-        retry_initial: Duration::from_secs(10), // never retries in test duration
+        retry_initial: Duration::from_secs(10), // no retry within the test
         retry_max: Duration::from_secs(60),
         retry_jitter: false,
         max_attempts: 50,
@@ -212,13 +199,10 @@ fn queue_full_blocks_emit_does_not_drop() {
     assert!(*blocked.lock().unwrap(), "thread should have started");
     assert!(!*finished.lock().unwrap(), "third enqueue must be blocking");
 
-    // Stopping the drainer frees capacity → unblocks the thread
+    // stop() releases every slot, so the blocked enqueue returns (false).
     d.stop(Duration::from_secs(1));
     thread::sleep(Duration::from_millis(500));
-    // The thread unblocks (enqueue returns false due to stopped drainer)
 }
-
-// ── §5 queue_stats ────────────────────────────────────────────────────────────
 
 #[test]
 fn queue_stats_fields_populated() {
@@ -259,8 +243,6 @@ fn stats_high_water_monotonic() {
     assert!(s2["high_water"].as_u64().unwrap() >= hw1, "high_water must be monotonic");
 }
 
-// ── §6 flush returns false on timeout ─────────────────────────────────────────
-
 #[test]
 fn flush_returns_false_on_timeout() {
     let d = Drainer::new(Box::new(BrokenStore), DrainerConfig {
@@ -273,8 +255,6 @@ fn flush_returns_false_on_timeout() {
     let result = d.flush(Duration::from_millis(50));
     assert!(!result, "flush must return false when store is down");
 }
-
-// ── §7 dead letter after max_attempts ────────────────────────────────────────
 
 #[test]
 fn dead_letter_after_max_attempts() {
@@ -298,8 +278,6 @@ fn dead_letter_after_max_attempts() {
         thread::sleep(Duration::from_millis(10));
     }
 }
-
-// ── §8 flush targets rows at call time (REVIEW #14) ──────────────────────────
 
 #[test]
 fn flush_targets_rows_at_call_time_not_later_emits() {
@@ -337,15 +315,13 @@ fn flush_targets_rows_at_call_time_not_later_emits() {
         }
     });
 
-    // flush() should return within a reasonable time even under concurrent emits.
+    // Concurrent enqueues must not keep flush() waiting.
     assert!(d.flush(Duration::from_secs(3)), "flush must complete for rows at call time");
     *stop_bg.lock().unwrap() = true;
 }
 
-// ── §9a audit_drain_recovered state transition ────────────────────────────────
-// Verifies the stats reset that accompanies the audit_drain_recovered sys event.
-// The event itself is written to stderr; this test confirms the state machine
-// transition: retry_count_active → 0 and last_error → null after recovery.
+// The audit_drain_recovered event goes to stderr; this checks the stats
+// reset that comes with it.
 
 #[test]
 fn recovery_resets_retry_stats() {
@@ -364,8 +340,6 @@ fn recovery_resets_retry_stats() {
     assert!(stats["last_error"].is_null(), "last_error must clear after recovery");
     assert_eq!(stats["drained_total"], 1);
 }
-
-// ── §9b panicking store does not kill the drainer thread ─────────────────────
 
 #[test]
 fn panicking_store_dead_letters_and_continues() {
@@ -409,7 +383,7 @@ fn panicking_store_dead_letters_and_continues() {
         ..DrainerConfig::default()
     });
 
-    // First row panics → dead-lettered; second row succeeds → drainer still alive.
+    // The first row panics and is dead-lettered; the second still drains.
     d.enqueue(make_row("r-panic"));
     d.enqueue(make_row("r-ok"));
     assert!(d.flush(Duration::from_secs(5)));
@@ -419,8 +393,6 @@ fn panicking_store_dead_letters_and_continues() {
     assert_eq!(rows_ref.lock().unwrap().len(), 1, "second row must drain normally");
     assert_eq!(stats["depth"], 0, "queue must be empty after flush");
 }
-
-// ── §9 backoff jitter does not panic ─────────────────────────────────────────
 
 #[test]
 fn backoff_jitter_does_not_panic_and_drains() {

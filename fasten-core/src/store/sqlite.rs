@@ -11,8 +11,6 @@ use crate::{
 
 use super::Store;
 
-// ── SqliteStore ───────────────────────────────────────────────────────────────
-
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     table: String,
@@ -30,7 +28,8 @@ impl SqliteStore {
     /// audit table + indexes.
     ///
     /// `path` may be a filesystem path or `":memory:"`.
-    /// `table` must match `[A-Za-z_][A-Za-z0-9_]*` — no schema prefix.
+    /// `table` must match `[A-Za-z_][A-Za-z0-9_]*`; a schema prefix is not
+    /// supported here.
     /// `wal`  enables WAL journal mode (ignored for `:memory:` databases).
     pub fn open(path: &str, table: &str, wal: bool) -> Result<Self, Error> {
         validate_table_name(table)?;
@@ -110,7 +109,7 @@ impl Store for SqliteStore {
             row.severity,
             row.service_id,
             row.source_node_id,
-            row.tenant_id,      // Option<String> → NULL when None
+            row.tenant_id,      // None is stored as NULL
             row.actor,
             row.actor_kind,
             row.target,
@@ -120,7 +119,7 @@ impl Store for SqliteStore {
             row.request_id,
             detail_str,
             pii,
-            row.shipped_at,     // Option<String> → NULL when None
+            row.shipped_at,     // None is stored as NULL
         ])?;
 
         Ok(())
@@ -134,7 +133,7 @@ impl Store for SqliteStore {
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
         let (where_clause, params_owned) = build_filter_where(filter);
-        // LIMIT / OFFSET are integers, interpolated directly — no injection risk.
+        // LIMIT and OFFSET are integers, so interpolating them is safe.
         let mut sql = format!(
             "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
              code,action,severity,service_id,source_node_id,tenant_id,\
@@ -174,7 +173,7 @@ impl Store for SqliteStore {
     }
 
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
-        // Always emit LIMIT; use i64::MAX when the caller passes 0.
+        // limit 0 means all rows; i64::MAX keeps the statement cacheable.
         let effective: i64 = if limit == 0 {
             i64::MAX
         } else {
@@ -253,8 +252,6 @@ impl Store for SqliteStore {
     }
 }
 
-// ── SQL helpers ───────────────────────────────────────────────────────────────
-
 fn build_insert_sql(table: &str) -> String {
     format!(
         "INSERT OR IGNORE INTO {table} \
@@ -305,8 +302,6 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     (clause, params)
 }
 
-// ── Row mapper ────────────────────────────────────────────────────────────────
-
 /// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.
 fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let detail_str: String = r.get(18)?;
@@ -338,8 +333,6 @@ fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         ..Default::default()
     })
 }
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -385,7 +378,7 @@ mod tests {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let row = make_row("evt-idem-001", "TEST");
         store.insert(&row).unwrap();
-        store.insert(&row).unwrap(); // INSERT OR IGNORE — no error
+        store.insert(&row).unwrap(); // INSERT OR IGNORE, no error
     }
 
     #[test]

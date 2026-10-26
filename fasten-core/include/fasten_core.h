@@ -1,5 +1,5 @@
 /**
- * fasten_core.h — C ABI for the shared fasten audit-store + drainer library.
+ * fasten_core.h: C ABI for the shared fasten audit store and drainer.
  *
  * Supported platforms
  * -------------------
@@ -9,8 +9,8 @@
  *
  * Backends
  * --------
- * "sqlite"   — SQLite 3 (bundled; no system dep required)
- * "postgres" — PostgreSQL 15+ via pure-Rust wire protocol (no libpq)
+ * "sqlite"     SQLite 3 (bundled; no system dependency)
+ * "postgres"   PostgreSQL 15+ via a pure-Rust wire protocol client (no libpq)
  *
  * Ownership rules
  * ---------------
@@ -20,7 +20,8 @@
  *    *out_rows_json, are heap-allocated by the library.  The caller must free
  *    them with fasten_store_free_str().
  * 3. The library never retains pointers passed by the caller after the
- *    function returns.
+ *    function returns, except the callback and userdata given to
+ *    fasten_store_from_callback().
  *
  * Thread safety
  * -------------
@@ -37,7 +38,7 @@
 extern "C" {
 #endif
 
-/* ── Opaque handle ─────────────────────────────────────────────────────────── */
+/* Opaque handle */
 
 /**
  * Opaque audit-store handle. Do not inspect or allocate directly.
@@ -45,7 +46,7 @@ extern "C" {
  */
 typedef struct FastenStore FastenStore;
 
-/* ── Error codes ───────────────────────────────────────────────────────────── */
+/* Error codes */
 
 /**
  * Typed return codes from all fasten_store_* functions (except open/close/
@@ -67,7 +68,7 @@ typedef enum {
     FASTEN_ERR_UNKNOWN   = 99   /**< Internal panic or unexpected error.        */
 } FastenErrorCode;
 
-/* ── Lifecycle ─────────────────────────────────────────────────────────────── */
+/* Lifecycle */
 
 /**
  * Open an audit store.
@@ -103,13 +104,12 @@ FastenStore* fasten_store_open(
  */
 void fasten_store_close(FastenStore* store);
 
-/* ── Write path ────────────────────────────────────────────────────────────── */
+/* Write path */
 
 /**
  * Insert a single audit row.
  *
- * Duplicate rows (same `id`) are silently ignored — the operation is
- * idempotent.
+ * A row whose `id` already exists is ignored, so inserts are idempotent.
  *
  * @param store    Non-null handle returned by fasten_store_open().
  * @param row_json UTF-8 JSON object matching the fasten wire schema.
@@ -128,7 +128,7 @@ FastenErrorCode fasten_store_insert(
     char**       out_err
 );
 
-/* ── Health ─────────────────────────────────────────────────────────────────── */
+/* Health */
 
 /**
  * Verify the backend is reachable.
@@ -143,7 +143,7 @@ FastenErrorCode fasten_store_insert(
  */
 FastenErrorCode fasten_store_ping(FastenStore* store, char** out_err);
 
-/* ── Read path ─────────────────────────────────────────────────────────────── */
+/* Read path */
 
 /**
  * Query rows matching an optional JSON filter object.
@@ -151,14 +151,14 @@ FastenErrorCode fasten_store_ping(FastenStore* store, char** out_err);
  * @param store         Non-null handle.
  * @param filter_json   Optional JSON object (may be NULL = match all rows).
  *                      Recognised keys (all optional):
- *                        "request_id"    — exact match
- *                        "code"          — exact match
- *                        "domain"        — exact match
- *                        "source_node_id"— exact match
- *                        "since"         — timestamp >= value (ISO-8601)
- *                        "until"         — timestamp <= value (ISO-8601)
- *                        "limit"         — max rows (0 = no limit)
- *                        "offset"        — skip this many matching rows
+ *                        "request_id"      exact match
+ *                        "code"            exact match
+ *                        "domain"          exact match
+ *                        "source_node_id"  exact match
+ *                        "since"           timestamp >= value (ISO-8601)
+ *                        "until"           timestamp <= value (ISO-8601)
+ *                        "limit"           max rows (0 = no limit)
+ *                        "offset"          skip this many matching rows
  * @param out_rows_json On success: set to a heap-allocated UTF-8 JSON array
  *                      of row objects, ordered by monotonic_seq ASC.
  *                      Free with fasten_store_free_str(). May be NULL.
@@ -263,7 +263,7 @@ FastenErrorCode fasten_store_max_monotonic_seq(
     char**       out_err
 );
 
-/* ── Memory management ─────────────────────────────────────────────────────── */
+/* Memory management */
 
 /**
  * Free a string returned by this library (error strings and JSON output
@@ -273,7 +273,7 @@ FastenErrorCode fasten_store_max_monotonic_seq(
  */
 void fasten_store_free_str(char* s);
 
-/* ── Metadata ──────────────────────────────────────────────────────────────── */
+/* Metadata */
 
 /**
  * Return a NUL-terminated version string (e.g. "0.1.0").
@@ -282,7 +282,7 @@ void fasten_store_free_str(char* s);
  */
 const char* fasten_store_version(void);
 
-/* ── Redaction ─────────────────────────────────────────────────────────────── */
+/* Redaction */
 
 /**
  * Redact a JSON value using the global default key-pattern + value-shape rules.
@@ -334,7 +334,7 @@ FastenErrorCode fasten_redact_full(
     char**      out_err
 );
 
-/* ── Code catalog ──────────────────────────────────────────────────────────── */
+/* Code catalog */
 
 /**
  * Register a batch of audit codes for a domain.
@@ -353,10 +353,10 @@ FastenErrorCode fasten_redact_full(
  * @param out_err    Set on error; may be NULL.
  *
  * Error codes:
- *   FASTEN_ERR_INVALID_KEY    — code key is not UPPER_SNAKE_CASE
- *   FASTEN_ERR_ID_MISMATCH    — Meta.id disagrees with the dict key
- *   FASTEN_ERR_DOMAIN_MISMATCH — Meta.domain disagrees with domain argument
- *   FASTEN_ERR_DUPLICATE_CODE — code was already registered
+ *   FASTEN_ERR_INVALID_KEY      code key is not UPPER_SNAKE_CASE
+ *   FASTEN_ERR_ID_MISMATCH      Meta.id disagrees with the dict key
+ *   FASTEN_ERR_DOMAIN_MISMATCH  Meta.domain disagrees with domain argument
+ *   FASTEN_ERR_DUPLICATE_CODE   code was already registered
  *
  * @return FASTEN_OK on success, error code otherwise (out_err set).
  */
@@ -385,7 +385,7 @@ FastenErrorCode fasten_meta_of(
 
 /**
  * Dump the entire registry as sorted `id,domain,severity` CSV, one code
- * per line.  Identical to the Python `fasten.codes.dump()` output.
+ * per line. Same output as Python's `fasten.codes.dump()`.
  *
  * @param out_csv  On success: heap-allocated UTF-8 CSV string.
  *                 Free with fasten_store_free_str(). May be NULL.
@@ -404,7 +404,7 @@ FastenErrorCode fasten_registry_dump(
  */
 void fasten_registry_clear(void);
 
-/* ── Buffer-based variants (no heap allocation) ───────────────────────────── */
+/* Buffer-based variants (no heap allocation) */
 
 /**
  * Buffer-based variant of fasten_redact.  No heap allocation; the caller
@@ -475,7 +475,7 @@ int32_t fasten_meta_of_buf(
     uint32_t    err_buf_len
 );
 
-/* ── SDK-store callback bridge ─────────────────────────────────────────────── */
+/* SDK-store callback bridge */
 
 /**
  * Callback invoked by the drainer for each row insert.
@@ -500,7 +500,7 @@ FastenStore* fasten_store_from_callback(
     char**                 out_err
 );
 
-/* ── Drainer ───────────────────────────────────────────────────────────────── */
+/* Drainer */
 
 /**
  * Attach a background-drain queue to an existing store handle.
@@ -513,7 +513,7 @@ FastenStore* fasten_store_from_callback(
  * @param capacity         Max queued + in-flight slots (0 = default 100).
  * @param retry_initial_ms First backoff window ms (0 = default 100).
  * @param retry_max_ms     Backoff ceiling ms (0 = default 60 000).
- * @param retry_jitter     Non-zero = apply ±20% uniform jitter.
+ * @param retry_jitter     Non-zero = apply +/-20% uniform jitter.
  * @param max_attempts     Dead-letter threshold (0 = default 50).
  * @param out_err          Set on error; may be NULL.
  *
@@ -589,7 +589,7 @@ FastenErrorCode fasten_drainer_stats_json(
  */
 void fasten_drainer_close(FastenStore* store);
 
-/* ── Additional error codes (catalog) ─────────────────────────────────────── */
+/* Additional error codes (catalog) */
 
 /* These values extend the FastenErrorCode enum defined above. */
 #define FASTEN_ERR_INVALID_KEY     6  /**< Code key not UPPER_SNAKE_CASE.           */
