@@ -111,4 +111,6 @@ jobs:
           fail_ci_if_error: false
 
       - name: Audit (pip-audit)
-        run: pip-audit
+        # Run pip-audit from its own env so it audits the project venv and
+        # not its own dependencies (filelock has no fixed release for 3.10).
+        run: uvx pip-audit@2.10.1 --path .venv/lib/python3*/site-packages
