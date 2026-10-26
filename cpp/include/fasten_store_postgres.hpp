@@ -1,4 +1,4 @@
-// fasten_store_postgres.hpp — header-only PostgreSQL audit store for fasten.hpp
+// fasten_store_postgres.hpp: header-only PostgreSQL audit store for fasten.hpp
 //
 // Requires: libpq (PostgreSQL C client library)
 // CMake:    target_link_libraries(mytarget PRIVATE PostgreSQL::PostgreSQL)
@@ -28,15 +28,14 @@ namespace fasten {
 
 class PostgresStore {
 public:
-    /// Connect to `conninfo`, bootstrap the schema/table/indexes, and
-    /// return a ready-to-use store.
+    /// Connect to `conninfo` and create the schema, table and indexes if
+    /// missing.
     ///
-    /// `conninfo` — libpq connection string or URI
-    ///              (e.g. "host=localhost user=app dbname=audit" or
-    ///               "postgresql://app@localhost/audit").
-    /// `table`    — plain name ("audit_log") or schema-qualified
-    ///              ("audit.audit_log"). Both parts must match
-    ///              [A-Za-z_][A-Za-z0-9_]*.
+    /// `conninfo`: libpq connection string or URI, e.g.
+    ///             "host=localhost user=app dbname=audit" or
+    ///             "postgresql://app@localhost/audit".
+    /// `table`:    "audit_log" or schema-qualified "audit.audit_log". Each
+    ///             part must match [A-Za-z_][A-Za-z0-9_]*.
     explicit PostgresStore(const std::string& conninfo,
                            const std::string& table = "audit_log")
         : table_(table)
@@ -68,13 +67,13 @@ public:
     PostgresStore(const PostgresStore&)            = delete;
     PostgresStore& operator=(const PostgresStore&) = delete;
 
-    /// Insert one audit row. Thread-safe via internal mutex.
+    /// Insert one audit row. Thread-safe.
     void insert(const Row& row) {
         std::string detail_json = detail_::fields_to_json(row.detail);
         std::string mono_str    = std::to_string(row.monotonic_seq);
         const char* pii_str     = row.pii_in_detail ? "1" : "0";
 
-        // nullptr → SQL NULL for nullable columns
+        // nullptr is sent as SQL NULL.
         const char* tenant_ptr  = row.tenant_id.empty()  ? nullptr : row.tenant_id.c_str();
         const char* shipped_ptr = row.shipped_at.empty() ? nullptr : row.shipped_at.c_str();
 
@@ -88,7 +87,7 @@ public:
             row.severity.c_str(),        // $7  severity
             row.service_id.c_str(),      // $8  service_id
             row.source_node_id.c_str(),  // $9  source_node_id
-            tenant_ptr,                  // $10 tenant_id   (nullptr → NULL)
+            tenant_ptr,                  // $10 tenant_id   (nullptr = NULL)
             row.actor.c_str(),           // $11 actor
             row.actor_kind.c_str(),      // $12 actor_kind
             row.target.c_str(),          // $13 target
@@ -98,7 +97,7 @@ public:
             row.request_id.c_str(),      // $17 request_id
             detail_json.c_str(),         // $18 detail
             pii_str,                     // $19 pii_in_detail
-            shipped_ptr,                 // $20 shipped_at  (nullptr → NULL)
+            shipped_ptr,                 // $20 shipped_at  (nullptr = NULL)
         };
 
         const std::string sql =
@@ -117,10 +116,10 @@ public:
             conn_,
             sql.c_str(),
             20,
-            nullptr,   // param types — infer from context
+            nullptr,   // param types: inferred
             params,
-            nullptr,   // param lengths — text mode
-            nullptr,   // param formats — text mode
+            nullptr,   // param lengths: text mode
+            nullptr,   // param formats: text mode
             0          // result format: text
         );
 

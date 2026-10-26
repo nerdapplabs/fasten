@@ -1,5 +1,5 @@
 #pragma once
-// Minimal spdlog stub — provides only the surface fasten/shim/spdlog.hpp uses.
+// Minimal spdlog stub: only what fasten/shim/spdlog.hpp uses.
 #include <mutex>
 #include <string>
 

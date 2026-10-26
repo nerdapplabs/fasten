@@ -1,9 +1,9 @@
 #pragma once
 /**
- * fasten/shim/boost_log.hpp — Boost.Log → fasten syslog bridge.
+ * fasten/shim/boost_log.hpp: copy Boost.Log records into fasten's sys log.
  *
- * Header-only, opt-in. Add the fasten backend to your Boost.Log core
- * and every log record is mirrored into fasten's /logs/sys ring.
+ * Add sink_mt to the Boost.Log core and each record is also redacted and
+ * pushed to the buffer behind query_syslog() and /logs/sys.
  *
  * Usage:
  *   #include "fasten.hpp"
@@ -15,17 +15,13 @@
  *       std::make_shared<fasten::shim::boost_log::sink_mt>()
  *   );
  *
- *   // Existing BOOST_LOG_TRIVIAL calls unchanged:
+ *   // Also lands in fasten's sys log:
  *   BOOST_LOG_TRIVIAL(info) << "user_login user_id=" << uid;
  *
- * Thread safety: sink_mt is multi-threaded (uses a mutex). sink_st is
- * single-threaded for environments where locking is not needed.
+ * A per-thread flag stops the sink from re-entering itself.
  *
- * Recursion guard: a per-thread flag prevents fasten's own internal
- * log writes from re-entering this sink.
- *
- * Requires: Boost.Log (boost >= 1.54). Link with
- *   boost_log boost_log_setup boost_thread boost_system.
+ * Requires Boost.Log 1.54+. Link boost_log, boost_log_setup, boost_thread
+ * and boost_system.
  */
 
 #include <string>
@@ -44,11 +40,8 @@ namespace detail_ {
 static thread_local bool sink_active = false;
 }
 
-/**
- * Backend that pushes records into the fasten syslog ring.
- * frontend (sync_frontend / async_frontend) wraps this backend and
- * provides the thread-safety model.
- */
+// Pushes each record to the sys log buffer. The frontend that wraps it
+// decides the threading model.
 class fasten_backend :
     public boost::log::sinks::basic_formatted_sink_backend<
         char,
@@ -88,7 +81,7 @@ public:
     }
 };
 
-// Convenience type aliases matching the spdlog naming convention.
+// Synchronous frontend around fasten_backend.
 using sink_mt = boost::log::sinks::synchronous_sink<fasten_backend>;
 
 }  // namespace fasten::shim::boost_log

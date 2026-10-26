@@ -1,11 +1,9 @@
 /**
- * Minimal connector example — Modbus TCP stub.
+ * Minimal connector example: a Modbus TCP stub.
  *
- * Build (C++14):
- *   g++ -std=c++14 -I../include connector.cpp -o connector
- *
- * Build (C++17, recommended):
- *   g++ -std=c++17 -I../include connector.cpp -o connector
+ * Build (after building fasten-core):
+ *   g++ -std=c++14 -I../include connector.cpp \
+ *       -L../../fasten-core/target/release -lfasten_core -lpthread -o connector
  *
  * Run:
  *   FASTEN_SERVICE_ID=modbus-tcp FASTEN_NODE_ID=edge-01 ./connector
@@ -14,7 +12,7 @@
 
 #include <cstdio>
 
-// Register codes once at startup — same string constants as Python/Go/JS.
+// Register codes once at startup.
 void register_audit_codes() {
     fasten::register_codes("node", {
         {"CONNECTOR_CONNECTED",    {
@@ -35,22 +33,19 @@ void register_audit_codes() {
 int main() {
     register_audit_codes();
 
-    // Init from env (FASTEN_SERVICE_ID, FASTEN_NODE_ID) or explicit config.
+    // Empty ids fall back to FASTEN_SERVICE_ID / FASTEN_NODE_ID.
     fasten::init("modbus-tcp", "edge-01");
 
-    // Optional: register a persistent audit sink.
-    // Replace with real SQLite/Postgres writes in production.
+    // Optional audit sink, e.g. fasten::SqliteStore::sink(). Set after
+    // init(), so emit() calls it directly rather than through the queue.
     fasten::set_audit_sink([](const fasten::Row& row) {
-        // e.g. write row.to_json() to a SQLite DB here.
         (void)row;
     });
 
-    // ── Connection attempt ──────────────────────────────────────────────────
-
-    // Each logical operation gets its own RequestScope.
-    // All emit/log calls inside inherit the scoped request_id.
+    // One RequestScope per operation; emit() and log calls inside share its
+    // request_id.
     {
-        fasten::RequestScope scope; // mints e.g. "a1b2c3d4e5f6"
+        fasten::RequestScope scope; // new id, e.g. "a1b2c3d4e5f6"
         fasten::log::info("connector_starting",
             {{"protocol", "modbus-tcp"}, {"host", "192.168.1.10"}, {"port", "502"}});
 
@@ -62,8 +57,7 @@ int main() {
         fasten::log::info("poll_loop_started", {{"interval_ms", "1000"}});
     }
 
-    // ── Error scenario ──────────────────────────────────────────────────────
-
+    // Error
     {
         fasten::RequestScope scope;
         fasten::emit("CONNECTOR_ERROR",
@@ -72,8 +66,7 @@ int main() {
             fasten::detail({{"error", "timeout"}, {"register", "40001"}}));
     }
 
-    // ── Disconnect ──────────────────────────────────────────────────────────
-
+    // Disconnect
     {
         fasten::RequestScope scope;
         fasten::emit("CONNECTOR_DISCONNECTED",
@@ -84,17 +77,14 @@ int main() {
         fasten::log::warn("connector_stopped", {{"reason", "timeout"}});
     }
 
-    // ── Scheduled job with scheduler shim ──────────────────────────────────
-
+    // Scheduled job, request id "scheduler-<hex>"
     {
-        // Mints "scheduler-<hex>" id automatically.
         auto scope = fasten::scheduler::job_run();
         fasten::log::info("health_check_job",
             {{"status", "ok"}, {"latency_ms", "3"}});
     }
 
-    // ── Print dump for cross-language consistency gate ──────────────────────
-
+    // Print the registered codes.
     std::printf("\n-- fasten dump --\n%s\n", fasten::dump().c_str());
 
     return 0;

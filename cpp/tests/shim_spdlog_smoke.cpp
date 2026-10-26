@@ -1,8 +1,6 @@
-// P1-12 — spdlog → fasten syslog shim integration test.
-//
-// Compiled against the stub headers in tests/shim_stubs/ so no real spdlog
-// install is required. Tests:
-//   1. Level mapping (debug/info/warn/err/critical → fasten level strings)
+// fasten/shim/spdlog.hpp, built against the stubs in tests/shim_stubs/ so
+// spdlog need not be installed. Covers:
+//   1. Level mapping (debug/info/warn/err/critical to fasten levels)
 //   2. Ring receives correct event + logger fields
 //   3. event value with api_key pattern is redacted
 //   4. Recursion guard (no infinite re-entry)
@@ -111,6 +109,6 @@ int main() {
     test_event_and_logger_fields();
     test_event_redaction();
     test_recursion_guard();
-    std::cout << "\nALL P1-12 spdlog SHIM TESTS PASSED\n";
+    std::cout << "\nALL SPDLOG SHIM TESTS PASSED\n";
     return 0;
 }
