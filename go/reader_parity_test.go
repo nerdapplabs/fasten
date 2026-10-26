@@ -9,9 +9,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// FR5 reader parity: /audit honours actor/target/tenant_id, /topology exists,
-// and /audit/doctor carries the redactor/chain/worker_pid blocks — matching the
-// Python reader.
+// /audit honours actor/target/tenant_id, /topology exists, and /audit/doctor
+// carries the redactor/chain/worker_pid blocks, as in the Python reader.
 
 func initAuditReader(t *testing.T) {
 	t.Helper()
@@ -174,7 +173,7 @@ func (*brokenQueryStore) Query(context.Context, Filter) ([]Row, error) {
 	return nil, errBrokenQuery
 }
 func (*brokenQueryStore) ListUnshipped(context.Context, int) ([]Row, error) { return nil, nil }
-func (*brokenQueryStore) MarkShipped(context.Context, []string) error        { return nil }
+func (*brokenQueryStore) MarkShipped(context.Context, []string) error       { return nil }
 func (*brokenQueryStore) Purge(context.Context, time.Time, bool) (int, error) {
 	return 0, nil
 }

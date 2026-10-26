@@ -5,13 +5,9 @@ import (
 	"strings"
 )
 
-// Query translation — NL / smart-box input to structured chips (§3.7, §6.3).
-//
-// Discovery input is translated into the same primitives the reader already
-// exposes — structured field filters, a correlation request_id, and the bounded
-// free-text q= — so the translator is an interpreter above the reader, not a
-// fourth query surface, and it never invents a filter the store doesn't support
-// (an unknown field:value becomes search text). Mirrors the Python fasten.query.
+// Query translation turns search-box text into the reader's own parameters
+// (field filters, a request_id, and free-text q), spec §3.7 and §6.3. An
+// unknown field:value becomes search text rather than a new filter.
 
 // knownQueryFields are the structured filter fields the reader supports. A
 // field:value chip is only produced for one of these.
@@ -23,31 +19,28 @@ var knownQueryFields = map[string]bool{
 }
 
 var (
-	// A bare token that looks like a correlation id → pivot to /correlate.
-	// mint id is 12 hex chars; require >= 8 to avoid matching short words.
+	// A bare token that looks like a request id switches to /correlate.
+	// Minted ids are 12 hex chars; >= 8 avoids matching short words.
 	hexIDRe  = regexp.MustCompile(`^[0-9a-f]{8,}$`)
 	quotedRe = regexp.MustCompile(`"([^"]*)"`)
 )
 
-// Chips is the translated query: the three reader primitives side by side.
-// RequestID is the exclusive correlation pivot (when set, correlate rather than
-// filter). Filters are structured exact-match chips composed with AND. Q is the
-// bounded free-text fallback.
+// Chips is a translated query. When RequestID is set the caller should
+// correlate instead of filtering. Filters are exact-match and ANDed; Q is
+// free text.
 type Chips struct {
 	RequestID string
 	Filters   map[string]string
 	Q         string
 }
 
-// Translator turns query text into Chips. The rule-based OSS translator and a
-// cloud NL model are interchangeable behind it.
+// Translator turns query text into Chips.
 type Translator interface {
 	Translate(text string) Chips
 }
 
-// RuleTranslator is the deterministic reference translator — the §6.3 smart-box
-// rules. Prose like "yesterday 2pm" is left to a cloud NL model; this parser
-// does not guess time ranges it cannot ground.
+// RuleTranslator applies the §6.3 rules. It doesn't try to parse prose like
+// "yesterday 2pm".
 type RuleTranslator struct{}
 
 func (RuleTranslator) Translate(text string) Chips {
@@ -60,7 +53,7 @@ func (RuleTranslator) Translate(text string) Chips {
 
 	// Quoted spans are free-text, verbatim.
 	remainder := quotedRe.ReplaceAllStringFunc(text, func(m string) string {
-		qParts = append(qParts, m[1:len(m)-1]) // strip the surrounding quotes
+		qParts = append(qParts, m[1:len(m)-1])
 		return " "
 	})
 

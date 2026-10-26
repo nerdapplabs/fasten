@@ -72,11 +72,11 @@ func TestPushSyslog_RedactsPIIKeys(t *testing.T) {
 	initRedactStreams(t)
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{
-		"event":    "auth_failed",
-		"level":    "error",
-		"password": "hunter2",
-		"api_key":  "sk-real-key",
-		"user":     "alice@example.com",
+		"event":      "auth_failed",
+		"level":      "error",
+		"password":   "hunter2",
+		"api_key":    "sk-real-key",
+		"user":       "alice@example.com",
 		"request_id": "r-1",
 	})
 	rows, err := tr.QuerySyslog(10, StreamQuery{})

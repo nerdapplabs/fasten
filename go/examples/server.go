@@ -4,8 +4,8 @@
 //
 //   - fasten.Init() reading env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID).
 //   - One audit code (USER_CREATED) registered at startup.
-//   - fasten.RequestID middleware mints / honours X-Request-ID per
-//     request and stashes it in the context for downstream Emit / Log.
+//   - fasten.RequestID middleware reads or mints X-Request-ID and puts
+//     it in the context for Emit and Log.
 //   - POST /users emits an audit row with the in-context request_id.
 //   - GET  /users/<id> emits a read-side audit row + a structured sys log.
 //   - On Ctrl-C, fasten.Flush() drains pending audit rows.
@@ -71,12 +71,11 @@ func main() {
 
 	srv := &http.Server{Addr: ":8080", Handler: fasten.RequestID(mux)}
 
-	// Graceful shutdown: drain pending audit rows before exit.
 	go func() {
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 		<-stop
-		log.Println("shutting down — flushing audit queue")
+		log.Println("shutting down, flushing audit queue")
 		fasten.Flush(5 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

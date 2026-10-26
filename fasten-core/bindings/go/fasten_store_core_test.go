@@ -17,28 +17,28 @@ import (
 	fastenstore "."
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// Helpers
 
 func makeRow(id, code string) map[string]any {
 	return map[string]any{
-		"wire_version":    "1",
-		"id":              id,
-		"origin_id":       id,
-		"monotonic_seq":   1,
-		"timestamp":       "2026-05-07T00:00:00.000Z",
-		"code":            code,
-		"action":          "test",
-		"severity":        "info",
-		"service_id":      "test-svc",
-		"source_node_id":  "node-1",
-		"actor":           "tester",
-		"actor_kind":      "user",
-		"target":          "res-1",
-		"category":        "test",
-		"domain":          "test",
-		"method":          "sdk",
-		"request_id":      "req-001",
-		"detail":          map[string]any{"key": "value"},
+		"wire_version":   "1",
+		"id":             id,
+		"origin_id":      id,
+		"monotonic_seq":  1,
+		"timestamp":      "2026-05-07T00:00:00.000Z",
+		"code":           code,
+		"action":         "test",
+		"severity":       "info",
+		"service_id":     "test-svc",
+		"source_node_id": "node-1",
+		"actor":          "tester",
+		"actor_kind":     "user",
+		"target":         "res-1",
+		"category":       "test",
+		"domain":         "test",
+		"method":         "sdk",
+		"request_id":     "req-001",
+		"detail":         map[string]any{"key": "value"},
 	}
 }
 
@@ -51,7 +51,7 @@ func pgDSN(t *testing.T) string {
 	return dsn
 }
 
-// ── Version ───────────────────────────────────────────────────────────────────
+// Version
 
 func TestVersion(t *testing.T) {
 	v := fastenstore.Version()
@@ -61,7 +61,7 @@ func TestVersion(t *testing.T) {
 	t.Logf("library version: %s", v)
 }
 
-// ── SQLite ────────────────────────────────────────────────────────────────────
+// SQLite
 
 func TestSQLite_OpenAndPing(t *testing.T) {
 	store, err := fastenstore.Open("sqlite", ":memory:", "audit_log")
@@ -159,7 +159,7 @@ func TestSQLite_UnknownBackendReturnsError(t *testing.T) {
 	}
 }
 
-// ── PostgreSQL ────────────────────────────────────────────────────────────────
+// PostgreSQL
 
 func TestPostgres_OpenAndPing(t *testing.T) {
 	dsn := pgDSN(t)

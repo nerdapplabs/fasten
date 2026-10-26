@@ -8,9 +8,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// §8.1 background-work correlation — Background / Go mint a bg- sentinel when the
-// context has no request_id, else inherit it. Parity with the Python
-// fasten.background / fasten.go.
+// §8.1 background-work correlation: Background and Go mint a bg- sentinel when
+// the context has no request_id, else inherit it.
 
 func TestBackground_MintsBGWhenNoContext(t *testing.T) {
 	resetGlobals(t)

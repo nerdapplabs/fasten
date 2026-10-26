@@ -20,9 +20,9 @@ func TestPII_ForcesRetShort(t *testing.T) {
 	resetForPII(t)
 	if err := Register("pii", map[Code]Meta{
 		"PII_FORCE_SHORT": {
-			Domain:         "pii", Category: "x", Action: "x",
-			Severity:       SevInfo,
-			Description:    "x", Emitter: "t",
+			Domain: "pii", Category: "x", Action: "x",
+			Severity:    SevInfo,
+			Description: "x", Emitter: "t",
 			RetentionClass: RetLong,
 			PiiInDetail:    true,
 		},
@@ -43,8 +43,8 @@ func TestPII_ForceRedactsDetail(t *testing.T) {
 	_ = Init(Config{ServiceID: "svc", NodeID: "node"})
 	if err := Register("pii", map[Code]Meta{
 		"PII_FULL_REDACT": {
-			Domain:    "pii", Category: "c", Action: "a",
-			Severity:  SevInfo,
+			Domain: "pii", Category: "c", Action: "a",
+			Severity:    SevInfo,
 			Description: "x", Emitter: "t",
 			PiiInDetail: true,
 		},
@@ -82,8 +82,8 @@ func TestPII_PassthroughKeys(t *testing.T) {
 	_ = Init(Config{ServiceID: "svc", NodeID: "node"})
 	if err := Register("pii", map[Code]Meta{
 		"PII_PARTIAL": {
-			Domain:    "pii", Category: "c", Action: "a",
-			Severity:  SevInfo,
+			Domain: "pii", Category: "c", Action: "a",
+			Severity:    SevInfo,
 			Description: "x", Emitter: "t",
 			PiiInDetail:           true,
 			DetailPassthroughKeys: []string{"region"},
@@ -120,8 +120,8 @@ func TestNonPII_KeepsDetail(t *testing.T) {
 	_ = Init(Config{ServiceID: "svc", NodeID: "node"})
 	if err := Register("nonpii", map[Code]Meta{
 		"NON_PII_BASIC": {
-			Domain:    "nonpii", Category: "c", Action: "a",
-			Severity:  SevInfo,
+			Domain: "nonpii", Category: "c", Action: "a",
+			Severity:    SevInfo,
 			Description: "x", Emitter: "t",
 		},
 	}); err != nil {

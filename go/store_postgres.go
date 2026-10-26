@@ -27,17 +27,17 @@ type PostgresStore struct {
 	schema string
 	bare   string
 
-	// writeFailures counts swallowed persist failures; >0 means durable audit
-	// history has a known hole → "store-degraded". Sticky for the store's life.
+	// writeFailures counts swallowed write errors. Non-zero marks the audit
+	// stream "store-degraded" for the life of the store.
 	writeFailures atomic.Int64
 }
 
-// NoteWriteFailure records a swallowed persist failure (durable history has a
-// hole). Callers that surface the Insert error don't mark the store degraded.
+// NoteWriteFailure records a swallowed write error. Callers that return the
+// Insert error themselves don't call it.
 func (s *PostgresStore) NoteWriteFailure() { s.writeFailures.Add(1) }
 
-// Degraded reports whether at least one persist failure was swallowed. Drives
-// the "store-degraded" audit completeness flag.
+// Degraded reports whether any write error was swallowed, which makes the
+// audit stream "store-degraded".
 func (s *PostgresStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // NewPostgresStore creates and migrates the audit table, then returns the store.
@@ -49,7 +49,7 @@ func NewPostgresStore(db *sql.DB, tableName string) (*PostgresStore, error) {
 	if !validPgIdentifierRe.MatchString(tableName) {
 		return nil, fmt.Errorf(
 			"fasten PostgresStore: tableName %q is not a valid identifier "+
-				"(must match %s) — table names are string-substituted into SQL",
+				"(must match %s): table names are string-substituted into SQL",
 			tableName, validPgIdentifierRe.String())
 	}
 	schema := ""
@@ -105,8 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
--- One node, one chain (spec §2). A duplicate allocation fails at WRITE
--- rather than surfacing later in verify_chain as a false tamper signal.
+-- One node, one chain (spec §2). A duplicate seq fails on insert instead of
+-- showing up later in verify_chain as tampering.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
@@ -134,7 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 	if err != nil {
 		return err
 	}
-	existing := map[string]string{} // name → data_type
+	existing := map[string]string{} // name to data_type
 	for rows.Next() {
 		var name, dtype string
 		if err := rows.Scan(&name, &dtype); err != nil {
@@ -148,7 +148,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		return err
 	}
 
-	// Idempotent column additions for tables created before a given column existed.
+	// Add columns missing from tables created by older versions.
 	type colDef struct{ name, ddl string }
 	for _, col := range []colDef{
 		{"pii_in_detail", "SMALLINT NOT NULL DEFAULT 0"},
@@ -189,9 +189,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 	return nil
 }
 
-// pgAuditCols is the column list for Postgres — same logical order as auditCols
-// in store.go but timestamp/shipped_at are native TIMESTAMPTZ so we scan
-// directly into time.Time via scanRowsPg.
+// pgAuditCols is auditCols (store.go) for Postgres, where timestamp and
+// shipped_at are TIMESTAMPTZ and scan straight into time.Time.
 const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
@@ -199,9 +198,8 @@ const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, seve
 	// Form "2" (spec §1.4). See auditCols in store.go.
 	` detail_salt, detail_commitment`
 
-// insertRowExec runs the idempotent ON CONFLICT DO NOTHING insert on any
-// execContext (*sql.DB for a single autocommit insert, or *sql.Tx for a batch).
-// The originated/replicated intent split is enforced by the wrappers.
+// insertRowExec inserts a row (ON CONFLICT DO NOTHING) on a *sql.DB or
+// *sql.Tx. The originated and replicated checks are in the callers.
 func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
@@ -242,12 +240,12 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 	return err
 }
 
-// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+// insertRow inserts one row outside a transaction.
 func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
 	return s.insertRowExec(ctx, s.db, row)
 }
 
-// InsertOriginated inserts a row this node ORIGINATED (origin_id == id).
+// InsertOriginated inserts a row this node originated (origin_id == id).
 func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 	if row.OriginID != row.ID {
 		return fmt.Errorf(
@@ -257,32 +255,20 @@ func (s *PostgresStore) InsertOriginated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
-// InsertReplicated inserts a sealed row replicated from another origin
-// (autocommit single-row path).
-// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
-// atomically (spec §2.1). Mirrors SQLiteStore's implementation and Python's.
+// AllocateAndInsertOriginated allocates monotonic_seq and prev_hash, seals
+// the row and inserts it in one transaction (spec §2.1), and returns the
+// sealed row.
 //
-// Serialisation uses pg_advisory_xact_lock keyed on the node, NOT
-// SELECT … FOR UPDATE on the tip row: with an empty table there is no tip row
-// to lock, so FOR UPDATE would let every concurrent writer through to allocate
-// seq 1 — the exact defect this closes.
-//
-// Returns the SEALED row actually written.
+// It locks with pg_advisory_xact_lock on the node rather than SELECT ... FOR
+// UPDATE on the tip row, because an empty table has no tip row to lock.
 func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
 	if row.OriginID != row.ID {
 		return Row{}, fmt.Errorf(
 			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
 			row.OriginID, row.ID)
 	}
-	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
-	// microseconds and ROUNDS anything finer, so a row sealed over Go's
-	// nanosecond precision hashes a timestamp the store cannot hold: the row
-	// comes back with 265373000ns where 265372967ns was hashed, and
-	// VerifyChain reports a hash mismatch on a row nobody touched.
-	//
-	// SQLite does not show this because it stores the rendered ISO string
-	// verbatim, which is why every SQLite test passed. Truncating in both
-	// backends keeps one rule: what we hash is what the store can return.
+	// Truncate to microseconds before sealing. timestamptz rounds anything
+	// finer, so the stored row would no longer match its hash.
 	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
 	if row.ShippedAt != nil {
 		t := row.ShippedAt.Truncate(time.Microsecond)
@@ -295,10 +281,8 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Idempotence under retry: the caller may re-run this after a lost ack, and
-	// the first attempt may well have committed. Re-running would allocate a
-	// fresh seq, hit ON CONFLICT DO NOTHING on the id, and hand back a sealed
-	// row that is not the one in the store. Check first.
+	// A retry after a lost ack may find the row already committed. Return
+	// the stored one rather than sealing a new seq that ON CONFLICT drops.
 	var (
 		exSeq                  int64
 		exPrev, exHash, exForm string
@@ -321,9 +305,8 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 		return Row{}, err
 	}
 
-	// TWO questions, TWO queries — see the SQLite implementation. seq spans
-	// EVERY row on the node (an unsealed row still holds its number);
-	// prev_hash chains only from a sealed one.
+	// Two queries: seq counts every row on the node (an unsealed row still
+	// holds its number), while prev_hash comes from the last sealed row.
 	var nextSeq int64
 	if err := tx.QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = $1",
@@ -354,6 +337,7 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 	return sealed, nil
 }
 
+// InsertReplicated inserts a sealed row replicated from another origin.
 func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
@@ -361,9 +345,8 @@ func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
-// insertReplicatedTx inserts a sealed replicated row on the given exec context
-// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
-// it does NOT own the transaction — IngestReplicated commits once for the batch.
+// insertReplicatedTx is InsertReplicated on the caller's transaction;
+// IngestReplicated commits once for the batch.
 func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
@@ -371,7 +354,7 @@ func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext
 	return s.insertRowExec(ctx, exec, row)
 }
 
-// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
+// Insert calls InsertOriginated. The drainer writes through it.
 func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	return s.InsertOriginated(ctx, row)
 }
@@ -386,9 +369,9 @@ func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if offset < 0 {
 		offset = 0
 	}
-	// Cursor pagination (canonical): newest-first, so paging forward means
-	// older rows — monotonic_seq < AfterSeq. Applied here, not in
-	// filterToPostgresSQL, so CountFiltered/total stays the full filtered count.
+	// Cursor pagination: results are newest-first, so the next page is
+	// monotonic_seq < AfterSeq. It's applied here rather than in
+	// filterToPostgresSQL so CountFiltered still counts every match.
 	if f.AfterSeq > 0 {
 		n := len(args) + 1
 		if where == "" {
@@ -400,9 +383,8 @@ func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	}
 	limIdx := len(args) + 1
 	offIdx := len(args) + 2
-	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
-	// counter, meaningless across sub-chains — it stays as the
-	// same-timestamp tie-breaker only (#68).
+	// monotonic_seq is per source_node_id, so it only breaks
+	// ties between equal timestamps (#68).
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $%d OFFSET $%d`, pgAuditCols, s.table, where, limIdx, offIdx),
 		append(args, limit, offset)...,
@@ -414,9 +396,8 @@ func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	return scanRowsPg(rows)
 }
 
-// CountFiltered returns the total number of rows matching the same filter as
-// Query, ignoring Limit — so a capped read (e.g. /correlate) can report how
-// much matching history it truncated.
+// CountFiltered counts rows matching f, ignoring Limit, so a capped read
+// (e.g. /correlate) can report truncation.
 func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error) {
 	where, args := filterToPostgresSQL(f)
 	var count int
@@ -426,12 +407,10 @@ func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error
 	return count, err
 }
 
-// Search runs FR3 free-text search over the audit detail column (§4.1).
-// Case-insensitive ILIKE substring, since= bounded, hard-capped by limit,
-// newest-first, no ranking. Result rows carry request_id for /correlate.
-// %/_/\ in q are escaped so they match literally under ESCAPE E'\\'.
-// Search: `tenantID != ""` scopes the query to one tenant — see SQLiteStore
-// Search for the P1-44 reasoning.
+// Search does a case-insensitive substring match of q against detail
+// (§4.1), from since, newest-first, up to limit, with no ranking. LIKE
+// wildcards in q match literally. A non-empty tenantID scopes the query to
+// one tenant; see SQLiteStore.Search.
 func (s *PostgresStore) Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error) {
 	esc := escapeLikeLiteral(q)
 	conds := []string{"timestamp >= $1", `detail::text ILIKE $2 ESCAPE E'\\'`}
@@ -475,10 +454,9 @@ func (s *PostgresStore) ListUnshipped(ctx context.Context, limit int) ([]Row, er
 	return scanRowsPg(rows)
 }
 
-// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
-// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
-// from another origin are excluded so they are never re-shipped upstream. See
-// SQLiteStore.ListUnshippedOriginated for the rationale.
+// ListUnshippedOriginated returns unshipped rows this node originated, for
+// (serviceID, sourceNodeID) with origin_id = id. Replicated rows are left out
+// so they are never shipped upstream again.
 func (s *PostgresStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
@@ -578,8 +556,7 @@ func filterToPostgresSQL(f Filter) (string, []any) {
 		args = append(args, f.Until.UTC())
 		n++
 	}
-	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
-	// bound, applied in Query so CountFiltered/total stays the full match count.
+	// AfterSeq is applied in Query, so CountFiltered counts every match.
 	_ = n
 	if len(conds) == 0 {
 		return "", args
@@ -614,8 +591,7 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		// Strict — a malformed detail column is a bug at the writer, must
-		// fail loudly instead of silently returning an empty map.
+		// A malformed detail column is an error, not an empty map.
 		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
 			return nil, fmt.Errorf("scanRowsPg: row %q detail: %w", r.ID, err)
 		}
@@ -649,8 +625,8 @@ func (s *PostgresStore) ListRedactionCandidates(
 	if len(codes) == 0 {
 		return nil, 0, nil
 	}
-	// Numbered placeholders, not pq.Array: lib/pq is the caller's driver
-	// choice, not a dependency of this module (see the type doc).
+	// Numbered placeholders rather than pq.Array, so this module doesn't
+	// depend on lib/pq.
 	placeholders := make([]string, len(codes))
 	args := make([]any, 0, len(codes)+1)
 	args = append(args, before.UTC())

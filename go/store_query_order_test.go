@@ -2,7 +2,7 @@ package fasten
 
 // Query ordering across sub-chains (#68).
 //
-// MonotonicSeq is a per-(service_id, source_node_id) counter — comparing it
+// MonotonicSeq is a per-(service_id, source_node_id) counter; comparing it
 // across sub-chains is meaningless. A global Query must order by wall-clock
 // first, so a chatty old chain's high counters cannot bury a quieter chain's
 // newer rows below the page limit. Seq stays the same-timestamp tie-breaker
@@ -43,14 +43,14 @@ func TestQuery_OrdersByTimeAcrossSubChains(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// Chain A: an older, chattier writer — high seq, day-old timestamps.
+	// Chain A: an older, chattier writer with high seq and day-old timestamps.
 	for i := 0; i < 5; i++ {
 		row := orderRow(int64(100+i), now.Add(-24*time.Hour).Add(time.Duration(i)*time.Minute), "svc-a", "node-a")
 		if err := store.InsertOriginated(ctx, row); err != nil {
 			t.Fatalf("insert chain A: %v", err)
 		}
 	}
-	// Chain B: a fresh writer — counter restarted at 1, current timestamps.
+	// Chain B: a fresh writer, counter restarted at 1, current timestamps.
 	for i := 0; i < 3; i++ {
 		row := orderRow(int64(1+i), now.Add(time.Duration(i-3)*time.Minute), "svc-b", "node-b")
 		if err := store.InsertOriginated(ctx, row); err != nil {

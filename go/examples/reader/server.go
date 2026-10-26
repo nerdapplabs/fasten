@@ -1,16 +1,14 @@
-// Reader server example — mounts /api/v1/logs behind the bundled
+// Reader server example: mounts /api/v1/logs behind the bundled
 // bearer-token middleware and a tenant-scope hook.
 //
 // What it shows:
 //
-//   - fasten.NewReader wired with WithTenantScope + EnforceTenantIsolation
-//     so cross-tenant reads (?tenant_id=other) are impossible even when
-//     the caller manipulates the query string (P1-44).
-//   - fasten.RequireBearer as a drop-in auth gate reading FASTEN_READER_TOKEN
-//     — the opinionated default so a caller without an auth stack still
-//     gets a real gate rather than shipping public /audit (P1-45).
-//   - The tenant-scope hook is called AFTER the bearer check, so an
-//     unauthenticated caller never reaches the scope resolver.
+//   - fasten.NewReader with WithTenantScope and EnforceTenantIsolation,
+//     so ?tenant_id=other can't read another tenant's rows.
+//   - fasten.RequireBearer as a simple auth gate reading FASTEN_READER_TOKEN,
+//     for callers without their own auth stack.
+//   - The tenant-scope hook runs after the bearer check, so an
+//     unauthenticated caller never reaches it.
 //
 // Run:
 //
@@ -19,7 +17,7 @@
 //	FASTEN_READER_TOKEN=s3cret \
 //	  go run server.go
 //
-//	# unauthenticated → 401
+//	# unauthenticated: 401
 //	curl -i http://localhost:8080/api/v1/logs/audit
 //
 //	# tenant-a's rows only, regardless of ?tenant_id=
@@ -50,10 +48,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// tenantFromHeader is the opinionated default for this demo: the
-	// authenticated caller carries their tenant in X-Tenant. In real
-	// deployments this comes from the JWT / session decoded upstream
-	// (before RequireBearer, or inside a chained middleware).
+	// For the demo the tenant comes from X-Tenant. A real deployment would
+	// take it from the decoded JWT or session.
 	tenantFromHeader := func(r *http.Request) (string, bool) {
 		t := r.Header.Get("X-Tenant")
 		if t == "" {

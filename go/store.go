@@ -32,19 +32,17 @@ type SQLiteStore struct {
 	db    *sql.DB
 	table string
 
-	// writeFailures counts swallowed persist failures; >0 means durable audit
-	// history has a known hole, so the reader degrades the audit completeness
-	// flag from "store" to "store-degraded". Sticky for the store's lifetime.
+	// writeFailures counts swallowed write errors. Non-zero marks the audit
+	// stream "store-degraded" for the life of the store.
 	writeFailures atomic.Int64
 }
 
-// NoteWriteFailure records a persist failure the caller swallowed on the hot
-// path (durable history has a hole). Callers that surface the Insert error
-// don't mark the store degraded.
+// NoteWriteFailure records a swallowed write error. Callers that return the
+// Insert error themselves don't call it.
 func (s *SQLiteStore) NoteWriteFailure() { s.writeFailures.Add(1) }
 
-// Degraded reports whether at least one persist failure was swallowed. Drives
-// the "store-degraded" audit completeness flag.
+// Degraded reports whether any write error was swallowed, which makes the
+// audit stream "store-degraded".
 func (s *SQLiteStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
 // validIdentifierRe gates tableName against SQL injection. Every Insert /
@@ -55,21 +53,18 @@ func (s *SQLiteStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 // or env var without their own validation are the realistic blast radius.
 var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// auditCols is the canonical column order used in all SELECT and INSERT
-// statements. Explicit list decouples scanRows from table physical layout;
-// adding columns never breaks existing scans.
+// auditCols is the column order for every SELECT and INSERT, so scanRows
+// doesn't depend on the table's physical column order.
 const auditCols = `id, origin_id, monotonic_seq, timestamp, code, action, severity,` +
 	` service_id, source_node_id, tenant_id, actor, actor_kind,` +
 	` target, category, domain, method, request_id, detail,` +
 	` pii_in_detail, shipped_at, wire_version, hash, prev_hash, canonical_form_id,` +
-	// Form "2" (spec §1.4). Omitting them dropped the salt on every write, so
-	// replicated Python rows failed the commitment check.
+	// Form "2" columns (spec §1.4).
 	` detail_salt, detail_commitment`
 
 // NewSQLiteStore creates and migrates the audit table, then returns the store.
 // tableName must be a plain SQL identifier (^[A-Za-z_][A-Za-z0-9_]*$); any
-// other value is rejected to prevent SQL injection — see store.go regex
-// note above.
+// other value is rejected to prevent SQL injection (see validIdentifierRe).
 func NewSQLiteStore(db *sql.DB, tableName string) (*SQLiteStore, error) {
 	if tableName == "" {
 		tableName = "fasten_audit"
@@ -77,7 +72,7 @@ func NewSQLiteStore(db *sql.DB, tableName string) (*SQLiteStore, error) {
 	if !validIdentifierRe.MatchString(tableName) {
 		return nil, fmt.Errorf(
 			"fasten SQLiteStore: tableName %q is not a valid SQL identifier "+
-				"(must match %s) — table names are string-substituted into SQL "+
+				"(must match %s): table names are string-substituted into SQL "+
 				"because SQLite's API does not parameterize identifiers",
 			tableName, validIdentifierRe.String())
 	}
@@ -123,10 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_req ON %s(request_id);
 CREATE INDEX IF NOT EXISTS idx_%s_code ON %s(code);
 CREATE INDEX IF NOT EXISTS idx_%s_ts ON %s(timestamp);
 CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
--- One node, one chain (spec §2): monotonic_seq is unique within a
--- source_node_id. Enforced here so a duplicate allocation fails at WRITE
--- rather than being discovered later by verify_chain, where it is
--- indistinguishable from tampering.
+-- One node, one chain (spec §2). A duplicate seq fails on insert instead of
+-- showing up later in verify_chain as tampering.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
 `, s.table,
@@ -141,7 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		return err
 	}
 
-	// Idempotent column migrations for tables predating a given column.
+	// Add columns missing from tables created by older versions.
 	existing, err := s.existingColumns()
 	if err != nil {
 		return err
@@ -168,8 +161,8 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 		}
 	}
 
-	// Partial indexes created outside CREATE TABLE so they work on both fresh
-	// and legacy-migrated tables.
+	// Created after the column migration, since older tables may only now
+	// have pii_in_detail.
 	for _, idx := range []string{
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1", s.table, s.table),
 	} {
@@ -180,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at I
 	return nil
 }
 
-// existingColumns returns a set of column names present in the table.
+// existingColumns returns the table's column names.
 func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", s.table))
 	if err != nil {
@@ -201,10 +194,8 @@ func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 	return cols, rows.Err()
 }
 
-// insertRowExec runs the idempotent INSERT OR IGNORE on any execContext
-// (*sql.DB for a single autocommit insert, or *sql.Tx for a batch). The
-// originated/replicated intent split is enforced by the wrappers, not here —
-// the SQL is identical.
+// insertRowExec inserts a row (INSERT OR IGNORE) on a *sql.DB, *sql.Conn or
+// *sql.Tx. The originated and replicated checks are in the callers.
 func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
@@ -245,13 +236,12 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	return err
 }
 
-// insertRow is the single-row autocommit path (runs on the *sql.DB directly).
+// insertRow inserts one row outside a transaction.
 func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
 	return s.insertRowExec(ctx, s.db, row)
 }
 
-// InsertOriginated inserts a row this node ORIGINATED (origin_id == id). Used
-// by the engine's own Emit path.
+// InsertOriginated inserts a row this node originated (origin_id == id).
 func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
 	if row.OriginID != row.ID {
 		return fmt.Errorf(
@@ -261,50 +251,31 @@ func (s *SQLiteStore) InsertOriginated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
-// AllocateAndInsertOriginated allocates monotonic_seq + prev_hash and inserts,
-// atomically (spec §2.1).
+// AllocateAndInsertOriginated allocates monotonic_seq and prev_hash, seals
+// the row and inserts it in one transaction (spec §2.1), and returns the
+// sealed row.
 //
-// One node, one chain: monotonic_seq is unique within a source_node_id.
-// Allocating in engine memory is non-conformant — two engine instances (two
-// services on one store, a forking supervisor, several workers) each mint from
-// 1 and produce two rows at seq 1, which VerifyChain then reports as a
-// prev_hash break: a false tamper signal with no attacker involved.
-//
-// BEGIN IMMEDIATE takes a RESERVED lock BEFORE the read, so two writers cannot
-// both observe the same tip and then both insert. Without it this is a
-// read-modify-write race that merely moves the bug from memory into SQL.
-//
-// Returns the SEALED row actually written.
+// The seq comes from the store rather than engine memory, so several engines
+// sharing a store (services, forked workers) don't both write seq 1. BEGIN
+// IMMEDIATE takes the write lock before the read, so two writers can't read
+// the same tip.
 func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
 	if row.OriginID != row.ID {
 		return Row{}, fmt.Errorf(
 			"fasten AllocateAndInsertOriginated: requires origin_id == id (got origin_id=%q, id=%q)",
 			row.OriginID, row.ID)
 	}
-	// A REAL lock. The previous version did BeginTx + ExecContext("BEGIN
-	// IMMEDIATE") and discarded the error: BeginTx already opened a deferred
-	// transaction, so the nested BEGIN failed and the RESERVED lock was never
-	// taken. Two writers could then both read the same tip.
-	//
-	// The store is handed a *sql.DB by the caller, so it cannot put
-	// _txlock=immediate on the DSN. Instead take a dedicated connection and
-	// drive the transaction by hand, which lets BEGIN IMMEDIATE be the first
-	// statement on it and actually acquire RESERVED before the read.
-	// Truncate to microseconds BEFORE sealing. Postgres timestamptz stores
-	// microseconds and ROUNDS anything finer, so a row sealed over Go's
-	// nanosecond precision hashes a timestamp the store cannot hold: the row
-	// comes back with 265373000ns where 265372967ns was hashed, and
-	// VerifyChain reports a hash mismatch on a row nobody touched.
-	//
-	// SQLite does not show this because it stores the rendered ISO string
-	// verbatim, which is why every SQLite test passed. Truncating in both
-	// backends keeps one rule: what we hash is what the store can return.
+	// Truncate to microseconds before sealing, the same as PostgresStore,
+	// so the hash covers only what the stored timestamp keeps.
 	row.Timestamp = row.Timestamp.Truncate(time.Microsecond)
 	if row.ShippedAt != nil {
 		t := row.ShippedAt.Truncate(time.Microsecond)
 		row.ShippedAt = &t
 	}
 
+	// BeginTx can't start an IMMEDIATE transaction and the caller owns the
+	// DSN (so no _txlock=immediate), so run BEGIN IMMEDIATE by hand on a
+	// dedicated connection.
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return Row{}, err
@@ -317,16 +288,15 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	committed := false
 	defer func() {
 		if !committed {
-			// NOT ctx: a cancelled ctx skips the ROLLBACK, and Close() then
-			// returns the conn to the pool still holding the write lock.
+			// Not ctx: if ctx is cancelled the ROLLBACK wouldn't run and the
+			// connection would go back to the pool holding the write lock.
 			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
 
-	// TWO questions, TWO queries. seq must span EVERY row on this node, sealed
-	// or not — an unsealed row still occupies its number, and filtering those
-	// out restarts the counter and collides with them. prev_hash, by contrast,
-	// may only chain from a SEALED row.
+	// Two queries: seq counts every row on the node, sealed or not (an
+	// unsealed row still holds its number), while prev_hash comes from the
+	// last sealed row.
 	var nextSeq int64
 	if err := conn.QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(monotonic_seq), 0) FROM "+s.table+" WHERE source_node_id = ?",
@@ -358,8 +328,8 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	return sealed, nil
 }
 
-// InsertReplicated inserts a sealed row replicated from another origin. Used by
-// IngestReplicated after the chain verifies (autocommit single-row path).
+// InsertReplicated inserts a sealed row replicated from another origin,
+// outside a transaction. IngestReplicated uses insertReplicatedTx instead.
 func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten InsertReplicated: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
@@ -367,9 +337,8 @@ func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
 	return s.insertRow(ctx, row)
 }
 
-// insertReplicatedTx inserts a sealed replicated row on the given exec context
-// (a *sql.Tx in the batch path). Same sealed-row guard as InsertReplicated, but
-// it does NOT own the transaction — IngestReplicated commits once for the batch.
+// insertReplicatedTx is InsertReplicated on the caller's transaction;
+// IngestReplicated commits once for the batch.
 func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
 	if row.Hash == "" {
 		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
@@ -377,8 +346,7 @@ func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, 
 	return s.insertRowExec(ctx, exec, row)
 }
 
-// Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
-// Kept so the AuditRepository interface and the drainer stay stable.
+// Insert calls InsertOriginated. The drainer writes through it.
 func (s *SQLiteStore) Insert(ctx context.Context, row Row) error {
 	return s.InsertOriginated(ctx, row)
 }
@@ -393,19 +361,13 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	if offset < 0 {
 		offset = 0
 	}
-	// Cursor pagination (canonical): newest-first, so paging forward means
-	// older rows — monotonic_seq < AfterSeq. Applied here, not in filterToSQL,
-	// so CountFiltered/total stays the full filtered count.
+	// Cursor pagination: results are newest-first, so the next page is
+	// monotonic_seq < AfterSeq. It's applied here rather than in filterToSQL
+	// so CountFiltered still counts every match.
 	//
-	// Accepted limitation on multi-origin stores (A1 in PR #59 review): the
-	// query orders by (timestamp, monotonic_seq) but the cursor is
-	// monotonic_seq alone, which is a per-(service_id, source_node_id)
-	// counter (see the tie-breaker note below). Paging to exhaustion across
-	// rows from more than one origin can skip or repeat rows because a lower
-	// seq in origin B can appear at a newer timestamp than a higher seq in
-	// origin A. Single-origin stores are unaffected. A composite
-	// (timestamp, seq) cursor would fix this but changes the wire contract;
-	// keeping the simpler cursor is the deliberate call.
+	// Known limitation: seq is per origin, so on a store holding rows from
+	// several origins, paging can skip or repeat rows. Fixing it needs a
+	// (timestamp, seq) cursor, which would change the API.
 	if f.AfterSeq > 0 {
 		if where == "" {
 			where = "WHERE monotonic_seq < ?"
@@ -414,9 +376,8 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 		}
 		args = append(args, f.AfterSeq)
 	}
-	// Wall-clock first: monotonic_seq is a per-(service_id, source_node_id)
-	// counter, meaningless across sub-chains — it stays as the
-	// same-timestamp tie-breaker only (#68).
+	// monotonic_seq is per source_node_id, so it only breaks
+	// ties between equal timestamps (#68).
 	rows, err := s.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT %s FROM %s %s ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ? OFFSET ?`, auditCols, s.table, where),
 		append(args, limit, offset)...,
@@ -428,9 +389,8 @@ func (s *SQLiteStore) Query(ctx context.Context, f Filter) ([]Row, error) {
 	return scanRows(rows)
 }
 
-// CountFiltered returns the total number of rows matching the same filter as
-// Query, ignoring Limit — so a capped read (e.g. /correlate) can report how
-// much matching history it truncated.
+// CountFiltered counts rows matching f, ignoring Limit, so a capped read
+// (e.g. /correlate) can report truncation.
 func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) {
 	where, args := filterToSQL(f)
 	var n int
@@ -440,14 +400,13 @@ func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) 
 	return n, err
 }
 
-// Search runs FR3 free-text search over the audit store's detail column
-// (§4.1). Case-insensitive substring, since= bounded, hard-capped by limit,
-// newest-first, no relevance ranking. Result rows carry request_id for
-// /correlate follow-up. %/_/\ in q are escaped so they match literally.
-// Search: `tenantID != ""` scopes the query to one tenant (SQL WHERE
-// tenant_id=?) — the reader wires the caller's authenticated tenant here
+// Search does a case-insensitive substring match of q against detail
+// (§4.1), from since, newest-first, up to limit, with no ranking. LIKE
+// wildcards in q match literally.
+// A non-empty tenantID scopes the query to one tenant (SQL WHERE
+// tenant_id=?); the reader wires the caller's authenticated tenant here
 // so a shared multi-tenant store doesn't leak substring matches across
-// tenants (P1-44).
+// tenants.
 func (s *SQLiteStore) Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error) {
 	esc := escapeLikeLiteral(strings.ToLower(q))
 	conds := []string{"COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"}
@@ -495,12 +454,10 @@ func (s *SQLiteStore) ListUnshipped(ctx context.Context, limit int) ([]Row, erro
 	return scanRows(rows)
 }
 
-// ListUnshippedOriginated returns unshipped rows this node ORIGINATED — scoped
-// to (serviceID, sourceNodeID) AND origin_id = id. Replicated rows ingested
-// from another origin are excluded: re-shipping them upstream would duplicate
-// another node's sub-chain. This is the originated-only counterpart a relay
-// should use; plain ListUnshipped returns every unshipped row regardless of
-// origin.
+// ListUnshippedOriginated returns unshipped rows this node originated, for
+// (serviceID, sourceNodeID) with origin_id = id. Replicated rows are left out
+// so they aren't shipped upstream again. ListUnshipped returns every
+// unshipped row.
 func (s *SQLiteStore) ListUnshippedOriginated(ctx context.Context, serviceID, sourceNodeID string, limit int) ([]Row, error) {
 	if limit <= 0 {
 		limit = 100
@@ -550,24 +507,18 @@ func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnship
 	return int(n), nil
 }
 
-// Count returns the total number of rows in the audit table. Used by the
-// /audit/doctor health endpoint to confirm store reachability.
+// Count returns the number of rows in the audit table. /audit/doctor uses it
+// to check the store is reachable.
 func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, s.table)).Scan(&n)
 	return n, err
 }
 
-// MaxMonotonicSeq returns the maximum monotonic_seq stored for the given
-// (serviceID, sourceNodeID) sub-chain, for seq seeding on restart.
-//
-// The tamper chain is per (service_id, source_node_id) and monotonic_seq is a
-// per-node counter, so seeding the engine's seq MUST be scoped to the engine's
-// OWN identity. An unscoped MAX() across all origins would, after this node
-// ingested replicated rows from another origin, seed seq from a foreign
-// sub-chain and break this node's own chain. When serviceID and sourceNodeID
-// are both empty the query falls back to the legacy global MAX (used only
-// where identity is unavailable).
+// MaxMonotonicSeq returns the highest monotonic_seq for (serviceID,
+// sourceNodeID). The engine no longer uses it; the store allocates seq on
+// insert. If either id is empty
+// it returns the MAX over the whole table.
 func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error) {
 	var n sql.NullInt64
 	var err error
@@ -585,11 +536,9 @@ func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNode
 	return n.Int64, nil
 }
 
-// Sources aggregates the fleet topology from the rows already recorded: one
-// entry per distinct (source_node_id, service_id, tenant_id) with its row count
-// and first/last-seen timestamps, ordered by count. No separate topology table
-// — the view falls out of the audit rows, so it can't drift. Mirrors the Python
-// SQLiteStore.sources. Optional [since, until] windows the aggregation.
+// Sources returns one entry per (source_node_id, service_id, tenant_id) in
+// the audit rows, with row count and first and last timestamps, largest
+// first. since and until, if set, limit the rows counted.
 func (s *SQLiteStore) Sources(ctx context.Context, since, until time.Time) ([]map[string]any, error) {
 	var conds []string
 	var args []any
@@ -643,8 +592,6 @@ func nullStrOrNil(ns sql.NullString) any {
 	return nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
 func filterToSQL(f Filter) (string, []any) {
 	var conds []string
 	var args []any
@@ -684,8 +631,7 @@ func filterToSQL(f Filter) (string, []any) {
 		conds = append(conds, "timestamp <= ?")
 		args = append(args, canonicalTS(f.Until))
 	}
-	// AfterSeq (cursor) is intentionally NOT applied here — it's a pagination
-	// bound, applied in Query so CountFiltered/total stays the full match count.
+	// AfterSeq is applied in Query, so CountFiltered counts every match.
 	if len(conds) == 0 {
 		return "", args
 	}
@@ -714,12 +660,8 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		); err != nil {
 			return nil, err
 		}
-		// Strict parses — a row that doesn't round-trip through parseCanonicalTS
-		// / json.Unmarshal is a bug at the source (writer bypassed
-		// canonical_ts, or the column got hand-edited). Swallowing the error
-		// used to leave Timestamp = time.Time{} — Jan 1 year 1 — which sorts
-		// to the top of any timestamp-DESC query and quietly breaks the
-		// contract the whole canonical work was defending. Fail loudly instead.
+		// A timestamp or detail that doesn't parse is an error. A zero time
+		// would sort to the top of every newest-first query.
 		parsedTs, err := parseCanonicalTS(ts)
 		if err != nil {
 			return nil, fmt.Errorf("scanRows: row %q: %w", r.ID, err)
@@ -809,8 +751,8 @@ func (s *SQLiteStore) ListRedactionCandidates(
 
 // RedactRows implements RedactionRepository (spec §7.1). Destroys detail and
 // detail_salt on an explicit id list; the hash, prev_hash and monotonic_seq are
-// untouched, so the chain still verifies. Idempotent — it targets ids, not a
-// time window, so a retry destroys the same rows and returns the same list.
+// untouched, so the chain still verifies. It is idempotent: a retry with the
+// same ids returns the same list.
 func (s *SQLiteStore) RedactRows(ctx context.Context, ids []string) ([]string, error) {
 	if len(ids) == 0 {
 		return nil, nil

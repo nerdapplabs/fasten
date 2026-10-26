@@ -10,32 +10,26 @@ import (
 	"sync/atomic"
 )
 
-// PostgresStreamStore is the Postgres-backed StreamRepository — the high-volume
-// sibling of StreamStore. It carries the same schema form "1" columns/indexes
-// and the same query/filter/window/completeness/purge/search semantics, so a
-// stream table is portable across backends and the SQLite and Postgres paths
-// agree (and match the Python SDK). Chosen where SQLite's single-writer lock is
-// the bottleneck.
+// PostgresStreamStore is a Postgres StreamRepository with the same schema and
+// query semantics as the SQLite StreamStore. Use it when SQLite's single
+// writer is the bottleneck.
 //
 // The caller imports a Postgres driver (e.g. github.com/lib/pq) and owns the
-// *sql.DB, exactly as with the audit PostgresStore. This file uses only
-// database/sql, so it adds no driver dependency to the library build.
+// *sql.DB; this file only uses database/sql.
 type PostgresStreamStore struct {
 	db        *sql.DB
 	table     string
 	idxPrefix string
 	schema    string
 
-	// writeFailures: swallowed Insert errors → "store-degraded". See StreamStore.
+	// writeFailures counts swallowed Insert errors; see StreamStore.
 	writeFailures atomic.Int64
 }
 
-// NewPostgresStreamStore validates the table name, ensures the schema/table and
-// indexes exist, and returns a ready store. tableName is required — earlier
-// versions defaulted to "syslog" when empty, so a caller wiring an API stream
-// with a blank name silently landed api rows in the syslog table (PR #59
-// test-coverage gap). Pass "api_log" / "syslog" (or whatever you choose)
-// explicitly.
+// NewPostgresStreamStore validates the table name, creates the schema, table
+// and indexes if needed, and returns the store. tableName is required (e.g.
+// "api_log" or "syslog"); there is no default, so one stream can't end up
+// writing into another's table.
 func NewPostgresStreamStore(db *sql.DB, tableName string) (*PostgresStreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten: stream table name is required (was empty)")
@@ -88,10 +82,6 @@ func (s *PostgresStreamStore) migrate() error {
 }
 
 func (s *PostgresStreamStore) Insert(row map[string]any) error {
-	// SetEscapeHTML(false) so <, >, & land as literal UTF-8, matching
-	// Python's json.dumps(..., ensure_ascii=False). Without parity, a
-	// mixed-writer table returns different rows depending on which SDK
-	// wrote each row for a q= over payloads containing those chars.
 	payload, err := marshalStreamPayload(row)
 	if err != nil {
 		return err
@@ -113,11 +103,8 @@ func (s *PostgresStreamStore) WriteFailures() int64 { return s.writeFailures.Loa
 
 func (s *PostgresStreamStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
-// whereClause builds an equality + time-window WHERE with $N placeholders
-// starting at argStart. status arrives as a string in the eq map but the column
-// is INTEGER: compare it numerically (parse to int) so non-canonical forms like
-// "007" match 7 — matching the Python SDK, which binds status as an int. (The
-// old CAST(status AS TEXT) compared '7' != '007' and silently missed.)
+// whereClause builds an equality and time-window WHERE with $N placeholders
+// starting at argStart. status is compared as an integer so "007" matches 7.
 func (s *PostgresStreamStore) whereClause(eq map[string]string, since, until string, argStart int) (string, []any, int) {
 	var conds []string
 	var args []any
@@ -213,10 +200,8 @@ func (s *PostgresStreamStore) Purge(before string) (int64, error) {
 
 func (s *PostgresStreamStore) Search(q, since, until string, limit int) ([]map[string]any, error) {
 	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
-	// ILIKE is case-insensitive, so no lower(); wildcards in q are escaped.
-	// ESCAPE E'\\' (explicit escape-string) always means one backslash,
-	// independent of standard_conforming_strings; plain '\' would break if a
-	// deployment turned that off (FR3-4).
+	// ILIKE is case-insensitive; wildcards in q are escaped. E'\\' is one
+	// backslash whatever standard_conforming_strings is set to.
 	conds := []string{"COALESCE(timestamp,'') >= $1", `payload ILIKE $2 ESCAPE E'\\'`}
 	args := []any{since, "%" + esc + "%"}
 	n := 3

@@ -1,7 +1,6 @@
 package fasten
 
 import (
-	"unicode/utf8"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,12 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// ── Request ID middleware ─────────────────────────────────────────────────
-
-// RequestID is a stdlib http.Handler middleware that mints or honours
-// X-Request-ID and sets it in the context for the duration of the request.
+// RequestID is middleware that reads X-Request-ID, or mints one, and puts it
+// in the request context and the response header.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
@@ -26,8 +24,6 @@ func RequestID(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(WithRequestID(r.Context(), id)))
 	})
 }
-
-// ── API log middleware ────────────────────────────────────────────────────
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -46,8 +42,8 @@ func (r *statusRecorder) Status() int {
 	return r.status
 }
 
-// APILogger pushes each inbound HTTP request into fasten's API ring buffer.
-// Skips paths that match any of skipPaths (e.g. "/_system/health").
+// APILogger records each request in fasten's api stream, except for paths
+// in skipPaths (e.g. "/_system/health").
 func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 	skip := make(map[string]bool, len(skipPaths))
 	for _, p := range skipPaths {
@@ -76,19 +72,17 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 	}
 }
 
-// ── Reader ────────────────────────────────────────────────────────────────
-
-// NewReader returns an http.Handler bound to this Engine's configuration
-// (stores, SearchEnabled, persisted streams), serving:
+// NewReader returns an http.Handler for this Engine's stores and settings,
+// serving:
 //
-//	GET /sys               — syslog ring / store (?q= search when enabled)
-//	GET /api               — api-log ring / store
-//	GET /audit             — audit store query (?request_id=, ?code=, ?domain=,
-//	                         ?since=, ?until=, ?limit=, ?after=<monotonic_seq>)
-//	GET /audit/doctor      — audit pipeline health
-//	GET /search            — cross-stream free-text search (sys-only in v1)
-//	GET /correlate         — request_id → merged audit/api/sys view
-//	GET /topology          — service_id → event aggregation
+//	GET /sys               syslog rows (?q= search when enabled)
+//	GET /api               api log rows
+//	GET /audit             audit rows (?request_id=, ?code=, ?domain=,
+//	                       ?since=, ?until=, ?limit=, ?after=<monotonic_seq>)
+//	GET /audit/doctor      audit pipeline health
+//	GET /search            free-text search (?streams= audit, api, sys; default sys)
+//	GET /correlate         audit, api and sys rows for one request_id
+//	GET /topology          emitting nodes, services and tenants
 //
 // SECURITY: these endpoints expose internal state (queue stats, init config,
 // raw audit rows, full log payloads). Mount them behind authentication
@@ -98,19 +92,15 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 // Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
 // Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
 //
-// Per-reader overrides (the equivalent of Python's router(persist_streams=,
-// search_enabled=, store=, transport=)) are achieved by binding the reader to a
-// separately-configured *Engine rather than passing options to NewReader:
+// For a reader with different stores or settings from Default, create a
+// separate Engine and call its NewReader:
 //
 //	e2 := &fasten.Engine{}
 //	_ = e2.Init(fasten.Config{ServiceID: "svc", NodeID: "n", SearchEnabled: true,
 //	    AuditStore: replica, APIStore: apiStore}) // read-replica / multi-store
 //	mux.Handle("/logs/", http.StripPrefix("/logs", e2.NewReader()))
 //
-// so a reader can point at different stores or a different search/persistence
-// policy than the process-wide Default engine.
-//
-// P1-44 tenant isolation: on shared-store multi-tenant deployments wire
+// Tenant isolation: on shared-store multi-tenant deployments wire
 //
 //	fasten.NewReader(fasten.WithTenantScope(fn), fasten.EnforceTenantIsolation())
 //
@@ -138,7 +128,7 @@ func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
 	if rc.enforceTenantIsolation && rc.tenantScope == nil {
 		panic("fasten.NewReader(EnforceTenantIsolation()) requires WithTenantScope(fn) — " +
 			"wire (r) -> (tenant, ok) from your auth layer, or drop " +
-			"EnforceTenantIsolation() for a single-tenant deployment (see P1-44).")
+			"EnforceTenantIsolation() for a single-tenant deployment.")
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sys", e.handleSys)
@@ -201,11 +191,11 @@ func EnforceTenantIsolation() ReaderOption {
 	return func(e *Engine) { e.enforceTenantIsolation = true }
 }
 
-// resolveTenant runs the wired scope hook. Returns:
-//   - ("", true, nil)  when no hook is wired (single-tenant mode)
-//   - (tenant, true, nil) when the hook returns a scope
-//   - ("", false, wroteResponse)  when the hook returns ok=false; caller
-//     must return immediately (401 already written)
+// resolveTenant runs the scope hook. It returns:
+//   - ("", true) when no hook is wired (single-tenant mode)
+//   - (tenant, true) when the hook returns a scope
+//   - ("", false) when the hook returns ok=false or an empty tenant; a 401
+//     has been written and the caller must return
 func (e *Engine) resolveTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	rc := e.readerConfigFrom(r)
 	if rc.tenantScope == nil {
@@ -258,36 +248,16 @@ func scopeAPIRows(rows []APIRow, scope string) []APIRow {
 	return out
 }
 
-// streamSource reports whether a stream is backed by the durable store or a
-// bounded ring, so consumers stay honest about gaps.
-//
-// This is the stream's configured *durability class*, not a per-response gap
-// signal: it says whether the stream CAN lose rows, never whether THIS response
-// did. A ring that overflowed and evicted older matching rows still reports
-// "ring" — identical to an empty ring that lost nothing; there is no truncation
-// flag here. (For /correlate, the totals-vs-counts pair is the per-response
-// truncation signal.)
-//
-// A stream is "store" only when it actually has a store (audit included), so a
-// stdout-only or never-Init'd engine reports "ring" rather than advertising a
-// durable store that was never configured. persistedStreams is nil until Init;
-// indexing a nil map yields false, so that case resolves to "ring".
-//
-// error/uninitialised reads still carry the flag so the response shape stays
-// uniform (the `error` key is what signals a read actually failed).
-//
-// A store-backed stream whose sink has swallowed at least one persist
-// failure reports "store-degraded": reads are still served from the store,
-// but durable history has known holes (rows that live only in the ring,
-// which store-backed reads never consult), so plain "store" would assert a
-// durability the data no longer has. Sticky for the store's lifetime.
+// streamSource returns the completeness value for a stream: "store" if it
+// has a store, "store-degraded" if that store has missed writes, else "ring".
+// It describes the stream, not one response: a ring that has dropped rows
+// still says "ring". For /correlate, counts vs totals shows truncation.
 func (e *Engine) streamSource(stream string) string {
 	if !e.persistedStreams[stream] {
 		return "ring"
 	}
 	if stream == "audit" {
-		// Audit is not a transport stream — its degraded signal comes from the
-		// audit store + drainer, not the api/sys StreamStores.
+		// Audit's degraded state comes from the audit store and drainer.
 		if e.auditDegraded() {
 			return "store-degraded"
 		}
@@ -306,13 +276,8 @@ func (e *Engine) streamSource(stream string) string {
 	return "store"
 }
 
-// auditDegraded reports whether audit durable history has known holes: the
-// audit store swallowed a persist failure (sync fallback path) or the drainer
-// dead-lettered at least one row (async path).
-//
-// The engine-side flag is checked even when the store itself doesn't expose
-// Degraded (an adopter AuditRepository may not implement NoteWriteFailure —
-// see Engine.auditWriteSwallowed).
+// auditDegraded reports whether an audit write was swallowed (engine or
+// store flag) or the drainer dead-lettered a row.
 func (e *Engine) auditDegraded() bool {
 	if e.auditWriteSwallowed.Load() {
 		return true
@@ -338,16 +303,13 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	comp := map[string]string{"sys": e.streamSource("sys")}
 	if qtext := q.Get("q"); qtext != "" {
-		// FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
+		// Free-text search must be enabled and time-bounded (§4.1).
 		if msg := e.searchGuard(qtext, q.Get("since")); msg != "" {
 			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp, "error": msg})
 			return
 		}
-		// Reject q= combined with structured chips rather than silently
-		// dropping them (parity with /api?q= — see the reject just below in
-		// handleAPI). An operator who narrows with ?q=timeout&level=error
-		// must not get a superset back with no signal that the chip was
-		// ignored.
+		// q= can't be combined with structured filters. Reject rather than
+		// ignore them, or ?q=timeout&level=error would return more than asked.
 		var dropped []string
 		for _, name := range []string{"level", "request_id", "service_id", "event"} {
 			if q.Get(name) != "" {
@@ -383,7 +345,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		}
 		if !ok {
 			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp,
-				"error": "search requires sys persistence — configure a syslog store (FR1)"})
+				"error": "search requires sys persistence: configure a syslog store"})
 			return
 		}
 		if rows == nil {
@@ -427,17 +389,15 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 
 // MaxQueryLength is the maximum accepted length of ?q= on /sys, /api,
 // and /search. Rejects a naive attempt to DoS the store's LIKE pattern
-// with a multi-MB query. Parity with the Python side (P1-46).
+// with a multi-MB query. Same limit as the Python SDK.
 const MaxQueryLength = 1024
 
 // searchGuard returns "" when a q= read is allowed, else the reason it is not:
 // search must be explicitly enabled (§4.1) and time-bounded (since= mandatory,
 // no unbounded scans). Also caps q= length so a caller can't hand the store
-// a multi-MB LIKE pattern that runs quadratic per row (P1-46).
+// a multi-MB LIKE pattern that runs quadratic per row.
 func (e *Engine) searchGuard(q, since string) string {
-	// Count RUNES, not bytes. len() is bytes, so a 1024-character UTF-8 query
-	// with any multibyte character was rejected here while Python's
-	// max_length=1024 (characters) accepted it — same input, two answers.
+	// Count runes, not bytes, to match Python's max_length (characters).
 	if utf8.RuneCountInString(q) > MaxQueryLength {
 		return fmt.Sprintf("q= is capped at %d characters", MaxQueryLength)
 	}
@@ -450,14 +410,13 @@ func (e *Engine) searchGuard(q, since string) string {
 	return ""
 }
 
-// handleSearch is the FR3 free-text escape hatch (§4.1): time-bounded,
-// hard-capped, no ranking, opt-in via SearchEnabled. Returns matches carrying
-// request_id so a consumer can hand one to /correlate.
+// handleSearch serves free-text search (§4.1): enabled via SearchEnabled,
+// time-bounded, capped, unranked. Each match carries its request_id for
+// /correlate.
 //
-// ?streams= is a comma-separated subset of {audit, api, sys}. Default: sys.
-// Each named stream must have a store — ring-only streams produce a
-// per-stream error (errors.<stream>) rather than an empty list that reads
-// as "no matches".
+// ?streams= is a comma-separated subset of audit, api, sys (default sys). A
+// stream without a store gets an entry in errors rather than an empty list
+// that would look like "no matches".
 func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 	tenant, tok := e.resolveTenant(w, r)
 	if !tok {
@@ -466,10 +425,9 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	qtext := q.Get("q")
 
-	// Parse streams= before the guard — a bad ?streams=foo fails loudly
-	// rather than falling through.
+	// Check streams= first, so ?streams=foo is a 400 whatever else is wrong.
 	valid := map[string]bool{"audit": true, "api": true, "sys": true}
-	wanted := []string{"sys"} // default
+	wanted := []string{"sys"}
 	if s := q.Get("streams"); s != "" {
 		wanted = wanted[:0]
 		for _, p := range strings.Split(s, ",") {
@@ -530,9 +488,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 	matches := []map[string]any{}
 	counts := map[string]int{}
 	errs := map[string]string{}
-	// Stable stream order in the response so a UI can render tabs
-	// deterministically. Sys first (the historical default), then api,
-	// then audit — mirrors the /correlate response order.
+	// Fixed stream order (sys, api, audit), as in /correlate.
 	wantSet := map[string]bool{}
 	for _, s := range wanted {
 		wantSet[s] = true
@@ -549,7 +505,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if !ok {
-				errs["sys"] = "requires sys persistence — configure a syslog store (FR1)"
+				errs["sys"] = "requires sys persistence: configure a syslog store"
 				counts["sys"] = 0
 				continue
 			}
@@ -568,7 +524,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if !ok {
-				errs["api"] = "requires api persistence — configure an api store (FR1)"
+				errs["api"] = "requires api persistence: configure an api store"
 				counts["api"] = 0
 				continue
 			}
@@ -589,7 +545,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error)
 			})
 			if e.auditStore == nil || !ok {
-				errs["audit"] = "requires an audit store with a Search method (FR1)"
+				errs["audit"] = "requires an audit store with a Search method"
 				counts["audit"] = 0
 				continue
 			}
@@ -633,8 +589,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	if _, ok := q["q"]; ok {
-		// Free-text search is sys-only in v1 (§9). Reject rather than
-		// silently drop, so callers can't assume q= works on the api stream.
+		// /api doesn't take q=; api search goes through /search?streams=api.
 		http.Error(w, "free-text q= not accepted on /api — use /search?streams=api "+
 			"(or /logs/sys?q= for syslog only)", http.StatusBadRequest)
 		return
@@ -672,20 +627,17 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"rows": scopeAPIRows(rows, tenant), "completeness": map[string]string{"api": e.streamSource("api")}})
 }
 
-// filterCounter is the optional filtered-count capability of an audit store,
-// used for /correlate totals. The built-in SQLite and Postgres stores
-// implement it; adopter stores that don't fall back to totals == counts.
+// filterCounter is an optional audit store method used for totals. The
+// SQLite and Postgres stores implement it; without it the audit total is
+// null.
 type filterCounter interface {
 	CountFiltered(ctx context.Context, f Filter) (int, error)
 }
 
-// handleCorrelate is the unified correlation read (FR2): every stream for one
-// request_id in a single call. Fans out to the existing per-stream query paths
-// (audit store + sys/api rings-or-stores) and assembles them — no new query
-// semantics. completeness reports each stream's durability class, and totals
-// reports how many matching rows the backing source holds — counts is how
-// many this capped response returned, so counts < totals means the response
-// is truncated (raise limit or page the per-stream endpoints).
+// handleCorrelate returns the audit, api and sys rows for one request_id,
+// using the same queries as the per-stream endpoints. counts is what this
+// response holds and totals is what the source holds, so counts < totals
+// means it was truncated.
 func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	tenant, tok := e.resolveTenant(w, r)
 	if !tok {
@@ -707,7 +659,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	if e.auditStore != nil {
 		// Tenant pushed down to the store filter — prevents the
 		// X-Request-ID pivot attack where tenant B guesses/replays a
-		// known tenant-A request_id to read A's rows (P1-44).
+		// known tenant-A request_id to read A's rows.
 		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -757,17 +709,13 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Truncation is counts < totals per stream. The pair is authoritative; this
-	// boolean is a convenience so every caller doesn't re-derive the inequality
-	// (and get it subtly wrong). Reported per stream. audit total may be null
-	// (count failure or no filterCounter capability), in which case truncated
-	// is also null — an honest "unknown", not a spurious false.
+	// truncated is counts < totals per stream. If the audit total is unknown
+	// (null), so is audit's truncated.
 	var auditTruncated any
 	if auditTotal != nil {
 		auditTruncated = len(audit) < *auditTotal
 	}
-	// totals must marshal as {audit: null, api: N, sys: N} on count failure.
-	// A map[string]int can't hold nil, so use map[string]any.
+	// map[string]any so audit can be null.
 	totals := map[string]any{"api": apiTotal, "sys": sysTotal}
 	if auditTotal != nil {
 		totals["audit"] = *auditTotal
@@ -824,11 +772,9 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	// Cursor-based pagination: ?after=<monotonic_seq> returns the next page.
-	// Use the lowest MonotonicSeq from the previous response as the cursor.
-	// after=0 is refused (Python's Query(ge=1) equivalent) — MonotonicSeq
-	// starts at 1, so 0 is never a real cursor value; treating it as
-	// "no cursor" would silently accept a bad copy-paste.
+	// ?after=<monotonic_seq> pages on from the previous response's
+	// next_after. Seq starts at 1, so after=0 is rejected rather than
+	// treated as no cursor.
 	after, aerr := parseNonNegInt("after", q.Get("after"), 0)
 	if aerr != nil {
 		http.Error(w, aerr.Error(), http.StatusUnprocessableEntity)
@@ -839,7 +785,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 			http.StatusUnprocessableEntity)
 		return
 	}
-	// P1-44: when tenantScope is wired, override any caller-supplied
+	// When tenantScope is wired, override any caller-supplied
 	// ?tenant_id= with the resolved scope. Without the hook, ?tenant_id=
 	// is honoured as-is (single-tenant / legacy call sites).
 	tenantParam := q.Get("tenant_id")
@@ -865,22 +811,17 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// convert to []map[string]any for consistent JSON
 	out := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, rowToMap(row))
 	}
-	// Dual pagination (FR5): offset (total/limit/offset) for page-number UIs and
-	// cursor (next_after) as the canonical, insert-stable model. next_after is
-	// the smallest monotonic_seq in this page (results are newest-first), passed
-	// back as ?after= to page forward into older rows. Both are always reported.
-	// total is *int so a count failure (or no filterCounter) reports null rather
-	// than falling back to len(rows) — which is capped at limit, so a paginating
-	// caller can't tell page N is the last one. Null = unknown; consumers should
-	// treat that as "may have more" (PR #59 finding 9).
+	// Both offset paging (total, limit, offset) and cursor paging
+	// (next_after, the smallest seq on this page, passed back as ?after=)
+	// are reported. total is null when it can't be counted, meaning "may
+	// have more"; len(rows) would be capped at limit.
 	var total *int
 	if counter, ok := e.auditStore.(filterCounter); ok {
-		// CountFiltered ignores Limit/Offset/AfterSeq → the full filtered count.
+		// CountFiltered ignores Limit, Offset and AfterSeq.
 		if n, cerr := counter.CountFiltered(r.Context(), f); cerr == nil {
 			total = &n
 		}
@@ -900,18 +841,15 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sourceAggregator is the optional fleet-topology capability of an audit store.
-// The built-in SQLite store implements it; stores that don't cause /topology to
-// report "store does not support topology aggregation".
+// sourceAggregator is an optional audit store method for /topology. The
+// SQLite store implements it.
 type sourceAggregator interface {
 	Sources(ctx context.Context, since, until time.Time) ([]map[string]any, error)
 }
 
-// handleTopology reports who is emitting into the store — one entry per distinct
-// (source_node_id, service_id, tenant_id) with row counts and first/last-seen —
-// plus distinct node/service/tenant counts. No separate topology table: the
-// fleet view falls out of the rows already recorded, so it can't drift. Parity
-// with the Python /topology.
+// handleTopology lists who is writing to the audit store: one entry per
+// (source_node_id, service_id, tenant_id) with row counts and first and last
+// timestamps, plus the number of distinct nodes, services and tenants.
 func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 	tenant, tok := e.resolveTenant(w, r)
 	if !tok {
@@ -949,7 +887,7 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 		sources = []map[string]any{}
 	}
 	if tenant != "" {
-		// P1-44: post-filter fleet enumeration by the resolved tenant.
+		// Post-filter fleet enumeration by the resolved tenant.
 		filtered := sources[:0]
 		for _, s := range sources {
 			if t, _ := s["tenant_id"].(string); t == tenant {
@@ -1096,11 +1034,8 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// parseLimit parses the ?limit= param for the structured-query endpoints.
-// Empty -> def. A present value must be an integer in [1, max]; anything else
-// (non-integer, non-positive, over max) is a caller error, returned so the
-// handler can answer 422 — parity with Python's Query(ge=1, le=max), which
-// rejects rather than silently coercing to the default or clamping.
+// parseLimit parses ?limit=. Empty gives def; anything other than an integer
+// in [1, max] is an error (the handler answers 422).
 func parseLimit(s string, def, max int) (int, error) {
 	if s == "" {
 		return def, nil
@@ -1115,10 +1050,8 @@ func parseLimit(s string, def, max int) (int, error) {
 	return n, nil
 }
 
-// parseNonNegInt parses ?offset=, ?after=, etc. Same policy as parseLimit:
-// empty -> def, non-integer / negative -> caller error. Fixes the silent
-// coercion where ?after=12a3 fell back to 0 and re-served page one, so a
-// client paging to exhaustion looped forever (PR #59 finding 8).
+// parseNonNegInt parses ?offset=, ?after= and the like. Empty gives def;
+// a non-integer or negative value is an error.
 func parseNonNegInt(name, s string, def int64) (int64, error) {
 	if s == "" {
 		return def, nil
@@ -1133,9 +1066,8 @@ func parseNonNegInt(name, s string, def int64) (int64, error) {
 	return n, nil
 }
 
-// parseRFC3339 parses ?since= / ?until= strictly. A malformed value used to
-// zero-out the bound silently, which dropped the whole window and returned
-// an aggregate over all history under HTTP 200 (PR #59 finding 8).
+// parseRFC3339 parses ?since= or ?until=. Empty gives the zero time; a
+// malformed value is an error rather than no bound.
 func parseRFC3339(name, s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, nil
@@ -1147,13 +1079,9 @@ func parseRFC3339(name, s string) (time.Time, error) {
 	return t, nil
 }
 
-// parseWindowTS parses a ?since= / ?until= reader input and returns it in
-// the canonical form (spec §4.3) — the same string every fasten writer
-// stamps into the timestamp column. Handlers pass the canonical string
-// straight into the lex compare, so a caller writing
-// ``?since=2026-08-21T10:00:00Z`` (20-char short form) reads the same
-// rows a caller writing the full 27-char form would. Empty stays empty
-// (no filter). Malformed → 422.
+// parseWindowTS parses ?since= or ?until= and returns it in the canonical
+// form (spec §4.3), so it compares correctly as a string against stored
+// timestamps whatever RFC3339 form the caller used. Empty stays empty.
 func parseWindowTS(name, s string) (string, error) {
 	if s == "" {
 		return "", nil
@@ -1165,8 +1093,7 @@ func parseWindowTS(name, s string) (string, error) {
 	return canonicalTS(t), nil
 }
 
-// parseSearchLimit resolves the FR3 result cap: default 50, hard max 200.
-// Rejects non-integer / out-of-range rather than silently coercing.
+// parseSearchLimit parses the search ?limit=: default 50, max 200.
 func parseSearchLimit(s string) (int, error) {
 	if s == "" {
 		return 50, nil
@@ -1180,6 +1107,3 @@ func parseSearchLimit(s string) (int, error) {
 	}
 	return n, nil
 }
-
-// contextKey for stdlib context (unexported, avoids collision).
-var _ context.Context = context.Background() // compile-time check
