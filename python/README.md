@@ -108,8 +108,11 @@ write-through (one synchronous INSERT + commit per pushed row — WAL +
 
 `fasten.emit()` defaults to **queue mode** — rows go onto a bounded
 in-memory queue, drained by a background thread with exponential
-backoff (100 ms → 60 s, ±20 % jitter). Store failures stay off the
-request path. See `audit_store_failure_strategy="raise"` to opt into
+backoff (100 ms → 60 s, ±20 % jitter) and dead-lettered after
+`queue_drain_max_attempts`. A failed insert doesn't fail the request,
+but when the queue is full `emit()` blocks until a slot frees, so in a
+long outage it waits on the drainer's retries; size `queue_capacity`
+and the retry settings for that. See `audit_store_failure_strategy="raise"` to opt into
 synchronous-with-`AuditStoreError` semantics. `fasten.queue_stats()`
 and `fasten.flush()` complete the public surface.
 
