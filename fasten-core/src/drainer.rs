@@ -140,6 +140,10 @@ struct DrainerInner {
     flush_cv: Condvar,
     slots: Sem,
     stop: AtomicBool,
+    /// Set (under the stats lock) once the drain thread has returned.
+    exited: AtomicBool,
+    /// Set with `exited` if the drain thread ended by panicking.
+    panicked: AtomicBool,
     stats: Mutex<InternalStats>,
 }
 
@@ -166,6 +170,8 @@ impl Drainer {
             flush_cv: Condvar::new(),
             slots: Sem::new(capacity),
             stop: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             stats: Mutex::new(InternalStats::default()),
         });
         let inner2 = inner.clone();
@@ -222,6 +228,17 @@ impl Drainer {
             }
         }
         let mut q = lock_or_recover(&self.inner.queue);
+        // stop() may have run since the check above, and the drain loop may
+        // already have exited; under the queue lock this check is final.
+        if self.inner.stop.load(Ordering::SeqCst) {
+            drop(q);
+            self.inner.slots.release();
+            sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+                "reason": "drainer_stopped",
+                "row_id": row.id,
+            }));
+            return false;
+        }
         q.push_back(row);
         self.inner.queue_cv.notify_one();
         true
@@ -239,8 +256,14 @@ impl Drainer {
         let mut st = lock_or_recover(&self.inner.stats);
         loop {
             let done = st.drained_total + st.dead_lettered_total;
-            if done >= target {
+            // Once stopping, slot counts no longer track queued rows; wait
+            // for the drain thread, which handles every queued row first.
+            let stopping = self.inner.stop.load(Ordering::SeqCst);
+            if done >= target && !stopping {
                 return true;
+            }
+            if self.inner.exited.load(Ordering::SeqCst) {
+                return stopping && !self.inner.panicked.load(Ordering::SeqCst);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -283,15 +306,32 @@ impl Drainer {
 
     /// Stop the drainer: signal the background thread to exit, then join.
     /// Remaining rows get one final drain attempt with no retry.
+    /// The join has no timeout: the thread may be inside a host callback,
+    /// and the host may drop that callback once stop returns. If the join
+    /// takes longer than `timeout`, an `audit_drain_stop_slow` event says so.
     pub fn stop(&self, timeout: Duration) {
         self.inner.stop.store(true, Ordering::SeqCst);
         self.inner.slots.release_all();
-        self.inner.queue_cv.notify_all();
-        let deadline = Instant::now() + timeout;
+        {
+            // Notify under the queue lock so the drain loop can't miss it
+            // between its stop check and its wait.
+            let _q = lock_or_recover(&self.inner.queue);
+            self.inner.queue_cv.notify_all();
+        }
         if let Some(h) = lock_or_recover(&self.handle).take() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = h.join(); // join ignores timeout — thread exits quickly on stop
-            let _ = remaining;
+            let started = Instant::now();
+            let joined = h.join();
+            let depth = lock_or_recover(&self.inner.queue).len();
+            if joined.is_err() {
+                sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+                    "reason": "drain_thread_panicked",
+                    "depth": depth,
+                }));
+            } else if started.elapsed() > timeout {
+                sys_event("warn", "audit_drain_stop_slow", &serde_json::json!({
+                    "waited_seconds": started.elapsed().as_secs_f64(),
+                }));
+            }
         }
     }
 }
@@ -305,6 +345,21 @@ impl Drop for Drainer {
 // ── Drain loop (background thread) ────────────────────────────────────────
 
 fn drain_loop(inner: Arc<DrainerInner>) {
+    // Runs on normal return and on panic, so flush never waits on a dead thread.
+    struct Exit<'a>(&'a DrainerInner);
+    impl Drop for Exit<'_> {
+        fn drop(&mut self) {
+            let _st = lock_or_recover(&self.0.stats);
+            self.0.panicked.store(thread::panicking(), Ordering::SeqCst);
+            self.0.exited.store(true, Ordering::SeqCst);
+            self.0.flush_cv.notify_all();
+        }
+    }
+    let _exit = Exit(&inner);
+    drain_rows(&inner);
+}
+
+fn drain_rows(inner: &Arc<DrainerInner>) {
     loop {
         let row = {
             let mut q = lock_or_recover(&inner.queue);
@@ -315,7 +370,8 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                 if inner.stop.load(Ordering::Acquire) {
                     return; // exit cleanly
                 }
-                q = cv_wait_or_recover(&inner.queue_cv, q);
+                q = inner.queue_cv.wait_timeout(q, Duration::from_secs(1))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).0;
                 if inner.stop.load(Ordering::Acquire) && q.is_empty() {
                     return;
                 }
@@ -331,25 +387,28 @@ fn drain_loop(inner: Arc<DrainerInner>) {
             let result = match call {
                 Ok(r) => r,
                 Err(_) => {
-                    on_dead_letter(&inner, &row, attempt + 1, "store.insert panicked");
+                    on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
                     break;
                 }
             };
             match result {
                 Ok(()) => {
-                    on_success(&inner);
+                    on_success(inner);
                     break;
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     attempt += 1;
-                    if attempt >= inner.cfg.max_attempts || in_shutdown {
-                        on_dead_letter(&inner, &row, attempt, &msg);
+                    // Spec §10: no retry once stopping.
+                    if attempt >= inner.cfg.max_attempts || in_shutdown
+                        || inner.stop.load(Ordering::Acquire)
+                    {
+                        on_dead_letter(inner, &row, attempt, &msg);
                         break;
                     }
-                    on_failure(&inner, &msg, attempt);
+                    on_failure(inner, &msg, attempt);
                     // Wait out the backoff
-                    let backoff = compute_backoff(&inner, attempt);
+                    let backoff = compute_backoff(inner, attempt);
                     let deadline = Instant::now() + backoff;
                     loop {
                         let rem = deadline.saturating_duration_since(Instant::now());
@@ -479,7 +538,7 @@ fn compute_backoff_val(
 
 // ── Sys-stream emission ────────────────────────────────────────────────────
 
-fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
+pub(crate) fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut obj = serde_json::json!({
         "shape": "sys",
@@ -494,4 +553,41 @@ fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
     }
     let line = serde_json::to_string(&obj).unwrap_or_default();
     let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use crate::store::Filter;
+
+    struct OkStore;
+
+    impl Store for OkStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> { Ok(()) }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// A slot flush counts but whose row never gets queued, as when enqueue
+    /// is refused at stop: flush must return once the drain thread is gone.
+    #[test]
+    fn flush_returns_once_the_drain_thread_has_exited() {
+        let d = Drainer::new(Box::new(OkStore), DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts: 3,
+        });
+        d.stop(Duration::from_secs(2));
+        d.inner.slots.acquire();
+        let start = Instant::now();
+        assert!(d.flush(Duration::from_secs(30)));
+        assert!(start.elapsed() < Duration::from_secs(5), "flush waited for its timeout");
+    }
 }

@@ -506,8 +506,10 @@ FastenStore* fasten_store_from_callback(
  * Attach a background-drain queue to an existing store handle.
  *
  * Must be called before fasten_drainer_enqueue. The drainer shares the
- * store already held by `store`. Re-calling replaces any existing drainer
- * (previous pending rows are flushed with a 2-second timeout first).
+ * store already held by `store`. Re-calling replaces any existing drainer:
+ * the new one takes rows at once, and the old one is flushed (up to 5 s)
+ * and then stopped. Rows it could not write are reported in an
+ * `audit_drain_install_incomplete` sys event.
  *
  * @param store            Non-null handle returned by fasten_store_open().
  * @param capacity         Max queued + in-flight slots (0 = default 100).
@@ -533,7 +535,9 @@ FastenErrorCode fasten_drainer_install(
  * Enqueue a row JSON for asynchronous insertion.
  *
  * Blocks under back-pressure (queue full + store slow). Returns
- * FASTEN_ERR_NULL_ARG when no drainer is installed.
+ * FASTEN_ERR_NULL_ARG when no drainer is installed, and
+ * FASTEN_ERR_DRAINER_STOPPED when the drainer is stopping and the row was
+ * not queued; in both cases the caller should store the row itself.
  *
  * @param store    Non-null handle.
  * @param row_json UTF-8 JSON object matching the fasten wire schema.
@@ -583,9 +587,9 @@ FastenErrorCode fasten_drainer_stats_json(
 );
 
 /**
- * Shut down the drainer: signal the background thread to stop and
- * perform a best-effort drain (2-second timeout). Safe to call with NULL
- * or when no drainer is installed.
+ * Shut down the drainer. Each queued row gets one more attempt; then close
+ * waits for the drain thread, including a store callback in progress.
+ * Safe to call with NULL or when no drainer is installed.
  */
 void fasten_drainer_close(FastenStore* store);
 
@@ -596,6 +600,7 @@ void fasten_drainer_close(FastenStore* store);
 #define FASTEN_ERR_ID_MISMATCH     7  /**< Meta.id disagrees with dict key.         */
 #define FASTEN_ERR_DOMAIN_MISMATCH 8  /**< Meta.domain disagrees with domain arg.   */
 #define FASTEN_ERR_DUPLICATE_CODE  9  /**< Code already registered.                 */
+#define FASTEN_ERR_DRAINER_STOPPED 10 /**< Drainer stopping; row was not queued.    */
 
 #ifdef __cplusplus
 }

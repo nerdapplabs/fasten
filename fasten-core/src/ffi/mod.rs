@@ -18,7 +18,7 @@ pub(crate) mod redact;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::panic;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     drainer::Drainer,
@@ -55,7 +55,11 @@ where
 /// Heap-allocated, type-erased store + optional drainer. C sees only `FastenStore*`.
 pub struct FastenStoreHandle {
     store: Arc<dyn Store>,
-    drainer: Option<Arc<Drainer>>,
+    // Callers clone the Arc under the lock, so a drainer closed by one thread
+    // stays usable for calls already in progress on others.
+    drainer: Mutex<Option<Arc<Drainer>>>,
+    // Drainers being flushed or stopped by install/close; flush waits for them.
+    retiring: Mutex<Vec<Arc<Drainer>>>,
 }
 
 /// Write the error string and return the error code.
@@ -113,7 +117,11 @@ pub unsafe extern "C" fn fasten_store_open(
             other => return Err(Error::UnknownBackend(other.to_owned())),
         };
 
-        Ok(Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None })))
+        Ok(Box::into_raw(Box::new(FastenStoreHandle {
+            store,
+            drainer: Mutex::new(None),
+            retiring: Mutex::new(Vec::new()),
+        })))
     });
 
     match result {
@@ -419,7 +427,11 @@ pub unsafe extern "C" fn fasten_store_from_callback(
     _out_err: *mut *mut c_char,
 ) -> *mut FastenStoreHandle {
     let store: Arc<dyn Store> = Arc::new(CallbackStore { fn_ptr, ud: SendRawPtr(userdata) });
-    Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None }))
+    Box::into_raw(Box::new(FastenStoreHandle {
+        store,
+        drainer: Mutex::new(None),
+        retiring: Mutex::new(Vec::new()),
+    }))
 }
 
 /// Close the store (and any attached drainer) and release all resources.
@@ -430,8 +442,8 @@ pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
     if !handle.is_null() {
         // Stop drainer first so its background thread exits cleanly before
         // the store Arc's ref-count drops to zero.
-        let h = &mut *handle;
-        if let Some(d) = h.drainer.take() {
+        let taken = drainer::take(&*handle);
+        if let Some(d) = taken {
             d.stop(std::time::Duration::from_secs(2));
         }
         drop(Box::from_raw(handle));
