@@ -94,9 +94,11 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
          prev_hash,hash)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """
-        lock.withLock {
+        try lock.withLock {
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw FastenError("SQLite insert failed: \(lastError())")
+            }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_text(stmt,  1, row.id,            -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt,  2, row.originID,      -1, SQLITE_TRANSIENT)
@@ -127,7 +129,9 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             }
             sqlite3_bind_text(stmt, 20, row.prevHash,      -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 21, row.hash,          -1, SQLITE_TRANSIENT)
-            sqlite3_step(stmt)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw FastenError("SQLite insert failed: \(lastError())")
+            }
         }
     }
 
@@ -149,6 +153,10 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    private func lastError() -> String {
+        sqlite3_errmsg(db).map { String(cString: $0) } ?? "unknown error"
+    }
 
     private func exec(_ sql: String) throws {
         var err: UnsafeMutablePointer<CChar>? = nil
