@@ -1,0 +1,464 @@
+package fasten
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"math"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Queue mode: rows go through the fasten-core drainer and the store seals
+// them (spec/drainer-conformance.md §7 vectors, chain-replication §2.1).
+
+type flakyStore struct {
+	*SQLiteStore
+	mu       sync.Mutex
+	fail     int
+	failIf   func(Row) bool
+	panicIf  func(Row) bool
+	delay    time.Duration
+	attempts int
+}
+
+func (s *flakyStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	s.mu.Lock()
+	s.attempts++
+	failing := s.attempts <= s.fail || (s.failIf != nil && s.failIf(row))
+	panicking := s.panicIf != nil && s.panicIf(row)
+	delay := s.delay
+	s.mu.Unlock()
+	time.Sleep(delay)
+	if panicking {
+		panic("store bug")
+	}
+	if failing {
+		return row, errors.New("store down")
+	}
+	return s.SQLiteStore.AllocateAndInsertOriginated(ctx, row)
+}
+
+func (s *flakyStore) tries() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func newFlakyStore(t *testing.T, fail int) *flakyStore {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetMaxOpenConns(1) // SQLite allows one writer; extra connections get "database is locked"
+	inner, err := NewSQLiteStore(db, "fasten_audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &flakyStore{SQLiteStore: inner, fail: fail}
+}
+
+func (s *flakyStore) rows(t *testing.T) []Row {
+	t.Helper()
+	rows, err := s.SQLiteStore.Query(context.Background(), Filter{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func initQueue(t *testing.T, store AuditRepository, cfg Config) {
+	t.Helper()
+	cfg.ServiceID, cfg.NodeID, cfg.AuditStore = "svc", "node", store
+	cfg.AuditStoreFailureStrategy = "queue"
+	cfg.DisableQueueJitter = true
+	if cfg.QueueRetryInitial == 0 {
+		cfg.QueueRetryInitial = 10 * time.Millisecond
+	}
+	if cfg.QueueRetryMax == 0 {
+		cfg.QueueRetryMax = 50 * time.Millisecond
+	}
+	if err := Init(cfg); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+}
+
+func emitN(t *testing.T, n int) []Row {
+	t.Helper()
+	out := make([]Row, n)
+	for i := range out {
+		r, err := Emit(context.Background(), "USER_CREATED", Target("u"))
+		if err != nil {
+			t.Fatalf("Emit: %v", err)
+		}
+		out[i] = r
+	}
+	return out
+}
+
+func waitForTries(t *testing.T, s *flakyStore, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.tries() < n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.tries() < n {
+		t.Fatalf("store saw %d attempts, want %d", s.tries(), n)
+	}
+}
+
+func sysEvents(t *testing.T, event string) []SyslogRow {
+	t.Helper()
+	rows, err := Default.GetTransport().QuerySyslog(1000, StreamQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []SyslogRow
+	for _, r := range rows {
+		if r["event"] == event {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func TestQueueOutageThenRecovery(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 2)
+	initQueue(t, store, Config{})
+	emitN(t, 1)
+	if !Flush(2 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := len(store.rows(t)); got != 1 {
+		t.Fatalf("rows = %d, want 1", got)
+	}
+	if store.tries() < 3 {
+		t.Fatalf("attempts = %d, want >= 3", store.tries())
+	}
+	if s := GetQueueStats(); s == nil || s.DeadLetteredTotal != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestQueueDeadLetterAfterMaxAttempts(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, store, Config{QueueDrainMaxAttempts: 3})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	if s := GetQueueStats(); s == nil || s.DeadLetteredTotal != 1 || s.Depth != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	if store.tries() != 3 {
+		t.Fatalf("attempts = %d, want 3", store.tries())
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a dead-lettered row must mark the engine degraded")
+	}
+}
+
+func TestQueueDrainedRowsAreSealedInEmitOrder(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 1)
+	initQueue(t, store, Config{})
+	emitted := emitN(t, 3)
+	if !Flush(2 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	rows := store.rows(t)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	bySeq := map[int64]string{}
+	for _, r := range rows {
+		if r.Hash == "" {
+			t.Fatalf("row %s stored unsealed", r.ID)
+		}
+		bySeq[r.MonotonicSeq] = r.ID
+	}
+	for i, e := range emitted {
+		if bySeq[int64(i+1)] != e.ID {
+			t.Fatalf("seq %d = %s, want %s", i+1, bySeq[int64(i+1)], e.ID)
+		}
+		if e.Hash != "" {
+			t.Fatal("Emit cannot know the seal in queue mode (spec §8)")
+		}
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("chain must verify: %+v", res)
+	}
+}
+
+func TestQueueFullQueueLosesNothingUnderConcurrentEmits(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.delay = 10 * time.Millisecond
+	initQueue(t, store, Config{QueueCapacity: 2})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); emitN(t, 1) }()
+	}
+	wg.Wait()
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := len(store.rows(t)); got != 8 {
+		t.Fatalf("rows = %d, want 8", got)
+	}
+	if s := GetQueueStats(); s == nil || s.HighWater > 2 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestQueueEmitsRacingUninstallAreAllStored(t *testing.T) {
+	registerTestCodes(t)
+	for round := 0; round < 20; round++ {
+		resetGlobals(t)
+		store := newFlakyStore(t, 0)
+		store.delay = time.Millisecond
+		initQueue(t, store, Config{QueueCapacity: 2})
+		var wg sync.WaitGroup
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); emitN(t, 1) }()
+		}
+		Default.uninstallDrainer()
+		wg.Wait()
+		if got := len(store.rows(t)); got != 16 {
+			t.Fatalf("round %d: rows = %d, want 16", round, got)
+		}
+		if Default.auditWriteSwallowed.Load() {
+			t.Fatalf("round %d: engine marked degraded", round)
+		}
+	}
+}
+
+func TestQueueRowsAtStopAreRecoveredOrReportedLost(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 2) // "good" fails its first try and its try at stop
+	store.failIf = func(r Row) bool { return r.Target == "bad" }
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	good, _ := Emit(context.Background(), "USER_CREATED", Target("good"))
+	bad, _ := Emit(context.Background(), "USER_CREATED", Target("bad"))
+	waitForTries(t, store, 1) // "good" failed once and is in backoff
+	Default.uninstallDrainer()
+	rows := store.rows(t)
+	if len(rows) != 1 || rows[0].ID != good.ID {
+		t.Fatalf("stored %+v, want only %s", rows, good.ID)
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a row lost at stop must mark the engine degraded")
+	}
+	if ev := sysEvents(t, "audit_drain_lost_at_stop"); len(ev) != 1 || ev[0]["row_id"] != bad.ID {
+		t.Fatalf("lost events = %v", ev)
+	}
+	if ev := sysEvents(t, "audit_drain_recovered_at_stop"); len(ev) != 1 || len(ev[0]["row_ids"].([]any)) != 1 {
+		t.Fatalf("recovered events = %v", ev)
+	}
+}
+
+func TestQueueEmitAfterDrainerStoppedIsStored(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	initQueue(t, store, Config{})
+	Default.uninstallDrainer()
+	r := emitN(t, 1)[0]
+	if r.Hash == "" {
+		t.Fatal("row should be stored synchronously")
+	}
+}
+
+func TestQueueReinitWhileDrainingDoesNotOverlapTheDrainThread(t *testing.T) {
+	// The drain thread runs engine code; Init must retire it before writing
+	// engine fields (caught by -race otherwise).
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.delay = 5 * time.Millisecond
+	initQueue(t, store, Config{})
+	emitN(t, 20)
+	initQueue(t, store, Config{})
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := len(store.rows(t)); got != 20 {
+		t.Fatalf("rows = %d, want 20", got)
+	}
+}
+
+func TestQueueReinitKeepsTheFlagForTheSameStore(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, store, Config{QueueDrainMaxAttempts: 2})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	initQueue(t, store, Config{})
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a re-init on the same store must keep its hole reported")
+	}
+	initQueue(t, newFlakyStore(t, 0), Config{})
+	if Default.auditWriteSwallowed.Load() {
+		t.Fatal("a re-init on a new store clears the flag")
+	}
+}
+
+// valueStore is a store whose dynamic type is not comparable.
+type valueStore struct {
+	*flakyStore
+	tags []string
+}
+
+func (s valueStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	return s.flakyStore.AllocateAndInsertOriginated(ctx, row)
+}
+
+func TestQueueNonComparableStoreUsesTheDrainerAndReportsLoss(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	inner := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, valueStore{flakyStore: inner, tags: []string{"x"}}, Config{QueueDrainMaxAttempts: 2})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	if s := GetQueueStats(); s == nil || s.DeadLetteredTotal != 1 {
+		t.Fatalf("stats = %+v, want the row dead-lettered by the drainer", s)
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a dead-lettered row must mark the engine degraded")
+	}
+}
+
+func TestQueuePanickingStoreIsAFailedInsert(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.panicIf = func(Row) bool { return true }
+	initQueue(t, store, Config{QueueDrainMaxAttempts: 2})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	if s := GetQueueStats(); s == nil || s.DeadLetteredTotal != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a dead-lettered row must mark the engine degraded")
+	}
+}
+
+func TestQueueRowsRecoveredAtStopKeepEmitOrder(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	tried := map[string]int{}
+	// Each row fails its first try, and every try fails until all three
+	// have had one: the drainer gives up on them all at stop.
+	store.failIf = func(r Row) bool {
+		tried[r.ID]++
+		return tried[r.ID] == 1 || store.attempts < 4
+	}
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	emitted := emitN(t, 3)
+	waitForTries(t, store, 1)
+	Default.uninstallDrainer()
+	rows := store.rows(t)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	bySeq := map[int64]string{}
+	for _, r := range rows {
+		bySeq[r.MonotonicSeq] = r.ID
+	}
+	for i, e := range emitted {
+		if bySeq[int64(i+1)] != e.ID {
+			t.Fatalf("seq %d = %s, want %s", i+1, bySeq[int64(i+1)], e.ID)
+		}
+	}
+}
+
+func TestQueueFlushWaitsForARetiringDrainer(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 2) // first try and the try at stop fail
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	emitN(t, 1)
+	waitForTries(t, store, 1)
+	store.mu.Lock()
+	store.delay = 200 * time.Millisecond // the inline store at stop is slow
+	store.mu.Unlock()
+	go Default.uninstallDrainer()
+	for Default.activeDrainer() != nil {
+		time.Sleep(time.Millisecond)
+	}
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := len(store.rows(t)); got != 1 {
+		t.Fatalf("Flush returned before the row was stored: rows = %d", got)
+	}
+}
+
+func TestQueueOldStoreLosingRowsDoesNotDegradeTheNewOne(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	old := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, old, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	emitN(t, 1)
+	waitForTries(t, old, 1)
+	initQueue(t, newFlakyStore(t, 0), Config{})
+	if Default.auditWriteSwallowed.Load() {
+		t.Fatal("rows lost by the old store must not degrade the new one")
+	}
+	if old.tries() < 3 {
+		t.Fatalf("old store attempts = %d, want >= 3", old.tries())
+	}
+}
+
+func TestQueueMaxAttemptsOverflowIsRejected(t *testing.T) {
+	if math.MaxInt <= math.MaxUint32 {
+		t.Skip("int cannot exceed MaxUint32 here")
+	}
+	registerTestCodes(t)
+	resetGlobals(t)
+	err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: newFlakyStore(t, 0),
+		QueueDrainMaxAttempts: math.MaxUint32 + 1})
+	if err == nil {
+		t.Fatal("want an error for QueueDrainMaxAttempts > MaxUint32")
+	}
+}
+
+func TestQueueEmitReachingARetiredDrainerStoresInline(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	initQueue(t, store, Config{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	testHookEnqueue = func() { close(entered); <-release }
+	t.Cleanup(func() { testHookEnqueue = nil })
+	done := make(chan Row)
+	go func() { done <- emitN(t, 1)[0] }()
+	<-entered
+	testHookEnqueue = nil
+	Default.uninstallDrainer() // closes the drainer this emit already holds
+	close(release)
+	r := <-done
+	if r.Hash == "" {
+		t.Fatal("row should be stored inline once the drainer is closed")
+	}
+	if ev := sysEvents(t, "audit_drain_stored_inline"); len(ev) != 1 || ev[0]["row_id"] != r.ID {
+		t.Fatalf("stored-inline events = %v", ev)
+	}
+	if got := len(store.rows(t)); got != 1 {
+		t.Fatalf("rows = %d, want 1", got)
+	}
+}

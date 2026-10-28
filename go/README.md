@@ -103,9 +103,13 @@ set the pragma in your DSN so every pooled connection gets it).
 
 ## P1-15: audit-store failure handling
 
-`fasten.Emit()` defaults to **queue mode** — rows go onto a bounded
-channel, drained by a goroutine with exponential backoff (100 ms →
-60 s, ±20 % jitter). Store failures stay off the request path. Set
+`fasten.Emit()` defaults to **queue mode** — rows go onto the bounded
+fasten-core queue, drained by a background thread with exponential
+backoff (100 ms → 60 s, ±20 % jitter) and dead-lettered after
+`QueueDrainMaxAttempts`. A failed insert doesn't fail the request, but
+when the queue is full `Emit()` blocks until a slot frees, so in a long
+outage it waits on the drainer's retries; size `QueueCapacity` and the
+retry settings for that. Set
 `Config.AuditStoreFailureStrategy = "raise"` to opt into synchronous
 semantics with `*fasten.AuditStoreError`. `fasten.GetQueueStats()` and
 `fasten.Flush(timeout)` complete the public surface.

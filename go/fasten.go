@@ -456,10 +456,11 @@ type QueueStats struct {
 // AuditStoreFailureStrategy (P1-15) governs how Emit reacts when the
 // store rejects a row:
 //
-//   - "queue" (default) — Emit pushes rows onto a bounded in-memory
-//     queue and returns immediately. A background drainer goroutine
-//     writes to the store with exponential backoff. Emit blocks only
-//     when QueueCapacity (queued + in-flight retry) is saturated.
+//   - "queue" (default) — Emit hands rows to the fasten-core drainer,
+//     whose background thread stores them with exponential backoff and
+//     dead-letters a row after QueueDrainMaxAttempts. The returned row
+//     is not sealed yet (spec §8). Emit blocks only when QueueCapacity
+//     (queued + in-flight retry) is saturated.
 //   - "raise" — Emit calls Insert synchronously and returns the
 //     wrapped error (*AuditStoreError). Useful for tests and adopters
 //     who want loud failures during configuration debugging.
