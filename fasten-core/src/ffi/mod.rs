@@ -445,6 +445,7 @@ pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
         let taken = drainer::take(&*handle);
         if let Some(d) = taken {
             d.stop(std::time::Duration::from_secs(2));
+            d.wait_calls();
         }
         drop(Box::from_raw(handle));
     }

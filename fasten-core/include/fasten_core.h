@@ -532,6 +532,36 @@ FastenErrorCode fasten_drainer_install(
 );
 
 /**
+ * Receives one drainer sys event as a NUL-terminated JSON object with
+ * `shape`, `level`, `event`, `timestamp` and the event's fields. The string
+ * is valid only during the call.
+ */
+typedef void (*FastenSysLogFn)(const char* event_json, void* userdata);
+
+/**
+ * fasten_drainer_install, with the drainer's sys events (audit_drain_*,
+ * audit_queue_*) sent to `sys_log` instead of stderr. NULL = stderr.
+ *
+ * `sys_log` is called with no drainer lock held, from the drain thread or
+ * from a thread calling enqueue, install or close on this handle. It must
+ * not call fasten_drainer_enqueue, close or install on the same handle. It
+ * and `userdata` must stay valid until fasten_drainer_close (or an install
+ * that replaces this drainer) returns; close waits for enqueue calls still
+ * running, so none calls `sys_log` after that.
+ */
+FastenErrorCode fasten_drainer_install_with_sys_log(
+    FastenStore*   store,
+    uint64_t       capacity,
+    uint64_t       retry_initial_ms,
+    uint64_t       retry_max_ms,
+    int            retry_jitter,
+    uint32_t       max_attempts,
+    FastenSysLogFn sys_log,
+    void*          userdata,
+    char**         out_err
+);
+
+/**
  * Enqueue a row JSON for asynchronous insertion.
  *
  * Blocks under back-pressure (queue full + store slow). Returns

@@ -153,3 +153,23 @@ fn every_accepted_row_is_stored_or_dead_lettered_when_stop_races_enqueue() {
         assert_eq!(accepted.load(Ordering::SeqCst), handled, "round {round}");
     }
 }
+
+#[test]
+fn drain_events_are_out_before_flush_returns() {
+    use fasten_core::drainer::SysLog;
+    for _ in 0..200 {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink: SysLog = {
+            let events = events.clone();
+            Arc::new(move |line: &str| events.lock().unwrap().push(line.to_owned()))
+        };
+        let d = Drainer::with_sys_log(Box::new(TestStore::new(true, Duration::ZERO)),
+                                      DrainerConfig { max_attempts: 1, ..cfg(4, Duration::from_millis(1)) },
+                                      Some(sink));
+        d.enqueue(row("r-1"));
+        assert!(d.flush(Duration::from_secs(5)));
+        assert!(events.lock().unwrap().iter().any(|l| l.contains("audit_drain_dead_letter")));
+        d.stop(Duration::from_secs(2));
+    }
+}
+

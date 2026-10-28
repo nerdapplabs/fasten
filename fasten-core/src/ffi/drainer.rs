@@ -3,13 +3,14 @@
 //! The drainer attaches to an existing `FastenStoreHandle` and manages a
 //! background OS thread with the full conformance-spec state machine.
 
+use std::ffi::{c_void, CString};
 use std::os::raw::{c_char, c_int};
 use std::time::Duration;
 
 use std::sync::Arc;
 
 use crate::{
-    drainer::{Drainer, DrainerConfig},
+    drainer::{Drainer, DrainerConfig, SysLog},
     error::{Error, FastenErrorCode},
     row::Row,
     store::{Filter, Store},
@@ -43,9 +44,12 @@ fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Option<Duration>
     let dead_before = old.stats().dead_lettered_total;
     let flushed = flush_for.is_none_or(|t| old.flush(t));
     old.stop(Duration::from_secs(2));
+    // Enqueues still running may emit through the sys sink; the host may
+    // release it once this returns.
+    old.wait_calls();
     let dead = old.stats().dead_lettered_total - dead_before;
     if flush_for.is_some() && (!flushed || dead > 0) {
-        crate::drainer::sys_event("warn", "audit_drain_install_incomplete", &serde_json::json!({
+        old.sys_event("warn", "audit_drain_install_incomplete", &serde_json::json!({
             "flushed": flushed,
             "dead_lettered": dead,
         }));
@@ -88,6 +92,60 @@ pub unsafe extern "C" fn fasten_drainer_install(
     max_attempts: u32,
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
+    install(handle, capacity, retry_initial_ms, retry_max_ms, retry_jitter, max_attempts, None, out_err)
+}
+
+/// Receives each drainer sys event as a NUL-terminated JSON line.
+pub type FastenSysLogFn = extern "C" fn(event_json: *const c_char, userdata: *mut c_void);
+
+struct HostSysLog {
+    f: FastenSysLogFn,
+    userdata: *mut c_void,
+}
+
+// SAFETY: the host guarantees `f` and `userdata` may be used from any thread
+// until fasten_drainer_close (or a replacing install) returns, and retire
+// waits for every call that could still emit before those return.
+unsafe impl Send for HostSysLog {}
+unsafe impl Sync for HostSysLog {}
+
+/// `fasten_drainer_install`, with sys events sent to `sys_log` instead of
+/// stderr. `sys_log` may be NULL (stderr).
+#[no_mangle]
+pub unsafe extern "C" fn fasten_drainer_install_with_sys_log(
+    handle: *mut FastenStoreHandle,
+    capacity: u64,
+    retry_initial_ms: u64,
+    retry_max_ms: u64,
+    retry_jitter: c_int,
+    max_attempts: u32,
+    sys_log: Option<FastenSysLogFn>,
+    userdata: *mut c_void,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let sink = sys_log.map(|f| {
+        let host = HostSysLog { f, userdata };
+        Arc::new(move |line: &str| {
+            let host = &host; // capture the Send wrapper, not its raw pointer
+            if let Ok(c) = CString::new(line) {
+                (host.f)(c.as_ptr(), host.userdata);
+            }
+        }) as SysLog
+    });
+    install(handle, capacity, retry_initial_ms, retry_max_ms, retry_jitter, max_attempts, sink, out_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn install(
+    handle: *mut FastenStoreHandle,
+    capacity: u64,
+    retry_initial_ms: u64,
+    retry_max_ms: u64,
+    retry_jitter: c_int,
+    max_attempts: u32,
+    sys_log: Option<SysLog>,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
     let r = guarded(|| {
         if handle.is_null() {
             return Err(crate::error::Error::NullArg);
@@ -103,7 +161,7 @@ pub unsafe extern "C" fn fasten_drainer_install(
         // Spec §10: build the new drainer, swap it in, then flush and stop
         // the old one outside the lock.
         let store_box = Box::new(ArcStoreShim(Arc::clone(&h.store)));
-        let new = Drainer::new(store_box, cfg);
+        let new = Drainer::with_sys_log(store_box, cfg, sys_log);
         let old = slot(h).replace(new);
         if let Some(old) = old {
             retire(h, &old, Some(Duration::from_secs(5)));
@@ -131,11 +189,14 @@ pub unsafe extern "C" fn fasten_drainer_enqueue(
         }
         let json = super::util::read_str(row_json).ok_or(crate::error::Error::NullArg)?;
         let row: crate::row::Row = serde_json::from_str(json)?;
-        match current(&*handle) {
-            None => Err(crate::error::Error::DrainerNotInstalled),
-            Some(d) if d.enqueue(row) => Ok(()),
-            Some(_) => Err(crate::error::Error::DrainerStopped),
-        }
+        // Start the call under the drainer lock, so close can wait for it.
+        let (d, _call) = {
+            let g = slot(&*handle);
+            let d = g.clone().ok_or(crate::error::Error::DrainerNotInstalled)?;
+            let call = d.begin_call();
+            (d, call)
+        };
+        if d.enqueue(row) { Ok(()) } else { Err(crate::error::Error::DrainerStopped) }
     });
     result_to_rc(r, out_err)
 }
@@ -236,6 +297,7 @@ mod tests {
     use super::*;
     use crate::ffi::{fasten_store_close, fasten_store_from_callback};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::thread;
 
     extern "C" fn slow_ok(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
@@ -383,4 +445,81 @@ mod tests {
         }
         unsafe { fasten_store_close(h) };
     }
+
+    static SYS_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    extern "C" fn record_sys(json: *const c_char, _ud: *mut std::ffi::c_void) {
+        let line = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy().into_owned();
+        SYS_LINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(line);
+    }
+
+    extern "C" fn always_fails(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 1 }
+
+    /// Sys events go to the host's callback, in order, and not to stderr.
+    #[test]
+    fn sys_events_reach_the_host_callback() {
+        let h = unsafe { fasten_store_from_callback(always_fails, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let rc = unsafe {
+            fasten_drainer_install_with_sys_log(h, 8, 1, 1, 0, 2, Some(record_sys),
+                                                std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, FastenErrorCode::Ok);
+        unsafe { fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut()) };
+        let mut drained: c_int = 0;
+        unsafe { fasten_drainer_flush(h, 5_000, std::ptr::addr_of_mut!(drained), std::ptr::null_mut()) };
+        unsafe { fasten_drainer_close(h) };
+        let rc = unsafe { fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut()) };
+        assert_eq!(rc, FastenErrorCode::ErrNullArg);
+        unsafe { fasten_store_close(h) };
+        let events: Vec<String> = SYS_LINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| v["event"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(events, ["audit_drain_failed", "audit_drain_dead_letter"]);
+    }
+
+    static SINK_AFTER_CLOSE: AtomicBool = AtomicBool::new(false);
+    static CLOSED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn slow_sink(json: *const c_char, _ud: *mut std::ffi::c_void) {
+        let line = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy();
+        if line.contains("audit_drain_abandoned") {
+            thread::sleep(Duration::from_millis(300));
+        }
+        if CLOSED.load(Ordering::SeqCst) {
+            SINK_AFTER_CLOSE.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// An enqueue still running when close starts emits its abandoned event
+    /// before close returns, so the host may then release its sink.
+    #[test]
+    fn close_waits_for_an_enqueue_still_emitting() {
+        // The one slot is held by a row in a long backoff, so the second
+        // enqueue waits; close wakes it and it emits abandoned (slowly).
+        let h = unsafe { fasten_store_from_callback(always_fails, std::ptr::null_mut(), std::ptr::null_mut()) };
+        unsafe {
+            fasten_drainer_install_with_sys_log(h, 1, 10_000, 10_000, 0, 3, Some(slow_sink),
+                                                std::ptr::null_mut(), std::ptr::null_mut());
+            fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut());
+        }
+        let addr = h as usize;
+        let blocked = thread::spawn(move || unsafe {
+            fasten_drainer_enqueue(addr as *mut FastenStoreHandle, ROW.as_ptr().cast::<c_char>(),
+                                   std::ptr::null_mut())
+        });
+        let start = std::time::Instant::now();
+        while current(unsafe { &*h }).is_some_and(|d| d.calls_in_flight() == 0)
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            thread::yield_now();
+        }
+        unsafe { fasten_drainer_close(h) };
+        CLOSED.store(true, Ordering::SeqCst);
+        assert!(matches!(blocked.join(), Ok(FastenErrorCode::ErrDrainerStopped)));
+        unsafe { fasten_store_close(h) };
+        assert!(!SINK_AFTER_CLOSE.load(Ordering::SeqCst), "sys_log called after close returned");
+    }
 }
+
