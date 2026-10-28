@@ -10,6 +10,7 @@ package fasten
 // Forward declaration so CGo can resolve C.goInsertCallback below.
 // Note: CGo generates char* (not const char*) for *C.char parameters.
 extern int32_t goInsertCallback(char* row_json, void* userdata);
+extern void goSysLogCallback(char* event_json, void* userdata);
 
 // Pass a cgo.Handle (a uintptr) as the void* userdata. The uintptr->void*
 // cast happens here in C, so the Go side never does unsafe.Pointer(uintptr(...))
@@ -17,6 +18,15 @@ extern int32_t goInsertCallback(char* row_json, void* userdata);
 static inline FastenStore* fasten_store_from_handle(
     FastenInsertCallbackFn fn, uintptr_t h, char** out_err) {
     return fasten_store_from_callback(fn, (void*)h, out_err);
+}
+
+static inline FastenErrorCode fasten_drainer_install_with_handle(
+    FastenStore* store, uint64_t capacity, uint64_t retry_initial_ms,
+    uint64_t retry_max_ms, int retry_jitter, uint32_t max_attempts,
+    uintptr_t h, char** out_err) {
+    return fasten_drainer_install_with_sys_log(store, capacity, retry_initial_ms,
+        retry_max_ms, retry_jitter, max_attempts,
+        (FastenSysLogFn)goSysLogCallback, (void*)h, out_err);
 }
 */
 import "C"
@@ -52,6 +62,28 @@ func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) (rc C.int32_t) {
 		return 1
 	}
 	return 0
+}
+
+// goSysLogCallback puts a fasten-core drainer event on the sys stream
+// (spec drainer-conformance §4). userdata is the same cgo.Handle.
+//
+//export goSysLogCallback
+func goSysLogCallback(eventJSON *C.char, userdata unsafe.Pointer) {
+	defer func() { _ = recover() }() // a sys event must not fail the drainer
+	d, ok := cgo.Handle(uintptr(userdata)).Value().(*cFastenDrainer)
+	if !ok {
+		return
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(C.GoString(eventJSON)), &fields); err != nil {
+		return
+	}
+	level, _ := fields["level"].(string)
+	event, _ := fields["event"].(string)
+	for _, k := range []string{"shape", "level", "event", "timestamp"} {
+		delete(fields, k)
+	}
+	d.engine.drainerSysLog(level, event, fields)
 }
 
 // pendingRow is a row the drainer holds. The callback stores this row, not
@@ -117,13 +149,14 @@ func newCFastenDrainer(
 	if retryJitter {
 		jitter = 1
 	}
-	rc := C.fasten_drainer_install(
+	rc := C.fasten_drainer_install_with_handle(
 		storePtr,
 		C.uint64_t(capacity),
 		C.uint64_t(retryInitialMs),
 		C.uint64_t(retryMaxMs),
 		jitter,
 		C.uint32_t(maxAttempts),
+		C.uintptr_t(h),
 		&errStr,
 	)
 	if rc != C.FASTEN_OK {

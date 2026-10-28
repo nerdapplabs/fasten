@@ -598,7 +598,15 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 			// a row the drainer refuses.
 			d := e.activeDrainer()
 			refused := false
-			if !durable && d != nil {
+			switch {
+			case durable:
+			case d == nil:
+				// No drainer to take the row (spec §7 V-12).
+				refused = true
+				e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+					"reason": "drainer_stopped", "row_id": row.ID,
+				})
+			default:
 				refused = !d.enqueue(row)
 			}
 			if durable || d == nil || refused {

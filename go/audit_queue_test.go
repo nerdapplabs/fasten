@@ -268,7 +268,7 @@ func TestQueueRowsAtStopAreRecoveredOrReportedLost(t *testing.T) {
 	}
 }
 
-func TestQueueEmitAfterDrainerStoppedIsStored(t *testing.T) {
+func TestQueueEmitAfterDrainerStoppedIsStored(t *testing.T) { // V-12
 	registerTestCodes(t)
 	resetGlobals(t)
 	store := newFlakyStore(t, 0)
@@ -277,6 +277,9 @@ func TestQueueEmitAfterDrainerStoppedIsStored(t *testing.T) {
 	r := emitN(t, 1)[0]
 	if r.Hash == "" {
 		t.Fatal("row should be stored synchronously")
+	}
+	if len(sysEvents(t, "audit_drain_abandoned")) != 1 || len(sysEvents(t, "audit_drain_stored_inline")) != 1 {
+		t.Fatal("want audit_drain_abandoned then audit_drain_stored_inline")
 	}
 }
 
@@ -460,5 +463,74 @@ func TestQueueEmitReachingARetiredDrainerStoresInline(t *testing.T) {
 	}
 	if got := len(store.rows(t)); got != 1 {
 		t.Fatalf("rows = %d, want 1", got)
+	}
+}
+
+// drainOrder returns the drain-state events, oldest first.
+func drainOrder(t *testing.T) []string {
+	t.Helper()
+	rows, err := Default.GetTransport().QuerySyslog(1000, StreamQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for i := len(rows) - 1; i >= 0; i-- { // the ring returns newest first
+		switch ev, _ := rows[i]["event"].(string); ev {
+		case "audit_drain_failed", "audit_drain_degraded", "audit_drain_recovered":
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func TestQueueV8ThresholdEventsAreDebounced(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.delay = 20 * time.Millisecond
+	initQueue(t, store, Config{QueueCapacity: 10})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); emitN(t, 1) }()
+	}
+	wg.Wait()
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if n := len(sysEvents(t, "audit_queue_high_water")); n != 1 { // 8 of 10 crosses 50 %
+		t.Fatalf("audit_queue_high_water x%d, want 1", n)
+	}
+	if n := len(sysEvents(t, "audit_queue_near_full")); n > 1 {
+		t.Fatalf("audit_queue_near_full x%d, want <= 1", n)
+	}
+}
+
+func TestQueueV10DeadLetterReachesTheSysStream(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, store, Config{QueueDrainMaxAttempts: 3,
+		QueueRetryInitial: time.Millisecond, QueueRetryMax: 5 * time.Millisecond})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	if len(sysEvents(t, "audit_drain_dead_letter")) != 1 {
+		t.Fatal("want one audit_drain_dead_letter on the sys stream")
+	}
+}
+
+func TestQueueV11DrainStateEventsFireInOrder(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 5)
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Millisecond, QueueRetryMax: 20 * time.Millisecond})
+	emitN(t, 1)
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	got := drainOrder(t)
+	want := []string{"audit_drain_failed", "audit_drain_degraded", "audit_drain_recovered"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("events = %v, want %v", got, want)
 	}
 }
