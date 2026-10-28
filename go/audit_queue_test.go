@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ type flakyStore struct {
 	failIf   func(Row) bool
 	panicIf  func(Row) bool
 	delay    time.Duration
+	gate     chan struct{} // when set, the first insert waits for it to close
 	attempts int
 }
 
@@ -30,7 +32,14 @@ func (s *flakyStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (
 	failing := s.attempts <= s.fail || (s.failIf != nil && s.failIf(row))
 	panicking := s.panicIf != nil && s.panicIf(row)
 	delay := s.delay
+	gate := s.gate
+	if s.attempts > 1 {
+		gate = nil
+	}
 	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	time.Sleep(delay)
 	if panicking {
 		panic("store bug")
@@ -461,6 +470,10 @@ func TestQueueEmitReachingARetiredDrainerStoresInline(t *testing.T) {
 	if ev := sysEvents(t, "audit_drain_stored_inline"); len(ev) != 1 || ev[0]["row_id"] != r.ID {
 		t.Fatalf("stored-inline events = %v", ev)
 	}
+	// The handle was closed under it, so fasten-core reported nothing.
+	if ev := sysEvents(t, "audit_drain_abandoned"); len(ev) != 1 || ev[0]["reason"] != "enqueue_refused" {
+		t.Fatalf("abandoned events = %v", ev)
+	}
 	if got := len(store.rows(t)); got != 1 {
 		t.Fatalf("rows = %d, want 1", got)
 	}
@@ -487,7 +500,7 @@ func TestQueueV8ThresholdEventsAreDebounced(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
 	store := newFlakyStore(t, 0)
-	store.delay = 20 * time.Millisecond
+	store.gate = make(chan struct{})
 	initQueue(t, store, Config{QueueCapacity: 10})
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -495,14 +508,15 @@ func TestQueueV8ThresholdEventsAreDebounced(t *testing.T) {
 		go func() { defer wg.Done(); emitN(t, 1) }()
 	}
 	wg.Wait()
+	close(store.gate) // depth rose 1..8 with no dip below 50 %
 	if !Flush(5 * time.Second) {
 		t.Fatal("Flush timed out")
 	}
-	if n := len(sysEvents(t, "audit_queue_high_water")); n != 1 { // 8 of 10 crosses 50 %
+	if n := len(sysEvents(t, "audit_queue_high_water")); n != 1 {
 		t.Fatalf("audit_queue_high_water x%d, want 1", n)
 	}
-	if n := len(sysEvents(t, "audit_queue_near_full")); n > 1 {
-		t.Fatalf("audit_queue_near_full x%d, want <= 1", n)
+	if n := len(sysEvents(t, "audit_queue_near_full")); n != 1 {
+		t.Fatalf("audit_queue_near_full x%d, want 1", n)
 	}
 }
 
@@ -532,5 +546,152 @@ func TestQueueV11DrainStateEventsFireInOrder(t *testing.T) {
 	want := []string{"audit_drain_failed", "audit_drain_degraded", "audit_drain_recovered"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
 		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestQueueV1HappyPath(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	initQueue(t, store, Config{QueueCapacity: 100})
+	emitN(t, 2)
+	if !Flush(time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := len(store.rows(t)); got != 2 {
+		t.Fatalf("rows = %d, want 2", got)
+	}
+}
+
+func TestQueueV2V3V6RaiseMode(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: newFlakyStore(t, math.MaxInt32),
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Emit(context.Background(), "USER_CREATED", Target("u-1"))
+	var ase *AuditStoreError
+	if !errors.As(err, &ase) || !strings.Contains(err.Error(), "store down") { // V-2
+		t.Fatalf("err = %v, want an AuditStoreError with \"store down\"", err)
+	}
+	if GetQueueStats() != nil { // V-3
+		t.Fatal("raise mode has no drainer")
+	}
+	if !Flush(100 * time.Millisecond) { // V-6
+		t.Fatal("Flush is a no-op in raise mode")
+	}
+}
+
+func TestQueueV5StatsAfterDrain(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	initQueue(t, newFlakyStore(t, 0), Config{QueueCapacity: 100})
+	emitN(t, 1)
+	if !Flush(time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	s := GetQueueStats()
+	if s == nil || s.Depth != 0 || s.Capacity != 100 || s.HighWater < 1 || s.DrainedTotal != 1 ||
+		s.RetryCountActive != 0 || s.LastError != "" {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestQueueV7HighWaterNeverDecreases(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.gate = make(chan struct{})
+	initQueue(t, store, Config{QueueCapacity: 10})
+	emitN(t, 5)
+	close(store.gate)
+	Flush(time.Second)
+	hw1 := GetQueueStats().HighWater
+	emitN(t, 1)
+	Flush(time.Second)
+	if hw1 != 5 || GetQueueStats().HighWater < hw1 {
+		t.Fatalf("high_water %d then %d, want 5 then >= 5", hw1, GetQueueStats().HighWater)
+	}
+}
+
+func TestQueueV9SyncFallbackFailureIsReported(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	initQueue(t, newFlakyStore(t, math.MaxInt32), Config{})
+	Default.uninstallDrainer()
+	emitN(t, 1)
+	if len(sysEvents(t, "audit_sync_fallback_failed")) != 1 {
+		t.Fatal("want audit_sync_fallback_failed")
+	}
+}
+
+func TestQueueDoctorReportsTheDeadLetter(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	initQueue(t, newFlakyStore(t, math.MaxInt32), Config{QueueDrainMaxAttempts: 2,
+		QueueRetryInitial: time.Millisecond, QueueRetryMax: 5 * time.Millisecond})
+	emitN(t, 1)
+	Flush(2 * time.Second)
+	body, code := getJSON(t, NewReader(), "/audit/doctor")
+	q, _ := body["queue"].(map[string]any)
+	if code != 200 || q["dead_lettered_total"] != float64(1) || q["drained_total"] != float64(0) {
+		t.Fatalf("doctor queue = %v (status %d)", q, code)
+	}
+}
+
+func TestQueueEmitsWhileTheOldDrainerRetiresAreQueued(t *testing.T) {
+	// Init swaps in the new drainer before it retires the old one, so a row
+	// emitted while the old one drains is retried, not written once inline.
+	registerTestCodes(t)
+	resetGlobals(t)
+	initQueue(t, newFlakyStore(t, 0), Config{})
+	next := newFlakyStore(t, 2)
+	var emitted []Row
+	testHookRetire = func() { emitted = emitN(t, 1) }
+	t.Cleanup(func() { testHookRetire = nil })
+	initQueue(t, next, Config{})
+	testHookRetire = nil
+	if !Flush(2 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	rows := next.rows(t)
+	if len(emitted) != 1 || len(rows) != 1 || rows[0].ID != emitted[0].ID {
+		t.Fatalf("stored %v, want the row emitted during re-init", rows)
+	}
+	if Default.auditWriteSwallowed.Load() {
+		t.Fatal("nothing was lost")
+	}
+}
+
+func TestQueueRowRefusedAtStopGetsOneAbandonedEvent(t *testing.T) {
+	// fasten-core reports a row it refuses at stop; the engine must not
+	// report it again.
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.gate = make(chan struct{})
+	initQueue(t, store, Config{QueueCapacity: 1})
+	emitN(t, 1) // the held row takes the only slot
+	blocked := make(chan struct{})
+	go func() { defer close(blocked); emitN(t, 1) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for Default.activeDrainer().pendingLen() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() { defer close(closed); Default.uninstallDrainer() }()
+	for len(sysEvents(t, "audit_drain_abandoned")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(store.gate)
+	<-blocked
+	<-closed
+	ev := sysEvents(t, "audit_drain_abandoned")
+	if len(ev) != 1 || ev[0]["reason"] != "drainer_stopped" {
+		t.Fatalf("abandoned events = %v, want one from fasten-core", ev)
+	}
+	if got := len(store.rows(t)); got != 2 {
+		t.Fatalf("rows = %d, want 2", got)
 	}
 }

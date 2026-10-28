@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"runtime/cgo"
 	"sort"
 	"sync"
@@ -69,13 +70,19 @@ func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) (rc C.int32_t) {
 //
 //export goSysLogCallback
 func goSysLogCallback(eventJSON *C.char, userdata unsafe.Pointer) {
-	defer func() { _ = recover() }() // a sys event must not fail the drainer
+	// A sys event must not fail the drainer; say on stderr that one was lost.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "fasten: drainer sys event dropped: %T\n", r)
+		}
+	}()
 	d, ok := cgo.Handle(uintptr(userdata)).Value().(*cFastenDrainer)
 	if !ok {
 		return
 	}
 	var fields map[string]any
 	if err := json.Unmarshal([]byte(C.GoString(eventJSON)), &fields); err != nil {
+		fmt.Fprintf(os.Stderr, "fasten: drainer sys event dropped: %T\n", err)
 		return
 	}
 	level, _ := fields["level"].(string)
@@ -83,7 +90,7 @@ func goSysLogCallback(eventJSON *C.char, userdata unsafe.Pointer) {
 	for _, k := range []string{"shape", "level", "event", "timestamp"} {
 		delete(fields, k)
 	}
-	d.engine.drainerSysLog(level, event, fields)
+	d.engine.sysLogTo(d.out, level, event, fields)
 }
 
 // pendingRow is a row the drainer holds. The callback stores this row, not
@@ -102,6 +109,10 @@ type cFastenDrainer struct {
 	engine      *Engine
 	store       AuditRepository
 	maxAttempts int
+	// Captured at install: the drainer's rows and events keep the config
+	// they were emitted under, and Init can change the engine's meanwhile.
+	out sysOut
+	gen int64
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRow
@@ -125,6 +136,8 @@ func newCFastenDrainer(
 		engine:      e,
 		store:       store,
 		maxAttempts: maxAttempts,
+		out:         e.out(),
+		gen:         e.storeGen.Load(),
 		pending:     map[string]*pendingRow{},
 	}
 	h := cgo.NewHandle(d)
@@ -192,18 +205,24 @@ func (d *cFastenDrainer) insert(rowJSON string) bool {
 	d.pendingMu.Unlock()
 	if p == nil {
 		// Already settled here; nothing to store.
-		d.engine.drainerSysLog("error", "audit_drain_row_not_pending", map[string]any{"row_id": head.ID})
+		d.engine.sysLogTo(d.out, "error", "audit_drain_row_not_pending", map[string]any{"row_id": head.ID})
 		return true
 	}
 	if err := d.storeRow(p.row); err != nil {
 		if p.attempts >= d.maxAttempts {
 			d.settle(head.ID)
-			d.engine.markWriteLost(d.store)
+			d.engine.markWriteLost(d.store, d.gen)
 		}
 		return false
 	}
 	d.settle(head.ID)
 	return true
+}
+
+func (d *cFastenDrainer) pendingLen() int {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	return len(d.pending)
 }
 
 func (d *cFastenDrainer) settle(id string) {
@@ -219,27 +238,28 @@ func (d *cFastenDrainer) storeRow(row Row) (err error) {
 			err = fmt.Errorf("store panicked: %v", r)
 		}
 	}()
-	_, err = d.engine.allocateAndStore(context.Background(), d.store, row)
+	_, err = d.engine.allocateAndStore(context.Background(), d.store, d.out, row)
 	return err
 }
 
 // testHookEnqueue, when set, runs at the start of enqueue.
 var testHookEnqueue func()
 
-// enqueue hands row to the drainer. It returns false when the row was not
-// queued, and the caller stores it itself.
-func (d *cFastenDrainer) enqueue(row Row) bool {
+// enqueue hands row to the drainer. queued is false when it was not, and the
+// caller stores it itself; reported is true when fasten-core already emitted
+// audit_drain_abandoned for it.
+func (d *cFastenDrainer) enqueue(row Row) (queued, reported bool) {
 	if testHookEnqueue != nil {
 		testHookEnqueue()
 	}
 	d.use.RLock()
 	defer d.use.RUnlock()
 	if d.closed {
-		return false
+		return false, false
 	}
 	b, err := json.Marshal(row)
 	if err != nil {
-		return false
+		return false, false
 	}
 	d.pendingMu.Lock()
 	d.next++
@@ -255,9 +275,9 @@ func (d *cFastenDrainer) enqueue(row Row) bool {
 	}
 	if rc != C.FASTEN_OK {
 		d.settle(row.ID)
-		return false
+		return false, rc == C.FASTEN_ERR_DRAINER_STOPPED
 	}
-	return true
+	return true, false
 }
 
 // flush blocks until the queue drains or timeout elapses.
@@ -325,8 +345,8 @@ func (d *cFastenDrainer) retire(flushFor time.Duration) {
 	var recovered []string
 	for _, p := range rows {
 		if err := d.storeRow(p.row); err != nil {
-			d.engine.markWriteLost(d.store)
-			d.engine.drainerSysLog("error", "audit_drain_lost_at_stop", map[string]any{
+			d.engine.markWriteLost(d.store, d.gen)
+			d.engine.sysLogTo(d.out, "error", "audit_drain_lost_at_stop", map[string]any{
 				"error_type": fmt.Sprintf("%T", err),
 				"row_id":     p.row.ID,
 			})
@@ -335,6 +355,6 @@ func (d *cFastenDrainer) retire(flushFor time.Duration) {
 		recovered = append(recovered, p.row.ID)
 	}
 	if len(recovered) > 0 {
-		d.engine.drainerSysLog("info", "audit_drain_recovered_at_stop", map[string]any{"row_ids": recovered})
+		d.engine.sysLogTo(d.out, "info", "audit_drain_recovered_at_stop", map[string]any{"row_ids": recovered})
 	}
 }

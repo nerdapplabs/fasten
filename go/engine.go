@@ -55,6 +55,7 @@ type Engine struct {
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
 	retired   chan struct{} // closed once the last drainer taken out has been retired
+	storeGen  atomic.Int64  // bumped when Init switches to another audit store
 
 	// Engine-side "at least one audit-store insert was swallowed" flag.
 	// Tracked here (not only on the store) because AuditRepository does not
@@ -152,10 +153,6 @@ func (e *Engine) Init(cfg Config) error {
 		return fmt.Errorf("fasten.Init: QueueDrainMaxAttempts must be at most %d (got %d)",
 			uint32(math.MaxUint32), n)
 	}
-	// Retire the drainer before Init writes any field: its thread runs
-	// engine code (store, transport, sys events), so it must not overlap
-	// those writes. Emits until the new drainer is installed store inline.
-	e.retireDrainer(5 * time.Second)
 	prevStore := e.auditStore
 
 	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
@@ -181,6 +178,7 @@ func (e *Engine) Init(cfg Config) error {
 	// Re-init on a fresh store clears the sticky degrade — a hole in the
 	// previous store's history doesn't apply to this one.
 	if !sameStore(prevStore, e.auditStore) {
+		e.storeGen.Add(1)
 		e.auditWriteSwallowed.Store(false)
 	}
 
@@ -282,6 +280,7 @@ func (e *Engine) Init(cfg Config) error {
 	}
 	e.failureStrategy = strategy
 
+	var next *cFastenDrainer
 	if strategy == "queue" && e.auditStore != nil {
 		capacity := cfg.QueueCapacity
 		if capacity <= 0 {
@@ -299,11 +298,15 @@ func (e *Engine) Init(cfg Config) error {
 		if maxAttempts <= 0 {
 			maxAttempts = 50
 		}
-		e.installDrainer(
+		next = e.newDrainer(
 			e.auditStore,
 			capacity, retryInitialMs, retryMaxMs, !cfg.DisableQueueJitter, maxAttempts,
 		)
 	}
+	// Swap in the new drainer, then retire the old one: emits keep being
+	// queued while it drains, and its rows and events keep its own config.
+	old, done := e.swapDrainer(next)
+	e.retireOld(old, done, 5*time.Second)
 
 	// FR1 retention (§1). Env-var overrides zero-valued fields.
 	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
@@ -596,21 +599,31 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 			// lands (spec §2.1, §8). A durable emit must not return before the
 			// row is persisted, so it takes the synchronous path, and so does
 			// a row the drainer refuses.
+			gen := e.storeGen.Load()
 			d := e.activeDrainer()
 			refused := false
 			switch {
 			case durable:
+			case d != nil && d.gen != gen:
+				// Init is switching stores: store it inline in the new one.
 			case d == nil:
 				// No drainer to take the row (spec §7 V-12).
 				refused = true
 				e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
-					"reason": "drainer_stopped", "row_id": row.ID,
+					"reason": "no_drainer", "row_id": row.ID,
 				})
 			default:
-				refused = !d.enqueue(row)
+				queued, reported := d.enqueue(row)
+				refused = !queued
+				if refused && !reported {
+					// fasten-core reports only the rows it refused at stop.
+					e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+						"reason": "enqueue_refused", "row_id": row.ID,
+					})
+				}
 			}
 			if durable || d == nil || refused {
-				sealed, ferr := e.allocateAndStore(ctx, e.auditStore, row)
+				sealed, ferr := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
 				if ferr == nil {
 					row = sealed
 				}
@@ -620,21 +633,21 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 				if ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;
 					// degrade the audit completeness flag.
-					e.markWriteLost(e.auditStore)
+					e.markWriteLost(e.auditStore, gen)
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
 						// Type-only — see retention_purge_failed comment.
 						"error_type": fmt.Sprintf("%T", ferr),
 						"row_id":     row.ID,
 					})
 				} else if refused {
-					// fasten-core may have reported this row abandoned.
+					// Follows the abandoned event.
 					e.drainerSysLog("info", "audit_drain_stored_inline", map[string]any{"row_id": row.ID})
 				}
 			}
 		} else {
 			// "raise" strategy — same allocating path as the queue branch
 			// (spec §2.1); only the error handling differs.
-			sealed, err := e.allocateAndStore(ctx, e.auditStore, row)
+			sealed, err := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
 			if err != nil {
 				return row, &AuditStoreError{Err: err}
 			}
@@ -771,42 +784,57 @@ func isTruthy(s string) bool {
 
 // ── Drainer management (per-Engine) ──────────────────────────────────────────
 
-func (e *Engine) installDrainer(
+// newDrainer builds a drainer for store, capturing the engine's current
+// transport, service id and store generation. Nil if it could not start.
+func (e *Engine) newDrainer(
 	store AuditRepository,
 	capacity int,
 	retryInitialMs, retryMaxMs int64,
 	retryJitter bool,
 	maxAttempts int,
-) {
+) *cFastenDrainer {
 	d, err := newCFastenDrainer(
 		e, store, capacity, retryInitialMs, retryMaxMs, retryJitter, maxAttempts,
 	)
 	if err != nil {
 		e.drainerSysLog("error", "audit_drainer_install_failed",
 			map[string]any{"error_type": fmt.Sprintf("%T", err)})
-		return
+		return nil
 	}
-	e.drainerMu.Lock()
-	e.drainer = d
-	e.drainerMu.Unlock()
+	return d
 }
 
-// retireDrainer takes the installed drainer, gives it up to flushFor to
-// drain, then stops it and stores what it did not write. Flush waits for it.
-func (e *Engine) retireDrainer(flushFor time.Duration) {
+// swapDrainer installs next (nil removes the drainer) and returns the one it
+// replaced, with a channel Flush waits on until retireOld closes it.
+func (e *Engine) swapDrainer(next *cFastenDrainer) (*cFastenDrainer, chan struct{}) {
 	e.drainerMu.Lock()
+	defer e.drainerMu.Unlock()
 	old := e.drainer
-	e.drainer = nil
+	e.drainer = next
 	done := make(chan struct{})
 	e.retired = done
-	e.drainerMu.Unlock()
+	return old, done
+}
+
+// testHookRetire, when set, runs before a replaced drainer is retired.
+var testHookRetire func()
+
+// retireOld gives old up to flushFor to drain, then stops it and stores what
+// it did not write.
+func (e *Engine) retireOld(old *cFastenDrainer, done chan struct{}, flushFor time.Duration) {
 	if old != nil {
+		if testHookRetire != nil {
+			testHookRetire()
+		}
 		old.retire(flushFor)
 	}
 	close(done)
 }
 
-func (e *Engine) uninstallDrainer() { e.retireDrainer(0) }
+func (e *Engine) uninstallDrainer() {
+	old, done := e.swapDrainer(nil)
+	e.retireOld(old, done, 0)
+}
 
 func (e *Engine) activeDrainer() *cFastenDrainer {
 	e.drainerMu.Lock()
@@ -821,7 +849,7 @@ func (e *Engine) activeDrainer() *cFastenDrainer {
 // Falls back to the legacy unallocated Insert for adopter stores that predate
 // the interface — and says so once, because VerifyChain SKIPS hashless rows and
 // would otherwise report verified over a fully unchained table.
-func (e *Engine) allocateAndStore(ctx context.Context, store AuditRepository, row Row) (Row, error) {
+func (e *Engine) allocateAndStore(ctx context.Context, store AuditRepository, out sysOut, row Row) (Row, error) {
 	type allocator interface {
 		AllocateAndInsertOriginated(context.Context, Row) (Row, error)
 	}
@@ -829,7 +857,7 @@ func (e *Engine) allocateAndStore(ctx context.Context, store AuditRepository, ro
 	if !ok {
 		if e.unchainedStoreLogged.CompareAndSwap(false, true) {
 			e.auditChainUnavailable.Store(true)
-			e.drainerSysLog("error", "audit_chain_unavailable", map[string]any{
+			e.sysLogTo(out, "error", "audit_chain_unavailable", map[string]any{
 				"store":  fmt.Sprintf("%T", store),
 				"reason": "store has no AllocateAndInsertOriginated (spec 2.1); rows written unsealed",
 			})
@@ -840,16 +868,19 @@ func (e *Engine) allocateAndStore(ctx context.Context, store AuditRepository, ro
 	if err != nil {
 		return row, err
 	}
-	if e.xport != nil && sealed.Hash != "" {
-		e.xport.WriteAudit(rowToMap(sealed))
+	if out.xport != nil && sealed.Hash != "" {
+		out.xport.WriteAudit(rowToMap(sealed))
 	}
 	return sealed, nil
 }
 
-// markWriteLost records that a row did not reach store: durable history has a
-// hole. Re-init onto another store clears the engine flag.
-func (e *Engine) markWriteLost(store AuditRepository) {
-	e.auditWriteSwallowed.Store(true)
+// markWriteLost records that a row did not reach store, of store generation
+// gen: durable history has a hole. The engine flag only covers its current
+// store; re-init onto another store clears it, onto the same store keeps it.
+func (e *Engine) markWriteLost(store AuditRepository, gen int64) {
+	if gen == e.storeGen.Load() {
+		e.auditWriteSwallowed.Store(true)
+	}
 	if nwf, ok := store.(interface{ NoteWriteFailure() }); ok {
 		nwf.NoteWriteFailure()
 	}
@@ -882,13 +913,26 @@ func isTypedNil(v any) bool {
 	return false
 }
 
+// sysOut is where a sealed row's stdout line and sys events go: the engine's
+// current transport, or the one a drainer captured at install.
+type sysOut struct {
+	xport     *Transport
+	serviceID string
+}
+
+func (e *Engine) out() sysOut { return sysOut{e.xport, e.serviceID} }
+
 func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
+	e.sysLogTo(e.out(), level, event, fields)
+}
+
+func (e *Engine) sysLogTo(out sysOut, level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,
 		"event":      event,
 		"timestamp":  canonicalTS(time.Now()),
 		"request_id": "",
-		"service_id": e.serviceID,
+		"service_id": out.serviceID,
 	}
 	for k, v := range fields {
 		row[k] = v
@@ -899,8 +943,8 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	// push AND the direct stderr write — PushSyslog would redact its
 	// own copy, but the stderr line uses this local `row`.
 	row = SyslogRow(e.redactDetail(row))
-	if e.xport != nil {
-		e.xport.PushSyslog(row)
+	if out.xport != nil {
+		out.xport.PushSyslog(row)
 	}
 	if b, err := marshalWithShape(row, "sys"); err == nil {
 		fmt.Fprintln(os.Stderr, string(b))
