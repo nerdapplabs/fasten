@@ -158,11 +158,12 @@ class _QueueDrainer:
     """An installed fasten-core drainer and the rows it holds."""
 
     handle: Any                 # FastenStore* (ctypes void ptr)
-    callback: Any               # keeps the ctypes callback alive until close
+    callback: Any               # keep the ctypes callbacks alive until close
     # Rows waiting in the drainer, by id. The callback stores this row, not
     # fasten-core's JSON copy, so the store seals what was emitted (spec §2.1).
     pending: dict[str, list[Any]]
     store: Any
+    sys_callback: Any = None
     users: int = 0              # calls using the handle; close waits for 0
 
 
@@ -632,7 +633,13 @@ class Engine:
                 store = self._audit_store
                 if not _durable:
                     with self._using_drainer() as d:
-                        if d is not None:
+                        if d is None:
+                            # No drainer to take the row (spec §7 V-12).
+                            refused = True
+                            self._drainer_sys_log("error", "audit_drain_abandoned", {
+                                "reason": "drainer_stopped", "row_id": row.id,
+                            })
+                        else:
                             store = d.store
                             d.pending[row.id] = [row, 0]
                             try:
@@ -970,7 +977,18 @@ class Engine:
                     self._mark_write_lost(store)
                 return 1
 
+        def _sys_cb(event_json: bytes, _userdata: int) -> None:
+            # fasten-core's drainer events join the sys stream (spec §4).
+            try:
+                fields = json.loads(event_json.decode("utf-8"))
+                fields.pop("shape", None)
+                fields.pop("timestamp", None)
+                self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields)
+            except Exception:  # noqa: BLE001 — a sys event must not fail the drainer
+                cb_logger.exception("drainer sys event failed: %r", event_json)
+
         cb = _ffi.InsertCallbackFn(_insert_cb)
+        sys_cb = _ffi.SysLogCallbackFn(_sys_cb)
         new_handle = _ffi.store_from_callback(cb)
         _ffi.drainer_install(
             new_handle,
@@ -979,10 +997,11 @@ class Engine:
             retry_max_ms=retry_max_ms,
             retry_jitter=retry_jitter,
             max_attempts=max_attempts,
+            sys_log=sys_cb,
         )
         with self._drainer_lock:
             old = self._drainer
-            self._drainer = _QueueDrainer(new_handle, cb, pending, store)
+            self._drainer = _QueueDrainer(new_handle, cb, pending, store, sys_callback=sys_cb)
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
             self._atexit_registered = True

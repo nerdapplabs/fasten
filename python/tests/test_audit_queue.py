@@ -1,8 +1,6 @@
 """Queue mode: rows go through the fasten-core drainer and the store seals them.
 
-Vectors from spec/drainer-conformance.md §7. Sys events from the core drainer
-go to stderr only, so V-11 and the syslog asserts of V-10 and V-12 are not
-covered here.
+Vectors from spec/drainer-conformance.md §7.
 """
 import json
 import threading
@@ -222,6 +220,8 @@ def test_v12_emit_after_drainer_stopped_is_stored(tmp_path):
     row = fasten.emit(code="USER_CREATED", target="u-1")
     assert row.hash                 # stored synchronously
     assert len(_rows(store)) == 1
+    events = _sys_events()
+    assert "audit_drain_abandoned" in events and "audit_drain_stored_inline" in events
 
 
 def test_max_attempts_zero_uses_the_default(tmp_path):
@@ -427,4 +427,55 @@ def test_refused_enqueue_stored_inline_is_reported(tmp_path, monkeypatch, capsys
            if line.startswith("{")]
     assert any(e.get("event") == "audit_drain_stored_inline" and e.get("row_id") == row.id
                for e in err)
+
+
+def _sys_events():
+    return [r.get("event") for r in reversed(fasten.transport().query_syslog(limit=1000))]  # oldest first
+
+
+def test_v8_threshold_events_are_debounced(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), delay=0.02)
+    _init(store, queue_capacity=10)
+    for t in _emit_concurrently(8):
+        t.join(timeout=5)
+    assert fasten.flush(timeout=5.0)
+    events = _sys_events()
+    assert events.count("audit_queue_high_water") == 1   # 8 of 10 crosses 50 %
+    assert events.count("audit_queue_near_full") <= 1
+
+
+def test_v10_dead_letter_reaches_the_sys_stream(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_drain_max_attempts=3, queue_retry_initial_ms=1, queue_retry_max_ms=5)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    fasten.flush(timeout=2.0)
+    assert "audit_drain_dead_letter" in _sys_events()
+
+
+def test_v11_drain_state_events_fire_in_order(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=5)
+    _init(store, queue_retry_initial_ms=10, queue_retry_max_ms=20)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=5.0)
+    drain = [e for e in _sys_events() if e in
+             ("audit_drain_failed", "audit_drain_degraded", "audit_drain_recovered")]
+    assert drain == ["audit_drain_failed", "audit_drain_degraded", "audit_drain_recovered"]
+
+
+def test_v12_emit_racing_stop_is_reported(tmp_path, monkeypatch):
+    from fasten import core_ffi
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+    enqueue = core_ffi.drainer_enqueue
+    d = _default._drainer
+
+    def after_close(handle, row_json):
+        core_ffi.drainer_close(d.handle)   # stop lands between lookup and enqueue
+        return enqueue(handle, row_json)
+
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", after_close)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", enqueue)
+    assert len(_rows(store)) == 1
+    assert "audit_drain_stored_inline" in _sys_events()
 

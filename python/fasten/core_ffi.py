@@ -58,6 +58,8 @@ def _find_lib() -> str:
 
 # Declared here so _configure() can reference it at library-load time.
 InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
+# Receives one drainer sys event as a JSON line.
+SysLogCallbackFn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
 
 def _configure(lib: ctypes.CDLL) -> None:
@@ -91,6 +93,12 @@ def _configure(lib: ctypes.CDLL) -> None:
 
     lib.fasten_store_from_callback.restype  = vp
     lib.fasten_store_from_callback.argtypes = [InsertCallbackFn, vp, ctypes.POINTER(c_char_p)]
+
+    lib.fasten_drainer_install_with_sys_log.restype  = c_int
+    lib.fasten_drainer_install_with_sys_log.argtypes = [
+        vp, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
+        c_int, ctypes.c_uint32, SysLogCallbackFn, vp, ctypes.POINTER(c_char_p),
+    ]
 
     lib.fasten_drainer_install.restype  = c_int
     lib.fasten_drainer_install.argtypes = [
@@ -244,13 +252,22 @@ def drainer_install(
     retry_max_ms: int,
     retry_jitter: bool,
     max_attempts: int,
+    sys_log: Any = None,
 ) -> None:
+    """``sys_log``, a SysLogCallbackFn, receives the drainer's sys events
+    instead of stderr. The caller keeps it alive until drainer_close."""
     lib = get_lib()
     err = ctypes.c_char_p(None)
-    rc  = lib.fasten_drainer_install(
-        handle, capacity, retry_initial_ms, retry_max_ms,
-        int(retry_jitter), max_attempts, ctypes.byref(err),
-    )
+    if sys_log is None:
+        rc = lib.fasten_drainer_install(
+            handle, capacity, retry_initial_ms, retry_max_ms,
+            int(retry_jitter), max_attempts, ctypes.byref(err),
+        )
+    else:
+        rc = lib.fasten_drainer_install_with_sys_log(
+            handle, capacity, retry_initial_ms, retry_max_ms,
+            int(retry_jitter), max_attempts, sys_log, None, ctypes.byref(err),
+        )
     if rc != 0:
         msg = err.value.decode("utf-8", errors="replace") if err.value else f"rc={rc}"
         raise RuntimeError(f"fasten_drainer_install: {msg}")
