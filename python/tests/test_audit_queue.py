@@ -401,3 +401,30 @@ def test_queue_mode_without_a_store_installs_no_drainer(tmp_path):
     fasten.init(service_id="svc", node_id="node", audit_store_failure_strategy="queue")
     assert _default._drainer is None
 
+
+def test_reinit_keeps_the_flag_for_the_same_store(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_drain_max_attempts=2)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    fasten.flush(timeout=2.0)
+    _init(store)
+    assert _default.audit_write_swallowed()
+    _init(FlakyStore(str(tmp_path / "b.db")))
+    assert not _default.audit_write_swallowed()
+
+
+def test_refused_enqueue_stored_inline_is_reported(tmp_path, monkeypatch, capsys):
+    from fasten import core_ffi
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+
+    def refused(handle, row_json):
+        raise RuntimeError("fasten_drainer_enqueue: drainer stopped")
+
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", refused)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+           if line.startswith("{")]
+    assert any(e.get("event") == "audit_drain_stored_inline" and e.get("row_id") == row.id
+               for e in err)
+

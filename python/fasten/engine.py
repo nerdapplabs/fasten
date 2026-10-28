@@ -408,12 +408,13 @@ class Engine:
         self._service_id = cfg.service_id
         self._node_id    = cfg.node_id
         self._tenant_id  = cfg.tenant_id
-        self._audit_store = cfg.audit_store
+        prev_store, self._audit_store = self._audit_store, cfg.audit_store
         self._api_store   = cfg.api_store
         self._syslog_store = cfg.syslog_store
         # Re-init on a fresh store clears the sticky degrade — a hole in the
         # previous store's history doesn't apply to this one.
-        self._audit_write_swallowed = False
+        if cfg.audit_store is not prev_store:
+            self._audit_write_swallowed = False
 
         # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
         # (spec §2.1) and happens inside the insert transaction, so an engine
@@ -627,7 +628,7 @@ class Engine:
                 # The drainer retries the insert; the store seals the row when
                 # it lands (spec §2.1, §8). A durable emit must not return
                 # before the row is persisted, so it takes the synchronous path.
-                queued = False
+                queued = refused = False
                 store = self._audit_store
                 if not _durable:
                     with self._using_drainer() as d:
@@ -639,6 +640,7 @@ class Engine:
                                 queued = True
                             except Exception:  # noqa: BLE001 — enqueue refused; store it inline
                                 d.pending.pop(row.id, None)
+                                refused = True
                 if not queued:
                     try:
                         row = self._allocate_and_store(row, store)
@@ -649,17 +651,16 @@ class Engine:
                             # irreversible, so the failure has to reach it.
                             raise
                         # Swallowed on the hot path → durable history now has a
-                        # hole; degrade the audit completeness flag. Set the
-                        # engine flag unconditionally (adopter stores may not
-                        # implement note_write_failure); also call the store's
-                        # notifier when present so store-side reporting is
-                        # accurate too.
+                        # hole; degrade the audit completeness flag.
                         self._mark_write_lost(store)
                         self._drainer_sys_log("error", "audit_sync_fallback_failed", {
                             # Type-only — see retention_purge_failed comment.
                             "error_type": type(e).__name__,
                             "row_id": row.id,
                         })
+                    else:
+                        if refused:  # fasten-core may have reported this row abandoned
+                            self._drainer_sys_log("info", "audit_drain_stored_inline", {"row_id": row.id})
             else:
                 try:
                     row = self._allocate_and_store(row, self._audit_store)
@@ -896,7 +897,8 @@ class Engine:
 
     def _mark_write_lost(self, store: Any) -> None:
         """A row didn't reach the store: durable history has a hole. The engine
-        flag only covers its current store; re-init onto another store clears it."""
+        flag only covers its current store; re-init onto another store clears it,
+        re-init onto the same store keeps it."""
         if store is self._audit_store:
             self._audit_write_swallowed = True
         note = getattr(store, "note_write_failure", None)
