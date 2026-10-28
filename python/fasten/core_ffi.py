@@ -58,6 +58,18 @@ def _find_lib() -> str:
 
 # Declared here so _configure() can reference it at library-load time.
 InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
+# fasten_drainer_enqueue: the drainer is stopping; the row was not queued.
+ERR_DRAINER_STOPPED = 10
+
+
+class EnqueueError(RuntimeError):
+    """fasten_drainer_enqueue refused the row; ``rc`` is the error code."""
+
+    def __init__(self, rc: int, msg: str) -> None:
+        super().__init__(f"fasten_drainer_enqueue: {msg}")
+        self.rc = rc
+
+
 # Receives one drainer sys event as a JSON line.
 SysLogCallbackFn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
@@ -281,7 +293,7 @@ def drainer_enqueue(handle: ctypes.c_void_p, row_json: str) -> None:
         msg = err.value.decode("utf-8", errors="replace") if err.value else f"rc={rc}"
         if err.value:
             lib.fasten_store_free_str(err)
-        raise RuntimeError(f"fasten_drainer_enqueue: {msg}")
+        raise EnqueueError(rc, msg)
     if err.value:
         lib.fasten_store_free_str(err)
 

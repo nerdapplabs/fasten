@@ -165,6 +165,11 @@ class _QueueDrainer:
     store: Any
     sys_callback: Any = None
     users: int = 0              # calls using the handle; close waits for 0
+    # Captured at install: the drainer's rows and events keep the config they
+    # were emitted under, and init can change the engine's while it drains.
+    stdout: Any = None
+    service_id: str = ""
+    gen: int = 0                # engine store generation it writes to
 
 
 class Engine:
@@ -194,6 +199,7 @@ class Engine:
         self._unchained_store_logged: bool = False
         self._audit_chain_unavailable: bool = False
         self._drainer: Optional[_QueueDrainer] = None
+        self._store_gen = 0         # bumped when init switches to another store
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
         self._atexit_registered = False
@@ -392,20 +398,6 @@ class Engine:
                     "fasten.init: persist_streams / stores mismatch — " + "; ".join(bits)
                 )
 
-        # Swap the drainer before switching stores: a row emitted from here on
-        # goes to the new store, and the old drainer's rows stay with the old.
-        if cfg.audit_store_failure_strategy == "queue" and cfg.audit_store is not None:
-            old_drainer = self._install_drainer(
-                store=cfg.audit_store,
-                capacity=cfg.queue_capacity,
-                retry_initial_ms=cfg.queue_retry_initial_ms,
-                retry_max_ms=cfg.queue_retry_max_ms,
-                retry_jitter=cfg.queue_retry_jitter,
-                max_attempts=cfg.queue_drain_max_attempts,
-            )
-        else:
-            old_drainer = self._take_drainer()
-
         self._service_id = cfg.service_id
         self._node_id    = cfg.node_id
         self._tenant_id  = cfg.tenant_id
@@ -415,6 +407,7 @@ class Engine:
         # Re-init on a fresh store clears the sticky degrade — a hole in the
         # previous store's history doesn't apply to this one.
         if cfg.audit_store is not prev_store:
+            self._store_gen += 1
             self._audit_write_swallowed = False
 
         # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
@@ -442,9 +435,21 @@ class Engine:
         self._failure_strategy = cfg.audit_store_failure_strategy
         self._search_enabled = cfg.search_enabled
 
+        # Swap in the new drainer, then retire the old one: emits keep being
+        # queued while it drains, and its rows and events keep its own config.
+        if cfg.audit_store_failure_strategy == "queue" and cfg.audit_store is not None:
+            old_drainer = self._install_drainer(
+                store=cfg.audit_store,
+                capacity=cfg.queue_capacity,
+                retry_initial_ms=cfg.queue_retry_initial_ms,
+                retry_max_ms=cfg.queue_retry_max_ms,
+                retry_jitter=cfg.queue_retry_jitter,
+                max_attempts=cfg.queue_drain_max_attempts,
+            )
+        else:
+            old_drainer = self._take_drainer()
         if old_drainer is not None:
-            # A replaced drainer gets up to 5 s to write what it holds.
-            self._retire_drainer(old_drainer, flush_ms=5_000 if self._drainer else 0)
+            self._retire_drainer(old_drainer, flush_ms=5_000)
 
         # FR1 retention (§1). Only when a store is attached AND a retention
         # is set; running a background purger over a nil store is a no-op
@@ -630,27 +635,34 @@ class Engine:
                 # it lands (spec §2.1, §8). A durable emit must not return
                 # before the row is persisted, so it takes the synchronous path.
                 queued = refused = False
-                store = self._audit_store
+                store, gen = self._audit_store, self._store_gen
                 if not _durable:
                     with self._using_drainer() as d:
                         if d is None:
                             # No drainer to take the row (spec §7 V-12).
                             refused = True
                             self._drainer_sys_log("error", "audit_drain_abandoned", {
-                                "reason": "drainer_stopped", "row_id": row.id,
+                                "reason": "no_drainer", "row_id": row.id,
                             })
+                        elif d.gen != gen:
+                            pass    # init is switching stores: store it inline in the new one
                         else:
                             store = d.store
                             d.pending[row.id] = [row, 0]
                             try:
                                 _ffi.drainer_enqueue(d.handle, json.dumps(row.to_dict(), default=str))
                                 queued = True
-                            except Exception:  # noqa: BLE001 — enqueue refused; store it inline
+                            except Exception as e:  # noqa: BLE001 — enqueue refused; store it inline
                                 d.pending.pop(row.id, None)
                                 refused = True
+                                if getattr(e, "rc", None) != _ffi.ERR_DRAINER_STOPPED:
+                                    # fasten-core reports only the rows it refused at stop.
+                                    self._drainer_sys_log("error", "audit_drain_abandoned", {
+                                        "reason": "enqueue_refused", "row_id": row.id,
+                                    })
                 if not queued:
                     try:
-                        row = self._allocate_and_store(row, store)
+                        row = self._allocate_and_store(row, store, self._stdout)
                     except Exception as e:  # noqa: BLE001
                         if _durable:
                             # Not hot-path telemetry. The caller is relying on
@@ -659,18 +671,18 @@ class Engine:
                             raise
                         # Swallowed on the hot path → durable history now has a
                         # hole; degrade the audit completeness flag.
-                        self._mark_write_lost(store)
+                        self._mark_write_lost(store, gen)
                         self._drainer_sys_log("error", "audit_sync_fallback_failed", {
                             # Type-only — see retention_purge_failed comment.
                             "error_type": type(e).__name__,
                             "row_id": row.id,
                         })
                     else:
-                        if refused:  # fasten-core may have reported this row abandoned
+                        if refused:  # follows the abandoned event
                             self._drainer_sys_log("info", "audit_drain_stored_inline", {"row_id": row.id})
             else:
                 try:
-                    row = self._allocate_and_store(row, self._audit_store)
+                    row = self._allocate_and_store(row, self._audit_store, self._stdout)
                 except Exception as e:  # noqa: BLE001
                     raise AuditStoreError(f"{type(e).__name__}: {e}") from e
         return row
@@ -871,7 +883,7 @@ class Engine:
             redacted.extend(store.redact_rows(ids=[row_id]))
         return redacted
 
-    def _allocate_and_store(self, row: AuditRow, store: Any) -> AuditRow:
+    def _allocate_and_store(self, row: AuditRow, store: Any, stdout: Any) -> AuditRow:
         """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
 
         Falls back to the legacy unallocated insert for adopter repositories that
@@ -895,18 +907,18 @@ class Engine:
             store.insert(row)
             return row
         sealed = allocate(row)
-        if self._stdout is not None and sealed.hash:
+        if stdout is not None and sealed.hash:
             try:
-                self._stdout.write_audit(sealed.to_dict())
+                stdout.write_audit(sealed.to_dict())
             except Exception:  # noqa: BLE001 — the row is stored; don't report it as failed
                 logging.getLogger("fasten").exception("sealed stdout line failed for %s", sealed.id)
         return sealed
 
-    def _mark_write_lost(self, store: Any) -> None:
-        """A row didn't reach the store: durable history has a hole. The engine
-        flag only covers its current store; re-init onto another store clears it,
-        re-init onto the same store keeps it."""
-        if store is self._audit_store:
+    def _mark_write_lost(self, store: Any, gen: int) -> None:
+        """A row didn't reach ``store``, of store generation ``gen``: durable
+        history has a hole. The engine flag only covers its current store;
+        re-init onto another store clears it, onto the same store keeps it."""
+        if gen == self._store_gen:
             self._audit_write_swallowed = True
         note = getattr(store, "note_write_failure", None)
         if callable(note):
@@ -927,19 +939,22 @@ class Engine:
                     d.users -= 1
                     self._drainer_idle.notify_all()
 
-    def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any]) -> None:
-        """Route drainer events to stderr (not stdout) to avoid backpressure deadlock."""
-        if self._stdout is None:
+    def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any],
+                         via: Optional[_QueueDrainer] = None) -> None:
+        """Route drainer events to stderr (not stdout) to avoid backpressure
+        deadlock. ``via`` sends a drainer's own events to its transport."""
+        stdout, service_id = (via.stdout, via.service_id) if via else (self._stdout, self._service_id)
+        if stdout is None:
             return
         payload: dict[str, Any] = {
             "level": level,
             "event": event,
             "request_id": current_request_id(),
-            "service_id": self._service_id or None,
+            "service_id": service_id or None,
             "timestamp": canonical_now(),
             **fields,
         }
-        self._stdout.write_drainer_syslog(payload)
+        stdout.write_drainer_syslog(payload)
 
     def _install_drainer(
         self,
@@ -956,6 +971,8 @@ class Engine:
         cb_logger = logging.getLogger("fasten")
         max_attempts = max_attempts or 50   # fasten-core's default for 0
         pending: dict[str, list[Any]] = {}
+        d = _QueueDrainer(None, None, pending, store, stdout=self._stdout,
+                          service_id=self._service_id, gen=self._store_gen)
 
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
             row_id = "<unparsed>"
@@ -966,7 +983,7 @@ class Engine:
                     cb_logger.error("insert_cb: row %s is not pending", row_id)
                     return 0
                 entry[1] += 1
-                self._allocate_and_store(entry[0], store)
+                self._allocate_and_store(entry[0], store, d.stdout)
                 pending.pop(row_id, None)
                 return 0
             except Exception:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
@@ -974,7 +991,7 @@ class Engine:
                 failed = pending.get(row_id)
                 if failed is not None and failed[1] >= max_attempts:
                     pending.pop(row_id, None)  # the drainer dead-letters it now
-                    self._mark_write_lost(store)
+                    self._mark_write_lost(store, d.gen)
                 return 1
 
         def _sys_cb(event_json: bytes, _userdata: int) -> None:
@@ -983,7 +1000,7 @@ class Engine:
                 fields = json.loads(event_json.decode("utf-8"))
                 fields.pop("shape", None)
                 fields.pop("timestamp", None)
-                self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields)
+                self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields, via=d)
             except Exception:  # noqa: BLE001 — a sys event must not fail the drainer
                 cb_logger.exception("drainer sys event failed: %r", event_json)
 
@@ -999,9 +1016,9 @@ class Engine:
             max_attempts=max_attempts,
             sys_log=sys_cb,
         )
+        d.handle, d.callback, d.sys_callback = new_handle, cb, sys_cb
         with self._drainer_lock:
-            old = self._drainer
-            self._drainer = _QueueDrainer(new_handle, cb, pending, store, sys_callback=sys_cb)
+            old, self._drainer = self._drainer, d
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
             self._atexit_registered = True
@@ -1033,17 +1050,17 @@ class Engine:
         recovered = []
         for row, _ in list(d.pending.values()):
             try:
-                self._allocate_and_store(row, d.store)
+                self._allocate_and_store(row, d.store, d.stdout)
                 recovered.append(row.id)
             except Exception as e:  # noqa: BLE001
-                self._mark_write_lost(d.store)
+                self._mark_write_lost(d.store, d.gen)
                 self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
                     "error_type": type(e).__name__,
                     "row_id": row.id,
-                })
+                }, via=d)
         d.pending.clear()
         if recovered:
-            self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered})
+            self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
 
     def _atexit_flush(self) -> None:
         self.flush(5.0)

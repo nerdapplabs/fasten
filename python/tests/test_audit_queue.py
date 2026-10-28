@@ -48,6 +48,33 @@ def _rows(store):
     return store.inner.query(limit=100)
 
 
+def _signal_drainer_close(monkeypatch):
+    """Return an event set once fasten-core's drainer_close has returned."""
+    from fasten import core_ffi
+    closed, close = threading.Event(), core_ffi.drainer_close
+
+    def signalling(handle):
+        close(handle)
+        closed.set()
+    monkeypatch.setattr(core_ffi, "drainer_close", signalling)
+    return closed
+
+
+def _hold_first_insert(store):
+    """Block the store's first insert until the returned event is set, so
+    the queue fills to a known depth."""
+    gate, insert = threading.Event(), store.allocate_and_insert_originated
+    first = [True]
+
+    def held(row):
+        if first[0]:
+            first[0] = False
+            assert gate.wait(5)
+        return insert(row)
+    store.allocate_and_insert_originated = held
+    return gate
+
+
 def _wait_for_attempts(store, n):
     deadline = time.monotonic() + 5
     while store.attempts < n and time.monotonic() < deadline:
@@ -87,11 +114,14 @@ def test_v5_queue_stats_after_drain(tmp_path):
 
 def test_v7_high_water_never_decreases(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"))
+    gate = _hold_first_insert(store)
     _init(store, queue_capacity=10)
     for i in range(5):
         fasten.emit(code="USER_CREATED", target=f"u-{i}")
+    gate.set()
     assert fasten.flush(timeout=1.0)
     hw1 = fasten.queue_stats()["high_water"]
+    assert hw1 == 5
     fasten.emit(code="USER_CREATED", target="u-5")
     assert fasten.flush(timeout=1.0)
     assert fasten.queue_stats()["high_water"] >= hw1
@@ -153,9 +183,10 @@ def test_raise_mode_is_unchanged(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     fasten.init(service_id="svc", node_id="node", audit_store=store,
                 audit_store_failure_strategy="raise")
-    with pytest.raises(fasten.AuditStoreError):
+    with pytest.raises(fasten.AuditStoreError, match="store down"):          # V-2
         fasten.emit(code="USER_CREATED", target="u-1")
-    assert fasten.queue_stats() is None
+    assert fasten.queue_stats() is None                                        # V-3
+    assert fasten.flush(timeout=0.1)                                           # V-6
     row = fasten.emit(code="USER_CREATED", target="u-2")
     assert row.hash
 
@@ -279,9 +310,11 @@ def test_uninstall_waits_for_an_emit_still_using_the_handle(tmp_path, monkeypatc
                                kwargs={"code": "USER_CREATED", "target": "u-1"})
     emitter.start()
     assert entered.wait(5)
+    closed = _signal_drainer_close(monkeypatch)
     closer = threading.Thread(target=_default._uninstall_drainer)
     closer.start()
-    time.sleep(0.1)
+    assert closed.wait(5)           # retire now waits for the emit
+    time.sleep(0.05)                # let it reach the wait; store_close must not run yet
     release.set()
     emitter.join(timeout=5)
     closer.join(timeout=5)
@@ -301,7 +334,8 @@ def test_out_of_range_queue_settings_are_rejected(name, bad):
 
 def test_row_emitted_during_reinit_goes_to_the_new_store(tmp_path, monkeypatch):
     # An emit while init() is still running must not reach the old drainer
-    # once the engine has switched to the new store and cleared its flag.
+    # once the engine has switched to the new store and cleared its flag;
+    # with no drainer installed yet it is stored inline.
     import fasten.engine as engine_mod
     old = FlakyStore(str(tmp_path / "old.db"))
     _init(old)
@@ -317,7 +351,7 @@ def test_row_emitted_during_reinit_goes_to_the_new_store(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_mod, "StdoutTransport", transport)
     fasten.flush(timeout=2.0)
     assert _rows(old) == []
-    assert new.attempts >= 2
+    assert new.attempts >= 1
     assert _default.audit_write_swallowed()
 
 
@@ -353,9 +387,10 @@ def test_refused_enqueue_during_reinit_stays_with_the_old_store(tmp_path, monkey
     emitter.start()
     assert entered.wait(5)
     new = FlakyStore(str(tmp_path / "new.db"))
+    closed = _signal_drainer_close(monkeypatch)
     reinit = threading.Thread(target=_init, args=(new,))
     reinit.start()
-    time.sleep(0.2)                 # old drainer closed; the emit is still in enqueue
+    assert closed.wait(5)           # old drainer closed; the emit is still in enqueue
     release.set()
     emitter.join(timeout=5)
     reinit.join(timeout=5)
@@ -434,14 +469,16 @@ def _sys_events():
 
 
 def test_v8_threshold_events_are_debounced(tmp_path):
-    store = FlakyStore(str(tmp_path / "a.db"), delay=0.02)
+    store = FlakyStore(str(tmp_path / "a.db"))
+    gate = _hold_first_insert(store)
     _init(store, queue_capacity=10)
     for t in _emit_concurrently(8):
         t.join(timeout=5)
+    gate.set()                      # depth rose 1..8 with no dip below 50 %
     assert fasten.flush(timeout=5.0)
     events = _sys_events()
-    assert events.count("audit_queue_high_water") == 1   # 8 of 10 crosses 50 %
-    assert events.count("audit_queue_near_full") <= 1
+    assert events.count("audit_queue_high_water") == 1
+    assert events.count("audit_queue_near_full") == 1
 
 
 def test_v10_dead_letter_reaches_the_sys_stream(tmp_path):
@@ -477,5 +514,112 @@ def test_v12_emit_racing_stop_is_reported(tmp_path, monkeypatch):
     fasten.emit(code="USER_CREATED", target="u-1")
     monkeypatch.setattr(core_ffi, "drainer_enqueue", enqueue)
     assert len(_rows(store)) == 1
-    assert "audit_drain_stored_inline" in _sys_events()
+    events = _sys_events()
+    assert "audit_drain_abandoned" in events and "audit_drain_stored_inline" in events
+
+
+def test_enqueue_refused_without_core_event_is_reported(tmp_path, monkeypatch):
+    from fasten import core_ffi
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+
+    def not_installed(handle, row_json):
+        raise core_ffi.EnqueueError(4, "drainer not installed")
+
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", not_installed)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    events = _sys_events()
+    assert "audit_drain_abandoned" in events and "audit_drain_stored_inline" in events
+
+
+def test_doctor_queue_block_reports_the_dead_letter(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from fasten.reader.router import router as build_router
+    app = FastAPI()
+    app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_drain_max_attempts=2, queue_retry_initial_ms=1, queue_retry_max_ms=5)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    fasten.flush(timeout=2.0)
+    queue = TestClient(app).get("/api/v1/logs/audit/doctor").json()["queue"]
+    assert queue["dead_lettered_total"] == 1 and queue["drained_total"] == 0
+
+
+
+def test_old_drainer_events_keep_the_old_config(tmp_path, capsys):
+    old = FlakyStore(str(tmp_path / "old.db"), fail=10**6)
+    _init(old, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_for_attempts(old, 1)
+    fasten.init(service_id="svc-b", node_id="node", audit_store=FlakyStore(str(tmp_path / "b.db")),
+                audit_store_failure_strategy="queue")
+    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+           if line.startswith("{")]
+    dead = [e for e in err if e.get("event") == "audit_drain_dead_letter"]
+    assert dead and all(e["service_id"] == "svc" for e in dead)
+    assert "audit_drain_dead_letter" not in _sys_events()   # not in the new stream
+
+
+def test_emits_while_the_old_drainer_retires_are_queued(tmp_path, monkeypatch):
+    # init swaps in the new drainer before it retires the old one, so a row
+    # emitted while the old one drains is retried, not written once inline.
+    from fasten import core_ffi
+    _init(FlakyStore(str(tmp_path / "old.db")))
+    new = FlakyStore(str(tmp_path / "new.db"), fail=2)
+    flush, emitted = core_ffi.drainer_flush, []
+
+    def emit_while_retiring(handle, timeout_ms):
+        emitted.append(fasten.emit(code="USER_CREATED", target="during-retire"))
+        return flush(handle, timeout_ms)
+
+    monkeypatch.setattr(core_ffi, "drainer_flush", emit_while_retiring)
+    _init(new)
+    monkeypatch.setattr(core_ffi, "drainer_flush", flush)
+    assert fasten.flush(timeout=2.0)
+    assert [r.id for r in _rows(new)] == [r.id for r in emitted]
+    assert not _default.audit_write_swallowed()
+
+
+def test_concurrent_inits_retire_every_drainer(tmp_path, monkeypatch):
+    from fasten import core_ffi
+    opened, closed = [], []
+    open_, close = core_ffi.store_from_callback, core_ffi.store_close
+    monkeypatch.setattr(core_ffi, "store_from_callback", lambda cb: opened.append(1) or open_(cb))
+    monkeypatch.setattr(core_ffi, "store_close", lambda h: closed.append(1) or close(h))
+    store = FlakyStore(str(tmp_path / "a.db"))
+    threads = [threading.Thread(target=_init, args=(store,)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    _default._uninstall_drainer()
+    assert len(opened) == len(closed) == 4
+
+
+def test_row_refused_at_stop_gets_one_abandoned_event(tmp_path):
+    # fasten-core reports a row it refuses at stop (rc 10); the engine must
+    # not report it again.
+    store = FlakyStore(str(tmp_path / "a.db"))
+    gate = _hold_first_insert(store)
+    _init(store, queue_capacity=1)
+    fasten.emit(code="USER_CREATED", target="held")          # takes the only slot
+    blocked = threading.Thread(target=fasten.emit,
+                               kwargs={"code": "USER_CREATED", "target": "blocked"})
+    blocked.start()
+    deadline = time.monotonic() + 5
+    while _default._drainer.users == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    closer = threading.Thread(target=_default._uninstall_drainer)
+    closer.start()
+    while "audit_drain_abandoned" not in _sys_events() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    gate.set()
+    blocked.join(timeout=5)
+    closer.join(timeout=5)
+    abandoned = [e for e in reversed(fasten.transport().query_syslog(limit=1000))
+                 if e.get("event") == "audit_drain_abandoned"]
+    assert [e["reason"] for e in abandoned] == ["drainer_stopped"]
+    assert len(_rows(store)) == 2
 
