@@ -65,6 +65,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   assert byte-identical output on the same instant plus strict-reject
   of every non-canonical shape.
 
+### Changed — Chain verification (Python + Go)
+
+- A row with no hash is skipped only below its node's first sealed row; one
+  at or above it is a break. The sealed row right after an unsealed one must
+  link to `"genesis"`.
+- A row given more than once is checked once, with its sealed copy
+  preferred over an unsealed one (a stdout capture has both). Two sealed
+  copies must have the same hash, and each must verify.
+- Go now walks each node's chain separately, as Python does, so rows from
+  several nodes no longer break on interleaving. Both SDKs report a
+  duplicate `monotonic_seq` on one node, and `first_break_at` is the lowest
+  seq that breaks on any node.
+
 ### Changed — Ring filter semantics now match the store (gh #58, Python)
 
 - `python/fasten/store/ring.py` filter comparisons switched from lax to strict

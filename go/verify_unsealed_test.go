@@ -147,22 +147,49 @@ func TestVerifyADuplicateSeqBreaksAndARedeliveredRowDoesNot(t *testing.T) {
 	dup.ID = "evt-dup"
 	dup = Seal(rows[0].Hash, dup)
 	res := VerifyChain(append(append([]Row{}, rows...), dup))
-	if res.OK || res.FirstBreakAt != 2 || !strings.Contains(res.Reason, "duplicate") {
+	// Same reason as Python, which quotes the node with !r.
+	if res.OK || res.FirstBreakAt != 2 || !strings.Contains(res.Reason, "duplicate monotonic_seq 2 on node 'node-1'") {
 		t.Fatalf("want a duplicate break at 2, got %+v", res)
 	}
 }
 
-func TestVerifyKeepsTheFirstCopyOfARedeliveredRow(t *testing.T) {
-	// A later copy of a row with other values must not replace the first.
+func TestVerifyChecksEverySealedCopyOfARow(t *testing.T) {
 	rows := makeRemoteChain(3, "svc", "node-1")
 	stale := unsealed(rows[1])
 	stale.MonotonicSeq = 0
 	if res := VerifyChain(append(append([]Row{}, rows...), stale)); !res.OK {
-		t.Fatalf("want ok, got %+v", res)
+		t.Fatalf("an unsealed copy must be ignored, got %+v", res)
 	}
 	edited := rows[1]
-	edited.Target = "edited"
-	if res := VerifyChain(append(append([]Row{}, rows...), edited)); !res.OK {
-		t.Fatalf("the first copy is the one checked, got %+v", res)
+	edited.Target = "edited" // hash left as it was
+	resealed := Seal(rows[0].Hash, edited)
+	for _, extra := range []Row{edited, resealed} {
+		for _, in := range [][]Row{
+			append(append([]Row{}, rows...), extra),
+			append([]Row{extra}, rows...),
+		} {
+			if res := VerifyChain(in); res.OK || res.FirstBreakAt != 2 {
+				t.Fatalf("want a break at 2, got %+v", res)
+			}
+		}
+	}
+}
+
+func TestVerifyACaptureWithBothStdoutLinesChecksTheSealedRows(t *testing.T) {
+	// Spec §8: each row's unsealed phase-1 line comes before its sealed one.
+	rows := makeRemoteChain(3, "svc", "node-1")
+	var phase1 []Row
+	for _, r := range rows {
+		r = unsealed(r)
+		r.MonotonicSeq, r.PrevHash = 0, ""
+		phase1 = append(phase1, r)
+	}
+	if res := VerifyChain(append(append([]Row{}, phase1...), rows...)); !res.OK {
+		t.Fatalf("want ok, got %+v", res)
+	}
+	edited := append([]Row{}, rows...)
+	edited[2].Target = "edited"
+	if res := VerifyChain(append(append([]Row{}, phase1...), edited...)); res.OK || res.FirstBreakAt != 3 {
+		t.Fatalf("want a break at 3, got %+v", res)
 	}
 }

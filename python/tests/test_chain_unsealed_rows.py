@@ -116,12 +116,27 @@ def test_a_duplicate_seq_breaks_and_a_redelivered_row_does_not():
     assert verify_chain(rows + [rows[1]]).ok                         # same row again
     dup = seal(rows[0].hash, dataclasses.replace(_row(2), id="evt-dup"))
     result = verify_chain(rows + [dup])
-    assert not result.ok and result.first_break_at == 2 and "duplicate" in (result.reason or "")
+    assert not result.ok and result.first_break_at == 2
+    assert "duplicate monotonic_seq 2 on node 'node-1'" in (result.reason or "")
 
 
-def test_the_first_copy_of_a_redelivered_row_is_checked():
+def test_every_sealed_copy_of_a_row_is_checked():
     rows = _chain([1, 2, 3])
-    stale = _unsealed(rows[1], monotonic_seq=0)
-    assert verify_chain(rows + [stale]).ok
-    assert verify_chain(rows + [dataclasses.replace(rows[1], target="u/2")]).ok
+    assert verify_chain(rows + [_unsealed(rows[1], monotonic_seq=0)]).ok
+    edited = dataclasses.replace(rows[1], target="u/2")              # hash left as it was
+    resealed = seal(rows[0].hash, edited)                             # a different hash
+    for extra in (edited, resealed):
+        for order in (rows + [extra], [extra] + rows):
+            result = verify_chain(order)
+            assert not result.ok and result.first_break_at == 2, result
+
+
+def test_a_capture_with_both_stdout_lines_checks_the_sealed_rows():
+    # Spec §8: each row's unsealed phase-1 line comes before its sealed one.
+    rows = _chain([1, 2, 3])
+    phase1 = [_unsealed(r, monotonic_seq=0, prev_hash="") for r in rows]
+    assert verify_chain(phase1 + rows).ok
+    tail_edited = rows[:2] + [dataclasses.replace(rows[2], target="u/2")]
+    result = verify_chain(phase1 + tail_edited)
+    assert not result.ok and result.first_break_at == 3
 

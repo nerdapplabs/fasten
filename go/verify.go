@@ -103,7 +103,9 @@ type VerifyResult struct {
 //
 // Semantics mirror Python engine.py verify_chain exactly:
 //
-//   - Rows are sorted by MonotonicSeq and walked per SourceNodeID.
+//   - Rows are sorted by MonotonicSeq and walked per SourceNodeID, one copy
+//     per id. A sealed copy wins over an unsealed one; two sealed copies
+//     must have the same hash, and each must check out.
 //   - Rows with an empty Hash (written before hash-chain support, or in
 //     stdout-only mode) are skipped below their node's first sealed seq; one
 //     at or above it breaks the chain.
@@ -122,15 +124,46 @@ func VerifyChain(rows []Row) VerifyResult {
 		return VerifyResult{OK: true, TotalRows: 0}
 	}
 
-	// A re-delivered row is checked once (spec §4): keep the first copy of
-	// each node + id, in input order, as Python does.
+	// A re-delivered row is checked once (spec §4). A sealed copy replaces an
+	// unsealed one, since a stdout capture has the phase-1 line first. A
+	// second sealed copy must be the same row: the same hash, and a hash that
+	// checks out. Python does the same.
 	sorted := make([]Row, 0, total)
-	seenID := map[string]bool{}
+	kept := map[string]int{} // node + id -> index in sorted
+	var dup *VerifyResult
 	for _, row := range rows {
-		if key := row.SourceNodeID + "\x00" + row.ID; !seenID[key] {
-			seenID[key] = true
+		key := row.SourceNodeID + "\x00" + row.ID
+		i, seen := kept[key]
+		switch {
+		case !seen:
+			kept[key] = len(sorted)
 			sorted = append(sorted, row)
+		case sorted[i].Hash == "" && row.Hash != "":
+			sorted[i] = row
+		case sorted[i].Hash != "" && row.Hash != "":
+			reason := ""
+			if row.Hash != sorted[i].Hash {
+				reason = fmt.Sprintf("row %s: two sealed copies with different hashes", row.ID)
+			} else {
+				reason = rowBreak(row)
+			}
+			seq := min(row.MonotonicSeq, sorted[i].MonotonicSeq)
+			if reason != "" && (dup == nil || seq < dup.FirstBreakAt) {
+				dup = &VerifyResult{OK: false, TotalRows: total, FirstBreakAt: seq, Reason: reason}
+			}
 		}
+	}
+	res := walkChains(sorted, total)
+	if dup != nil && (res.OK || dup.FirstBreakAt < res.FirstBreakAt) {
+		return *dup
+	}
+	return res
+}
+
+// walkChains checks each node's chain in rows, one copy per row id.
+func walkChains(sorted []Row, total int) VerifyResult {
+	broke := func(row Row, reason string) VerifyResult {
+		return VerifyResult{OK: false, TotalRows: total, FirstBreakAt: row.MonotonicSeq, Reason: reason}
 	}
 	// By seq, then node: the first break found is the lowest seq on any node,
 	// as in Python, so both report the same FirstBreakAt.
@@ -143,8 +176,9 @@ func VerifyChain(rows []Row) VerifyResult {
 
 	// Chains are per node (spec §2). An unsealed row is skipped only below its
 	// node's first sealed seq: a conformant store never writes one at or above
-	// it. A sealed row at exactly seq+1 after an unsealed one links to
-	// "genesis"; after a gap the window starts there.
+	// it. Only the node's first sealed row may skip the prev_hash check: it
+	// links to "genesis" when the unsealed row before it is at seq-1, and
+	// starts the window when a purged head left a gap there.
 	firstSealed := map[string]int64{}
 	for _, row := range sorted {
 		if _, seen := firstSealed[row.SourceNodeID]; row.Hash != "" && !seen {
@@ -158,12 +192,7 @@ func VerifyChain(rows []Row) VerifyResult {
 		last[row.SourceNodeID] = row
 		if row.Hash == "" {
 			if first, ok := firstSealed[row.SourceNodeID]; ok && row.MonotonicSeq >= first {
-				return VerifyResult{
-					OK:           false,
-					TotalRows:    total,
-					FirstBreakAt: row.MonotonicSeq,
-					Reason:       fmt.Sprintf("row %s: no hash after the node's chain started", row.ID),
-				}
+				return broke(row, fmt.Sprintf("row %s: no hash after the node's chain started", row.ID))
 			}
 			continue // written before chaining, or stdout-only
 		}
@@ -171,101 +200,73 @@ func VerifyChain(rows []Row) VerifyResult {
 		// allocators raced — a non-conformant in-memory counter (spec §2.1).
 		seqKey := row.SourceNodeID + "\x00" + strconv.FormatInt(row.MonotonicSeq, 10)
 		if other, dup := seenSeq[seqKey]; dup && other != row.ID {
-			return VerifyResult{
-				OK:           false,
-				TotalRows:    total,
-				FirstBreakAt: row.MonotonicSeq,
-				Reason: fmt.Sprintf(
-					"duplicate monotonic_seq %d on node %q: rows %s and %s. Two engines allocated independently (spec §2.1).",
-					row.MonotonicSeq, row.SourceNodeID, other, row.ID),
-			}
+			return broke(row, fmt.Sprintf(
+				"duplicate monotonic_seq %d on node '%s': rows %s and %s. Two engines allocated independently (spec §2.1).",
+				row.MonotonicSeq, row.SourceNodeID, other, row.ID))
 		}
 		seenSeq[seqKey] = row.ID
-		formID := row.CanonicalFormID
-		if formID == "" {
-			// "1", NOT currentCanonicalFormID: a row written before the field
-			// existed IS form "1". Defaulting to "current" silently
-			// re-interpreted every legacy row the moment the SDK started
-			// sealing "2", and they then failed the commitment check.
-			formID = legacyCanonicalFormID
-		}
-		hashFn, ok := hashFnByForm[formID]
-		if !ok {
-			return VerifyResult{
-				OK:           false,
-				TotalRows:    total,
-				FirstBreakAt: row.MonotonicSeq,
-				Reason:       fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID),
-			}
-		}
-		// Form "2" hashes detail_commitment, NOT detail. The hash therefore
-		// does not protect detail on its own: an attacker could rewrite detail
-		// and leave the commitment intact. Whenever detail is present the
-		// commitment MUST be recomputable and must match — and a missing salt
-		// is a break, not a skip, or clearing it would disable the check.
-		// Redaction clears detail AND salt together (spec §7.1), so a
-		// legitimately redacted row never reaches here.
-		if formID == "2" && row.Detail != nil {
-			if row.DetailSalt == "" {
-				return VerifyResult{
-					OK:           false,
-					TotalRows:    total,
-					FirstBreakAt: row.MonotonicSeq,
-					Reason: fmt.Sprintf(
-						"row %s: detail present but detail_salt is missing — commitment cannot be verified",
-						row.ID),
-				}
-			}
-			if detailCommitment(row.DetailSalt, row.Detail) != row.DetailCommitment {
-				return VerifyResult{
-					OK:           false,
-					TotalRows:    total,
-					FirstBreakAt: row.MonotonicSeq,
-					Reason:       fmt.Sprintf("row %s: detail does not match its commitment", row.ID),
-				}
-			}
-		}
-
-		expected := hashFn(row)
-		if expected != row.Hash && formID == "1" {
-			// Pre-conformance Python hashed the wire timestamp verbatim
-			// (always-"Z") while the spec and Go use "+00:00" — the
-			// divergence in #91. Those rows exist in deployments and are not
-			// tampered; without this they verify in Python (which has the
-			// same fallback) and fail here, which reads as tampering.
-			// Delete with form "1".
-			expected = rowHashForm1LegacyZ(row)
-		}
-		if expected != row.Hash {
-			return VerifyResult{
-				OK:           false,
-				TotalRows:    total,
-				FirstBreakAt: row.MonotonicSeq,
-				Reason:       fmt.Sprintf("row %s: hash mismatch", row.ID),
-			}
+		if reason := rowBreak(row); reason != "" {
+			return broke(row, reason)
 		}
 		if hasPrev {
 			if prev.Hash != "" && row.PrevHash != prev.Hash {
-				return VerifyResult{
-					OK:           false,
-					TotalRows:    total,
-					FirstBreakAt: row.MonotonicSeq,
-					Reason: fmt.Sprintf(
-						"row %s: prev_hash does not match preceding row %s", row.ID, prev.ID),
-				}
+				return broke(row, fmt.Sprintf("row %s: prev_hash does not match preceding row %s", row.ID, prev.ID))
 			}
-			// After a gap (a purged head) the window starts here instead.
 			if prev.Hash == "" && prev.MonotonicSeq == row.MonotonicSeq-1 && row.PrevHash != "genesis" {
-				return VerifyResult{
-					OK:           false,
-					TotalRows:    total,
-					FirstBreakAt: row.MonotonicSeq,
-					Reason:       fmt.Sprintf("row %s: first sealed row does not link to genesis", row.ID),
-				}
+				return broke(row, fmt.Sprintf("row %s: first sealed row does not link to genesis", row.ID))
 			}
 		}
 	}
 	return VerifyResult{OK: true, TotalRows: total}
+}
+
+// rowBreak checks a sealed row on its own: its form, its detail commitment
+// and its hash. It returns why the row fails, or "" if it checks out.
+func rowBreak(row Row) string {
+	formID := row.CanonicalFormID
+	if formID == "" {
+		// "1", NOT currentCanonicalFormID: a row written before the field
+		// existed IS form "1". Defaulting to "current" silently
+		// re-interpreted every legacy row the moment the SDK started
+		// sealing "2", and they then failed the commitment check.
+		formID = legacyCanonicalFormID
+	}
+	hashFn, ok := hashFnByForm[formID]
+	if !ok {
+		return fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID)
+	}
+	// Form "2" hashes detail_commitment, NOT detail. The hash therefore
+	// does not protect detail on its own: a rewritten detail with the
+	// commitment left as it was still matches. Whenever detail is present the
+	// commitment MUST be recomputable and must match — and a missing salt
+	// is a break, not a skip, or clearing it would disable the check.
+	// Redaction clears detail AND salt together (spec §7.1), so a
+	// legitimately redacted row never reaches here.
+	if formID == "2" && row.Detail != nil {
+		if row.DetailSalt == "" {
+			return fmt.Sprintf(
+				"row %s: detail present but detail_salt is missing — commitment cannot be verified",
+				row.ID)
+		}
+		if detailCommitment(row.DetailSalt, row.Detail) != row.DetailCommitment {
+			return fmt.Sprintf("row %s: detail does not match its commitment", row.ID)
+		}
+	}
+
+	expected := hashFn(row)
+	if expected != row.Hash && formID == "1" {
+		// Pre-conformance Python hashed the wire timestamp verbatim
+		// (always-"Z") while the spec and Go use "+00:00" — the
+		// divergence in #91. Those rows exist in deployments and are not
+		// tampered; without this they verify in Python (which has the
+		// same fallback) and fail here, which reads as tampering.
+		// Delete with form "1".
+		expected = rowHashForm1LegacyZ(row)
+	}
+	if expected != row.Hash {
+		return fmt.Sprintf("row %s: hash mismatch", row.ID)
+	}
+	return ""
 }
 
 // rowHashPyCompat reproduces Python fasten.engine._row_hash byte-for-byte:
