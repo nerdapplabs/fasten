@@ -163,9 +163,11 @@ final class Engine: @unchecked Sendable {
 /// Shared default engine — module-level functions delegate here.
 let _defaultEngine = Engine()
 
-/// FastenError wraps any fasten-specific failure.
-public struct FastenError: Error, CustomStringConvertible {
+/// FastenError wraps any fasten-specific failure. Its localizedDescription is
+/// the message, which the drainer keeps as last_error.
+public struct FastenError: Error, LocalizedError, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }
     public var description: String { "FastenError: \(message)" }
+    public var errorDescription: String? { message }
 }

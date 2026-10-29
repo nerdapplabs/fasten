@@ -235,6 +235,37 @@ final class SQLiteStoreTests: XCTestCase {
         sqlite3_close(otherConnection(path, "DROP TABLE audit_log"))
         XCTAssertThrowsError(try Fasten.emit("USER_CREATED", target: "res-1", actor: "admin"))
     }
+
+    func testQueueModeRetriesWhileTheDatabaseIsLocked() throws {
+        Fasten.register("user", codes: [
+            "USER_CREATED": Meta(id: "USER_CREATED", domain: "user",
+                                 category: "account", action: "create",
+                                 description: "Test", emitter: "test"),
+        ])
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .queue)
+        let other = otherConnection(path, "BEGIN EXCLUSIVE")
+        try Fasten.emit("USER_CREATED", target: "res-1", actor: "admin")
+        XCTAssertFalse(Fasten.flush(timeout: 0.3))
+        XCTAssertEqual(store.maxMonotonicSeq(), 0)
+        sqlite3_exec(other, "COMMIT", nil, nil, nil)
+        sqlite3_close(other)
+        XCTAssertTrue(Fasten.flush(timeout: 5))
+        XCTAssertEqual(store.maxMonotonicSeq(), 1)
+    }
+
+    func testDrainerKeepsTheStoreErrorMessage() throws {
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        let other = otherConnection(path, "BEGIN EXCLUSIVE")
+        defer { sqlite3_close(other) }
+        let drainer = QueueDrainer(store: store, retryInitialMs: 20, retryMaxMs: 20, retryJitter: false)
+        defer { drainer.close() }
+        drainer.enqueue(row("evt-locked"))
+        XCTAssertFalse(drainer.flush(timeout: 0.2))
+        XCTAssertTrue(drainer.statsJSON.contains("SQLite insert failed"), drainer.statsJSON)
+    }
 }
 
 // MARK: - Context propagation
