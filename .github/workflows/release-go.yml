@@ -1,53 +1,22 @@
 name: Release Go SDK
 
+# The module lives in go/, so its versions are go/vX.Y.Z tags.
 on:
   push:
     tags:
-      - 'v*'
+      - 'go/v*'
 
 permissions:
   contents: read
+  id-token: write   # fasten-go.yml uploads coverage through Codecov OIDC
 
 jobs:
   verify:
+    uses: ./.github/workflows/fasten-go.yml
+
+  published:
+    needs: verify
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v6
-
-      # The Go SDK links libfasten_core through cgo, so build it first, the
-      # same way fasten-go.yml does.
-      - name: Read toolchain from rust-toolchain.toml
-        id: rust-toolchain-file
-        run: |
-          ch=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
-          [ -n "$ch" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
-          echo "channel=$ch" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-toolchain-file.outputs.channel }}
-
-      - name: Build fasten-core (.so)
-        working-directory: fasten-core
-        run: cargo build --release --locked --features all
-
-      - name: Set up Go 1.22
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Vet and test
-        working-directory: go
-        env:
-          CGO_ENABLED: "1"
-          CGO_LDFLAGS: -L${{ github.workspace }}/fasten-core/target/release
-          LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
-        run: |
-          go vet ./...
-          go test -v -race ./...
-
-      - name: Tag published
-        # pkg.go.dev serves Go modules from VCS tags; there is nothing to upload.
-        run: echo "Tag ${{ github.ref_name }} pushed; module github.com/nerdapplabs/fasten/go"
+      # pkg.go.dev serves Go modules from VCS tags; there is nothing to upload.
+      - run: echo "Tag ${{ github.ref_name }} pushed; module github.com/nerdapplabs/fasten/go"
