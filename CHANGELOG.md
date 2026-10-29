@@ -25,6 +25,21 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - The queue is no longer allocated up front, so a large `capacity` costs
   nothing until rows arrive.
 
+### Changed — Python queue mode goes through the shared drainer
+
+- In queue mode (the default), `emit()` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `monotonic_seq` is 0 and
+  `hash` is empty, and the store seals the row when it lands. Use
+  `audit_store_failure_strategy="raise"` to get the
+  sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `queue_drain_max_attempts`, instead of being dropped after one try. A row
+  the store rejects outright (DB-API `DataError` / `IntegrityError`) is
+  dead-lettered at once.
+- `emit()` blocks while the queue is full.
+- A forked child (gunicorn `--preload`, Celery prefork) installs its own
+  drainer.
+
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 
 - **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),

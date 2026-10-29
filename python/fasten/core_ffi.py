@@ -60,6 +60,8 @@ def _find_lib() -> str:
 InsertCallbackFn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
 # fasten_drainer_enqueue: the drainer is stopping; the row was not queued.
 ERR_DRAINER_STOPPED = 10
+# Insert callback result: the store rejected the row; dead-letter it, no retry.
+INSERT_REJECTED = -1
 
 
 class EnqueueError(RuntimeError):

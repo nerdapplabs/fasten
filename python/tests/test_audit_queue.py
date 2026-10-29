@@ -3,8 +3,11 @@
 Vectors from spec/drainer-conformance.md §7.
 """
 import json
+import os
+import sqlite3
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -80,6 +83,14 @@ def _wait_for_attempts(store, n):
     while store.attempts < n and time.monotonic() < deadline:
         time.sleep(0.005)
     assert store.attempts >= n
+
+
+def _wait_in_backoff():
+    """Wait until a failed row is in backoff, not still inside its attempt."""
+    deadline = time.monotonic() + 5
+    while fasten.queue_stats()["retry_count_active"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert fasten.queue_stats()["retry_count_active"] >= 1
 
 
 def test_v1_happy_path(tmp_path):
@@ -359,13 +370,15 @@ def test_rows_stored_at_stop_are_reported(tmp_path, capsys):
     store = FlakyStore(str(tmp_path / "a.db"), fail=2)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
     row = fasten.emit(code="USER_CREATED", target="u-1")
-    _wait_for_attempts(store, 1)    # first attempt failed, now in backoff
+    _wait_in_backoff()              # first attempt failed
     _default._uninstall_drainer()   # one more attempt fails; stored inline
     assert len(_rows(store)) == 1
     err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
            if line.startswith("{")]
     assert any(e.get("event") == "audit_drain_recovered_at_stop" and e.get("row_ids") == [row.id]
                for e in err)
+    # Stored after all, so not also reported as dead-lettered.
+    assert not any(e.get("event") == "audit_drain_dead_letter" for e in err)
 
 
 
@@ -401,6 +414,7 @@ def test_callback_for_a_settled_row_does_not_retry(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"))
     _init(store)
     assert _default._drainer.callback(b'{"id": "evt-not-pending"}', 0) == 0
+    assert "audit_drain_row_not_pending" in _sys_events()
 
 
 def test_refused_enqueue_is_stored_in_the_drainers_store(tmp_path, monkeypatch):
@@ -557,9 +571,9 @@ def test_old_drainer_events_keep_the_old_config(tmp_path, capsys):
                 audit_store_failure_strategy="queue")
     err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
            if line.startswith("{")]
-    dead = [e for e in err if e.get("event") == "audit_drain_dead_letter"]
-    assert dead and all(e["service_id"] == "svc" for e in dead)
-    assert "audit_drain_dead_letter" not in _sys_events()   # not in the new stream
+    lost = [e for e in err if e.get("event") == "audit_drain_lost_at_stop"]
+    assert lost and all(e["service_id"] == "svc" for e in lost)
+    assert "audit_drain_lost_at_stop" not in _sys_events()   # not in the new stream
 
 
 def test_emits_while_the_old_drainer_retires_are_queued(tmp_path, monkeypatch):
@@ -622,4 +636,81 @@ def test_row_refused_at_stop_gets_one_abandoned_event(tmp_path):
                  if e.get("event") == "audit_drain_abandoned"]
     assert [e["reason"] for e in abandoned] == ["drainer_stopped"]
     assert len(_rows(store)) == 2
+
+
+class RejectingStore(FlakyStore):
+    """Raises the DB-API IntegrityError, as a real store does for a row it
+    will never accept, for rows targeting "bad"."""
+
+    rejects = 0
+
+    def allocate_and_insert_originated(self, row):
+        if row.target == "bad":
+            self.rejects += 1
+            raise sqlite3.IntegrityError("constraint failed")
+        return super().allocate_and_insert_originated(row)
+
+
+def test_rejected_row_is_dead_lettered_without_holding_up_the_queue(tmp_path):
+    store = RejectingStore(str(tmp_path / "a.db"))
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    fasten.emit(code="USER_CREATED", target="bad")
+    fasten.emit(code="USER_CREATED", target="good")
+    assert fasten.flush(timeout=2.0)
+    assert [r.target for r in _rows(store)] == ["good"]
+    assert store.rejects == 1
+    assert fasten.queue_stats()["dead_lettered_total"] == 1
+    assert "audit_drain_dead_letter" in _sys_events()
+    assert _default.audit_write_swallowed()
+
+
+def test_flush_with_no_time_left_does_not_wait(tmp_path):
+    # fasten-core reads 0 ms as no timeout.
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    start = time.monotonic()
+    assert not fasten.flush(timeout=0)
+    assert not fasten.flush(timeout=0.0004)
+    assert time.monotonic() - start < 1
+
+
+def test_large_queue_capacity_is_accepted(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store, queue_capacity=10**12)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=1.0)
+    assert len(_rows(store)) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_forked_child_gets_its_own_drainer(tmp_path):
+    # gunicorn --preload / Celery prefork: the child inherits the drainer but
+    # not its thread. Before the child reinstalled, it hung once the queue
+    # filled and stored nothing.
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store, queue_capacity=3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+        pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            for i in range(6):
+                fasten.emit(code="USER_CREATED", target=f"child-{i}")
+            code = 0 if fasten.flush(timeout=5.0) else 2
+        finally:
+            os._exit(code)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        pytest.fail("forked child hung emitting")
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert sorted(r.target for r in _rows(store)) == [f"child-{i}" for i in range(6)]
 

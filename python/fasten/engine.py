@@ -21,6 +21,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import os
 import threading
 import uuid
@@ -170,6 +171,13 @@ class _QueueDrainer:
     stdout: Any = None
     service_id: str = ""
     gen: int = 0                # engine store generation it writes to
+    install: dict[str, Any] = dataclasses.field(default_factory=dict)  # to reinstall after fork
+
+
+def _rejects_row(exc: BaseException) -> bool:
+    """The store refused the row itself, so retrying cannot help. sqlite3 and
+    psycopg raise the DB-API DataError / IntegrityError for that."""
+    return any(c.__name__ in ("DataError", "IntegrityError") for c in type(exc).__mro__)
 
 
 class Engine:
@@ -694,7 +702,8 @@ class Engine:
         with self._using_drainer() as d:
             if d is None:
                 return True
-            return _ffi.drainer_flush(d.handle, int(timeout * 1000))
+            # Round up: fasten-core reads 0 ms as no timeout.
+            return _ffi.drainer_flush(d.handle, max(1, math.ceil(timeout * 1000)))
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
         """Drainer health snapshot. Returns None in raise mode."""
@@ -973,6 +982,9 @@ class Engine:
         pending: dict[str, list[Any]] = {}
         d = _QueueDrainer(None, None, pending, store, stdout=self._stdout,
                           service_id=self._service_id, gen=self._store_gen)
+        d.install = dict(store=store, capacity=capacity, retry_initial_ms=retry_initial_ms,
+                         retry_max_ms=retry_max_ms, retry_jitter=retry_jitter,
+                         max_attempts=max_attempts)
 
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
             row_id = "<unparsed>"
@@ -980,24 +992,29 @@ class Engine:
                 row_id = json.loads(row_json.decode("utf-8"))["id"]
                 entry = pending.get(row_id)
                 if entry is None:   # already settled here; nothing to store
-                    cb_logger.error("insert_cb: row %s is not pending", row_id)
+                    self._drainer_sys_log("error", "audit_drain_row_not_pending", {"row_id": row_id}, via=d)
                     return 0
                 entry[1] += 1
                 self._allocate_and_store(entry[0], store, d.stdout)
                 pending.pop(row_id, None)
                 return 0
-            except Exception:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
+            except Exception as e:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
                 cb_logger.exception("insert_cb failed for row %s", row_id)
+                rejected = _rejects_row(e)
                 failed = pending.get(row_id)
-                if failed is not None and failed[1] >= max_attempts:
+                if failed is not None and (rejected or failed[1] >= max_attempts):
                     pending.pop(row_id, None)  # the drainer dead-letters it now
                     self._mark_write_lost(store, d.gen)
-                return 1
+                return _ffi.INSERT_REJECTED if rejected else 1
 
         def _sys_cb(event_json: bytes, _userdata: int) -> None:
             # fasten-core's drainer events join the sys stream (spec §4).
             try:
                 fields = json.loads(event_json.decode("utf-8"))
+                # A row still pending failed its one try at stop; retire then
+                # stores it or reports it lost, so this would count it twice.
+                if fields.get("event") == "audit_drain_dead_letter" and fields.get("row_id") in pending:
+                    return
                 fields.pop("shape", None)
                 fields.pop("timestamp", None)
                 self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields, via=d)
@@ -1021,8 +1038,25 @@ class Engine:
             old, self._drainer = self._drainer, d
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
+            if hasattr(os, "register_at_fork"):
+                os.register_at_fork(after_in_child=self._reinstall_after_fork)
             self._atexit_registered = True
         return old
+
+    def _reinstall_after_fork(self) -> None:
+        """A forked child (gunicorn --preload, Celery prefork) inherits the
+        drainer but not its thread, so nothing it queued would be stored.
+        Drop it without closing it, since there is no thread to join and its
+        rows belong to the parent, and install a fresh one."""
+        # Another thread may have held these at the fork.
+        self._drainer_lock = threading.Lock()
+        self._drainer_idle = threading.Condition(self._drainer_lock)
+        old, self._drainer = self._drainer, None
+        if old is not None:
+            try:
+                self._install_drainer(**old.install)
+            except Exception:  # noqa: BLE001 — emits then store inline (no drainer)
+                logging.getLogger("fasten").exception("drainer reinstall after fork failed")
 
     def _take_drainer(self) -> Optional[_QueueDrainer]:
         with self._drainer_lock:
