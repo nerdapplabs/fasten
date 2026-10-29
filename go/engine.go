@@ -697,6 +697,16 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 	return d.flush(time.Until(deadline))
 }
 
+// Close flushes pending audit rows for up to timeout, then stops the drainer
+// and stores, or reports lost, any row it still holds. Call it on shutdown:
+// Flush alone leaves a row that is still being retried unreported at exit.
+// Emits after Close are stored synchronously. Returns Flush's result.
+func (e *Engine) Close(timeout time.Duration) bool {
+	drained := e.Flush(timeout)
+	e.uninstallDrainer()
+	return drained
+}
+
 // marshalWithShape renders row as a JSON line tagged with its stream shape
 // WITHOUT mutating row. Once a row has been handed to PushSyslog/PushAPI the
 // ring holds it by reference and a store may have persisted it, so writing

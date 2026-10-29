@@ -61,6 +61,22 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `spec/persistent-streams.md` — the normative schema, completeness, sentinel,
   retention, and constrained-search contract.
 
+### Changed — Go queue mode goes through the shared drainer
+
+- In queue mode (the default), `Emit` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `MonotonicSeq` and `Hash`
+  are zero, and the store seals the row when it lands. Use
+  `AuditStoreFailureStrategy: "raise"` to get the sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `QueueDrainMaxAttempts`, instead of being dropped after one try. A row
+  the store rejects outright (Postgres SQLSTATE class 22/23, a SQLite
+  constraint) is dead-lettered at once.
+- `Emit` blocks while the queue is full, and that wait does not observe
+  `ctx`.
+- New `fasten.Close(timeout)` flushes and stops the drainer; call it on
+  shutdown instead of `Flush` so a row still being retried is stored or
+  reported.
+
 ### Changed — canonical UTC timestamp form on both SDKs
 
 - Every outbound fasten timestamp is now stamped in the canonical form

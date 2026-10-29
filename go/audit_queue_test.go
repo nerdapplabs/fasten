@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ type flakyStore struct {
 	panicIf  func(Row) bool
 	delay    time.Duration
 	gate     chan struct{} // when set, the first insert waits for it to close
+	failWith error         // returned by failing inserts instead of "store down"
 	attempts int
 }
 
@@ -32,6 +34,7 @@ func (s *flakyStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (
 	failing := s.attempts <= s.fail || (s.failIf != nil && s.failIf(row))
 	panicking := s.panicIf != nil && s.panicIf(row)
 	delay := s.delay
+	failWith := s.failWith
 	gate := s.gate
 	if s.attempts > 1 {
 		gate = nil
@@ -45,6 +48,9 @@ func (s *flakyStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (
 		panic("store bug")
 	}
 	if failing {
+		if failWith != nil {
+			return row, failWith
+		}
 		return row, errors.New("store down")
 	}
 	return s.SQLiteStore.AllocateAndInsertOriginated(ctx, row)
@@ -118,6 +124,20 @@ func waitForTries(t *testing.T, s *flakyStore, n int) {
 	if s.tries() < n {
 		t.Fatalf("store saw %d attempts, want %d", s.tries(), n)
 	}
+}
+
+// waitInBackoff waits until a failed row is in backoff, not still inside
+// its attempt.
+func waitInBackoff(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := GetQueueStats(); s != nil && s.RetryCountActive >= 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no row went into backoff")
 }
 
 func sysEvents(t *testing.T, event string) []SyslogRow {
@@ -260,11 +280,15 @@ func TestQueueRowsAtStopAreRecoveredOrReportedLost(t *testing.T) {
 	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
 	good, _ := Emit(context.Background(), "USER_CREATED", Target("good"))
 	bad, _ := Emit(context.Background(), "USER_CREATED", Target("bad"))
-	waitForTries(t, store, 1) // "good" failed once and is in backoff
+	waitInBackoff(t) // "good" failed once
 	Default.uninstallDrainer()
 	rows := store.rows(t)
 	if len(rows) != 1 || rows[0].ID != good.ID {
 		t.Fatalf("stored %+v, want only %s", rows, good.ID)
+	}
+	// Both are reported below, so neither is also reported as dead-lettered.
+	if ev := sysEvents(t, "audit_drain_dead_letter"); len(ev) != 0 {
+		t.Fatalf("dead_letter events = %v", ev)
 	}
 	if !Default.auditWriteSwallowed.Load() {
 		t.Fatal("a row lost at stop must mark the engine degraded")
@@ -293,8 +317,8 @@ func TestQueueEmitAfterDrainerStoppedIsStored(t *testing.T) { // V-12
 }
 
 func TestQueueReinitWhileDrainingDoesNotOverlapTheDrainThread(t *testing.T) {
-	// The drain thread runs engine code; Init must retire it before writing
-	// engine fields (caught by -race otherwise).
+	// The drain thread runs engine code while Init rewrites engine fields;
+	// it must use only what it captured at install (caught by -race otherwise).
 	registerTestCodes(t)
 	resetGlobals(t)
 	store := newFlakyStore(t, 0)
@@ -693,5 +717,95 @@ func TestQueueRowRefusedAtStopGetsOneAbandonedEvent(t *testing.T) {
 	}
 	if got := len(store.rows(t)); got != 2 {
 		t.Fatalf("rows = %d, want 2", got)
+	}
+}
+
+// sqlStateErr is a Postgres error as lib/pq and pgx report it.
+type sqlStateErr string
+
+func (e sqlStateErr) Error() string    { return "pq: " + string(e) }
+func (e sqlStateErr) SQLState() string { return string(e) }
+
+// sqliteErr is a SQLite error as modernc.org/sqlite reports it.
+type sqliteErr int
+
+func (e sqliteErr) Error() string { return "sqlite error" }
+func (e sqliteErr) Code() int     { return int(e) }
+
+func TestRejectsRow(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{sqlStateErr("22021"), true},  // NUL byte / bad encoding
+		{sqlStateErr("23505"), true},  // unique violation
+		{sqlStateErr("08006"), false}, // connection failure
+		{sqlStateErr("40001"), false}, // serialization failure
+		{fmt.Errorf("insert: %w", sqlStateErr("23502")), true},
+		{sqliteErr(2067), true}, // SQLITE_CONSTRAINT_UNIQUE
+		{sqliteErr(20), true},   // SQLITE_MISMATCH
+		{sqliteErr(5), false},   // SQLITE_BUSY
+		{errors.New("store down"), false},
+	} {
+		if got := rejectsRow(c.err); got != c.want {
+			t.Errorf("rejectsRow(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+func TestQueueRejectedRowIsDeadLetteredAtOnce(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	store.failIf = func(r Row) bool { return r.Target == "bad" }
+	store.failWith = sqlStateErr("22021")
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	Emit(context.Background(), "USER_CREATED", Target("bad"))
+	good, _ := Emit(context.Background(), "USER_CREATED", Target("good"))
+	if !Flush(2 * time.Second) {
+		t.Fatal("the row behind a rejected one was held up")
+	}
+	if rows := store.rows(t); len(rows) != 1 || rows[0].ID != good.ID {
+		t.Fatalf("stored %+v, want only %s", rows, good.ID)
+	}
+	if s := GetQueueStats(); s.DeadLetteredTotal != 1 {
+		t.Fatalf("dead_lettered_total = %d, want 1", s.DeadLetteredTotal)
+	}
+	if !Default.auditWriteSwallowed.Load() {
+		t.Fatal("a rejected row must mark the engine degraded")
+	}
+}
+
+func TestQueueFlushWithNoTimeLeftDoesNotWait(t *testing.T) {
+	// fasten-core reads 0 ms as no timeout.
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, math.MaxInt32)
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	emitN(t, 1)
+	start := time.Now()
+	if Flush(0) || Flush(500*time.Microsecond) {
+		t.Fatal("flush reported drained during an outage")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("flush waited %v", time.Since(start))
+	}
+}
+
+func TestQueueCloseStoresARowStillRetrying(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 1) // fails once, then works
+	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
+	r := emitN(t, 1)[0]
+	waitInBackoff(t)
+	if Close(50 * time.Millisecond) {
+		t.Fatal("Close reported drained while the row was in backoff")
+	}
+	if rows := store.rows(t); len(rows) != 1 || rows[0].ID != r.ID {
+		t.Fatalf("stored %+v, want %s", rows, r.ID)
+	}
+	if Default.activeDrainer() != nil {
+		t.Fatal("Close left the drainer installed")
 	}
 }

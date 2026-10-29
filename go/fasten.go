@@ -458,9 +458,11 @@ type QueueStats struct {
 //
 //   - "queue" (default) — Emit hands rows to the fasten-core drainer,
 //     whose background thread stores them with exponential backoff and
-//     dead-letters a row after QueueDrainMaxAttempts. The returned row
-//     is not sealed yet (spec §8). Emit blocks only when QueueCapacity
-//     (queued + in-flight retry) is saturated.
+//     dead-letters a row after QueueDrainMaxAttempts, or at once when the
+//     store rejects the row itself. The returned row is not sealed yet
+//     (spec §8): MonotonicSeq and Hash are zero. Emit blocks only when
+//     QueueCapacity (queued + in-flight retry) is saturated, and that
+//     wait does not observe ctx.
 //   - "raise" — Emit calls Insert synchronously and returns the
 //     wrapped error (*AuditStoreError). Useful for tests and adopters
 //     who want loud failures during configuration debugging.
@@ -535,6 +537,9 @@ func GetTransport() *Transport { return Default.GetTransport() }
 
 // Flush blocks until the Default engine's pending rows drain.
 func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
+
+// Close flushes and stops the Default engine's drainer; call it on shutdown.
+func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.
 func GetQueueStats() *QueueStats { return Default.GetQueueStats() }

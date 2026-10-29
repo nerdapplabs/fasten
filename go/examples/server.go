@@ -8,7 +8,7 @@
 //     request and stashes it in the context for downstream Emit / Log.
 //   - POST /users emits an audit row with the in-context request_id.
 //   - GET  /users/<id> emits a read-side audit row + a structured sys log.
-//   - On Ctrl-C, fasten.Flush() drains pending audit rows.
+//   - On Ctrl-C, fasten.Close() drains pending audit rows.
 //
 // Run:
 //
@@ -71,22 +71,26 @@ func main() {
 
 	srv := &http.Server{Addr: ":8080", Handler: fasten.RequestID(mux)}
 
-	// Graceful shutdown: drain pending audit rows before exit.
+	// Graceful shutdown: finish in-flight requests, then drain pending
+	// audit rows before exit.
+	idle := make(chan struct{})
 	go func() {
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 		<-stop
-		log.Println("shutting down — flushing audit queue")
-		fasten.Flush(5 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		close(idle)
 	}()
 
 	log.Println("listening on :8080")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	<-idle
+	log.Println("shutting down — flushing audit queue")
+	fasten.Close(5 * time.Second)
 }
 
 func createUser(w http.ResponseWriter, r *http.Request) {

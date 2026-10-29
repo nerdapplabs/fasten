@@ -33,10 +33,12 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/cgo"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -59,10 +61,10 @@ func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) (rc C.int32_t) {
 		}
 	}()
 	d, ok := cgo.Handle(uintptr(userdata)).Value().(*cFastenDrainer)
-	if !ok || !d.insert(C.GoString(rowJSON)) {
+	if !ok {
 		return 1
 	}
-	return 0
+	return d.insert(C.GoString(rowJSON))
 }
 
 // goSysLogCallback puts a fasten-core drainer event on the sys stream
@@ -87,6 +89,11 @@ func goSysLogCallback(eventJSON *C.char, userdata unsafe.Pointer) {
 	}
 	level, _ := fields["level"].(string)
 	event, _ := fields["event"].(string)
+	if id, _ := fields["row_id"].(string); event == "audit_drain_dead_letter" && d.isPending(id) {
+		// A row still pending failed its one try at stop; retire then stores
+		// it or reports it lost, so this would count it twice.
+		return
+	}
 	for _, k := range []string{"shape", "level", "event", "timestamp"} {
 		delete(fields, k)
 	}
@@ -188,14 +195,16 @@ func newCFastenDrainer(
 	return d, nil
 }
 
-// insert stores the pending row named in rowJSON. It reports false so the
-// drainer retries; at maxAttempts the drainer dead-letters the row.
-func (d *cFastenDrainer) insert(rowJSON string) bool {
+// insert stores the pending row named in rowJSON and returns the callback
+// result: 0 when stored, FASTEN_INSERT_REJECTED when the store refused the
+// row itself, and 1 otherwise so the drainer retries it (dead-lettering it
+// at maxAttempts).
+func (d *cFastenDrainer) insert(rowJSON string) C.int32_t {
 	var head struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal([]byte(rowJSON), &head); err != nil {
-		return false
+		return 1
 	}
 	d.pendingMu.Lock()
 	p := d.pending[head.ID]
@@ -206,17 +215,46 @@ func (d *cFastenDrainer) insert(rowJSON string) bool {
 	if p == nil {
 		// Already settled here; nothing to store.
 		d.engine.sysLogTo(d.out, "error", "audit_drain_row_not_pending", map[string]any{"row_id": head.ID})
-		return true
+		return 0
 	}
 	if err := d.storeRow(p.row); err != nil {
-		if p.attempts >= d.maxAttempts {
-			d.settle(head.ID)
+		rejected := rejectsRow(err)
+		if rejected || p.attempts >= d.maxAttempts {
+			d.settle(head.ID) // the drainer dead-letters it now
 			d.engine.markWriteLost(d.store, d.gen)
 		}
-		return false
+		if rejected {
+			return C.FASTEN_INSERT_REJECTED
+		}
+		return 1
 	}
 	d.settle(head.ID)
-	return true
+	return 0
+}
+
+// rejectsRow reports whether the store refused the row itself, so retrying
+// cannot help: a Postgres data exception or integrity violation (SQLSTATE
+// class 22 or 23, from lib/pq or pgx), or a SQLite constraint or datatype
+// mismatch (modernc.org/sqlite).
+func rejectsRow(err error) bool {
+	var pg interface{ SQLState() string }
+	if errors.As(err, &pg) {
+		s := pg.SQLState()
+		return strings.HasPrefix(s, "22") || strings.HasPrefix(s, "23")
+	}
+	var lite interface{ Code() int }
+	if errors.As(err, &lite) {
+		// Primary result code SQLITE_CONSTRAINT or SQLITE_MISMATCH.
+		c := lite.Code() & 0xff
+		return c == 19 || c == 20
+	}
+	return false
+}
+
+func (d *cFastenDrainer) isPending(id string) bool {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	return d.pending[id] != nil
 }
 
 func (d *cFastenDrainer) pendingLen() int {
@@ -287,7 +325,11 @@ func (d *cFastenDrainer) flush(timeout time.Duration) bool {
 	if d.closed {
 		return true
 	}
-	ms := C.uint64_t(timeout.Milliseconds())
+	// Round up to at least 1 ms: fasten-core reads 0 as no timeout.
+	ms := C.uint64_t(1)
+	if timeout > time.Millisecond {
+		ms = C.uint64_t((timeout + time.Millisecond - 1) / time.Millisecond)
+	}
 	var drained C.int
 	C.fasten_drainer_flush((*C.FastenStore)(d.handle), ms, &drained, nil)
 	return drained != 0
