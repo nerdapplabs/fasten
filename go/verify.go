@@ -103,11 +103,15 @@ type VerifyResult struct {
 //
 // Semantics mirror Python engine.py verify_chain exactly:
 //
-//   - Rows are sorted by MonotonicSeq before walking.
-//   - Rows with an empty Hash (written before hash-chain support) are skipped.
+//   - Rows are sorted by MonotonicSeq and walked per SourceNodeID.
+//   - Rows with an empty Hash (written before hash-chain support, or in
+//     stdout-only mode) are skipped below their node's first sealed seq; one
+//     at or above it breaks the chain.
 //   - For each hash-bearing row the canonical row hash is recomputed and
 //     compared to the stored Hash.
-//   - Each row's PrevHash is compared to the preceding row's Hash.
+//   - Each row's PrevHash is compared to the preceding row's Hash on its
+//     node, or to "genesis" when that row is unsealed and directly precedes it.
+//   - With several nodes, FirstBreakAt is the lowest seq at which any breaks.
 //   - On the first mismatch the walk stops and returns OK=false with
 //     FirstBreakAt set to that row's MonotonicSeq.
 //
@@ -120,14 +124,60 @@ func VerifyChain(rows []Row) VerifyResult {
 
 	sorted := make([]Row, total)
 	copy(sorted, rows)
+	// By seq, then node: the first break found is the lowest seq on any node,
+	// as in Python, so both report the same FirstBreakAt.
 	sort.SliceStable(sorted, func(i, j int) bool {
-		return sorted[i].MonotonicSeq < sorted[j].MonotonicSeq
+		if sorted[i].MonotonicSeq != sorted[j].MonotonicSeq {
+			return sorted[i].MonotonicSeq < sorted[j].MonotonicSeq
+		}
+		return sorted[i].SourceNodeID < sorted[j].SourceNodeID
 	})
 
-	for i, row := range sorted {
-		if row.Hash == "" {
-			continue // pre-upgrade row; skip
+	// Chains are per node (spec §2). An unsealed row is skipped only below its
+	// node's first sealed seq: a conformant store never writes one at or above
+	// it. The row right after the last unsealed one links to "genesis".
+	firstSealed := map[string]int64{}
+	for _, row := range sorted {
+		if _, seen := firstSealed[row.SourceNodeID]; row.Hash != "" && !seen {
+			firstSealed[row.SourceNodeID] = row.MonotonicSeq
 		}
+	}
+	last := map[string]Row{}
+	seenID := map[string]bool{}    // node + id: a re-delivered row is checked once (spec §4)
+	seenSeq := map[string]string{} // node + seq of a sealed row -> its id
+	for _, row := range sorted {
+		if key := row.SourceNodeID + "\x00" + row.ID; seenID[key] {
+			continue
+		} else {
+			seenID[key] = true
+		}
+		prev, hasPrev := last[row.SourceNodeID]
+		last[row.SourceNodeID] = row
+		if row.Hash == "" {
+			if first, ok := firstSealed[row.SourceNodeID]; ok && row.MonotonicSeq >= first {
+				return VerifyResult{
+					OK:           false,
+					TotalRows:    total,
+					FirstBreakAt: row.MonotonicSeq,
+					Reason:       fmt.Sprintf("row %s: no hash after the node's chain started", row.ID),
+				}
+			}
+			continue // written before chaining, or stdout-only
+		}
+		// MonotonicSeq is unique within a node, so a duplicate means two
+		// allocators raced — a non-conformant in-memory counter (spec §2.1).
+		seqKey := row.SourceNodeID + "\x00" + strconv.FormatInt(row.MonotonicSeq, 10)
+		if other, dup := seenSeq[seqKey]; dup && other != row.ID {
+			return VerifyResult{
+				OK:           false,
+				TotalRows:    total,
+				FirstBreakAt: row.MonotonicSeq,
+				Reason: fmt.Sprintf(
+					"duplicate monotonic_seq %d on node %q: rows %s and %s. Two engines allocated independently (spec §2.1).",
+					row.MonotonicSeq, row.SourceNodeID, other, row.ID),
+			}
+		}
+		seenSeq[seqKey] = row.ID
 		formID := row.CanonicalFormID
 		if formID == "" {
 			// "1", NOT currentCanonicalFormID: a row written before the field
@@ -191,8 +241,7 @@ func VerifyChain(rows []Row) VerifyResult {
 				Reason:       fmt.Sprintf("row %s: hash mismatch", row.ID),
 			}
 		}
-		if i > 0 {
-			prev := sorted[i-1]
+		if hasPrev {
 			if prev.Hash != "" && row.PrevHash != prev.Hash {
 				return VerifyResult{
 					OK:           false,
@@ -200,6 +249,15 @@ func VerifyChain(rows []Row) VerifyResult {
 					FirstBreakAt: row.MonotonicSeq,
 					Reason: fmt.Sprintf(
 						"row %s: prev_hash does not match preceding row %s", row.ID, prev.ID),
+				}
+			}
+			// After a gap (a purged head) the window starts here instead.
+			if prev.Hash == "" && prev.MonotonicSeq == row.MonotonicSeq-1 && row.PrevHash != "genesis" {
+				return VerifyResult{
+					OK:           false,
+					TotalRows:    total,
+					FirstBreakAt: row.MonotonicSeq,
+					Reason:       fmt.Sprintf("row %s: first sealed row does not link to genesis", row.ID),
 				}
 			}
 		}
