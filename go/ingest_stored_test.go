@@ -191,3 +191,33 @@ func TestIngestAndEmitOnSeveralConnectionsDoNotFailBusy(t *testing.T) {
 		t.Fatalf("stored %d rows, want 100", got)
 	}
 }
+
+func TestBeginImmediateKeepsALongerBusyTimeout(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ set, want int }{{0, sqliteBusyTimeoutMs}, {30000, 30000}} {
+		db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "t.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = "+itoa(tc.set)); err != nil {
+			t.Fatal(err)
+		}
+		if err := beginImmediate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		var got int
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		db.Close()
+		if got != tc.want {
+			t.Fatalf("busy_timeout %d -> %d, want %d", tc.set, got, tc.want)
+		}
+	}
+}

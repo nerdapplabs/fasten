@@ -383,9 +383,17 @@ const sqliteBusyTimeoutMs = 5000
 
 // beginImmediate starts a write transaction on conn that holds SQLite's write
 // lock before its first read, waiting for another writer rather than failing.
+// busy_timeout belongs to the connection and outlives this call in the pool,
+// so it is only ever raised, never lowered below what the caller set.
 func beginImmediate(ctx context.Context, conn *sql.Conn) error {
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMs)); err != nil {
+	var current int
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&current); err != nil {
 		return fmt.Errorf("fasten: busy_timeout: %w", err)
+	}
+	if current < sqliteBusyTimeoutMs {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMs)); err != nil {
+			return fmt.Errorf("fasten: busy_timeout: %w", err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
