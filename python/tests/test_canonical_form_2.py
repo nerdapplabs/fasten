@@ -360,8 +360,7 @@ def test_clearing_the_salt_does_not_skip_verification():
 GO_VECTOR = Path(__file__).resolve().parents[2] / "spec" / "go-sealed-form2.json"
 
 
-def _rows_from_go_vector() -> list[AuditRow]:
-    raw = json.loads(GO_VECTOR.read_text())
+def _rows_from_dicts(raw: list[dict]) -> list[AuditRow]:
     out = []
     for d in raw:
         for field in ("timestamp", "shipped_at"):
@@ -371,6 +370,10 @@ def _rows_from_go_vector() -> list[AuditRow]:
             k: d[k] for k in AuditRow.__dataclass_fields__ if k in d
         }))
     return out
+
+
+def _rows_from_go_vector() -> list[AuditRow]:
+    return _rows_from_dicts(json.loads(GO_VECTOR.read_text()))
 
 
 def test_python_verifies_a_go_sealed_form_2_chain():
@@ -437,7 +440,8 @@ def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
     for required in ("form1_micros", "form1_whole_second",
                      "form1_legacy_Z_micros", "form1_legacy_Z_whole",
                      "form2_micros", "form2_whole_second",
-                     "form1_shipped", "form2_shipped"):
+                     "form1_shipped", "form1_legacy_Z_shipped",
+                     "form2_shipped"):
         assert required in labels, f"vector lost coverage: {required}"
 
 
@@ -484,3 +488,27 @@ def test_mark_shipped_keeps_the_chain_verifying(tmp_path):
     rows = store.query(limit=10)
     assert all(r.shipped_at is not None for r in rows)
     assert verify_chain(rows).ok
+
+
+def test_python_verifies_every_python_sealed_vector_case():
+    """Go checks these cases in CI; this makes Python check them too, including
+    the shipped rows under each form."""
+    cases = json.loads((Path(__file__).resolve().parents[2] / "spec" /
+                        "python-sealed-forms.json").read_text())["cases"]
+    for case in cases:
+        [row] = _rows_from_dicts([dict(case["row"])])
+        result = verify_chain([row])
+        assert result.ok, f"{case['label']}: {result.reason}"
+
+
+def test_real_pre_fix_release_row_verifies_once_shipped():
+    """Rows the old release wrote verify only through the legacy fallback, so
+    marking them shipped must not move that hash either (#123)."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from gen_cross_sdk_vectors import FROZEN_PREFIX_ROW
+
+    d = dict(FROZEN_PREFIX_ROW, shipped_at="2026-06-16T08:00:00.250000Z")
+    [row] = _rows_from_dicts([d])
+    result = verify_chain([row])
+    assert result.ok, f"shipped pre-fix row rejected: {result.reason}"

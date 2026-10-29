@@ -232,6 +232,39 @@
    }
   },
   {
+   "label": "form1_legacy_Z_shipped",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "f7045e7190c9f291ee9a8495599101405f8d96a3be14d85a76a76dc459817425",
+    "id": "evt-form1_legacy_Z_shipped",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_legacy_Z_shipped",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z",
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
    "label": "form2_shipped",
    "row": {
     "action": "create",

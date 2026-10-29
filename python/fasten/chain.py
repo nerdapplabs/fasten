@@ -84,9 +84,8 @@ _TS_HASHED_FIELDS = ("timestamp",)
 
 
 def _hashed_fields(row_dict: dict[str, Any], excluded: frozenset[str]) -> dict[str, Any]:
-    """The row's hashed fields for one form. ``shipped_at`` is delivery
-    bookkeeping that ``mark_shipped`` sets after sealing, so every form hashes
-    it as null, the value it has when a row is sealed (spec §1.1)."""
+    """Row fields hashed by one form. ``shipped_at`` is hashed as null:
+    ``mark_shipped`` sets it after sealing (spec §1.1)."""
     d = {k: v for k, v in row_dict.items() if k not in excluded}
     if "shipped_at" in d:
         d["shipped_at"] = None

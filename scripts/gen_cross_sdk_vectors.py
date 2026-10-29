@@ -140,6 +140,13 @@ def build() -> dict:
     d.pop("hash", None)
     form1 = dataclasses.replace(form1, prev_hash="genesis", hash=_row_hash_form_1(d))
     add("form1_shipped", dataclasses.replace(form1, shipped_at=shipped_at))
+    legacy = dataclasses.replace(_row("evt-form1_legacy_Z_shipped", MICROS),
+                                 canonical_form_id="1")
+    d = legacy.to_dict()
+    d.pop("hash", None)
+    legacy = dataclasses.replace(legacy, prev_hash="genesis",
+                                 hash=_row_hash_form_1_legacy_z(d))
+    add("form1_legacy_Z_shipped", dataclasses.replace(legacy, shipped_at=shipped_at))
     form2 = seal("genesis", dataclasses.replace(_row("evt-form2_shipped", MICROS),
                                                 detail_salt=PINNED_SALT))
     add("form2_shipped", dataclasses.replace(form2, shipped_at=shipped_at))

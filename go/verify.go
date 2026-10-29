@@ -207,7 +207,7 @@ func VerifyChain(rows []Row) VerifyResult {
 	return VerifyResult{OK: true, TotalRows: total}
 }
 
-// rowHashPyCompat reproduces Python fasten.engine._row_hash byte-for-byte:
+// rowHashPyCompat reproduces Python fasten.chain._row_hash byte-for-byte:
 // SHA-256 of the canonical JSON of the row dict with the "hash" field excluded.
 //
 // The canonical form matches Python's
@@ -273,9 +273,9 @@ func rowHashForm2(row Row) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// pyCanonicalRowMap builds the map whose key set and value encodings match
-// Python AuditRow.to_dict() minus the "hash" key. pii_in_detail is
-// deliberately omitted because the Python row dict never contains it.
+// pyCanonicalRowMap builds the hashed row map: Python AuditRow.to_dict() minus
+// "hash", with shipped_at forced to nil (spec §1.1). pii_in_detail is omitted
+// because the Python row dict never has it.
 func pyCanonicalRowMap(row Row) map[string]any {
 	var tenant any
 	if row.TenantID != nil {
@@ -314,8 +314,7 @@ func pyCanonicalRowMap(row Row) map[string]any {
 		"request_id":        row.RequestID,
 		"detail":            detail,
 		"wire_version":      wire,
-		// Delivery bookkeeping that MarkShipped sets after sealing, so every
-		// form hashes it as null, its value when a row is sealed (spec §1.1).
+		// MarkShipped sets this after sealing, so it is hashed as null (spec §1.1).
 		"shipped_at": nil,
 		"prev_hash":  row.PrevHash,
 	}

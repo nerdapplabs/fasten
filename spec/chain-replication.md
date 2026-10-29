@@ -42,10 +42,8 @@ severity, shipped_at, source_node_id, target, tenant_id, timestamp, wire_version
 - `hash` is **excluded** (it is the output).
 - `canonical_form_id` is **included** — the form choice is covered by the hash.
 - `shipped_at` is hashed as **`null`** in every form, whatever the row holds.
-  It is delivery bookkeeping: rows are sealed with it `null`, and
-  `mark_shipped` sets it afterwards, so it must not move the hash. Emit seals
-  every row with `shipped_at` `null`, so no row it sealed before this rule
-  changes hash.
+  Rows are sealed with it `null` and `mark_shipped` sets it later, so it must
+  not move the hash. Rows sealed through emit keep their existing hashes.
 - `pii_in_detail` is **excluded**. The Go wire `Row` carries it as a field; the
   Python `AuditRow` does not. Both SDKs MUST exclude it from the hash so a Go
   aggregator can verify a Python-sealed chain. This is a deliberate, fixed
