@@ -218,8 +218,8 @@ func VerifyChain(rows []Row) VerifyResult {
 //   - the exact Python field set (NOTE: no pii_in_detail, which the Go wire
 //     Row carries but the Python AuditRow does not),
 //   - sorted keys (top level and nested), compact separators,
-//   - None -> null for tenant_id / shipped_at,
-//   - timestamp / shipped_at as Python datetime.isoformat() strings,
+//   - None -> null for tenant_id; shipped_at always null (spec §1.1),
+//   - timestamp as a Python datetime.isoformat() string,
 //   - non-ASCII escaped as \uXXXX (Python json.dumps ensure_ascii=True),
 //   - <, >, & left literal (Python does not HTML-escape).
 func rowHashPyCompat(row Row) string {
@@ -252,9 +252,6 @@ func rowHashForm1LegacyZ(row Row) string {
 	d := pyCanonicalRowMap(row)
 	delete(d, "hash")
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	if row.ShippedAt != nil {
-		d["shipped_at"] = canonicalTS(*row.ShippedAt)
-	}
 	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
 }
@@ -272,9 +269,6 @@ func rowHashForm2(row Row) string {
 	delete(d, "detail")
 	d["detail_commitment"] = row.DetailCommitment
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	if row.ShippedAt != nil {
-		d["shipped_at"] = canonicalTS(*row.ShippedAt)
-	}
 	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
 }
@@ -286,10 +280,6 @@ func pyCanonicalRowMap(row Row) map[string]any {
 	var tenant any
 	if row.TenantID != nil {
 		tenant = *row.TenantID
-	}
-	var shipped any
-	if row.ShippedAt != nil {
-		shipped = pyISOFormat(*row.ShippedAt)
 	}
 	wire := row.WireVersion
 	if wire == "" {
@@ -324,8 +314,10 @@ func pyCanonicalRowMap(row Row) map[string]any {
 		"request_id":        row.RequestID,
 		"detail":            detail,
 		"wire_version":      wire,
-		"shipped_at":        shipped,
-		"prev_hash":         row.PrevHash,
+		// Delivery bookkeeping that MarkShipped sets after sealing, so every
+		// form hashes it as null, its value when a row is sealed (spec §1.1).
+		"shipped_at": nil,
+		"prev_hash":  row.PrevHash,
 	}
 }
 

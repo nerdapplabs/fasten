@@ -22,7 +22,8 @@ over ``AuditRow.to_dict()``. This means:
     from the hash so a Go aggregator can verify a Python-sealed chain),
   - ``canonical_form_id`` IS included in the hashed bytes,
   - sorted keys (top level and nested), compact separators,
-  - ``None`` -> ``null`` for tenant_id / shipped_at,
+  - ``None`` -> ``null`` for tenant_id; shipped_at is always hashed as ``null``
+    (it is set after sealing, spec §1.1),
   - timestamps as ``datetime.isoformat()`` strings.
 
 A new form is added by registering a new id in ``_HASH_FN_BY_FORM`` with its own
@@ -79,7 +80,17 @@ def detail_commitment(salt: str, detail: Any) -> str:
     return hashlib.sha256(salt.encode() + _canonical_json(detail)).hexdigest()
 
 
-_TS_HASHED_FIELDS = ("timestamp", "shipped_at")
+_TS_HASHED_FIELDS = ("timestamp",)
+
+
+def _hashed_fields(row_dict: dict[str, Any], excluded: frozenset[str]) -> dict[str, Any]:
+    """The row's hashed fields for one form. ``shipped_at`` is delivery
+    bookkeeping that ``mark_shipped`` sets after sealing, so every form hashes
+    it as null, the value it has when a row is sealed (spec §1.1)."""
+    d = {k: v for k, v in row_dict.items() if k not in excluded}
+    if "shipped_at" in d:
+        d["shipped_at"] = None
+    return d
 
 
 def _hashed_ts(value: Any) -> Any:
@@ -115,7 +126,7 @@ def _row_hash_form_1(row_dict: dict[str, Any]) -> str:
     ``canonical_form_id`` is part of ``row_dict`` (via AuditRow.to_dict) and is
     therefore covered by the hash.
     """
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
     return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
 
 
@@ -131,7 +142,7 @@ def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
     ``verify_chain`` falls back to this for form-"1" rows ONLY. Delete it when
     form "1" is retired.
     """
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
     return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 
@@ -146,7 +157,7 @@ def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
     # NO _to_hashed_form here: form "2" hashes the timestamp exactly as the row
     # carries it on the wire (§4.3 / §1.4). One renderer, one spelling. Form "1"
     # needs the conversion because it hashed a different spelling than it wrote.
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_2_EXCLUDED)
     return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 

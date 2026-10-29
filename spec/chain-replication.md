@@ -41,6 +41,11 @@ severity, shipped_at, source_node_id, target, tenant_id, timestamp, wire_version
 
 - `hash` is **excluded** (it is the output).
 - `canonical_form_id` is **included** — the form choice is covered by the hash.
+- `shipped_at` is hashed as **`null`** in every form, whatever the row holds.
+  It is delivery bookkeeping: rows are sealed with it `null`, and
+  `mark_shipped` sets it afterwards, so it must not move the hash. Emit seals
+  every row with `shipped_at` `null`, so no row it sealed before this rule
+  changes hash.
 - `pii_in_detail` is **excluded**. The Go wire `Row` carries it as a field; the
   Python `AuditRow` does not. Both SDKs MUST exclude it from the hash so a Go
   aggregator can verify a Python-sealed chain. This is a deliberate, fixed
@@ -62,8 +67,8 @@ Every SDK MUST reproduce these bytes:
 | Whitespace | None — `,` and `:` separators, no spaces. |
 | Non-ASCII | Escaped as `\uXXXX` (and UTF-16 surrogate pairs for astral chars), i.e. CPython `ensure_ascii=True`. |
 | `<` `>` `&` | Left **literal** (CPython does NOT HTML-escape; a Go encoder MUST disable HTML escaping). |
-| Null | `None` → `null` for `tenant_id` and `shipped_at` when absent. |
-| Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp` and `shipped_at`. |
+| Null | `None` → `null` for `tenant_id` when absent; `shipped_at` is always `null` (§1.1). |
+| Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp`. |
 
 ### §1.3 Number rendering (cross-language hazard)
 

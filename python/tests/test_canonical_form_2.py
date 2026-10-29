@@ -436,7 +436,8 @@ def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
                           "spec" / "python-sealed-forms.json").read_text())["cases"]}
     for required in ("form1_micros", "form1_whole_second",
                      "form1_legacy_Z_micros", "form1_legacy_Z_whole",
-                     "form2_micros", "form2_whole_second"):
+                     "form2_micros", "form2_whole_second",
+                     "form1_shipped", "form2_shipped"):
         assert required in labels, f"vector lost coverage: {required}"
 
 
@@ -467,3 +468,19 @@ def test_legacy_fallback_reproduces_a_real_pre_fix_release_hash():
         "the legacy fallback no longer reproduces what a real pre-fix release "
         "wrote — rows sealed by that release will now read as tampering"
     )
+
+
+def test_mark_shipped_keeps_the_chain_verifying(tmp_path):
+    """#123: shipped_at is set after sealing, so marking rows shipped must not
+    change their hashes."""
+    from fasten.chain import verify_chain
+    from fasten.store.sqlite import SQLiteStore
+    store = SQLiteStore(str(tmp_path / "audit.db"))
+    for i in range(3):
+        store.allocate_and_insert_originated(
+            dataclasses.replace(_row(), id=f"evt-ship-{i}", origin_id=f"evt-ship-{i}"))
+    assert verify_chain(store.query(limit=10)).ok
+    store.mark_shipped([r.id for r in store.list_unshipped(limit=10)])
+    rows = store.query(limit=10)
+    assert all(r.shipped_at is not None for r in rows)
+    assert verify_chain(rows).ok
