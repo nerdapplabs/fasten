@@ -261,11 +261,13 @@ class PostgresStore:
             row.detail_commitment,
         )
 
-    def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
+    def _insert_row_core(self, cur: Any, row: AuditRow) -> int:
         """Execute the idempotent insert on ``cur`` WITHOUT committing — the
         transaction boundary belongs to the caller (per-row in _insert_row, one
-        BEGIN/COMMIT in ingest_replicated)."""
+        BEGIN/COMMIT in ingest_replicated). Returns the rows inserted: 0 when
+        the id was already stored."""
         cur.execute(self._INSERT_SQL.format(table=self._table), self._insert_params(row))
+        return int(cur.rowcount)
 
     def _insert_row(self, row: AuditRow) -> None:
         """Idempotent ON CONFLICT DO NOTHING insert of a single row, committed
@@ -455,7 +457,8 @@ class PostgresStore:
         (ON CONFLICT (id) DO NOTHING): a retry after a successful commit is a
         no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import IngestResult, cut_at_conflict, stored_conflict, verified_prefix
+        from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
+                           stored_conflict, verified_prefix)
 
         verified, verified_reject, verified_reason = verified_prefix(rows)
         for row in verified:
@@ -492,7 +495,7 @@ class PostgresStore:
                         verified, verified_reject, verified_reason,
                         stored_conflict(verified, by_id, at_seq))
                     for row in prefix:
-                        self._insert_row_core(cur, row)
+                        check_inserted(self._insert_row_core(cur, row), row, by_id)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -503,8 +506,15 @@ class PostgresStore:
                 reason=reason or None,
             )
 
-        result: IngestResult = self._execute_with_retry(_run)
-        return result
+        # The node locks don't cover ids, which are unique across nodes; if an
+        # ingest for another node stored one of these ids meanwhile, check again.
+        for _ in range(3):
+            try:
+                result: IngestResult = self._execute_with_retry(_run)
+                return result
+            except StoredMeanwhile:
+                continue
+        raise RuntimeError("ingest_replicated: rows kept being stored by another writer")
 
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":

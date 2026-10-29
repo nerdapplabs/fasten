@@ -1,8 +1,10 @@
 package fasten
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -111,8 +113,14 @@ func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix []Row
 		}
 		return ordered[i].SourceNodeID < ordered[j].SourceNodeID
 	})
+	nodeOf := map[string]string{}
 	for _, row := range ordered {
 		node, seq := row.SourceNodeID, row.MonotonicSeq
+		// id is unique across nodes, so only one of these could be stored.
+		if other, seen := nodeOf[row.ID]; seen && other != node {
+			return seq, fmt.Sprintf("row %s: also in this batch on node '%s'", row.ID, other), nil
+		}
+		nodeOf[row.ID] = node
 		held, ok, err := l.byID(ctx, tx, row.ID)
 		if err != nil {
 			return 0, "", err
@@ -128,9 +136,10 @@ func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix []Row
 		} else if ok {
 			return seq, fmt.Sprintf("row %s: seq %d on node %q is stored as row %s", row.ID, seq, node, other.id), nil
 		}
+		// After an unsealed row the store links to "genesis" (spec §2).
 		if before, ok, err := l.atSeq(ctx, tx, node, seq-1); err != nil {
 			return 0, "", err
-		} else if ok && row.PrevHash != before.hash {
+		} else if ok && row.PrevHash != cmp.Or(before.hash, "genesis") {
 			return seq, fmt.Sprintf("row %s: prev_hash does not match stored row %s", row.ID, before.id), nil
 		}
 		if after, ok, err := l.atSeq(ctx, tx, node, seq+1); err != nil {
@@ -157,14 +166,39 @@ func ingestReplicatedTx(
 	ctx context.Context,
 	db *sql.DB,
 	rows []Row,
-	insertTx func(context.Context, execContext, Row) error,
+	insertTx func(context.Context, execContext, Row) (int64, error),
 	look storedLookup,
 ) (IngestResult, error) {
 	prefix, rejectedFromSeq, reason := verifiedPrefix(rows)
 	if len(prefix) == 0 {
 		return IngestResult{Inserted: 0, RejectedFromSeq: rejectedFromSeq, Reason: reason}, nil
 	}
+	// The node locks don't cover ids, which are unique across nodes; if an
+	// ingest for another node stored one of these ids meanwhile, check again.
+	for range 3 {
+		res, err := ingestPrefix(ctx, db, prefix, rejectedFromSeq, reason, insertTx, look)
+		if !errors.Is(err, errStoredMeanwhile) {
+			return res, err
+		}
+	}
+	return IngestResult{}, errors.New("fasten IngestReplicated: rows kept being stored by another writer")
+}
 
+// errStoredMeanwhile means another writer stored a row with this id after the
+// stored-row checks ran, so the insert was skipped.
+var errStoredMeanwhile = errors.New("row stored meanwhile")
+
+// ingestPrefix checks a verified prefix against the stored rows and inserts
+// what agrees, in one transaction.
+func ingestPrefix(
+	ctx context.Context,
+	db *sql.DB,
+	prefix []Row,
+	rejectedFromSeq int64,
+	reason string,
+	insertTx func(context.Context, execContext, Row) (int64, error),
+	look storedLookup,
+) (IngestResult, error) {
 	tx, commit, rollback, err := beginIngest(ctx, db, look.immediate)
 	if err != nil {
 		return IngestResult{}, err
@@ -204,7 +238,16 @@ func ingestReplicatedTx(
 	}
 	inserted := 0
 	for _, row := range prefix {
-		if err := insertTx(ctx, tx, row); err != nil {
+		n, err := insertTx(ctx, tx, row)
+		if err == nil && n == 0 {
+			// Skipped: fine for a re-delivery, not for any other row.
+			if held, _, herr := look.byID(ctx, tx, row.ID); herr != nil {
+				err = herr
+			} else if held != row.Hash {
+				err = errStoredMeanwhile
+			}
+		}
+		if err != nil {
 			rollback()
 			return IngestResult{}, err
 		}
@@ -239,7 +282,8 @@ func beginIngest(ctx context.Context, db *sql.DB, immediate bool) (txConn, func(
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if err := beginImmediate(ctx, conn); err != nil {
+	restore, err := beginImmediate(ctx, conn)
+	if err != nil {
 		_ = conn.Close()
 		return nil, nil, nil, err
 	}
@@ -249,6 +293,7 @@ func beginIngest(ctx context.Context, db *sql.DB, immediate bool) (txConn, func(
 			return err
 		}
 		done = true
+		restore()
 		return conn.Close()
 	}
 	rollback := func() {
@@ -258,6 +303,7 @@ func beginIngest(ctx context.Context, db *sql.DB, immediate bool) (txConn, func(
 			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 			done = true
 		}
+		restore()
 		_ = conn.Close()
 	}
 	return conn, commit, rollback, nil

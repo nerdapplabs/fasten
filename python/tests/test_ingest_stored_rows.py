@@ -1,6 +1,10 @@
 """Ingest checks a batch against what the store already holds (spec §4): a
 row that disagrees with a stored row is rejected and reported, not ignored."""
+import dataclasses
+import os
 from datetime import datetime, timezone
+
+import pytest
 
 from fasten.attrs import AuditRow
 from fasten.chain import seal
@@ -8,13 +12,14 @@ from fasten.replication import ingest
 from fasten.store.sqlite import SQLiteStore
 
 
-def _row(seq: int, *, target: str = "u/1", rid: str | None = None) -> AuditRow:
+def _row(seq: int, *, target: str = "u/1", rid: str | None = None,
+         node: str = "node-1") -> AuditRow:
     rid = rid or f"evt-{seq}"
     return AuditRow(
         id=rid, origin_id=rid, monotonic_seq=seq,
         timestamp=datetime(2026, 6, 15, 10, 30, seq, tzinfo=timezone.utc),
         code="USER_CREATED", action="create", severity="info",
-        service_id="svc", source_node_id="node-1", tenant_id=None,
+        service_id="svc", source_node_id=node, tenant_id=None,
         actor="a", actor_kind="user", target=target,
         category="account", domain="user", method="sdk",
         request_id=f"req-{seq}", detail={"k": "v"},
@@ -95,3 +100,70 @@ def test_a_kept_row_is_checked_against_the_stored_row_after_it():
     result = ingest(store, other)
     assert result.rejected_from_seq == 5 and result.inserted == 0
     assert ingest(store, [rows[4]]).rejected_from_seq is None   # the real 5 fits
+
+
+def test_one_id_on_two_nodes_in_a_batch_is_rejected():
+    # id is unique across nodes, so the store could keep only one of them.
+    store = SQLiteStore(":memory:")
+    rows = _chain([1]) + _chain([1], node="node-2")
+    result = ingest(store, rows)
+    assert result.rejected_from_seq == 1 and result.inserted == 0
+    assert "also in this batch" in result.reason
+    assert _stored(store) == []
+
+
+def test_a_row_after_a_stored_unsealed_row_links_to_genesis():
+    store = SQLiteStore(":memory:")
+    store.insert_originated(dataclasses.replace(_row(1), hash="", prev_hash=""))
+    assert ingest(store, _chain([2], prev="deadbeef")).rejected_from_seq == 2
+    result = ingest(store, _chain([2]))
+    assert result.rejected_from_seq is None and result.inserted == 1
+
+
+def _blind_first_check(monkeypatch):
+    """Make the first stored-row check miss everything, as when another
+    writer stores a row between the check and the insert."""
+    from fasten.store import repo
+    real, calls = repo.stored_conflict, []
+
+    def blind(prefix, by_id, at_seq):
+        calls.append(1)
+        return None if len(calls) == 1 else real(prefix, by_id, at_seq)
+    monkeypatch.setattr(repo, "stored_conflict", blind)
+    return calls
+
+
+def _stored_elsewhere(store):
+    """evt-1 already stored on node-2; the batch carries evt-1 on node-1."""
+    ingest(store, _chain([1], node="node-2"))
+    return _chain([1, 2])
+
+
+def test_a_skipped_insert_is_not_reported_as_stored_sqlite(monkeypatch):
+    store = SQLiteStore(":memory:")
+    rows = _stored_elsewhere(store)
+    _blind_first_check(monkeypatch)
+    with pytest.raises(Exception, match="evt-1"):
+        ingest(store, rows)
+    assert [n for n, _, _ in _stored(store)] == [1]
+
+
+@pytest.mark.skipif(not os.getenv("FASTEN_TEST_POSTGRES_DSN"),
+                    reason="FASTEN_TEST_POSTGRES_DSN not set")
+def test_a_row_stored_meanwhile_is_checked_again_postgres(monkeypatch):
+    import uuid
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    store = PostgresStore.from_dsn(f"{os.environ['FASTEN_TEST_POSTGRES_DSN']}?table={table}")
+    try:
+        rows = _stored_elsewhere(store)
+        calls = _blind_first_check(monkeypatch)
+        result = ingest(store, rows)
+        assert len(calls) == 2
+        assert result.rejected_from_seq == 1 and result.inserted == 0
+        assert len(store.query(limit=10)) == 1
+    finally:
+        import psycopg
+        with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+

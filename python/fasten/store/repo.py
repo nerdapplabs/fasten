@@ -199,8 +199,12 @@ def stored_conflict(
     # The stored neighbours are checked even when the batch holds one too: the
     # batch neighbour may be cut by a later break, and if both are kept they
     # must agree anyway.
+    node_of: dict[str, str] = {}
     for row in sorted(prefix, key=lambda r: (r.monotonic_seq, r.source_node_id)):
         node, seq = row.source_node_id, row.monotonic_seq
+        # id is unique across nodes, so only one of these could be stored.
+        if node_of.setdefault(row.id, node) != node:
+            return seq, f"row {row.id}: also in this batch on node {node_of[row.id]!r}"
         held = by_id(row.id)
         if held is not None:
             if held != row.hash:
@@ -210,12 +214,25 @@ def stored_conflict(
         if other is not None:
             return seq, f"row {row.id}: seq {seq} on node {node!r} is stored as row {other[0]}"
         before = at_seq(node, seq - 1)
-        if before is not None and row.prev_hash != before[1]:
+        # After an unsealed row the store links to "genesis" (spec §2).
+        if before is not None and row.prev_hash != (before[1] or "genesis"):
             return seq, f"row {row.id}: prev_hash does not match stored row {before[0]}"
         after = at_seq(node, seq + 1)
         if after is not None and after[2] != row.hash:
             return seq, f"row {row.id}: stored row {after[0]} does not link to it"
     return None
+
+
+class StoredMeanwhile(Exception):
+    """Another writer stored a row with this id after the stored-row checks
+    ran, so the insert was skipped. The caller rolls back and checks again."""
+
+
+def check_inserted(count: int, row: AuditRow, by_id: Callable[[str], "str | None"]) -> None:
+    """Raise StoredMeanwhile if the insert of ``row`` was skipped for a row
+    other than the same one already stored (a re-delivery)."""
+    if count == 0 and by_id(row.id) != row.hash:
+        raise StoredMeanwhile(row.id)
 
 
 def cut_at_conflict(

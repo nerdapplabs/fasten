@@ -106,10 +106,10 @@ func TestIngestReplicatedTx_RollsBackOnInsertError(t *testing.T) {
 	injected := errors.New("injected insert failure")
 	calls := 0
 
-	insertTx := func(ctx context.Context, exec execContext, row Row) error {
+	insertTx := func(ctx context.Context, exec execContext, row Row) (int64, error) {
 		calls++
 		if calls == 3 { // fail mid-batch, after two successful inserts on the tx
-			return injected
+			return 0, injected
 		}
 		return store.insertReplicatedTx(ctx, exec, row)
 	}

@@ -210,14 +210,15 @@ class SQLiteStore:
             wal=q.get("wal", "true") != "false",
         )
 
-    def _insert_row_core(self, conn: Any, row: AuditRow) -> None:
+    def _insert_row_core(self, conn: Any, row: AuditRow) -> int:
         """Execute the idempotent INSERT OR IGNORE on ``conn`` WITHOUT committing.
 
         The transaction boundary is owned by the caller: ``_insert_row`` commits
         per row, while the batch path in ``ingest_replicated`` executes many of
         these and commits once. Shared by the originated and replicated entry
-        points — the intent split is enforced by the wrappers, not here."""
-        conn.execute(
+        points — the intent split is enforced by the wrappers, not here.
+        Returns the rows inserted: 0 when the id was already stored."""
+        cur = conn.execute(
             f"INSERT OR IGNORE INTO {self._table} "
             "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
             "service_id,source_node_id,tenant_id,actor,actor_kind,"
@@ -241,6 +242,7 @@ class SQLiteStore:
                 row.detail_commitment,
             ),
         )
+        return int(cur.rowcount)
 
     def _insert_row(self, row: AuditRow) -> None:
         """Idempotent INSERT OR IGNORE of a single row, committed immediately."""
@@ -404,7 +406,8 @@ class SQLiteStore:
         (INSERT OR IGNORE on the id PK): a retry after a successful commit is a
         no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import IngestResult, cut_at_conflict, stored_conflict, verified_prefix
+        from .repo import (IngestResult, check_inserted, cut_at_conflict, stored_conflict,
+                           verified_prefix)
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
         for row in prefix:
@@ -435,8 +438,10 @@ class SQLiteStore:
 
                 prefix, rejected_from_seq, reason = cut_at_conflict(
                     prefix, rejected_from_seq, reason, stored_conflict(prefix, by_id, at_seq))
+                # BEGIN IMMEDIATE holds off other writers, so a skipped insert
+                # here means the checks missed something: fail, don't drop it.
                 for row in prefix:
-                    self._insert_row_core(conn, row)
+                    check_inserted(self._insert_row_core(conn, row), row, by_id)
                     inserted += 1
                 conn.commit()
             except Exception:

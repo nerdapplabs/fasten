@@ -192,9 +192,11 @@ func TestIngestAndEmitOnSeveralConnectionsDoNotFailBusy(t *testing.T) {
 	}
 }
 
-func TestBeginImmediateKeepsALongerBusyTimeout(t *testing.T) {
+func TestBeginImmediateRaisesBusyTimeoutOnlyForTheTransaction(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct{ set, want int }{{0, sqliteBusyTimeoutMs}, {30000, 30000}} {
+	for _, tc := range []struct{ set, during int }{
+		{0, sqliteBusyTimeoutMs}, {100, sqliteBusyTimeoutMs}, {30000, 30000},
+	} {
 		db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "t.db"))
 		if err != nil {
 			t.Fatal(err)
@@ -203,21 +205,109 @@ func TestBeginImmediateKeepsALongerBusyTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		busy := func() int {
+			var v int
+			if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&v); err != nil {
+				t.Fatal(err)
+			}
+			return v
+		}
 		if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout = "+itoa(tc.set)); err != nil {
 			t.Fatal(err)
 		}
-		if err := beginImmediate(ctx, conn); err != nil {
+		restore, err := beginImmediate(ctx, conn)
+		if err != nil {
 			t.Fatal(err)
 		}
+		during := busy()
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		var got int
-		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&got); err != nil {
-			t.Fatal(err)
-		}
+		restore()
+		after := busy()
 		conn.Close()
 		db.Close()
-		if got != tc.want {
-			t.Fatalf("busy_timeout %d -> %d, want %d", tc.set, got, tc.want)
+		if during != tc.during || after != tc.set {
+			t.Fatalf("busy_timeout %d: %d during, %d after; want %d, %d", tc.set, during, after, tc.during, tc.set)
 		}
+	}
+}
+
+func TestAllocationLeavesThePoolsBusyTimeoutAsSet(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "t.db")+"?_pragma=busy_timeout(100)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	s, err := NewSQLiteStore(db, "fasten_audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := makeRemoteChain(1, "svc", "node-1")[0]
+	row.Hash, row.PrevHash = "", ""
+	if _, err := s.AllocateAndInsertOriginated(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 100 {
+		t.Fatalf("busy_timeout = %d after allocation, want the pool's 100", v)
+	}
+}
+
+func TestIngestOneIDOnTwoNodesInABatchIsRejected(t *testing.T) {
+	// id is unique across nodes, so the store could keep only one of them.
+	s := ingestStore(t)
+	a := makeRemoteChain(1, "svc", "node-a")[0]
+	b := a
+	b.SourceNodeID = "node-b"
+	b = Seal("genesis", b)
+	res, err := ingestPrefix(context.Background(), s.db, []Row{a, b}, 0, "", s.insertReplicatedTx, s.lookup())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RejectedFromSeq != 1 || res.Inserted != 0 || !strings.Contains(res.Reason, "also in this batch") {
+		t.Fatalf("want a rejection at 1, got %+v", res)
+	}
+	if storedCount(t, s) != 0 {
+		t.Fatal("a row was stored")
+	}
+}
+
+func TestIngestARowAfterAStoredUnsealedRowLinksToGenesis(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(2, "svc", "node-1")
+	unsealed := rows[0]
+	unsealed.Hash, unsealed.PrevHash = "", ""
+	if err := s.InsertOriginated(context.Background(), unsealed); err != nil {
+		t.Fatal(err)
+	}
+	if res := ingestOK(t, s, resealFrom(strings.Repeat("0", 64), rows[1:])); res.RejectedFromSeq != 2 {
+		t.Fatalf("want a rejection at 2, got %+v", res)
+	}
+	if res := ingestOK(t, s, resealFrom("genesis", rows[1:])); res.RejectedFromSeq != 0 || res.Inserted != 1 {
+		t.Fatalf("want row 2 stored, got %+v", res)
+	}
+}
+
+func TestIngestASkippedInsertIsCheckedAgain(t *testing.T) {
+	// An insert skipped for a row stored meanwhile must not count as stored:
+	// the ingest checks the stored rows again.
+	s, rows := ingestStore(t), makeRemoteChain(2, "svc", "node-1")
+	calls := 0
+	insertTx := func(ctx context.Context, exec execContext, row Row) (int64, error) {
+		calls++
+		if calls == 1 {
+			return 0, nil
+		}
+		return s.insertReplicatedTx(ctx, exec, row)
+	}
+	res, err := ingestReplicatedTx(context.Background(), s.db, rows, insertTx, s.lookup())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted != 2 || calls != 3 || storedCount(t, s) != 2 {
+		t.Fatalf("got %+v after %d inserts", res, calls)
 	}
 }
