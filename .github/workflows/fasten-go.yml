@@ -12,6 +12,7 @@ on:
       - 'go/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-go.yml'
+  workflow_call:
 
 permissions:
   contents: read
