@@ -455,35 +455,56 @@ class PostgresStore:
         (ON CONFLICT (id) DO NOTHING): a retry after a successful commit is a
         no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import IngestResult, verified_prefix
+        from .repo import IngestResult, cut_at_conflict, stored_conflict, verified_prefix
 
-        prefix, rejected_from_seq, reason = verified_prefix(rows)
-        for row in prefix:
+        verified, verified_reject, verified_reason = verified_prefix(rows)
+        for row in verified:
             if not row.hash:
                 raise ValueError(
                     "ingest_replicated requires sealed rows (non-empty hash); "
                     f"row {row.id!r} has no hash"
                 )
 
-        def _run(conn: Any) -> int:
-            inserted = 0
+        def _run(conn: Any) -> "IngestResult":
             try:
                 with conn.cursor() as cur:
+                    # Serialise with allocation and other ingests on each node
+                    # (same lock as allocate_and_insert_originated), then check
+                    # against what is already stored (spec §4): a conflicting
+                    # row is reported, never ignored.
+                    for node in sorted({r.source_node_id for r in verified}):
+                        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (node,))
+
+                    def by_id(row_id: str) -> str | None:
+                        cur.execute(f"SELECT hash FROM {self._table} WHERE id = %s", (row_id,))
+                        r = cur.fetchone()
+                        return r[0] if r else None
+
+                    def at_seq(node: str, seq: int) -> tuple[str, str, str] | None:
+                        cur.execute(
+                            f"SELECT id, hash, prev_hash FROM {self._table} "
+                            "WHERE source_node_id = %s AND monotonic_seq = %s LIMIT 1",
+                            (node, seq))
+                        r = cur.fetchone()
+                        return (r[0], r[1], r[2]) if r else None
+
+                    prefix, rejected_from_seq, reason = cut_at_conflict(
+                        verified, verified_reject, verified_reason,
+                        stored_conflict(verified, by_id, at_seq))
                     for row in prefix:
                         self._insert_row_core(cur, row)
-                        inserted += 1
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-            return inserted
+            return IngestResult(
+                inserted=len(prefix),
+                rejected_from_seq=rejected_from_seq,
+                reason=reason or None,
+            )
 
-        inserted = self._execute_with_retry(_run)
-        return IngestResult(
-            inserted=inserted,
-            rejected_from_seq=rejected_from_seq,
-            reason=reason or None,
-        )
+        result: IngestResult = self._execute_with_retry(_run)
+        return result
 
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":

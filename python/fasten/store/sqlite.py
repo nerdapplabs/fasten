@@ -404,7 +404,7 @@ class SQLiteStore:
         (INSERT OR IGNORE on the id PK): a retry after a successful commit is a
         no-op; a retry after a rolled-back failure re-inserts cleanly.
         """
-        from .repo import IngestResult, verified_prefix
+        from .repo import IngestResult, cut_at_conflict, stored_conflict, verified_prefix
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
         for row in prefix:
@@ -417,6 +417,24 @@ class SQLiteStore:
         with self._txn():
             conn = self._connect()
             try:
+                # Check against what is already stored, in the same transaction
+                # (spec §4): a conflicting row is reported, never ignored.
+                conn.execute("BEGIN IMMEDIATE")
+
+                def by_id(row_id: str) -> str | None:
+                    r = conn.execute(f"SELECT hash FROM {self._table} WHERE id = ?",
+                                     (row_id,)).fetchone()
+                    return r[0] if r else None
+
+                def at_seq(node: str, seq: int) -> tuple[str, str, str] | None:
+                    r = conn.execute(
+                        f"SELECT id, hash, prev_hash FROM {self._table} "
+                        "WHERE source_node_id = ? AND monotonic_seq = ? LIMIT 1",
+                        (node, seq)).fetchone()
+                    return (r[0], r[1], r[2]) if r else None
+
+                prefix, rejected_from_seq, reason = cut_at_conflict(
+                    prefix, rejected_from_seq, reason, stored_conflict(prefix, by_id, at_seq))
                 for row in prefix:
                     self._insert_row_core(conn, row)
                     inserted += 1

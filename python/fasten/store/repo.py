@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from ..attrs import AuditRow
 from ..chain import verify_chain
@@ -184,6 +184,51 @@ def verified_prefix(
     return prefix, break_at, result.reason or ""
 
 
+def stored_conflict(
+    prefix: list[AuditRow],
+    by_id: Callable[[str], "str | None"],
+    at_seq: Callable[[str, int], "tuple[str, str, str] | None"],
+) -> tuple[int, str] | None:
+    """The first row of a verified prefix that disagrees with what the store
+    already holds (spec §4), as ``(monotonic_seq, reason)``; None if none does.
+
+    ``by_id(id)`` returns the stored row's hash, ``at_seq(node, seq)`` the
+    stored ``(id, hash, prev_hash)`` at that position; each None if absent.
+    A row already stored with the same hash is a re-delivery, not a conflict.
+    """
+    # The stored neighbours are checked even when the batch holds one too: the
+    # batch neighbour may be cut by a later break, and if both are kept they
+    # must agree anyway.
+    for row in sorted(prefix, key=lambda r: (r.monotonic_seq, r.source_node_id)):
+        node, seq = row.source_node_id, row.monotonic_seq
+        held = by_id(row.id)
+        if held is not None:
+            if held != row.hash:
+                return seq, f"row {row.id}: differs from the stored row with that id"
+            continue
+        other = at_seq(node, seq)
+        if other is not None:
+            return seq, f"row {row.id}: seq {seq} on node {node!r} is stored as row {other[0]}"
+        before = at_seq(node, seq - 1)
+        if before is not None and row.prev_hash != before[1]:
+            return seq, f"row {row.id}: prev_hash does not match stored row {before[0]}"
+        after = at_seq(node, seq + 1)
+        if after is not None and after[2] != row.hash:
+            return seq, f"row {row.id}: stored row {after[0]} does not link to it"
+    return None
+
+
+def cut_at_conflict(
+    prefix: list[AuditRow], rejected_from_seq: int | None, reason: str,
+    conflict: tuple[int, str] | None,
+) -> tuple[list[AuditRow], int | None, str]:
+    """Shorten a verified prefix to the rows before a stored conflict."""
+    if conflict is None:
+        return prefix, rejected_from_seq, reason
+    seq, why = conflict
+    return [r for r in prefix if r.monotonic_seq < seq], seq, why
+
+
 def _insert_one_replicated(store: "AuditRepository", row: AuditRow) -> None:
     """Route one replicated row through insert_replicated when available.
 
@@ -205,8 +250,10 @@ def ingest_replicated_into(store: "AuditRepository", rows: list[AuditRow]) -> In
     Computes the verified prefix and inserts it row-by-row via the idempotent
     insert. SQLiteStore and PostgresStore override this with a single-transaction
     implementation (real atomicity); this loop-insert variant is the safe default
-    for adopter stores that don't expose a transaction. Never raises on a chain
-    break — rejected rows surface via ``rejected_from_seq``.
+    for adopter stores that don't expose a transaction. It cannot look up what
+    the store already holds, so it does not check for stored conflicts (spec
+    §4); SQLiteStore and PostgresStore do. Never raises on a chain break —
+    rejected rows surface via ``rejected_from_seq``.
     """
     prefix, rejected_from_seq, reason = verified_prefix(rows)
     inserted = 0

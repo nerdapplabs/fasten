@@ -311,8 +311,8 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return Row{}, fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
+	if err := beginImmediate(ctx, conn); err != nil {
+		return Row{}, err
 	}
 	committed := false
 	defer func() {
@@ -375,6 +375,22 @@ func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, 
 		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRowExec(ctx, exec, row)
+}
+
+// sqliteBusyTimeoutMs is how long a writer waits for SQLite's write lock before
+// failing with SQLITE_BUSY, matching Python's sqlite3 default of 5 s.
+const sqliteBusyTimeoutMs = 5000
+
+// beginImmediate starts a write transaction on conn that holds SQLite's write
+// lock before its first read, waiting for another writer rather than failing.
+func beginImmediate(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMs)); err != nil {
+		return fmt.Errorf("fasten: busy_timeout: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
+	}
+	return nil
 }
 
 // Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
