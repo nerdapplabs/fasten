@@ -122,8 +122,16 @@ func VerifyChain(rows []Row) VerifyResult {
 		return VerifyResult{OK: true, TotalRows: 0}
 	}
 
-	sorted := make([]Row, total)
-	copy(sorted, rows)
+	// A re-delivered row is checked once (spec §4): keep the first copy of
+	// each node + id, in input order, as Python does.
+	sorted := make([]Row, 0, total)
+	seenID := map[string]bool{}
+	for _, row := range rows {
+		if key := row.SourceNodeID + "\x00" + row.ID; !seenID[key] {
+			seenID[key] = true
+			sorted = append(sorted, row)
+		}
+	}
 	// By seq, then node: the first break found is the lowest seq on any node,
 	// as in Python, so both report the same FirstBreakAt.
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -135,7 +143,8 @@ func VerifyChain(rows []Row) VerifyResult {
 
 	// Chains are per node (spec §2). An unsealed row is skipped only below its
 	// node's first sealed seq: a conformant store never writes one at or above
-	// it. The row right after the last unsealed one links to "genesis".
+	// it. A sealed row at exactly seq+1 after an unsealed one links to
+	// "genesis"; after a gap the window starts there.
 	firstSealed := map[string]int64{}
 	for _, row := range sorted {
 		if _, seen := firstSealed[row.SourceNodeID]; row.Hash != "" && !seen {
@@ -143,14 +152,8 @@ func VerifyChain(rows []Row) VerifyResult {
 		}
 	}
 	last := map[string]Row{}
-	seenID := map[string]bool{}    // node + id: a re-delivered row is checked once (spec §4)
 	seenSeq := map[string]string{} // node + seq of a sealed row -> its id
 	for _, row := range sorted {
-		if key := row.SourceNodeID + "\x00" + row.ID; seenID[key] {
-			continue
-		} else {
-			seenID[key] = true
-		}
 		prev, hasPrev := last[row.SourceNodeID]
 		last[row.SourceNodeID] = row
 		if row.Hash == "" {

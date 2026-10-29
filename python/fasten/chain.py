@@ -243,19 +243,16 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
             return row.monotonic_seq, f'row {row.id}: unknown canonical_form_id "{form_id}"'
         row_d = {k: v for k, v in row.to_dict().items()}
 
-        # Form "2" hashes detail_commitment, NOT detail. So the hash alone
-        # does not protect detail: an attacker could rewrite detail and
-        # leave the commitment intact. Whenever detail AND its salt are
-        # still present, recompute the commitment and compare. Once the row
-        # is redacted (both NULL, spec §7.1) there is nothing left to check
-        # and the commitment stands on its own.
+        # Form "2" hashes detail_commitment, not detail, so a changed detail
+        # with the commitment left as it was still matches the hash. While
+        # detail and its salt are present, recompute the commitment and
+        # compare. Once the row is redacted (both NULL, spec §7.1) the
+        # commitment stands on its own.
         if form_id == "2" and row.detail is not None:
-            # detail present means the commitment MUST be checkable. An
-            # attacker who rewrites detail and clears detail_salt would
-            # otherwise skip this branch entirely and the row would verify
-            # — the salt is not a switch for turning verification off.
-            # Redaction clears detail AND salt together (spec §7.1), so a
-            # legitimately redacted row never reaches here.
+            # Detail present means the commitment must be checkable; a
+            # missing salt is a break, not a reason to skip the check.
+            # Redaction clears detail and salt together (spec §7.1), so a
+            # redacted row never reaches here.
             if not row.detail_salt:
                 return row.monotonic_seq, (f"row {row.id}: detail present but detail_salt "
                             "is missing — commitment cannot be verified")

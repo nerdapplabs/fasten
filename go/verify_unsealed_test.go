@@ -151,3 +151,18 @@ func TestVerifyADuplicateSeqBreaksAndARedeliveredRowDoesNot(t *testing.T) {
 		t.Fatalf("want a duplicate break at 2, got %+v", res)
 	}
 }
+
+func TestVerifyKeepsTheFirstCopyOfARedeliveredRow(t *testing.T) {
+	// A later copy of a row with other values must not replace the first.
+	rows := makeRemoteChain(3, "svc", "node-1")
+	stale := unsealed(rows[1])
+	stale.MonotonicSeq = 0
+	if res := VerifyChain(append(append([]Row{}, rows...), stale)); !res.OK {
+		t.Fatalf("want ok, got %+v", res)
+	}
+	edited := rows[1]
+	edited.Target = "edited"
+	if res := VerifyChain(append(append([]Row{}, rows...), edited)); !res.OK {
+		t.Fatalf("the first copy is the one checked, got %+v", res)
+	}
+}

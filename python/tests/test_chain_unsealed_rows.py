@@ -117,3 +117,11 @@ def test_a_duplicate_seq_breaks_and_a_redelivered_row_does_not():
     dup = seal(rows[0].hash, dataclasses.replace(_row(2), id="evt-dup"))
     result = verify_chain(rows + [dup])
     assert not result.ok and result.first_break_at == 2 and "duplicate" in (result.reason or "")
+
+
+def test_the_first_copy_of_a_redelivered_row_is_checked():
+    rows = _chain([1, 2, 3])
+    stale = _unsealed(rows[1], monotonic_seq=0)
+    assert verify_chain(rows + [stale]).ok
+    assert verify_chain(rows + [dataclasses.replace(rows[1], target="u/2")]).ok
+
