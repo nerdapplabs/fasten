@@ -101,6 +101,9 @@ def configure(
     from fasten.shim.stdlib import LoggingHandler
 
     level = logging.DEBUG if debug else logging.INFO
+    # One redactor for structlog and the stdlib bridge, so both honour
+    # extra_redact_keys.
+    redactor = _redactor().with_extra_keys(extra_redact_keys)
 
     # ── structlog chain ────────────────────────────────────────────────────
     # PrintLoggerFactory writes structlog logs directly to stdout (no stdlib
@@ -114,7 +117,7 @@ def configure(
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
-        _redactor().with_extra_keys(extra_redact_keys).as_structlog_processor(),
+        redactor.as_structlog_processor(),
         make_fasten_processor(),
     ]
     if extra_processors:
@@ -144,7 +147,7 @@ def configure(
     root.handlers = [
         h for h in root.handlers if not isinstance(h, LoggingHandler)
     ]
-    root.addHandler(LoggingHandler())
+    root.addHandler(LoggingHandler(redactor=redactor))
 
     # Quiet noisy libs
     quiet_libs = quiet if quiet is not None else _DEFAULT_QUIET

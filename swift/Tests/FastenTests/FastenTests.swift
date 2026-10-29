@@ -294,4 +294,12 @@ final class LogTests: XCTestCase {
         XCTAssertTrue(out.contains("\"password\":\"[x]\""), out)
         XCTAssertTrue(out.contains("\"ssn\":\"[x]\""), out)
     }
+
+    func testSecretInTheEventIsRedacted() throws {
+        try Fasten.configure(serviceID: "svc", nodeID: "node")
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl"
+        let out = captureStdout { Fasten.log.info("bearer \(jwt)") }
+        XCTAssertFalse(out.contains(jwt), out)
+        XCTAssertTrue(out.contains("\"event\""), out)
+    }
 }

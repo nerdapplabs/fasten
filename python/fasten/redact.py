@@ -69,9 +69,10 @@ def _unredactable_marker(value: Any) -> Any:
     return marker["_summary"]
 
 
-# Structlog internals that are never redacted regardless of key name.
+# Structlog internals that are never redacted regardless of key name. Not
+# "event": it is the message, and a secret can be in it.
 _STRUCTLOG_SKIP = frozenset({
-    "timestamp", "level", "logger", "event", "_record", "_from_structlog",
+    "timestamp", "level", "logger", "_record", "_from_structlog",
 })
 
 # Default key-pattern regex — same patterns as the Rust REDACT_PATTERNS.
@@ -187,8 +188,9 @@ class Redactor:
     def as_structlog_processor(self) -> Callable[..., Any]:
         """Return a structlog processor that redacts sensitive keys from event_dict.
 
-        Structlog internal keys (timestamp, level, event, …) are always skipped.
-        All other keys are redacted via the Rust core.
+        Structlog internal keys (timestamp, level, logger, …) are always
+        skipped. All other keys, including the event, are redacted via the
+        Rust core.
         """
         def _processor(logger_: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
             # Separate structlog internals from user payload; redact payload; merge.

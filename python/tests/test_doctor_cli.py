@@ -1,4 +1,6 @@
 """fasten doctor CLI output."""
+import sqlite3
+
 import pytest
 
 from fasten.cli import _doctor
@@ -54,16 +56,51 @@ def test_api_dsn_uppercase_scheme_is_postgres(doctor_env, monkeypatch, capsys):
 
 
 def test_sqlite_dsn_shows_its_path(doctor_env, monkeypatch, capsys):
+    from fasten.store.sqlite import SQLiteStore
+    SQLiteStore.from_dsn("sqlite:///./audit.db")
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
     out = _run(capsys)
     assert "sqlite /./audit.db (connected" in out
 
 
+def test_a_missing_sqlite_file_fails_and_is_not_created(doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
+    monkeypatch.setenv("FASTEN_API_DSN", "./api.db")
+    out = _run(capsys)
+    assert "SQLite file not found" in out
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_doctor_does_not_alter_the_schema(doctor_env, monkeypatch, capsys, tmp_path):
+    db = sqlite3.connect(tmp_path / "audit.db")
+    db.execute("CREATE TABLE audit_log (id TEXT)")
+    db.commit()
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
+    out = _run(capsys)
+    assert "(connected, sample query returned 0 row[s])" in out
+    cols = [r[1] for r in db.execute("PRAGMA table_info(audit_log)")]
+    assert cols == ["id"]
+
+
+def test_a_libpq_keyword_dsn_is_not_printed_or_opened(doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "host=db password=s3cret")
+    monkeypatch.setenv("FASTEN_API_DSN", "host=db password=s3cret")
+    out = _run(capsys)
+    assert "s3cret" not in out and "unrecognised DSN" in out
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unsupported_api_dsn_scheme_fails(doctor_env, monkeypatch, capsys):
+    monkeypatch.setenv("FASTEN_API_DSN", "mysql://db/api")
+    out = _run(capsys)
+    assert "unsupported DSN scheme 'mysql'" in out
+
+
 def test_error_hides_details_that_contain_the_password(doctor_env, monkeypatch, capsys):
     dsn = "postgresql://app:s3cret@db"
     monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
-    monkeypatch.setattr("fasten.engine._store_from_dsn",
-                        lambda d: (_ for _ in ()).throw(ValueError(f"bad dsn {d!r}")))
+    monkeypatch.setattr("fasten.cli._doctor._probe",
+                        lambda d, *a: (_ for _ in ()).throw(ValueError(f"bad dsn {d!r}")))
     out = _run(capsys)
     assert "s3cret" not in out
     assert "ValueError (details hidden" in out
@@ -75,15 +112,15 @@ def test_error_hides_details_that_contain_the_password(doctor_env, monkeypatch, 
 ])
 def test_error_hides_escaped_and_query_passwords(doctor_env, monkeypatch, capsys, dsn, shown):
     monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
-    monkeypatch.setattr("fasten.engine._store_from_dsn",
-                        lambda d: (_ for _ in ()).throw(ValueError(f"bad {shown}")))
+    monkeypatch.setattr("fasten.cli._doctor._probe",
+                        lambda d, *a: (_ for _ in ()).throw(ValueError(f"bad {shown}")))
     out = _run(capsys)
     assert "cdEFGH" not in out and "s3cret" not in out
 
 
 def test_error_keeps_details_without_the_password(doctor_env, monkeypatch, capsys):
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "postgresql://app:s3cret@db/audit")
-    monkeypatch.setattr("fasten.engine._store_from_dsn",
-                        lambda d: (_ for _ in ()).throw(OSError("connection refused")))
+    monkeypatch.setattr("fasten.cli._doctor._probe",
+                        lambda d, *a: (_ for _ in ()).throw(OSError("connection refused")))
     out = _run(capsys)
     assert "OSError: connection refused" in out

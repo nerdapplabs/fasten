@@ -79,6 +79,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   query now returns zero rows. Uppercase/lowercase your query values to match
   what the emitter writes, or switch to an indexed store-backed read.
 
+### Fixed — Log output goes through the redactor (JS, Swift, Python)
+
+- JS and Swift log lines, and JS drainer lines on stderr, are redacted as a
+  whole, the message included, as Go and Python already do.
+- Python: the structlog processor redacts the event too, and `configure()`
+  gives the stdlib bridge the same `extra_redact_keys`.
+- JS `extraRedactKeys` are matched as case-insensitive literal substrings,
+  as in the other SDKs, in `emit()` as well as logs. They were regexes, so a
+  key like `^ssn$` or `card_?num` no longer matches; list the plain names.
+- `fasten doctor` no longer prints the DSN: `--json` reports
+  `detail.backend` where it reported `detail.dsn`. It opens stores
+  read-only, so it no longer creates a missing SQLite file or runs
+  CREATE/ALTER TABLE, and it does not open a libpq `key=value` DSN.
+
 ### Fixed — Reader hardening (gh #58, Python + Go)
 
 - `/sys`, `/api`, `/audit`, `/correlate` reject a non-positive `limit` (a

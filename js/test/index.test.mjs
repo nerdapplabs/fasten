@@ -490,6 +490,16 @@ describe('log', () => {
         assert.deepEqual(lines.map((l) => l.event), ['bare', 'fn']);
     });
 
+    test('a secret in the event itself is redacted', () => {
+        initTestSDK();
+        const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl';
+        const [line] = captureStdout(() => log.info(`bearer ${jwt}`));
+        assert.ok(!line.event.includes(jwt), line.event);
+        const [err] = capture(process.stderr, () =>
+            defaultEngine._drainerSysLog('error', `store said ${jwt}`, {}));
+        assert.ok(!err.event.includes(jwt), err.event);
+    });
+
     test('drainer sys lines on stderr are redacted', () => {
         initTestSDK();
         const [line] = capture(process.stderr, () =>

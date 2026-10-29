@@ -434,9 +434,10 @@ export class Engine {
 			service_id: this.#config.serviceId || undefined,
 			timestamp: new Date().toISOString(),
 			// Fields that aren't JSON (none, or a function) log as {}.
-			...this._redact(JSON.stringify(fields) === undefined ? {} : fields),
+			...(JSON.stringify(fields) === undefined ? {} : fields),
 		};
-		stream.write(`${JSON.stringify(line)}\n`);
+		// The whole line, as Go and Python do: a secret can be in the event.
+		stream.write(`${JSON.stringify(this._redact(line))}\n`);
 	}
 
 	_drainerSysLog(level, event, fields) {
