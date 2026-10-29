@@ -27,20 +27,35 @@ fn current(h: &FastenStoreHandle) -> Option<Arc<Drainer>> {
     slot(h).clone()
 }
 
-/// Remove the installed drainer from the handle.
-pub(super) fn take(h: &FastenStoreHandle) -> Option<Arc<Drainer>> {
-    slot(h).take()
-}
-
 fn retiring(h: &FastenStoreHandle) -> std::sync::MutexGuard<'_, Vec<Arc<Drainer>>> {
     h.retiring.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Flush (if `flush_for` is set) and stop a drainer that is no longer
-/// installed. Until it returns, `fasten_drainer_flush` also waits for it.
+/// Install `new` (or nothing) and return the old drainer, already on the
+/// retiring list: both change under the slot lock, so flush finds the old
+/// drainer in one list or the other. Pass the result to `retire`.
+pub(super) fn swap(h: &FastenStoreHandle, new: Option<Arc<Drainer>>) -> Option<Arc<Drainer>> {
+    let mut g = slot(h);
+    let old = std::mem::replace(&mut *g, new);
+    if let Some(o) = &old {
+        retiring(h).push(Arc::clone(o));
+    }
+    old
+}
+
+/// Wait until every drainer taken off the handle has stopped, including
+/// one another thread's install is still retiring.
+pub(super) fn wait_retired(h: &FastenStoreHandle) {
+    let mut r = retiring(h);
+    while !r.is_empty() {
+        r = h.retired.wait(r).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Flush (if `flush_for` is set) and stop a drainer `swap` took off the
+/// handle. Until it returns, `fasten_drainer_flush` also waits for it.
 /// Install reports rows the old drainer could not write.
-fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Option<Duration>) {
-    retiring(h).push(Arc::clone(old));
+pub(super) fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Option<Duration>) {
     let dead_before = old.stats().dead_lettered_total;
     let flushed = flush_for.is_none_or(|t| old.flush(t));
     old.stop(Duration::from_secs(2));
@@ -55,6 +70,7 @@ fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Option<Duration>
         }));
     }
     retiring(h).retain(|d| !Arc::ptr_eq(d, old));
+    h.retired.notify_all();
 }
 
 // Thin newtype so we can pass an Arc<dyn Store> as a Box<dyn Store>.
@@ -162,8 +178,7 @@ unsafe fn install(
         // the old one outside the lock.
         let store_box = Box::new(ArcStoreShim(Arc::clone(&h.store)));
         let new = Drainer::with_sys_log(store_box, cfg, sys_log);
-        let old = slot(h).replace(new);
-        if let Some(old) = old {
+        if let Some(old) = swap(h, Some(new)) {
             retire(h, &old, Some(Duration::from_secs(5)));
         }
         Ok(())
@@ -223,9 +238,14 @@ pub unsafe extern "C" fn fasten_drainer_flush(
             Duration::from_millis(timeout_ms)
         };
         let deadline = std::time::Instant::now() + timeout;
-        // The installed drainer plus any being retired by install/close.
-        let mut drainers: Vec<Arc<Drainer>> = retiring(h).clone();
-        drainers.extend(current(h));
+        // The installed drainer plus any being retired by install/close,
+        // read under the slot lock so a swap can't hide one.
+        let drainers: Vec<Arc<Drainer>> = {
+            let g = slot(h);
+            let mut v = retiring(h).clone();
+            v.extend(g.clone());
+            v
+        };
         let drained = drainers.iter().all(|d| {
             d.flush(deadline.saturating_duration_since(std::time::Instant::now()))
         });
@@ -278,7 +298,8 @@ pub unsafe extern "C" fn fasten_drainer_stats_json(
 }
 
 /// Shut down the drainer. Each queued row gets one more attempt; then close
-/// waits for the drain thread, including a host callback in progress.
+/// waits for the drain thread, including a host callback in progress, and
+/// for a drainer an install on another thread is still retiring.
 /// Safe to call with NULL or when no drainer is installed.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_drainer_close(handle: *mut FastenStoreHandle) {
@@ -286,10 +307,10 @@ pub unsafe extern "C" fn fasten_drainer_close(handle: *mut FastenStoreHandle) {
         return;
     }
     let h = &*handle;
-    let taken = take(h);
-    if let Some(d) = taken {
+    if let Some(d) = swap(h, None) {
         retire(h, &d, None);
     }
+    wait_retired(h);
 }
 
 #[cfg(test)]
@@ -521,5 +542,121 @@ mod tests {
         unsafe { fasten_store_close(h) };
         assert!(!SINK_AFTER_CLOSE.load(Ordering::SeqCst), "sys_log called after close returned");
     }
-}
 
+    static REJECT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static REJECT_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    extern "C" fn rejects_first(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
+        if REJECT_CALLS.fetch_add(1, Ordering::SeqCst) == 0 { -1 } else { 0 }
+    }
+
+    extern "C" fn record_reject(json: *const c_char, _ud: *mut std::ffi::c_void) {
+        let line = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy().into_owned();
+        REJECT_LINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(line);
+    }
+
+    /// A row the store rejects is dead-lettered on its first attempt, so the
+    /// row behind it is not held up by a 10 s backoff.
+    #[test]
+    fn rejected_row_is_dead_lettered_without_retry() {
+        let h = unsafe { fasten_store_from_callback(rejects_first, std::ptr::null_mut(), std::ptr::null_mut()) };
+        unsafe {
+            fasten_drainer_install_with_sys_log(h, 8, 10_000, 10_000, 0, 10, Some(record_reject),
+                                                std::ptr::null_mut(), std::ptr::null_mut());
+            fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut());
+            fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut());
+        }
+        let mut drained: c_int = 0;
+        unsafe { fasten_drainer_flush(h, 2_000, std::ptr::addr_of_mut!(drained), std::ptr::null_mut()) };
+        assert_eq!(drained, 1);
+        assert_eq!(REJECT_CALLS.load(Ordering::SeqCst), 2);
+        unsafe { fasten_store_close(h) };
+        let events: Vec<serde_json::Value> = REJECT_LINES.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "audit_drain_dead_letter");
+        assert_eq!(events[0]["attempt_count"], 1);
+    }
+
+    static RETIRE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn counted_100ms(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
+        thread::sleep(Duration::from_millis(100));
+        RETIRE_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    /// close on one thread while an install on another is still flushing
+    /// the old drainer: close returns only after that drainer has stopped.
+    #[test]
+    fn close_waits_for_a_drainer_another_install_is_retiring() {
+        let h = unsafe { fasten_store_from_callback(counted_100ms, std::ptr::null_mut(), std::ptr::null_mut()) };
+        unsafe { fasten_drainer_install(h, 8, 5, 5, 0, 3, std::ptr::null_mut()) };
+        for _ in 0..3 {
+            unsafe { fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut()) };
+        }
+        let addr = h as usize;
+        let installer = thread::spawn(move || unsafe {
+            fasten_drainer_install(addr as *mut FastenStoreHandle, 8, 5, 5, 0, 3, std::ptr::null_mut())
+        });
+        let start = std::time::Instant::now();
+        while unsafe { &*h }.retiring.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            thread::yield_now();
+        }
+        unsafe { fasten_drainer_close(h) };
+        assert_eq!(RETIRE_CALLS.load(Ordering::SeqCst), 3, "close returned before the old drainer stopped");
+        assert!(matches!(installer.join(), Ok(FastenErrorCode::Ok)));
+        unsafe { fasten_store_close(h) };
+    }
+
+    static SWAP_STORED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn counted_2ms(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
+        thread::sleep(Duration::from_millis(2));
+        SWAP_STORED.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    /// A flush that overlaps an install never reports the old drainer's
+    /// queued rows as drained before they are stored.
+    #[test]
+    fn flush_during_install_sees_the_old_drainer() {
+        for _ in 0..50 {
+            SWAP_STORED.store(0, Ordering::SeqCst);
+            let h = unsafe { fasten_store_from_callback(counted_2ms, std::ptr::null_mut(), std::ptr::null_mut()) };
+            unsafe { fasten_drainer_install(h, 8, 5, 5, 0, 3, std::ptr::null_mut()) };
+            for _ in 0..4 {
+                unsafe { fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut()) };
+            }
+            let addr = h as usize;
+            let installer = thread::spawn(move || unsafe {
+                fasten_drainer_install(addr as *mut FastenStoreHandle, 8, 5, 5, 0, 3, std::ptr::null_mut())
+            });
+            loop {
+                let mut drained: c_int = 0;
+                unsafe { fasten_drainer_flush(h, 1, std::ptr::addr_of_mut!(drained), std::ptr::null_mut()) };
+                let stored = SWAP_STORED.load(Ordering::SeqCst);
+                if drained == 1 {
+                    assert_eq!(stored, 4, "flush reported drained with {stored} of 4 rows stored");
+                    break;
+                }
+            }
+            assert!(installer.join().is_ok());
+            unsafe { fasten_store_close(h) };
+        }
+    }
+
+    /// The queue is not allocated up front, so a large capacity is fine.
+    #[test]
+    fn large_capacity_is_not_allocated_up_front() {
+        let h = unsafe { fasten_store_from_callback(slow_ok, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let rc = unsafe { fasten_drainer_install(h, 1 << 40, 5, 5, 0, 3, std::ptr::null_mut()) };
+        assert_eq!(rc, FastenErrorCode::Ok);
+        unsafe { fasten_store_close(h) };
+    }
+}

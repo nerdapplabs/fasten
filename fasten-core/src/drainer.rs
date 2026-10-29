@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::{row::Row, store::Store};
+use crate::{error::Error, row::Row, store::Store};
 
 // ── Conformance constants ──────────────────────────────────────────────────
 
@@ -180,7 +180,9 @@ impl Drainer {
         let inner = Arc::new(DrainerInner {
             store,
             cfg,
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            // Not preallocated: the slots bound the depth, and a large
+            // capacity would otherwise allocate it all up front.
+            queue: Mutex::new(VecDeque::new()),
             queue_cv: Condvar::new(),
             flush_cv: Condvar::new(),
             slots: Sem::new(capacity),
@@ -422,9 +424,10 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                 Err(e) => {
                     let msg = e.to_string();
                     attempt += 1;
-                    // Spec §10: no retry once stopping.
+                    // Spec §10: no retry once stopping. Spec §3: no retry for
+                    // a row the store rejected.
                     if attempt >= inner.cfg.max_attempts || in_shutdown
-                        || inner.stop.load(Ordering::Acquire)
+                        || inner.stop.load(Ordering::Acquire) || rejected(&e)
                     {
                         on_dead_letter(inner, &row, attempt, &msg);
                         break;
@@ -443,6 +446,12 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
             }
         }
     }
+}
+
+/// The store refused the row itself, so retrying cannot help: an insert
+/// callback returned a negative code (`FASTEN_INSERT_REJECTED`).
+fn rejected(e: &Error) -> bool {
+    matches!(e, Error::CallbackFailed(rc) if *rc < 0)
 }
 
 fn on_success(inner: &DrainerInner) {
