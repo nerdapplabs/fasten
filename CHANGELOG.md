@@ -6,6 +6,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Shared drainer stop, install and close (fasten-core C ABI)
+
+- `fasten_drainer_install` on a handle that already has a drainer now
+  flushes the old one (up to 5 s) before stopping it, and reports rows it
+  could not write in an `audit_drain_install_incomplete` sys event.
+- `fasten_drainer_close` and `fasten_store_close` wait for the drain thread,
+  including a store callback in progress, and for an old drainer a
+  concurrent install is still stopping. A slow stop emits
+  `audit_drain_stop_slow` instead of returning early.
+- `fasten_drainer_enqueue` returns the new `FASTEN_ERR_DRAINER_STOPPED` (10)
+  when the drainer is stopping and the row was not queued.
+- New `fasten_drainer_install_with_sys_log` sends sys events to a host
+  callback instead of stderr.
+- An insert callback can return `FASTEN_INSERT_REJECTED` (any negative code)
+  for a row the store will never accept; it is dead-lettered at once
+  instead of being retried for the whole retry budget.
+- The queue is no longer allocated up front, so a large `capacity` costs
+  nothing until rows arrive.
+
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 
 - **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),

@@ -99,6 +99,13 @@ between consecutive failed insert attempts.  Starts at `retry_initial`
 The degraded flag (`_degraded_emitted`) resets to `false` on every
 successful insert so the next failure burst can re-emit `audit_drain_degraded`.
 
+**Rejected rows.** When the store rejects the row itself (bad content,
+a constraint it can never meet), retrying cannot help, and the row would
+hold up every row behind it for the whole retry budget. Such a failure
+MUST dead-letter the row on that attempt. Over the shared C ABI, an insert
+callback signals it by returning a negative code (`FASTEN_INSERT_REJECTED`);
+any positive code is retried as usual.
+
 ---
 
 ## §4 Sys-stream events
@@ -140,8 +147,10 @@ both.
 | `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` 0→1) |
 | `audit_drain_degraded` | `error` | `retry_count` reaches 5 within the burst |
 | `audit_drain_recovered` | `info` | Insert succeeds after one or more failures |
-| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts` |
+| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts`, is rejected by the store (§3), or fails its one attempt at stop (§10) |
 | `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
+| `audit_drain_stop_slow` | `warn` | Joining the drainer thread at stop took longer than the stop timeout (§10) |
+| `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or it dead-lettered rows (§10) |
 
 **`audit_drain_failed` fields:**
 
@@ -179,6 +188,18 @@ both.
 
 ```json
 { "reason": "drainer_stopped", "row_id": "<string|null>" }
+```
+
+**`audit_drain_stop_slow` fields:**
+
+```json
+{ "waited_seconds": <float> }
+```
+
+**`audit_drain_install_incomplete` fields:**
+
+```json
+{ "flushed": <bool>, "dead_lettered": <int> }
 ```
 
 ---
@@ -431,12 +452,22 @@ When `jitter=false` the first five delays (with `retry_initial=100ms`,
 2. Interrupt any in-progress backoff sleep immediately.
 3. Drain remaining queue entries with at most one attempt each
    (no retry in shutdown path).
-4. Join the drainer thread with a short timeout.
+4. Join the drainer thread. Where the thread may be inside a host store
+   callback (the shared C ABI), the join has no timeout, since the host
+   may release that callback once stop returns; if it takes longer than
+   the stop timeout, emit `audit_drain_stop_slow`. Other implementations
+   MAY join with a short timeout.
 
 `install_drainer()` / `init()` on a running engine MUST:
 
 1. Build the new drainer first.
-2. Atomically swap the slot (under a mutex).
-3. Flush the old drainer (outside the mutex) then stop it.
+2. Atomically swap the slot (under a mutex). The old drainer must stay
+   visible to `flush()` throughout, so a flush during the swap waits for
+   its rows too.
+3. Flush the old drainer (outside the mutex, up to 5 s) then stop it. If
+   the flush timed out or rows were dead-lettered, emit
+   `audit_drain_install_incomplete`.
 
 This race-safe swap prevents dropping in-flight rows during re-init.
+Closing the drainer also waits for an old drainer that a concurrent
+re-install is still stopping.
