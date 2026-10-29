@@ -478,11 +478,18 @@ int32_t fasten_meta_of_buf(
 /* ── SDK-store callback bridge ─────────────────────────────────────────────── */
 
 /**
- * Callback invoked by the drainer for each row insert.
+ * Callback invoked by the drainer for each row insert, on the drain thread.
  * `row_json` is valid only for the duration of the call.
- * Return 0 = success; any other value = error (drainer will retry).
+ * Return 0 = success; FASTEN_INSERT_REJECTED (or any negative value) = the
+ * store rejected this row, so it is dead-lettered without retry; any
+ * positive value = error, retried up to max_attempts.
+ * It must not call fasten_drainer_enqueue, flush, close or install on the
+ * same handle: they wait on the row this call is still writing.
  */
 typedef int32_t (*FastenInsertCallbackFn)(const char* row_json, void* userdata);
+
+/** Insert callback result: the row itself was rejected; do not retry it. */
+#define FASTEN_INSERT_REJECTED (-1)
 
 /**
  * Create a store handle backed by a C insert callback.
@@ -544,7 +551,8 @@ typedef void (*FastenSysLogFn)(const char* event_json, void* userdata);
  *
  * `sys_log` is called with no drainer lock held, from the drain thread or
  * from a thread calling enqueue, install or close on this handle. It must
- * not call fasten_drainer_enqueue, close or install on the same handle. It
+ * not call fasten_drainer_enqueue, flush, close or install on the same
+ * handle. It
  * and `userdata` must stay valid until fasten_drainer_close (or an install
  * that replaces this drainer) returns; close waits for enqueue calls still
  * running, so none calls `sys_log` after that.
@@ -618,7 +626,8 @@ FastenErrorCode fasten_drainer_stats_json(
 
 /**
  * Shut down the drainer. Each queued row gets one more attempt; then close
- * waits for the drain thread, including a store callback in progress.
+ * waits for the drain thread, including a store callback in progress, and
+ * for a drainer an install on another thread is still retiring.
  * Safe to call with NULL or when no drainer is installed.
  */
 void fasten_drainer_close(FastenStore* store);

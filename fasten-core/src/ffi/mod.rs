@@ -18,7 +18,7 @@ pub(crate) mod redact;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::panic;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{
     drainer::Drainer,
@@ -60,6 +60,8 @@ pub struct FastenStoreHandle {
     drainer: Mutex<Option<Arc<Drainer>>>,
     // Drainers being flushed or stopped by install/close; flush waits for them.
     retiring: Mutex<Vec<Arc<Drainer>>>,
+    // Signalled when a drainer leaves `retiring`.
+    retired: Condvar,
 }
 
 /// Write the error string and return the error code.
@@ -121,6 +123,7 @@ pub unsafe extern "C" fn fasten_store_open(
             store,
             drainer: Mutex::new(None),
             retiring: Mutex::new(Vec::new()),
+            retired: Condvar::new(),
         })))
     });
 
@@ -389,7 +392,8 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
 
 // ── Callback-backed store ──────────────────────────────────────────────────
 
-/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`.
+/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`; a negative
+/// code means the row itself was rejected and is not retried.
 pub type CInsertFn = unsafe extern "C" fn(*const c_char, *mut std::ffi::c_void) -> i32;
 
 struct SendRawPtr(*mut std::ffi::c_void);
@@ -431,6 +435,7 @@ pub unsafe extern "C" fn fasten_store_from_callback(
         store,
         drainer: Mutex::new(None),
         retiring: Mutex::new(Vec::new()),
+        retired: Condvar::new(),
     }))
 }
 
@@ -440,13 +445,13 @@ pub unsafe extern "C" fn fasten_store_from_callback(
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
     if !handle.is_null() {
-        // Stop drainer first so its background thread exits cleanly before
-        // the store Arc's ref-count drops to zero.
-        let taken = drainer::take(&*handle);
-        if let Some(d) = taken {
-            d.stop(std::time::Duration::from_secs(2));
-            d.wait_calls();
+        // Stop every drainer first, including one an install on another
+        // thread is retiring, so no drain thread outlives the handle.
+        let h = &*handle;
+        if let Some(d) = drainer::swap(h, None) {
+            drainer::retire(h, &d, None);
         }
+        drainer::wait_retired(h);
         drop(Box::from_raw(handle));
     }
 }
