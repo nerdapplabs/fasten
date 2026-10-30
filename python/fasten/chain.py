@@ -22,7 +22,8 @@ over ``AuditRow.to_dict()``. This means:
     from the hash so a Go aggregator can verify a Python-sealed chain),
   - ``canonical_form_id`` IS included in the hashed bytes,
   - sorted keys (top level and nested), compact separators,
-  - ``None`` -> ``null`` for tenant_id / shipped_at,
+  - ``None`` -> ``null`` for tenant_id; shipped_at is always hashed as ``null``
+    (it is set after sealing, spec §1.1),
   - timestamps as ``datetime.isoformat()`` strings.
 
 A new form is added by registering a new id in ``_HASH_FN_BY_FORM`` with its own
@@ -79,7 +80,16 @@ def detail_commitment(salt: str, detail: Any) -> str:
     return hashlib.sha256(salt.encode() + _canonical_json(detail)).hexdigest()
 
 
-_TS_HASHED_FIELDS = ("timestamp", "shipped_at")
+_TS_HASHED_FIELDS = ("timestamp",)
+
+
+def _hashed_fields(row_dict: dict[str, Any], excluded: frozenset[str]) -> dict[str, Any]:
+    """Row fields hashed by one form. ``shipped_at`` is hashed as null:
+    ``mark_shipped`` sets it after sealing (spec §1.1)."""
+    d = {k: v for k, v in row_dict.items() if k not in excluded}
+    if "shipped_at" in d:
+        d["shipped_at"] = None
+    return d
 
 
 def _hashed_ts(value: Any) -> Any:
@@ -115,7 +125,7 @@ def _row_hash_form_1(row_dict: dict[str, Any]) -> str:
     ``canonical_form_id`` is part of ``row_dict`` (via AuditRow.to_dict) and is
     therefore covered by the hash.
     """
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
     return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
 
 
@@ -131,7 +141,7 @@ def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
     ``verify_chain`` falls back to this for form-"1" rows ONLY. Delete it when
     form "1" is retired.
     """
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
     return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 
@@ -146,8 +156,28 @@ def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
     # NO _to_hashed_form here: form "2" hashes the timestamp exactly as the row
     # carries it on the wire (§4.3 / §1.4). One renderer, one spelling. Form "1"
     # needs the conversion because it hashed a different spelling than it wrote.
-    d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
+    d = _hashed_fields(row_dict, _FORM_2_EXCLUDED)
     return hashlib.sha256(_canonical_json(d)).hexdigest()
+
+
+def _row_hashes_over_shipped_at(form_id: str, row_dict: dict[str, Any]) -> list[str]:
+    """Hashes of a row sealed with ``shipped_at`` already set, as every form
+    hashed it before §1.1 nulled it: the stored value, rendered like the
+    timestamp next to it. Emit never sealed such rows; a caller passing
+    ``shipped_at`` to ``seal()`` or ``allocate_and_insert_originated`` did.
+
+    ``verify_chain`` falls back to these only when the row has a ``shipped_at``.
+    """
+    if form_id == "1":
+        d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+        hashed = _to_hashed_form(d)
+        hashed["shipped_at"] = _hashed_ts(d["shipped_at"])
+        # The second is the legacy-"Z" spelling (#91), both fields verbatim.
+        return [hashlib.sha256(_canonical_json(x)).hexdigest() for x in (hashed, d)]
+    if form_id == "2":
+        d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
+        return [hashlib.sha256(_canonical_json(d)).hexdigest()]
+    return []
 
 
 # Form-id -> hash function registry. Adding a v2 is purely additive: register a
@@ -321,6 +351,11 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
                 # Before #91, Python sealed form "1" over the wire "Z" spelling.
                 # Accept it rather than report our own spec fix as tampering.
                 if _row_hash_form_1_legacy_z(row_d) == row.hash:
+                    expected = row.hash
+            if expected != row.hash and row.shipped_at is not None:
+                # Sealed with shipped_at already set, before §1.1 hashed it as
+                # null. Such a row matches only over its exact stored value.
+                if row.hash in _row_hashes_over_shipped_at(form_id, row_d):
                     expected = row.hash
             if expected != row.hash:
                 return ChainVerifyResult(

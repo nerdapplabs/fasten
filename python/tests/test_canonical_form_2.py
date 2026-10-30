@@ -360,8 +360,7 @@ def test_clearing_the_salt_does_not_skip_verification():
 GO_VECTOR = Path(__file__).resolve().parents[2] / "spec" / "go-sealed-form2.json"
 
 
-def _rows_from_go_vector() -> list[AuditRow]:
-    raw = json.loads(GO_VECTOR.read_text())
+def _rows_from_dicts(raw: list[dict]) -> list[AuditRow]:
     out = []
     for d in raw:
         for field in ("timestamp", "shipped_at"):
@@ -371,6 +370,10 @@ def _rows_from_go_vector() -> list[AuditRow]:
             k: d[k] for k in AuditRow.__dataclass_fields__ if k in d
         }))
     return out
+
+
+def _rows_from_go_vector() -> list[AuditRow]:
+    return _rows_from_dicts(json.loads(GO_VECTOR.read_text()))
 
 
 def test_python_verifies_a_go_sealed_form_2_chain():
@@ -436,7 +439,9 @@ def test_cross_sdk_vector_covers_both_forms_and_both_timestamp_shapes():
                           "spec" / "python-sealed-forms.json").read_text())["cases"]}
     for required in ("form1_micros", "form1_whole_second",
                      "form1_legacy_Z_micros", "form1_legacy_Z_whole",
-                     "form2_micros", "form2_whole_second"):
+                     "form2_micros", "form2_whole_second",
+                     "form1_shipped", "form1_legacy_Z_shipped",
+                     "form2_shipped"):
         assert required in labels, f"vector lost coverage: {required}"
 
 
@@ -467,3 +472,90 @@ def test_legacy_fallback_reproduces_a_real_pre_fix_release_hash():
         "the legacy fallback no longer reproduces what a real pre-fix release "
         "wrote — rows sealed by that release will now read as tampering"
     )
+
+
+def test_mark_shipped_keeps_the_chain_verifying(tmp_path):
+    """#123: shipped_at is set after sealing, so marking rows shipped must not
+    change their hashes."""
+    from fasten.chain import verify_chain
+    from fasten.store.sqlite import SQLiteStore
+    store = SQLiteStore(str(tmp_path / "audit.db"))
+    for i in range(3):
+        store.allocate_and_insert_originated(
+            dataclasses.replace(_row(), id=f"evt-ship-{i}", origin_id=f"evt-ship-{i}"))
+    assert verify_chain(store.query(limit=10)).ok
+    store.mark_shipped([r.id for r in store.list_unshipped(limit=10)])
+    rows = store.query(limit=10)
+    assert all(r.shipped_at is not None for r in rows)
+    assert verify_chain(rows).ok
+
+
+def test_python_verifies_every_python_sealed_vector_case():
+    """Go checks these cases in CI; this makes Python check them too, including
+    the shipped rows under each form."""
+    cases = json.loads((Path(__file__).resolve().parents[2] / "spec" /
+                        "python-sealed-forms.json").read_text())["cases"]
+    for case in cases:
+        [row] = _rows_from_dicts([dict(case["row"])])
+        result = verify_chain([row])
+        assert result.ok, f"{case['label']}: {result.reason}"
+
+
+def test_real_pre_fix_release_row_verifies_once_shipped():
+    """Rows the old release wrote verify only through the legacy fallback, so
+    marking them shipped must not move that hash either (#123)."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from gen_cross_sdk_vectors import FROZEN_PREFIX_ROW
+
+    d = dict(FROZEN_PREFIX_ROW, shipped_at="2026-06-16T08:00:00.250000Z")
+    [row] = _rows_from_dicts([d])
+    result = verify_chain([row])
+    assert result.ok, f"shipped pre-fix row rejected: {result.reason}"
+
+
+# Rows sealed with shipped_at ALREADY set, hashed by the release before §1.1
+# nulled it (python/fasten/chain.py at bf9c179). Literals: do not regenerate.
+# Go checks the same rows in verify_shipped_test.go.
+_SEALED_SHIPPED_BASE = {
+    "action": "create", "actor": "alice", "actor_kind": "user",
+    "category": "order", "code": "ORDER_PLACED",
+    "detail": {"qty": 3, "sku": "WIDGET"}, "domain": "sales", "method": "http",
+    "monotonic_seq": 1, "prev_hash": "genesis", "request_id": "req-xyz",
+    "service_id": "gateway", "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z", "source_node_id": "node-1",
+    "target": "order/42", "tenant_id": None,
+    "timestamp": "2026-06-15T10:30:45.123456Z", "wire_version": "1",
+}
+SEALED_SHIPPED_ROWS = [
+    dict(_SEALED_SHIPPED_BASE, id=i, origin_id=i, **extra) for i, extra in (
+        ("evt-form1-sealed-shipped", {
+            "canonical_form_id": "1",
+            "hash": "5c3cf746ca5745e07baff24c66cb84b596cf6d2db94d985ff26bfbf2b97f6af2"}),
+        ("evt-form1_legacy_Z-sealed-shipped", {
+            "canonical_form_id": "1",
+            "hash": "11f6ce9b648ed4b54ade9720076951405320bed68170db4b6fda5602cd7cb15e"}),
+        ("evt-form2-sealed-shipped", {
+            "canonical_form_id": "2", "detail_salt": "b" * 64,
+            "detail_commitment": "f539a999e9d125e1097ffaf48dc5034d46eda02f8ee2620ee0b896ebf9cd3dfd",
+            "hash": "67acd6ab0fcd7c6c14a314a6cb4bad414aa08f1fd1edc4e2946488682491f920"}),
+    )
+]
+
+
+@pytest.mark.parametrize("raw", SEALED_SHIPPED_ROWS, ids=lambda d: d["id"])
+def test_row_sealed_with_shipped_at_set_still_verifies(raw):
+    [row] = _rows_from_dicts([dict(raw)])
+    result = verify_chain([row])
+    assert result.ok, result.reason
+
+
+@pytest.mark.parametrize("raw", SEALED_SHIPPED_ROWS, ids=lambda d: d["id"])
+def test_row_sealed_with_shipped_at_set_binds_that_value(raw):
+    """The fallback accepts only the stored value it was sealed over."""
+    [row] = _rows_from_dicts([dict(raw)])
+    moved = dataclasses.replace(
+        row, shipped_at=datetime(2026, 6, 17, tzinfo=timezone.utc))
+    assert not verify_chain([moved]).ok
+    assert not verify_chain([dataclasses.replace(row, shipped_at=None)]).ok
+    assert not verify_chain([dataclasses.replace(row, actor="bob")]).ok

@@ -92,6 +92,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — `mark_shipped` no longer breaks a row's hash (#123, Python + Go)
+
+- Every canonical form hashes `shipped_at` as null (spec §1.1). Setting it
+  after sealing changed the hash, so `verify_chain` failed on untouched rows.
+- Emit always sealed with `shipped_at` null, so existing hashes don't change.
+  A row sealed by calling `seal()` or `allocate_and_insert_originated` with
+  `shipped_at` already set still verifies, over its stored value.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

@@ -132,6 +132,25 @@ def build() -> dict:
                                 detail_salt=PINNED_SALT)
         add(label, seal("genesis", r))
 
+    # Shipped rows: sealed with shipped_at null, then marked shipped. Every
+    # form hashes shipped_at as null (spec §1.1), so marking moves no hash.
+    shipped_at = datetime(2026, 6, 16, 8, 0, 0, 250000, tzinfo=timezone.utc)
+    form1 = dataclasses.replace(_row("evt-form1_shipped", MICROS), canonical_form_id="1")
+    d = form1.to_dict()
+    d.pop("hash", None)
+    form1 = dataclasses.replace(form1, prev_hash="genesis", hash=_row_hash_form_1(d))
+    add("form1_shipped", dataclasses.replace(form1, shipped_at=shipped_at))
+    legacy = dataclasses.replace(_row("evt-form1_legacy_Z_shipped", MICROS),
+                                 canonical_form_id="1")
+    d = legacy.to_dict()
+    d.pop("hash", None)
+    legacy = dataclasses.replace(legacy, prev_hash="genesis",
+                                 hash=_row_hash_form_1_legacy_z(d))
+    add("form1_legacy_Z_shipped", dataclasses.replace(legacy, shipped_at=shipped_at))
+    form2 = seal("genesis", dataclasses.replace(_row("evt-form2_shipped", MICROS),
+                                                detail_salt=PINNED_SALT))
+    add("form2_shipped", dataclasses.replace(form2, shipped_at=shipped_at))
+
     # The frozen real-release row, passed through verbatim.
     cases.append({"label": "form1_real_prefix_release",
                   "row": dict(FROZEN_PREFIX_ROW)})
