@@ -402,6 +402,24 @@ final class ChainTests: XCTestCase {
         XCTAssertEqual(seqs, Array(1...(2 * perEngine)))
     }
 
+    // ping and maxMonotonicSeq share the drainer's connection, which SQLite
+    // does not serialize in multi-thread mode.
+    func testReadsWhileInsertingOnOneStore() throws {
+        let store = try SQLiteStore(path: tempDBPath(self))
+        let n = 2000
+        DispatchQueue.concurrentPerform(iterations: 2) { i in
+            for j in 0..<n {
+                if i == 0 {
+                    try? store.insert(testRow("r\(j)"))
+                } else {
+                    _ = store.maxMonotonicSeq()
+                    try? store.ping()
+                }
+            }
+        }
+        XCTAssertEqual(store.maxMonotonicSeq(), n)
+    }
+
     func testFailedCommitRollsBack() throws {
         let path = tempDBPath(self)
         let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
@@ -475,6 +493,33 @@ final class RedactionTests: XCTestCase {
 
         XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
         XCTAssertEqual(query(path, "SELECT COUNT(*) FROM audit_log"), [["5"]])
+    }
+
+    // Spec 7.1: a sealed form "1" row is refused and the refusal is reported.
+    func testSealedFormOneRowIsRefusedAndReported() throws {
+        registerCodes()
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        let engine = Engine()
+        engine.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let lines = Lock()
+        var captured: [String] = []
+        engine.transport.write = { line in lines.withLock { captured.append(line) } }
+        let email: [String: AnyCodable] = ["email": AnyCodable("a@example.com")]
+        try store.insert(testRow("sealed", seq: 1, code: "USER_EMAIL_SEEN",
+                                 timestamp: isoString40DaysAgo(), detail: email, hash: "abc"))
+
+        XCTAssertEqual(try engine.redactExpired(before: Date().addingTimeInterval(-30 * day),
+                                                reason: "retention"), [])
+        XCTAssertEqual(query(path, "SELECT detail FROM audit_log WHERE id = 'sealed'"),
+                       [[#"{"email":"a@example.com"}"#]])
+        let warn = lines.withLock { captured }.compactMap { line -> [String: Any]? in
+            let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            return obj?["event"] as? String == "pii_redaction_skipped_legacy_form" ? obj : nil
+        }
+        XCTAssertEqual(warn.count, 1)
+        XCTAssertEqual(warn.first?["level"] as? String, "warn")
+        XCTAssertEqual(warn.first?["rows"] as? Int, 1)
     }
 
     func testRedactExpiredOnMemoryStore() throws {

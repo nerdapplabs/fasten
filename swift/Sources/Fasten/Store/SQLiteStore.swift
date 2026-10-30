@@ -219,6 +219,31 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         }
     }
 
+    public func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int {
+        guard !codes.isEmpty else { return 0 }
+        let ph = Array(repeating: "?", count: codes.count).joined(separator: ",")
+        let sql = """
+        SELECT COUNT(*) FROM \(table)
+        WHERE timestamp < ? AND code IN (\(ph)) AND hash <> '' AND canonical_form_id <> '2'
+          AND detail <> 'null'
+        """
+        return try lock.withLock {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw FastenError("SQLite query failed: \(lastError())")
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, canonicalTS(before), -1, SQLITE_TRANSIENT)
+            for (i, c) in codes.enumerated() {
+                sqlite3_bind_text(stmt, Int32(i + 2), c, -1, SQLITE_TRANSIENT)
+            }
+            guard sqlite3_step(stmt) == SQLITE_ROW else {
+                throw FastenError("SQLite query failed: \(lastError())")
+            }
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+    }
+
     /// Sets `detail` to the JSON literal 'null' (the column is NOT NULL).
     public func redactRows(ids: [String]) throws -> [String] {
         guard !ids.isEmpty else { return [] }
@@ -243,21 +268,27 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         return ids
     }
 
+    // Every use of `db` takes `lock`: SQLite does not serialize one
+    // connection across threads, and the drainer inserts from its own thread.
     public func ping() throws {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT 1", -1, &stmt, nil) == SQLITE_OK else {
-            throw FastenError("SQLite ping failed")
+        try lock.withLock {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT 1", -1, &stmt, nil) == SQLITE_OK else {
+                throw FastenError("SQLite ping failed")
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     public func maxMonotonicSeq() -> Int {
-        var stmt: OpaquePointer?
-        let sql = "SELECT COALESCE(MAX(monotonic_seq),0) FROM \(table)"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-        return Int(sqlite3_column_int64(stmt, 0))
+        lock.withLock {
+            var stmt: OpaquePointer?
+            let sql = "SELECT COALESCE(MAX(monotonic_seq),0) FROM \(table)"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

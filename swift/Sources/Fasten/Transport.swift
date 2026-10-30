@@ -3,6 +3,8 @@ import Foundation
 /// Stdout NDJSON transport — same wire format as all other SDKs.
 final class StdoutTransport: @unchecked Sendable {
     private let lock = Lock()
+    /// Where lines go; tests swap it to capture output.
+    var write: (String) -> Void = { print($0) }
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = [.sortedKeys]
@@ -12,7 +14,7 @@ final class StdoutTransport: @unchecked Sendable {
     func emit(_ row: AuditRow) {
         guard let data = try? encoder.encode(row),
               let line = String(data: data, encoding: .utf8) else { return }
-        lock.withLock { print(line) }
+        lock.withLock { write(line) }
     }
 
     func log(level: String, event: String, serviceID: String?, nodeID: String?,
@@ -30,7 +32,7 @@ final class StdoutTransport: @unchecked Sendable {
         guard let data = try? JSONSerialization.data(withJSONObject: obj,
                                                      options: [.sortedKeys]),
               let line = String(data: data, encoding: .utf8) else { return }
-        lock.withLock { print(line) }
+        lock.withLock { write(line) }
     }
 }
 

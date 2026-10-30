@@ -29,6 +29,11 @@ public protocol AuditStore: Sendable {
     /// Set `detail` to null on the given rows (spec 7.1). Never deletes.
     /// Idempotent; returns `ids`.
     func redactRows(ids: [String]) throws -> [String]
+
+    /// Rows of `codes` older than `before` that still hold detail but are
+    /// sealed under form "1", so they are refused (spec 7.1 says to report
+    /// them). Defaults to 0.
+    func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int
 }
 
 extension AuditStore {
@@ -39,6 +44,8 @@ extension AuditStore {
     public func redactRows(ids: [String]) throws -> [String] {
         throw FastenError("\(type(of: self)) does not support redaction (spec 7.1)")
     }
+
+    public func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int { 0 }
 }
 
 /// In-memory store — tests + stdout-only deployments.
@@ -77,6 +84,16 @@ public final class MemoryStore: AuditStore, @unchecked Sendable {
             }
             .sorted { $0.monotonicSeq < $1.monotonicSeq }
             .map { RedactionCandidate(id: $0.id, monotonicSeq: $0.monotonicSeq) }
+        }
+    }
+
+    // MemoryStore has no canonical_form_id, so every sealed row counts as form "1".
+    public func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int {
+        let cutoff = canonicalTS(before)
+        let wanted = Set(codes)
+        return lock.withLock {
+            rows.filter { !$0.hash.isEmpty && wanted.contains($0.code) && $0.timestamp < cutoff }
+                .count
         }
     }
 
