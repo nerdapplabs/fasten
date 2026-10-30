@@ -198,7 +198,11 @@ class SQLiteStore:
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        path = u.path.lstrip("/")
+        # Strip only the URL-separator slash, as the stream store does:
+        # sqlite:///rel.db is relative, sqlite:////abs/path.db is absolute.
+        path = u.path
+        if u.scheme and path.startswith("/"):
+            path = path[1:]
         if not path:
             raise ValueError(
                 f"fasten SQLiteStore: DSN {dsn!r} has no path. "
@@ -776,6 +780,20 @@ class SQLiteStore:
                     f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}"
                 )
             return int(cur.fetchone()[0])
+
+    def chain_tail(self, source_node_id: str, limit: int) -> list[AuditRow]:
+        """The node's newest ``limit`` rows by monotonic_seq, oldest first.
+
+        The doctor's chain sample. query() orders by timestamp, so after a
+        clock step back its newest rows can skip a seq and read as a break.
+        """
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT * FROM {self._table} WHERE source_node_id = ? "
+                "ORDER BY monotonic_seq DESC LIMIT ?",
+                (source_node_id, limit),
+            )
+            return [self._row(r) for r in reversed(cur.fetchall())]
 
     def _row(self, r: sqlite3.Row) -> AuditRow:
         from ..canonical_ts import parse_canonical

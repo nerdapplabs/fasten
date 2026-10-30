@@ -383,6 +383,9 @@ class Engine:
         # Re-init on a fresh store clears the sticky degrade — a hole in the
         # previous store's history doesn't apply to this one.
         self._audit_write_swallowed = False
+        # Same for the unchained-store flag: it describes the old store.
+        self._unchained_store_logged = False
+        self._audit_chain_unavailable = False
 
         # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
         # (spec §2.1) and happens inside the insert transaction, so an engine

@@ -176,6 +176,17 @@ def router(
     def _store() -> Any:
         return store if store is not None else _active_audit_store()
 
+    def _check_failed(check: str, e: Exception) -> str:
+        """Log a failed doctor check by error type and return the fixed text
+        the response carries. Driver messages can quote SQL, row values and
+        the database host and user; type-only like the other store-error
+        sys lines."""
+        from ..emitter import _default as _default_engine
+        _default_engine._drainer_sys_log("error", "doctor_check_failed", {
+            "check": check, "error_type": type(e).__name__,
+        })
+        return f"{check} check failed; see the service log"
+
     def _transport() -> Any:
         return transport if transport is not None else _active_transport()
 
@@ -750,7 +761,7 @@ def router(
                 store_block["reachable"] = True
             except Exception as e:  # noqa: BLE001
                 store_block["reachable"] = False
-                store_block["last_error"] = f"{type(e).__name__}: {e}"
+                store_block["last_error"] = _check_failed("store", e)
 
         queue_block: Optional[dict[str, Any]] = _default_engine.queue_stats()
 
@@ -780,6 +791,9 @@ def router(
             # OS process they are hitting (relevant under uvicorn --workers N).
             "worker_pid": os.getpid(),
         }
+        if tenant is not None:
+            # The host's own tenant_id is not the caller's to read.
+            init_block["tenant_id"] = None
 
         # P1-23: hash chain verification — spot-check latest 50 rows.
         # breaks is None until verification actually runs; 0 when the chain is
@@ -798,12 +812,15 @@ def router(
         if s is not None and hasattr(s, "query"):
             try:
                 from ..engine import verify_chain
-                recent = s.query(
-                    source_node_id=_default_engine._node_id or None,
-                    limit=50,
-                )
-                if recent:
+                node = _default_engine._node_id or None
+                if node is not None and hasattr(s, "chain_tail"):
+                    # By seq: a timestamp-ordered sample skips seqs after a
+                    # clock step back and reads as a break.
+                    recent = s.chain_tail(node, 50)
+                else:
+                    recent = s.query(source_node_id=node, limit=50)
                     recent.reverse()  # verify_chain requires oldest-first traversal
+                if recent:
                     result = verify_chain(recent)
                     chain_block = {
                         # An unchained store can never be "verified".
@@ -813,6 +830,14 @@ def router(
                         "reason": result.reason,
                         "last_verified_at": canonical_now(),
                     }
+                    # The sample is this node's chain, which can hold other
+                    # tenants' rows. A scoped caller gets the verdict but not
+                    # the row it broke on. Filtering the sample by tenant
+                    # instead would break prev_hash links and report false
+                    # breaks.
+                    if tenant is not None and not result.ok:
+                        chain_block["first_break_at"] = None
+                        chain_block["reason"] = "chain break in this node's recent rows"
             except Exception as e:  # noqa: BLE001
                 # Never collapse a failed check into breaks: 0. Surface the
                 # error so operators can see verification is broken rather
@@ -821,7 +846,7 @@ def router(
                     "verified": None,
                     "breaks": None,
                     "error": type(e).__name__,
-                    "reason": str(e),
+                    "reason": _check_failed("chain", e),
                     "last_verified_at": None,
                 }
 

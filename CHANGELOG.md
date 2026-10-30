@@ -92,6 +92,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — Python audit DSN path and `/audit/doctor` (#135, items 1–3)
+
+- `SQLiteStore.from_dsn` keeps `sqlite:////abs/path.db` absolute, as the
+  stream store already did. It used to create the file under the working
+  directory.
+- `/audit/doctor` samples the node's newest 50 rows by `monotonic_seq` through
+  the new `chain_tail()` on both built-in stores. The timestamp-ordered sample
+  skipped seqs after a clock step back and reported a break on a clean chain.
+  A store without `chain_tail()` keeps the old sample.
+- A scoped caller no longer sees the host `tenant_id`, or the row a chain break
+  is on. The doctor's `last_error` and chain `reason` carry fixed text and log
+  a `doctor_check_failed` sys line with the error type.
+- `init()` clears the chain-unavailable flag a previous store set.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

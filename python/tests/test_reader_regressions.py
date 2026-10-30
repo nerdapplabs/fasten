@@ -76,6 +76,17 @@ def test_stream_store_from_dsn_preserves_absolute_path(tmp_path):
     assert getattr(s2, "path", getattr(s2, "_path", None)) == "rel.db"
 
 
+def test_audit_store_from_dsn_preserves_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    abs_db = tmp_path / "abs" / "audit.db"
+    abs_db.parent.mkdir()
+    SQLiteStore.from_dsn(f"sqlite:///{abs_db}")  # 3 slashes + abs = 4
+    assert abs_db.exists()
+    assert not (tmp_path / str(abs_db).lstrip("/")).exists()
+    SQLiteStore.from_dsn("sqlite:///rel.db")
+    assert (tmp_path / "rel.db").exists()
+
+
 # PR #59 finding 11: reject unknown DSN schemes rather than silently opening
 # a local SQLite file named after the DSN's path component. Any of these
 # used to create a container-local file that reads then reports
