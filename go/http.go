@@ -996,29 +996,33 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
-					storeBlock["last_error"] = e.doctorError(r, "store", fmt.Errorf("panic: %v", p))
+					storeBlock["last_error"] = e.doctorError(r, "store", fmt.Sprintf("panic %T", p))
 				}
 			}()
 			// tenant is "" without isolation, which CountFiltered reads as
 			// no filter.
-			// A store with only an unscoped Count still answers an unscoped
-			// caller.
+			// A store with only an unscoped Count still probes the store, but
+			// a scoped caller doesn't get its number.
 			var count func() (int, error)
+			showRows := true
 			if c, ok := store.(interface {
 				CountFiltered(context.Context, Filter) (int, error)
 			}); ok {
 				count = func() (int, error) { return c.CountFiltered(r.Context(), Filter{TenantID: tenant}) }
 			} else if c, ok := store.(interface {
 				Count(context.Context) (int, error)
-			}); ok && tenant == "" {
+			}); ok {
 				count = func() (int, error) { return c.Count(r.Context()) }
+				showRows = tenant == ""
 			}
 			if count == nil {
 				storeBlock["reachable"] = true
 			} else if n, err := count(); err != nil {
-				storeBlock["last_error"] = e.doctorError(r, "store", err)
+				storeBlock["last_error"] = e.doctorError(r, "store", fmt.Sprintf("%T", err))
 			} else {
-				storeBlock["rows"] = n
+				if showRows {
+					storeBlock["rows"] = n
+				}
 				storeBlock["reachable"] = true
 			}
 		}()
@@ -1083,7 +1087,7 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 			// verification is broken rather than a green status page (same
 			// shape as the storeBlock's last_error above).
 			chainBlock["error"] = "query failed"
-			chainBlock["reason"] = e.doctorError(r, "chain", err)
+			chainBlock["reason"] = e.doctorError(r, "chain", fmt.Sprintf("%T", err))
 		case len(recent) > 0:
 			res := VerifyChain(recent)
 			breaks := 0
@@ -1136,11 +1140,11 @@ func (e *Engine) serverError(w http.ResponseWriter, r *http.Request, err error) 
 
 // doctorError logs the error type for the doctor's check and returns the fixed
 // text the response carries in its place.
-func (e *Engine) doctorError(r *http.Request, check string, err error) string {
+func (e *Engine) doctorError(r *http.Request, check, errType string) string {
 	e.drainerSysLog("error", "doctor_check_failed", map[string]any{
 		"request_id": RequestIDFromContext(r.Context()),
 		"check":      check,
-		"error_type": fmt.Sprintf("%T", err),
+		"error_type": errType,
 	})
 	return check + " check failed; see the service log"
 }

@@ -269,6 +269,61 @@ func TestAuditDoctor_CountOnlyStoreStillReportsRows(t *testing.T) {
 	}
 }
 
+// countPanicStore panics with a non-error value in CountFiltered.
+type countPanicStore struct{ brokenQueryStore }
+
+type panicValue struct{}
+
+func (*countPanicStore) CountFiltered(context.Context, Filter) (int, error) {
+	panic(panicValue{})
+}
+
+func TestAuditDoctor_CountPanicLogsThePanicType(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countPanicStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	if store := body["store"].(map[string]any); store["last_error"] == nil || store["reachable"] != false {
+		t.Fatalf("a panicking store must read as down; got %v", store)
+	}
+	logged, err := GetTransport().QuerySyslog(50, StreamQuery{})
+	if err != nil {
+		t.Fatalf("QuerySyslog: %v", err)
+	}
+	for _, row := range logged {
+		if row["event"] == "doctor_check_failed" && row["check"] == "store" {
+			if row["error_type"] != "panic fasten.panicValue" {
+				t.Errorf("want the panic value's type; got %v", row["error_type"])
+			}
+			return
+		}
+	}
+	t.Errorf("no doctor_check_failed line for the store")
+}
+
+// countOnlyDownStore has only Count, and Count fails.
+type countOnlyDownStore struct{ brokenQueryStore }
+
+func (*countOnlyDownStore) Count(context.Context) (int, error) { return 0, errBrokenQuery }
+
+func TestAuditDoctor_CountOnlyStoreDownReadsAsDownWhenScoped(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countOnlyDownStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ := getJSON(t, h, "/audit/doctor")
+	store := body["store"].(map[string]any)
+	if store["reachable"] != false || store["last_error"] == nil || store["rows"] != nil {
+		t.Errorf("scoped doctor must probe Count and report the store down; got %v", store)
+	}
+}
+
 // Seq 30 is stamped 90 s before every other row. The newest 50 by timestamp
 // skip it, and that sample reads as a break on a clean chain.
 func TestAuditDoctor_SamplesBySeqAfterAClockStepBack(t *testing.T) {
