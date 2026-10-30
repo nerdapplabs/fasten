@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::Store;
+use super::{RedactionCandidates, Store};
 
 // ── Connection holder ─────────────────────────────────────────────────────────
 //
@@ -287,9 +287,8 @@ impl PostgresStore {
         })
     }
 
-    /// `" AND hash = ''"` when the table has a `hash` column, else `""`.
-    /// See the SQLite store.
-    fn unsealed_gate(&self, client: &mut pg::Client) -> Result<&'static str, Error> {
+    /// Whether the table has a `hash` column. See the SQLite store.
+    fn has_hash_column(&self, client: &mut pg::Client) -> Result<bool, Error> {
         let row = client.query_one(
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = COALESCE($1, current_schema()) \
@@ -297,7 +296,7 @@ impl PostgresStore {
             &[&self.schema, &self.bare],
         )?;
         let n: i64 = row.get(0);
-        Ok(if n > 0 { " AND hash = ''" } else { "" })
+        Ok(n > 0)
     }
 }
 
@@ -454,23 +453,45 @@ impl Store for PostgresStore {
         &self,
         before: &str,
         codes: &[String],
-    ) -> Result<Vec<(String, u64)>, Error> {
+    ) -> Result<RedactionCandidates, Error> {
         if codes.is_empty() {
-            return Ok(vec![]);
+            return Ok(RedactionCandidates::default());
         }
         self.with_reconnect(|inner| {
-            let gate = self.unsealed_gate(&mut inner.client)?;
-            let sql = format!(
-                "SELECT id, monotonic_seq FROM {} \
-                 WHERE timestamp < $1 AND code = ANY($2) \
-                 AND detail <> 'null'{gate} ORDER BY monotonic_seq",
+            let has_hash = self.has_hash_column(&mut inner.client)?;
+            let base = format!(
+                "FROM {} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null'",
                 self.table
             );
-            let rows = inner.client.query(sql.as_str(), &[&before, &codes])?;
-            Ok(rows
-                .iter()
-                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1).unsigned_abs()))
-                .collect())
+            let gate = if has_hash { " AND hash = ''" } else { "" };
+            // REPEATABLE READ so the list and the count see the same rows.
+            let mut tx = inner
+                .client
+                .build_transaction()
+                .isolation_level(pg::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()?;
+            let rows = tx.query(
+                format!("SELECT id, monotonic_seq {base}{gate} ORDER BY monotonic_seq").as_str(),
+                &[&before, &codes],
+            )?;
+            let skipped: i64 = if has_hash {
+                tx.query_one(
+                    format!("SELECT COUNT(*) {base} AND hash <> ''").as_str(),
+                    &[&before, &codes],
+                )?
+                .get(0)
+            } else {
+                0
+            };
+            tx.commit()?;
+            Ok(RedactionCandidates {
+                rows: rows
+                    .iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1).unsigned_abs()))
+                    .collect(),
+                skipped: skipped.unsigned_abs(),
+            })
         })
     }
 
@@ -479,8 +500,9 @@ impl Store for PostgresStore {
             return Ok(vec![]);
         }
         self.with_reconnect(|inner| {
-            let gate = self.unsealed_gate(&mut inner.client)?;
-            // 'null' is the JSON literal; see the SQLite store.
+            let gate = if self.has_hash_column(&mut inner.client)? { " AND hash = ''" } else { "" };
+            // 'null' is the JSON literal; see the SQLite store. ids go in one
+            // array parameter, so there is no per-id bind limit here.
             let sql = format!(
                 "UPDATE {} SET detail = 'null' WHERE id = ANY($1){gate}",
                 self.table
@@ -493,7 +515,7 @@ impl Store for PostgresStore {
 
 // ── Schema bootstrap ──────────────────────────────────────────────────────────
 
-fn pg_exec(client: &mut pg::Client, sql: &str) -> Result<(), Error> {
+fn pg_exec(client: &mut pg::Transaction<'_>, sql: &str) -> Result<(), Error> {
     client.execute(sql, &[]).map(|_| ()).map_err(Error::Postgres)
 }
 
@@ -503,6 +525,16 @@ fn migrate(
     bare: &str,
     schema: Option<&str>,
 ) -> Result<(), Error> {
+    // Concurrent CREATE ... IF NOT EXISTS on a fresh database can fail with a
+    // duplicate key on pg_type. Same lock key as the Python store; the xact
+    // lock is released on commit, or on rollback when `tx` drops on error.
+    let mut tx = client.transaction()?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&format!("fasten.bootstrap.{table}")],
+    )?;
+    let client = &mut tx;
+
     if let Some(s) = schema {
         pg_exec(client, &format!("CREATE SCHEMA IF NOT EXISTS {s}"))?;
     }
@@ -548,6 +580,7 @@ fn migrate(
         pg_exec(client, sql)?;
     }
 
+    tx.commit()?;
     Ok(())
 }
 
@@ -857,15 +890,19 @@ mod tests {
         let codes = vec!["USER_LOGIN".to_string()];
         let cutoff = days_ago(30);
         let found = store.list_redaction_candidates(&cutoff, &codes).unwrap();
-        assert_eq!(found, vec![("evt-pii-old".to_string(), 1)]);
-        let ids: Vec<String> = found.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(found.rows, vec![("evt-pii-old".to_string(), 1)]);
+        assert_eq!(found.skipped, 0);
+        let ids: Vec<String> = found.rows.into_iter().map(|(id, _)| id).collect();
         assert_eq!(store.redact_rows(&ids).unwrap(), ids);
 
         assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
         assert_eq!(detail_of(&store, "evt-ops-old"), serde_json::json!({"k": "v"}));
         assert_eq!(store.count(&Filter::default()).unwrap(), 2);
 
-        assert!(store.list_redaction_candidates(&cutoff, &codes).unwrap().is_empty());
+        assert_eq!(
+            store.list_redaction_candidates(&cutoff, &codes).unwrap(),
+            RedactionCandidates::default()
+        );
         assert_eq!(store.redact_rows(&ids).unwrap(), ids);
         assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
         assert_eq!(store.count(&Filter::default()).unwrap(), 2);
@@ -890,7 +927,8 @@ mod tests {
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
-        assert_eq!(found, vec![("evt-unsealed".to_string(), 2)]);
+        assert_eq!(found.rows, vec![("evt-unsealed".to_string(), 2)]);
+        assert_eq!(found.skipped, 1);
         store
             .redact_rows(&["evt-sealed".to_string(), "evt-unsealed".to_string()])
             .unwrap();

@@ -23,6 +23,16 @@ pub struct Filter {
     pub offset:         u32,
 }
 
+/// Result of [`Store::list_redaction_candidates`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RedactionCandidates {
+    /// `(id, monotonic_seq)` ordered by `monotonic_seq`.
+    pub rows: Vec<(String, u64)>,
+    /// Matching rows left out because they are sealed (`hash <> ''`).
+    /// Always 0 on a table without a `hash` column.
+    pub skipped: u64,
+}
+
 /// Shared contract for all audit-store backends.
 ///
 /// All methods must be thread-safe; implementations wrap internals in a
@@ -77,14 +87,14 @@ pub trait Store: Send + Sync {
 
     // ── Redaction (spec §7.1) ────────────────────────────────────────────────
 
-    /// `(id, monotonic_seq)` of rows with `timestamp < before`, `code` in
-    /// `codes` and a `detail` not yet redacted, ordered by `monotonic_seq`.
-    /// Sealed rows are never returned.
+    /// Rows with `timestamp < before`, `code` in `codes` and a `detail` not
+    /// yet redacted. Sealed rows are never listed; they are counted in
+    /// `skipped`.
     fn list_redaction_candidates(
         &self,
         _before: &str,
         _codes: &[String],
-    ) -> Result<Vec<(String, u64)>, Error> {
+    ) -> Result<RedactionCandidates, Error> {
         Err(Error::Unsupported("list_redaction_candidates"))
     }
 

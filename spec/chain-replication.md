@@ -190,11 +190,15 @@ A conformant allocation is, atomically:
 ```
 BEGIN
   seq  := COALESCE(MAX(monotonic_seq), 0) + 1   -- WHERE source_node_id = ?
-  prev := hash of the row at seq-1               -- same predicate, or "genesis"
+  prev := hash of the node's last sealed row     -- or "genesis" if none
   row  := seal(prev, row WITH monotonic_seq = seq)
   INSERT row
 COMMIT
 ```
+
+`seq` counts every row on the node, sealed or not. `prev` is the `hash` of the
+node's sealed row (`hash <> ''`) with the highest `monotonic_seq`, or
+`"genesis"` when the node has no sealed row.
 
 The transaction MUST serialise against concurrent allocations for the same
 `source_node_id` (SQLite: `BEGIN IMMEDIATE`; Postgres: `SELECT … FOR UPDATE` on
@@ -354,12 +358,10 @@ exists to forbid.
 
 ### §8.2 Allocation without sealing
 
-A store MAY allocate `monotonic_seq` (§2.1) for an SDK that cannot seal, for
-example one writing through fasten-core. Such rows carry `hash = ""` and
-`prev_hash = ""`. They still hold their `monotonic_seq`, so later rows on the
-node, sealed or not, are allocated after them.
+A store MAY allocate `monotonic_seq` (§2.1) for a writer that cannot seal, for
+example one writing through fasten-core. Such rows have an empty `hash`;
+`verify_chain` treats them as unsealed (§2). The writer MUST log
+`audit_chain_unavailable` once per init, as in §8.1.
 
-`verify_chain` treats them as unsealed (§2): it skips them, and does not check a
-sealed row's `prev_hash` against an unsealed row before it. The SDK MUST log
-`audit_chain_unavailable` once per init, as in §8.1, so the stream is not taken
-for a verified chain.
+A node that writes unsealed rows MUST NOT share its `source_node_id` with a
+writer that seals; give it a distinct node id.

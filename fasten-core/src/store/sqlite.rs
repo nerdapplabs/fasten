@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::Store;
+use super::{RedactionCandidates, Store};
 
 // ── SqliteStore ───────────────────────────────────────────────────────────────
 
@@ -95,20 +95,28 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// `" AND hash = ''"` when the table has a `hash` column, else `""`.
+    /// Whether the table has a `hash` column.
     ///
     /// Tables created here have no chain columns, so every row is unsealed.
     /// A table shared with an SDK that seals (Go adds `hash` on open) may hold
-    /// sealed rows, and redacting one of those would break its chain.
-    fn unsealed_gate(conn: &Connection, table: &str) -> Result<&'static str, Error> {
+    /// sealed rows, which redaction leaves alone.
+    fn has_hash_column(conn: &Connection, table: &str) -> Result<bool, Error> {
         let (schema, bare) = split_table(table);
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info(?1, ?2) WHERE name = 'hash'",
             rusqlite::params![bare, schema.unwrap_or("main")],
             |r| r.get(0),
         )?;
-        Ok(if n > 0 { " AND hash = ''" } else { "" })
+        Ok(n > 0)
     }
+}
+
+/// Ids or codes bound per statement. SQLite caps bound variables per
+/// statement (999 before 3.32, 32766 since).
+const BIND_CHUNK: usize = 500;
+
+fn placeholders(from: usize, n: usize) -> String {
+    (from..from + n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
 }
 
 impl Store for SqliteStore {
@@ -272,55 +280,71 @@ impl Store for SqliteStore {
         &self,
         before: &str,
         codes: &[String],
-    ) -> Result<Vec<(String, u64)>, Error> {
+    ) -> Result<RedactionCandidates, Error> {
+        let mut codes: Vec<&String> = codes.iter().collect();
+        codes.sort();
+        codes.dedup();
+        let mut out = RedactionCandidates::default();
         if codes.is_empty() {
-            return Ok(vec![]);
+            return Ok(out);
         }
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let gate = Self::unsealed_gate(&guard, &self.table)?;
-        let placeholders = (2..=codes.len() + 1)
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT id, monotonic_seq FROM {} \
-             WHERE timestamp < ?1 AND code IN ({placeholders}) \
-             AND detail <> 'null'{gate} ORDER BY monotonic_seq",
-            self.table
-        );
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(codes.len() + 1);
-        params.push(&before);
-        for c in codes {
-            params.push(c);
-        }
-        let mut stmt = guard.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params.as_slice(), |r| {
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // One read transaction so every chunk sees the same rows.
+        let tx = guard.transaction()?;
+        let has_hash = Self::has_hash_column(&tx, &self.table)?;
+        for chunk in codes.chunks(BIND_CHUNK) {
+            let base = format!(
+                "FROM {} WHERE timestamp < ?1 AND code IN ({}) AND detail <> 'null'",
+                self.table,
+                placeholders(2, chunk.len())
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            params.push(&before);
+            for c in chunk {
+                params.push(*c);
+            }
+            let gate = if has_hash { " AND hash = ''" } else { "" };
+            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{gate}"))?;
+            let rows = stmt.query_map(params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+            })?;
+            for r in rows {
+                out.rows.push(r?);
+            }
+            if has_hash {
+                let n: i64 = tx.query_row(
+                    &format!("SELECT COUNT(*) {base} AND hash <> ''"),
+                    params.as_slice(),
+                    |r| r.get(0),
+                )?;
+                out.skipped += n.unsigned_abs();
+            }
+        }
+        tx.commit()?;
+        out.rows.sort_by_key(|(_, seq)| *seq);
+        Ok(out)
     }
 
     fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let gate = Self::unsealed_gate(&guard, &self.table)?;
-        let placeholders = (1..=ids.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // 'null' is the JSON literal: detail is NOT NULL, and it reads back as
-        // a null detail.
-        let sql = format!(
-            "UPDATE {} SET detail = 'null' WHERE id IN ({placeholders}){gate}",
-            self.table
-        );
-        let params: Vec<&dyn rusqlite::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        guard.execute(&sql, params.as_slice())?;
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let gate = if Self::has_hash_column(&tx, &self.table)? { " AND hash = ''" } else { "" };
+        for chunk in ids.chunks(BIND_CHUNK) {
+            // 'null' is the JSON literal: detail is NOT NULL, and it reads
+            // back as a null detail.
+            let sql = format!(
+                "UPDATE {} SET detail = 'null' WHERE id IN ({}){gate}",
+                self.table,
+                placeholders(1, chunk.len())
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            tx.execute(&sql, params.as_slice())?;
+        }
+        tx.commit()?;
         Ok(ids.to_vec())
     }
 }
@@ -720,8 +744,9 @@ mod tests {
         let codes = vec!["USER_LOGIN".to_string()];
         let cutoff = days_ago(30);
         let found = store.list_redaction_candidates(&cutoff, &codes).unwrap();
-        assert_eq!(found, vec![("evt-pii-old".to_string(), 1)]);
-        let ids: Vec<String> = found.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(found.rows, vec![("evt-pii-old".to_string(), 1)]);
+        assert_eq!(found.skipped, 0);
+        let ids: Vec<String> = found.rows.into_iter().map(|(id, _)| id).collect();
         assert_eq!(store.redact_rows(&ids).unwrap(), ids);
 
         assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
@@ -729,7 +754,10 @@ mod tests {
         assert_eq!(store.count(&Filter::default()).unwrap(), 2);
 
         // Idempotent: nothing left to list, and a repeat redact is harmless.
-        assert!(store.list_redaction_candidates(&cutoff, &codes).unwrap().is_empty());
+        assert_eq!(
+            store.list_redaction_candidates(&cutoff, &codes).unwrap(),
+            RedactionCandidates::default()
+        );
         assert_eq!(store.redact_rows(&ids).unwrap(), ids);
         assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
         assert_eq!(store.count(&Filter::default()).unwrap(), 2);
@@ -762,10 +790,40 @@ mod tests {
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
-        assert_eq!(found, vec![("evt-unsealed".to_string(), 2)]);
+        assert_eq!(found.rows, vec![("evt-unsealed".to_string(), 2)]);
+        assert_eq!(found.skipped, 1);
         let all = vec!["evt-sealed".to_string(), "evt-unsealed".to_string()];
         store.redact_rows(&all).unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"key": "value"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// More ids and codes than SQLite binds in one statement.
+    #[test]
+    fn redaction_handles_more_ids_than_one_statement_binds() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let n = 1200;
+        for i in 0..n {
+            let mut r = make_row(&format!("evt-{i}"), "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        // 40_000 is above SQLite's default per-statement variable limit.
+        let mut codes: Vec<String> = (0..40_000).map(|i| format!("UNUSED_{i}")).collect();
+        codes.push("USER_LOGIN".into());
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(found.rows.len(), n);
+        assert_eq!(
+            found.rows.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            (1..=n as u64).collect::<Vec<_>>()
+        );
+
+        let mut ids: Vec<String> = found.rows.into_iter().map(|(id, _)| id).collect();
+        ids.extend((0..40_000).map(|i| format!("missing-{i}")));
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+        let rows = store.query(&Filter::default()).unwrap();
+        assert_eq!(rows.len(), n);
+        assert!(rows.iter().all(|r| r.detail.is_null()));
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
     }
 }

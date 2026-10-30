@@ -389,6 +389,8 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
 /// `out_json`       — on success, a JSON array of
 ///                    `{"id": ..., "monotonic_seq": ...}` ordered by
 ///                    `monotonic_seq`. Free with `fasten_store_free_str`.
+/// `out_skipped`    — on success, the number of matching sealed rows left
+///                    out of `out_json`. May be NULL.
 /// `out_err`        — set on error; may be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
@@ -396,6 +398,7 @@ pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
     before_iso8601: *const c_char,
     codes_json: *const c_char,
     out_json: *mut *mut c_char,
+    out_skipped: *mut u64,
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
@@ -404,16 +407,20 @@ pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
         }
         let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
         let codes: Vec<String> = serde_json::from_str(read_str(codes_json).ok_or(Error::NullArg)?)?;
-        let rows = (*handle).store.list_redaction_candidates(before, &codes)?;
-        let out: Vec<_> = rows
+        let found = (*handle).store.list_redaction_candidates(before, &codes)?;
+        let out: Vec<_> = found
+            .rows
             .into_iter()
             .map(|(id, seq)| serde_json::json!({"id": id, "monotonic_seq": seq}))
             .collect();
-        Ok(serde_json::to_string(&out)?)
+        Ok((serde_json::to_string(&out)?, found.skipped))
     });
     match r {
-        Ok(json) => {
+        Ok((json, skipped)) => {
             set_error(out_json, &json);
+            if !out_skipped.is_null() {
+                *out_skipped = skipped;
+            }
             FastenErrorCode::Ok
         }
         Err((code, msg)) => {
@@ -623,12 +630,22 @@ mod tests {
             assert_eq!(rc, FastenErrorCode::Ok);
 
             let mut out: *mut c_char = std::ptr::null_mut();
+            let mut skipped: u64 = 99;
             let rc = fasten_store_list_redaction_candidates(
                 h, cs("2021-01-01T00:00:00Z").as_ptr(), cs(r#"["USER_LOGIN"]"#).as_ptr(),
-                &mut out, &mut err,
+                &mut out, &mut skipped, &mut err,
             );
             assert_eq!(rc, FastenErrorCode::Ok);
             assert_eq!(take(out), r#"[{"id":"evt-1","monotonic_seq":1}]"#);
+            assert_eq!(skipped, 0);
+
+            // out_skipped may be NULL.
+            let rc = fasten_store_list_redaction_candidates(
+                h, cs("2021-01-01T00:00:00Z").as_ptr(), cs(r#"["USER_LOGIN"]"#).as_ptr(),
+                &mut out, std::ptr::null_mut(), &mut err,
+            );
+            assert_eq!(rc, FastenErrorCode::Ok);
+            take(out);
 
             let rc = fasten_store_redact_rows(h, cs(r#"["evt-1"]"#).as_ptr(), &mut out, &mut err);
             assert_eq!(rc, FastenErrorCode::Ok);

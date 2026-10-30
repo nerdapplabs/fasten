@@ -106,9 +106,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `redact_rows` on the `Store` trait, exported as
   `fasten_store_list_redaction_candidates` / `fasten_store_redact_rows`.
   `detail` becomes JSON `null`; rows are never deleted. Sealed rows on a
-  table shared with a sealing SDK are left alone.
-- Spec: §8.2 (allocation without sealing), and §7.1 allows redacting any
-  unsealed row.
+  table shared with a sealing SDK are left alone, and
+  `list_redaction_candidates` reports how many it left out (`skipped`; the C
+  export's `out_skipped`, may be NULL). The SQLite store binds ids and codes
+  in chunks of 500 inside one transaction, so long lists stay under SQLite's
+  bound-variable limit.
+- `PostgresStore` takes the `fasten.bootstrap.<table>` advisory lock (same key
+  as Python) around its schema bootstrap, so stores opening a fresh database
+  at once no longer fail on a duplicate `pg_type` key.
+- Spec: §8.2 (allocation without sealing), §2.1 states `prev_hash` comes from
+  the node's last sealed row, and §7.1 allows redacting any unsealed row.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

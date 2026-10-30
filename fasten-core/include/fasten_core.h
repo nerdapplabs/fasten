@@ -283,6 +283,8 @@ FastenErrorCode fasten_store_max_monotonic_seq(
  * @param out_json       On success: heap-allocated JSON array of
  *                       {"id": "...", "monotonic_seq": n}, ordered by
  *                       monotonic_seq. Free with fasten_store_free_str().
+ * @param out_skipped    On success: number of matching sealed rows left out
+ *                       of out_json. May be NULL.
  * @param out_err        Set on error; may be NULL.
  *
  * @return  FASTEN_OK on success, error code otherwise (out_err set).
@@ -294,6 +296,7 @@ FastenErrorCode fasten_store_list_redaction_candidates(
     const char*  before_iso8601,
     const char*  codes_json,
     char**       out_json,
+    uint64_t*    out_skipped,
     char**       out_err
 );
 
