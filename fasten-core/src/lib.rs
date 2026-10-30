@@ -71,7 +71,7 @@ pub use catalog::{CodeRegistry, Meta, GLOBAL_REGISTRY};
 pub use error::{Error, FastenErrorCode};
 pub use redact::{Redactor, REDACTOR};
 pub use row::Row;
-pub use store::{Filter, Store};
+pub use store::{Filter, RedactionCandidates, Store};
 
 #[cfg(feature = "sqlite")]
 pub use store::sqlite::SqliteStore;

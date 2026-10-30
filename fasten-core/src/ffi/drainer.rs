@@ -12,7 +12,7 @@ use crate::{
     drainer::{Drainer, DrainerConfig},
     error::{Error, FastenErrorCode},
     row::Row,
-    store::{Filter, Store},
+    store::{Filter, RedactionCandidates, Store},
 };
 use super::{FastenStoreHandle, guarded, result_to_rc};
 use super::util::set_error;
@@ -29,6 +29,10 @@ impl Store for ArcStoreShim {
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> { self.0.mark_shipped(ids) }
     fn purge(&self, before: &str, respect: bool) -> Result<u64, Error> { self.0.purge(before, respect) }
     fn max_monotonic_seq(&self) -> Result<u64, Error> { self.0.max_monotonic_seq() }
+    fn list_redaction_candidates(&self, before: &str, codes: &[String]) -> Result<RedactionCandidates, Error> {
+        self.0.list_redaction_candidates(before, codes)
+    }
+    fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> { self.0.redact_rows(ids) }
 }
 
 /// Add (or replace) a drainer on an existing store handle.

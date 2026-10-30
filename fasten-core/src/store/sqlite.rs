@@ -1,15 +1,16 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::{
     error::Error,
     row::Row,
     store::Filter,
-    validate::validate_table_name,
+    validate::{split_table, validate_table_name},
 };
 
-use super::Store;
+use super::{RedactionCandidates, Store};
 
 // ── SqliteStore ───────────────────────────────────────────────────────────────
 
@@ -36,6 +37,10 @@ impl SqliteStore {
         validate_table_name(table)?;
 
         let conn = Connection::open(path)?;
+        // Another handle on the same file may hold the write lock while it
+        // allocates a seq; wait for it instead of failing with SQLITE_BUSY.
+        // rusqlite's default is also 5 s; set here so we don't rely on it.
+        conn.busy_timeout(Duration::from_secs(5))?;
 
         if wal && path != ":memory:" {
             conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -76,7 +81,8 @@ impl SqliteStore {
                 request_id      TEXT    NOT NULL DEFAULT '',
                 detail          TEXT    NOT NULL DEFAULT '{{}}',
                 pii_in_detail   INTEGER NOT NULL DEFAULT 0,
-                shipped_at      TEXT
+                shipped_at      TEXT,
+                UNIQUE (source_node_id, monotonic_seq)
             );
             CREATE INDEX IF NOT EXISTS idx_{t}_req  ON {t}(request_id);
             CREATE INDEX IF NOT EXISTS idx_{t}_code ON {t}(code);
@@ -88,41 +94,59 @@ impl SqliteStore {
         guard.execute_batch(&ddl)?;
         Ok(())
     }
+
+    /// Whether the table has a `hash` column.
+    ///
+    /// Tables created here have no chain columns, so every row is unsealed.
+    /// A table shared with an SDK that seals (Go adds `hash` on open) may hold
+    /// sealed rows, which redaction leaves alone.
+    fn has_hash_column(conn: &Connection, table: &str) -> Result<bool, Error> {
+        let (schema, bare) = split_table(table);
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1, ?2) WHERE name = 'hash'",
+            rusqlite::params![bare, schema.unwrap_or("main")],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+}
+
+/// Ids or codes bound per statement. SQLite caps bound variables per
+/// statement (999 before 3.32, 32766 since).
+const BIND_CHUNK: usize = 500;
+
+fn placeholders(from: usize, n: usize) -> String {
+    (from..from + n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
 }
 
 impl Store for SqliteStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
-        let detail_str = serde_json::to_string(&row.detail)?;
-        let pii: i64 = row.pii_in_detail as i64;
-        let seq: i64 = row.monotonic_seq as i64;
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if row.monotonic_seq != 0 {
+            return insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64);
+        }
 
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = guard.prepare_cached(&self.insert_sql)?;
-
-        stmt.execute(rusqlite::params![
-            row.id,
-            row.wire_version,
-            row.origin_id,
-            seq,
-            row.timestamp,
-            row.code,
-            row.action,
-            row.severity,
-            row.service_id,
-            row.source_node_id,
-            row.tenant_id,      // Option<String> → NULL when None
-            row.actor,
-            row.actor_kind,
-            row.target,
-            row.category,
-            row.domain,
-            row.method,
-            row.request_id,
-            detail_str,
-            pii,
-            row.shipped_at,     // Option<String> → NULL when None
-        ])?;
-
+        // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
+        // handles on one file cannot both read the same tip (spec §2.1).
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)", self.table),
+            rusqlite::params![row.id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let seq: i64 = tx.query_row(
+                &format!(
+                    "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
+                     WHERE source_node_id = ?1",
+                    self.table
+                ),
+                rusqlite::params![row.source_node_id],
+                |r| r.get(0),
+            )?;
+            insert_row(&tx, &self.insert_sql, row, seq)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -251,18 +275,124 @@ impl Store for SqliteStore {
         let seq: i64 = stmt.query_row([], |r| r.get(0))?;
         Ok(seq.unsigned_abs())
     }
+
+    fn list_redaction_candidates(
+        &self,
+        before: &str,
+        codes: &[String],
+    ) -> Result<RedactionCandidates, Error> {
+        let mut codes: Vec<&String> = codes.iter().collect();
+        codes.sort();
+        codes.dedup();
+        let mut out = RedactionCandidates::default();
+        if codes.is_empty() {
+            return Ok(out);
+        }
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // One read transaction so every chunk sees the same rows.
+        let tx = guard.transaction()?;
+        let has_hash = Self::has_hash_column(&tx, &self.table)?;
+        for chunk in codes.chunks(BIND_CHUNK) {
+            let base = format!(
+                "FROM {} WHERE timestamp < ?1 AND code IN ({}) AND detail <> 'null'",
+                self.table,
+                placeholders(2, chunk.len())
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            params.push(&before);
+            for c in chunk {
+                params.push(*c);
+            }
+            let gate = if has_hash { " AND hash = ''" } else { "" };
+            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{gate}"))?;
+            let rows = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
+            })?;
+            for r in rows {
+                out.rows.push(r?);
+            }
+            if has_hash {
+                let n: i64 = tx.query_row(
+                    &format!("SELECT COUNT(*) {base} AND hash <> ''"),
+                    params.as_slice(),
+                    |r| r.get(0),
+                )?;
+                out.skipped += n.unsigned_abs();
+            }
+        }
+        tx.commit()?;
+        out.rows.sort_by_key(|(_, seq)| *seq);
+        Ok(out)
+    }
+
+    fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let gate = if Self::has_hash_column(&tx, &self.table)? { " AND hash = ''" } else { "" };
+        for chunk in ids.chunks(BIND_CHUNK) {
+            // 'null' is the JSON literal: detail is NOT NULL, and it reads
+            // back as a null detail.
+            let sql = format!(
+                "UPDATE {} SET detail = 'null' WHERE id IN ({}){gate}",
+                self.table,
+                placeholders(1, chunk.len())
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            tx.execute(&sql, params.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(ids.to_vec())
+    }
 }
 
 // ── SQL helpers ───────────────────────────────────────────────────────────────
 
+fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Result<(), Error> {
+    let detail_str = serde_json::to_string(&row.detail)?;
+    let pii: i64 = row.pii_in_detail as i64;
+    let mut stmt = conn.prepare_cached(insert_sql)?;
+    stmt.execute(rusqlite::params![
+        row.id,
+        row.wire_version,
+        row.origin_id,
+        seq,
+        row.timestamp,
+        row.code,
+        row.action,
+        row.severity,
+        row.service_id,
+        row.source_node_id,
+        row.tenant_id,      // Option<String> → NULL when None
+        row.actor,
+        row.actor_kind,
+        row.target,
+        row.category,
+        row.domain,
+        row.method,
+        row.request_id,
+        detail_str,
+        pii,
+        row.shipped_at,     // Option<String> → NULL when None
+    ])?;
+
+    Ok(())
+}
+
+// ON CONFLICT (id), not INSERT OR IGNORE: a repeated id is a no-op, but a
+// clash on (source_node_id, monotonic_seq) must fail, not drop the row.
 fn build_insert_sql(table: &str) -> String {
     format!(
-        "INSERT OR IGNORE INTO {table} \
+        "INSERT INTO {table} \
          (id, wire_version, origin_id, monotonic_seq, timestamp, \
           code, action, severity, service_id, source_node_id, tenant_id, \
           actor, actor_kind, target, category, domain, method, \
           request_id, detail, pii_in_detail, shipped_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)"
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+         ON CONFLICT (id) DO NOTHING"
     )
 }
 
@@ -351,7 +481,7 @@ mod tests {
             wire_version: "1".into(),
             id: id.into(),
             origin_id: id.into(),
-            monotonic_seq: 1,
+            monotonic_seq: 0,
             timestamp: "2026-05-07T00:00:00.000Z".into(),
             code: code.into(),
             action: "test".into(),
@@ -385,7 +515,7 @@ mod tests {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let row = make_row("evt-idem-001", "TEST");
         store.insert(&row).unwrap();
-        store.insert(&row).unwrap(); // INSERT OR IGNORE — no error
+        store.insert(&row).unwrap(); // ON CONFLICT (id) DO NOTHING — no error
     }
 
     #[test]
@@ -475,7 +605,225 @@ mod tests {
     fn max_monotonic_seq_empty_and_after_insert() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         assert_eq!(store.max_monotonic_seq().unwrap(), 0);
-        store.insert(&make_row("evt-seq-001", "TEST")).unwrap(); // monotonic_seq = 1
+        store.insert(&make_row("evt-seq-001", "TEST")).unwrap(); // allocated seq 1
         assert_eq!(store.max_monotonic_seq().unwrap(), 1);
+    }
+
+    fn row_on(id: &str, node: &str) -> Row {
+        let mut r = make_row(id, "TEST");
+        r.source_node_id = node.into();
+        r
+    }
+
+    fn seqs(store: &SqliteStore, node: &str) -> Vec<u64> {
+        let f = Filter { source_node_id: Some(node.into()), ..Default::default() };
+        store.query(&f).unwrap().iter().map(|r| r.monotonic_seq).collect()
+    }
+
+    /// A temp file path, removed (with its WAL files) on drop.
+    struct TempDb(String);
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "fasten_core_{name}_{}_{}.db",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            TempDb(p.to_string_lossy().into_owned())
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.0));
+            }
+        }
+    }
+
+    #[test]
+    fn seq_zero_is_allocated_per_node() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&row_on("evt-a1", "node-a")).unwrap();
+        store.insert(&row_on("evt-a2", "node-a")).unwrap();
+        store.insert(&row_on("evt-b1", "node-b")).unwrap();
+        assert_eq!(seqs(&store, "node-a"), vec![1, 2]);
+        assert_eq!(seqs(&store, "node-b"), vec![1]);
+    }
+
+    #[test]
+    fn explicit_seq_is_kept() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut r = row_on("evt-rep-1", "node-a");
+        r.monotonic_seq = 7;
+        store.insert(&r).unwrap();
+        store.insert(&row_on("evt-own-1", "node-a")).unwrap();
+        assert_eq!(seqs(&store, "node-a"), vec![7, 8]);
+    }
+
+    #[test]
+    fn duplicate_node_seq_is_rejected() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut a = row_on("evt-dup-1", "node-a");
+        a.monotonic_seq = 3;
+        let mut b = row_on("evt-dup-2", "node-a");
+        b.monotonic_seq = 3;
+        store.insert(&a).unwrap();
+        assert!(store.insert(&b).is_err());
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    #[test]
+    fn retried_id_does_not_take_a_seq() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let r = row_on("evt-retry-1", "node-a");
+        store.insert(&r).unwrap();
+        store.insert(&r).unwrap();
+        store.insert(&row_on("evt-retry-2", "node-a")).unwrap();
+        assert_eq!(seqs(&store, "node-a"), vec![1, 2]);
+    }
+
+    /// #92: two stores on one file, one node. Each used to mint its own seq.
+    #[test]
+    fn two_handles_on_one_file_get_unique_seqs() {
+        let db = TempDb::new("two_handles");
+        let a = SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        let b = SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        for i in 0..10 {
+            a.insert(&row_on(&format!("evt-a-{i}"), "node-1")).unwrap();
+            b.insert(&row_on(&format!("evt-b-{i}"), "node-1")).unwrap();
+        }
+        assert_eq!(seqs(&a, "node-1"), (1..=20).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn concurrent_handles_allocate_contiguous_seqs() {
+        let db = TempDb::new("concurrent");
+        // Create the table before the threads race to open it.
+        drop(SqliteStore::open(&db.0, "audit_log", true).unwrap());
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let path = db.0.clone();
+                std::thread::spawn(move || {
+                    let store = SqliteStore::open(&path, "audit_log", true).unwrap();
+                    for i in 0..25 {
+                        store.insert(&row_on(&format!("evt-{t}-{i}"), "node-1")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        assert_eq!(seqs(&store, "node-1"), (1..=100).collect::<Vec<u64>>());
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string()
+    }
+
+    fn detail_of(store: &SqliteStore, id: &str) -> serde_json::Value {
+        let rows = store.query(&Filter::default()).unwrap();
+        rows.into_iter().find(|r| r.id == id).unwrap().detail
+    }
+
+    #[test]
+    fn redaction_blanks_only_expired_pii_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut pii = make_row("evt-pii-old", "USER_LOGIN");
+        pii.timestamp = days_ago(40);
+        let mut ops = make_row("evt-ops-old", "JOB_RAN");
+        ops.timestamp = days_ago(40);
+        store.insert(&pii).unwrap();
+        store.insert(&ops).unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let cutoff = days_ago(30);
+        let found = store.list_redaction_candidates(&cutoff, &codes).unwrap();
+        assert_eq!(found.rows, vec![("evt-pii-old".to_string(), 1)]);
+        assert_eq!(found.skipped, 0);
+        let ids: Vec<String> = found.rows.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+
+        assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
+        assert_eq!(detail_of(&store, "evt-ops-old"), serde_json::json!({"key": "value"}));
+        assert_eq!(store.count(&Filter::default()).unwrap(), 2);
+
+        // Idempotent: nothing left to list, and a repeat redact is harmless.
+        assert_eq!(
+            store.list_redaction_candidates(&cutoff, &codes).unwrap(),
+            RedactionCandidates::default()
+        );
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+        assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
+        assert_eq!(store.count(&Filter::default()).unwrap(), 2);
+    }
+
+    /// On a table that also carries chain columns (Go adds them), a sealed
+    /// row's detail is inside its hash and must not be touched.
+    #[test]
+    fn redaction_skips_sealed_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        {
+            let c = store.conn.lock().unwrap();
+            c.execute_batch(
+                "ALTER TABLE audit_log ADD COLUMN hash TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE audit_log ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1';",
+            )
+            .unwrap();
+        }
+        for id in ["evt-sealed", "evt-unsealed"] {
+            let mut r = make_row(id, "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-sealed'", [])
+            .unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(found.rows, vec![("evt-unsealed".to_string(), 2)]);
+        assert_eq!(found.skipped, 1);
+        let all = vec!["evt-sealed".to_string(), "evt-unsealed".to_string()];
+        store.redact_rows(&all).unwrap();
+        assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"key": "value"}));
+        assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// More ids and codes than SQLite binds in one statement.
+    #[test]
+    fn redaction_handles_more_ids_than_one_statement_binds() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let n = 1200;
+        for i in 0..n {
+            let mut r = make_row(&format!("evt-{i}"), "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        // 40_000 is above SQLite's default per-statement variable limit.
+        let mut codes: Vec<String> = (0..40_000).map(|i| format!("UNUSED_{i}")).collect();
+        codes.push("USER_LOGIN".into());
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(found.rows.len(), n);
+        assert_eq!(
+            found.rows.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            (1..=n as u64).collect::<Vec<_>>()
+        );
+
+        let mut ids: Vec<String> = found.rows.into_iter().map(|(id, _)| id).collect();
+        ids.extend((0..40_000).map(|i| format!("missing-{i}")));
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+        let rows = store.query(&Filter::default()).unwrap();
+        assert_eq!(rows.len(), n);
+        assert!(rows.iter().all(|r| r.detail.is_null()));
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
     }
 }

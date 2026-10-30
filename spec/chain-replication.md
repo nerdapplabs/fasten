@@ -190,11 +190,15 @@ A conformant allocation is, atomically:
 ```
 BEGIN
   seq  := COALESCE(MAX(monotonic_seq), 0) + 1   -- WHERE source_node_id = ?
-  prev := hash of the row at seq-1               -- same predicate, or "genesis"
+  prev := hash of the node's last sealed row     -- or "genesis" if none
   row  := seal(prev, row WITH monotonic_seq = seq)
   INSERT row
 COMMIT
 ```
+
+`seq` counts every row on the node, sealed or not. `prev` is the `hash` of the
+node's sealed row (`hash <> ''`) with the highest `monotonic_seq`, or
+`"genesis"` when the node has no sealed row.
 
 The transaction MUST serialise against concurrent allocations for the same
 `source_node_id` (SQLite: `BEGIN IMMEDIATE`; Postgres: `SELECT … FOR UPDATE` on
@@ -296,6 +300,9 @@ SDKs MUST refuse to redact a form-`"1"` row (its `detail` is hashed directly, so
 redaction would require re-sealing the entire suffix) and MUST report that the row
 predates form `"2"`.
 
+An unsealed row (`hash = ""`) is not in the chain, so it MAY be redacted
+whatever its `canonical_form_id`.
+
 ### §7.2 The redaction event
 
 Every redaction MUST itself be an originated, chained row:
@@ -348,3 +355,13 @@ that chaining is disabled. `verify_chain` already skips empty-hash rows (§2), s
 such a stream verifies vacuously rather than failing. An SDK MUST NOT fabricate
 an in-memory sequence in this mode — that is the exact non-conformance §2.1
 exists to forbid.
+
+### §8.2 Allocation without sealing
+
+A store MAY allocate `monotonic_seq` (§2.1) for a writer that cannot seal, for
+example one writing through fasten-core. Such rows have an empty `hash`;
+`verify_chain` treats them as unsealed (§2). The writer MUST log
+`audit_chain_unavailable` once per init, as in §8.1.
+
+A node that writes unsealed rows MUST NOT share its `source_node_id` with a
+writer that seals; give it a distinct node id.

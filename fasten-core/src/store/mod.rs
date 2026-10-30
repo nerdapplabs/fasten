@@ -23,6 +23,16 @@ pub struct Filter {
     pub offset:         u32,
 }
 
+/// Result of [`Store::list_redaction_candidates`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RedactionCandidates {
+    /// `(id, monotonic_seq)` ordered by `monotonic_seq`.
+    pub rows: Vec<(String, u64)>,
+    /// Matching rows left out because they are sealed (`hash <> ''`).
+    /// Always 0 on a table without a `hash` column.
+    pub skipped: u64,
+}
+
 /// Shared contract for all audit-store backends.
 ///
 /// All methods must be thread-safe; implementations wrap internals in a
@@ -31,7 +41,11 @@ pub trait Store: Send + Sync {
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Persist `row`.  Duplicate IDs are silently ignored
-    /// (`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`).
+    /// (`ON CONFLICT (id) DO NOTHING`).
+    ///
+    /// When `row.monotonic_seq` is 0 the store assigns the next seq for
+    /// `row.source_node_id` inside the insert transaction (spec §2.1, §8.2).
+    /// The row is not sealed. A non-zero seq is written as given.
     fn insert(&self, row: &Row) -> Result<(), Error>;
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -66,7 +80,29 @@ pub trait Store: Send + Sync {
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
     /// the table is empty.
+    ///
+    /// Table-wide, not per node. Kept for existing callers; do not use it to
+    /// allocate a seq (insert a row with `monotonic_seq == 0` instead).
     fn max_monotonic_seq(&self) -> Result<u64, Error>;
+
+    // ── Redaction (spec §7.1) ────────────────────────────────────────────────
+
+    /// Rows with `timestamp < before`, `code` in `codes` and a `detail` not
+    /// yet redacted. Sealed rows are never listed; they are counted in
+    /// `skipped`.
+    fn list_redaction_candidates(
+        &self,
+        _before: &str,
+        _codes: &[String],
+    ) -> Result<RedactionCandidates, Error> {
+        Err(Error::Unsupported("list_redaction_candidates"))
+    }
+
+    /// Set `detail` to the JSON literal `null` on the unsealed rows in `ids`.
+    /// Idempotent. Returns `ids`.
+    fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
+        Err(Error::Unsupported("redact_rows"))
+    }
 }
 
 #[cfg(feature = "sqlite")]
