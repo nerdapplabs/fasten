@@ -40,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -124,6 +125,11 @@ type cFastenDrainer struct {
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRow
 	next      uint64
+	lost      atomic.Int64 // rows dead-lettered or lost at stop
+
+	// Inserts run under ctx; retire cancels it at its deadline.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// use guards the handle: calls hold it for reading, and retire takes it
 	// for writing before it closes the handle.
@@ -147,6 +153,7 @@ func newCFastenDrainer(
 		gen:         e.storeGen.Load(),
 		pending:     map[string]*pendingRow{},
 	}
+	d.ctx, d.cancel = context.WithCancel(context.Background())
 	h := cgo.NewHandle(d)
 
 	var errStr *C.char
@@ -221,6 +228,7 @@ func (d *cFastenDrainer) insert(rowJSON string) C.int32_t {
 		rejected := rejectsRow(err)
 		if rejected || p.attempts >= d.maxAttempts {
 			d.settle(head.ID) // the drainer dead-letters it now
+			d.lost.Add(1)
 			d.engine.markWriteLost(d.store, d.gen)
 		}
 		if rejected {
@@ -270,13 +278,17 @@ func (d *cFastenDrainer) settle(id string) {
 }
 
 // storeRow seals and stores row; a panicking store counts as a failed insert.
+// Past retire's deadline it does not try.
 func (d *cFastenDrainer) storeRow(row Row) (err error) {
+	if err := d.ctx.Err(); err != nil {
+		return err
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("store panicked: %v", r)
 		}
 	}()
-	_, err = d.engine.allocateAndStore(context.Background(), d.store, d.out, row)
+	_, err = d.engine.allocateAndStore(d.ctx, d.store, d.out, row)
 	return err
 }
 
@@ -357,8 +369,14 @@ func (d *cFastenDrainer) statsJSON() string {
 }
 
 // retire stops a drainer that is no longer installed and stores the rows it
-// did not write. flushFor > 0 gives it that long to drain first.
-func (d *cFastenDrainer) retire(flushFor time.Duration) {
+// did not write. flushFor > 0 gives it that long to drain first. A non-zero
+// deadline cancels the inserts still running at that point, and a row not
+// stored by then is reported lost.
+func (d *cFastenDrainer) retire(flushFor time.Duration, deadline time.Time) {
+	defer d.cancel()
+	if !deadline.IsZero() {
+		defer time.AfterFunc(time.Until(deadline), d.cancel).Stop()
+	}
 	if flushFor > 0 {
 		d.flush(flushFor)
 	}
@@ -387,6 +405,7 @@ func (d *cFastenDrainer) retire(flushFor time.Duration) {
 	var recovered []string
 	for _, p := range rows {
 		if err := d.storeRow(p.row); err != nil {
+			d.lost.Add(1)
 			d.engine.markWriteLost(d.store, d.gen)
 			d.engine.sysLogTo(d.out, "error", "audit_drain_lost_at_stop", map[string]any{
 				"error_type": fmt.Sprintf("%T", err),

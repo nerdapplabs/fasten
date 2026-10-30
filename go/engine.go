@@ -56,6 +56,7 @@ type Engine struct {
 	drainer   *cFastenDrainer
 	retired   chan struct{} // closed once the last drainer taken out has been retired
 	storeGen  atomic.Int64  // bumped when Init switches to another audit store
+	closed    atomic.Bool   // Close has run and Init has not since
 
 	// Engine-side "at least one audit-store insert was swallowed" flag.
 	// Tracked here (not only on the store) because AuditRepository does not
@@ -306,7 +307,8 @@ func (e *Engine) Init(cfg Config) error {
 	// Swap in the new drainer, then retire the old one: emits keep being
 	// queued while it drains, and its rows and events keep its own config.
 	old, done := e.swapDrainer(next)
-	e.retireOld(old, done, 5*time.Second)
+	e.closed.Store(false)
+	e.retireOld(old, done, 5*time.Second, time.Time{})
 
 	// FR1 retention (§1). Env-var overrides zero-valued fields.
 	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
@@ -606,6 +608,8 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 			case durable:
 			case d != nil && d.gen != gen:
 				// Init is switching stores: store it inline in the new one.
+			case d == nil && e.closed.Load():
+				// After Close, rows are stored inline.
 			case d == nil:
 				// No drainer to take the row (spec §7 V-12).
 				refused = true
@@ -697,14 +701,24 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 	return d.flush(time.Until(deadline))
 }
 
-// Close flushes pending audit rows for up to timeout, then stops the drainer
-// and stores, or reports lost, any row it still holds. Call it on shutdown:
-// Flush alone leaves a row that is still being retried unreported at exit.
-// Emits after Close are stored synchronously. Returns Flush's result.
+// Close flushes pending audit rows for up to half of timeout, then stops the
+// drainer and stores any row it still holds. A row not stored once timeout
+// has passed is reported lost (audit_drain_lost_at_stop); the store must
+// honour ctx for Close to return by then. Call it on shutdown: Flush alone
+// leaves a row that is still being retried unreported at exit. Emits after
+// Close are stored synchronously. Returns false if a row was lost.
 func (e *Engine) Close(timeout time.Duration) bool {
-	drained := e.Flush(timeout)
-	e.uninstallDrainer()
-	return drained
+	deadline := time.Now().Add(timeout)
+	d := e.activeDrainer()
+	var lost int64
+	if d != nil {
+		lost = d.lost.Load()
+	}
+	e.closed.Store(true)
+	e.Flush(timeout / 2)
+	old, done := e.swapDrainer(nil)
+	e.retireOld(old, done, 0, deadline)
+	return d == nil || d.lost.Load() == lost
 }
 
 // marshalWithShape renders row as a JSON line tagged with its stream shape
@@ -769,6 +783,7 @@ func (e *Engine) ResetForTests() {
 	e.searchEnabled = false
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
+	e.closed.Store(false)
 	e.auditWriteSwallowed.Store(false)
 	e.hashMu.Lock()
 	e.prevHash = ""
@@ -830,20 +845,20 @@ func (e *Engine) swapDrainer(next *cFastenDrainer) (*cFastenDrainer, chan struct
 var testHookRetire func()
 
 // retireOld gives old up to flushFor to drain, then stops it and stores what
-// it did not write.
-func (e *Engine) retireOld(old *cFastenDrainer, done chan struct{}, flushFor time.Duration) {
+// it did not write, up to deadline if one is set.
+func (e *Engine) retireOld(old *cFastenDrainer, done chan struct{}, flushFor time.Duration, deadline time.Time) {
 	if old != nil {
 		if testHookRetire != nil {
 			testHookRetire()
 		}
-		old.retire(flushFor)
+		old.retire(flushFor, deadline)
 	}
 	close(done)
 }
 
 func (e *Engine) uninstallDrainer() {
 	old, done := e.swapDrainer(nil)
-	e.retireOld(old, done, 0)
+	e.retireOld(old, done, 0, time.Time{})
 }
 
 func (e *Engine) activeDrainer() *cFastenDrainer {

@@ -539,6 +539,7 @@ func GetTransport() *Transport { return Default.GetTransport() }
 func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
 
 // Close flushes and stops the Default engine's drainer; call it on shutdown.
+// It returns within about timeout, and false if a row was lost.
 func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.

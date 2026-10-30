@@ -799,13 +799,73 @@ func TestQueueCloseStoresARowStillRetrying(t *testing.T) {
 	initQueue(t, store, Config{QueueRetryInitial: 10 * time.Second, QueueRetryMax: 10 * time.Second})
 	r := emitN(t, 1)[0]
 	waitInBackoff(t)
-	if Close(50 * time.Millisecond) {
-		t.Fatal("Close reported drained while the row was in backoff")
+	// The flush times out while the row is in backoff; its try at stop stores it.
+	if !Close(time.Second) {
+		t.Fatal("Close reported a loss, but the row was stored")
 	}
 	if rows := store.rows(t); len(rows) != 1 || rows[0].ID != r.ID {
 		t.Fatalf("stored %+v, want %s", rows, r.ID)
 	}
 	if Default.activeDrainer() != nil {
 		t.Fatal("Close left the drainer installed")
+	}
+}
+
+// hangingStore blocks every insert until ctx is done or release is closed.
+type hangingStore struct {
+	*SQLiteStore
+	release chan struct{}
+}
+
+func (s hangingStore) AllocateAndInsertOriginated(ctx context.Context, row Row) (Row, error) {
+	select {
+	case <-ctx.Done():
+		return row, ctx.Err()
+	case <-s.release:
+		return row, errors.New("released")
+	}
+}
+
+func TestQueueCloseReturnsByTimeoutWhenTheStoreHangs(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := hangingStore{newFlakyStore(t, 0).SQLiteStore, make(chan struct{})}
+	initQueue(t, store, Config{})
+	rows := emitN(t, 3)
+	start := time.Now()
+	result := make(chan bool, 1)
+	go func() { result <- Close(300 * time.Millisecond) }()
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("Close reported no loss, but no row was stored")
+		}
+	case <-time.After(3 * time.Second):
+		close(store.release)
+		<-result
+		t.Fatalf("Close still running after %v", time.Since(start))
+	}
+	lost := sysEvents(t, "audit_drain_lost_at_stop")
+	if len(lost) != len(rows) {
+		t.Fatalf("lost events = %v, want %d", lost, len(rows))
+	}
+}
+
+func TestQueueEmitAfterCloseIsStoredWithoutAbandonedEvent(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := newFlakyStore(t, 0)
+	initQueue(t, store, Config{})
+	if !Close(time.Second) {
+		t.Fatal("Close reported a loss")
+	}
+	if r := emitN(t, 1)[0]; r.Hash == "" {
+		t.Fatal("row should be stored synchronously")
+	}
+	if ev := sysEvents(t, "audit_drain_abandoned"); len(ev) != 0 {
+		t.Fatalf("abandoned events after Close = %v", ev)
+	}
+	if ev := sysEvents(t, "audit_drain_stored_inline"); len(ev) != 0 {
+		t.Fatalf("stored_inline events after Close = %v", ev)
 	}
 }

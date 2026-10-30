@@ -117,7 +117,9 @@ than retried. `Emit()` returns the row before it is stored, so its
 semantics with `*fasten.AuditStoreError` and get the sealed row back.
 `fasten.GetQueueStats()`, `fasten.Flush(timeout)` and
 `fasten.Close(timeout)` complete the public surface; call `Close` on
-shutdown so a row still being retried is stored or reported.
+shutdown so a row still being retried is stored or reported. `Close`
+returns within about `timeout`, reports rows not stored by then as
+`audit_drain_lost_at_stop`, and returns false if any row was lost.
 
 ## Tests
 

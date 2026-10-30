@@ -75,7 +75,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `ctx`.
 - New `fasten.Close(timeout)` flushes and stops the drainer; call it on
   shutdown instead of `Flush` so a row still being retried is stored or
-  reported.
+  reported. It returns within about `timeout` (the store must honour
+  `ctx`), reports rows not stored by then as `audit_drain_lost_at_stop`,
+  and returns false only if a row was lost. Emits after `Close` are
+  stored inline without an `audit_drain_abandoned` event.
 
 ### Changed — canonical UTC timestamp form on both SDKs
 
