@@ -116,7 +116,8 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //
 // where `fn func(*http.Request) (tenant string, ok bool)` returns the
 // resolved tenant from the (already-authenticated) request. Every reader
-// endpoint (/audit, /correlate, /search, /sys, /api, /topology) then
+// endpoint (/audit, /audit/doctor, /correlate, /search, /sys, /api,
+// /topology) then
 // injects that tenant into the store filter and IGNORES any caller
 // ?tenant_id=. Without the hook, ?tenant_id= is honoured as-is — safe
 // for single-tenant deployments, unsafe on any shared-store multi-
@@ -378,7 +379,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		}
 		rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			e.serverError(w, r, err)
 			return
 		}
 		if !ok {
@@ -416,7 +417,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		Until:     until,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		e.serverError(w, r, err)
 		return
 	}
 	if rows == nil {
@@ -545,7 +546,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		case "sys":
 			rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				e.serverError(w, r, err)
 				return
 			}
 			if !ok {
@@ -564,7 +565,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		case "api":
 			rows, ok, err := e.xport.SearchAPI(qtext, since, until, limit)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				e.serverError(w, r, err)
 				return
 			}
 			if !ok {
@@ -597,7 +598,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 			// when resolveTenant returned a scope; "" is single-tenant.
 			rows, err := searcher.Search(r.Context(), qtext, since, until, tenant, limit)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				e.serverError(w, r, err)
 				return
 			}
 			counts["audit"] = len(rows)
@@ -663,7 +664,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		Until:     until,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		e.serverError(w, r, err)
 		return
 	}
 	if rows == nil {
@@ -710,7 +711,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		// known tenant-A request_id to read A's rows (P1-44).
 		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			e.serverError(w, r, err)
 			return
 		}
 		for _, row := range rows {
@@ -729,13 +730,13 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	if e.xport != nil {
 		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			e.serverError(w, r, err)
 			return
 		}
 		api = scopeAPIRows(a, tenant)
 		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			e.serverError(w, r, err)
 			return
 		}
 		sys = scopeSyslogRows(s, tenant)
@@ -747,11 +748,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 			sysTotal = len(sys)
 		} else {
 			if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				e.serverError(w, r, err)
 				return
 			}
 			if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				e.serverError(w, r, err)
 				return
 			}
 		}
@@ -862,7 +863,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := e.auditStore.Query(r.Context(), f)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		e.serverError(w, r, err)
 		return
 	}
 	// convert to []map[string]any for consistent JSON
@@ -942,7 +943,7 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 	}
 	sources, err := agg.Sources(r.Context(), since, until)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		e.serverError(w, r, err)
 		return
 	}
 	if sources == nil {
@@ -975,15 +976,13 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
-	// Scope like every other handler. Without this the endpoint 200s to a
-	// caller that /audit 401s, and leaks the global row count, the host
-	// tenant_id, a cross-tenant chain sample, and raw driver errors carrying
-	// DSN host/user.
+	// Scope like every other handler: a scoped caller sees its own row count,
+	// no host tenant_id and no other tenant's row ids. Store errors go to the
+	// log, not the response, since they can carry the DSN host and user.
 	tenant, ok := e.resolveTenant(w, r)
 	if !ok {
 		return
 	}
-	_ = tenant
 	store := e.auditStore
 	storeBlock := map[string]any{
 		"kind":           nil,
@@ -997,20 +996,33 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
-					storeBlock["last_error"] = fmt.Sprintf("panic: %v", p)
+					storeBlock["last_error"] = e.doctorError(r, "store", fmt.Sprintf("panic %T", p))
 				}
 			}()
-			if counter, ok := store.(interface {
+			// tenant is "" without isolation, which CountFiltered reads as
+			// no filter.
+			// A store with only an unscoped Count still probes the store, but
+			// a scoped caller doesn't get its number.
+			var count func() (int, error)
+			showRows := true
+			if c, ok := store.(interface {
+				CountFiltered(context.Context, Filter) (int, error)
+			}); ok {
+				count = func() (int, error) { return c.CountFiltered(r.Context(), Filter{TenantID: tenant}) }
+			} else if c, ok := store.(interface {
 				Count(context.Context) (int, error)
 			}); ok {
-				n, err := counter.Count(r.Context())
-				if err != nil {
-					storeBlock["last_error"] = err.Error()
-				} else {
-					storeBlock["rows"] = n
-					storeBlock["reachable"] = true
-				}
+				count = func() (int, error) { return c.Count(r.Context()) }
+				showRows = tenant == ""
+			}
+			if count == nil {
+				storeBlock["reachable"] = true
+			} else if n, err := count(); err != nil {
+				storeBlock["last_error"] = e.doctorError(r, "store", fmt.Sprintf("%T", err))
 			} else {
+				if showRows {
+					storeBlock["rows"] = n
+				}
 				storeBlock["reachable"] = true
 			}
 		}()
@@ -1039,6 +1051,10 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		// Multi-worker awareness: callers can confirm which OS process they hit.
 		"worker_pid": os.Getpid(),
 	}
+	if tenant != "" {
+		// The host's own tenant_id is not the caller's to read.
+		initBlock["tenant_id"] = nil
+	}
 
 	// Redaction is always applied (RedactDetail) once the engine is initialised.
 	redactorBlock := map[string]any{"active": e.serviceID != ""}
@@ -1054,14 +1070,24 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		"last_verified_at": nil,
 	}
 	if store != nil {
-		recent, err := store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+		var recent []Row
+		var err error
+		if t, ok := store.(interface {
+			ChainTail(context.Context, string, int) ([]Row, error)
+		}); ok && e.nodeID != "" {
+			// By seq: a timestamp-ordered sample skips seqs after a clock
+			// step back and reads as a break.
+			recent, err = t.ChainTail(r.Context(), e.nodeID, 50)
+		} else {
+			recent, err = store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+		}
 		switch {
 		case err != nil:
-			// Store reachable but the query failed. Surface the error so
-			// operators see verification is broken rather than seeing a green
-			// status page (same shape as the storeBlock's last_error above).
+			// Store reachable but the query failed. Flag it so operators see
+			// verification is broken rather than a green status page (same
+			// shape as the storeBlock's last_error above).
 			chainBlock["error"] = "query failed"
-			chainBlock["reason"] = err.Error()
+			chainBlock["reason"] = e.doctorError(r, "chain", fmt.Sprintf("%T", err))
 		case len(recent) > 0:
 			res := VerifyChain(recent)
 			breaks := 0
@@ -1074,6 +1100,14 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 				"first_break_at":   res.FirstBreakAt,
 				"reason":           res.Reason,
 				"last_verified_at": canonicalNow(),
+			}
+			// The sample is this node's chain, which can hold other tenants'
+			// rows. A scoped caller gets the verdict but not the row it
+			// broke on. Filtering the sample by tenant instead would break
+			// prev_hash links and report false breaks.
+			if tenant != "" && !res.OK {
+				chainBlock["first_break_at"] = nil
+				chainBlock["reason"] = "chain break in this node's recent rows"
 			}
 		}
 		// len(recent) == 0 case: leave chainBlock as (nil, nil, nil) —
@@ -1089,6 +1123,30 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		"init":      initBlock,
 		"chain":     chainBlock,
 	})
+}
+
+// serverError logs the error type as a sys line and answers 500 with a fixed
+// body. Type-only like the other store-error sys lines: driver errors can quote
+// SQL, row values and the database host and user, and sys is readable from
+// /sys.
+func (e *Engine) serverError(w http.ResponseWriter, r *http.Request, err error) {
+	e.drainerSysLog("error", "reader_query_failed", map[string]any{
+		"request_id": RequestIDFromContext(r.Context()),
+		"path":       r.URL.Path,
+		"error_type": fmt.Sprintf("%T", err),
+	})
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// doctorError logs the error type for the doctor's check and returns the fixed
+// text the response carries in its place.
+func (e *Engine) doctorError(r *http.Request, check, errType string) string {
+	e.drainerSysLog("error", "doctor_check_failed", map[string]any{
+		"request_id": RequestIDFromContext(r.Context()),
+		"check":      check,
+		"error_type": errType,
+	})
+	return check + " check failed; see the service log"
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

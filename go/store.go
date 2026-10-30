@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -568,6 +569,23 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 // sub-chain and break this node's own chain. When serviceID and sourceNodeID
 // are both empty the query falls back to the legacy global MAX (used only
 // where identity is unavailable).
+// ChainTail returns the node's newest limit rows by monotonic_seq, oldest
+// first. It is the doctor's chain sample: Query orders by timestamp, so after
+// a clock step back its newest rows can skip a seq and read as a break.
+func (s *SQLiteStore) ChainTail(ctx context.Context, sourceNodeID string, limit int) ([]Row, error) {
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE source_node_id = ? ORDER BY monotonic_seq DESC LIMIT ?`, auditCols, s.table),
+		sourceNodeID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanRows(rows)
+	slices.Reverse(out)
+	return out, err
+}
+
 func (s *SQLiteStore) MaxMonotonicSeq(ctx context.Context, serviceID, sourceNodeID string) (int64, error) {
 	var n sql.NullInt64
 	var err error

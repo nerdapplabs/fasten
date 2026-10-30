@@ -3,6 +3,9 @@ package fasten
 import (
 	"context"
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,3 +187,169 @@ var errBrokenQuery = errBrokenStr("simulated query failure")
 type errBrokenStr string
 
 func (e errBrokenStr) Error() string { return string(e) }
+
+// countFailingStore also fails CountFiltered, so the doctor's store check errors.
+type countFailingStore struct{ brokenQueryStore }
+
+func (*countFailingStore) CountFiltered(context.Context, Filter) (int, error) {
+	return 0, errBrokenQuery
+}
+
+// Store errors can quote SQL and the database host and user. They go to the
+// sys log; the response carries fixed text.
+func TestReader_StoreErrorsStayOutOfResponses(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countFailingStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	NewReader().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("/audit: want 500, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); strings.Contains(body, errBrokenQuery.Error()) {
+		t.Errorf("/audit 500 body carries the store error: %q", body)
+	}
+
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	store := body["store"].(map[string]any)
+	chain := body["chain"].(map[string]any)
+	if store["last_error"] == nil || chain["reason"] == nil {
+		t.Fatalf("doctor must still flag both failed checks; got store=%v chain=%v", store, chain)
+	}
+	for _, v := range []any{store["last_error"], chain["reason"]} {
+		if strings.Contains(v.(string), errBrokenQuery.Error()) {
+			t.Errorf("doctor carries the store error: %q", v)
+		}
+	}
+
+	logged, err := GetTransport().QuerySyslog(50, StreamQuery{})
+	if err != nil {
+		t.Fatalf("QuerySyslog: %v", err)
+	}
+	events := map[string]bool{}
+	for _, row := range logged {
+		for _, v := range row {
+			if s, ok := v.(string); ok && strings.Contains(s, errBrokenQuery.Error()) {
+				t.Errorf("sys line carries the store error: %v", row)
+			}
+		}
+		if row["error_type"] == "fasten.errBrokenStr" {
+			events[row["event"].(string)] = true
+		}
+	}
+	if !events["reader_query_failed"] || !events["doctor_check_failed"] {
+		t.Errorf("store errors must reach the sys log by type; got %v", events)
+	}
+}
+
+// countOnlyStore has the unscoped Count but not CountFiltered.
+type countOnlyStore struct{ brokenQueryStore }
+
+func (*countOnlyStore) Count(context.Context) (int, error) { return 7, nil }
+
+func TestAuditDoctor_CountOnlyStoreStillReportsRows(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countOnlyStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	if rows := body["store"].(map[string]any)["rows"]; rows != float64(7) {
+		t.Errorf("unscoped doctor must use Count; got %v", rows)
+	}
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ = getJSON(t, h, "/audit/doctor")
+	store := body["store"].(map[string]any)
+	if store["rows"] != nil || store["reachable"] != true {
+		t.Errorf("scoped doctor must not report an unscoped count; got %v", store)
+	}
+}
+
+// countPanicStore panics with a non-error value in CountFiltered.
+type countPanicStore struct{ brokenQueryStore }
+
+type panicValue struct{}
+
+func (*countPanicStore) CountFiltered(context.Context, Filter) (int, error) {
+	panic(panicValue{})
+}
+
+func TestAuditDoctor_CountPanicLogsThePanicType(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countPanicStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	if store := body["store"].(map[string]any); store["last_error"] == nil || store["reachable"] != false {
+		t.Fatalf("a panicking store must read as down; got %v", store)
+	}
+	logged, err := GetTransport().QuerySyslog(50, StreamQuery{})
+	if err != nil {
+		t.Fatalf("QuerySyslog: %v", err)
+	}
+	for _, row := range logged {
+		if row["event"] == "doctor_check_failed" && row["check"] == "store" {
+			if row["error_type"] != "panic fasten.panicValue" {
+				t.Errorf("want the panic value's type; got %v", row["error_type"])
+			}
+			return
+		}
+	}
+	t.Errorf("no doctor_check_failed line for the store")
+}
+
+// countOnlyDownStore has only Count, and Count fails.
+type countOnlyDownStore struct{ brokenQueryStore }
+
+func (*countOnlyDownStore) Count(context.Context) (int, error) { return 0, errBrokenQuery }
+
+func TestAuditDoctor_CountOnlyStoreDownReadsAsDownWhenScoped(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: &countOnlyDownStore{},
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ := getJSON(t, h, "/audit/doctor")
+	store := body["store"].(map[string]any)
+	if store["reachable"] != false || store["last_error"] == nil || store["rows"] != nil {
+		t.Errorf("scoped doctor must probe Count and report the store down; got %v", store)
+	}
+}
+
+// Seq 30 is stamped 90 s before every other row. The newest 50 by timestamp
+// skip it, and that sample reads as a break on a clean chain.
+func TestAuditDoctor_SamplesBySeqAfterAClockStepBack(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	store, closeFn := newMemStore(t, "clock_step")
+	defer closeFn()
+	t0 := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	for i := 1; i <= 52; i++ {
+		ts := t0.Add(time.Duration(i) * time.Second)
+		if i == 30 {
+			ts = t0.Add(-90 * time.Second)
+		}
+		row := orderRow(int64(i), ts, "svc", "node")
+		row.MonotonicSeq = 0
+		if _, err := store.AllocateAndInsertOriginated(context.Background(), row); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	chain := body["chain"].(map[string]any)
+	if chain["verified"] != true || chain["breaks"] != float64(0) {
+		t.Errorf("clean chain must verify; got %v", chain)
+	}
+}

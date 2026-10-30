@@ -222,3 +222,61 @@ func TestTenantScope_TopologyPostFilters(t *testing.T) {
 
 // Silence unused-import for strings when Go elides.
 var _ = strings.ToLower
+
+// ── /audit/doctor ────────────────────────────────────────────────────────
+
+func TestTenantScope_DoctorCountsOnlyTheCallersRows(t *testing.T) {
+	audit := initSharedStore(t)
+	Init(Config{ServiceID: "svc", NodeID: "node", TenantID: "tenant-b",
+		AuditStore: audit, AuditStoreFailureStrategy: "raise"})
+
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	if rows := body["store"].(map[string]any)["rows"]; rows != float64(2) {
+		t.Errorf("unscoped doctor must count every row; got %v", rows)
+	}
+	if tid := body["init"].(map[string]any)["tenant_id"]; tid != "tenant-b" {
+		t.Errorf("unscoped doctor must report the host tenant_id; got %v", tid)
+	}
+
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ = getJSON(t, h, "/audit/doctor")
+	if rows := body["store"].(map[string]any)["rows"]; rows != float64(1) {
+		t.Errorf("scoped doctor must count only tenant-a's rows; got %v", rows)
+	}
+	if tid := body["init"].(map[string]any)["tenant_id"]; tid != nil {
+		t.Errorf("scoped doctor must not report the host tenant_id; got %v", tid)
+	}
+	if chain := body["chain"].(map[string]any); chain["verified"] != true || chain["reason"] != "" {
+		t.Errorf("scoped doctor must report a clean chain as clean; got %v", chain)
+	}
+}
+
+func TestTenantScope_DoctorHidesTheBrokenRowFromAScopedCaller(t *testing.T) {
+	audit := initSharedStore(t)
+	var id string
+	if err := audit.db.QueryRow(`SELECT id FROM audit_shared WHERE tenant_id = 'tenant-b'`).Scan(&id); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if _, err := audit.db.Exec(`UPDATE audit_shared SET hash = 'x' WHERE id = ?`, id); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	chain := body["chain"].(map[string]any)
+	if reason, _ := chain["reason"].(string); !strings.Contains(reason, id) {
+		t.Fatalf("unscoped doctor must name the broken row; got %v", chain)
+	}
+
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ = getJSON(t, h, "/audit/doctor")
+	chain = body["chain"].(map[string]any)
+	if chain["verified"] != false || chain["breaks"] != float64(1) {
+		t.Errorf("scoped doctor must still report the break; got %v", chain)
+	}
+	if reason, _ := chain["reason"].(string); strings.Contains(reason, id) {
+		t.Errorf("scoped doctor must not name tenant-b's row; got %q", reason)
+	}
+	if chain["first_break_at"] != nil {
+		t.Errorf("scoped doctor must not report first_break_at; got %v", chain["first_break_at"])
+	}
+}

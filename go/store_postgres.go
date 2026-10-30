@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -374,6 +375,22 @@ func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext
 // Insert is a thin alias for InsertOriginated — the engine emit/drainer path.
 func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	return s.InsertOriginated(ctx, row)
+}
+
+// ChainTail returns the node's newest limit rows by monotonic_seq, oldest
+// first. See SQLiteStore.ChainTail.
+func (s *PostgresStore) ChainTail(ctx context.Context, sourceNodeID string, limit int) ([]Row, error) {
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE source_node_id = $1 ORDER BY monotonic_seq DESC LIMIT $2`, pgAuditCols, s.table),
+		sourceNodeID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanRowsPg(rows)
+	slices.Reverse(out)
+	return out, err
 }
 
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
