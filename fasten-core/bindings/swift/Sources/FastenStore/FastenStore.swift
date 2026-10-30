@@ -7,7 +7,8 @@ import CFastenStoreCore
 /// ```sh
 /// cd fasten/fasten-core
 /// cargo build --release --features all
-/// swift build -Xlinker -L./target/release
+/// cd bindings/swift
+/// swift build -Xlinker -L../../target/release
 /// ```
 ///
 /// Usage:

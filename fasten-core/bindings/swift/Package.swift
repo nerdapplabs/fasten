@@ -8,8 +8,8 @@
 //
 // 2. Build + test (macOS / Linux):
 //      cd fasten/fasten-core/bindings/swift
-//      swift build  -Xlinker -L../../../../target/release
-//      swift test   -Xlinker -L../../../../target/release
+//      swift build  -Xlinker -L../../target/release
+//      swift test   -Xlinker -L../../target/release
 //
 //    Override the library directory:
 //      FASTEN_STORE_CORE_LIB_DIR=/custom/path swift test \
