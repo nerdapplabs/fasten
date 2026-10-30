@@ -217,7 +217,7 @@ final class SQLiteStoreTests: XCTestCase {
 
     func testInsertThrowsWhenDatabaseIsLocked() throws {
         let path = tempPath()
-        let store = try SQLiteStore(path: path)
+        let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
         let other = otherConnection(path, "BEGIN EXCLUSIVE")
         defer { sqlite3_close(other) }
         XCTAssertThrowsError(try store.insert(row("evt-locked")))
@@ -243,7 +243,7 @@ final class SQLiteStoreTests: XCTestCase {
                                  description: "Test", emitter: "test"),
         ])
         let path = tempPath()
-        let store = try SQLiteStore(path: path)
+        let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
         try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .queue)
         let other = otherConnection(path, "BEGIN EXCLUSIVE")
         try Fasten.emit("USER_CREATED", target: "res-1", actor: "admin")
@@ -257,7 +257,7 @@ final class SQLiteStoreTests: XCTestCase {
 
     func testDrainerKeepsTheStoreErrorMessage() throws {
         let path = tempPath()
-        let store = try SQLiteStore(path: path)
+        let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
         let other = otherConnection(path, "BEGIN EXCLUSIVE")
         defer { sqlite3_close(other) }
         let drainer = QueueDrainer(store: store, retryInitialMs: 20, retryMaxMs: 20, retryJitter: false)
@@ -294,40 +294,215 @@ final class ContextTests: XCTestCase {
     }
 }
 
-// MARK: - Hash chain
+// MARK: - Store-assigned seq (spec 2.1, #92)
 
-final class HashChainTests: XCTestCase {
+private func tempDBPath(_ test: XCTestCase) -> String {
+    let path = NSTemporaryDirectory() + "fasten-\(UUID().uuidString).db"
+    test.addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
+    return path
+}
+
+private func testRow(_ id: String, seq: Int = 0, code: String = "TEST",
+                     timestamp: String = isoNow(), detail: [String: AnyCodable] = [:],
+                     hash: String = "") -> AuditRow {
+    AuditRow(wireVersion: "1", id: id, originID: id, monotonicSeq: seq,
+             timestamp: timestamp, code: code, action: "test", severity: "info",
+             serviceID: "svc", sourceNodeID: "node", tenantID: nil, actor: "svc",
+             actorKind: "service", target: "res", category: "test", domain: "test",
+             method: "sdk", requestID: "req-001", detail: detail, shippedAt: nil,
+             prevHash: hash.isEmpty ? "" : "genesis", hash: hash)
+}
+
+/// Runs a query on a separate connection; one row per result, columns as text.
+private func query(_ path: String, _ sql: String) -> [[String]] {
+    var db: OpaquePointer?
+    sqlite3_open(path, &db)
+    defer { sqlite3_close(db) }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+    defer { sqlite3_finalize(stmt) }
+    var out: [[String]] = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        out.append((0..<sqlite3_column_count(stmt)).map {
+            sqlite3_column_text(stmt, $0).map { String(cString: $0) } ?? ""
+        })
+    }
+    return out
+}
+
+private final class CapturingStore: AuditStore, @unchecked Sendable {
+    private let lock = Lock()
+    private var captured: [AuditRow] = []
+    func insert(_ row: AuditRow) throws { lock.withLock { captured.append(row) } }
+    func ping() throws {}
+    func maxMonotonicSeq() -> Int { 0 }
+    var rows: [AuditRow] { lock.withLock { captured } }
+}
+
+private let userCreated: [Code: Meta] = [
+    "USER_CREATED": Meta(id: "USER_CREATED", domain: "user", category: "account",
+                         action: "create", description: "Test", emitter: "test"),
+]
+
+final class ChainTests: XCTestCase {
     override func setUp() { Fasten._resetForTests() }
 
-    func testHashPresentOnEmit() throws {
-        Fasten.register("user", codes: [
-            "USER_CREATED": Meta(id: "USER_CREATED", domain: "user",
-                                 category: "account", action: "create",
-                                 description: "Test", emitter: "test"),
-        ])
-        let store = MemoryStore()
-        try Fasten.configure(serviceID: "svc", nodeID: "node",
-                              store: store, strategy: .raise)
-        try Fasten.emit("USER_CREATED", target: "res", actor: "admin")
-        let rows = store.all()
-        XCTAssertEqual(rows.count, 1)
-        XCTAssertFalse(rows[0].hash.isEmpty)
-        XCTAssertEqual(rows[0].prevHash, "genesis")
-    }
-
-    func testChainLinksRows() throws {
-        Fasten.register("user", codes: [
-            "USER_CREATED": Meta(id: "USER_CREATED", domain: "user",
-                                 category: "account", action: "create",
-                                 description: "Test", emitter: "test"),
-        ])
-        let store = MemoryStore()
-        try Fasten.configure(serviceID: "svc", nodeID: "node",
-                              store: store, strategy: .raise)
+    func testEmitHandsTheStoreAnUnsealedRowWithSeqZero() throws {
+        Fasten.register("user", codes: userCreated)
+        let store = CapturingStore()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
         try Fasten.emit("USER_CREATED", target: "r1", actor: "a")
         try Fasten.emit("USER_CREATED", target: "r2", actor: "a")
-        let rows = store.all().sorted { $0.monotonicSeq < $1.monotonicSeq }
-        XCTAssertEqual(rows[1].prevHash, rows[0].hash)
+        XCTAssertEqual(store.rows.map(\.monotonicSeq), [0, 0])
+        XCTAssertEqual(store.rows.map(\.hash), ["", ""])
+        XCTAssertEqual(store.rows.map(\.prevHash), ["", ""])
+    }
+
+    func testMemoryStoreAssignsSeqPerNode() throws {
+        let store = MemoryStore()
+        try store.insert(testRow("a"))
+        try store.insert(testRow("b"))
+        try store.insert(testRow("c", seq: 7))
+        XCTAssertEqual(store.all().map(\.monotonicSeq), [1, 2, 7])
+    }
+
+    func testSQLiteStoreAssignsSeqAndKeepsAGivenOne() throws {
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        try store.insert(testRow("a"))
+        try store.insert(testRow("b", seq: 9))
+        try store.insert(testRow("c"))
+        XCTAssertEqual(query(path, "SELECT id, monotonic_seq FROM audit_log ORDER BY id"),
+                       [["a", "1"], ["b", "9"], ["c", "10"]])
+    }
+
+    // #92: two engines, each with its own connection to one file, same node.
+    func testTwoEnginesOnOneFileGetSeqsOneToN() throws {
+        Fasten.register("user", codes: userCreated)
+        let path = tempDBPath(self)
+        let engines = try (0..<2).map { _ -> Engine in
+            let e = Engine()
+            e.configure(serviceID: "svc", nodeID: "node",
+                        store: try SQLiteStore(path: path), strategy: .raise)
+            return e
+        }
+        let perEngine = 25
+        let errors = Lock()
+        var failures: [Error] = []
+        DispatchQueue.concurrentPerform(iterations: 2 * perEngine) { i in
+            do {
+                try engines[i % 2].emit(code: "USER_CREATED", target: "r\(i)", actor: "a")
+            } catch {
+                errors.withLock { failures.append(error) }
+            }
+        }
+        XCTAssertTrue(failures.isEmpty, "\(failures)")
+        let seqs = query(path, "SELECT monotonic_seq FROM audit_log ORDER BY monotonic_seq")
+            .map { Int($0[0])! }
+        XCTAssertEqual(seqs, Array(1...(2 * perEngine)))
+    }
+
+    func testFailedCommitRollsBack() throws {
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
+        // A reader holding a SHARED lock makes our COMMIT fail with SQLITE_BUSY.
+        var reader: OpaquePointer?
+        sqlite3_open(path, &reader)
+        sqlite3_exec(reader, "BEGIN; SELECT COUNT(*) FROM audit_log;", nil, nil, nil)
+        XCTAssertThrowsError(try store.insert(testRow("lost")))
+        sqlite3_exec(reader, "COMMIT", nil, nil, nil)
+        sqlite3_close(reader)
+        // Left in a transaction, this insert would fail on BEGIN IMMEDIATE.
+        try store.insert(testRow("kept"))
+        XCTAssertEqual(query(path, "SELECT id, monotonic_seq FROM audit_log"), [["kept", "1"]])
+    }
+}
+
+// MARK: - PII redaction (spec 7)
+
+final class RedactionTests: XCTestCase {
+    override func setUp() { Fasten._resetForTests() }
+
+    private let day: TimeInterval = 86_400
+
+    private func registerCodes() {
+        Fasten.register("user", codes: [
+            "USER_EMAIL_SEEN": Meta(id: "USER_EMAIL_SEEN", domain: "user", category: "account",
+                                    action: "read", description: "PII", emitter: "test",
+                                    piiInDetail: true),
+            "USER_LOGIN": Meta(id: "USER_LOGIN", domain: "user", category: "account",
+                               action: "login", description: "not PII", emitter: "test"),
+        ])
+    }
+
+    func testPiiCodesFromRegistry() {
+        registerCodes()
+        Fasten.register("ops", codes: [
+            "OPS_SHORT": Meta(id: "OPS_SHORT", domain: "ops", category: "x", action: "y",
+                              description: "", emitter: "test", retentionClass: .short_),
+        ])
+        XCTAssertEqual(Fasten.piiCodes(), ["OPS_SHORT", "USER_EMAIL_SEEN"])
+    }
+
+    func testRedactExpiredOnSQLite() throws {
+        registerCodes()
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let old = isoString40DaysAgo()
+        let email: [String: AnyCodable] = ["email": AnyCodable("a@example.com")]
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN", timestamp: old, detail: email))
+        try store.insert(testRow("ops", code: "USER_LOGIN", timestamp: old, detail: email))
+        try store.insert(testRow("sealed", seq: 50, code: "USER_EMAIL_SEEN", timestamp: old,
+                                 detail: email, hash: "abc"))
+        try store.insert(testRow("fresh", code: "USER_EMAIL_SEEN", detail: email))
+
+        let cutoff = Date().addingTimeInterval(-30 * day)
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), ["pii"])
+
+        let detail = Dictionary(uniqueKeysWithValues: query(
+            path, "SELECT id, detail FROM audit_log WHERE code <> 'AUDIT_ROW_REDACTED'")
+            .map { ($0[0], $0[1]) })
+        XCTAssertEqual(detail["pii"], "null")
+        XCTAssertEqual(detail["ops"], #"{"email":"a@example.com"}"#)
+        XCTAssertEqual(detail["sealed"], #"{"email":"a@example.com"}"#)
+        XCTAssertEqual(detail["fresh"], #"{"email":"a@example.com"}"#)
+
+        let records = query(path, "SELECT target, detail FROM audit_log WHERE code = 'AUDIT_ROW_REDACTED'")
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?[0], "pii")
+        XCTAssertTrue(records.first?[1].contains(#""redacted_seq":1"#) ?? false, "\(records)")
+
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
+        XCTAssertEqual(query(path, "SELECT COUNT(*) FROM audit_log"), [["5"]])
+    }
+
+    func testRedactExpiredOnMemoryStore() throws {
+        registerCodes()
+        let store = MemoryStore()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let old = isoString40DaysAgo()
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN", timestamp: old,
+                                 detail: ["email": AnyCodable("a@example.com")]))
+        try store.insert(testRow("ops", code: "USER_LOGIN", timestamp: old))
+        let cutoff = Date().addingTimeInterval(-30 * day)
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), ["pii"])
+        XCTAssertTrue(store.isRedacted("pii"))
+        XCTAssertFalse(store.isRedacted("ops"))
+        XCTAssertTrue(store.all().first { $0.id == "pii" }!.detail.isEmpty)
+        XCTAssertEqual(store.all().filter { $0.code == "AUDIT_ROW_REDACTED" }.map(\.target), ["pii"])
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
+    }
+
+    func testStoreWithoutRedactionSupportThrows() throws {
+        registerCodes()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: CapturingStore(),
+                             strategy: .raise)
+        XCTAssertThrowsError(try Fasten.redactExpired(before: Date()))
+    }
+
+    private func isoString40DaysAgo() -> String {
+        ISO8601DateFormatter().string(from: Date().addingTimeInterval(-40 * day))
     }
 }
 

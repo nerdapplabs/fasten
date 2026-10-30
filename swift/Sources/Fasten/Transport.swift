@@ -37,3 +37,13 @@ final class StdoutTransport: @unchecked Sendable {
 func isoNow() -> String {
     ISO8601DateFormatter().string(from: Date())
 }
+
+/// Spec 4.3 canonical form, e.g. 2026-08-21T10:00:00.500000Z. Used for
+/// cutoffs so they compare correctly against rows from the other SDKs.
+func canonicalTS(_ date: Date) -> String {
+    let t = date.timeIntervalSince1970
+    let secs = t.rounded(.down)
+    let micros = Int(((t - secs) * 1_000_000).rounded(.down))
+    let base = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: secs))
+    return String(base.dropLast()) + String(format: ".%06dZ", micros)
+}

@@ -42,6 +42,26 @@ public struct AuditRow: Codable, Sendable {
     }
 }
 
+extension AuditRow {
+    func withMonotonicSeq(_ seq: Int) -> AuditRow {
+        copy(monotonicSeq: seq, detail: detail)
+    }
+
+    func withDetail(_ newDetail: [String: AnyCodable]) -> AuditRow {
+        copy(monotonicSeq: monotonicSeq, detail: newDetail)
+    }
+
+    private func copy(monotonicSeq: Int, detail: [String: AnyCodable]) -> AuditRow {
+        AuditRow(wireVersion: wireVersion, id: id, originID: originID,
+                 monotonicSeq: monotonicSeq, timestamp: timestamp, code: code,
+                 action: action, severity: severity, serviceID: serviceID,
+                 sourceNodeID: sourceNodeID, tenantID: tenantID, actor: actor,
+                 actorKind: actorKind, target: target, category: category,
+                 domain: domain, method: method, requestID: requestID,
+                 detail: detail, shippedAt: shippedAt, prevHash: prevHash, hash: hash)
+    }
+}
+
 /// Syslog row — for /logs/sys stream.
 public struct SysRow: Codable, Sendable {
     public let timestamp:  String

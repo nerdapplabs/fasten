@@ -99,6 +99,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `FastenError` conforms to `LocalizedError`, so `localizedDescription` carries
   the store's message.
 
+### Fixed — Swift: store-assigned monotonic_seq, no non-spec hash, PII redaction (#124)
+
+- **Breaking:** the store assigns `monotonic_seq` inside the insert
+  transaction (`BEGIN IMMEDIATE` on SQLite, spec §2.1), so two engines on one
+  file and node no longer write duplicate seqs. `emit` hands the store a row
+  with `monotonic_seq` 0, and `hash` and `prev_hash` are now empty. The old
+  Swift hash did not follow spec §1, so `verify_chain` in Python and Go
+  reported those rows as tampered. Rows are written unsealed, and `configure`
+  logs `audit_chain_unavailable` once. A store given a non-zero seq writes it
+  as given.
+- `SQLiteStore` sets a 5 s busy timeout (`busyTimeoutMs`) and adds the
+  `pii_in_detail`, `canonical_form_id`, `detail_salt` and `detail_commitment`
+  columns.
+- `Fasten.redactExpired(before:reason:)` sets `detail` to null on rows of
+  `Fasten.piiCodes()` older than `before`, after writing an
+  `AUDIT_ROW_REDACTED` row for each one (spec §7). Rows are never deleted, and
+  sealed form-"1" rows are not touched. The SDK runs no retention loop, so
+  call it on a schedule. `Meta` gains `piiInDetail`.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
