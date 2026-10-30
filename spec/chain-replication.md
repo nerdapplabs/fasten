@@ -228,7 +228,8 @@ See §8 for what the stdout stream carries in the interim.
 1. Keep one copy of each row `id` per node (re-delivery, §4; or a stdout
    capture holding both §8 lines). A sealed copy wins over an unsealed one.
    Two sealed copies MUST have the same `hash`, and each MUST pass step 2;
-   otherwise the chain breaks at that row. Sort by `monotonic_seq`.
+   otherwise the chain breaks at the lower `monotonic_seq` of the two copies.
+   Sort by `monotonic_seq`.
 2. For each hash-bearing row, recompute the §1 hash for its `canonical_form_id`
    and compare to the stored `hash`. A row with an empty `hash` at or above
    its node's first sealed seq is a break (§2).
