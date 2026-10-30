@@ -1,10 +1,10 @@
-"""Scenario 3: pool exhaustion — emit under connection saturation.
+"""Scenario 3: emit while the connection pool is exhausted.
 
-Holds all pgbouncer connections busy, then verifies that emit() either
-succeeds (queued) or raises AuditStoreError (raise mode) — never silently
-drops rows.
+Holds pool_size connections open in a transaction, emits in queue mode from
+burst_writers threads, then releases them and flushes. Each emit must either
+end up in the table or raise AuditStoreError.
 
-Pass criteria: no silent drops (emitted == actual_count + queue_depth).
+Passes when actual_count + emit errors == successful emits.
 """
 import argparse
 import json
@@ -72,7 +72,7 @@ def run(dsn, table, pool_size, burst_writers, duration_s):
     for t in threads:
         t.join()
 
-    # Release held connections so drainer can flush.
+    # Release the held connections so the drainer can write.
     for c in holder_conns:
         try:
             c.execute("ROLLBACK")

@@ -8,26 +8,19 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// PR #59 test-coverage gaps — before this file:
-//   - no test rejected an invalid table name at any of the four store constructors;
-//   - no ring test covered a row with NULL/missing timestamp against a since
-//     window (delete the COALESCE and every Go test still passed);
-//   - since/until inclusivity was assumed, never asserted (changing <= to <
-//     broke nothing).
-// This file pins all three.
-
-// ── table-name rejection ──────────────────────────────────────────────────
+// Table-name validation, undated rows in windowed ring reads, and since/until
+// inclusivity.
 
 // The regex is the only injection barrier; each constructor must reject the
-// same set of bad names, and NewPostgresStreamStore must not default an empty
-// name to "syslog" (that was the silent api→syslog split).
+// same set of bad names, and the stream stores must not default an empty
+// name to "syslog".
 func TestStoreConstructors_RejectBadTableNames(t *testing.T) {
 	db, _ := sql.Open("sqlite", ":memory:")
 	t.Cleanup(func() { db.Close() })
 
 	// Invalid-shape names must be rejected everywhere (the regex is the only
-	// injection barrier). NewSQLiteStore intentionally defaults "" to
-	// "fasten_audit", so empty is excluded here — see its docstring.
+	// injection barrier). NewSQLiteStore defaults "" to "fasten_audit", so
+	// empty is excluded here.
 	badShape := []string{
 		"1abc", "a-b", "a b", "a;b", "drop table x;",
 	}
@@ -39,12 +32,10 @@ func TestStoreConstructors_RejectBadTableNames(t *testing.T) {
 			t.Errorf("NewStreamStore(%q): want error, got nil", name)
 		}
 	}
-	// The stream stores must also reject empty — that's the api→syslog silent
-	// split the PR #59 review flagged for the Postgres constructor.
+	// The stream stores must also reject an empty name.
 	if _, err := NewStreamStore(db, ""); err == nil {
 		t.Error("NewStreamStore(\"\"): want error (no default), got nil")
 	}
-	// Good names still work.
 	if _, err := NewSQLiteStore(db, "audit_ok"); err != nil {
 		t.Errorf("NewSQLiteStore(audit_ok) unexpectedly failed: %v", err)
 	}
@@ -53,14 +44,9 @@ func TestStoreConstructors_RejectBadTableNames(t *testing.T) {
 	}
 }
 
-// ── ring NULL/missing-timestamp window ────────────────────────────────────
-
-// A row with no timestamp field must NOT appear in a windowed read — its age
-// is unknown; if a caller narrows with ?since=..., undated rows fall outside
-// (matching the store's COALESCE behaviour). Delete the store COALESCE and
-// this test still passes because it exercises the ring inWindow path; the
-// point is that we pinned the ring's behaviour so it can't quietly drift
-// off from the stores.
+// A row with no timestamp has an unknown age, so it is left out of any
+// windowed read. The stores do the same through COALESCE; this pins the
+// ring's inWindow path to match.
 func TestRing_NullTimestamp_WindowExcludes(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -79,33 +65,28 @@ func TestRing_NullTimestamp_WindowExcludes(t *testing.T) {
 	if rows[0].(map[string]any)["request_id"] != "r-ok" {
 		t.Errorf("windowed read must exclude undated rows; got %v", rows)
 	}
-	// No window ⇒ both rows visible.
+	// No window: both rows visible.
 	body2, _ := getJSON(t, NewReader(), "/sys")
 	if r, _ := body2["rows"].([]any); len(r) != 2 {
 		t.Errorf("no-window read must include both rows; got %d", len(r))
 	}
 }
 
-// ── since / until inclusivity ─────────────────────────────────────────────
-
-// spec §4.3 states [since, until] is inclusive on both ends. Neither ring
-// nor store test used to pin the equality boundary; changing the comparison
-// operator broke nothing.
+// spec §4.3: [since, until] is inclusive on both ends.
 func TestRing_WindowInclusiveOnBothEnds(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	tr := GetTransport()
-	// Row is written in the canonical form (spec §4.3) — writers MUST use
-	// canonical_ts / canonicalTS. Query param can be any RFC3339 flavour;
-	// the reader canonicalises it before the lex compare.
+	// Rows are written in the canonical form (spec §4.3). The query param can
+	// be any RFC3339 flavour; the reader canonicalises it before comparing.
 	boundary := "2026-08-15T00:00:00.000000Z"
 	tr.PushSyslog(SyslogRow{"event": "at.boundary", "request_id": "r-eq",
 		"timestamp": boundary})
 
-	// Query param uses the shorter RFC3339 form — the reader canonicalises
-	// it to the same 27-char shape the row was stored in.
+	// The reader canonicalises the short RFC3339 form to the same 27-char
+	// shape the row was stored in.
 	shortForm := "2026-08-15T00:00:00Z"
 	// since == ts must include the row.
 	body, _ := getJSON(t, NewReader(), "/sys?since="+shortForm)
@@ -121,9 +102,7 @@ func TestRing_WindowInclusiveOnBothEnds(t *testing.T) {
 	}
 }
 
-// A store-backed variant — the store path also honours the inclusive
-// boundary; a divergent < / <= between ring and store would surface as a
-// row appearing under one backend and not the other.
+// Same boundary check through the store path, so ring and store agree.
 func TestStore_WindowInclusiveOnBothEnds(t *testing.T) {
 	resetGlobals(t)
 	sdb, _ := sql.Open("sqlite", ":memory:")
@@ -148,8 +127,7 @@ func TestStore_WindowInclusiveOnBothEnds(t *testing.T) {
 	if r, _ := body["rows"].([]any); len(r) != 1 {
 		t.Errorf("store until=ts must be inclusive; got %d rows", len(r))
 	}
-	// One second earlier must NOT match with a window that ends there
-	// (paranoia against an accidental exclusive-lower switch).
+	// A window ending one second earlier must not match.
 	oneEarlier := "2026-08-14T23:59:59Z"
 	body, _ = getJSON(t, NewReader(), "/sys?since="+oneEarlier+"&until="+oneEarlier)
 	if r, _ := body["rows"].([]any); len(r) != 0 {
@@ -157,9 +135,8 @@ func TestStore_WindowInclusiveOnBothEnds(t *testing.T) {
 	}
 }
 
-// Sanity-only: the rejection error mentions "identifier" or "required" so
-// callers can pattern-match if they need to distinguish invariants. Not part
-// of the coverage matrix — kept small so the file's contract is one line.
+// The rejection error mentions "identifier" or "required" so callers can
+// tell the cases apart.
 func TestStoreConstructorErrorsSayWhy(t *testing.T) {
 	db, _ := sql.Open("sqlite", ":memory:")
 	t.Cleanup(func() { db.Close() })

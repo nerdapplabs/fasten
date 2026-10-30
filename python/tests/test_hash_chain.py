@@ -1,4 +1,4 @@
-"""P1-23: per-row hash chain — emit, verify, tamper-detect."""
+"""Per-row hash chain: emit, verify, detect tampering."""
 import dataclasses
 import hashlib
 import json
@@ -9,7 +9,7 @@ from fasten import verify_chain
 from fasten.engine import _row_hash
 
 
-# ── Basic emission ────────────────────────────────────────────────────────────
+# Basic emission
 
 def test_emitted_row_has_hash(initialized):
     row = fasten.emit(code="USER_CREATED", target="u-1")
@@ -35,14 +35,9 @@ def test_hash_is_deterministic(initialized):
 
 def test_hash_excludes_hash_field(initialized):
     row = fasten.emit(code="USER_CREATED", target="u-1")
-    # The hash field must not appear in its own preimage.
-    #
-    # The preimage is the HASHED form (spec §1.2): timestamps carry a "+00:00"
-    # offset, NOT the always-"Z" wire form that to_dict() stamps via
-    # canonical_ts (spec §4.3). Recomputing with the wire form here is what
-    # previously let Python drift away from the Go cross-language vector.
-    # Emitted rows are form "2" now, which hashes detail_commitment in place of
-    # detail and uses the wire timestamp verbatim (no _to_hashed_form).
+    # The hash field is not part of its own preimage. Emitted rows are form
+    # "2": the preimage is to_dict() minus _FORM_2_EXCLUDED, with
+    # detail_commitment in place of detail and the timestamp as serialised.
     from fasten.chain import _FORM_2_EXCLUDED
     d = {k: v for k, v in row.to_dict().items() if k not in _FORM_2_EXCLUDED}
     expected = hashlib.sha256(
@@ -51,7 +46,7 @@ def test_hash_excludes_hash_field(initialized):
     assert expected == row.hash
 
 
-# ── verify_chain ──────────────────────────────────────────────────────────────
+# verify_chain
 
 def test_verify_chain_empty():
     result = verify_chain([])
@@ -94,13 +89,13 @@ def test_verify_chain_detects_prev_hash_break(initialized):
 
 def test_verify_chain_rows_out_of_order(initialized):
     rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(4)]
-    # Pass in reverse order — verify_chain sorts by monotonic_seq
+    # verify_chain sorts by monotonic_seq
     result = verify_chain(list(reversed(rows)))
     assert result.ok is True
 
 
 def test_verify_chain_skips_empty_hash_rows(initialized, mem_store):
-    """Rows without a hash field (pre-upgrade) are silently skipped."""
+    """Rows without a hash (pre-upgrade) are skipped."""
     row = fasten.emit(code="USER_CREATED", target="u-1")
     # Simulate a legacy row with no hash
     legacy = dataclasses.replace(row, hash="", prev_hash="genesis",
@@ -111,7 +106,7 @@ def test_verify_chain_skips_empty_hash_rows(initialized, mem_store):
     assert result.ok is True  # legacy row skipped; row self-verifies
 
 
-# ── Store round-trip ──────────────────────────────────────────────────────────
+# Store round-trip
 
 def test_hash_chain_survives_store_roundtrip(initialized, mem_store):
     original = fasten.emit(code="USER_CREATED", target="u-1")
@@ -129,7 +124,7 @@ def test_verify_chain_from_store(initialized, mem_store):
     assert result.ok is True
 
 
-# ── Re-init seeds prev_hash correctly ─────────────────────────────────────────
+# Re-init continues the chain
 
 def test_reinit_seeds_prev_hash_from_store(mem_store, monkeypatch):
     monkeypatch.setenv("FASTEN_SERVICE_ID", "svc-chain")
@@ -140,7 +135,7 @@ def test_reinit_seeds_prev_hash_from_store(mem_store, monkeypatch):
     r1 = fasten.emit(code="USER_CREATED", target="u-1")
     r2 = fasten.emit(code="USER_CREATED", target="u-2")
 
-    # Second session: re-init should seed prev_hash from store
+    # Second session: the store supplies prev_hash
     fasten.init(audit_store=mem_store, audit_store_failure_strategy="raise")
     r3 = fasten.emit(code="USER_CREATED", target="u-3")
 

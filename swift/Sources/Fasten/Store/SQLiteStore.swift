@@ -5,13 +5,8 @@ import SQLite3
 import CSQLite3
 #endif
 
-/// SQLite-backed AuditStore.  Uses the system SQLite3 library (always available on
-/// Apple platforms; install libsqlite3-dev on Linux).
-///
-/// Usage:
-///   let store = try SQLiteStore(path: "./fasten-audit.db")
-///   // or in-memory for tests:
-///   let store = try SQLiteStore(path: ":memory:")
+/// AuditStore backed by the system SQLite3 library (install libsqlite3-dev on
+/// Linux). Pass ":memory:" as the path for an in-memory database.
 public final class SQLiteStore: AuditStore, @unchecked Sendable {
 
     private var db: OpaquePointer?
@@ -36,8 +31,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     deinit { sqlite3_close(db) }
-
-    // ── Schema ─────────────────────────────────────────────────────────────
 
     private func bootstrap() throws {
         let ddl = """
@@ -69,7 +62,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_\(table)_ts   ON \(table)(timestamp);
         """
         try exec(ddl)
-        // Hash-chain migration for pre-existing tables.
+        // Tables created before the hash chain lack these columns.
         let migrations = [
             "ALTER TABLE \(table) ADD COLUMN prev_hash TEXT NOT NULL DEFAULT 'genesis'",
             "ALTER TABLE \(table) ADD COLUMN hash      TEXT NOT NULL DEFAULT ''",
@@ -78,8 +71,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             try? exec(m)   // ignore if column already exists
         }
     }
-
-    // ── AuditStore protocol ─────────────────────────────────────────────────
 
     public func insert(_ row: AuditRow) throws {
         let detail = (try? JSONEncoder().encode(row.detail)).flatMap {
@@ -147,8 +138,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
-
-    // ── Helpers ────────────────────────────────────────────────────────────
 
     private func exec(_ sql: String) throws {
         var err: UnsafeMutablePointer<CChar>? = nil

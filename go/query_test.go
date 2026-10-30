@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// NL / smart-box → structured chips (§3.7, §6.3). Parity with the Python
-// test_query_translate.py contract.
+// Free-text query to structured chips (§3.7, §6.3), same contract as the
+// Python test_query_translate.py.
 
 func TestTranslate_StructuredFieldChip(t *testing.T) {
 	c := TranslateQuery("target:r-901")
@@ -58,7 +58,7 @@ func TestTranslate_ExplicitRequestIDField(t *testing.T) {
 }
 
 func TestTranslate_UnknownFieldIsSearchText(t *testing.T) {
-	c := TranslateQuery("colour:blue") // no such filter — must not fabricate one
+	c := TranslateQuery("colour:blue") // no such filter; must not invent one
 	if len(c.Filters) != 0 || c.Q != "colour:blue" {
 		t.Errorf("got %+v", c)
 	}

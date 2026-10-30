@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Flag workflow steps that read a repo-root file under a subdirectory default.
 
-fasten-rust.yml sets `defaults.run.working-directory: rust` and fasten-py.yml
-sets `python`. Steps that grep rust-toolchain.toml — which lives at the repo
-root — inherited that and failed with "No such file or directory". fasten-cpp
-and fasten-go declare no default, which is why only those two jobs passed.
-
-ci-local.sh runs from the repo root, so this class cannot be caught by running
-the commands; it has to be checked structurally.
+Jobs such as fasten-rust.yml set `defaults.run.working-directory`, so a step
+that reads rust-toolchain.toml (at the repo root) must set its own
+working-directory or it fails with "No such file or directory".
 
 Exit 0 clean, 1 with findings on stdout.
 """
@@ -16,9 +12,8 @@ import sys
 
 import yaml
 
-# Only files genuinely read from the repo root. "spec/" and "scripts/" were
-# tried and substring-matched legitimate relative paths like "../spec/" — a
-# check that cries wolf gets ignored.
+# Only files that are read from the repo root. Directory names like "spec/"
+# would also match valid relative paths such as "../spec/".
 ROOT_FILES = ("rust-toolchain.toml",)
 
 

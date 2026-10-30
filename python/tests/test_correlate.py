@@ -1,8 +1,7 @@
-"""FR2 — unified correlation read: every stream for one request_id.
+"""Correlation read: every stream for one request_id.
 
-GET /logs/correlate?request_id=X fans out to the audit store + sys/api
-rings-or-stores and assembles {request_id, audit, api, sys, counts,
-completeness}, so a consumer gets the whole operation in one call.
+GET /logs/correlate?request_id=X reads the audit store and the api/sys rings
+or stores and returns {request_id, audit, api, sys, counts, completeness}.
 """
 import pytest
 
@@ -23,7 +22,6 @@ def _client():
 
 
 def _init():
-    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
@@ -39,7 +37,7 @@ def test_correlate_assembles_all_three_streams():
     t = fasten.transport()
     t.push_api({"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": rid})
     t.push_syslog({"level": "error", "event": "db.timeout", "request_id": rid})
-    # noise under a different request_id must not leak in
+    # a different request_id must not appear
     t.push_api({"method": "GET", "path": "/health", "status": 200, "request_id": "other"})
 
     body = _client().get(f"/api/v1/logs/correlate?request_id={rid}").json()
@@ -66,10 +64,9 @@ def test_correlate_requires_request_id():
 
 
 def test_correlate_reports_store_when_streams_persisted():
-    """When api/sys persist, completeness flips and history is recoverable
-    past the ring window — the historical-investigation use case."""
+    """With api/sys persisted, completeness reports store and rows older than
+    the ring window are still found."""
     from fasten.store.stream import StreamStore
-    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
@@ -90,10 +87,8 @@ def test_correlate_reports_store_when_streams_persisted():
 
 
 def test_correlate_totals_expose_truncation_ring_only():
-    """counts reflects the capped response; totals reflects what the backing
-    source holds — counts < totals is the truncation signal a heavily
-    correlated request_id needs (100-of-100 vs 100-of-5000 was previously
-    indistinguishable)."""
+    """counts is what the response holds and totals is what the source holds,
+    so counts < totals means the response was truncated."""
     _init()
     rid = "req-hot"
     t = fasten.transport()
@@ -110,12 +105,10 @@ def test_correlate_totals_expose_truncation_ring_only():
 
 
 def test_correlate_totals_count_store_history_and_audit():
-    """With persistence on, totals counts durable history (beyond any window)
-    for the streams AND the audit store — every stream reports total vs
-    returned."""
+    """With persistence on, totals counts stored history for the streams and
+    the audit store."""
     from fasten.context import with_request_id
     from fasten.store.stream import StreamStore
-    # service_id / node_id passed explicitly; the earlier os.environ writes were dead code that leaked env across tests.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),

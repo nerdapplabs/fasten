@@ -48,10 +48,8 @@ jobs:
           echo "toolchain: $ch"
 
       - name: Install Rust (rust-toolchain.toml)
-        # dtolnay/rust-toolchain requires an explicit `toolchain` input — it
-        # does NOT read rust-toolchain.toml. Read the channel from that file
-        # and pass it, so the file stays the single source of truth and the
-        # four workflows that build fasten-core cannot drift apart again.
+        # dtolnay/rust-toolchain needs an explicit `toolchain` input and does not
+        # read rust-toolchain.toml, so pass the channel read from that file.
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-toolchain-file.outputs.channel }}

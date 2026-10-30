@@ -1,4 +1,4 @@
-"""Tests for `fasten codes typegen` CLI (P1-11 typegen)."""
+"""`fasten codes typegen`."""
 import textwrap
 from pathlib import Path
 

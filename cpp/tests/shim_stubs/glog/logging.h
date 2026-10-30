@@ -1,5 +1,5 @@
 #pragma once
-// Minimal glog stub — provides only the surface fasten/shim/glog.hpp uses.
+// Minimal glog stub: only what fasten/shim/glog.hpp uses.
 #include <ctime>
 #include <string>
 
@@ -25,7 +25,7 @@ public:
     virtual void WaitTillSent() = 0;
 };
 
-// No-op in tests — shim smoke tests call send() directly.
+// No-ops: the smoke tests call send() directly.
 inline void AddLogSink(LogSink*) {}
 inline void RemoveLogSink(LogSink*) {}
 

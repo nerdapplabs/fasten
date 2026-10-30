@@ -1,10 +1,9 @@
 #pragma once
 /**
- * fasten/shim/spdlog.hpp — spdlog → fasten syslog bridge.
+ * fasten/shim/spdlog.hpp: copy spdlog messages into fasten's sys log.
  *
- * Header-only, opt-in. Add one sink to your spdlog logger and every
- * log line is mirrored into fasten's /logs/sys ring without changing
- * any existing call sites.
+ * Add the sink to a logger and each message is also redacted and pushed
+ * to the buffer behind query_syslog() and /logs/sys.
  *
  * Usage:
  *   #include "fasten.hpp"
@@ -16,19 +15,13 @@
  *       std::make_shared<fasten::shim::spdlog_sink_mt>()
  *   );
  *
- *   // Existing code unchanged — now also writes to fasten ring:
+ *   // Also lands in fasten's sys log:
  *   spdlog::info("user_login user_id={}", uid);
  *
- * Thread safety: spdlog_sink_mt is the multi-threaded variant (mutex
- * internally). spdlog_sink_st exists for single-threaded use.
+ * spdlog_sink_mt locks a mutex; spdlog_sink_st is for single-threaded use.
+ * A per-thread flag stops the sink from re-entering itself.
  *
- * Recursion guard: the sink checks a per-thread flag before pushing
- * so fasten's own internal sys writes (via fasten::log::*) never
- * re-enter this sink even if someone accidentally adds it to the logger
- * that fasten itself uses.
- *
- * Requires: spdlog >= 1.x (sink interface stable across 1.x and 2.x).
- * Include spdlog/sinks/base_sink.h before this header.
+ * Requires spdlog 1.x.
  */
 
 #include <mutex>
@@ -39,8 +32,6 @@
 namespace fasten::shim {
 
 namespace detail_ {
-// static gives internal linkage per TU — correct for a header-only recursion
-// guard where the sink and its callers live in the same translation unit.
 static thread_local bool spdlog_sink_active = false;
 }
 

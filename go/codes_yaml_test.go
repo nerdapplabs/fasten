@@ -146,7 +146,7 @@ func TestReload_FaultTolerant(t *testing.T) {
 	}
 	regMu.RUnlock()
 
-	// Corrupt the yaml — invalid severity
+	// Corrupt the yaml with an invalid severity
 	if err := os.WriteFile(path, []byte(`
 domain: fleet
 codes:

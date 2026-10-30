@@ -8,16 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * REVIEW #26: Java SDK is a v1.0-beta placeholder. Every public
- * runtime entry point must throw {@link UnsupportedOperationException}
- * with a fix-it message — half-implemented no-ops (register / init /
- * metaOf / dump returning silently) used to let adopters chain
- * configuration before only failing at emit time.
- *
- * <p>This suite is the test the future runtime impl will need to delete
- * (or rewrite into proper behavioural tests). Until then it pins the
- * "loud failure at first call" contract so a regression to silent
- * no-ops can never sneak back in.
+ * The Java SDK has no runtime yet, so every public entry point must throw
+ * {@link UnsupportedOperationException} with a message pointing to a working
+ * SDK. Replace these with behavioural tests once the runtime exists.
  */
 class FastenTest {
 
@@ -93,9 +86,7 @@ class FastenTest {
 
     @Test
     void rowRecordHasSpecCompatibleFields() {
-        // Smoke that the wire-shape rename landed: originId (was
-        // edgeRowId), tenantId (was siteId), piiInDetail added.
-        // Construct a Row to make the compiler enforce the shape.
+        // Constructing a Row makes the compiler check the field list.
         Fasten.Row r = new Fasten.Row(
             "evt-00000000000000000000",
             "evt-00000000000000000000",
@@ -114,7 +105,6 @@ class FastenTest {
             false,                  // piiInDetail
             Optional.empty()        // shippedAt
         );
-        // Field accessors expose the renamed names.
         assertTrue(r.originId().equals(r.id()));
         assertTrue(r.tenantId().isEmpty());
         assertTrue(!r.piiInDetail());

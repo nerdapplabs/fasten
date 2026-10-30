@@ -1,9 +1,5 @@
-"""
-SQLite implementation of AuditRepository.
-
-Parses `sqlite:///path?table=X&wal=true` DSN, creates the table on first use,
-and uses WAL mode by default.
-"""
+"""SQLite AuditRepository. DSN: ``sqlite:///path?table=X&wal=true``. The table
+is created on first use; WAL is on by default."""
 from __future__ import annotations
 
 import contextlib
@@ -28,13 +24,8 @@ _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _utc_iso(dt: datetime) -> str:
-    """Serialise to the canonical UTC form (spec §4.3, ``canonical_ts``).
-
-    Naive datetimes are treated as UTC. A naive `.isoformat()` produced
-    a string without an offset, so lexicographic ordering against
-    existing rows ('2026-05-04T10:00:00' vs '2026-05-04T10:00:00+00:00')
-    silently mis-ordered. Canonical form additionally fixes cross-SDK
-    boundary truncation — see fasten/canonical_ts.py."""
+    """Canonical timestamp string (naive datetimes are UTC), so stored
+    timestamps compare correctly as strings."""
     from ..canonical_ts import canonical_ts
     return canonical_ts(dt)
 
@@ -60,9 +51,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
     canonical_form_id TEXT NOT NULL DEFAULT '1',
-    -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
-    -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, and NULL again once redacted.
+    -- Form "2" columns (spec 1.4). NULL on form "1" rows, and detail_salt is
+    -- cleared on redaction.
     detail_salt       TEXT,
     detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
@@ -76,23 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE sh
 
 
 class SQLiteStore:
-    """Thread-safe SQLite-backed AuditRepository.
+    """Thread-safe SQLite AuditRepository.
 
-    For file-backed stores: one connection PER THREAD via
-    threading.local. The earlier "single connection shared via
-    check_same_thread=False" pattern only silenced sqlite3's safety
-    assertion — it did not make concurrent drainer + reader access
-    actually safe, and operations on the same connection from multiple
-    threads can interleave statements and corrupt the cursor protocol.
-    WAL mode (the default) is designed around per-thread connections:
-    many readers + one writer can progress in parallel without blocking
-    each other.
-
-    For ``:memory:``: every sqlite3 ``:memory:`` connection is a
-    SEPARATE private database, so per-thread connections would each
-    see an empty schema. We fall back to a single connection guarded
-    by an RLock — the pattern is correct for tests / dev, but file
-    storage is the right choice for any production load.
+    A file database gets one connection per thread, since statements from
+    several threads on one connection can interleave. ``:memory:`` gets a
+    single connection behind an RLock, because each in-memory connection is
+    its own database. Use a file for anything but tests.
     """
 
     def __init__(self, path: str, table: str = "audit_log", wal: bool = True) -> None:
@@ -104,25 +83,16 @@ class SQLiteStore:
         self._path = path
         self._table = table
         self._wal = wal
-        # Swallowed persist-failure counter (mirrors StreamStore). At least one
-        # means durable audit history has a known hole, so the reader degrades
-        # the audit completeness flag from "store" to "store-degraded". Sticky
-        # for the store's lifetime: a hole doesn't heal when the disk recovers.
+        # Failed inserts the caller dropped (see note_write_failure). Any
+        # makes the reader report "store-degraded"; it never resets.
         self._write_failures = 0
-        # `:memory:` databases cannot be shared across connections, so
-        # the per-thread model breaks. Detect once at init and route
-        # subsequent calls accordingly.
         self._is_memory = path == ":memory:"
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
-        # Run the DDL once on the constructor's thread so the table /
-        # indexes / pii migration exist before any other thread opens
-        # its own connection. Subsequent threads see the table already
-        # present and skip straight to insert/query.
+        # Create the table and run migrations before other threads connect.
         bootstrap = self._connect()
         if wal and not self._is_memory:
-            # WAL is meaningless for `:memory:` (no journal file).
             bootstrap.execute("PRAGMA journal_mode=WAL")
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():
@@ -139,8 +109,7 @@ class SQLiteStore:
                 f"ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"
             )
             bootstrap.commit()
-        # Migration: add the canonical_form_id column (item 6) to pre-existing
-        # tables. Additive — existing rows default to form "1".
+        # Migration: canonical_form_id; existing rows are form "1".
         try:
             bootstrap.execute(f"SELECT canonical_form_id FROM {table} LIMIT 0")
         except sqlite3.OperationalError:
@@ -148,8 +117,7 @@ class SQLiteStore:
                 f"ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1'"
             )
 
-        # P1-47 migration: form "2" commitment columns. Nullable with no default,
-        # so existing rows are untouched and their form-"1" hashes still verify.
+        # Migration: form "2" columns. Nullable, so existing rows are unchanged.
         for _col in ("detail_salt", "detail_commitment"):
             try:
                 bootstrap.execute(f"SELECT {_col} FROM {table} LIMIT 0")
@@ -158,13 +126,9 @@ class SQLiteStore:
             bootstrap.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        """Return this thread's sqlite3 connection, opening it on first call.
-
-        For `:memory:` returns the single shared connection (sqlite3
-        cannot share an in-memory database across multiple connections).
-        Callers MUST hold ``self._mem_lock`` for the duration of any
-        compound operation against the in-memory store.
-        """
+        """This thread's connection, or the shared one for ``:memory:``.
+        Compound operations on ``:memory:`` must hold ``self._mem_lock``
+        (use ``_txn()``)."""
         if self._is_memory:
             if self._mem_conn is None:
                 self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -172,26 +136,15 @@ class SQLiteStore:
             return self._mem_conn
         conn = getattr(self._tls, "conn", None)
         if conn is None:
-            # check_same_thread=True (default) is correct now — every
-            # thread gets its own connection, so the cross-thread guard
-            # never trips and we get the safety assertion for free.
             conn = sqlite3.connect(self._path)
             conn.row_factory = sqlite3.Row
             if self._wal:
-                # Each connection sets its own journal_mode pragma.
                 conn.execute("PRAGMA journal_mode=WAL")
             self._tls.conn = conn
         return conn
 
     def _txn(self) -> contextlib.AbstractContextManager[Any]:
-        """Lock context for a compound operation.
-
-        File-backed: per-thread connection means no inter-thread
-        contention; nullcontext() is correct.
-        In-memory: every thread shares the single connection, so we
-        serialise with the RLock to avoid sqlite3-on-shared-conn
-        statement interleaving.
-        """
+        """The RLock for ``:memory:`` (one shared connection), else a no-op."""
         return self._mem_lock if self._is_memory else contextlib.nullcontext()
 
     @classmethod
@@ -211,12 +164,8 @@ class SQLiteStore:
         )
 
     def _insert_row_core(self, conn: Any, row: AuditRow) -> None:
-        """Execute the idempotent INSERT OR IGNORE on ``conn`` WITHOUT committing.
-
-        The transaction boundary is owned by the caller: ``_insert_row`` commits
-        per row, while the batch path in ``ingest_replicated`` executes many of
-        these and commits once. Shared by the originated and replicated entry
-        points — the intent split is enforced by the wrappers, not here."""
+        """INSERT OR IGNORE one row on ``conn`` without committing; the caller
+        owns the transaction. The public insert methods do the checks."""
         conn.execute(
             f"INSERT OR IGNORE INTO {self._table} "
             "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
@@ -250,8 +199,7 @@ class SQLiteStore:
             conn.commit()
 
     def insert_originated(self, row: AuditRow) -> None:
-        """Insert a row this node ORIGINATED (origin_id == id). Used by the
-        engine's own emit path."""
+        """Insert a row this node originated (origin_id == id)."""
         if row.origin_id != row.id:
             raise ValueError(
                 "insert_originated requires origin_id == id "
@@ -261,20 +209,12 @@ class SQLiteStore:
         self._insert_row(row)
 
     def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
-        """Allocate monotonic_seq + prev_hash and insert, atomically (spec §2.1).
+        """Allocate monotonic_seq and prev_hash, seal, and insert in one
+        transaction (spec 2.1). Returns the sealed row.
 
-        One node, one chain: ``monotonic_seq`` is unique within a
-        ``source_node_id``. Allocating in the engine's memory is non-conformant —
-        two engine instances (two services on one store, a forking supervisor,
-        ``uvicorn --workers``) each mint from 1 and produce two rows at seq 1,
-        which ``verify_chain`` must then report as a duplicate allocation.
-
-        ``BEGIN IMMEDIATE`` takes a RESERVED lock before the read, so two writers
-        cannot both observe the same MAX(seq) and then both insert. Without it
-        this method would be a read-modify-write race that merely moves the bug
-        from memory into SQL.
-
-        Returns the SEALED row actually written.
+        The seq is unique per source_node_id across every engine and process
+        writing to the store. ``BEGIN IMMEDIATE`` takes the write lock before
+        reading MAX(seq), so two writers cannot read the same value.
         """
         from ..chain import seal
 
@@ -287,15 +227,8 @@ class SQLiteStore:
             conn = self._connect()
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # TWO questions, TWO queries — conflating them is a bug.
-                #
-                # seq must be unique across EVERY row on this node, sealed or
-                # not: an unsealed row (pre-upgrade, or stdout-only mode per
-                # §8.1) still occupies its sequence number. Filtering those out
-                # here restarts the counter at 1 and collides with them.
-                #
-                # prev_hash, by contrast, may only chain from a SEALED row —
-                # an empty hash is not a link.
+                # Two queries: the seq counts every row on the node, sealed or
+                # not, while prev_hash may only come from a sealed row.
                 cur = conn.execute(
                     f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table} "
                     "WHERE source_node_id = ?",
@@ -320,8 +253,7 @@ class SQLiteStore:
         return sealed
 
     def insert_replicated(self, row: AuditRow) -> None:
-        """Insert a row replicated from another origin. Used by
-        ingest_replicated after the chain verifies; the row must be sealed."""
+        """Insert a sealed row replicated from another origin."""
         if not row.hash:
             raise ValueError(
                 "insert_replicated requires a sealed row (non-empty hash); "
@@ -330,14 +262,11 @@ class SQLiteStore:
         self._insert_row(row)
 
     def insert(self, row: AuditRow) -> None:
-        """Thin alias for insert_originated — the engine emit/drainer path. Kept
-        so the AuditRepository protocol and the drainer callback stay stable."""
+        """Same as insert_originated(). Used by the drainer."""
         self.insert_originated(row)
 
     def note_write_failure(self) -> None:
-        """Record a persist failure the caller swallowed on the hot path, so
-        durable history has a known hole. Callers that surface (raise) the
-        insert() error themselves don't mark the store degraded."""
+        """Record an insert failure the caller dropped instead of raising."""
         self._write_failures += 1
 
     @property
@@ -346,8 +275,7 @@ class SQLiteStore:
 
     @property
     def degraded(self) -> bool:
-        """True once at least one persist failure was swallowed (durable
-        history has holes). Drives the ``store-degraded`` completeness flag."""
+        """True once any write failure has been recorded."""
         return self._write_failures > 0
 
     def list_unshipped(
@@ -356,14 +284,11 @@ class SQLiteStore:
         service_id: str | None = None,
         source_node_id: str | None = None,
     ) -> list[AuditRow]:
-        """Unshipped rows oldest-first.
+        """Unshipped rows, oldest first.
 
-        When ``service_id`` and ``source_node_id`` are both given the result is
-        scoped to rows this engine ORIGINATED — ``origin_id = id`` AND the
-        matching identity. Replicated rows (ingested from another origin) are
-        excluded: re-shipping them upstream would duplicate another node's
-        sub-chain. With neither argument the legacy unscoped behaviour is kept
-        for direct adopter use.
+        With both ``service_id`` and ``source_node_id``, only rows originated
+        by that identity are returned, so replicated rows are not shipped
+        again. Without them, all unshipped rows are returned.
         """
         scoped = service_id is not None and source_node_id is not None
         with self._txn():
@@ -393,16 +318,10 @@ class SQLiteStore:
             conn.commit()
 
     def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
-        """Verify the chain of replicated rows, then insert the verified prefix.
-
-        The longest verified prefix (rows before the first chain break) is
-        inserted in ONE SQL transaction: every INSERT OR IGNORE runs on the same
-        connection and a single ``conn.commit()`` seals them, so a crash mid-batch
-        rolls the whole prefix back (real all-or-nothing, unlike per-row commits).
-        Never raises on a chain break — rejected rows surface via
-        ``rejected_from_seq`` so the sender resyncs from the break. Idempotent
-        (INSERT OR IGNORE on the id PK): a retry after a successful commit is a
-        no-op; a retry after a rolled-back failure re-inserts cleanly.
+        """Verify a replicated batch and insert its verified prefix in one
+        transaction. A chain break does not raise; it is reported in
+        ``rejected_from_seq``. Rows are inserted with INSERT OR IGNORE, so
+        retries are safe.
         """
         from .repo import IngestResult, verified_prefix
 
@@ -444,17 +363,10 @@ class SQLiteStore:
     def list_redaction_candidates(
         self, *, before: datetime, codes: "Sequence[str]",
     ) -> "list[tuple[str, int]]":
-        """``(id, monotonic_seq)`` of rows this store WOULD redact.
+        """``(id, monotonic_seq)`` of the rows redact_rows() should destroy.
 
-        Split out from the destruction so the caller can write its spec §7.2
-        records BEFORE any data is destroyed. Doing it the other way round —
-        redact, then emit — has a failure window where the rows are already
-        gone and the emit fails, leaving destroyed data with no record and
-        nothing a retry can find.
-
-        Returns ``monotonic_seq`` alongside the id because spec §7.2 specifies
-        ``detail = {"redacted_seq": <n>, ...}``, and the seq is not derivable
-        from the id.
+        Separate from redact_rows() so the caller can record each redaction
+        first (spec 7.2). The seq is returned for the ``redacted_seq`` field.
 
         Skips form-"1" rows: their ``detail`` IS hashed, so redacting one would
         change its hash and cascade a re-seal down the rest of the chain. They
@@ -492,26 +404,17 @@ class SQLiteStore:
         return [(r[0], r[1]) for r in rows]
 
     def redact_rows(self, *, ids: "Sequence[str]") -> "list[str]":
-        """Destroy ``detail`` and ``detail_salt`` on an explicit id list.
-
-        Idempotent by construction: it targets ids, not a time window, so a
-        retry after a lost commit acknowledgement destroys the same rows and
-        returns the same list. The previous shape derived its return value from
-        ``RETURNING id`` on a window query guarded by ``detail <> 'null'``, so
-        a retry matched nothing, returned ``[]``, and the caller wrote no
-        events for rows it had just destroyed.
-        """
+        """Destroy ``detail`` and ``detail_salt`` on the given form "2" rows.
+        Ids that are not form "2" are left alone but still returned. Returns
+        ``ids`` as given, so a retry returns the same list."""
         if not ids:
             return []
         placeholders = ",".join("?" for _ in ids)
         with self._txn():
             conn = self._connect()
             conn.execute(
-                # 'null' (the JSON literal), not SQL NULL: the detail column is
-                # NOT NULL, and dropping that constraint on SQLite needs a full
-                # table rebuild. json.loads('null') is Python None, so the row
-                # reads back with detail=None exactly as spec §1.4 requires,
-                # and the bytes are genuinely gone either way.
+                # The JSON literal 'null', since detail is NOT NULL and
+                # changing that needs a table rebuild. It reads back as None.
                 f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
                 f"WHERE id IN ({placeholders}) AND canonical_form_id = '2'",
                 tuple(ids),
@@ -521,25 +424,14 @@ class SQLiteStore:
 
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":
-        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec §7.1).
+        """Destroy ``detail`` on rows of ``codes`` older than ``before`` (spec 7.1).
 
-        This is what makes ``pii_in_detail`` mean something. Retention policy
-        differs by code — personal data may have to go at 30 days while
-        operational history is kept for a year — and ``purge()`` alone cannot
-        express that because it filters on age only.
+        Rows are not deleted: that would break the chain. Form "2" hashes
+        ``detail_commitment`` rather than ``detail``, so the chain still
+        verifies afterwards.
 
-        DELETE would be wrong: it removes rows from the MIDDLE of the chain,
-        which ``verify_chain`` is built to detect as tampering. Under form "2"
-        the hash covers ``detail_commitment``, not ``detail``, so nulling
-        ``detail`` and its salt destroys the data while leaving ``hash``,
-        ``prev_hash`` and ``monotonic_seq`` untouched — the chain still
-        verifies, and the commitment still proves what the row originally said
-        to anyone holding the original.
-
-        Convenience wrapper over ``list_redaction_candidates`` + ``redact_rows``
-        for callers with no audit chain to write events into. ``Engine`` drives
-        the two halves separately so it can record before it destroys — prefer
-        ``Engine.redact_expired``, which is what spec §7.2 requires.
+        Writes no AUDIT_ROW_REDACTED records; ``Engine.redact_expired`` does
+        (spec 7.2).
         """
         candidates = self.list_redaction_candidates(before=before, codes=codes)
         return self.redact_rows(ids=[cid for cid, _ in candidates])
@@ -614,28 +506,21 @@ class SQLiteStore:
             actor=actor, target=target,
             since=since, until=until,
         )
-        # Cursor pagination (canonical): rows are newest-first, so paging forward
-        # means older rows — monotonic_seq < after_seq. Applied here, not in
-        # _build_where, so count()/total stays the full filtered count
-        # independent of the cursor. Mirrors the Go audit store.
+        # Cursor paging: rows are newest first, so the next page is
+        # monotonic_seq < after_seq. Not in _build_where so count() ignores
+        # the cursor. Same as the Go store.
         #
-        # Accepted limitation on multi-origin stores (A1 in PR #59 review):
-        # the query orders by (timestamp, monotonic_seq) but the cursor is
-        # monotonic_seq alone, which is a per-(service_id, source_node_id)
-        # counter (see the tie-breaker note below). Paging to exhaustion
-        # across rows from more than one origin can skip or repeat rows
-        # because a lower seq in origin B can appear at a newer timestamp
-        # than a higher seq in origin A. Single-origin stores are unaffected.
-        # A composite (timestamp, seq) cursor would fix this but changes the
-        # wire contract; keeping the simpler cursor is the deliberate call.
+        # Known limitation: the seq is per node but rows are ordered by
+        # timestamp, so paging through rows from several nodes can skip or
+        # repeat rows. Fixing it needs a (timestamp, seq) cursor, which would
+        # change the wire format.
         if after_seq > 0:
             where = f"{where} AND monotonic_seq < ?" if where else "WHERE monotonic_seq < ?"
             params = [*params, after_seq]
         with self._txn():
             cur = self._connect().execute(
-                # Wall-clock first: monotonic_seq is a per-(service_id,
-                # source_node_id) counter, meaningless across sub-chains —
-                # it stays as the same-timestamp tie-breaker only (#68).
+                # Timestamp first: monotonic_seq is per node, so it only
+                # breaks ties (#68).
                 f"SELECT * FROM {self._table} {where} "
                 "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
@@ -677,19 +562,14 @@ class SQLiteStore:
         limit: int = 50,
         tenant_id: str | None = None,
     ) -> list[AuditRow]:
-        """FR3 free-text search over persisted audit history (§4.1). Substring
-        scan over the ``detail`` JSON column (audit's payload equivalent). The
-        result carries the same ``request_id`` that ``/correlate`` consumes.
-
-        Deliberately constrained: ``since`` is mandatory to bound the linear
-        scan; ``%``/``_``/``\\`` in ``q`` are escaped so they match literally
-        rather than acting as LIKE wildcards. Newest-first, hard-capped by
-        ``limit`` — no relevance ranking.
+        """Case-insensitive substring search of the ``detail`` JSON, newest
+        first, at most ``limit`` rows. ``since`` bounds the scan. ``%``, ``_``
+        and ``\\`` in ``q`` match literally.
 
         ``tenant_id`` scopes the search to one tenant when supplied — the
         reader wires the caller's authenticated tenant into this arg so a
         multi-tenant shared store doesn't leak substring matches across
-        tenant boundaries (P1-44)."""
+        tenant boundaries."""
         esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["COALESCE(timestamp, '') >= ?", "lower(detail) LIKE ? ESCAPE '\\'"]
         params: list[Any] = [since, f"%{esc}%"]
@@ -714,15 +594,8 @@ class SQLiteStore:
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Fleet topology, aggregated from the rows already recorded.
-
-        Groups by ``(source_node_id, service_id, tenant_id)`` and returns
-        one entry per distinct emitting source with its row count and
-        first/last-seen timestamps. There is no separate topology table —
-        this is the honest "what nodes/services/tenants are represented in
-        this store" view, derived from the audit rows themselves. Ordered
-        by row count, busiest first.
-        """
+        """Row count and first/last seen time per ``(source_node_id,
+        service_id, tenant_id)``, busiest first."""
         where, params = self._build_where(since=since, until=until)
         with self._txn():
             cur = self._connect().execute(
@@ -751,18 +624,10 @@ class SQLiteStore:
         service_id: str | None = None,
         source_node_id: str | None = None,
     ) -> int:
-        """Return MAX(monotonic_seq) for seeding _seq at init; 0 if no rows.
-
-        The tamper chain is per ``(service_id, source_node_id)`` and
-        ``monotonic_seq`` is a per-node counter, so seeding MUST be scoped to
-        the engine's OWN identity. An unscoped MAX() across all origins would,
-        after this node ingested replicated rows from another origin, seed the
-        engine's seq from a foreign sub-chain and break this node's own chain
-        (its next row would skip ahead of its own last seq). When both
-        arguments are given the query is scoped; called with no arguments it
-        falls back to the legacy global MAX (used only where identity is
-        unavailable).
-        """
+        """MAX(monotonic_seq), or 0 with no rows. Scoped to the given
+        ``service_id`` and ``source_node_id`` when both are passed, otherwise
+        over the whole table. The engine does not use this; the store
+        allocates seq on insert."""
         scoped = service_id is not None and source_node_id is not None
         with self._txn():
             if scoped:
@@ -782,9 +647,7 @@ class SQLiteStore:
         keys = r.keys()
         return AuditRow(
             id=r["id"], origin_id=r["origin_id"], monotonic_seq=r["monotonic_seq"],
-            # Strict canonical parse (spec §4.3). Every row in this table was
-            # written by _utc_iso → canonical_ts, so anything else is a bug at
-            # the source and must fail loudly instead of round-tripping.
+            # Strict: every row was written by _utc_iso().
             timestamp=parse_canonical(r["timestamp"]),
             code=r["code"], action=r["action"], severity=r["severity"],
             service_id=r["service_id"], source_node_id=r["source_node_id"],

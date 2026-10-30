@@ -1,8 +1,8 @@
 // Smoke tests for fasten_store_postgres.hpp.
 //
-// Tests #1 and #2 (validation + connection error) run without a live database.
-// Tests #3+ require FASTEN_TEST_POSTGRES_DSN to be set; they are silently
-// skipped when the env var is absent so CI passes without a Postgres service.
+// Table-name validation and the connection error run without a database.
+// The rest need FASTEN_TEST_POSTGRES_DSN and are skipped (still passing)
+// when it is unset.
 #include "fasten.hpp"
 #include "fasten_store_postgres.hpp"
 
@@ -40,7 +40,7 @@ fasten::Row make_row(const std::string& id, const std::string& code) {
     return r;
 }
 
-// ── No-DSN tests ──────────────────────────────────────────────────────────
+// No-DSN tests
 
 void test_invalid_table_name() {
     bool threw = false;
@@ -68,13 +68,13 @@ void test_connection_error() {
     std::cout << "  test_connection_error: PASS\n";
 }
 
-// ── Live-database tests (require FASTEN_TEST_POSTGRES_DSN) ────────────────
+// Live-database tests (require FASTEN_TEST_POSTGRES_DSN)
 
 void test_insert_idempotent(const std::string& dsn) {
     fasten::PostgresStore store(dsn, "fasten_cpp_pg_test");
     auto row = make_row("evt-cpp-pg-insert-001", "TEST_INSERT");
     store.insert(row);
-    store.insert(row); // ON CONFLICT (id) DO NOTHING — must not throw
+    store.insert(row); // ON CONFLICT (id) DO NOTHING: must not throw
     std::cout << "  test_insert_idempotent: PASS\n";
 }
 
@@ -129,7 +129,7 @@ int main() {
 
     const char* raw_dsn = get_dsn();
     if (!raw_dsn) {
-        std::cout << "FASTEN_TEST_POSTGRES_DSN not set — skipping live tests.\n";
+        std::cout << "FASTEN_TEST_POSTGRES_DSN not set, skipping live tests.\n";
         std::cout << "All PostgreSQL store smoke tests passed.\n";
         return 0;
     }

@@ -1,8 +1,7 @@
-"""NL / smart-box → structured chips (§3.7, §6.3).
+"""Search box text to structured chips (spec §3.7, §6.3).
 
-The translator maps query text to the three reader primitives — structured
-filters, a correlation request_id, and the bounded q= — and never invents a
-filter the store doesn't support.
+Text maps to structured filters, a correlation request_id, or the bounded q=.
+The translator never invents a filter the store doesn't support.
 """
 from fasten.query import Chips, RuleTranslator, Translator, translate
 
@@ -25,7 +24,7 @@ def test_quoted_text_becomes_q():
 
 
 def test_bare_hex_is_correlation_id():
-    c = translate("3a7b1c9d0e2f")  # 12 hex → request_id pivot
+    c = translate("3a7b1c9d0e2f")  # 12 hex chars: a request_id
     assert c.request_id == "3a7b1c9d0e2f"
     assert c.q is None
 
@@ -42,7 +41,7 @@ def test_explicit_request_id_field():
 
 
 def test_unknown_field_is_search_text_not_a_filter():
-    # The store has no 'colour' filter — must not fabricate one.
+    # The store has no 'colour' filter.
     c = translate("colour:blue")
     assert c.filters == {}
     assert c.q == "colour:blue"

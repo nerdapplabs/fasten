@@ -58,10 +58,10 @@ func TestSeal_TwoRowChain(t *testing.T) {
 }
 
 // TestVerifyChain_UnknownCanonicalFormID proves a row carrying an unknown
-// canonical_form_id is REJECTED, with the reason naming the offending id.
+// canonical_form_id is rejected, with the reason naming the offending id.
 func TestVerifyChain_UnknownCanonicalFormID(t *testing.T) {
 	row := Seal("genesis", bareRow(1, "evt-1"))
-	// Forge an unknown form id WITHOUT recomputing the hash — the rejection must
+	// Set an unknown form id without recomputing the hash; the rejection must
 	// be on the unknown id, ahead of any hash recompute.
 	row.CanonicalFormID = "99"
 	res := VerifyChain([]Row{row})

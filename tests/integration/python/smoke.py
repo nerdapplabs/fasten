@@ -20,10 +20,10 @@ register("user", [
 
 fasten.init()
 
-# 1. sys row — fasten's own structured syslog; stamps request_id automatically.
+# 1. sys row. fasten.log adds request_id itself.
 fasten.log.info("startup_ok", lang="python")
 
-# 2. audit row with PII detail — redaction exercised.
+# 2. audit row whose detail has fields that must be redacted.
 fasten.emit(
     code="USER_CREATED",
     target="u-42",
@@ -36,9 +36,8 @@ fasten.emit(
     },
 )
 
-# 3. api row — what an access-log middleware emits after each HTTP request.
-#    In production this is written by RequestIDMiddleware (or a thin wrapper);
-#    here we call write_api directly to keep the smoke dep-free.
+# 3. api row, normally written by RequestIDMiddleware after each HTTP request.
+#    Called directly here to avoid a web framework dependency.
 fasten.transport().write_api({
     "method": "POST",
     "path": "/api/users",
@@ -48,10 +47,8 @@ fasten.transport().write_api({
     "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
 })
 
-# 4. structlog shim — adopters already on structlog route their events through
-#    make_fasten_processor(), which buffers each log line into fasten's syslog
-#    ring (for /logs/sys) without touching stdout (structlog owns stdout).
-#    Adopters on this path never call fasten.log directly.
+# 4. structlog shim. make_fasten_processor() copies each structlog event into
+#    fasten's syslog ring (served at /logs/sys) and leaves stdout to structlog.
 try:
     import structlog
     from fasten.shim.structlog import make_fasten_processor
@@ -60,7 +57,7 @@ try:
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            make_fasten_processor(),       # buffer into fasten ring; stdout untouched
+            make_fasten_processor(),
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(0),
@@ -74,4 +71,4 @@ try:
         "structlog shim: 'structlog_ok' not found in syslog ring buffer"
     )
 except ImportError:
-    pass  # structlog is optional — skip when not installed
+    pass  # structlog is optional

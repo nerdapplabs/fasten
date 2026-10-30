@@ -14,52 +14,38 @@ import (
 	"unicode/utf8"
 )
 
-// currentCanonicalFormID is stamped on every row sealed by this SDK version.
+// currentCanonicalFormID is stamped on every row this SDK seals. It must
+// match Python's CURRENT_CANONICAL_FORM_ID.
 //
-// Canonical forms
-// ---------------
-// The hashed canonical form is versioned via Row.CanonicalFormID so the choice
-// of bytes is tamper-evident and future forms are additive.
+// Form "1": SHA-256 of the canonical JSON of pyCanonicalRowMap (without
+// "hash", with canonical_form_id), matching Python's form "1" hash:
+// AuditRow.to_dict() with timestamps in isoformat (+00:00) form, through
+// json.dumps(sort_keys=True, separators=(',',':'), default=str).
 //
-// Form "1": SHA-256 of the canonical JSON of the row map built by
-// pyCanonicalRowMap (the "hash" key excluded, canonical_form_id INCLUDED),
-// matching Python json.dumps(sort_keys=True, separators=(',',':'),
-// default=str) over AuditRow.to_dict() byte-for-byte.
-//
-// Form "2" (spec §1.4, what we seal now): detail_commitment replaces detail in
-// the hashed set, so detail can be destroyed for retention without moving the
-// hash. Form "1" rows still verify under form "1" — old rows are never
-// re-sealed, which would destroy the evidence.
-//
-// This MUST match Python's CURRENT_CANONICAL_FORM_ID. While Go sealed "1" and
-// Python sealed "2", the two SDKs produced different forms for the same row,
-// and the PII horizon (Config.RetentionPII) could never fire on a Go-sealed
-// row: form "1" hashes detail directly, so redacting one breaks the chain.
-// VerifyChain dispatches per row and REJECTS an unknown id.
+// Form "2" (spec §1.4): detail_commitment replaces detail in the hashed set,
+// so detail can be removed for retention without changing the hash. Old
+// rows keep verifying under form "1" and are never re-sealed. VerifyChain
+// picks the form per row and rejects an unknown id.
 const currentCanonicalFormID = "2"
 
-// legacyCanonicalFormID is the form a row carries when canonical_form_id is
-// absent — i.e. it was written before the field existed, which means form "1".
+// legacyCanonicalFormID is the form of a row without canonical_form_id: it
+// predates the field, so it is form "1".
 const legacyCanonicalFormID = "1"
 
-// hashFnByForm maps a canonical_form_id to the function that hashes a row under
-// that form. Adding v2 is purely additive: register a new id here, stamp it in
-// Seal, and VerifyChain dispatches automatically.
+// hashFnByForm maps a canonical_form_id to its row hash function. A new form
+// is added here and stamped in Seal; VerifyChain picks it up from this map.
 var hashFnByForm = map[string]func(Row) string{
 	"1": rowHashPyCompat,
 	"2": rowHashForm2,
 }
 
 // Seal returns a copy of row sealed into the chain: it stamps the current
-// CanonicalFormID, sets PrevHash, mints the form-"2" salt/commitment, and
-// computes the self Hash. This is the ONE canonical way to seal a row — Emit
-// goes through it, so Go Emit, Go VerifyChain and Python seal agree on a
-// single field set.
+// CanonicalFormID, sets PrevHash, sets the detail salt and commitment, and
+// computes Hash. Emit seals through this.
 func Seal(prevHash string, row Row) Row {
 	row.CanonicalFormID = currentCanonicalFormID
 	row.PrevHash = prevHash
-	// Mirrors Python chain.seal: reuse a caller-supplied salt (a replicated
-	// row arrives with its own) and mint one otherwise.
+	// A replicated row arrives with its own salt; keep it.
 	if row.DetailSalt == "" {
 		row.DetailSalt = newDetailSalt()
 	}
@@ -68,8 +54,8 @@ func Seal(prevHash string, row Row) Row {
 	return row
 }
 
-// newDetailSalt mints a 32-byte salt, hex-encoded — the same shape as Python's
-// secrets.token_hex(32), so a commitment is reproducible across SDKs.
+// newDetailSalt returns 32 random bytes, hex-encoded, like Python's
+// secrets.token_hex(32).
 func newDetailSalt() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -92,16 +78,10 @@ type VerifyResult struct {
 	Reason       string `json:"reason"`
 }
 
-// VerifyChain walks the per-row tamper-evidence hash chain and reports whether
-// it is intact. It is the Go counterpart of the Python fasten.verify_chain and
-// produces byte-for-byte identical row hashes, so a Go upstream aggregator can
-// verify chains that were sealed by a Python node.
-//
-// The canonical hashed form, the cross-language rendering rules (including the
-// whole-number-float hazard in §1.3), the canonical_form_id registry, and the
-// replication contract are normative in ../spec/chain-replication.md.
-//
-// Semantics mirror Python engine.py verify_chain exactly:
+// VerifyChain checks the hash chain over rows and reports whether it is
+// intact. Row hashes match Python's, so chains sealed by either SDK verify
+// here. The hashed form and rendering rules are specified in
+// ../spec/chain-replication.md.
 //
 //   - Rows are sorted by MonotonicSeq before walking.
 //   - Rows with an empty Hash (written before hash-chain support) are skipped.
@@ -130,10 +110,7 @@ func VerifyChain(rows []Row) VerifyResult {
 		}
 		formID := row.CanonicalFormID
 		if formID == "" {
-			// "1", NOT currentCanonicalFormID: a row written before the field
-			// existed IS form "1". Defaulting to "current" silently
-			// re-interpreted every legacy row the moment the SDK started
-			// sealing "2", and they then failed the commitment check.
+			// A row without the field predates it, so it is form "1".
 			formID = legacyCanonicalFormID
 		}
 		hashFn, ok := hashFnByForm[formID]
@@ -215,8 +192,8 @@ func VerifyChain(rows []Row) VerifyResult {
 //	json.dumps(d, sort_keys=True, separators=(',',':'), default=str)
 //
 // over AuditRow.to_dict(), which means:
-//   - the exact Python field set (NOTE: no pii_in_detail, which the Go wire
-//     Row carries but the Python AuditRow does not),
+//   - the exact Python field set (no pii_in_detail, which the Go Row
+//     carries but the Python AuditRow does not),
 //   - sorted keys (top level and nested), compact separators,
 //   - None -> null for tenant_id / shipped_at,
 //   - timestamp / shipped_at as Python datetime.isoformat() strings,
@@ -259,14 +236,9 @@ func rowHashForm1LegacyZ(row Row) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// rowHashForm2 hashes form "2" (spec §1.4): form "1"'s field set with detail
-// and detail_salt removed and detail_commitment added, and the timestamp taken
-// VERBATIM from the wire form rather than re-rendered.
-//
-// Form "1" hashed "+00:00" while the row carried always-"Z" on the wire, so
-// every SDK needed a second private timestamp renderer used only in the hash
-// path — which is how Go and Python drifted apart inside it (#91). Form "2"
-// has one timestamp form, the one already written to the wire.
+// rowHashForm2 hashes form "2" (spec §1.4): form "1"'s fields with detail
+// replaced by detail_commitment, and timestamps in the same canonical form
+// as on the wire (form "1" used a separate "+00:00" rendering).
 func rowHashForm2(row Row) string {
 	d := pyCanonicalRowMap(row)
 	delete(d, "detail")
@@ -279,9 +251,9 @@ func rowHashForm2(row Row) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// pyCanonicalRowMap builds the map whose key set and value encodings match
-// Python AuditRow.to_dict() minus the "hash" key. pii_in_detail is
-// deliberately omitted because the Python row dict never contains it.
+// pyCanonicalRowMap builds the map with the same keys and value encodings as
+// Python's AuditRow.to_dict(), without "hash" (and without pii_in_detail,
+// which Python's dict doesn't have).
 func pyCanonicalRowMap(row Row) map[string]any {
 	var tenant any
 	if row.TenantID != nil {
@@ -329,8 +301,8 @@ func pyCanonicalRowMap(row Row) map[string]any {
 	}
 }
 
-// pyISOFormat formats t exactly as Python datetime.isoformat() does for a
-// UTC-aware datetime: the timestamps fasten emits are always tz-aware UTC, so
+// pyISOFormat formats t as Python's datetime.isoformat() does for a UTC
+// datetime:
 //   - the offset is rendered as "+00:00" (not "Z"),
 //   - the fractional part is omitted entirely when microseconds == 0,
 //   - otherwise it is exactly six digits (microseconds, trailing zeros kept),
@@ -349,18 +321,15 @@ func pyISOFormat(t time.Time) string {
 // json.dumps(v, sort_keys=True, separators=(',',':'), default=str, ensure_ascii=True)
 // would: sorted keys, compact separators, HTML left literal, non-ASCII escaped.
 //
-// Go's encoding/json already sorts map keys and uses compact separators, so we
-// only have to (a) disable Go's default HTML escaping and (b) escape non-ASCII
-// runes to \uXXXX. Because every structural JSON byte is ASCII, escaping any
-// byte >= 0x80 is safe and only touches string contents.
+// encoding/json already sorts map keys and is compact, so this only turns off
+// HTML escaping and escapes non-ASCII runes as \uXXXX. Bytes >= 0x80 only
+// appear inside strings, so that is safe.
 func canonicalJSON(v any) []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	// Encode panics-free for the map shapes we build; an error here would be a
-	// programming bug, not runtime data, so we surface the encoder's own bytes.
+	// The maps built here always encode, so the error is ignored.
 	_ = enc.Encode(v)
-	// Encoder appends a trailing newline; strip it.
 	out := bytes.TrimRight(buf.Bytes(), "\n")
 	return asciiEscape(out)
 }
@@ -368,7 +337,6 @@ func canonicalJSON(v any) []byte {
 // asciiEscape replaces every non-ASCII rune in the JSON bytes with its \uXXXX
 // (or surrogate-pair) escape, matching Python json.dumps ensure_ascii=True.
 func asciiEscape(b []byte) []byte {
-	// Fast path: pure ASCII needs no rewrite.
 	if isASCII(b) {
 		return b
 	}
@@ -382,13 +350,13 @@ func asciiEscape(b []byte) []byte {
 		}
 		r, size := utf8.DecodeRune(b[i:])
 		if r == utf8.RuneError && size == 1 {
-			// Invalid byte — emit as-is to avoid corrupting length.
+			// Invalid UTF-8: copy the byte as is.
 			sb.WriteByte(c)
 			i++
 			continue
 		}
 		if r > 0xFFFF {
-			// Encode as a UTF-16 surrogate pair, matching Python.
+			// UTF-16 surrogate pair, as Python writes it.
 			r -= 0x10000
 			hi := 0xD800 + (r >> 10)
 			lo := 0xDC00 + (r & 0x3FF)

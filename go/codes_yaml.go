@@ -9,37 +9,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// codeKeyRe validates audit-code identifiers — UPPER_SNAKE_CASE.
-// Used by the YAML loader; programmatic Register() delegates to the Rust core.
+// codeKeyRe checks UPPER_SNAKE_CASE code keys in yaml files. Register()
+// leaves this check to fasten-core.
 var codeKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
-// Catalog YAML loader (P1-11).
+// Loading audit codes from yaml files:
 //
-// Optional feature — adopters who stay on programmatic Register() never
-// touch this code path. yaml.v3 is a small dep (~150 KB); paid by every
-// Go fasten install but only meaningfully imported when Load() is called.
-//
-// API:
-//
-//	fasten.Load("fleet.codes.yaml")    // initial load (returns error)
+//	fasten.Load("fleet.codes.yaml")
 //	fasten.MustLoad("fleet.codes.yaml") // panics on error
-//	fasten.Reload()                    // atomic + fault-tolerant
+//	fasten.Reload()
 //
-// Reload re-reads every previously-loaded path. If parsing or validation
-// fails, the previous catalog stays active and the error is returned.
-// Reload is NOT additive — codes removed from the yaml become unknown
-// after the swap. Stored audit rows referencing them remain readable
-// (the wire `code` field is a free string).
-//
-// Codes registered programmatically (via fasten.Register) are tracked
-// separately and survive Reload.
+// Reload re-reads every loaded file and swaps the catalog in one step. If
+// anything fails, the old catalog stays. Codes removed from the yaml are
+// dropped (stored rows that use them are still readable); codes added with
+// Register() are kept.
 
 var (
 	yamlMu    sync.Mutex
 	yamlPaths []string
-	// yamlCodes records which codes came from yaml (vs. programmatic).
-	// Reload uses this to drop codes the new yaml file no longer declares
-	// while preserving programmatic registrations.
+	// yamlCodes marks codes that came from yaml, so Reload can tell them
+	// apart from codes added with Register().
 	yamlCodes = map[Code]bool{}
 )
 
@@ -60,10 +49,8 @@ type yamlCodeEntry struct {
 	HighVolume     bool   `yaml:"high_volume"`
 }
 
-// Load reads a yaml catalog file into the registry.
-//
-// Errors raise loudly (return error) — designed for startup, restart-safe.
-// Use Reload() to refresh later without restarting the process.
+// Load adds the codes in a yaml file to the registry. Use Reload() to pick
+// up later edits without restarting.
 func Load(path string) error {
 	fresh, err := buildFromYAMLPaths([]string{path})
 	if err != nil {
@@ -75,11 +62,11 @@ func Load(path string) error {
 	regMu.Lock()
 	defer regMu.Unlock()
 
-	// Reject collisions with programmatic registrations.
+	// A yaml code can't replace one added with Register().
 	for code := range fresh {
 		if _, exists := _registry[code]; exists && !yamlCodes[code] {
 			return fmt.Errorf(
-				"fasten.Load: %s:%s — duplicate code (already registered programmatically)",
+				"fasten.Load: %s:%s: duplicate code (already registered programmatically)",
 				path, code,
 			)
 		}
@@ -104,16 +91,10 @@ func MustLoad(path string) {
 	}
 }
 
-// Reload re-reads every previously-loaded path and atomically swaps the registry.
-//
-// Atomic + fault-tolerant: parse + validate fully into a fresh map; any
-// error returns without touching the live registry. On success, swap
-// under a lock — concurrent Emit readers see either old or new, never
-// partial state.
-//
-// Reload is NOT additive: codes removed from the yaml file become unknown
-// (Emit raises). Programmatic Register() codes (not in any yaml file)
-// survive the swap.
+// Reload re-reads every loaded file and swaps the registry under regMu, so
+// Emit sees either the old catalog or the new one. On error the registry is
+// left alone. Codes no longer in any file become unknown (Emit returns an
+// error); codes added with Register() are kept.
 func Reload() error {
 	yamlMu.Lock()
 	paths := append([]string{}, yamlPaths...)
@@ -133,7 +114,6 @@ func Reload() error {
 	yamlMu.Lock()
 	defer yamlMu.Unlock()
 
-	// Preserve programmatic codes (not in current or previous yaml set).
 	programmatic := map[Code]Meta{}
 	for code, meta := range _registry {
 		if !yamlCodes[code] {
@@ -157,8 +137,8 @@ func Reload() error {
 	return nil
 }
 
-// buildFromYAMLPaths parses + validates every path; returns the fresh
-// registry or the first error. Caller's live registry is untouched.
+// buildFromYAMLPaths parses and validates every file and returns the codes,
+// or the first error. It doesn't touch the live registry.
 func buildFromYAMLPaths(paths []string) (map[Code]Meta, error) {
 	fresh := map[Code]Meta{}
 	for _, path := range paths {
@@ -171,30 +151,30 @@ func buildFromYAMLPaths(paths []string) (map[Code]Meta, error) {
 			return nil, fmt.Errorf("fasten: parsing %s: %w", path, err)
 		}
 		if f.Domain == "" {
-			return nil, fmt.Errorf("fasten: %s — top-level 'domain' is required", path)
+			return nil, fmt.Errorf("fasten: %s: top-level 'domain' is required", path)
 		}
 		for codeStr, raw := range f.Codes {
 			if !codeKeyRe.MatchString(codeStr) {
 				return nil, fmt.Errorf(
-					"fasten: %s:%s — code key must be UPPER_SNAKE_CASE",
+					"fasten: %s:%s: code key must be UPPER_SNAKE_CASE",
 					path, codeStr,
 				)
 			}
 			if _, ok := fresh[Code(codeStr)]; ok {
-				return nil, fmt.Errorf("fasten: %s:%s — duplicate code in yaml", path, codeStr)
+				return nil, fmt.Errorf("fasten: %s:%s: duplicate code in yaml", path, codeStr)
 			}
 
 			sev, err := parseSeverityYAML(raw.Severity)
 			if err != nil {
-				return nil, fmt.Errorf("fasten: %s:%s — %w", path, codeStr, err)
+				return nil, fmt.Errorf("fasten: %s:%s: %w", path, codeStr, err)
 			}
 			rc, err := parseRetentionYAML(raw.RetentionClass)
 			if err != nil {
-				return nil, fmt.Errorf("fasten: %s:%s — %w", path, codeStr, err)
+				return nil, fmt.Errorf("fasten: %s:%s: %w", path, codeStr, err)
 			}
 			if raw.Domain != "" && raw.Domain != f.Domain {
 				return nil, fmt.Errorf(
-					"fasten: %s:%s — domain=%q disagrees with file-level domain=%q",
+					"fasten: %s:%s: domain=%q disagrees with file-level domain=%q",
 					path, codeStr, raw.Domain, f.Domain,
 				)
 			}

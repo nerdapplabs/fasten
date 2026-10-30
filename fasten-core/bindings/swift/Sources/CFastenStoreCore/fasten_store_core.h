@@ -1,5 +1,5 @@
 /**
- * fasten_core.h — C ABI for the shared fasten audit-store library.
+ * fasten_store_core.h: the store functions from fasten-core/include/fasten_core.h.
  *
  * Supported platforms
  * -------------------
@@ -9,8 +9,8 @@
  *
  * Backends
  * --------
- * "sqlite"   — SQLite 3 (bundled; no system dep required)
- * "postgres" — PostgreSQL 15+ via pure-Rust wire protocol (no libpq)
+ * "sqlite"   SQLite 3 (bundled; no system dep required)
+ * "postgres" PostgreSQL 15+ via pure-Rust wire protocol (no libpq)
  *
  * Ownership rules
  * ---------------
@@ -37,7 +37,7 @@
 extern "C" {
 #endif
 
-/* ── Opaque handle ─────────────────────────────────────────────────────────── */
+/* Opaque handle */
 
 /**
  * Opaque audit-store handle. Do not inspect or allocate directly.
@@ -45,7 +45,7 @@ extern "C" {
  */
 typedef struct FastenStore FastenStore;
 
-/* ── Error codes ───────────────────────────────────────────────────────────── */
+/* Error codes */
 
 /**
  * Typed return codes from all fasten_store_* functions (except open/close/
@@ -67,7 +67,7 @@ typedef enum {
     FASTEN_ERR_UNKNOWN   = 99   /**< Internal panic or unexpected error.        */
 } FastenErrorCode;
 
-/* ── Lifecycle ─────────────────────────────────────────────────────────────── */
+/* Lifecycle */
 
 /**
  * Open an audit store.
@@ -103,12 +103,12 @@ FastenStore* fasten_store_open(
  */
 void fasten_store_close(FastenStore* store);
 
-/* ── Write path ────────────────────────────────────────────────────────────── */
+/* Write path */
 
 /**
  * Insert a single audit row.
  *
- * Duplicate rows (same `id`) are silently ignored — the operation is
+ * Duplicate rows (same `id`) are silently ignored; the operation is
  * idempotent.
  *
  * @param store    Non-null handle returned by fasten_store_open().
@@ -128,7 +128,7 @@ FastenErrorCode fasten_store_insert(
     char**       out_err
 );
 
-/* ── Health ─────────────────────────────────────────────────────────────────── */
+/* Health */
 
 /**
  * Verify the backend is reachable.
@@ -143,7 +143,7 @@ FastenErrorCode fasten_store_insert(
  */
 FastenErrorCode fasten_store_ping(FastenStore* store, char** out_err);
 
-/* ── Read path ─────────────────────────────────────────────────────────────── */
+/* Read path */
 
 /**
  * Query rows matching an optional JSON filter object.
@@ -151,14 +151,14 @@ FastenErrorCode fasten_store_ping(FastenStore* store, char** out_err);
  * @param store         Non-null handle.
  * @param filter_json   Optional JSON object (may be NULL = match all rows).
  *                      Recognised keys (all optional):
- *                        "request_id"    — exact match
- *                        "code"          — exact match
- *                        "domain"        — exact match
- *                        "source_node_id"— exact match
- *                        "since"         — timestamp >= value (ISO-8601)
- *                        "until"         — timestamp <= value (ISO-8601)
- *                        "limit"         — max rows (0 = no limit)
- *                        "offset"        — skip this many matching rows
+ *                        "request_id"    exact match
+ *                        "code"          exact match
+ *                        "domain"        exact match
+ *                        "source_node_id"  exact match
+ *                        "since"         timestamp >= value (ISO-8601)
+ *                        "until"         timestamp <= value (ISO-8601)
+ *                        "limit"         max rows (0 = no limit)
+ *                        "offset"        skip this many matching rows
  * @param out_rows_json On success: set to a heap-allocated UTF-8 JSON array
  *                      of row objects, ordered by monotonic_seq ASC.
  *                      Free with fasten_store_free_str(). May be NULL.
@@ -263,7 +263,7 @@ FastenErrorCode fasten_store_max_monotonic_seq(
     char**       out_err
 );
 
-/* ── Memory management ─────────────────────────────────────────────────────── */
+/* Memory management */
 
 /**
  * Free a string returned by this library (error strings and JSON output
@@ -273,7 +273,7 @@ FastenErrorCode fasten_store_max_monotonic_seq(
  */
 void fasten_store_free_str(char* s);
 
-/* ── Metadata ──────────────────────────────────────────────────────────────── */
+/* Metadata */
 
 /**
  * Return a NUL-terminated version string (e.g. "0.1.0").

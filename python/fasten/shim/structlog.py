@@ -1,15 +1,8 @@
-"""
-structlog shim — push every log event into fasten's syslog ring + a one-call
-``configure()`` that wires structlog + stdlib to the same formatter.
+"""structlog integration.
 
-Two public surfaces:
-
-    make_fasten_processor()  → a structlog processor (compose-it-yourself path)
-    configure(...)           → opinionated one-call setup (most adopters)
-
-``configure()`` is the recommended path: it installs the fasten processor,
-the redaction processor, JSON or console renderer, and a stdlib bridge so
-``import logging`` calls reach the same destination.
+``configure()`` sets up structlog with the fasten and redaction processors, a
+JSON or console renderer, and the stdlib bridge. ``make_fasten_processor()``
+returns just the processor, for an existing structlog setup.
 """
 from __future__ import annotations
 
@@ -18,13 +11,8 @@ from typing import Any, Callable, Iterable, Optional
 
 
 def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, Any]]:
-    """Return a structlog processor that pushes events to fasten's syslog buffer.
-
-    Side-effect only: writes to fasten's ring + returns ``event_dict`` unchanged.
-    Does NOT write to stdout (the renderer / formatter handles that).
-
-    If ``fasten.init()`` has not been called, the processor is a no-op.
-    """
+    """Return a structlog processor that pushes each event to fasten's sys
+    stream and returns ``event_dict`` unchanged. Does nothing before init()."""
 
     def _processor(logger: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -33,11 +21,11 @@ def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, An
             if transport is None:
                 return event_dict
 
-            # Build a clean syslog row — exclude structlog internals
+            # Drop structlog's internal keys.
             _skip = {"_record", "_from_structlog"}
             row = {k: v for k, v in event_dict.items() if k not in _skip}
 
-            # Normalise level key (structlog uses "log_level" in some configs)
+            # Some structlog configs use "log_level".
             if "log_level" in row and "level" not in row:
                 row["level"] = row.pop("log_level")
 
@@ -49,9 +37,7 @@ def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, An
     return _processor
 
 
-# ── One-call configure ────────────────────────────────────────────────────
-
-# Defaults reasonable noisy libs to WARN. Override via ``quiet=()`` to disable.
+# Loggers set to WARNING by configure() unless quiet= is given.
 _DEFAULT_QUIET = (
     "urllib3",
     "botocore",
@@ -68,7 +54,7 @@ def configure(
     quiet: Optional[Iterable[str]] = None,
     extra_redact_keys: Optional[list[str]] = None,
 ) -> None:
-    """Install structlog + stdlib bridge in one call.
+    """Configure structlog and the stdlib bridge.
 
     Args:
         json: True for JSON output (prod), False for ConsoleRenderer (dev).
@@ -80,14 +66,9 @@ def configure(
             Pass ``()`` to disable; pass your own iterable to override.
         extra_redact_keys: extra patterns for the redaction processor.
 
-    Side effects:
-      - ``structlog.configure(...)`` is called with fasten's processor list
-      - ``logging.basicConfig`` sets the stdlib root level
-      - ``LoggingHandler`` (fasten.shim.stdlib) is attached to the stdlib
-        root so ``import logging`` calls also reach the fasten ring
-      - Quiet libs raised to WARNING
-
-    Mirrors Go's one-liner ``slog.New(fasten.NewSlogHandler(base))``.
+    Calls ``structlog.configure()``, sets the root logger's level, attaches
+    one ``LoggingHandler`` to the root logger (replacing any earlier one) and
+    sets the ``quiet`` loggers to WARNING.
     """
     try:
         import structlog
@@ -102,12 +83,10 @@ def configure(
 
     level = logging.DEBUG if debug else logging.INFO
 
-    # ── structlog chain ────────────────────────────────────────────────────
-    # PrintLoggerFactory writes structlog logs directly to stdout (no stdlib
-    # roundtrip), so make_fasten_processor() is the only path into the ring
-    # for structlog events. ``add_logger_name`` is omitted because it needs
-    # a stdlib-style logger; adopters who want a logger field use
-    # ``structlog.get_logger().bind(logger="my-svc")`` or pass it explicitly.
+    # PrintLoggerFactory writes straight to stdout without stdlib logging, so
+    # make_fasten_processor() is how structlog events reach fasten.
+    # add_logger_name is left out because it needs a stdlib logger; bind a
+    # logger field instead.
     processors: list[Callable] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
@@ -135,10 +114,7 @@ def configure(
         cache_logger_on_first_use=True,
     )
 
-    # ── stdlib bridge ──────────────────────────────────────────────────────
-    # Route ``import logging`` calls into the fasten ring via LoggingHandler.
-    # A StreamHandler keeps stdout output for stdlib-native code (so legacy
-    # libraries still write to terminal as expected).
+    # Send stdlib logging to fasten too. Existing handlers are kept.
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers = [
@@ -146,7 +122,6 @@ def configure(
     ]
     root.addHandler(LoggingHandler())
 
-    # Quiet noisy libs
     quiet_libs = quiet if quiet is not None else _DEFAULT_QUIET
     for name in quiet_libs:
         logging.getLogger(name).setLevel(logging.WARNING)

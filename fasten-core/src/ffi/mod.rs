@@ -28,10 +28,6 @@ use crate::{
 };
 use util::{read_str, set_error};
 
-// ── Shared helper ─────────────────────────────────────────────────────────────
-// Re-exported so the redact and catalog submodules can use it without
-// duplicating the catch_unwind boilerplate.
-
 /// Run `f`; catch any Rust panic; return `Ok(R)` or `Err((code, message))`.
 pub(crate) fn guarded<F, R>(f: F) -> Result<R, (FastenErrorCode, String)>
 where
@@ -49,8 +45,6 @@ where
         )),
     }
 }
-
-// ── Opaque handle ─────────────────────────────────────────────────────────────
 
 /// Heap-allocated, type-erased store + optional drainer. C sees only `FastenStore*`.
 pub struct FastenStoreHandle {
@@ -75,14 +69,12 @@ unsafe fn result_to_rc(
     }
 }
 
-// ── Exported symbols ──────────────────────────────────────────────────────────
-
 /// Open a store and return an opaque handle.
 ///
-/// `backend`  — `"sqlite"` or `"postgres"`.
-/// `connstr`  — filesystem path (sqlite) or connection DSN (postgres).
-/// `table`    — table name, optionally schema-qualified (`"schema.table"`).
-/// `out_err`  — set to a heap-allocated error string on failure (free with
+/// `backend`:   `"sqlite"` or `"postgres"`.
+/// `connstr`:   filesystem path (sqlite) or connection DSN (postgres).
+/// `table`:     table name, optionally schema-qualified (`"schema.table"`).
+/// `out_err`:   set to a heap-allocated error string on failure (free with
 ///              `fasten_store_free_str`); may be NULL if the caller ignores
 ///              error detail.
 ///
@@ -127,9 +119,9 @@ pub unsafe extern "C" fn fasten_store_open(
 
 /// Insert a JSON-encoded audit row.
 ///
-/// `handle`   — handle returned by `fasten_store_open`; must be non-null.
-/// `row_json` — UTF-8 JSON object matching the fasten wire schema.
-/// `out_err`  — set on error; may be NULL.
+/// `handle`:    handle returned by `fasten_store_open`; must be non-null.
+/// `row_json`:  UTF-8 JSON object matching the fasten wire schema.
+/// `out_err`:   set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -172,14 +164,14 @@ pub unsafe extern "C" fn fasten_store_ping(
 
 /// Query rows matching an optional JSON filter object.
 ///
-/// `filter_json` — nullable; when NULL all rows are returned.
+/// `filter_json`:  nullable; when NULL all rows are returned.
 ///                 JSON object with optional fields: `request_id`, `code`,
 ///                 `domain`, `source_node_id`, `since`, `until`, `limit`,
 ///                 `offset`.
-/// `out_rows_json` — on success, set to a heap-allocated UTF-8 JSON array of
+/// `out_rows_json`:  on success, set to a heap-allocated UTF-8 JSON array of
 ///                   row objects.  Free with `fasten_store_free_str`.
 ///                   May be NULL if the caller doesn't need the rows.
-/// `out_err`     — set on error; may be NULL.
+/// `out_err`:      set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -214,9 +206,9 @@ pub unsafe extern "C" fn fasten_store_query(
 
 /// Count rows matching an optional JSON filter object.
 ///
-/// `filter_json` — nullable; when NULL counts all rows.
-/// `out_count`   — set to the row count on success; must be non-null.
-/// `out_err`     — set on error; may be NULL.
+/// `filter_json`:  nullable; when NULL counts all rows.
+/// `out_count`:    set to the row count on success; must be non-null.
+/// `out_err`:      set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -252,10 +244,10 @@ pub unsafe extern "C" fn fasten_store_count(
 
 /// List unshipped rows (those with `shipped_at IS NULL`).
 ///
-/// `limit`         — maximum rows to return; 0 = all unshipped rows.
-/// `out_rows_json` — on success, set to a heap-allocated UTF-8 JSON array.
+/// `limit`:          maximum rows to return; 0 = all unshipped rows.
+/// `out_rows_json`:  on success, set to a heap-allocated UTF-8 JSON array.
 ///                   Free with `fasten_store_free_str`.
-/// `out_err`       — set on error; may be NULL.
+/// `out_err`:        set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -286,9 +278,9 @@ pub unsafe extern "C" fn fasten_store_list_unshipped(
 
 /// Mark rows as shipped by setting `shipped_at` to the current UTC time.
 ///
-/// `ids_json` — UTF-8 JSON array of ID strings, e.g. `["id1","id2"]`.
+/// `ids_json`:  UTF-8 JSON array of ID strings, e.g. `["id1","id2"]`.
 ///              IDs that do not exist are silently ignored.
-/// `out_err`  — set on error; may be NULL.
+/// `out_err`:   set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -311,11 +303,11 @@ pub unsafe extern "C" fn fasten_store_mark_shipped(
 
 /// Delete rows whose `timestamp` is before `before_iso8601`.
 ///
-/// `before_iso8601`    — ISO-8601 UTC upper bound; rows strictly older are
+/// `before_iso8601`:     ISO-8601 UTC upper bound; rows strictly older are
 ///                       deleted.
-/// `respect_unshipped` — non-zero: skip rows with `shipped_at IS NULL`.
-/// `out_deleted`       — set to the count of deleted rows; may be NULL.
-/// `out_err`           — set on error; may be NULL.
+/// `respect_unshipped`:  non-zero: skip rows with `shipped_at IS NULL`.
+/// `out_deleted`:        set to the count of deleted rows; may be NULL.
+/// `out_err`:            set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -349,8 +341,8 @@ pub unsafe extern "C" fn fasten_store_purge(
 
 /// Return the maximum `monotonic_seq` across all stored rows, or 0 if empty.
 ///
-/// `out_seq` — set to the maximum sequence number on success; must be non-null.
-/// `out_err` — set on error; may be NULL.
+/// `out_seq`:  set to the maximum sequence number on success; must be non-null.
+/// `out_err`:  set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -378,8 +370,6 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
         }
     }
 }
-
-// ── Callback-backed store ──────────────────────────────────────────────────
 
 /// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`.
 pub type CInsertFn = unsafe extern "C" fn(*const c_char, *mut std::ffi::c_void) -> i32;
@@ -468,22 +458,15 @@ mod tests {
     use crate::row::Row;
     use crate::store::Store;
 
-    /// Regression for issue #36 — Bug 2: when a host-language insert
-    /// callback returns non-zero, CallbackStore must report
-    /// `CallbackFailed(rc)`, not `InvalidTableName("insert callback rc=N")`.
-    /// The old wording ran an SQL-identifier validation regex against
-    /// what was actually a free-form error message, masking the real
-    /// host-side exception (compounded with Bug 1 — see python's
-    /// _insert_cb test for the round-trip half).
+    /// A non-zero rc from the host callback is reported as
+    /// `CallbackFailed(rc)` (issue #36).
     #[test]
     fn callback_store_failure_reports_callback_failed_variant() {
-        // Returns a non-zero rc to simulate a host-side callback that
-        // caught its own exception and surfaced an error code.
         extern "C" fn failing_cb(
             _json: *const c_char,
             _ud: *mut std::ffi::c_void,
         ) -> i32 {
-            7  // arbitrary non-zero
+            7
         }
         let store = CallbackStore {
             fn_ptr: failing_cb,
@@ -496,8 +479,7 @@ mod tests {
             "expected CallbackFailed(7); got {err:?} \
              (formatted: {err})",
         );
-        // And the human-readable form is what an adopter actually sees
-        // in their `audit_drain_failed` log line — no "table name" noise.
+        // This text ends up in the `audit_drain_failed` log line.
         assert_eq!(err.to_string(), "insert callback returned non-zero rc=7");
     }
 

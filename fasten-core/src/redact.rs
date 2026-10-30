@@ -1,14 +1,9 @@
-//! Secret-key and value-shape redaction — canonical implementation.
+//! Key-pattern and value-shape redaction (see spec/redact-conformance):
+//!   1. Object keys matching `REDACT_PATTERNS` get the replacement token.
+//!   2. String values matching a known secret shape get a typed token.
 //!
-//! Two-pass algorithm (identical to spec/redact-conformance):
-//!   1. Key-pattern — dict keys matching REDACT_PATTERNS → replacement token.
-//!   2. Value-shape — string values matching known secret shapes → typed token.
-//!
-//! `REDACTOR` is the global default instance used by the C ABI.
-//! `Redactor::new(extra_keys, replacement)` produces a custom instance
-//! (used by SDK adapters that call `fasten.init(extra_redact_keys=[...])`)
-//!
-//! `REDACT_PATTERNS` lists the default key-pattern strings.
+//! `REDACTOR` is the default instance used by the C ABI. `Redactor::new`
+//! builds one with extra keys, a custom replacement and extra value patterns.
 
 use regex::Regex;
 use serde_json::Value;
@@ -16,7 +11,7 @@ use std::sync::LazyLock;
 
 use crate::error::Error;
 
-// ── Key-pattern list (mirrors spec/row-schema.json codegen) ─────────────────
+// Keep in sync with x-fasten-redact.patterns in spec/row-schema.json.
 
 pub const DEFAULT_REPLACEMENT: &str = "***";
 
@@ -45,9 +40,7 @@ fn build_key_re(extra: &[&str]) -> Regex {
     Regex::new(&format!("(?i)({combined})")).expect("key pattern is valid regex")
 }
 
-// ── Value-shape patterns ──────────────────────────────────────────────────────
-
-// CC: 13–19 digit groups with optional space/dash separators.
+// Card numbers: 13 to 19 digits with optional space or dash separators.
 #[allow(clippy::expect_used)]
 static CC_DIGIT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b\d[\d\s\-]{11,17}\d\b").expect("CC regex is valid")
@@ -89,8 +82,6 @@ static VALUE_PATTERNS: LazyLock<Vec<CompiledVp>> = LazyLock::new(|| {
         .collect()
 });
 
-// ── Luhn ────────────────────────────────────────────────────────────────────
-
 fn luhn_valid(digits: &str) -> bool {
     let bytes = digits.as_bytes();
     let len = bytes.len();
@@ -107,8 +98,6 @@ fn luhn_valid(digits: &str) -> bool {
     }
     total % 10 == 0
 }
-
-// ── Redactor ─────────────────────────────────────────────────────────────────
 
 pub struct Redactor {
     key_re:      Regex,
@@ -128,12 +117,10 @@ impl Default for Redactor {
 }
 
 impl Redactor {
-    /// Custom instance.
-    ///
-    /// `extra_keys` — plain strings (not regexes); they are regex-escaped.
-    /// `replacement` — defaults to `"***"` when empty.
-    /// `extra_value_patterns` — `(pattern_str, replacement_token)` pairs appended
-    ///   after the built-in value-shape patterns. First match wins.
+    /// `extra_keys`: plain strings, not regexes; they are escaped.
+    /// `replacement`: defaults to `"***"` when empty.
+    /// `extra_value_patterns`: `(pattern, replacement_token)` pairs checked
+    ///   after the built-in value shapes. First match wins.
     #[allow(clippy::expect_used)]
     pub fn new(
         extra_keys:             &[&str],
@@ -161,7 +148,7 @@ impl Redactor {
     }
 
     fn check_value(&self, s: &str) -> Option<String> {
-        // CC check: Luhn guard prevents order-number false positives.
+        // The Luhn check keeps order numbers and similar ids from matching.
         if let Some(m) = CC_DIGIT_RE.find(s) {
             let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
             if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
@@ -211,11 +198,7 @@ impl Redactor {
     }
 }
 
-// ── Global default ────────────────────────────────────────────────────────────
-
 pub static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::default);
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -283,7 +266,7 @@ mod tests {
 
     #[test]
     fn value_cc_luhn_redacted() {
-        // Visa test number 4539578763621486 — passes Luhn.
+        // Visa test number; passes Luhn.
         let out = r().redact_value(&json!({"card": "4539578763621486"}));
         assert_eq!(out["card"], "***CC***");
     }

@@ -1,19 +1,7 @@
-"""
-`fasten doctor` — verify init config + store + correlation wiring.
+"""`fasten doctor`: read-only checks of env, stores, catalog and correlation.
 
-Read-only diagnostic. Runs each check, prints status + message, returns
-exit-code = number of failures. Six checks today:
-
-  1. env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID required; tenant + dsn optional)
-  2. audit DSN — parseable, connectable, table exists, returns count
-  3. api DSN — configured? (informational; default ring-only is fine)
-  4. catalog — codes registered, domains discovered
-  5. shims — `fasten.shim.http` importable (correlation prerequisite)
-  6. correlation — current_request_id() returns sane value when set
-
-Sample-emit roundtrip is deliberately *not* a doctor check — it would
-write a synthetic row into the production audit log. Tests in P0-1 cover
-the emit path.
+Exits 1 if any check fails. It does not emit a test row, since that would
+land in the real audit log.
 """
 from __future__ import annotations
 

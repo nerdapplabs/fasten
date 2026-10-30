@@ -17,8 +17,8 @@ func status(t *testing.T, h http.Handler, url string) int {
 	return rr.Code
 }
 
-// M2 — a non-positive / non-integer / over-max limit is refused with 422 on the
-// structured-query endpoints, not silently coerced to the default.
+// A non-positive, non-integer or over-max limit is refused with 422 on the
+// structured-query endpoints, not coerced to the default.
 func TestLimitRejectedWith422(t *testing.T) {
 	registerTestCodes(t)
 	db, _ := sql.Open("sqlite", ":memory:")
@@ -48,11 +48,9 @@ func TestLimitRejectedWith422(t *testing.T) {
 	}
 }
 
-// PR #59 finding 8 — offset / after / since / until / search-limit are
-// parsed strictly on the Go audit + topology + search endpoints. A corrupted
-// cursor (?after=12a3) used to silently fall back to 0 and re-serve page one
-// (client paging to exhaustion loops forever); a bad ?since= silently zeroed
-// the bound and returned an aggregate over all history.
+// offset, after, since, until and search limit are parsed strictly on the
+// audit, topology and search endpoints. Falling back to 0 on a bad ?after=
+// would re-serve page one forever; a bad ?since= would read all history.
 func TestAuditStrictParamRejects(t *testing.T) {
 	registerTestCodes(t)
 	db, _ := sql.Open("sqlite", ":memory:")
@@ -121,8 +119,8 @@ func TestSearchLimitStrict(t *testing.T) {
 	}
 }
 
-// FR3-3 — free-text q= is sys-only; the api endpoint rejects it (400) rather
-// than silently dropping it.
+// Free-text q= is sys-only; the api endpoint rejects it (400) rather than
+// ignoring it.
 func TestApiQParamRejected(t *testing.T) {
 	registerTestCodes(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -140,8 +138,8 @@ func TestApiQParamRejected(t *testing.T) {
 	}
 }
 
-// FR5-r — a capacity-0 ring drops on push instead of panicking (parity with
-// Python's deque(maxlen=0)).
+// A capacity-0 ring drops on push instead of panicking, like Python's
+// deque(maxlen=0).
 func TestRingCapacityZeroDrops(t *testing.T) {
 	rb := newRingBuffer[int](0)
 	rb.Push(1) // must not panic
@@ -154,7 +152,7 @@ func TestRingCapacityZeroDrops(t *testing.T) {
 	}
 }
 
-// M1 — OpenStreamStore sets synchronous=NORMAL on every pooled connection (not
+// OpenStreamStore sets synchronous=NORMAL on every pooled connection (not
 // just the migrate connection).
 func TestOpenStreamStorePragmaAllConns(t *testing.T) {
 	s, err := OpenStreamStore(t.TempDir()+"/streams.db", "sys_log")
@@ -189,8 +187,8 @@ func TestOpenStreamStorePragmaAllConns(t *testing.T) {
 	}
 }
 
-// M4 — a non-string request_id is treated as missing and gets a sentinel
-// (parity with Python), not stashed as-is.
+// A non-string request_id is treated as missing and gets a sentinel, not
+// stored as-is.
 func TestStampRequestIDNonString(t *testing.T) {
 	tr := NewTransport(10)
 	tr.serviceID = "svc"
@@ -207,7 +205,7 @@ func TestStampRequestIDNonString(t *testing.T) {
 	}
 }
 
-// FR5-9 — /audit reports both pagination models: offset (total/limit/offset)
+// /audit reports both pagination models: offset (total/limit/offset)
 // and cursor (next_after, forward = older rows).
 func TestAuditDualPaginationRegression(t *testing.T) {
 	registerTestCodes(t)

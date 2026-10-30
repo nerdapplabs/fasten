@@ -1,8 +1,4 @@
-"""Multi-tenant isolation tests (P1-3).
-
-Verifies that audit rows emitted under tenant_id=A are not returned when
-querying for tenant_id=B, and vice versa.
-"""
+"""Rows written under one tenant_id are not returned for another."""
 import uuid
 from datetime import datetime, timezone
 
@@ -30,7 +26,7 @@ def shared_store():
     return SQLiteStore(":memory:")
 
 
-# ── Store-level isolation ─────────────────────────────────────────────────────
+# Store-level isolation
 
 def test_tenant_a_rows_invisible_to_tenant_b(shared_store):
     for i in range(3):
@@ -94,7 +90,7 @@ def test_tenant_filter_combined_with_code(shared_store):
     assert rows[0].tenant_id == "tenant-a"
 
 
-# ── Engine-level: init(tenant_id=...) stamps rows ─────────────────────────────
+# init(tenant_id=...) stamps rows
 
 def test_engine_stamps_tenant_id_on_rows(mem_store):
     import fasten

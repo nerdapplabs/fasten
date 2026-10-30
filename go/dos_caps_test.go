@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// P1-46 DoS caps — pins the three fail-closed guards on the Go side:
+// DoS caps: pins the three fail-closed guards on the Go side:
 //   1) Per-row byte cap (FASTEN_MAX_DETAIL_BYTES, default 64 KiB).
 //   2) Deep-nesting graceful degrade returns <unredactable> marker.
 //   3) q= length cap on /sys and /search (via searchGuard).

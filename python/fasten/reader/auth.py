@@ -1,12 +1,7 @@
-"""
-Bundled auth hooks for the reader router.
+"""A simple auth dependency for the reader router.
 
-These are convenience defaults so callers who don't yet have an auth
-system can hand the reader a valid `dependencies=` argument without
-writing their own hook. Not a replacement for a real IdP — an
-environment-variable-loaded bearer token is fine for a single-node
-internal deployment; anything shared, multi-tenant, or public-facing
-belongs behind the caller's own auth layer (see P1-45).
+A shared bearer token from the environment suits a single internal service.
+Anything shared, multi-tenant or public should use its own auth.
 """
 from __future__ import annotations
 
@@ -16,18 +11,11 @@ from typing import Any
 
 
 def require_bearer(token_env: str = "FASTEN_READER_TOKEN") -> Any:
-    """FastAPI dependency that enforces `Authorization: Bearer <token>`.
+    """FastAPI dependency requiring ``Authorization: Bearer <token>``.
 
-    The expected token is read from the environment variable named by
-    ``token_env`` (default ``FASTEN_READER_TOKEN``). The env var must be
-    set to a non-empty value at import/wire time — an unset or empty env
-    fails loudly rather than defaulting to "no token required", which is
-    the mis-configuration this helper exists to prevent.
-
-    Comparison is constant-time (``hmac.compare_digest``). Missing or
-    malformed ``Authorization`` header rejects with 401; token mismatch
-    rejects with 401. Both messages are deliberately generic — no leak
-    of "header present but token wrong" vs "no header at all".
+    The token is read from ``token_env`` when this is called; if that is unset
+    or empty it raises RuntimeError rather than allowing every request. A
+    missing or wrong token gets the same 401, compared in constant time.
 
     Usage:
         from fasten.reader import router, require_bearer
@@ -48,17 +36,15 @@ def require_bearer(token_env: str = "FASTEN_READER_TOKEN") -> Any:
         raise RuntimeError(
             f"fasten.reader.require_bearer: ${token_env} is unset or empty. "
             "Set it to the shared bearer token, or wire your own auth "
-            "dependency (this helper is opinionated — env-var only)."
+            "dependency (this helper is opinionated, env-var only)."
         )
 
     async def dep(authorization: str = Header(default="")) -> None:
         prefix = "Bearer "
         if not authorization.startswith(prefix):
             raise HTTPException(status_code=401, detail="unauthenticated")
-        # Compare BYTES. hmac.compare_digest() raises TypeError on a str with
-        # any non-ASCII character, and HTTP headers decode as latin-1 — so a
-        # single non-ASCII byte in the Authorization header turned every route
-        # into an unhandled 500 for anonymous callers.
+        # Compare bytes: compare_digest() raises TypeError for a str with
+        # non-ASCII characters, which a latin-1 decoded header can contain.
         presented = authorization[len(prefix):].encode("utf-8", "surrogateescape")
         if not hmac.compare_digest(presented, expected.encode("utf-8")):
             raise HTTPException(status_code=401, detail="unauthenticated")

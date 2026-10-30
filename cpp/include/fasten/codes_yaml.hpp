@@ -1,22 +1,16 @@
-// fasten/codes_yaml.hpp — catalog YAML loader (P1-11 C++).
+// fasten/codes_yaml.hpp: load audit codes from yaml files.
 //
-// Optional, opt-in header. fasten.hpp itself stays free of yaml-cpp;
-// only adopters who #include this header pay the dep.
+// Optional; only code that includes this header needs yaml-cpp.
 //
-//   // Cmake / build system: link yaml-cpp
 //   #include "fasten.hpp"
 //   #include "fasten/codes_yaml.hpp"
 //
 //   fasten::codes::load("fleet.codes.yaml");   // throws on error
-//   fasten::codes::reload();                    // atomic + fault-tolerant
+//   fasten::codes::reload();
 //
-// Reload semantics match Python / Go / JS / Rust:
-// - Atomic: parse + validate fully into a fresh map; only swap if
-//   everything succeeds.
-// - Fault-tolerant: any error during reload (parse, invalid severity,
-//   missing field) leaves the previous catalog active and throws.
-// - NOT additive: codes removed from the yaml become unknown after the
-//   swap. Programmatic register_codes() entries survive reload.
+// reload() re-reads every loaded file and swaps the yaml codes in one step.
+// If anything fails, the old catalog stays and the error is thrown. Codes
+// removed from the yaml are dropped; codes from register_codes() are kept.
 #pragma once
 
 #include "../fasten.hpp"
@@ -71,8 +65,8 @@ inline Retention parse_retention(const std::string& s) {
         "retention_class='" + s + "' is not one of {short,medium,long}");
 }
 
-// Parse + validate every yaml file into a fresh map. Throws on first error;
-// caller's live registry is untouched until this returns successfully.
+// Parse and validate every file into a new map. Throws on the first error
+// and never touches the live registry.
 inline std::unordered_map<std::string, Meta> build_from_paths(
     const std::vector<std::string>& paths)
 {
@@ -96,20 +90,20 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
         }
         if (!doc.IsMap()) {
             throw AuditCatalogError(
-                "fasten: " + path + " — top-level must be a mapping");
+                "fasten: " + path + ": top-level must be a mapping");
         }
 
         const auto file_domain = doc["domain"].as<std::string>("");
         if (file_domain.empty()) {
             throw AuditCatalogError(
-                "fasten: " + path + " — top-level 'domain' is required");
+                "fasten: " + path + ": top-level 'domain' is required");
         }
         const auto file_emitter = doc["emitter"].as<std::string>("");
 
         const auto codes_node = doc["codes"];
         if (codes_node && !codes_node.IsMap()) {
             throw AuditCatalogError(
-                "fasten: " + path + " — 'codes' must be a mapping");
+                "fasten: " + path + ": 'codes' must be a mapping");
         }
 
         for (const auto& kv : codes_node) {
@@ -117,23 +111,23 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
             if (!is_upper_snake(code)) {
                 throw AuditCatalogError(
                     "fasten: " + path + ":" + code +
-                    " — code key must be UPPER_SNAKE_CASE");
+                    ": code key must be UPPER_SNAKE_CASE");
             }
             if (fresh.count(code)) {
                 throw AuditCatalogError(
-                    "fasten: " + path + ":" + code + " — duplicate code in yaml");
+                    "fasten: " + path + ":" + code + ": duplicate code in yaml");
             }
             const auto& raw = kv.second;
             if (!raw.IsMap()) {
                 throw AuditCatalogError(
-                    "fasten: " + path + ":" + code + " — entry must be a mapping");
+                    "fasten: " + path + ":" + code + ": entry must be a mapping");
             }
 
             const auto code_domain = raw["domain"].as<std::string>("");
             if (!code_domain.empty() && code_domain != file_domain) {
                 throw AuditCatalogError(
                     "fasten: " + path + ":" + code +
-                    " — domain='" + code_domain +
+                    ": domain='" + code_domain +
                     "' disagrees with file-level domain='" + file_domain + "'");
             }
             Meta meta;
@@ -150,7 +144,7 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
                 meta.pii_in_detail   = raw["pii_in_detail"].as<bool>(false);
             } catch (const AuditCatalogError& e) {
                 throw AuditCatalogError(
-                    "fasten: " + path + ":" + code + " — " + std::string(e.what()).substr(8));
+                    "fasten: " + path + ":" + code + ": " + std::string(e.what()).substr(8));
             }
 
             fresh.emplace(code, std::move(meta));
@@ -161,8 +155,8 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
 
 }  // namespace detail_yaml
 
-// Initial load — throws on error (startup-safe). Subsequent reload() calls
-// re-read all paths previously passed to load.
+// Add the codes in `path` to the catalog and remember the path for
+// reload(). Throws on any error without changing the catalog.
 inline void load(const std::string& path) {
     std::lock_guard<std::mutex> ylk(detail_yaml::yaml_mu());
     auto fresh = detail_yaml::build_from_paths({path});
@@ -175,7 +169,7 @@ inline void load(const std::string& path) {
         if (g.registry.count(kv.first) && !yc.count(kv.first)) {
             throw AuditCatalogError(
                 "fasten.load: " + path + ":" + kv.first +
-                " — duplicate code (already registered programmatically)");
+                ": duplicate code (already registered programmatically)");
         }
     }
     for (auto& kv : fresh) {
@@ -189,12 +183,8 @@ inline void load(const std::string& path) {
     }
 }
 
-// Re-read every previously-loaded path and atomically swap.
-//
-// Atomic + fault-tolerant: parse + validate fully into a fresh map;
-// any error throws and the previous catalog stays active.
-// Reload is NOT additive — codes removed from yaml become unknown.
-// Programmatic register_codes() codes survive reload.
+// Re-read every loaded path and replace the yaml codes. On error the
+// previous catalog stays and the error is thrown.
 inline void reload() {
     std::vector<std::string> paths_snapshot;
     {
@@ -210,12 +200,10 @@ inline void reload() {
     std::lock_guard<std::mutex> rlk(g.reg_mu);
 
     auto& yc = detail_yaml::yaml_codes();
-    // Drop entries that came from yaml in the previous load.
     for (const auto& code : yc) {
         g.registry.erase(code);
     }
     yc.clear();
-    // Insert fresh yaml-derived entries.
     for (auto& kv : fresh) {
         yc.insert(kv.first);
         g.registry[kv.first] = std::move(kv.second);

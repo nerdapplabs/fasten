@@ -34,7 +34,7 @@ import (
 	"unsafe"
 )
 
-// ── Error handling ────────────────────────────────────────────────────────────
+// Error handling
 
 // takeError reads and frees an out-err string returned by the library.
 // Must be called even when rc == 0 to avoid leaking the pointer slot.
@@ -47,7 +47,7 @@ func takeError(raw *C.char) error {
 	return fmt.Errorf("fasten-core: %s", msg)
 }
 
-// ── Store ─────────────────────────────────────────────────────────────────────
+// Store
 
 // Store wraps a FastenStore handle. It is safe to use concurrently.
 type Store struct {
@@ -62,7 +62,7 @@ type Store struct {
 func Open(backend, connstr, table string) (*Store, error) {
 	cBackend := C.CString(backend)
 	cConnstr := C.CString(connstr)
-	cTable   := C.CString(table)
+	cTable := C.CString(table)
 	defer C.free(unsafe.Pointer(cBackend))
 	defer C.free(unsafe.Pointer(cConnstr))
 	defer C.free(unsafe.Pointer(cTable))

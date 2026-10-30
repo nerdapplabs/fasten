@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// pyFloatVectorJSON is a Python-sealed row exactly as Python fasten emits it,
-// with a WHOLE-NUMBER float (setpoint: 75.0), a fractional float (12.5) and an
-// int (7) in detail. Python json.dumps renders 75.0 as "75.0"; a Go row decoded
-// with a plain unmarshal would render the resulting float64 as "75" and fail
+// pyFloatVectorJSON is a Python-sealed row with a whole-number float
+// (setpoint: 75.0), a fractional float (12.5) and an int (7) in detail. Python
+// renders 75.0 as "75.0"; a plain unmarshal would give "75" and fail
 // verification. pyFloatVectorHash is the hash Python computed over this row.
 //
 // Regenerate from the fasten submodule root with the same generator as
@@ -18,10 +17,9 @@ const pyFloatVectorHash = "512021c690ddfd2077192cb6d75921ea36d35b3270a12fdf91888
 
 const pyFloatVectorJSON = `{"id": "evt-float-vec", "origin_id": "evt-float-vec", "monotonic_seq": 1, "timestamp": "2026-06-15T10:30:45+00:00", "code": "SETPOINT_WRITE", "action": "write", "severity": "info", "service_id": "event-engine", "source_node_id": "node-1", "tenant_id": "acme", "actor": "event-engine", "actor_kind": "service", "target": "connector-opcua-01/ns=2;s=Valve", "category": "actuation", "domain": "control", "method": "sdk", "request_id": "req-float-1", "detail": {"setpoint": 75.0, "tolerance": 12.5, "retries": 7}, "wire_version": "1", "shipped_at": null, "canonical_form_id": "1", "prev_hash": "genesis", "hash": "512021c690ddfd2077192cb6d75921ea36d35b3270a12fdf91888d5ffabcf54b"}`
 
-// TestVerifyChain_WholeNumberFloatVector proves a Python-sealed row carrying a
-// whole-number float in detail verifies on the Go side. It is the regression
-// guard for the float-normalization cross-language break: Row.UnmarshalJSON
-// preserves the "75.0" token (via UseNumber) so Go reproduces Python's rendering.
+// TestVerifyChain_WholeNumberFloatVector checks that a Python-sealed row with a
+// whole-number float in detail verifies in Go. Row.UnmarshalJSON keeps the
+// "75.0" token (via UseNumber) so Go reproduces Python's rendering.
 func TestVerifyChain_WholeNumberFloatVector(t *testing.T) {
 	var row Row
 	if err := json.Unmarshal([]byte(pyFloatVectorJSON), &row); err != nil {
@@ -35,10 +33,9 @@ func TestVerifyChain_WholeNumberFloatVector(t *testing.T) {
 	}
 }
 
-// pyVectorRow is the exact AuditRow the Python generator below produced. Its
-// expected hash was computed by Python fasten.engine._row_hash. The Go row hash
-// MUST equal pyVectorHash byte-for-byte, proving cross-language chain
-// compatibility (a Go upstream aggregator verifying a Python-node-sealed chain).
+// pyVectorRow is the exact AuditRow the Python generator below produced.
+// Go's row hash must equal pyVectorHash byte for byte, so a Go aggregator can
+// verify a chain sealed by a Python node.
 //
 // To regenerate, run (from the fasten submodule root):
 //
@@ -58,8 +55,8 @@ func TestVerifyChain_WholeNumberFloatVector(t *testing.T) {
 //	print(_row_hash(row.to_dict()))
 //	PY
 //
-// The form includes canonical_form_id="1" (item 6 — the canonical form is itself
-// versioned and tamper-evident), so this hash differs from the pre-item-6 value.
+// The hashed form includes canonical_form_id="1", so the form version is
+// itself covered by the hash.
 const pyVectorHash = "cbf5a1ee4bb7baeb0b433bedfa60434bdea42627b9671183895970bbff02f9ac"
 
 func pyVectorRow() Row {
@@ -89,8 +86,8 @@ func pyVectorRow() Row {
 	}
 }
 
-// TestRowHash_CrossLanguageVector is the load-bearing cross-language test:
-// Go's row hash of a Python-sealed row must equal the hash Python computed.
+// TestRowHash_CrossLanguageVector: Go's row hash of a Python-sealed row must
+// equal the hash Python computed.
 func TestRowHash_CrossLanguageVector(t *testing.T) {
 	got := rowHashPyCompat(pyVectorRow())
 	if got != pyVectorHash {
@@ -124,7 +121,7 @@ func TestVerifyChain_Tampered_FieldChange(t *testing.T) {
 	}
 }
 
-// TestVerifyChain_Empty returns OK for an empty slice (matches Python).
+// TestVerifyChain_Empty returns OK for an empty slice.
 func TestVerifyChain_Empty(t *testing.T) {
 	res := VerifyChain(nil)
 	if !res.OK || res.TotalRows != 0 {
@@ -160,9 +157,9 @@ func TestVerifyChain_PrevHashLink(t *testing.T) {
 	}
 }
 
-// TestVerifiedPrefix_RejectsFirstRowBreak proves a chain broken at the first
-// row yields an empty verified prefix and names the break (Fix #4 — no longer a
-// reject-all raise; the caller inserts the empty prefix and resyncs).
+// TestVerifiedPrefix_RejectsFirstRowBreak: a chain broken at the first row
+// yields an empty verified prefix and names the break. The caller inserts the
+// empty prefix and resyncs.
 func TestVerifiedPrefix_RejectsFirstRowBreak(t *testing.T) {
 	r := pyVectorRow()
 	r.Target = "tampered" // breaks the self-hash at seq 1

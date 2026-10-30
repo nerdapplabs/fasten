@@ -7,7 +7,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// §3.4 — indexed structured-field filters on the sys/api reader endpoints:
+// §3.4: indexed structured-field filters on the sys/api reader endpoints:
 // event (sys), status (api), and since/until windows, honoured identically
 // whether the stream is ring-only or persisted.
 
@@ -74,11 +74,9 @@ func TestStructuredFilters_StoreAgreesWithRing(t *testing.T) {
 	}
 }
 
-// TestRingStatusNumericCompare_ParityWithStore (PR #59 finding 5): the ring
-// used fmt.Sprint(row["status"]) != q.Status — string equality that returns
-// zero rows for ?status=0502 against integer 502. Both stores compare
-// numerically (SQLite affinity, Postgres strconv.Atoi), so enabling
-// persistence silently changed query results. Pin the numeric compare.
+// TestRingStatusNumericCompare_ParityWithStore: the ring compares status
+// numerically, like both stores (SQLite affinity, Postgres strconv.Atoi), so
+// ?status=0502 matches 502 whether or not persistence is on.
 func TestRingStatusNumericCompare_ParityWithStore(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -88,7 +86,7 @@ func TestRingStatusNumericCompare_ParityWithStore(t *testing.T) {
 	h := NewReader()
 
 	// The seed pushes status=502 (int). Query with leading-zero equivalent,
-	// exact numeric string, and plain int-form — all three must match the
+	// exact numeric string, and plain int-form: all three must match the
 	// same row, and none should return zero.
 	for _, q := range []string{"?status=502", "?status=0502", "?status=00502"} {
 		body, _ := getJSON(t, h, "/api"+q)
@@ -109,10 +107,8 @@ func TestRingStatusNumericCompare_ParityWithStore(t *testing.T) {
 	}
 }
 
-// TestStructuredFilters_RingAndStoreAgree (PR #59 test-coverage gap):
-// run the same query on ring-only and persisted, assert the row set matches.
-// The earlier suite tested each in isolation, so the ring/store status
-// divergence shipped.
+// TestStructuredFilters_RingAndStoreAgree runs the same query on ring-only and
+// persisted streams and checks the row sets match.
 func TestStructuredFilters_RingAndStoreAgree(t *testing.T) {
 	// Ring-only pass.
 	resetGlobals(t)

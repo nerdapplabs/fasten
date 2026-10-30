@@ -1,18 +1,8 @@
-"""
-fasten — audit + correlation SDK.
+"""fasten audit and correlation SDK.
 
-Kernel:
-  - `request_id` context carrier (ambient across every emission)
-  - `emit(code, target, ...)` — enforces 6 anchors (5 Ws + H) + correlation
-  - `AuditRepository` protocol — pluggable storage backend
-  - Redactor — secret-key scrubbing before emit
-
-Opt-in:
-  - `shim.http`, `shim.mqtt`, `shim.scheduler`
-  - `transport.stdout` (default)
-  - `reader.router()` — mountable /logs/{api,sys,audit}
-
-See README.md for the full design.
+``emit()`` writes audit rows carrying the ambient ``request_id``. Storage is
+pluggable through ``AuditRepository``; HTTP/MQTT/scheduler shims and the
+``/logs`` reader router are opt-in. See README.md.
 """
 from __future__ import annotations
 
@@ -107,7 +97,7 @@ __all__ = [
     "search_enabled",
     "redactor",
     "transport",
-    # query translation (NL / smart-box → structured chips)
+    # query translation (search box text to structured chips)
     "Chips",
     "Translator",
     "RuleTranslator",

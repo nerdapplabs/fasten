@@ -16,12 +16,12 @@ import { PostgresStore } from '../src/store/postgres.js';
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
 const skip = !DSN;
 
-// One unique table for the entire test run — dropped in `after`.
+// One table for the whole run, dropped in `after`.
 const TABLE = `t_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 
 let store = skip ? null : new PostgresStore(DSN, { table: TABLE });
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// Helpers
 
 function _id() {
     return `evt-${randomUUID().replace(/-/g, '').slice(0, 20)}`;
@@ -55,7 +55,7 @@ function makeRow(overrides = {}) {
     };
 }
 
-// ── Cleanup ────────────────────────────────────────────────────────────────
+// Cleanup
 
 after(async () => {
     if (skip || !store) return;
@@ -69,7 +69,7 @@ after(async () => {
     await store.close();
 });
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// Tests
 
 // 1. insert + query by requestId
 test('insert and query by requestId', { skip }, async () => {
@@ -83,7 +83,7 @@ test('insert and query by requestId', { skip }, async () => {
 });
 
 // 2. insert idempotent (ON CONFLICT DO NOTHING)
-test('insert is idempotent — ON CONFLICT DO NOTHING', { skip }, async () => {
+test('insert ignores a duplicate id', { skip }, async () => {
     const row = makeRow();
     await store.insert(row);
     await store.insert(row);

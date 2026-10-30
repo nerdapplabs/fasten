@@ -1,11 +1,11 @@
 package fasten
 
-// Redact conformance — loads spec/redact-conformance.json, runs every case.
+// Redact conformance: loads spec/redact-conformance.json and runs every case.
 //
 // The spec is the single source of truth; fasten-core/src/redact.rs is canonical.
 // All SDKs must pass every case; failures indicate a divergence from the Rust impl.
 //
-// NOTE: The Stripe live-key case is not in the JSON spec (GitHub push protection
+// The Stripe live-key case is not in the JSON spec (GitHub push protection
 // false-positive). It is tested below via a runtime-constructed value.
 
 import (
@@ -60,7 +60,7 @@ func TestRedactConformance(t *testing.T) {
 		})
 	}
 
-	// Stripe live key — constructed at runtime so the literal sk_live_<24+ chars>
+	// Stripe live key, constructed at runtime so the literal sk_live_<24+ chars>
 	// never appears in source (GitHub push-protection false-positive).
 	t.Run("value_stripe_live", func(t *testing.T) {
 		key := "sk" + "_live_" + strings.Repeat("A", 24)

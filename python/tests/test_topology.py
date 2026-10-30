@@ -1,8 +1,7 @@
-"""Topology aggregation — store.sources() + reader /topology route.
+"""store.sources() and the reader /topology route.
 
-The fleet topology is derived from the audit rows already recorded
-(grouped by source_node_id / service_id / tenant_id), so it can never
-drift from reality. These tests pin the aggregation and the endpoint.
+Topology is derived from the recorded audit rows, grouped by
+source_node_id, service_id and tenant_id.
 """
 from datetime import datetime, timezone
 
@@ -35,7 +34,7 @@ def _row(seq, *, node, service, tenant, when=None):
     )
 
 
-# ── store.sources() aggregation ───────────────────────────────────────────
+# store.sources()
 
 def test_sources_groups_by_node_service_tenant(mem_store):
     # node-a/svc-x/acme: 3 rows, node-b/svc-y/acme: 1, node-a/svc-x/beta: 1
@@ -47,7 +46,6 @@ def test_sources_groups_by_node_service_tenant(mem_store):
 
     sources = mem_store.sources()
 
-    # three distinct (node, service, tenant) combinations
     assert len(sources) == 3
     # busiest first
     assert sources[0]["source_node_id"] == "node-a"
@@ -86,7 +84,7 @@ def test_sources_window_filters_by_time(mem_store):
     assert windowed[0]["rows"] == 1
 
 
-# ── reader /topology route ────────────────────────────────────────────────
+# /topology
 
 def _client(build_router):
     from fastapi import FastAPI
@@ -101,7 +99,7 @@ def test_topology_endpoint_summarises_sources(initialized):
     pytest.importorskip("fastapi")
     from fasten.reader.router import router as build_router
 
-    # initialized fixture → service_id="test-svc", source_node_id="test-node"
+    # The initialized fixture uses service_id="test-svc", node_id="test-node".
     fasten.emit(code="USER_CREATED", target="u-1", actor="alice")
     fasten.emit(code="USER_CREATED", target="u-2", actor="bob")
 
@@ -121,7 +119,7 @@ def test_topology_endpoint_uninitialised_returns_empty():
     pytest.importorskip("fastapi")
     from fasten.reader.router import router as build_router
 
-    # fresh_state autouse fixture leaves the engine pre-init → store is None.
+    # The fresh_state fixture leaves the engine uninitialised, so there is no store.
     body = _client(build_router).get("/api/v1/logs/topology").json()
     assert body == {
         "sources": [], "nodes": 0, "services": 0, "tenants": 0,

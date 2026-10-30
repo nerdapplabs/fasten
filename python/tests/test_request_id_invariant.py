@@ -1,10 +1,8 @@
-"""§8.7 conformance — every persisted sys row carries a request_id.
+"""Every persisted sys row carries a request_id (spec §8.7).
 
-Correlation is only a contract if it holds always. This drives a service through
-boot → first request → background tick → shutdown and asserts every sys row in
-the persisted store has a non-empty request_id (a real one inside a request, a
-sentinel outside), so /correlate never silently drops context-less lines. The Go
-suite runs the same scenario (TestRequestIDInvariant_EveryPersistedSysRow).
+Runs boot, a request, a background tick and shutdown, and checks that every
+stored sys row has a real request_id or a sentinel. The Go suite runs the same
+scenario (TestRequestIDInvariant_EveryPersistedSysRow).
 """
 import fasten
 from fasten.context import request_id_kind, with_request_id
@@ -35,5 +33,5 @@ def test_every_persisted_sys_row_has_request_id():
     kind = {r["event"]: request_id_kind(r["request_id"]) for r in rows}
     assert kind["boot.init"] == "boot"     # boot-window sentinel
     assert kind["handling"] == "request"   # real correlation id
-    assert kind["bg.tick"] == "orphan"     # context-less after boot → orphan
+    assert kind["bg.tick"] == "orphan"     # no context, after boot
     assert kind["shutdown"] == "orphan"

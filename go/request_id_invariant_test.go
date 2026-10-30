@@ -8,11 +8,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// §8.7 conformance — every persisted sys row carries a request_id. Drives a
-// service through boot -> first request -> background tick -> shutdown and
-// asserts every sys row in the persisted store has a non-empty request_id (real
-// inside a request, sentinel outside). Mirrors the Python
-// test_every_persisted_sys_row_has_request_id.
+// §8.7: every persisted sys row carries a request_id. Drives a service through
+// boot, first request, background tick and shutdown, and checks every stored
+// sys row has a non-empty request_id (real inside a request, sentinel outside).
 
 func TestRequestIDInvariant_EveryPersistedSysRow(t *testing.T) {
 	resetGlobals(t)
@@ -29,10 +27,10 @@ func TestRequestIDInvariant_EveryPersistedSysRow(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 
-	Default.LogSys(context.Background(), "info", "boot.init", nil)                          // boot
+	Default.LogSys(context.Background(), "info", "boot.init", nil)                                // boot
 	Default.LogSys(WithRequestID(context.Background(), "req-abc123def"), "info", "handling", nil) // first request
-	Default.LogSys(context.Background(), "info", "bg.tick", nil)                            // background
-	Default.LogSys(context.Background(), "info", "shutdown", nil)                           // shutdown
+	Default.LogSys(context.Background(), "info", "bg.tick", nil)                                  // background
+	Default.LogSys(context.Background(), "info", "shutdown", nil)                                 // shutdown
 
 	rows, err := ss.Query(100, nil, "", "")
 	must(t, err)

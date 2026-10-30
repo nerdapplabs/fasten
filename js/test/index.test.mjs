@@ -1,14 +1,4 @@
-/**
- * fasten JS unit tests — node:test (no external deps, runs inside node:20-alpine)
- *
- * Coverage:
- *  - init: env reading, missing service_id guard
- *  - register: duplicate detection
- *  - emit: payload shape, request_id, severity override, monotonic seq, PII redact
- *  - withRequestID / currentRequestID ALS propagation
- *  - redact: nested dicts, lists, case-insensitive, safe keys
- *  - dump: CSV format
- */
+// init, register, emit, request-id propagation, redaction and dump().
 import { test, before, beforeEach, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -18,7 +8,7 @@ import {
 } from '../src/index.js';
 import * as auditQueue from '../src/audit_queue.js';
 
-// ── shared test codes ──────────────────────────────────────────────────────
+// Shared test codes
 
 const TEST_CODES = {
     USER_CREATED: {
@@ -41,7 +31,7 @@ function initTestSDK(overrides = {}) {
     init({ serviceId: 'test-svc', nodeId: 'test-node', ...overrides });
 }
 
-// ── init ──────────────────────────────────────────────────────────────────
+// Init
 
 describe('init', () => {
     test('throws when serviceId missing', () => {
@@ -71,7 +61,7 @@ describe('init', () => {
     });
 });
 
-// ── register ──────────────────────────────────────────────────────────────
+// Register
 
 describe('register', () => {
     test('duplicate code throws', () => {
@@ -98,21 +88,21 @@ describe('register', () => {
         assert.equal(m.domain, 'user');
     });
 
-    // P1-10: id is filled from the dict key when omitted.
+    // id is filled from the dict key when omitted.
     test('fills id from key when omitted', () => {
-        register('p1_10', {
-            P1_10_FILLED: { domain: 'p1_10', category: 'x', action: 'x',
+        register('keyfill', {
+            KEY_FILLED: { domain: 'keyfill', category: 'x', action: 'x',
                             severity: 'info', description: 'x', emitter: 't' },
         });
-        const m = metaOf('P1_10_FILLED');
-        assert.equal(m.id, 'P1_10_FILLED');
+        const m = metaOf('KEY_FILLED');
+        assert.equal(m.id, 'KEY_FILLED');
     });
 
-    // P1-10: explicit id that disagrees with the key throws.
+    // explicit id that disagrees with the key throws.
     test('id mismatch throws', () => {
         assert.throws(
-            () => register('p1_10b', {
-                P1_10_MISMATCH: { id: 'WRONG_ID', domain: 'p1_10b',
+            () => register('keymismatch', {
+                KEY_MISMATCH: { id: 'WRONG_ID', domain: 'keymismatch',
                                   severity: 'info', description: 'x',
                                   category: 'x', action: 'x', emitter: 't' },
             }),
@@ -120,11 +110,11 @@ describe('register', () => {
         );
     });
 
-    // P1-10: lowercase / invalid key shape throws.
+    // lowercase / invalid key shape throws.
     test('invalid key shape throws', () => {
         assert.throws(
-            () => register('p1_10c', {
-                lowercase_bad: { domain: 'p1_10c', severity: 'info',
+            () => register('keycase', {
+                lowercase_bad: { domain: 'keycase', severity: 'info',
                                  category: 'x', action: 'x',
                                  description: 'x', emitter: 't' },
             }),
@@ -176,7 +166,7 @@ describe('register', () => {
     });
 });
 
-// ── emit ──────────────────────────────────────────────────────────────────
+// Emit
 
 describe('emit', () => {
     before(() => initTestSDK());
@@ -255,10 +245,7 @@ describe('emit', () => {
     });
 
     test('row keys are snake_case (matches src/index.d.ts and wire spec)', () => {
-        // Regression guard: TS adopters were reading camelCase fields
-        // (row.serviceId etc.) that always returned undefined because
-        // the runtime emits snake_case. The .d.ts now declares snake
-        // _case to match — this test catches any future drift back.
+        // index.d.ts declares snake_case row fields; keep the runtime in step.
         initTestSDK();
         const row = emit({ code: 'USER_CREATED', target: 'u-42' });
         const camelKeys = ['serviceId', 'sourceNodeId', 'requestId',
@@ -305,7 +292,7 @@ describe('emit', () => {
     });
 });
 
-// ── ALS correlation ───────────────────────────────────────────────────────
+// ALS correlation
 
 describe('withRequestID / currentRequestID', () => {
     test('propagates via ALS', async () => {
@@ -352,7 +339,7 @@ describe('withRequestID / currentRequestID', () => {
     });
 });
 
-// ── mintID ────────────────────────────────────────────────────────────────
+// MintID
 
 describe('mintID', () => {
     test('returns 12 hex chars', () => {
@@ -366,7 +353,7 @@ describe('mintID', () => {
     });
 });
 
-// ── redact (standalone) ───────────────────────────────────────────────────
+// Redact (standalone)
 
 describe('redact via emit detail', () => {
     before(() => initTestSDK());
@@ -396,7 +383,7 @@ describe('redact via emit detail', () => {
     });
 });
 
-// ── redact customization (env / opts parity) ───────────────────────────────
+// Redact customization (env / opts parity)
 
 describe('redact customization', () => {
     test('extra keys + custom replacement via opts', () => {
@@ -430,7 +417,7 @@ describe('redact customization', () => {
     });
 });
 
-// ── dump ──────────────────────────────────────────────────────────────────
+// Dump
 
 describe('dump', () => {
     test('CSV format id,domain,severity', () => {

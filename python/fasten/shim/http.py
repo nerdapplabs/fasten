@@ -1,8 +1,5 @@
-"""
-HTTP shim — honours or mints `X-Request-ID` per request, and (optionally)
-pushes an api-log row to the fasten transport on each request.
+"""ASGI middleware: X-Request-ID handling and api log rows.
 
-FastAPI / Starlette:
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(APILogger, skip={"/health", "/metrics"})
 """
@@ -19,10 +16,8 @@ Send = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class RequestIDMiddleware:
-    """
-    ASGI middleware — mints/honours X-Request-ID on every request and sets
-    it in the ambient context for the duration of the call.
-    """
+    """Use the incoming X-Request-ID (or mint one) as the request_id for the
+    request, and echo it in the response headers."""
 
     HEADER = b"x-request-id"
 
@@ -52,20 +47,12 @@ class RequestIDMiddleware:
 
 
 class APILogger:
-    """
-    ASGI middleware — pushes each inbound HTTP request into fasten's
-    api-log ring buffer (and the persistent api store if configured).
+    """Record an api log row per HTTP request, except for paths in ``skip``.
 
-    Skips paths in ``skip`` (set or iterable of strings, e.g.
-    ``{"/health", "/metrics"}``).
+    Rows have the same keys as Go's ``fasten.APILogger``: ``method``,
+    ``path``, ``status``, ``duration_ms``, ``request_id``, ``timestamp``.
 
-    Mirrors Go's ``fasten.APILogger(skipPaths...)`` — same row keys
-    (``method``, ``path``, ``status``, ``duration_ms``, ``request_id``,
-    ``timestamp``) so /logs/api responses are uniform across services
-    in mixed-language fleets.
-
-    Place this middleware **after** :class:`RequestIDMiddleware` so the
-    api row carries the request_id minted/honoured upstream.
+    Add it after :class:`RequestIDMiddleware` so rows get its request_id.
     """
 
     def __init__(

@@ -5,11 +5,9 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── libfasten_core (Rust shared library) ────────────────────────────
-# Build fasten-core before configuring this project:
+# libfasten_core (Rust). Build it first:
 #   cd ../fasten-core && cargo build --release --features all
-# Then set FASTEN_CORE_LIB_DIR to the release output dir, or let CMake
-# look in the default location relative to this file.
+# FASTEN_CORE_LIB_DIR defaults to ../fasten-core/target/release.
 if(NOT FASTEN_CORE_LIB_DIR)
     set(FASTEN_CORE_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fasten-core/target/release")
 endif()
@@ -20,7 +18,6 @@ find_library(FASTEN_CORE_LIB
     REQUIRED
 )
 
-# ── Interface library ─────────────────────────────────────────────────────
 add_library(fasten INTERFACE)
 target_include_directories(fasten INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,13 +25,13 @@ target_include_directories(fasten INTERFACE
 )
 target_link_libraries(fasten INTERFACE ${FASTEN_CORE_LIB})
 
-# Warn on common pitfalls; treat warnings as errors in CI.
+# Warnings only; they are not treated as errors.
 target_compile_options(fasten INTERFACE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
 )
 
-# ── Example ───────────────────────────────────────────────────────────────
+# Examples
 option(FASTEN_BUILD_EXAMPLES "Build example binaries" ON)
 
 if(FASTEN_BUILD_EXAMPLES)
@@ -44,15 +41,14 @@ if(FASTEN_BUILD_EXAMPLES)
         target_link_libraries(connector PRIVATE pthread)
     endif()
 
-    # reader_example needs no extra deps (uses fasten_reader.hpp core only).
+    # Uses fasten_reader.hpp only, no HTTP framework.
     add_executable(reader_example examples/reader_example.cpp)
     target_link_libraries(reader_example PRIVATE fasten)
     if(UNIX AND NOT APPLE)
         target_link_libraries(reader_example PRIVATE pthread)
     endif()
 
-    # Simple-Web-Server adapter — only built when SIMPLE_WEB_SERVER_DIR is set.
-    # cmake -DSIMPLE_WEB_SERVER_DIR=/path/to/Simple-Web-Server ..
+    # Only with -DSIMPLE_WEB_SERVER_DIR=/path/to/Simple-Web-Server.
     if(SIMPLE_WEB_SERVER_DIR)
         add_executable(reader_simplehttp examples/reader_simplehttp_main.cpp)
         target_include_directories(reader_simplehttp PRIVATE ${SIMPLE_WEB_SERVER_DIR})
@@ -60,9 +56,7 @@ if(FASTEN_BUILD_EXAMPLES)
     endif()
 endif()
 
-# ── Tests ─────────────────────────────────────────────────────────────────
-# Off by default — adopters embedding fasten don't need to build our tests.
-# CI flips this on with -DFASTEN_BUILD_TESTS=ON.
+# Tests are off by default; CI passes -DFASTEN_BUILD_TESTS=ON.
 option(FASTEN_BUILD_TESTS "Build smoke tests" OFF)
 
 if(FASTEN_BUILD_TESTS)
@@ -75,7 +69,6 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME pii_in_detail_smoke COMMAND pii_in_detail_smoke)
 
-    # REVIEW.md item #1: substring-redact regression guard
     add_executable(redact_substring_smoke tests/redact_substring_smoke.cpp)
     target_link_libraries(redact_substring_smoke PRIVATE fasten)
     if(UNIX AND NOT APPLE)
@@ -90,7 +83,7 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_env_keys_smoke COMMAND redact_env_keys_smoke)
 
-    # spec/redact-conformance.json cross-language conformance
+    # Cases from spec/redact-conformance.json.
     add_executable(redact_conformance_smoke tests/redact_conformance_smoke.cpp)
     target_link_libraries(redact_conformance_smoke PRIVATE fasten)
     if(UNIX AND NOT APPLE)
@@ -98,9 +91,8 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_conformance_smoke COMMAND redact_conformance_smoke)
 
-    # sqlite_store_smoke needs sqlite3 at link time.
-    # Guard with TARGET check: some cmake/platform combos set SQLite3_FOUND but
-    # fail to create the SQLite3::SQLite3 IMPORTED target (cmake bug on older 3.x).
+    # Check the target, not SQLite3_FOUND: older CMake 3.x can set the latter
+    # without creating SQLite3::SQLite3.
     find_package(SQLite3 QUIET)
     if(TARGET SQLite3::SQLite3)
         add_executable(sqlite_store_smoke tests/sqlite_store_smoke.cpp)
@@ -110,10 +102,9 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
     else()
-        message(STATUS "SQLite3::SQLite3 target unavailable — skipping sqlite_store_smoke")
+        message(STATUS "SQLite3::SQLite3 target unavailable, skipping sqlite_store_smoke")
     endif()
 
-    # postgres_store_smoke needs libpq at link time.
     find_package(PostgreSQL QUIET)
     if(TARGET PostgreSQL::PostgreSQL)
         add_executable(postgres_store_smoke tests/postgres_store_smoke.cpp)
@@ -123,11 +114,10 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME postgres_store_smoke COMMAND postgres_store_smoke)
     else()
-        message(STATUS "PostgreSQL::PostgreSQL target unavailable — skipping postgres_store_smoke")
+        message(STATUS "PostgreSQL::PostgreSQL target unavailable, skipping postgres_store_smoke")
     endif()
 
-    # codes_yaml smoke needs libyaml-cpp at link time — guard so the build
-    # doesn't fail on systems without it. CI installs libyaml-cpp-dev.
+    # Skipped without libyaml-cpp; CI installs libyaml-cpp-dev.
     find_library(YAMLCPP_LIB yaml-cpp)
     if(YAMLCPP_LIB)
         add_executable(codes_yaml_smoke tests/codes_yaml_smoke.cpp)
@@ -137,12 +127,11 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME codes_yaml_smoke COMMAND codes_yaml_smoke)
     else()
-        message(STATUS "yaml-cpp not found — skipping codes_yaml_smoke")
+        message(STATUS "yaml-cpp not found, skipping codes_yaml_smoke")
     endif()
 
-    # P1-12: logger-shim smoke tests.
-    # spdlog + glog use stub headers in tests/shim_stubs/ — no install required.
-    # boost_log requires Boost.Log headers — guarded with find_package.
+    # Logger shims. spdlog and glog build against tests/shim_stubs/; the
+    # Boost.Log test needs a real Boost.Log.
 
     add_executable(shim_spdlog_smoke tests/shim_spdlog_smoke.cpp)
     target_include_directories(shim_spdlog_smoke BEFORE PRIVATE
@@ -172,9 +161,8 @@ if(FASTEN_BUILD_TESTS)
         endif()
         add_test(NAME shim_boost_log_smoke COMMAND shim_boost_log_smoke)
     else()
-        message(STATUS "Boost.Log not found — skipping shim_boost_log_smoke")
+        message(STATUS "Boost.Log not found, skipping shim_boost_log_smoke")
     endif()
 endif()
 
-# ── Install ───────────────────────────────────────────────────────────────
 install(DIRECTORY include/ DESTINATION include)

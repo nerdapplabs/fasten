@@ -1,10 +1,9 @@
 #pragma once
 /**
- * fasten/shim/glog.hpp — glog (google/glog) → fasten syslog bridge.
+ * fasten/shim/glog.hpp: copy glog messages into fasten's sys log.
  *
- * Header-only, opt-in. Call fasten::shim::glog::install() once after
- * fasten::init() and every LOG(INFO/WARNING/ERROR/FATAL) also writes
- * a syslog row into fasten's /logs/sys ring.
+ * After fasten::shim::glog::install(), each LOG(...) message is also
+ * redacted and pushed to the buffer behind query_syslog() and /logs/sys.
  *
  * Usage:
  *   #include "fasten.hpp"
@@ -15,16 +14,13 @@
  *   fasten::init(...);
  *   fasten::shim::glog::install();
  *
- *   // Existing LOG calls unchanged:
+ *   // Also lands in fasten's sys log:
  *   LOG(INFO) << "user_login user_id=" << uid;
  *
- * install() is idempotent — calling it multiple times registers only
- * one sink.
+ * install() registers the sink only once. A per-thread flag stops the
+ * sink from re-entering itself.
  *
- * Recursion guard: a per-thread flag prevents fasten's own internal
- * log writes from re-entering the glog sink.
- *
- * Requires: google/glog (any version with AddLogSink / LogSink).
+ * Requires glog with LogSink and AddLogSink.
  */
 
 #include <string>
@@ -76,10 +72,8 @@ public:
     void WaitTillSent() override {}
 };
 
-/**
- * Register the fasten glog sink once. Safe to call multiple times.
- * Returns a raw pointer to the installed sink (owned by glog's registry).
- */
+// Register the sink on the first call; later calls return the same sink.
+// The sink is never freed.
 inline FastenLogSink* install() {
     static FastenLogSink* sink = nullptr;
     if (!sink) {
@@ -89,14 +83,9 @@ inline FastenLogSink* install() {
     return sink;
 }
 
-/**
- * Remove the fasten glog sink (e.g. in tests or graceful shutdown).
- * No-op if install() was never called.
- */
+// Does nothing at present: `sink` here is a separate static from the one
+// in install(), so it is always null and RemoveLogSink is never called.
 inline void uninstall() {
-    // glog does not provide a way to remove a specific sink by pointer
-    // through the public API, so we rely on RemoveLogSink which was
-    // added in recent versions. Guard with a feature test.
 #if defined(HAVE_GLOG_REMOVE_LOG_SINK) || GLOG_VERSION_MAJOR >= 1
     static FastenLogSink* sink = nullptr;
     if (sink) {

@@ -1,18 +1,10 @@
-"""
-Stdout transport — JSON lines to stdout. Docker log driver captures + rotates.
+"""JSON lines on stdout, one per row, with a ``shape`` of sys, api or audit.
 
-Three shapes:
-  {"shape": "sys",   ...}  — structured log lines from fasten.log.*
-  {"shape": "api",   ...}  — HTTP request log lines
-  {"shape": "audit", ...}  — audit rows (also persisted to SQL store)
+sys and api rows are also kept in an in-memory ring (or a stream store, if
+configured) for the reader. Audit rows are read from the audit store.
 
-sys and api are also buffered in an in-memory ring so /logs/sys and /logs/api
-can serve recent events without reading from disk. audit is not ring-buffered
-here — /logs/audit queries the durable SQL store directly.
-
-Adopters who manage their own stdout (e.g. structlog, slog, zap) should call
-push_syslog / push_api instead of write_syslog / write_api — the push variants
-only buffer, they do not write to stdout (avoiding double-output).
+Apps that already write their own log lines should use push_syslog/push_api,
+which skip stdout.
 """
 from __future__ import annotations
 
@@ -27,18 +19,11 @@ from ..store.stream import StreamStore
 
 
 class StdoutTransport:
-    """Stdout writer + in-memory rings for the ``sys``/``api`` streams.
+    """Stdout writer with in-memory rings for the sys and api streams.
 
-    When a stream store is supplied (FR1, opt-in persistence) the ring stays
-    the hot write path and the store is a write-through sink; reads for that
-    stream are served from the store so they reach durable history instead of
-    a bounded window. Without a store the stream is ring-only — today's
-    backward-compatible behaviour.
-
-    Every push (sys, api, drainer sys) runs through the engine redactor
-    before it lands in the ring, the store, and stdout/stderr. An
-    "audit + correlation SDK" that leaked PII on any stream would be a
-    broken promise — the redactor is applied uniformly, not per-stream.
+    With a stream store, rows go to both the ring and the store, and reads
+    come from the store. Every sys and api row is redacted before it is
+    buffered, stored or written.
     """
 
     def __init__(
@@ -56,16 +41,11 @@ class StdoutTransport:
         self._api_store = api_store
         self._syslog_store = syslog_store
         self._service_id = service_id
-        # A default Redactor covers pre-init use (fasten.log.* before init)
-        # and adopter code that constructs its own StdoutTransport; the
-        # engine hands its own configured Redactor at init.
+        # The engine passes its configured Redactor.
         self._redactor = redactor if redactor is not None else Redactor()
-        # Sentinel invariant: rows written before the first real request belong
-        # to one stable boot window; context-less rows after that are orphans.
-        # _boot_over needs no lock (unlike Go's bootMu): the GIL makes the
-        # attribute read/write atomic and the flag is monotonic (False->True
-        # once), so a benign race at the transition stamps at most one extra
-        # row with the boot id.
+        # Rows without a request_id get the boot id until the first real
+        # request, then an orphan id. _boot_over only goes False to True, so
+        # it needs no lock; a race stamps at most one extra row with boot.
         self._boot_request_id = boot_request_id
         self._boot_over = False
 
@@ -92,11 +72,8 @@ class StdoutTransport:
             sys.stderr.write(f"fasten: {stream} persist failed: {type(exc).__name__}\n")
 
     def _redact(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Return a redacted shallow copy of ``row`` for the sys/api streams.
-        The audit path has its own redaction inside engine.emit; this
-        method is what protects the two non-audit surfaces (both direct
-        push and shim-mediated push) and every downstream sink — stdout,
-        stderr, ring, persistent store — sees the redacted form."""
+        """Redacted copy of a sys or api row. Audit rows are redacted in
+        Engine.emit()."""
         return self._redactor.redact(row)
 
     def _stream_store(self, stream: str) -> StreamStore | None:
@@ -107,20 +84,16 @@ class StdoutTransport:
         return None
 
     def stream_degraded(self, stream: str) -> bool:
-        """True when the stream's durable sink has swallowed at least one
-        persist failure — durable history has known holes. Always False for
-        ring-only streams."""
+        """True if a write to the stream's store has failed. Always False
+        without a store."""
         store = self._stream_store(stream)
         return store is not None and store.degraded
 
     def _stamp_request_id(self, row: dict[str, Any]) -> None:
-        """Guarantee a non-empty request_id on every stream row (the sentinel
-        invariant). A real id ends the boot window; a missing id is filled with
-        the shared boot sentinel during startup, else a unique orphan id."""
+        """Make sure the row has a request_id: the boot id before the first
+        real request, an orphan id after."""
         rid = row.get("request_id")
-        # Only a non-empty *string* counts as a caller-supplied id. A truthy
-        # non-string (e.g. an int a shim stashed) is treated as missing and
-        # gets a sentinel — parity with Go's `.(string)` assertion.
+        # A non-string id (e.g. an int) counts as missing.
         if isinstance(rid, str) and rid:
             if not is_sentinel(rid):
                 self._boot_over = True
@@ -130,10 +103,8 @@ class StdoutTransport:
         else:
             row["request_id"] = mint_sentinel("orphan", self._service_id)
 
-    # ── syslog ──────────────────────────────────────────────────────────────
-
     def write_syslog(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer (+ persist if configured). Redacted."""
+        """Redact, buffer, store if configured, and write to stdout."""
         self._stamp_request_id(row)
         row = self._redact(row)
         self._syslog.push(row)
@@ -142,31 +113,18 @@ class StdoutTransport:
         sys.stdout.flush()
 
     def push_syslog(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout (+ persist if configured). Redacted."""
+        """Like write_syslog() but without the stdout line."""
         self._stamp_request_id(row)
         row = self._redact(row)
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
 
     def write_drainer_syslog(self, row: dict[str, Any]) -> None:
-        """Drainer self-report path. Buffers + writes to STDERR, never stdout.
+        """Like write_syslog() but the line goes to stderr.
 
-        The audit queue drainer cannot share the stdout fd with emit() and
-        application logging: under stdout backpressure (slow Docker log
-        driver, blocked sidecar tail) writing here would block the drainer
-        thread, which would in turn block emit() once the queue fills —
-        a textbook capacity-deadlock with no recovery path. stderr lives on
-        a separate fd so the drainer keeps making progress; the row is
-        also pushed to the in-memory ring so `/logs/sys` and
-        `query_syslog()` continue to return drainer events for adopters
-        who never look at stderr.
-
-        The row is persisted like every other syslog push (matching Go, whose
-        drainer self-reports go through PushSyslog): with a syslog store
-        attached, reads are served from the store, so skipping the persist
-        would make drainer events vanish from the reader API. The store
-        insert touches SQLite, not stdout, so it cannot reintroduce the
-        stdout-backpressure deadlock above.
+        Used for fasten's own events. If the drainer thread wrote to a
+        blocked stdout it would stall, and emit() would block once the queue
+        filled.
         """
         self._stamp_request_id(row)
         row = self._redact(row)
@@ -191,10 +149,8 @@ class StdoutTransport:
                          service_id=service_id, event=event, since=since, until=until)
 
     def count_syslog(self, **filters: Any) -> int:
-        """Total syslog rows matching the filters in the backing source
-        (durable store, or the ring's current window) — the uncapped
-        counterpart of query_syslog(), so capped reads can report
-        truncation."""
+        """Number of sys rows matching the filters, without query_syslog()'s
+        limit."""
         if self._syslog_store is not None:
             return self._syslog_store.count_matching(**filters)
         return self._syslog.count(**filters)
@@ -202,10 +158,7 @@ class StdoutTransport:
     def search_syslog(
         self, *, q: str, since: str, until: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]] | None:
-        """FR3 free-text search over persisted sys history. Returns ``None`` when
-        the sys stream is ring-only — search is defined over durable history, not
-        a bounded window, so without a store there is nothing honest to search
-        (the caller surfaces this as "search requires sys persistence")."""
+        """Free-text search of the sys store. None if there is no store."""
         if self._syslog_store is None:
             return None
         return self._syslog_store.search(q=q, since=since, until=until, limit=limit)
@@ -213,18 +166,13 @@ class StdoutTransport:
     def search_api(
         self, *, q: str, since: str, until: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]] | None:
-        """FR3 free-text search over persisted api history. Same shape as
-        search_syslog — the api StreamStore is identical to the sys one, and
-        this method is what the reader calls when ``/search?streams=api`` is
-        requested. ``None`` = api ring-only, "requires api persistence"."""
+        """Free-text search of the api store. None if there is no store."""
         if self._api_store is None:
             return None
         return self._api_store.search(q=q, since=since, until=until, limit=limit)
 
-    # ── api log ─────────────────────────────────────────────────────────────
-
     def write_api(self, row: dict[str, Any]) -> None:
-        """Write to stdout AND buffer (+ persist if configured). Redacted."""
+        """Redact, buffer, store if configured, and write to stdout."""
         self._stamp_request_id(row)
         row = self._redact(row)
         self._api.push(row)
@@ -233,7 +181,7 @@ class StdoutTransport:
         sys.stdout.flush()
 
     def push_api(self, row: dict[str, Any]) -> None:
-        """Buffer only — no stdout (+ persist if configured). Redacted."""
+        """Like write_api() but without the stdout line."""
         self._stamp_request_id(row)
         row = self._redact(row)
         self._api.push(row)
@@ -255,16 +203,13 @@ class StdoutTransport:
                          request_id=request_id, status=status, since=since, until=until)
 
     def count_api(self, **filters: Any) -> int:
-        """Total api rows matching the filters in the backing source (durable
-        store, or the ring's current window) — the uncapped counterpart of
-        query_api(), so capped reads can report truncation."""
+        """Number of api rows matching the filters, without query_api()'s
+        limit."""
         if self._api_store is not None:
             return self._api_store.count_matching(**filters)
         return self._api.count(**filters)
 
-    # ── audit ────────────────────────────────────────────────────────────────
-
     def write_audit(self, row: dict[str, Any]) -> None:
-        """Write to stdout. Audit rows are also persisted to SQL store."""
+        """Write an audit row to stdout. Storing it is the Engine's job."""
         sys.stdout.write(json.dumps({"shape": "audit", **row}, default=str) + "\n")
         sys.stdout.flush()

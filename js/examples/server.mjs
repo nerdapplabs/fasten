@@ -4,13 +4,13 @@
 //
 //   - fasten.init() reading env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID).
 //   - One audit code (USER_CREATED) registered at startup.
-//   - withRequestID() wraps each request — mints / honours X-Request-ID
+//   - withRequestID() wraps each request and mints or honours X-Request-ID
 //     and stashes it in AsyncLocalStorage for downstream emit / log.
 //   - POST /users emits an audit row with the in-context request_id.
 //   - GET  /users/<id> emits a read-side audit row + a structured sys log.
 //   - On SIGINT/SIGTERM, fasten.flush() drains pending audit rows.
 //
-// Zero external deps — uses Node's built-in http.
+// No dependencies; uses Node's built-in http.
 //
 // Run:
 //   cd js/examples
@@ -100,7 +100,7 @@ server.listen(port, () => console.log(`listening on :${port}`));
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, async () => {
-        console.log('shutting down — flushing audit queue');
+        console.log('shutting down, flushing audit queue');
         await fasten.flush(5000);
         server.close(() => process.exit(0));
     });

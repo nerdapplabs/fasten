@@ -10,35 +10,36 @@
 [![Version](https://img.shields.io/badge/version-1.0.0--beta-teal.svg)](CHANGELOG.md)
 
 > *Logs tell you what happened. Traces tell you where. fasten tells you
-> who changed what — and why.*
+> who changed what, and why.*
 
-Audit + correlation SDK.
+fasten is an audit and correlation SDK for AI agents and software systems.
+It goes beyond observability to state over time, and from observation to
+evidence: verify before, govern during, prove after.
 
-**Beyond observability. State over time.**
+A software system is more than its AI agents. Logs, metrics and traces tell
+you what is happening. fasten is a fourth pillar next to them: it connects AI
+and non-AI components with a tamper-evident record of what happened, who
+changed it, and who can prove it.
 
-**Verify before · govern during · prove after.**
+It writes three streams: logs, an HTTP access trail, and typed audit rows.
+One `request_id` ties them together. Every audit row carries 7 anchors (the
+5 Ws, H, and CORRELATION), enforced at the type level. Shims for HTTP, MQTT
+and scheduler-fired jobs are included, along with a mountable HTTP reader
+API for querying the record back.
 
-**From observation to evidence.  For AI agents and software systems.**
+**Status: v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++ and
+Swift are beta. Nothing is published to PyPI, npm or crates.io yet; install
+from source.
 
-A software system is more than AI agents. Logs, metrics, and traces tell
-you *what is happening*. **fasten is the connective tissue across AI and
-non-AI components** — the fourth pillar, joining all three with the
-tamper-evident record of *what happened, who changed it, who can prove it*.
-
-Logs, HTTP access trail, and typed audit rows — one `request_id` threads all three streams. 7 anchors (5 Ws + H + CORRELATION) enforced at the type level. Bundled shims for HTTP, MQTT, and scheduler-fired jobs. A mountable HTTP reader API for querying it back.
-
-**v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++, and Swift
-are beta. Not yet on PyPI, npm, or crates.io — install from source.
-
-**[Website →](https://fasten.sh)**
+[Website](https://fasten.sh)
 
 ---
 
 ## Where it fits
 
-fasten is the open-source substrate. It treats AI agents as one kind of
-actor, alongside users, services, schedulers, and integrations. Same
-primitive for every actor.
+fasten is the open-source base layer. It treats AI agents as one kind of
+actor alongside users, services, schedulers and integrations, and records
+all of them the same way.
 
 Two commercial layers build on it:
 
@@ -56,7 +57,7 @@ You only need fasten to start.
 
 | Question                                          | Before fasten          | With fasten            |
 |---------------------------------------------------|-----------------------|-----------------------|
-| Who deployed this config at 14:32?                | grep + Slack + 20 min | `?since=&until=` → 30 s |
+| Who deployed this config at 14:32?                | grep + Slack + 20 min | `?since=&until=`, 30 s |
 | Which HTTP request caused this MQTT disconnect?   | Unknown               | Same `request_id`     |
 | Show every mutation to this resource in 30 days   | Log scraping          | `?target=resource-id` |
 | Compliance audit trail for a regulated deployment | Custom table + glue   | `?code=&since=&until=` |
@@ -64,20 +65,22 @@ You only need fasten to start.
 
 ---
 
-## Install + Quickstart
+## Install and quickstart
 
-Start at **[fasten.sh/docs](https://fasten.sh/docs/)**. The
-install steps for every language and a runnable Python quickstart
-are at the top of the page.
+Start at **[fasten.sh/docs](https://fasten.sh/docs/)**. The install steps
+for every language and a runnable Python quickstart are at the top of the
+page. Each SDK directory also has its own README:
+[Python](python/README.md), [Go](go/README.md), [Node](js/README.md),
+[Rust](rust/README.md), [C++](cpp/README.md), [Java](java/README.md).
 
 ---
 
 ## Reference
 
-The same docs cover the rest:
-language matrix (Python, Go, Node, Rust, C++, Swift), bundled CLI + TUI,
-C++ logger bridges (spdlog, glog, Boost.Log), audit-store failure
-handling, PII redaction, and the wire schema versioning contract.
+The same docs cover the language matrix (Python, Go, Node, Rust, C++,
+Swift), the bundled CLI and TUI, the C++ logger bridges (spdlog, glog,
+Boost.Log), audit-store failure handling, PII redaction, and the wire
+schema versioning contract.
 
 ---
 
@@ -91,7 +94,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
-v1.0.0-beta. Apache-2.0, contributions welcome.
+v1.0.0-beta. Apache-2.0. Contributions are welcome.
 
 ## License
 

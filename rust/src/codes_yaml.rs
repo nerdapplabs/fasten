@@ -1,8 +1,5 @@
-//! Catalog YAML loader (P1-11).
-//!
-//! Optional feature — gated behind the `codes-yaml` cargo feature so
-//! adopters who stay on programmatic [`super::register`] never pull
-//! `serde_yaml` into their build.
+//! Load audit codes from yaml files. Behind the `codes-yaml` feature, so
+//! users of [`super::register`] alone don't build `serde_yaml`.
 //!
 //! ```ignore
 //! // in Cargo.toml:
@@ -11,16 +8,10 @@
 //! fasten::codes::reload()?;
 //! ```
 //!
-//! Reload semantics match Python / Go / JS:
-//! - **Atomic**: parse + validate fully into a fresh map; only swap if
-//!   everything succeeds. Concurrent emit() readers see either old or
-//!   new, never partial state.
-//! - **Fault-tolerant**: any error during reload (parse, invalid
-//!   severity, missing field) leaves the previous catalog active and
-//!   returns the error.
-//! - **NOT additive**: codes removed from the yaml become unknown after
-//!   reload. Programmatic `register()` codes are tracked separately and
-//!   survive reload.
+//! `reload()` re-reads every loaded file and validates it before swapping
+//! the catalog under the registry write lock, so readers see the old or the
+//! new catalog, never a mix. On error the old catalog stays. Codes removed
+//! from the yaml are dropped; codes added with `register()` are kept.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -115,7 +106,7 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
 
         if doc.domain.is_empty() {
             return Err(Error::YamlInvalid(format!(
-                "{} — top-level 'domain' is required",
+                "{}: top-level 'domain' is required",
                 path.display()
             )));
         }
@@ -123,25 +114,25 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
         for (code, raw) in doc.codes {
             if !is_upper_snake(&code) {
                 return Err(Error::YamlInvalid(format!(
-                    "{}:{code} — code key must be UPPER_SNAKE_CASE",
+                    "{}:{code}: code key must be UPPER_SNAKE_CASE",
                     path.display()
                 )));
             }
             if fresh.contains_key(&code) {
                 return Err(Error::YamlInvalid(format!(
-                    "{}:{code} — duplicate code in yaml",
+                    "{}:{code}: duplicate code in yaml",
                     path.display()
                 )));
             }
             let sev = parse_severity(&raw.severity).map_err(|e| {
-                Error::YamlInvalid(format!("{}:{code} — {e}", path.display()))
+                Error::YamlInvalid(format!("{}:{code}: {e}", path.display()))
             })?;
             let rc = parse_retention(&raw.retention_class).map_err(|e| {
-                Error::YamlInvalid(format!("{}:{code} — {e}", path.display()))
+                Error::YamlInvalid(format!("{}:{code}: {e}", path.display()))
             })?;
             if !raw.domain.is_empty() && raw.domain != doc.domain {
                 return Err(Error::YamlInvalid(format!(
-                    "{}:{code} — domain={:?} disagrees with file-level domain={:?}",
+                    "{}:{code}: domain={:?} disagrees with file-level domain={:?}",
                     path.display(),
                     raw.domain,
                     doc.domain
@@ -175,11 +166,10 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
     Ok(fresh)
 }
 
-/// Initial load of a yaml catalog file. Errors raise loudly (startup, restart-safe).
+/// Load a yaml catalog file and add its codes to the registry.
 ///
-/// Subsequent [`reload`] calls re-read this path along with any other
-/// paths previously passed to `load`. Programmatic `register` calls
-/// remain in the registry and survive `reload`.
+/// [`reload`] re-reads every path passed to `load`. A yaml code can't
+/// replace one added with `register()`.
 pub fn load(path: impl Into<PathBuf>) -> Result<(), Error> {
     let path = path.into();
     let fresh = build_from_paths(std::slice::from_ref(&path))?;
@@ -193,7 +183,7 @@ pub fn load(path: impl Into<PathBuf>) -> Result<(), Error> {
         for code in fresh.keys() {
             if reg.contains_key(code) && !yaml_codes.contains(code) {
                 return Err(Error::YamlInvalid(format!(
-                    "{}:{code} — duplicate code (already registered programmatically)",
+                    "{}:{code}: duplicate code (already registered programmatically)",
                     path.display()
                 )));
             }
@@ -211,12 +201,10 @@ pub fn load(path: impl Into<PathBuf>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Re-read every previously-loaded yaml path and atomically swap the registry.
+/// Re-read every loaded yaml file and swap the yaml codes in one step.
 ///
-/// Atomic + fault-tolerant: build new registry fully + run all
-/// validation; if anything fails the previous catalog stays active.
-/// Reload is **NOT additive** — codes removed from the yaml become
-/// unknown after the swap. Programmatic `register` codes survive.
+/// On error the previous catalog stays. Codes removed from the yaml are
+/// dropped; codes added with `register()` are kept.
 pub fn reload() -> Result<(), Error> {
     let paths_snapshot: Vec<PathBuf> = {
         let paths = LOADED_PATHS.lock().expect("loaded_paths poisoned");
@@ -252,9 +240,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    // Global registry + LOADED_PATHS + YAML_CODES are shared module-level
-    // state. Cargo runs tests in parallel by default; serialize this
-    // module's tests so they don't trample each other's reset_yaml_state.
+    // The registry, LOADED_PATHS and YAML_CODES are global, so these tests
+    // run one at a time.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fleet_yaml() -> &'static str {
@@ -275,9 +262,8 @@ codes:
 "
     }
 
-    /// Tiny replacement for the `tempfile` crate (which transitively pulls
-    /// a getrandom version requiring Rust 1.85). Builds a unique path
-    /// under /tmp using a process-local counter.
+    /// Temp file removed on drop, so the tests need no `tempfile` dependency.
+    /// The name is unique per process and call.
     struct TempYaml(PathBuf);
 
     impl TempYaml {

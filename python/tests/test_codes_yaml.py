@@ -1,4 +1,4 @@
-"""Tests for P1-11 — `fasten.codes.load()` + `reload()` yaml catalog."""
+"""Yaml catalog: `fasten.codes.load()` and `reload()`."""
 import textwrap
 from pathlib import Path
 
@@ -43,9 +43,8 @@ def fasten_yaml(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def clean_yaml_paths():
-    """Reset yaml-load state between tests: clear loaded paths AND any
-    FLEET_/EXTRA_ codes in the registry (fresh_state in conftest doesn't
-    touch the catalog)."""
+    """Reset yaml-load state and FLEET_/EXTRA_ codes around a test.
+    conftest's fresh_state does not touch the catalog."""
     from fasten.codes_yaml import _loaded_paths, _yaml_codes, _yaml_code_origins
     saved_paths = list(_loaded_paths)
     saved_yaml_codes = set(_yaml_codes)
@@ -127,8 +126,7 @@ def test_load_collision_with_programmatic_raises(fasten_yaml, clean_yaml_paths):
 
 
 def test_load_cross_file_collision_raises(fasten_yaml, tmp_path, clean_yaml_paths):
-    """REVIEW #13: same code-id loaded from two different files used to
-    silently overwrite the first registration's metadata."""
+    """The same code id in a second file must not replace the first one."""
     load(str(fasten_yaml))
     # Second file also declares FLEET_NODE_REGISTERED with different metadata.
     p2 = tmp_path / "fleet-v2.codes.yaml"
@@ -144,7 +142,7 @@ def test_load_cross_file_collision_raises(fasten_yaml, tmp_path, clean_yaml_path
     """))
     with pytest.raises(AuditCatalogError, match="already loaded from"):
         load(str(p2))
-    # First file's metadata still wins (silent overwrite did not happen).
+    # First file's metadata still wins.
     reg = registry()
     assert reg["FLEET_NODE_REGISTERED"].emitter == "fleet-service"
     assert reg["FLEET_NODE_REGISTERED"].severity == Severity.INFO
@@ -161,7 +159,7 @@ def test_load_same_path_twice_is_idempotent(fasten_yaml, clean_yaml_paths):
 def test_reload_picks_up_new_codes(fasten_yaml, clean_yaml_paths):
     load(str(fasten_yaml))
 
-    # Edit yaml — add a new code
+    # Add a new code to the yaml
     fasten_yaml.write_text(textwrap.dedent("""\
         domain: fleet
         codes:
@@ -183,7 +181,7 @@ def test_reload_picks_up_new_codes(fasten_yaml, clean_yaml_paths):
 
 
 def test_reload_removes_codes(fasten_yaml, clean_yaml_paths):
-    """Reload is full replacement of the file — codes removed from yaml are gone."""
+    """Reload replaces the file's codes, so codes removed from the yaml are gone."""
     load(str(fasten_yaml))
     assert "FLEET_DEPLOY_FAILED" in registry()
 
@@ -203,7 +201,7 @@ def test_reload_removes_codes(fasten_yaml, clean_yaml_paths):
 
 
 def test_reload_fault_tolerant(fasten_yaml, clean_yaml_paths):
-    """Bad yaml during reload must NOT break the live registry."""
+    """Bad yaml during reload leaves the live registry unchanged."""
     load(str(fasten_yaml))
     snapshot = dict(registry())  # known-good registry contents
 
@@ -218,7 +216,6 @@ def test_reload_fault_tolerant(fasten_yaml, clean_yaml_paths):
     with pytest.raises(AuditCatalogError):
         reload()
 
-    # Live registry must be unchanged — previous catalog still active.
     after = registry()
     assert after == snapshot
 
@@ -228,7 +225,7 @@ def test_reload_preserves_programmatic_codes(fasten_yaml, clean_yaml_paths):
     from fasten.codes import register, Meta
     load(str(fasten_yaml))
 
-    # Add a code programmatically — different domain, not in yaml
+    # Add a code programmatically, in a domain not in the yaml
     if "EXTRA_PROG_CODE" in _registry:
         del _registry["EXTRA_PROG_CODE"]
     register("extra", {
@@ -258,5 +255,5 @@ def test_reload_preserves_programmatic_codes(fasten_yaml, clean_yaml_paths):
 
 
 def test_reload_no_op_without_load(clean_yaml_paths):
-    """reload() with no prior load() is a no-op (no-op is the right default)."""
+    """reload() with no prior load() is a no-op."""
     reload()  # must not raise

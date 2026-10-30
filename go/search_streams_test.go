@@ -9,8 +9,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// PR #59 finding 16 (phase0 restoration): /search accepts ?streams=
-// comma-separated over {audit, api, sys} and fans out to each.
+// /search accepts ?streams= comma-separated over {audit, api, sys} and
+// searches each.
 
 func initSearchFull(t *testing.T, withStores bool) {
 	t.Helper()
@@ -60,7 +60,7 @@ func TestSearchStreams_ApiStream(t *testing.T) {
 	initSearchFull(t, true)
 	tr := GetTransport()
 	tr.PushAPI(APIRow{"method": "POST", "path": "/checkout", "status": 502,
-		"message": "gateway timeout on payment provider",
+		"message":   "gateway timeout on payment provider",
 		"timestamp": "2026-08-01T00:00:00Z", "request_id": "r-api"})
 	body, _ := getJSON(t, NewReader(),
 		"/search?q=gateway&since="+searchSince+"&streams=api")
@@ -104,7 +104,7 @@ func TestSearchStreams_AllThreeFanOut(t *testing.T) {
 	tr.PushSyslog(SyslogRow{"event": "cache.miss", "message": "cache miss on key foo",
 		"timestamp": "2026-08-01T00:00:00Z", "request_id": "r-sys"})
 	tr.PushAPI(APIRow{"method": "GET", "path": "/foo", "status": 200,
-		"message": "hit for foo",
+		"message":   "hit for foo",
 		"timestamp": "2026-08-01T00:00:01Z", "request_id": "r-api"})
 	if _, err := Emit(context.Background(), "USER_CREATED",
 		Target("u"), WithDetail(map[string]any{"note": "foo did it"})); err != nil {
@@ -116,7 +116,7 @@ func TestSearchStreams_AllThreeFanOut(t *testing.T) {
 	if counts["sys"] != float64(1) || counts["api"] != float64(1) || counts["audit"] != float64(1) {
 		t.Fatalf("counts=%v, want {sys:1, api:1, audit:1}", counts)
 	}
-	// Stable stream order in matches: sys → api → audit (mirrors /correlate).
+	// Stable stream order in matches: sys, api, audit (same as /correlate).
 	matches, _ := body["matches"].([]any)
 	got := []string{}
 	for _, m := range matches {
@@ -132,8 +132,8 @@ func TestSearchStreams_AllThreeFanOut(t *testing.T) {
 }
 
 func TestSearchStreams_MissingStorePerStreamError(t *testing.T) {
-	// syslog store attached, api store not — ?streams=api reports errors.api
-	// rather than a silent counts.api=0.
+	// syslog store attached, api store not: ?streams=api reports errors.api
+	// rather than counts.api=0.
 	resetGlobals(t)
 	registerTestCodes(t)
 	sdb, _ := sql.Open("sqlite", ":memory:")

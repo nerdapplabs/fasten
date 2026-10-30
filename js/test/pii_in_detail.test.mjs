@@ -1,20 +1,15 @@
-/**
- * P1-5: pii_in_detail enforcement (JS parity with Python + Go).
- *
- * 1. register() forces retentionClass=SHORT and warns when piiInDetail=true
- * 2. emit() force-redacts detail; passthrough keys survive (still scrubbed)
- * 3. row.pii_in_detail mirrors meta.piiInDetail
- */
+// pii_in_detail: register() forces SHORT retention and warns, emit()
+// redacts detail except passthrough keys, and the row carries the flag.
 import { test, beforeEach, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, metaOf,
     REDACT_REPLACEMENT, RetentionClass,
-    registry, _clearRustRegistry,
+    registry, _clearCoreRegistry,
 } from '../src/index.js';
 
 function clear() {
-    _clearRustRegistry();
+    _clearCoreRegistry();
     registry().clear();
 }
 
@@ -27,9 +22,9 @@ function captureWarn(fn) {
     return calls;
 }
 
-// ── #1 force SHORT at registration ────────────────────────────────────────
+// Force SHORT at registration
 
-describe('P1-5 register: piiInDetail forces SHORT', () => {
+describe('register: piiInDetail forces SHORT', () => {
     beforeEach(clear);
 
     test('forces SHORT and warns when adopter set LONG', () => {
@@ -80,9 +75,9 @@ describe('P1-5 register: piiInDetail forces SHORT', () => {
     });
 });
 
-// ── #2 force-redact + passthrough at emit ─────────────────────────────────
+// Force-redact + passthrough at emit
 
-describe('P1-5 emit: force-redact + passthrough', () => {
+describe('emit: force-redact + passthrough', () => {
     beforeEach(() => {
         clear();
         init({ serviceId: 'svc', nodeId: 'node' });
@@ -122,7 +117,7 @@ describe('P1-5 emit: force-redact + passthrough', () => {
         });
         assert.equal(row.detail.region, 'MH');
         assert.ok(!('city' in row.detail));
-        assert.ok(!('api_key' in row.detail), 'api_key not in passthrough → gone entirely');
+        assert.ok(!('api_key' in row.detail), 'api_key is not a passthrough key');
         assert.equal(row.detail._redacted, REDACT_REPLACEMENT);
     });
 

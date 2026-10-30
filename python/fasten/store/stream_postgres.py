@@ -1,16 +1,9 @@
-"""PostgreSQL-backed per-stream store for the ``api`` and ``sys`` streams (FR1),
-psycopg v3.
+"""Postgres store for the api or sys stream (psycopg 3).
 
-The Postgres sibling of :class:`fasten.store.stream.StreamStore`. It carries the
-same schema form ``"1"`` columns and indexes and the same query / filter /
-window / completeness / search semantics, so a stream table is portable across
-backends and the SQLite and Postgres paths agree (and match the Go SDK). Chosen
-for high-volume ``api``/``sys`` persistence, where SQLite's single-writer lock
-becomes the bottleneck.
-
-Connection handling mirrors :class:`fasten.store.postgres.PostgresStore`: one
-psycopg connection per thread via ``threading.local``, with a one-shot reconnect
-on a stale connection. Install the optional dep: ``pip install "fasten[postgres]"``.
+Same columns, indexes and query behaviour as
+:class:`fasten.store.stream.StreamStore`, for streams too busy for SQLite's
+single writer. One connection per thread, reconnecting once if it has gone
+stale. Needs ``pip install "fasten[postgres]"``.
 """
 from __future__ import annotations
 
@@ -40,7 +33,7 @@ CREATE TABLE IF NOT EXISTS {table} (
 """
 
 _INDEXES = [
-    # {p} = bare table name for the index identifier; {t} = full (maybe schema.table).
+    # {p}: table name without schema, for index names. {t}: full table name.
     "CREATE INDEX IF NOT EXISTS idx_{p}_req ON {t}(request_id)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts  ON {t}(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_lvl ON {t}(level)",
@@ -56,17 +49,15 @@ _INDEXED_FIELDS = ("request_id", "timestamp", "level", "service_id",
 
 
 class PostgresStreamStore:
-    """Durable, queryable Postgres backing for one ring-buffered stream."""
+    """Postgres table backing one stream."""
 
     def __init__(self, dsn: str, table: str) -> None:
-        # `table` is required — earlier versions defaulted to "syslog" so a
-        # caller wiring an api stream with a blank name silently landed api
-        # rows in the syslog table (parity with Go's NewPostgresStreamStore
-        # fix). Pass "api_log" / "syslog" (or whatever you choose) explicitly.
+        # No default table, so api rows can't end up in the syslog table by
+        # accident.
         if not table:
             raise ValueError(
                 "fasten PostgresStreamStore: table name is required "
-                "(no default — pass \"api_log\" / \"syslog\" explicitly to "
+                "(no default: pass \"api_log\" / \"syslog\" explicitly to "
                 "avoid api rows landing in the syslog table)."
             )
         if not _SAFE_IDENTIFIER.match(table):
@@ -80,8 +71,7 @@ class PostgresStreamStore:
         self._idx_prefix = table.split(".")[-1]
         self._schema = table.split(".")[0] if "." in table else None
         self._tls = threading.local()
-        # Swallowed persist attempts — see StreamStore for the semantics; drives
-        # the reader's ``store-degraded`` completeness flag.
+        # See StreamStore._write_failures.
         self._write_failures = 0
         conn = self._connect()
         with conn.cursor() as cur:
@@ -91,8 +81,6 @@ class PostgresStreamStore:
             for sql in _INDEXES:
                 cur.execute(sql.format(t=self._table, p=self._idx_prefix))
         conn.commit()
-
-    # ── Connection management ─────────────────────────────────────────────
 
     def _connect(self) -> Any:
         import psycopg
@@ -117,25 +105,14 @@ class PostgresStreamStore:
         return conn
 
     def _execute_with_retry(self, fn: Callable[[Any], Any]) -> Any:
-        """Run fn(conn) once; on stale-connection error reconnect and retry once.
+        """Run fn(conn), reconnecting and retrying once on a connection error.
 
-        Whether fn returns or raises, release any transaction it left open so the
-        connection is never parked holding locks. A write fn ``commit()``s itself
-        (leaving the connection IDLE — untouched here). A read fn runs a bare
-        ``SELECT`` and returns, leaving the connection *idle in transaction*
-        (INTRANS); a read that *raises* (e.g. a bad column during a concurrent
-        ``ALTER``) leaves it INERROR — both still hold any lock the statement
-        took (``ACCESS SHARE``) until the transaction ends, and INERROR also
-        poisons the connection for reuse.
-
-        Without this guard, a non-Operational error in a write fn (e.g.
-        ``UndefinedTable``, ``NotNullViolation``) is swallowed one level up,
-        leaves the thread-local connection ``INERROR``, and every subsequent
-        statement raises ``InFailedSqlTransaction`` — which is
-        ``psycopg.InternalError``, **not** ``OperationalError`` — so the
-        reconnect branch never fires. Every api/sys row on that thread then
-        fails to persist forever while the flag stays green. Mirrors
-        ``PostgresStore._execute_with_retry`` in ``postgres.py``."""
+        Afterwards any open transaction is rolled back. Reads leave one open
+        (holding locks), and a failed statement leaves the connection in an
+        error state where every later statement raises InFailedSqlTransaction,
+        which is not an OperationalError and so would never trigger the
+        reconnect. Same as PostgresStore._execute_with_retry.
+        """
         import psycopg
 
         def _call(conn: Any) -> Any:
@@ -146,7 +123,7 @@ class PostgresStreamStore:
                     try:
                         conn.rollback()
                     except (psycopg.OperationalError, psycopg.InterfaceError):
-                        pass  # dead conn; don't mask the in-flight error
+                        pass  # dead connection; keep the original error
 
         try:
             return _call(self._connect())
@@ -161,18 +138,14 @@ class PostgresStreamStore:
 
     @classmethod
     def from_dsn(cls, dsn: str, default_table: str) -> "PostgresStreamStore":
-        """Parse ``postgres[ql]://...?table=X`` — strip the fasten-specific
-        ``table`` param before handing the DSN to psycopg (libpq rejects
-        unknown params). ``default_table`` is used only when the DSN has
-        no ``?table=`` override; caller must pass one explicitly (no
-        implicit "syslog" — same reasoning as PostgresStreamStore.__init__)."""
+        """Build a store from ``postgres[ql]://...?table=X``. ``table`` is
+        removed before connecting, since libpq rejects unknown parameters;
+        ``default_table`` is used when it is absent."""
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         table = q.pop("table", default_table)
         pg_dsn = urlunparse(u._replace(query=urlencode(q)))
         return cls(dsn=pg_dsn, table=table)
-
-    # ── Write path ────────────────────────────────────────────────────────
 
     def insert(self, row: dict[str, Any]) -> None:
         cols = {f: row.get(f) for f in _INDEXED_FIELDS}
@@ -187,9 +160,7 @@ class PostgresStreamStore:
                         cols["request_id"], cols["timestamp"], cols["level"],
                         cols["service_id"], cols["event"], cols["method"],
                         cols["path"], cols["status"],
-                        # ensure_ascii=False — see stream.py for why (parity
-                        # with Go's json.Marshal, otherwise q= over non-ASCII
-                        # text returns zero matches).
+                        # Unescaped non-ASCII; see StreamStore.insert.
                         json.dumps(row, default=str, ensure_ascii=False),
                     ),
                 )
@@ -207,8 +178,6 @@ class PostgresStreamStore:
     @property
     def degraded(self) -> bool:
         return self._write_failures > 0
-
-    # ── Read path ─────────────────────────────────────────────────────────
 
     def _build_where(
         self,
@@ -274,11 +243,8 @@ class PostgresStreamStore:
         return self._execute_with_retry(_run)
 
     def purge(self, *, before: "datetime | str") -> int:
-        """Age-based retention delete (FR1). NULL timestamps are never purged.
-
-        Accepts a ``datetime`` or an already-canonical string — see
-        ``StreamStore.purge`` for why both families must agree on this.
-        """
+        """Delete rows older than ``before`` (a datetime or canonical string)
+        and return how many were deleted. Rows without a timestamp are kept."""
         if not isinstance(before, str):
             from ..canonical_ts import canonical_ts
             before = canonical_ts(before)
@@ -295,12 +261,11 @@ class PostgresStreamStore:
     def search(
         self, *, q: str, since: str, until: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """FR3 bounded substring search (§4.1). Case-insensitive via ILIKE; %/_/\\
-        in ``q`` are escaped so they match literally."""
+        """Case-insensitive substring search (ILIKE) of the stored JSON within
+        ``[since, until]``. ``%``, ``_`` and ``\\`` in ``q`` match literally."""
         esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        # ESCAPE E'\\' (explicit escape-string) always means one backslash,
-        # independent of standard_conforming_strings; plain '\' would break if a
-        # deployment turned that off (FR3-4).
+        # E'\\' is one backslash whatever standard_conforming_strings is set
+        # to; a plain '\' would not be.
         conds = ["COALESCE(timestamp, '') >= %s", "payload ILIKE %s ESCAPE E'\\\\'"]
         params: list[Any] = [since, f"%{esc}%"]
         if until:

@@ -7,18 +7,13 @@ import (
 	"time"
 )
 
-// The PII retention horizon: expiring a stored audit payload without breaking
-// the chain it belongs to (spec §7.1/§7.2).
+// PII retention (spec §7.1, §7.2): Detail on PII rows is destroyed sooner
+// than the rows themselves, which are kept by age.
 //
-// Two horizons, because one cannot express the policy: operational history is
-// kept by age, while personal data in Detail goes sooner. A single age purge
-// forces a choice between destroying the history too or keeping the personal
-// data as long as the history.
-//
-// Redaction, never deletion — removing a row from a hash-chained stream is
-// what VerifyChain reports as tampering. Under form "2" the hash covers
-// DetailCommitment rather than Detail, so the payload can be destroyed while
-// the hash, PrevHash and MonotonicSeq stay put (P1-55).
+// Rows are redacted, not deleted, because deleting from a hash chain shows up
+// as tampering in VerifyChain. Under form "2" the hash covers
+// DetailCommitment rather than Detail, so Detail can go while the hash,
+// PrevHash and MonotonicSeq stay.
 
 // RedactionCandidate is a row that a PII horizon would redact. MonotonicSeq
 // travels with the id because spec §7.2 records redacted_seq, which is not
@@ -28,10 +23,9 @@ type RedactionCandidate struct {
 	MonotonicSeq int64
 }
 
-// RedactionRepository is the spec §7.1 capability. Split in two halves so a
-// caller can write its §7.2 records BEFORE anything is destroyed: the reverse
-// order has a window where the rows are gone and the record fails, leaving no
-// trace and nothing a retry can find.
+// RedactionRepository is the spec §7.1 capability. Listing and redacting are
+// separate so the caller can write the §7.2 record before anything is
+// destroyed; the other order can lose rows with no record and nothing to retry.
 type RedactionRepository interface {
 	// The int is the number of form-"1" rows past the horizon that were NOT
 	// returned because their detail is inside the hash. Reported by the
@@ -41,11 +35,9 @@ type RedactionRepository interface {
 	RedactRows(ctx context.Context, ids []string) ([]string, error)
 }
 
-// piiCodes returns the codes whose rows may carry personal data in Detail.
-//
-// Includes a code if it declares PiiInDetail OR is classified RetShort — the
-// register-time forcing makes the first imply the second, and an adopter who
-// sets RetShort directly has said the same thing about retention.
+// piiCodes returns the codes whose rows may carry personal data in Detail:
+// those with PiiInDetail or RetShort. Register forces PiiInDetail codes to
+// RetShort, and setting RetShort directly means the same for retention.
 func piiCodes() []Code {
 	regMu.RLock()
 	defer regMu.RUnlock()
@@ -83,12 +75,11 @@ func ensureRedactionCode() error {
 	})
 }
 
-// RedactExpired destroys Detail on expired PII rows AND records that it
-// happened (spec §7.1 + §7.2). Returns the ids redacted.
+// RedactExpired destroys Detail on expired PII rows and records each one
+// (spec §7.1, §7.2). It returns the ids redacted.
 //
-// Records before destroying: an emit failure then destroys nothing and the
-// retry is clean, and a destroy failure leaves the data intact under a record
-// the next tick converges on.
+// The record is written first. If that fails nothing is destroyed; if the
+// destroy fails the data is intact and the next run picks it up again.
 func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason string) ([]string, error) {
 	store, ok := e.auditStore.(RedactionRepository)
 	if !ok {
@@ -121,16 +112,12 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	if reason == "" {
 		reason = "retention"
 	}
-	// One row at a time, record then destroy. Emitting the whole batch and
-	// then destroying it in one call meant a failed destroy left every row
-	// still a candidate, so the next tick re-emitted a record for all of them
-	// — duplicate events scaling with the batch. Per row, only the row that
-	// failed between its own record and its destroy can repeat.
+	// One row at a time, so a failed destroy can only duplicate the record
+	// for that one row on the next run, not for the whole batch.
 	redacted := make([]string, 0, len(candidates))
 	for _, c := range candidates {
-		// emitRow(durable=true): queue mode (the default) swallows store
-		// failures and returns normally, so a plain Emit let the destroy
-		// proceed for rows whose record had never persisted.
+		// durable=true: in queue mode a plain Emit returns before the row is
+		// stored, and the destroy must not run unless the record persisted.
 		if _, err := e.emitRow(ctx, CodeAuditRowRedacted, true,
 			Target(c.ID),
 			// spec §7.2 shape; redacted_id too, since seq is only unique per
