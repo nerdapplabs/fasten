@@ -20,6 +20,10 @@ public final class FastenStore {
 
     private var handle: OpaquePointer?
     private let lock = RWLock()
+    // Set before close() waits for the write lock, so new calls fail at once
+    // instead of queueing ahead of it (glibc's rwlock favours readers).
+    private var closing = false
+    private let closingLock = NSLock()
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -46,6 +50,9 @@ public final class FastenStore {
     /// Calling `close()` again is a no-op; other operations throw.
     /// Waits for calls already in progress, so a slow insert delays it.
     public func close() {
+        closingLock.lock()
+        closing = true
+        closingLock.unlock()
         lock.writeLock()
         defer { lock.unlock() }
         if let h = handle {
@@ -57,6 +64,10 @@ public final class FastenStore {
     // Calls share the read lock so they still run concurrently; close()
     // takes the write lock and waits for them to finish.
     private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+        closingLock.lock()
+        let isClosing = closing
+        closingLock.unlock()
+        if isClosing { throw FastenStoreError("store is closed") }
         lock.readLock()
         defer { lock.unlock() }
         guard let h = handle else { throw FastenStoreError("store is closed") }
@@ -88,7 +99,7 @@ public final class FastenStore {
     public func insertJSON(_ json: String) throws {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
         let rc = try withHandle { fasten_store_insert($0, json, &errPtr) }
-        guard rc == 0 else {
+        guard rc == FASTEN_OK else {
             let msg = errPtr.map { String(cString: $0) } ?? "insert failed"
             errPtr.map { fasten_store_free_str($0) }
             throw FastenStoreError(msg)
@@ -101,7 +112,7 @@ public final class FastenStore {
     public func ping() throws {
         var errPtr: UnsafeMutablePointer<CChar>? = nil
         let rc = try withHandle { fasten_store_ping($0, &errPtr) }
-        guard rc == 0 else {
+        guard rc == FASTEN_OK else {
             let msg = errPtr.map { String(cString: $0) } ?? "ping failed"
             errPtr.map { fasten_store_free_str($0) }
             throw FastenStoreError(msg)

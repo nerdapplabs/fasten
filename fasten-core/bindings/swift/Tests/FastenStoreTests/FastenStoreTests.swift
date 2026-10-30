@@ -114,6 +114,7 @@ final class SQLiteTests: XCTestCase {
         let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
         let lock = NSLock()
         var unexpected: [String] = []
+        var closedHits = 0
         DispatchQueue.concurrentPerform(iterations: 5) { worker in
             if worker == 0 {
                 usleep(1_000)
@@ -124,6 +125,9 @@ final class SQLiteTests: XCTestCase {
                 do {
                     try store.insert(makeRow("evt-close-\(worker)-\(i)"))
                 } catch let e as FastenStoreError where e.message == "store is closed" {
+                    lock.lock()
+                    closedHits += 1
+                    lock.unlock()
                     break
                 } catch {
                     lock.lock()
@@ -133,6 +137,8 @@ final class SQLiteTests: XCTestCase {
             }
         }
         XCTAssertTrue(unexpected.isEmpty, "\(unexpected)")
+        // The workers really did run into the close.
+        XCTAssertGreaterThan(closedHits, 0)
         assertClosed { try store.ping() }
     }
 
