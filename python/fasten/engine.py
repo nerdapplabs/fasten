@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
@@ -172,6 +173,13 @@ class _QueueDrainer:
     service_id: str = ""
     gen: int = 0                # engine store generation it writes to
     install: dict[str, Any] = dataclasses.field(default_factory=dict)  # to reinstall after fork
+    deadline: Optional[float] = None    # time.monotonic(); close starts no insert after it
+    lost: int = 0                       # rows dead-lettered or lost at stop
+    reported: bool = False              # rows left at stop have been reported
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def past_deadline(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
 
 
 def _rejects_row(exc: BaseException) -> bool:
@@ -213,6 +221,8 @@ class Engine:
         # Held around the drainer's store call and across fork(), so a child
         # never inherits a store (or SQLite's global mutex) mid-insert.
         self._insert_lock = threading.Lock()
+        self._fork_lock: Optional[threading.Lock] = None   # the one held across fork()
+        self._closed = False    # close() has run and init has not since
         self._atexit_registered = False
         self._last_init_at: Optional[datetime] = None
 
@@ -445,6 +455,7 @@ class Engine:
         )
         self._failure_strategy = cfg.audit_store_failure_strategy
         self._search_enabled = cfg.search_enabled
+        self._closed = False
 
         # Swap in the new drainer, then retire the old one: emits keep being
         # queued while it drains, and its rows and events keep its own config.
@@ -649,7 +660,9 @@ class Engine:
                 store, gen = self._audit_store, self._store_gen
                 if not _durable:
                     with self._using_drainer() as d:
-                        if d is None:
+                        if d is None and self._closed:
+                            pass    # after close, rows are stored inline
+                        elif d is None:
                             # No drainer to take the row (spec §7 V-12).
                             refused = True
                             self._drainer_sys_log("error", "audit_drain_abandoned", {
@@ -707,6 +720,36 @@ class Engine:
                 return True
             # Round up: fasten-core reads 0 ms as no timeout.
             return _ffi.drainer_flush(d.handle, max(1, math.ceil(timeout * 1000)))
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """Flush pending audit rows for up to half of ``timeout``, then stop
+        the drainer and store any row it still holds. Returns within about
+        ``timeout``: a row not stored by then is reported lost
+        (audit_drain_lost_at_stop), and a store call still running is left
+        behind. Emits after close are stored inline. Returns False if a row
+        was lost."""
+        deadline = time.monotonic() + timeout
+        with self._drainer_lock:
+            self._closed = True
+            d = self._drainer
+        if d is None:
+            return True
+        lost = d.lost
+        d.deadline = deadline
+        self.flush(timeout / 2)
+        old = self._take_drainer()
+        if old is not None:
+            old.deadline = deadline
+            t = threading.Thread(target=self._retire_drainer, args=(old, 0),
+                                 name="fasten-retire", daemon=True)
+            t.start()
+            t.join(max(0.0, deadline - time.monotonic()))
+            if t.is_alive():
+                self._report_unstored(old)
+                # The stuck call keeps the old lock; fork() and a later
+                # drainer must not wait for it.
+                self._insert_lock = threading.Lock()
+        return d.lost == lost
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
         """Drainer health snapshot. Returns None in raise mode."""
@@ -801,6 +844,7 @@ class Engine:
         constructing a new one. Do not call in production code.
         """
         self._uninstall_drainer()
+        self._closed = False
         # Retention threads outlive the reset otherwise. Harmless while the
         # only purgers were age-based on api/sys, but an audit PII purger
         # holds a reference to the old store and keeps redacting into it
@@ -990,6 +1034,8 @@ class Engine:
                          max_attempts=max_attempts)
 
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
+            if d.past_deadline():
+                return 1    # close reports it lost
             row_id = "<unparsed>"
             try:
                 row_id = json.loads(row_json.decode("utf-8"))["id"]
@@ -1008,6 +1054,8 @@ class Engine:
                 failed = pending.get(row_id)
                 if failed is not None and (rejected or failed[1] >= max_attempts):
                     pending.pop(row_id, None)  # the drainer dead-letters it now
+                    with d.lock:
+                        d.lost += 1
                     self._mark_write_lost(store, d.gen)
                 return _ffi.INSERT_REJECTED if rejected else 1
 
@@ -1017,7 +1065,8 @@ class Engine:
                 fields = json.loads(event_json.decode("utf-8"))
                 # A row still pending failed its one try at stop; retire then
                 # stores it or reports it lost, so this would count it twice.
-                if fields.get("event") == "audit_drain_dead_letter" and fields.get("row_id") in pending:
+                if fields.get("event") == "audit_drain_dead_letter" and (
+                        d.reported or fields.get("row_id") in pending):
                     return
                 fields.pop("shape", None)
                 fields.pop("timestamp", None)
@@ -1041,7 +1090,7 @@ class Engine:
         with self._drainer_lock:
             old, self._drainer = self._drainer, d
         if not self._atexit_registered:
-            atexit.register(self._atexit_flush)
+            atexit.register(self._atexit_close)
             if hasattr(os, "register_at_fork"):
                 os.register_at_fork(before=self._insert_lock_before_fork,
                                     after_in_parent=self._insert_lock_after_fork,
@@ -1050,10 +1099,12 @@ class Engine:
         return old
 
     def _insert_lock_before_fork(self) -> None:
-        self._insert_lock.acquire()
+        self._fork_lock = self._insert_lock
+        self._fork_lock.acquire()
 
     def _insert_lock_after_fork(self) -> None:
-        self._insert_lock.release()
+        if self._fork_lock is not None:
+            self._fork_lock.release()
 
     def _reinstall_after_fork(self) -> None:
         """A forked child (gunicorn --preload, Celery prefork) inherits the
@@ -1094,24 +1145,47 @@ class Engine:
         _ffi.store_close(d.handle)
         # Rows still pending were not stored: the drainer abandoned them or
         # gave them one try at shutdown, and may have reported them lost.
+        # Past close's deadline they are reported lost without a try.
         recovered = []
         for row, _ in list(d.pending.values()):
+            if d.past_deadline():
+                break
             try:
                 self._allocate_and_store(row, d.store, d.stdout)
-                recovered.append(row.id)
             except Exception as e:  # noqa: BLE001
-                self._mark_write_lost(d.store, d.gen)
-                self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
-                    "error_type": type(e).__name__,
-                    "row_id": row.id,
-                }, via=d)
-        d.pending.clear()
+                with d.lock:
+                    if not d.reported:
+                        d.pending.pop(row.id, None)
+                        self._lose_at_stop(d, row, type(e).__name__)
+            else:
+                with d.lock:
+                    if not d.reported:
+                        d.pending.pop(row.id, None)
+                        recovered.append(row.id)
         if recovered:
             self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
+        self._report_unstored(d)
 
-    def _atexit_flush(self) -> None:
-        self.flush(5.0)
-        self._uninstall_drainer()
+    def _report_unstored(self, d: _QueueDrainer) -> None:
+        """Report the rows a retiring drainer still holds as lost, once."""
+        with d.lock:
+            if d.reported:
+                return
+            d.reported = True
+            for row, _ in list(d.pending.values()):
+                self._lose_at_stop(d, row, "TimeoutError")
+            d.pending.clear()
+
+    def _lose_at_stop(self, d: _QueueDrainer, row: AuditRow, error_type: str) -> None:
+        d.lost += 1
+        self._mark_write_lost(d.store, d.gen)
+        self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
+            "error_type": error_type,
+            "row_id": row.id,
+        }, via=d)
+
+    def _atexit_close(self) -> None:
+        self.close(5.0)
         self._stop_retention_threads()
 
 

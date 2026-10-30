@@ -119,6 +119,11 @@ than retried. `emit()` returns the row before it is stored, so its
 `audit_store_failure_strategy="raise"` to opt into
 synchronous-with-`AuditStoreError` semantics and get the sealed row back.
 `fasten.queue_stats()` and `fasten.flush()` complete the public surface.
+`fasten.close(timeout=5.0)` stops the drainer on shutdown (the exit hook
+calls it): it flushes for half of `timeout`, then stores the rows still
+held. It returns within about `timeout`, reports rows not stored by then
+as `audit_drain_lost_at_stop`, and returns False if any row was lost. A
+store call still running at that point is left behind, not interrupted.
 
 ## Tests
 

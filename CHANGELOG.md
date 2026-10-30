@@ -40,6 +40,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - A forked child (gunicorn `--preload`, Celery prefork) installs its own
   drainer. `fork()` waits for an in-flight store insert, so a child no
   longer stops storing after inheriting SQLite mid-insert.
+- `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
+  of `timeout`, then stops the drainer and stores the rows it still holds.
+  It returns within about `timeout`: no store call starts after that, one
+  still running is left behind, and rows not stored are reported as
+  `audit_drain_lost_at_stop`. It returns False only if a row was lost. The
+  exit hook calls `close(5.0)`, so a hanging store no longer holds
+  interpreter exit. Emits after `close` are stored inline without an
+  `audit_drain_abandoned` event.
 
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 

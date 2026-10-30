@@ -756,3 +756,107 @@ def test_fork_never_lands_mid_insert(tmp_path):
     targets = {r.target for r in store.query(limit=10000)}
     assert all(f"child-{r}-{k}" in targets for r in range(3) for k in range(8))
 
+
+
+class HangingStore(FlakyStore):
+    """Every insert blocks until ``release`` is set, then fails."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.release = threading.Event()
+
+    def allocate_and_insert_originated(self, row):
+        with self.lock:
+            self.attempts += 1
+        self.release.wait(10)
+        raise OSError("store hung")
+
+
+def _release_hung_store(store):
+    store.release.set()
+    for t in threading.enumerate():
+        if t.name == "fasten-retire":
+            t.join(timeout=5)
+
+
+def test_close_returns_by_its_timeout_when_the_store_hangs(tmp_path):
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store)
+    try:
+        rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(3)]
+        _wait_for_attempts(store, 1)
+        start = time.monotonic()
+        assert not fasten.close(timeout=0.3)
+        assert time.monotonic() - start < 1.5
+        lost = [e for e in fasten.transport().query_syslog(limit=1000)
+                if e.get("event") == "audit_drain_lost_at_stop"]
+        assert sorted(e["row_id"] for e in lost) == sorted(r.id for r in rows)
+        assert _default.audit_write_swallowed()
+    finally:
+        _release_hung_store(store)
+    # No store call starts after the deadline, and nothing is reported twice.
+    assert store.attempts == 1
+    events = _sys_events()
+    assert events.count("audit_drain_lost_at_stop") == 3
+    assert "audit_drain_dead_letter" not in events
+    assert "audit_drain_row_not_pending" not in events
+
+
+def test_close_returns_true_when_retire_stores_the_row(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=1)
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_in_backoff()
+    # The flush times out while the row is in backoff; its try at stop stores it.
+    assert fasten.close(timeout=1.0)
+    assert [r.id for r in _rows(store)] == [row.id]
+
+
+def test_close_returns_false_when_a_row_is_lost(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_in_backoff()
+    assert not fasten.close(timeout=1.0)
+    assert "audit_drain_lost_at_stop" in _sys_events()
+
+
+def test_emit_after_close_is_stored_without_an_abandoned_event(tmp_path):
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+    assert fasten.close(timeout=1.0)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    assert row.hash                 # stored synchronously
+    events = _sys_events()
+    assert "audit_drain_abandoned" not in events
+    assert "audit_drain_stored_inline" not in events
+    _init(store)                    # init installs a drainer again
+    assert not fasten.emit(code="USER_CREATED", target="u-2").hash
+
+
+def test_exit_is_not_held_by_a_hanging_store(tmp_path):
+    import subprocess
+    import sys
+    script = f"""
+import threading, fasten
+from fasten.codes import Meta, RetentionClass, Severity, register
+from fasten.store.sqlite import SQLiteStore
+
+class Hanging(SQLiteStore):
+    def allocate_and_insert_originated(self, row):
+        threading.Event().wait()
+
+register("t", {{"USER_CREATED": Meta(domain="t", category="auth", action="create",
+    severity=Severity.INFO, description="x", emitter="t",
+    retention_class=RetentionClass.LONG)}})
+fasten.init(service_id="svc", node_id="node", audit_store=Hanging({str(tmp_path / "a.db")!r}))
+for i in range(3):
+    fasten.emit(code="USER_CREATED", target=f"u-{{i}}")
+"""
+    start = time.monotonic()
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                          text=True, timeout=30, env={**os.environ, "PYTHONPATH": os.getcwd()})
+    assert proc.returncode == 0, proc.stderr
+    assert time.monotonic() - start < 10    # atexit closes within 5 s
+    lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
+    assert len(lost) == 3
