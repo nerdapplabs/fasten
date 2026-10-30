@@ -84,10 +84,27 @@ def test_doctor_does_not_alter_the_schema(doctor_env, monkeypatch, capsys, tmp_p
 
 def test_a_libpq_keyword_dsn_is_not_printed_or_opened(doctor_env, monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "host=db password=s3cret")
-    monkeypatch.setenv("FASTEN_API_DSN", "host=db password=s3cret")
+    monkeypatch.setenv("FASTEN_API_DSN", "host=x dbname=y")
     out = _run(capsys)
-    assert "s3cret" not in out and "unrecognised DSN" in out
+    assert "s3cret" not in out and out.count("unrecognised DSN") == 4
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("dsn, table", [
+    ("./my dir/audit.db", "audit_log"),
+    ("./plain.db?table=audit_x", "audit_x"),
+])
+def test_sqlite_paths_with_a_space_or_table_param_are_opened(
+        doctor_env, monkeypatch, capsys, tmp_path, dsn, table):
+    path = tmp_path / dsn.split("?")[0]
+    path.parent.mkdir(exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute(f"CREATE TABLE {table} (id TEXT)")
+    db.commit()
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
+    out = _run(capsys)
+    assert "unrecognised DSN" not in out
+    assert "(connected, sample query returned 0 row[s])" in out
 
 
 def test_an_unsupported_api_dsn_scheme_fails(doctor_env, monkeypatch, capsys):

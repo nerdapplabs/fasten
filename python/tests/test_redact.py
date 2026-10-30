@@ -265,3 +265,13 @@ def test_with_extra_keys_keeps_base_rules():
         "ssn": "[x]", "api_key": "[x]", "batch": 7}
     assert r2.redact({"info": "MY_SECRET_ABCD"}) == {"info": "***MY***"}
     assert base.with_extra_keys(None) is base
+
+
+def test_structlog_event_survives_an_oversize_payload():
+    proc = Redactor(extra_keys=["big"]).as_structlog_processor()
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"
+    out = proc(None, "info", {"event": "big_event", "blob": "x" * 70000})
+    assert out["event"] == "big_event" and out["_truncated"] is True
+    assert "blob" not in out
+    out = proc(None, "info", {"event": f"bearer {jwt}"})
+    assert out["event"] == "***JWT***"

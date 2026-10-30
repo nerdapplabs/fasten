@@ -40,6 +40,7 @@ class CheckResult:
 # A libpq key=value DSN ("host=db password=...") has no scheme; init would
 # take it for a SQLite path, so doctor neither prints nor opens it.
 _KEYWORD_DSN = "unrecognised DSN (not shown; use a postgres:// URL)"
+_KEYWORD_RE = re.compile(r"^\s*\w+\s*=|\s\w+\s*=")
 _TABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?")
 
 
@@ -49,7 +50,7 @@ def _describe(dsn: str, is_postgres: bool) -> str:
         return "postgres"
     if "@" in dsn:
         return "sqlite (path hidden: the DSN has credentials)"
-    if "://" not in dsn and ("=" in dsn or any(c.isspace() for c in dsn)):
+    if "://" not in dsn and _KEYWORD_RE.search(dsn):
         return _KEYWORD_DSN
     try:
         path = urlsplit(dsn).path
