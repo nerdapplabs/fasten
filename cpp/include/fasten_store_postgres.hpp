@@ -16,9 +16,13 @@
 #define FASTEN_STORE_POSTGRES_HPP
 
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <libpq-fe.h>
 
@@ -94,7 +98,81 @@ public:
         }
     }
 
+    /// (id, monotonic_seq) of rows with a code in `codes`, older than
+    /// `before`, that redact_rows() would redact (spec §7.1). A sealed row
+    /// under form "1" is never one: its detail is in the hash. Their number
+    /// goes to `skipped`.
+    std::vector<std::pair<std::string, int64_t>> list_redaction_candidates(
+        std::chrono::system_clock::time_point before,
+        const std::vector<std::string>& codes,
+        int64_t* skipped = nullptr)
+    {
+        std::vector<std::pair<std::string, int64_t>> out;
+        if (skipped) *skipped = 0;
+        if (codes.empty()) return out;
+        const std::string cutoff = detail_::iso8601(before);
+        std::vector<const char*> params{cutoff.c_str()};
+        for (const auto& c : codes) params.push_back(c.c_str());
+        const std::string where =
+            " FROM " + table_ + " WHERE timestamp < $1 AND code IN (" +
+            placeholders(2, codes.size()) + ") AND detail <> 'null' AND ";
+
+        std::lock_guard<std::mutex> lk(mu_);
+        if (skipped) {
+            *skipped = std::stoll(query("SELECT COUNT(*)" + where + "NOT " + redactable(),
+                                        static_cast<int>(params.size()), params.data()));
+        }
+        Result res(conn_, "SELECT id, monotonic_seq" + where + redactable() +
+                          " ORDER BY monotonic_seq",
+                   static_cast<int>(params.size()), params.data());
+        for (int i = 0; i < PQntuples(res.r); ++i)
+            out.emplace_back(PQgetvalue(res.r, i, 0), std::stoll(PQgetvalue(res.r, i, 1)));
+        return out;
+    }
+
+    /// Sets detail to the JSON literal null and clears detail_salt on these
+    /// ids (spec §7.1). Hash, prev_hash and seq are kept. A sealed form-"1"
+    /// row is left alone. Safe to repeat; returns `ids`.
+    std::vector<std::string> redact_rows(const std::vector<std::string>& ids) {
+        if (ids.empty()) return ids;
+        std::vector<const char*> params;
+        for (const auto& id : ids) params.push_back(id.c_str());
+        std::lock_guard<std::mutex> lk(mu_);
+        query("UPDATE " + table_ + " SET detail = 'null', detail_salt = ''"
+              " WHERE id IN (" + placeholders(1, ids.size()) + ") AND " + redactable(),
+              static_cast<int>(params.size()), params.data());
+        return ids;
+    }
+
 private:
+    // Unsealed, or sealed under form "2" where the hash covers the detail
+    // commitment and not the detail.
+    static const char* redactable() {
+        return "(hash = '' OR canonical_form_id = '2')";
+    }
+
+    static std::string placeholders(size_t first, size_t n) {
+        std::string out;
+        for (size_t i = 0; i < n; ++i)
+            out += (i ? ",$" : "$") + std::to_string(first + i);
+        return out;
+    }
+
+    struct Result {
+        PGresult* r;
+        Result(PGconn* c, const std::string& sql, int n, const char* const* params)
+            : r(PQexecParams(c, sql.c_str(), n, nullptr, params, nullptr, nullptr, 0)) {
+            if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+                std::string msg = PQerrorMessage(c);
+                PQclear(r);
+                throw std::runtime_error("fasten PostgresStore: " + msg);
+            }
+        }
+        ~Result() { PQclear(r); }
+        Result(const Result&)            = delete;
+        Result& operator=(const Result&) = delete;
+    };
+
     void exec(const char* sql) { query(sql, 0, nullptr); }
 
     // Runs sql and returns the first column of the first row, or "".
@@ -150,9 +228,11 @@ private:
             " (id, origin_id, monotonic_seq, timestamp,"
             "  code, action, severity, service_id, source_node_id, tenant_id,"
             "  actor, actor_kind, target, category, domain, method,"
-            "  request_id, detail, pii_in_detail, shipped_at)"
+            "  request_id, detail, pii_in_detail, shipped_at,"
+            "  prev_hash, hash, canonical_form_id, detail_salt, detail_commitment)"
             " VALUES"
-            " ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"
+            " ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,"
+            "  '','','1','','')"
             " ON CONFLICT (id) DO NOTHING";
 
         PGresult* res = PQexecParams(
@@ -246,9 +326,25 @@ private:
             "  detail          TEXT        NOT NULL DEFAULT '{}',"
             "  pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,"
             "  shipped_at      TEXT,"
+            "  prev_hash       TEXT        NOT NULL DEFAULT '',"
+            "  hash            TEXT        NOT NULL DEFAULT '',"
+            "  canonical_form_id TEXT      NOT NULL DEFAULT '1',"
+            "  detail_salt     TEXT        NOT NULL DEFAULT '',"
+            "  detail_commitment TEXT      NOT NULL DEFAULT '',"
             "  PRIMARY KEY (id)"
             ")"
         );
+
+        // Chain columns for a table created before they were added, with the
+        // Go store's definitions so the table can be shared.
+        for (const char* col : {
+                 "prev_hash TEXT NOT NULL DEFAULT ''",
+                 "hash TEXT NOT NULL DEFAULT ''",
+                 "canonical_form_id TEXT NOT NULL DEFAULT '1'",
+                 "detail_salt TEXT NOT NULL DEFAULT ''",
+                 "detail_commitment TEXT NOT NULL DEFAULT ''"}) {
+            pg_exec("ALTER TABLE " + table_ + " ADD COLUMN IF NOT EXISTS " + col);
+        }
 
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_req  ON " + table_ + " (request_id)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_code ON " + table_ + " (code)");

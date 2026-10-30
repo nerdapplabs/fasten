@@ -244,9 +244,18 @@ inline std::string json_str(const std::string& s) {
 
 // Serialize Fields to a JSON object — keys sorted for deterministic output.
 //
-// `_pii_in_detail` is the one cross-language P1-5 marker: Fields can only
-// hold strings, but Python/Go/JS/Rust emit it as a JSON boolean. We
-// special-case the wire format here so the NDJSON shape matches.
+// Fields can only hold strings. Two keys other SDKs write as JSON scalars
+// are special-cased so the shape matches: `_pii_in_detail` (boolean, P1-5)
+// and `redacted_seq` (number, spec §7.2) when it is all digits.
+inline std::string field_json_value_(const std::string& key, const std::string& val) {
+    if (key == "_pii_in_detail") return val == "true" ? "true" : "false";
+    if (key == "redacted_seq" && !val.empty() &&
+        std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return val;
+    }
+    return json_str(val);
+}
+
 inline std::string fields_to_json(const Fields& f) {
     std::vector<std::pair<std::string, std::string>> pairs(f.begin(), f.end());
     std::sort(pairs.begin(), pairs.end());
@@ -254,12 +263,7 @@ inline std::string fields_to_json(const Fields& f) {
     bool first = true;
     for (auto& kv : pairs) {
         if (!first) out += ',';
-        out += json_str(kv.first) + ':';
-        if (kv.first == "_pii_in_detail") {
-            out += (kv.second == "true" ? "true" : "false");
-        } else {
-            out += json_str(kv.second);
-        }
+        out += json_str(kv.first) + ':' + field_json_value_(kv.first, kv.second);
         first = false;
     }
     out += '}';
@@ -268,11 +272,11 @@ inline std::string fields_to_json(const Fields& f) {
 
 // Canonical UTC timestamp (spec §4.3): six fractional digits and Z, e.g.
 // 2026-08-21T10:00:00.500000Z. Thread-safe (gmtime_r / gmtime_s).
-inline std::string now_iso8601() {
+inline std::string iso8601(std::chrono::system_clock::time_point tp) {
     using namespace std::chrono;
-    auto now = system_clock::now();
-    auto us  = duration_cast<microseconds>(now.time_since_epoch()) % 1000000;
-    auto t   = system_clock::to_time_t(now);
+    auto us  = duration_cast<microseconds>(tp.time_since_epoch()) % 1000000;
+    if (us.count() < 0) us += seconds(1);
+    auto t   = system_clock::to_time_t(time_point_cast<seconds>(tp - us));
     struct tm tmb {};
 #ifdef _WIN32
     gmtime_s(&tmb, &t);
@@ -287,6 +291,8 @@ inline std::string now_iso8601() {
         static_cast<long long>(us.count()));
     return buf;
 }
+
+inline std::string now_iso8601() { return iso8601(std::chrono::system_clock::now()); }
 
 // Hex-random id — `bytes` random bytes → 2*bytes lowercase hex chars.
 inline std::string mint_id_bytes(size_t bytes) {
@@ -407,6 +413,10 @@ inline Fields parse_flat_json_fields(const std::string& json) {
             val = "true"; i += 4;
         } else if (i + 5 <= json.size() && json.substr(i, 5) == "false") {
             val = "false"; i += 5;
+        } else if (i < json.size() && (json[i] == '-' || (json[i] >= '0' && json[i] <= '9'))) {
+            // A number keeps its text, so redacted_seq survives a redact pass.
+            while (i < json.size() && json[i] != ',' && json[i] != '}' &&
+                   json[i] != ' ' && json[i] != '\n') val += json[i++];
         } else {
             while (i < json.size() && json[i] != ',' && json[i] != '}') ++i;
             continue;
@@ -1104,12 +1114,8 @@ inline std::string Row::to_cloud_event_json() const {
     bool first = true;
     for (auto& kv : detail) {
         if (!first) data += ',';
-        data += detail_::json_str(kv.first) + ':';
-        if (kv.first == "_pii_in_detail") {
-            data += (kv.second == "true" ? "true" : "false");
-        } else {
-            data += detail_::json_str(kv.second);
-        }
+        data += detail_::json_str(kv.first) + ':' +
+                detail_::field_json_value_(kv.first, kv.second);
         first = false;
     }
     if (!first) data += ',';
@@ -1539,9 +1545,11 @@ inline std::function<void(EmitOpts&)> method(const std::string& m) {
 
 // ── Emit ───────────────────────────────────────────────────────────────────
 
-template<typename... Opts>
-inline Row emit(const std::string& code, Opts&&... opts) {
-    auto& g = detail_::globals();
+namespace detail_ {
+
+// Builds the row for `code` and writes its NDJSON line to stdout.
+inline Row make_row_(const std::string& code, const EmitOpts& o) {
+    auto& g = globals();
     if (g.service_id.empty()) {
         throw InitError("emit: fasten::init() must be called first");
     }
@@ -1555,11 +1563,6 @@ inline Row emit(const std::string& code, Opts&&... opts) {
         }
         meta = it->second;
     }
-
-    EmitOpts o;
-    // C++14 parameter-pack expansion into dummy array.
-    int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
-    (void)dummy;
 
     std::string rid = detail_::tl_request_id();
     if (rid.empty()) rid = mint_id();
@@ -1625,6 +1628,19 @@ inline Row emit(const std::string& code, Opts&&... opts) {
               << ",\"detail\":"         << detail_::fields_to_json(row.detail)
               << ",\"pii_in_detail\":"  << (row.pii_in_detail ? "true" : "false")
               << "}\n" << std::flush;
+    return row;
+}
+
+}  // namespace detail_
+
+template<typename... Opts>
+inline Row emit(const std::string& code, Opts&&... opts) {
+    auto& g = detail_::globals();
+    EmitOpts o;
+    // C++14 parameter-pack expansion into dummy array.
+    int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
+    (void)dummy;
+    Row row = detail_::make_row_(code, o);
 
     // P1-15: route through the drainer (queue mode) or invoke the
     // sink synchronously and wrap exceptions (raise mode).
@@ -1677,6 +1693,91 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     }
 
     return row;
+}
+
+// ── PII retention (spec §7) ────────────────────────────────────────────────
+
+// Codes whose rows may carry personal data in detail: pii_in_detail, or
+// retention class short. Sorted.
+inline std::vector<std::string> pii_codes() {
+    std::vector<std::string> out;
+    for (const auto& kv : registry()) {
+        if (kv.second.pii_in_detail || kv.second.retention_class == Retention::Short)
+            out.push_back(kv.first);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+constexpr const char* kAuditRowRedacted = "AUDIT_ROW_REDACTED";
+
+namespace detail_ {
+
+inline void ensure_redaction_code_() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    {
+        auto& g = globals();
+        std::lock_guard<std::mutex> rk(g.reg_mu);
+        if (g.registry.count(kAuditRowRedacted)) return;
+    }
+    Meta m;
+    m.domain          = "fasten";
+    m.category        = "retention";
+    m.action          = "redact";
+    m.severity        = Sev::Warn;
+    m.description     = "Audit row detail destroyed under a retention policy";
+    m.emitter         = "fasten";
+    m.retention_class = Retention::Long;
+    register_codes("fasten", {{kAuditRowRedacted, m}});
+}
+
+}  // namespace detail_
+
+// Redacts the detail of rows with a PII code (pii_codes()) older than
+// `before`, and returns their ids. Rows are never deleted: detail becomes the
+// JSON literal null and the row keeps its id, seq and place in the table.
+//
+// For each row an AUDIT_ROW_REDACTED row (target = the row's id) is inserted
+// with store.insert() first, then the row is redacted. The insert goes to the
+// store directly, not through the queue, so the record exists before the data
+// is gone; if it throws, that row is left as it was.
+//
+// `store` is SqliteStore, PostgresStore, or any type with insert(Row),
+// list_redaction_candidates() and redact_rows() of the same shape. fasten has
+// no background loop here: call this on a schedule, e.g. daily with
+// before = now - 30 days. Needs init(). A sealed form-"1" row is not redacted
+// (its detail is in the hash); those are counted on the sys stream as
+// pii_redaction_skipped_legacy_form.
+template<typename Store>
+inline std::vector<std::string> redact_expired(
+    Store& store,
+    std::chrono::system_clock::time_point before,
+    std::string reason = "retention")
+{
+    std::vector<std::string> redacted;
+    const auto codes = pii_codes();
+    if (codes.empty()) return redacted;
+    detail_::ensure_redaction_code_();
+    int64_t skipped = 0;
+    const auto candidates = store.list_redaction_candidates(before, codes, &skipped);
+    if (skipped > 0) {
+        detail_::drainer_sys_log("warn", "pii_redaction_skipped_legacy_form",
+            {{"rows", std::to_string(skipped)},
+             {"reason", "sealed under canonical form 1, detail is in the hash; "
+                        "the personal data in these rows still exists"}});
+    }
+    if (reason.empty()) reason = "retention";
+    for (const auto& c : candidates) {
+        EmitOpts o;
+        o.target = c.first;
+        o.fields = {{"redacted_seq", std::to_string(c.second)},
+                    {"reason", reason},
+                    {"redacted_id", c.first}};
+        store.insert(detail_::make_row_(kAuditRowRedacted, o));
+        for (auto& id : store.redact_rows({c.first})) redacted.push_back(std::move(id));
+    }
+    return redacted;
 }
 
 // ── Ring buffer accessors ──────────────────────────────────────────────────

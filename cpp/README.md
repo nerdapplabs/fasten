@@ -87,6 +87,23 @@ inserts a row gets before it is dead-lettered.
 insert's transaction; rows are not sealed. A row put on a drainer that
 `init()` has just replaced is reported as `audit_drain_abandoned`.
 
+## PII retention
+
+Rows of a code with `pii_in_detail` (or retention class short) can be
+redacted once they are older than your PII period:
+
+```cpp
+fasten::SqliteStore store("audit.db");
+auto ids = fasten::redact_expired(store,
+    std::chrono::system_clock::now() - std::chrono::hours(24 * 30));
+```
+
+Each row keeps its place, and its `detail` becomes `null`. An
+`AUDIT_ROW_REDACTED` row naming it is written to the store first. fasten
+runs no background job for this, so call it on a schedule. C++ rows are
+unsealed, so all of them can be redacted. A row sealed under canonical form
+`"1"` by another SDK is left alone and counted on the sys stream.
+
 ## Reader tenant isolation
 
 On a store shared by several tenants, resolve the caller's tenant from

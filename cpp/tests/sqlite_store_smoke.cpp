@@ -8,6 +8,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -181,6 +183,42 @@ void test_failed_commit_does_not_wedge_the_store() {
     std::cout << "  test_failed_commit_does_not_wedge_the_store: PASS\n";
 }
 
+// #92: two stores (two engines) on one file, one node. Each insert must get
+// the next seq from the table, not from its own store.
+void test_two_stores_one_node_get_distinct_seqs() {
+    const std::string path = "/tmp/fasten_two_" + fasten::mint_id() + ".db";
+    const int per_store = 50;
+    {
+        fasten::SqliteStore a(path);
+        fasten::SqliteStore b(path);
+        auto run = [&](fasten::SqliteStore& s, const std::string& tag) {
+            for (int i = 0; i < per_store; ++i) {
+                auto row = make_row("evt-two-" + tag + std::to_string(i), "TEST_TWO");
+                row.monotonic_seq = 0;
+                s.insert(row);
+            }
+        };
+        std::thread ta(run, std::ref(a), "a");
+        std::thread tb(run, std::ref(b), "b");
+        ta.join();
+        tb.join();
+    }
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db,
+        "SELECT monotonic_seq FROM audit_log WHERE source_node_id = 'node-1' ORDER BY monotonic_seq",
+        -1, &q, nullptr);
+    std::vector<int64_t> seqs;
+    while (sqlite3_step(q) == SQLITE_ROW) seqs.push_back(sqlite3_column_int64(q, 0));
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    std::remove(path.c_str());
+    assert(seqs.size() == static_cast<size_t>(2 * per_store));
+    for (size_t i = 0; i < seqs.size(); ++i) assert(seqs[i] == static_cast<int64_t>(i + 1));
+    std::cout << "  test_two_stores_one_node_get_distinct_seqs: PASS\n";
+}
+
 int main() {
     std::cout << "=== sqlite_store_smoke ===\n";
     test_insert_idempotent();
@@ -193,6 +231,7 @@ int main() {
     test_custom_table_name();
     test_seq_allocated_per_node();
     test_failed_commit_does_not_wedge_the_store();
+    test_two_stores_one_node_get_distinct_seqs();
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;
 }
