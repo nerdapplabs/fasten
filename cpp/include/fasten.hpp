@@ -567,11 +567,9 @@ using SysLog = std::function<void(const std::string&,
 
 // ── JSON extraction helpers (used by CFastenDrainer::bridge_) ─────────────
 
-inline std::string json_extract_str_(const std::string& j, const std::string& k) {
-    std::string needle = "\"" + k + "\":\"";
-    auto pos = j.find(needle);
-    if (pos == std::string::npos) return "";
-    pos += needle.size();
+// Decodes the JSON string whose first character after the opening quote is
+// at pos.
+inline std::string json_decode_str_(const std::string& j, size_t pos) {
     std::string val;
     while (pos < j.size() && j[pos] != '"') {
         if (j[pos] == '\\' && pos + 1 < j.size()) {
@@ -588,6 +586,13 @@ inline std::string json_extract_str_(const std::string& j, const std::string& k)
         ++pos;
     }
     return val;
+}
+
+inline std::string json_extract_str_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":\"";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return "";
+    return json_decode_str_(j, pos + needle.size());
 }
 
 inline int64_t json_extract_int_(const std::string& j, const std::string& k) {
@@ -628,46 +633,92 @@ inline bool json_extract_bool_(const std::string& j, const std::string& k) {
     return pos + 4 <= j.size() && j.substr(pos, 4) == "true";
 }
 
-inline Fields json_extract_detail_(const std::string& j) {
-    std::string needle = "\"detail\":";
-    auto pos = j.find(needle);
-    if (pos == std::string::npos) return {};
-    pos += needle.size();
-    while (pos < j.size() && (j[pos] == ' ' || j[pos] == '\t')) ++pos;
-    if (pos >= j.size() || j[pos] != '{') return {};
-    int depth = 0;
-    size_t start = pos, end_pos = pos;
-    while (pos < j.size()) {
-        if      (j[pos] == '{') ++depth;
-        else if (j[pos] == '}') { --depth; if (depth == 0) { end_pos = pos + 1; break; } }
-        ++pos;
+// The members of a JSON object, each value as its raw text. Strings and
+// nested values are skipped whole, so a key inside "detail" is never read as
+// a column.
+inline std::unordered_map<std::string, std::string> json_members_(const std::string& j) {
+    std::unordered_map<std::string, std::string> out;
+    size_t i = j.find('{');
+    if (i == std::string::npos) return out;
+    ++i;
+    auto skip_ws = [&] {
+        while (i < j.size() && (j[i] == ' ' || j[i] == '\t' || j[i] == '\n' || j[i] == '\r')) ++i;
+    };
+    auto skip_string = [&] {  // at the opening quote
+        for (++i; i < j.size() && j[i] != '"'; ++i)
+            if (j[i] == '\\') ++i;
+        ++i;
+    };
+    while (true) {
+        skip_ws();
+        if (i >= j.size() || j[i] != '"') break;
+        size_t key_start = i + 1;
+        skip_string();
+        if (i > j.size()) break;
+        std::string key = j.substr(key_start, i - 1 - key_start);
+        skip_ws();
+        if (i >= j.size() || j[i] != ':') break;
+        ++i;
+        skip_ws();
+        size_t val_start = i;
+        if (i < j.size() && j[i] == '"') {
+            skip_string();
+        } else if (i < j.size() && (j[i] == '{' || j[i] == '[')) {
+            int depth = 0;
+            while (i < j.size()) {
+                if (j[i] == '"') { skip_string(); continue; }
+                if (j[i] == '{' || j[i] == '[') ++depth;
+                else if ((j[i] == '}' || j[i] == ']') && --depth == 0) { ++i; break; }
+                ++i;
+            }
+        } else {
+            while (i < j.size() && j[i] != ',' && j[i] != '}') ++i;
+        }
+        if (i > j.size()) break;
+        std::string val = j.substr(val_start, i - val_start);
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' ||
+                                val.back() == '\n' || val.back() == '\r')) val.pop_back();
+        out[key] = val;
+        skip_ws();
+        if (i >= j.size() || j[i] != ',') break;
+        ++i;
     }
-    return parse_flat_json_fields(j.substr(start, end_pos - start));
+    return out;
 }
 
 inline Row row_from_json_(const std::string& j) {
+    const auto m = json_members_(j);
+    auto raw = [&](const char* k) {
+        auto it = m.find(k);
+        return it == m.end() ? std::string() : it->second;
+    };
+    // null or absent reads as "".
+    auto str = [&](const char* k) {
+        std::string v = raw(k);
+        return !v.empty() && v[0] == '"' ? json_decode_str_(v, 1) : std::string();
+    };
     Row r;
-    r.wire_version   = json_extract_str_(j, "wire_version");
-    r.id             = json_extract_str_(j, "id");
-    r.origin_id      = json_extract_str_(j, "origin_id");
-    r.monotonic_seq  = json_extract_int_(j, "monotonic_seq");
-    r.timestamp      = json_extract_str_(j, "timestamp");
-    r.code           = json_extract_str_(j, "code");
-    r.action         = json_extract_str_(j, "action");
-    r.severity       = json_extract_str_(j, "severity");
-    r.service_id     = json_extract_str_(j, "service_id");
-    r.source_node_id = json_extract_str_(j, "source_node_id");
-    r.tenant_id      = json_extract_str_(j, "tenant_id");
-    r.actor          = json_extract_str_(j, "actor");
-    r.actor_kind     = json_extract_str_(j, "actor_kind");
-    r.target         = json_extract_str_(j, "target");
-    r.category       = json_extract_str_(j, "category");
-    r.domain         = json_extract_str_(j, "domain");
-    r.method         = json_extract_str_(j, "method");
-    r.request_id     = json_extract_str_(j, "request_id");
-    r.detail         = json_extract_detail_(j);
-    r.pii_in_detail  = json_extract_bool_(j, "pii_in_detail");
-    r.shipped_at     = json_extract_str_(j, "shipped_at");
+    r.wire_version   = str("wire_version");
+    r.id             = str("id");
+    r.origin_id      = str("origin_id");
+    try { r.monotonic_seq = std::stoll(raw("monotonic_seq")); } catch (...) {}
+    r.timestamp      = str("timestamp");
+    r.code           = str("code");
+    r.action         = str("action");
+    r.severity       = str("severity");
+    r.service_id     = str("service_id");
+    r.source_node_id = str("source_node_id");
+    r.tenant_id      = str("tenant_id");
+    r.actor          = str("actor");
+    r.actor_kind     = str("actor_kind");
+    r.target         = str("target");
+    r.category       = str("category");
+    r.domain         = str("domain");
+    r.method         = str("method");
+    r.request_id     = str("request_id");
+    r.detail         = parse_flat_json_fields(raw("detail"));
+    r.pii_in_detail  = raw("pii_in_detail") == "true";
+    r.shipped_at     = str("shipped_at");
     return r;
 }
 
