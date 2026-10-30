@@ -136,8 +136,15 @@ if(FASTEN_BUILD_TESTS)
             target_link_libraries(sqlite_store_smoke PRIVATE pthread)
         endif()
         add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
+
+        add_executable(pii_redaction_smoke tests/pii_redaction_smoke.cpp)
+        target_link_libraries(pii_redaction_smoke PRIVATE fasten SQLite::SQLite3)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(pii_redaction_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME pii_redaction_smoke COMMAND pii_redaction_smoke)
     else()
-        message(STATUS "SQLite::SQLite3 target unavailable — skipping sqlite_store_smoke")
+        message(STATUS "SQLite::SQLite3 target unavailable — skipping sqlite_store_smoke and pii_redaction_smoke")
     endif()
 
     # postgres_store_smoke needs libpq at link time.
