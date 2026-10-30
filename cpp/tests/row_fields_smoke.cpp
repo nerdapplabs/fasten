@@ -92,11 +92,31 @@ void json_escapes_decode() {
 
 }  // namespace
 
+// redacted_seq is written as a JSON number only when it is a canonical
+// integer; "007" stays a string, so the detail stays valid JSON and the
+// redactor still masks the password next to it.
+void redacted_seq_is_a_number_only_when_canonical() {
+    reset_state();
+    fasten::Meta m;
+    m.domain = "user"; m.category = "account"; m.action = "create";
+    m.severity = fasten::Sev::Info; m.description = "x"; m.emitter = "t";
+    fasten::register_codes("user", { {"USER_X", m} });
+    auto row = fasten::emit("USER_X", fasten::target("u-1"),
+        fasten::detail({{"redacted_seq", "007"}, {"password", "hunter2"}}));
+    assert(row.detail["password"] != "hunter2");
+    auto js = fasten::detail_::fields_to_json(row.detail);
+    assert(js.find("\"redacted_seq\":\"007\"") != std::string::npos);
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "42"}}) == "{\"redacted_seq\":42}");
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "0"}}) == "{\"redacted_seq\":0}");
+    std::cout << "redacted_seq JSON: PASS\n";
+}
+
 int main() {
     sys_rows_get_boot_then_orphan_sentinels();
     sys_rows_carry_the_engine_tenant();
     scheduler_mints_sched_ids();
     emit_leaves_seq_to_the_store_and_stamps_canonical_time();
     json_escapes_decode();
+    redacted_seq_is_a_number_only_when_canonical();
     return 0;
 }

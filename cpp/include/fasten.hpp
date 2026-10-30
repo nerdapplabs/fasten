@@ -246,10 +246,13 @@ inline std::string json_str(const std::string& s) {
 //
 // Fields can only hold strings. Two keys other SDKs write as JSON scalars
 // are special-cased so the shape matches: `_pii_in_detail` (boolean, P1-5)
-// and `redacted_seq` (number, spec §7.2) when it is all digits.
+// and `redacted_seq` (number, spec §7.2) when it is a canonical JSON integer
+// (no leading zero, fits int64). Anything else stays a string, so the line
+// is always valid JSON.
 inline std::string field_json_value_(const std::string& key, const std::string& val) {
     if (key == "_pii_in_detail") return val == "true" ? "true" : "false";
-    if (key == "redacted_seq" && !val.empty() &&
+    if (key == "redacted_seq" && !val.empty() && val.size() <= 18 &&
+        (val == "0" || val[0] != '0') &&
         std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; })) {
         return val;
     }
