@@ -10,9 +10,6 @@ let package = Package(
     products: [
         .library(name: "Fasten", targets: ["Fasten"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
-    ],
     targets: [
         // Linux system SQLite3 wrapper.  On Apple platforms the SDK-provided
         // SQLite3 module is used directly; this target is only active on Linux.
@@ -25,7 +22,6 @@ let package = Package(
         .target(
             name: "Fasten",
             dependencies: [
-                .product(name: "Crypto", package: "swift-crypto"),
                 .target(name: "CSQLite3", condition: .when(platforms: [.linux])),
             ],
             path: "Sources/Fasten"

@@ -1,5 +1,4 @@
 import Foundation
-import Crypto
 
 /// Thread-safe fasten engine — all SDK state lives here.
 final class Engine: @unchecked Sendable {
@@ -14,8 +13,6 @@ final class Engine: @unchecked Sendable {
     private var drainer:        QueueDrainer?
     private var strategy:       FailureStrategy = .queue
 
-    private var seq:        Int = 0
-    private var prevHash:   String = "genesis"
     private let lock        = Lock()
 
     func configure(
@@ -41,9 +38,11 @@ final class Engine: @unchecked Sendable {
             self.store     = store
             self.strategy  = strategy
             self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement)
-            self.seq       = store?.maxMonotonicSeq() ?? 0
-            self.prevHash  = "genesis"
         }
+        log(level: "error", event: "audit_chain_unavailable", fields: [
+            "store":  store.map { "\(type(of: $0))" } ?? "none",
+            "reason": "the Swift SDK does not seal rows (spec 2.1); rows are written unsealed",
+        ])
         if strategy == .queue, let s = store {
             drainer = QueueDrainer(
                 store:          s,
@@ -70,57 +69,9 @@ final class Engine: @unchecked Sendable {
             throw FastenError("unknown code \(code) — call Fasten.register() first")
         }
 
-        let redactedDetail = redactor.redact(detail)
-        let requestID = _currentRequestID() ?? _mintID()
-        let rowID     = _mintID()
-        let ts        = isoNow()
-        let sev       = severity ?? meta.severity
-
-        // Compute hash chain under lock.
-        let (nextSeq, ph, rowHash) = lock.withLock { () -> (Int, String, String) in
-            seq += 1
-            let s = seq
-            let ph = prevHash
-            // Canonical JSON for hashing (sorted keys, no whitespace).
-            let canonical: [String: Any] = [
-                "id": rowID, "code": code, "monotonic_seq": s,
-                "timestamp": ts, "actor": actor, "target": target,
-                "request_id": requestID, "prev_hash": ph,
-            ]
-            let data = (try? JSONSerialization.data(withJSONObject: canonical,
-                                                    options: [.sortedKeys])) ?? Data()
-            let digest = SHA256.hash(data: data)
-            let h = digest.map { String(format: "%02x", $0) }.joined()
-            prevHash = h
-            return (s, ph, h)
-        }
-
-        let detailCodable = redactedDetail.toAnyCodable()
-
-        let row = AuditRow(
-            wireVersion:  "1",
-            id:           rowID,
-            originID:     rowID,
-            monotonicSeq: nextSeq,
-            timestamp:    ts,
-            code:         code,
-            action:       meta.action,
-            severity:     sev.rawValue,
-            serviceID:    serviceID,
-            sourceNodeID: nodeID,
-            tenantID:     tenantID,
-            actor:        actor,
-            actorKind:    actorKind.rawValue,
-            target:       target,
-            category:     meta.category,
-            domain:       meta.domain,
-            method:       method.rawValue,
-            requestID:    requestID,
-            detail:       detailCodable,
-            shippedAt:    nil,
-            prevHash:     ph,
-            hash:         rowHash
-        )
+        let row = makeRow(code: code, meta: meta, target: target, actor: actor,
+                          actorKind: actorKind, detail: detail, method: method,
+                          severity: severity)
 
         if let d = drainer {
             transport.emit(row)
@@ -131,6 +82,84 @@ final class Engine: @unchecked Sendable {
         } else {
             transport.emit(row)
         }
+    }
+
+    // seq comes from the store (spec 2.1). Swift does not seal, so prev_hash
+    // and hash stay empty and verify_chain skips these rows.
+    private func makeRow(
+        code: Code, meta: Meta, target: String, actor: String,
+        actorKind: ActorKind, detail: [String: Any], method: Method,
+        severity: Severity?
+    ) -> AuditRow {
+        let rowID = _mintID()
+        return AuditRow(
+            wireVersion:  "1",
+            id:           rowID,
+            originID:     rowID,
+            monotonicSeq: 0,
+            timestamp:    isoNow(),
+            code:         code,
+            action:       meta.action,
+            severity:     (severity ?? meta.severity).rawValue,
+            serviceID:    serviceID,
+            sourceNodeID: nodeID,
+            tenantID:     tenantID,
+            actor:        actor,
+            actorKind:    actorKind.rawValue,
+            target:       target,
+            category:     meta.category,
+            domain:       meta.domain,
+            method:       method.rawValue,
+            requestID:    _currentRequestID() ?? _mintID(),
+            detail:       redactor.redact(detail).toAnyCodable(),
+            shippedAt:    nil,
+            prevHash:     "",
+            hash:         ""
+        )
+    }
+
+    static let redactionCode: Code = "AUDIT_ROW_REDACTED"
+
+    /// Redacts detail on PII rows older than `before` (spec 7). For each row it
+    /// first writes an AUDIT_ROW_REDACTED record straight to the store, then
+    /// redacts that row, so a failure never leaves destroyed data unrecorded.
+    /// Returns the redacted ids.
+    func redactExpired(before: Date, reason: String) throws -> [String] {
+        guard let store = lock.withLock({ self.store }) else {
+            throw FastenError("redactExpired needs an audit store")
+        }
+        if CodeRegistry.shared.lookup(Self.redactionCode) == nil {
+            CodeRegistry.shared.register("fasten", [Self.redactionCode: Meta(
+                id: Self.redactionCode, domain: "fasten", category: "retention",
+                action: "redact", severity: .warn,
+                description: "Audit row detail destroyed under a retention policy",
+                emitter: "fasten", retentionClass: .long_)])
+        }
+        guard let meta = CodeRegistry.shared.lookup(Self.redactionCode) else {
+            throw FastenError("cannot register \(Self.redactionCode)")
+        }
+        let codes = CodeRegistry.shared.piiCodes()
+        let refused = try store.countRefusedLegacyRows(before: before, codes: codes)
+        if refused > 0 {
+            log(level: "warn", event: "pii_redaction_skipped_legacy_form", fields: [
+                "rows": refused,
+                "reason": "canonical_form_id != 2; detail is inside the hash, so redacting "
+                    + "would break the chain. The personal data in these rows still exists.",
+            ])
+        }
+        let candidates = try store.listRedactionCandidates(before: before, codes: codes)
+        var redacted: [String] = []
+        for c in candidates {
+            let record = makeRow(
+                code: Self.redactionCode, meta: meta, target: c.id, actor: "system",
+                actorKind: .service,
+                detail: ["redacted_seq": c.monotonicSeq, "reason": reason, "redacted_id": c.id],
+                method: .sdk, severity: nil)
+            transport.emit(record)
+            try store.insert(record)
+            redacted += try store.redactRows(ids: [c.id])
+        }
+        return redacted
     }
 
     func log(level: String, event: String, fields: [String: Any]) {
@@ -154,7 +183,6 @@ final class Engine: @unchecked Sendable {
         lock.withLock {
             serviceID = ""; nodeID = ""; tenantID = nil
             store = nil; strategy = .queue
-            seq = 0; prevHash = "genesis"
             redactor = Redactor()
         }
     }

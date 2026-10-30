@@ -99,6 +99,26 @@ public enum Fasten {
                                 method: method, severity: severity)
     }
 
+    // ── Retention ─────────────────────────────────────────────────────────
+
+    /// Codes whose detail may hold personal data: `piiInDetail` or retention
+    /// class short.
+    public static func piiCodes() -> [Code] {
+        CodeRegistry.shared.piiCodes()
+    }
+
+    /// Set `detail` to null on rows of `piiCodes()` older than `before`
+    /// (spec 7). Rows are never deleted. Each redaction is recorded first as
+    /// an AUDIT_ROW_REDACTED row whose target is the redacted row's id.
+    /// Returns the redacted ids; calling it again redacts nothing new.
+    ///
+    /// The SDK runs no retention loop. Call this on a schedule, e.g. daily
+    /// with `before` set to now minus your PII retention period.
+    @discardableResult
+    public static func redactExpired(before: Date, reason: String = "retention") throws -> [String] {
+        try _defaultEngine.redactExpired(before: before, reason: reason)
+    }
+
     // ── Structured logging ────────────────────────────────────────────────
 
     public enum log {
