@@ -38,7 +38,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   dead-lettered at once.
 - `emit()` blocks while the queue is full.
 - A forked child (gunicorn `--preload`, Celery prefork) installs its own
-  drainer.
+  drainer. `fork()` waits for an in-flight store insert, so a child no
+  longer stops storing after inheriting SQLite mid-insert.
 
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 

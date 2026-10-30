@@ -714,3 +714,45 @@ def test_forked_child_gets_its_own_drainer(tmp_path):
     assert os.waitstatus_to_exitcode(status) == 0
     assert sorted(r.target for r in _rows(store)) == [f"child-{i}" for i in range(6)]
 
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_never_lands_mid_insert(tmp_path):
+    # Forked while the parent's drain thread was inside SQLite, a child
+    # inherited its global mutex or file lock state and never stored a row.
+    store = SQLiteStore(str(tmp_path / "a.db"))
+    _init(store)
+    pids = []
+    for rnd in range(3):
+        for i in range(300):
+            fasten.emit(code="USER_CREATED", target=f"parent-{rnd}-{i}")
+        for k in range(8):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+                pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    fasten.emit(code="USER_CREATED", target=f"child-{rnd}-{k}")
+                    code = 0 if fasten.flush(timeout=5.0) else 2
+                finally:
+                    os._exit(code)
+            pids.append(pid)
+    deadline = time.monotonic() + 20
+    failed = 0
+    for pid in pids:
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                failed += os.waitstatus_to_exitcode(status) != 0
+                break
+            if time.monotonic() > deadline:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+                failed += 1
+                break
+            time.sleep(0.02)
+    assert failed == 0, f"{failed} of {len(pids)} forked children did not store"
+    assert fasten.flush(timeout=10.0)
+    targets = {r.target for r in store.query(limit=10000)}
+    assert all(f"child-{r}-{k}" in targets for r in range(3) for k in range(8))
+

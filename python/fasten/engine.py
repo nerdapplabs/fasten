@@ -210,6 +210,9 @@ class Engine:
         self._store_gen = 0         # bumped when init switches to another store
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
+        # Held around the drainer's store call and across fork(), so a child
+        # never inherits a store (or SQLite's global mutex) mid-insert.
+        self._insert_lock = threading.Lock()
         self._atexit_registered = False
         self._last_init_at: Optional[datetime] = None
 
@@ -995,7 +998,8 @@ class Engine:
                     self._drainer_sys_log("error", "audit_drain_row_not_pending", {"row_id": row_id}, via=d)
                     return 0
                 entry[1] += 1
-                self._allocate_and_store(entry[0], store, d.stdout)
+                with self._insert_lock:
+                    self._allocate_and_store(entry[0], store, d.stdout)
                 pending.pop(row_id, None)
                 return 0
             except Exception as e:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
@@ -1039,9 +1043,17 @@ class Engine:
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
             if hasattr(os, "register_at_fork"):
-                os.register_at_fork(after_in_child=self._reinstall_after_fork)
+                os.register_at_fork(before=self._insert_lock_before_fork,
+                                    after_in_parent=self._insert_lock_after_fork,
+                                    after_in_child=self._reinstall_after_fork)
             self._atexit_registered = True
         return old
+
+    def _insert_lock_before_fork(self) -> None:
+        self._insert_lock.acquire()
+
+    def _insert_lock_after_fork(self) -> None:
+        self._insert_lock.release()
 
     def _reinstall_after_fork(self) -> None:
         """A forked child (gunicorn --preload, Celery prefork) inherits the
@@ -1051,6 +1063,7 @@ class Engine:
         # Another thread may have held these at the fork.
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
+        self._insert_lock = threading.Lock()
         old, self._drainer = self._drainer, None
         if old is not None:
             try:
