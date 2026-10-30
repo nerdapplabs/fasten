@@ -160,6 +160,26 @@ def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 
+def _row_hashes_over_shipped_at(form_id: str, row_dict: dict[str, Any]) -> list[str]:
+    """Hashes of a row sealed with ``shipped_at`` already set, as every form
+    hashed it before §1.1 nulled it: the stored value, rendered like the
+    timestamp next to it. Emit never sealed such rows; a caller passing
+    ``shipped_at`` to ``seal()`` or ``allocate_and_insert_originated`` did.
+
+    ``verify_chain`` falls back to these only when the row has a ``shipped_at``.
+    """
+    if form_id == "1":
+        d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
+        hashed = _to_hashed_form(d)
+        hashed["shipped_at"] = _hashed_ts(d["shipped_at"])
+        # The second is the legacy-"Z" spelling (#91), both fields verbatim.
+        return [hashlib.sha256(_canonical_json(x)).hexdigest() for x in (hashed, d)]
+    if form_id == "2":
+        d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
+        return [hashlib.sha256(_canonical_json(d)).hexdigest()]
+    return []
+
+
 # Form-id -> hash function registry. Adding a v2 is purely additive: register a
 # new id here and stamp it in seal(); verify_chain dispatches automatically and
 # rejects any id not present in this map.
@@ -331,6 +351,11 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
                 # Before #91, Python sealed form "1" over the wire "Z" spelling.
                 # Accept it rather than report our own spec fix as tampering.
                 if _row_hash_form_1_legacy_z(row_d) == row.hash:
+                    expected = row.hash
+            if expected != row.hash and row.shipped_at is not None:
+                # Sealed with shipped_at already set, before §1.1 hashed it as
+                # null. Such a row matches only over its exact stored value.
+                if row.hash in _row_hashes_over_shipped_at(form_id, row_d):
                     expected = row.hash
             if expected != row.hash:
                 return ChainVerifyResult(

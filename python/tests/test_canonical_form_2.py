@@ -512,3 +512,50 @@ def test_real_pre_fix_release_row_verifies_once_shipped():
     [row] = _rows_from_dicts([d])
     result = verify_chain([row])
     assert result.ok, f"shipped pre-fix row rejected: {result.reason}"
+
+
+# Rows sealed with shipped_at ALREADY set, hashed by the release before §1.1
+# nulled it (python/fasten/chain.py at bf9c179). Literals: do not regenerate.
+# Go checks the same rows in verify_shipped_test.go.
+_SEALED_SHIPPED_BASE = {
+    "action": "create", "actor": "alice", "actor_kind": "user",
+    "category": "order", "code": "ORDER_PLACED",
+    "detail": {"qty": 3, "sku": "WIDGET"}, "domain": "sales", "method": "http",
+    "monotonic_seq": 1, "prev_hash": "genesis", "request_id": "req-xyz",
+    "service_id": "gateway", "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z", "source_node_id": "node-1",
+    "target": "order/42", "tenant_id": None,
+    "timestamp": "2026-06-15T10:30:45.123456Z", "wire_version": "1",
+}
+SEALED_SHIPPED_ROWS = [
+    dict(_SEALED_SHIPPED_BASE, id=i, origin_id=i, **extra) for i, extra in (
+        ("evt-form1-sealed-shipped", {
+            "canonical_form_id": "1",
+            "hash": "5c3cf746ca5745e07baff24c66cb84b596cf6d2db94d985ff26bfbf2b97f6af2"}),
+        ("evt-form1_legacy_Z-sealed-shipped", {
+            "canonical_form_id": "1",
+            "hash": "11f6ce9b648ed4b54ade9720076951405320bed68170db4b6fda5602cd7cb15e"}),
+        ("evt-form2-sealed-shipped", {
+            "canonical_form_id": "2", "detail_salt": "b" * 64,
+            "detail_commitment": "f539a999e9d125e1097ffaf48dc5034d46eda02f8ee2620ee0b896ebf9cd3dfd",
+            "hash": "67acd6ab0fcd7c6c14a314a6cb4bad414aa08f1fd1edc4e2946488682491f920"}),
+    )
+]
+
+
+@pytest.mark.parametrize("raw", SEALED_SHIPPED_ROWS, ids=lambda d: d["id"])
+def test_row_sealed_with_shipped_at_set_still_verifies(raw):
+    [row] = _rows_from_dicts([dict(raw)])
+    result = verify_chain([row])
+    assert result.ok, result.reason
+
+
+@pytest.mark.parametrize("raw", SEALED_SHIPPED_ROWS, ids=lambda d: d["id"])
+def test_row_sealed_with_shipped_at_set_binds_that_value(raw):
+    """The fallback accepts only the stored value it was sealed over."""
+    [row] = _rows_from_dicts([dict(raw)])
+    moved = dataclasses.replace(
+        row, shipped_at=datetime(2026, 6, 17, tzinfo=timezone.utc))
+    assert not verify_chain([moved]).ok
+    assert not verify_chain([dataclasses.replace(row, shipped_at=None)]).ok
+    assert not verify_chain([dataclasses.replace(row, actor="bob")]).ok

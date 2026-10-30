@@ -44,6 +44,9 @@ severity, shipped_at, source_node_id, target, tenant_id, timestamp, wire_version
 - `shipped_at` is hashed as **`null`** in every form, whatever the row holds.
   Rows are sealed with it `null` and `mark_shipped` sets it later, so it must
   not move the hash. Rows sealed through emit keep their existing hashes.
+  A row sealed earlier with `shipped_at` already set was hashed over that
+  value; verifiers MUST accept it when the hash matches with the stored
+  `shipped_at` (rendered like `timestamp`) in place of `null`.
 - `pii_in_detail` is **excluded**. The Go wire `Row` carries it as a field; the
   Python `AuditRow` does not. Both SDKs MUST exclude it from the hash so a Go
   aggregator can verify a Python-sealed chain. This is a deliberate, fixed

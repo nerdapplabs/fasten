@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -183,6 +184,13 @@ func VerifyChain(rows []Row) VerifyResult {
 			// Delete with form "1".
 			expected = rowHashForm1LegacyZ(row)
 		}
+		if expected != row.Hash && row.ShippedAt != nil {
+			// Sealed with shipped_at already set, before §1.1 hashed it as
+			// null. Such a row matches only over its exact stored value.
+			if slices.Contains(rowHashesOverShippedAt(row, formID), row.Hash) {
+				expected = row.Hash
+			}
+		}
 		if expected != row.Hash {
 			return VerifyResult{
 				OK:           false,
@@ -271,6 +279,36 @@ func rowHashForm2(row Row) string {
 	d["timestamp"] = canonicalTS(row.Timestamp)
 	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
+}
+
+// rowHashesOverShippedAt mirrors Python _row_hashes_over_shipped_at: the hashes
+// of a row sealed with ShippedAt already set, as every form hashed it before
+// §1.1 nulled it, the stored value rendered like the timestamp next to it.
+// Emit never sealed such rows; a caller passing ShippedAt to Seal or
+// AllocateAndInsertOriginated did. Verification fallback only.
+func rowHashesOverShippedAt(row Row, formID string) []string {
+	hash := func(d map[string]any) string {
+		sum := sha256.Sum256(canonicalJSON(d))
+		return hex.EncodeToString(sum[:])
+	}
+	switch formID {
+	case "1":
+		d := pyCanonicalRowMap(row)
+		d["shipped_at"] = pyISOFormat(*row.ShippedAt)
+		form1 := hash(d)
+		// The legacy-"Z" spelling (#91): both fields verbatim.
+		d["timestamp"] = canonicalTS(row.Timestamp)
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+		return []string{form1, hash(d)}
+	case "2":
+		d := pyCanonicalRowMap(row)
+		delete(d, "detail")
+		d["detail_commitment"] = row.DetailCommitment
+		d["timestamp"] = canonicalTS(row.Timestamp)
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+		return []string{hash(d)}
+	}
+	return nil
 }
 
 // pyCanonicalRowMap builds the hashed row map: Python AuditRow.to_dict() minus
