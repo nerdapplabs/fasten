@@ -218,6 +218,78 @@ class ChainVerifyResult:
     reason: Optional[str]
 
 
+def _row_break(row: "AuditRow") -> Optional[str]:
+    """Check a sealed row on its own: its form, its detail commitment and its
+    hash. Returns why it fails, or None if it checks out."""
+    form_id = str(row.canonical_form_id)
+    hash_fn = _HASH_FN_BY_FORM.get(form_id)
+    if hash_fn is None:
+        return f'row {row.id}: unknown canonical_form_id "{form_id}"'
+    row_d = {k: v for k, v in row.to_dict().items()}
+
+    # Form "2" hashes detail_commitment, not detail, so a changed detail
+    # with the commitment left as it was still matches the hash. While
+    # detail and its salt are present, recompute the commitment and
+    # compare. Once the row is redacted (both NULL, spec §7.1) the
+    # commitment stands on its own.
+    if form_id == "2" and row.detail is not None:
+        # Detail present means the commitment must be checkable; a
+        # missing salt is a break, not a reason to skip the check.
+        # Redaction clears detail and salt together (spec §7.1), so a
+        # redacted row never reaches here.
+        if not row.detail_salt:
+            return (f"row {row.id}: detail present but detail_salt "
+                    "is missing — commitment cannot be verified")
+        recomputed = detail_commitment(row.detail_salt, row.detail)
+        if recomputed != (row.detail_commitment or ""):
+            return f"row {row.id}: detail does not match its commitment"
+
+    expected = hash_fn(row_d)
+    if expected != row.hash and form_id == "1":
+        # Before #91, Python sealed form "1" over the wire "Z" spelling.
+        # Accept it rather than report our own spec fix as tampering.
+        if _row_hash_form_1_legacy_z(row_d) == row.hash:
+            expected = row.hash
+    if expected != row.hash:
+        return f"row {row.id}: hash mismatch"
+    return None
+
+
+def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
+    """The first break in one node's chain, sorted by monotonic_seq, as
+    (monotonic_seq, reason); None if the chain verifies."""
+    sealed = [r.monotonic_seq for r in sorted_rows if r.hash]
+    first_sealed = min(sealed) if sealed else None
+    seen: dict[int, str] = {}
+    for i, row in enumerate(sorted_rows):
+        if not row.hash:
+            if first_sealed is not None and row.monotonic_seq >= first_sealed:
+                return row.monotonic_seq, f"row {row.id}: no hash after the node's chain started"
+            continue  # written before chaining, or stdout-only
+        # monotonic_seq is unique within a node, so a duplicate means two
+        # allocators raced — a non-conformant in-memory counter (spec §2.1).
+        if seen.get(row.monotonic_seq, row.id) != row.id:
+            return row.monotonic_seq, (
+                f"duplicate monotonic_seq {row.monotonic_seq} on node "
+                f"{row.source_node_id!r}: rows {seen[row.monotonic_seq]} and {row.id}. "
+                f"Two engines allocated independently (spec §2.1).")
+        seen[row.monotonic_seq] = row.id
+        reason = _row_break(row)
+        if reason is not None:
+            return row.monotonic_seq, reason
+        if i > 0:
+            prev = sorted_rows[i - 1]
+            if prev.hash and row.prev_hash != prev.hash:
+                return row.monotonic_seq, f"row {row.id}: prev_hash does not match preceding row {prev.id}"
+            # Only a node's first sealed row may skip the check above: the
+            # store links it to "genesis" when the unsealed row before it is
+            # at seq-1, and a purged head leaves a gap where the window starts.
+            if (not prev.hash and prev.monotonic_seq == row.monotonic_seq - 1
+                    and row.prev_hash != "genesis"):
+                return row.monotonic_seq, f"row {row.id}: first sealed row does not link to genesis"
+    return None
+
+
 def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     """Walk the per-row hash chain and return a verification result.
 
@@ -229,9 +301,14 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     detect tail truncation — that requires an external tip-anchor (see P1-23 for
     the documented limitation).
 
-    Rows with an empty ``hash`` field (written before hash-chain support was
-    enabled) are skipped silently — the chain is verified only for the portion
-    that carries hashes.
+    Rows with an empty ``hash`` field (written before hash-chain support, or in
+    stdout-only mode) are skipped below their node's first sealed seq; they are
+    not covered by the chain. A conformant store never writes one at or above
+    it, so one there breaks the chain. A sealed row right after an unsealed one
+    must link to "genesis", as the store allocates it (spec §2). With several
+    nodes, ``first_break_at`` is the lowest seq at which any of them breaks.
+    A row given more than once is checked once: a sealed copy wins over an
+    unsealed one, and two sealed copies must have the same, valid hash.
 
     Each row's ``canonical_form_id`` is dispatched against the form registry: a
     known id is recomputed and compared; an UNKNOWN id is REJECTED (the result
@@ -241,102 +318,38 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     if not rows:
         return ChainVerifyResult(ok=True, total_rows=0, first_break_at=None, reason=None)
 
-    # One node, one chain (spec §2). monotonic_seq is unique within a
-    # source_node_id, so duplicates mean two allocators raced — a non-conformant
-    # in-memory counter (spec §2.1) — and MUST be reported rather than tolerated.
-    seen: dict[tuple[str, int], str] = {}
-    for row in sorted(rows, key=lambda r: (r.source_node_id, r.monotonic_seq, r.id)):
-        if not row.hash:
-            continue
-        key = (row.source_node_id, row.monotonic_seq)
-        if key in seen and seen[key] != row.id:
-            return ChainVerifyResult(
-                ok=False,
-                total_rows=len(rows),
-                first_break_at=row.monotonic_seq,
-                reason=(
-                    f"duplicate monotonic_seq {row.monotonic_seq} on node "
-                    f"{row.source_node_id!r}: rows {seen[key]} and {row.id}. "
-                    f"Two engines allocated independently (spec §2.1)."
-                ),
-            )
-        seen[key] = row.id
-
     # Chains are per node (spec §2), so the prev_hash walk MUST be scoped by
     # source_node_id — a flat walk interleaves two nodes' sequences and reports a
     # spurious break. Dedupe by id first: replication is idempotent (spec §4) and
-    # a re-delivered row must not be compared against itself.
+    # a re-delivered row must not be compared against itself. A sealed copy
+    # replaces an unsealed one, since a stdout capture has the phase-1 line
+    # first. A second sealed copy must be the same row: the same hash, and a
+    # hash that checks out. Go does the same.
     by_node: dict[str, dict[str, "AuditRow"]] = {}
+    dup: "tuple[int, str] | None" = None
     for row in rows:
-        by_node.setdefault(row.source_node_id, {}).setdefault(row.id, row)
+        kept = by_node.setdefault(row.source_node_id, {})
+        old = kept.get(row.id)
+        if old is None or (not old.hash and row.hash):
+            kept[row.id] = row
+        elif old.hash and row.hash:
+            reason = (f"row {row.id}: two sealed copies with different hashes"
+                      if row.hash != old.hash else _row_break(row))
+            seq = min(row.monotonic_seq, old.monotonic_seq)
+            if reason is not None and (dup is None or seq < dup[0]):
+                dup = seq, reason
 
+    # A break on any node fails the chain; report the lowest seq at which one
+    # occurs, so every SDK gives the same first_break_at for the same rows.
+    first: "tuple[int, str] | None" = None
     for _node in sorted(by_node):
         sorted_rows = sorted(by_node[_node].values(), key=lambda r: r.monotonic_seq)
-        for i, row in enumerate(sorted_rows):
-            if not row.hash:
-                continue  # pre-upgrade row; skip
-            form_id = str(row.canonical_form_id)
-            hash_fn = _HASH_FN_BY_FORM.get(form_id)
-            if hash_fn is None:
-                return ChainVerifyResult(
-                    ok=False,
-                    total_rows=len(rows),
-                    first_break_at=row.monotonic_seq,
-                    reason=f'row {row.id}: unknown canonical_form_id "{form_id}"',
-                )
-            row_d = {k: v for k, v in row.to_dict().items()}
-
-            # Form "2" hashes detail_commitment, NOT detail. So the hash alone
-            # does not protect detail: an attacker could rewrite detail and
-            # leave the commitment intact. Whenever detail AND its salt are
-            # still present, recompute the commitment and compare. Once the row
-            # is redacted (both NULL, spec §7.1) there is nothing left to check
-            # and the commitment stands on its own.
-            if form_id == "2" and row.detail is not None:
-                # detail present means the commitment MUST be checkable. An
-                # attacker who rewrites detail and clears detail_salt would
-                # otherwise skip this branch entirely and the row would verify
-                # — the salt is not a switch for turning verification off.
-                # Redaction clears detail AND salt together (spec §7.1), so a
-                # legitimately redacted row never reaches here.
-                if not row.detail_salt:
-                    return ChainVerifyResult(
-                        ok=False,
-                        total_rows=len(rows),
-                        first_break_at=row.monotonic_seq,
-                        reason=(f"row {row.id}: detail present but detail_salt "
-                                "is missing — commitment cannot be verified"),
-                    )
-                recomputed = detail_commitment(row.detail_salt, row.detail)
-                if recomputed != (row.detail_commitment or ""):
-                    return ChainVerifyResult(
-                        ok=False,
-                        total_rows=len(rows),
-                        first_break_at=row.monotonic_seq,
-                        reason=f"row {row.id}: detail does not match its commitment",
-                    )
-
-            expected = hash_fn(row_d)
-            if expected != row.hash and form_id == "1":
-                # Before #91, Python sealed form "1" over the wire "Z" spelling.
-                # Accept it rather than report our own spec fix as tampering.
-                if _row_hash_form_1_legacy_z(row_d) == row.hash:
-                    expected = row.hash
-            if expected != row.hash:
-                return ChainVerifyResult(
-                    ok=False,
-                    total_rows=len(rows),
-                    first_break_at=row.monotonic_seq,
-                    reason=f"row {row.id}: hash mismatch",
-                )
-            if i > 0:
-                prev = sorted_rows[i - 1]
-                if prev.hash and row.prev_hash != prev.hash:
-                    return ChainVerifyResult(
-                        ok=False,
-                        total_rows=len(rows),
-                        first_break_at=row.monotonic_seq,
-                        reason=f"row {row.id}: prev_hash does not match preceding row {prev.id}",
-                    )
+        found = _first_break(sorted_rows)
+        if found is not None and (first is None or found[0] < first[0]):
+            first = found
+    if dup is not None and (first is None or dup[0] < first[0]):
+        first = dup
+    if first is not None:
+        return ChainVerifyResult(ok=False, total_rows=len(rows), first_break_at=first[0], reason=first[1])
 
     return ChainVerifyResult(ok=True, total_rows=len(rows), first_break_at=None, reason=None)
