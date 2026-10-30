@@ -135,6 +135,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   again: CMake looked for `SQLite3::SQLite3`, but FindSQLite3 names the
   target `SQLite::SQLite3`, so it was always skipped.
 
+### Fixed — C++ PII redaction (#124)
+
+- `fasten::redact_expired(store, before, reason)` redacts rows of the codes in
+  `pii_codes()` (`pii_in_detail`, or retention class short) older than
+  `before`, as Python and Go do (spec §7). `detail` becomes the JSON literal
+  `null`; rows are never deleted. An `AUDIT_ROW_REDACTED` row is inserted
+  into the store before each row is redacted. There is no background loop:
+  the adopter calls it on a schedule.
+- `SqliteStore` and `PostgresStore` gain `list_redaction_candidates()` and
+  `redact_rows()`, and the `prev_hash`, `hash`, `canonical_form_id`,
+  `detail_salt` and `detail_commitment` columns (added to existing tables).
+  C++ rows are unsealed; a sealed form-"1" row is never redacted.
+- Test for #92: two `SqliteStore`s on one file and one node get seqs 1..N.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
