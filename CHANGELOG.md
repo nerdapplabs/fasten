@@ -92,6 +92,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — Go `/audit/doctor` tenant scope and 500 bodies (#150)
+
+- `/audit/doctor` uses the resolved tenant. A scoped caller gets its own row
+  count, no host `tenant_id`, and on a chain break the verdict without
+  `first_break_at` or a `reason` naming another tenant's row.
+- The row count uses `CountFiltered`, so the Postgres store reports `rows` too.
+  A custom store with only `Count` still reports `rows` to an unscoped caller.
+- Reader 500s answer `internal error` and log a `reader_query_failed` sys line
+  with the request id and the error type. The doctor's `last_error` and chain
+  `reason` carry fixed text and log a `doctor_check_failed` sys line.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

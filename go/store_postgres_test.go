@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -439,5 +440,39 @@ func TestPostgres_QueryOrdersByTimeAcrossSubChains(t *testing.T) {
 			t.Fatalf("row %d: expected node-b (newer chain) first, got %s (seq %d)",
 				i, page[i].SourceNodeID, page[i].MonotonicSeq)
 		}
+	}
+}
+
+func TestPostgres_DoctorCountsTheCallersRows(t *testing.T) {
+	db := pgDB(t)
+	table := uniqueTable("fasten_doctor")
+	store, err := NewPostgresStore(db, table)
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	t.Cleanup(func() { dropTable(t, db, table) })
+	for i, tenant := range []string{"tenant-a", "tenant-b"} {
+		row := pgRow(fmt.Sprintf("doctor-%d", i), "req")
+		row.TenantID = &tenant
+		row.MonotonicSeq = int64(i + 1)
+		if err := store.Insert(context.Background(), row); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+	resetGlobals(t)
+	registerTestCodes(t)
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	if rows := body["store"].(map[string]any)["rows"]; rows != float64(2) {
+		t.Errorf("unscoped doctor must count every row; got %v", rows)
+	}
+	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	body, _ = getJSON(t, h, "/audit/doctor")
+	if rows := body["store"].(map[string]any)["rows"]; rows != float64(1) {
+		t.Errorf("scoped doctor must count only tenant-a's rows; got %v", rows)
 	}
 }
