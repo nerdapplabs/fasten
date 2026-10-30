@@ -281,3 +281,127 @@ test('queue stats high water monotonic', async () => {
     assert.equal(await flush(1000), true);
     assert.ok(queueStats().high_water >= high);
 });
+
+// ── async stores, stop, degraded backoff (#137) ────────────────────────────
+
+class AsyncBrokenStore {
+    constructor(msg = 'store down') { this.msg = msg; this.attempts = 0; }
+    async insert(_row) {
+        this.attempts++;
+        await new Promise(r => setTimeout(r, 1));
+        throw new Error(this.msg);
+    }
+}
+
+// Runs fn(captured) with sys lines on stderr captured; returns them.
+async function captureSys(fn) {
+    const captured = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
+        try {
+            const obj = JSON.parse(String(chunk).trim());
+            if (obj.shape === 'sys') { captured.push(obj); return true; }
+        } catch { /* not json */ }
+        return origWrite(chunk, ...rest);
+    };
+    try {
+        await fn(captured);
+    } finally {
+        process.stderr.write = origWrite;
+    }
+    return captured;
+}
+
+// Fails the test if a promise rejection goes unhandled while fn runs.
+async function noUnhandledRejection(fn) {
+    const seen = [];
+    const onRejection = (err) => seen.push(err);
+    process.on('unhandledRejection', onRejection);
+    try {
+        await fn();
+        await new Promise(r => setTimeout(r, 20));
+    } finally {
+        process.off('unhandledRejection', onRejection);
+    }
+    assert.deepEqual(seen, []);
+}
+
+test('raise mode rejects with AuditStoreError for an async store', async () => {
+    await noUnhandledRejection(async () => {
+        _initRaise(new AsyncBrokenStore());
+        await assert.rejects(
+            emit({ code: 'USER_CREATED', target: 'u-1' }),
+            (err) => err instanceof AuditStoreError && /store down/.test(err.message),
+        );
+    });
+});
+
+test('raise mode resolves to the row for an async store', async () => {
+    const store = new SlowStore(1);
+    _initRaise(store);
+    const row = await emit({ code: 'USER_CREATED', target: 'u-1' });
+    assert.equal(row.target, 'u-1');
+    assert.equal(store.rows.length, 1);
+});
+
+test('sync fallback logs a failed async insert', async () => {
+    let captured;
+    await noUnhandledRejection(async () => {
+        captured = await captureSys(async () => {
+            _initQueue(new AsyncBrokenStore());
+            await uninstallDrainer();
+            emit({ code: 'USER_CREATED', target: 'u-1' });
+            await new Promise(r => setTimeout(r, 20));
+        });
+    });
+    assert.ok(captured.some(r => r.event === 'audit_sync_fallback_failed'),
+        `got ${JSON.stringify(captured.map(c => c.event))}`);
+});
+
+test('stop writes the rows still queued', async () => {
+    const store = new SlowStore(5);
+    _initQueue(store);
+    for (let i = 0; i < 5; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    await uninstallDrainer();
+    assert.equal(store.rows.length, 5);
+});
+
+test('stop dead-letters rows whose last attempt fails', async () => {
+    const store = new BrokenStore();
+    const captured = await captureSys(async () => {
+        _initQueue(store, {
+            queueRetryInitialMs: 60_000,
+            queueRetryMaxMs: 60_000,
+            queueRetryJitter: false,
+        });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        emit({ code: 'USER_CREATED', target: 'u-2' });
+        while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
+        const t0 = Date.now();
+        await uninstallDrainer();
+        assert.ok(Date.now() - t0 < 1000, 'stop must cut the backoff short');
+    });
+    const dead = captured.filter(r => r.event === 'audit_drain_dead_letter');
+    assert.equal(dead.length, 2, `got ${JSON.stringify(captured.map(c => c.event))}`);
+    // u-1: its first attempt, then one after the stop. u-2: one, after the stop.
+    assert.equal(store.attempts, 3);
+});
+
+test('drainer degraded reports the backoff it is about to wait', async () => {
+    const captured = await captureSys(async (seen) => {
+        _initQueue(new BrokenStore(), {
+            queueRetryInitialMs: 200,
+            queueRetryMaxMs: 200,
+            queueRetryJitter: false,
+        });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        const deadline = Date.now() + 5000;
+        while (!seen.some(r => r.event === 'audit_drain_degraded') && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 20));
+        }
+    });
+    const degraded = captured.find(r => r.event === 'audit_drain_degraded');
+    assert.ok(degraded, 'audit_drain_degraded never fired');
+    assert.ok(degraded.in_backoff_seconds > 0.15,
+        `in_backoff_seconds was ${degraded.in_backoff_seconds}`);
+});

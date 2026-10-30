@@ -121,7 +121,11 @@ export interface EmitInput {
 	method?: Method;
 }
 
-export function emit(input: EmitInput): Row;
+/**
+ * Returns the row. In raise mode with a store whose `insert` returns a
+ * promise, returns a promise for the row that rejects with AuditStoreError.
+ */
+export function emit(input: EmitInput): Row | Promise<Row>;
 
 export interface Logger {
 	debug(event: string, fields?: Record<string, unknown>): void;

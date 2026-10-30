@@ -66,8 +66,10 @@ class AuditQueueDrainer {
 		this._errHWFired = false;
 		this._degradedFired = false;
 
-		// Kick the drainer loop.
-		setImmediate(() => this._tick());
+		// Kick the drainer loop. stop() resolves when it has finished.
+		this._done = new Promise((resolve) => {
+			setImmediate(() => this._tick().then(resolve));
+		});
 	}
 
 	put(row) {
@@ -137,12 +139,15 @@ class AuditQueueDrainer {
 		return this._drainedTotal >= target;
 	}
 
+	// Spec §10: rows still queued get one attempt each, and a row that fails
+	// it is dead-lettered. The returned promise resolves once that is done.
 	stop() {
 		this._stopped = true;
+		return this._done;
 	}
 
 	async _tick() {
-		while (!this._stopped) {
+		while (!this._stopped || this._q.length > 0) {
 			if (this._q.length === 0) {
 				await new Promise((r) => setImmediate(r));
 				continue;
@@ -166,14 +171,13 @@ class AuditQueueDrainer {
 				this._onSuccess();
 				return;
 			} catch (err) {
-				if (attempt >= this._maxAttempts) {
+				if (attempt >= this._maxAttempts || this._stopped) {
 					this._onDeadLetter(row, attempt, err);
 					return;
 				}
 				this._onFailure(err);
-				if (this._stopped) return;
-				const cont = await this._waitBackoff();
-				if (!cont) return;
+				// A stop cuts the wait short; the next pass is the row's last.
+				await this._waitBackoff();
 			}
 		}
 	}
@@ -201,6 +205,8 @@ class AuditQueueDrainer {
 		const crossedDegraded =
 			this._retryCount >= DEGRADED_AFTER && !this._degradedFired;
 		if (crossedDegraded) this._degradedFired = true;
+		// Set before the degraded event so it reports this retry's wait.
+		this._inBackoffUntilMs = Date.now() + this._backoffMs();
 
 		if (first) {
 			this._sysLog("warn", "audit_drain_failed", { error: msg });
@@ -233,7 +239,7 @@ class AuditQueueDrainer {
 		}
 	}
 
-	async _waitBackoff() {
+	_backoffMs() {
 		const n = this._retryCount;
 		let delay = this._retryInitialMs * 2 ** Math.max(0, n - 1);
 		if (delay > this._retryMaxMs) delay = this._retryMaxMs;
@@ -242,17 +248,15 @@ class AuditQueueDrainer {
 			delay += (Math.random() * 2 - 1) * j;
 			if (delay < 0) delay = 0;
 		}
-		this._inBackoffUntilMs = Date.now() + delay;
-		// Sleep, but check _stopped frequently so shutdown is prompt.
-		const stepMs = Math.min(delay, 50);
-		const end = Date.now() + delay;
-		while (Date.now() < end) {
-			if (this._stopped) return false;
-			await new Promise((r) =>
-				setTimeout(r, Math.min(stepMs, end - Date.now())),
-			);
+		return delay;
+	}
+
+	// Sleeps until _inBackoffUntilMs, checking _stopped so shutdown is prompt.
+	async _waitBackoff() {
+		const end = this._inBackoffUntilMs;
+		while (Date.now() < end && !this._stopped) {
+			await new Promise((r) => setTimeout(r, Math.min(50, end - Date.now())));
 		}
-		return !this._stopped;
 	}
 }
 
@@ -275,7 +279,7 @@ export function installDrainer(opts) {
 }
 
 export function uninstallDrainer() {
-	_defaultEngine?._uninstallDrainer();
+	return _defaultEngine?._uninstallDrainer() ?? Promise.resolve();
 }
 
 export function activeDrainer() {

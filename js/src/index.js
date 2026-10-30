@@ -367,20 +367,34 @@ export class Engine {
 				if (d) {
 					d.put(row);
 				} else {
-					try {
-						cfg.auditStore.insert(row);
-					} catch (err) {
+					const failed = (err) =>
 						this._drainerSysLog("error", "audit_sync_fallback_failed", {
 							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
 							row_id: row?.id ?? null,
 						});
+					try {
+						const p = cfg.auditStore.insert(row);
+						if (typeof p?.then === "function") p.then(undefined, failed);
+					} catch (err) {
+						failed(err);
 					}
 				}
 			} else {
+				let p;
 				try {
-					cfg.auditStore.insert(row);
+					p = cfg.auditStore.insert(row);
 				} catch (err) {
 					throw new AuditStoreError(err);
+				}
+				// An async store fails after emit() returns, so hand the caller a
+				// promise for the row that rejects with AuditStoreError.
+				if (typeof p?.then === "function") {
+					return p.then(
+						() => row,
+						(err) => {
+							throw new AuditStoreError(err);
+						},
+					);
 				}
 			}
 		}
@@ -424,7 +438,7 @@ export class Engine {
 	_uninstallDrainer() {
 		const old = this._drainer;
 		this._drainer = null;
-		if (old) old.stop();
+		return old ? old.stop() : Promise.resolve();
 	}
 
 	_drainerSysLog(level, event, fields) {

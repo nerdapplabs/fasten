@@ -75,8 +75,11 @@ in-memory queue and a `setImmediate`-driven drainer writes to the
 sink with exponential backoff (100 ms → 60 s, ±20 % jitter). Sink
 failures stay off the request path. Set
 `auditStoreFailureStrategy: 'raise'` to opt into synchronous semantics
-with `AuditStoreError`. `queueStats()` and `flush(timeoutMs)` complete
-the public surface.
+with `AuditStoreError`. With an async store such as `PostgresStore`,
+raise-mode `emit()` returns a promise for the row; `await` it to see the
+`AuditStoreError`. `queueStats()` and `flush(timeoutMs)` complete
+the public surface. Re-`init()` stops the old drainer: rows still queued
+get one more attempt each and are dead-lettered if it fails.
 
 **Cross-language deviation.** Node is single-threaded — `emit()`
 cannot synchronously block on a counting semaphore the way Python /

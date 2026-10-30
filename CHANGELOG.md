@@ -92,6 +92,21 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — JS async store errors and drainer stop (#137, items 1, 2, 5)
+
+- Raise mode with a store whose `insert` returns a promise (such as
+  `PostgresStore`): `emit()` returns a promise for the row that rejects with
+  `AuditStoreError`. It used to return normally, and the rejection ended the
+  process as an `unhandledRejection`. A sync store still throws from `emit()`.
+- The queue-mode fallback with no drainer logs `audit_sync_fallback_failed`
+  for a rejected async insert too.
+- Stopping the drainer (re-`init()`, uninstall) no longer drops rows. It cuts
+  any backoff short and gives each row still queued one more attempt; a row
+  that fails it is dead-lettered (`audit_drain_dead_letter`), as spec §10
+  says. `stop()` returns a promise that resolves when this is done.
+- `audit_drain_degraded` reports the backoff about to start in
+  `in_backoff_seconds`; it was always 0.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
