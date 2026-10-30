@@ -111,6 +111,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   error-path cases, plus a no-database reconnect/cleanup unit test). Retires
   the downstream `idle_in_transaction_session_timeout` reaper workaround.
 
+### Changed — Replication ingest checks the stored rows (Python + Go)
+
+- `ingest` / `IngestReplicated` now check a batch against the rows the store
+  already holds, and reject from the first row that disagrees, where they
+  used to keep the stored version and report the row as inserted: a row
+  whose id, or node and seq, is stored with other content; a row that does
+  not link to the stored row before or after it; an id repeated within the
+  batch, on one node or two. A row
+  stored with the same hash is still a re-delivery.
+- Go SQLite stores raise `busy_timeout` to 5 s only while they write, and put
+  back the pool connection's own value afterwards.
+
 ### Changed — README
 
 - New "Where it fits" section linking to Membrane and fasten fleet.

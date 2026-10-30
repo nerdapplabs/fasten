@@ -240,6 +240,17 @@ rows keep their origin's `hash` / `prev_hash` / `origin_id` / `monotonic_seq`.
   `rejected_from_seq` (the `monotonic_seq` of the first broken row, or null when
   the whole batch verified), and `reason`. The sender resyncs from
   `rejected_from_seq` instead of re-shipping a poison-pilled batch forever.
+- **Stored rows.** In the same transaction, `ingest` checks the verified prefix
+  against what the store already holds for each node. A row whose `id`, or
+  whose (`source_node_id`, `monotonic_seq`), is stored with different content
+  is a break at that row; so is a new row whose `prev_hash` does not match the
+  stored row at `seq - 1` (`"genesis"` when that row is unsealed, §2), or whose
+  `hash` the stored row at `seq + 1` does not link to. Since `id` is unique,
+  a repeat of an `id` within a batch, on the same node or another, is a break
+  at the later row. `ingest` MUST
+  NOT keep one version silently: an insert skipped because another writer
+  stored that `id` in the meantime is checked again, not counted as inserted.
+  A row stored with the same `hash` is a re-delivery.
 - **Atomicity.** The verified prefix is inserted in a single transaction; insert
   is idempotent so re-delivery is a no-op.
 - **`origin_id == id`** is the "originated-here" discriminator: a node's
