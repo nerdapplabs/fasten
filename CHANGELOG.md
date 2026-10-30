@@ -127,6 +127,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - JS CI runs the `PostgresStore` tests against Postgres; they were always
   skipped. Two purge tests that failed against a real database are fixed.
 
+### Fixed — JS PII redaction (#124)
+
+- `fasten.redactExpired({ before })` clears `detail` (to `null`) on rows of
+  the PII codes (`piiCodes()`: `piiInDetail` or SHORT) older than `before`,
+  as Python and Go do (spec §7). It writes an `AUDIT_ROW_REDACTED` row for
+  each one first, straight to the store, then clears it. Rows are never
+  deleted, and a row sealed under form "1" is left alone and counted in
+  `pii_redaction_skipped_legacy_form`.
+- `init({ retentionPii: '30d' })` or `FASTEN_RETENTION_PII` runs it on init
+  and then hourly.
+- `PostgresStore` has `listRedactionCandidates()` and `redactRows()`, and
+  takes an advisory lock while it creates its table, so two stores starting
+  on a new table no longer fail with a duplicate-key error.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

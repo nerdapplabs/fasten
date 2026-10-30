@@ -206,6 +206,17 @@ export function metaOf(code) {
 	return _registry.get(code);
 }
 
+/**
+ * Codes whose rows may carry personal data in `detail`: those that declare
+ * piiInDetail or are classified SHORT. Sorted.
+ */
+export function piiCodes() {
+	return [..._registry.values()]
+		.filter((m) => m.piiInDetail || m.retentionClass === RetentionClass.SHORT)
+		.map((m) => m.id)
+		.sort();
+}
+
 export function dump() {
 	return [..._registry.values()]
 		.map((m) => [m.id, m.domain, m.severity])
@@ -218,6 +229,64 @@ export function dump() {
 export function _clearRustRegistry() {
 	coreRegistryClear();
 }
+
+// --- Retention ------------------------------------------------------------
+
+const _DURATION_UNITS = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+
+/**
+ * Parse a retention duration like "30d", "24h", "90m" or "3600s" into
+ * milliseconds. Throws on anything else (empty, unknown unit, non-positive,
+ * compound).
+ */
+export function parseDuration(s) {
+	if (typeof s !== "string" || !s) {
+		throw new Error(
+			`retention duration must be a non-empty string (got ${JSON.stringify(s)})`,
+		);
+	}
+	const token = s.trim().toLowerCase();
+	const unit = _DURATION_UNITS[token.at(-1)];
+	if (token.length < 2 || !unit) {
+		throw new Error(
+			`retention duration ${JSON.stringify(s)}: unit must be one of s/m/h/d (e.g. '7d', '24h')`,
+		);
+	}
+	const num = token.slice(0, -1);
+	if (!/^[+-]?\d+$/.test(num)) {
+		throw new Error(
+			`retention duration ${JSON.stringify(s)}: expected integer before the unit`,
+		);
+	}
+	const n = Number(num);
+	if (n <= 0) {
+		throw new Error(
+			`retention duration ${JSON.stringify(s)}: must be positive`,
+		);
+	}
+	return n * unit;
+}
+
+// Spec §7.2: fasten's own code for the redaction event, registered on first
+// use so adopters who never redact don't carry it.
+const REDACTION_CODE = "AUDIT_ROW_REDACTED";
+
+function _ensureRedactionCode() {
+	if (_registry.has(REDACTION_CODE)) return;
+	register("fasten", {
+		[REDACTION_CODE]: {
+			domain: "fasten",
+			category: "retention",
+			action: "redact",
+			severity: Severity.WARN,
+			description: "Audit row detail destroyed under a retention policy",
+			emitter: "fasten",
+			retentionClass: RetentionClass.LONG,
+		},
+	});
+}
+
+const RETENTION_CHECK_MS = 3_600_000;
 
 // --- Engine ---------------------------------------------------------------
 
@@ -241,6 +310,8 @@ export class Engine {
 		failureStrategy: "queue",
 	};
 	_drainer = null; // accessible by audit_queue.js shims via _setDefaultEngine
+	_retentionTimer = null;
+	_retentionFirst = null;
 
 	init(opts = {}) {
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
@@ -272,9 +343,24 @@ export class Engine {
 				opts.redactReplacement ?? process.env.FASTEN_REDACT_REPLACEMENT ?? null,
 			failureStrategy: strategy,
 		};
+		this._stopRetention();
 		if (!this.#config.serviceId || !this.#config.nodeId) {
 			throw new Error(
 				"fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required",
+			);
+		}
+		const piiRet =
+			opts.retentionPii ?? (process.env.FASTEN_RETENTION_PII || null);
+		const piiRetMs = piiRet ? parseDuration(piiRet) : 0;
+		const store = this.#config.auditStore;
+		if (
+			piiRetMs &&
+			store &&
+			(typeof store.listRedactionCandidates !== "function" ||
+				typeof store.redactRows !== "function")
+		) {
+			throw new Error(
+				"fasten.init: retentionPii is set but the audit store has no listRedactionCandidates / redactRows (spec §7.1); personal data would never be redacted",
 			);
 		}
 
@@ -298,9 +384,54 @@ export class Engine {
 		} else {
 			this._uninstallDrainer();
 		}
+		if (piiRetMs && store) this._startRetention(piiRetMs);
 	}
 
-	emit({
+	emit(input) {
+		const cfg = this.#config;
+		const row = this._buildRow(input);
+		if (cfg.auditStore) {
+			if (cfg.failureStrategy === "queue") {
+				const d = this._drainer;
+				if (d) {
+					d.put(row);
+				} else {
+					const failed = (err) =>
+						this._drainerSysLog("error", "audit_sync_fallback_failed", {
+							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
+							row_id: row?.id ?? null,
+						});
+					try {
+						const p = cfg.auditStore.insert(row);
+						if (typeof p?.then === "function") p.then(undefined, failed);
+					} catch (err) {
+						failed(err);
+					}
+				}
+			} else {
+				let p;
+				try {
+					p = cfg.auditStore.insert(row);
+				} catch (err) {
+					throw new AuditStoreError(err);
+				}
+				// An async store fails after emit() returns, so hand the caller a
+				// promise for the row that rejects with AuditStoreError.
+				if (typeof p?.then === "function") {
+					return p.then(
+						() => row,
+						(err) => {
+							throw new AuditStoreError(err);
+						},
+					);
+				}
+			}
+		}
+		return row;
+	}
+
+	// Builds the row and writes it to stdout (spec §8 phase 1).
+	_buildRow({
 		code,
 		target,
 		actor = "system",
@@ -370,44 +501,61 @@ export class Engine {
 		};
 		process.stdout.write(`${JSON.stringify({ shape: "audit", ...row })}\n`);
 
-		if (cfg.auditStore) {
-			if (cfg.failureStrategy === "queue") {
-				const d = this._drainer;
-				if (d) {
-					d.put(row);
-				} else {
-					const failed = (err) =>
-						this._drainerSysLog("error", "audit_sync_fallback_failed", {
-							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
-							row_id: row?.id ?? null,
-						});
-					try {
-						const p = cfg.auditStore.insert(row);
-						if (typeof p?.then === "function") p.then(undefined, failed);
-					} catch (err) {
-						failed(err);
-					}
-				}
-			} else {
-				let p;
-				try {
-					p = cfg.auditStore.insert(row);
-				} catch (err) {
-					throw new AuditStoreError(err);
-				}
-				// An async store fails after emit() returns, so hand the caller a
-				// promise for the row that rejects with AuditStoreError.
-				if (typeof p?.then === "function") {
-					return p.then(
-						() => row,
-						(err) => {
-							throw new AuditStoreError(err);
-						},
-					);
-				}
-			}
-		}
 		return row;
+	}
+
+	/**
+	 * Clear `detail` on PII rows older than `before` and record each one with
+	 * an AUDIT_ROW_REDACTED row (spec §7). Never deletes. The record is
+	 * inserted straight into the store before its row is cleared, so a failed
+	 * insert clears nothing. Returns the ids redacted.
+	 */
+	async redactExpired({ before, codes = piiCodes(), reason = "retention" }) {
+		const store = this.#config.auditStore;
+		if (
+			typeof store?.listRedactionCandidates !== "function" ||
+			typeof store?.redactRows !== "function"
+		) {
+			throw new AuditStoreError(
+				new Error(
+					"redactExpired: the audit store does not implement listRedactionCandidates / redactRows (spec §7.1)",
+				),
+			);
+		}
+		if (codes.length === 0) return [];
+		_ensureRedactionCode();
+		const { candidates, skipped } = await store.listRedactionCandidates({
+			before,
+			codes,
+		});
+		if (skipped > 0) {
+			this._drainerSysLog("warn", "pii_redaction_skipped_legacy_form", {
+				rows: skipped,
+				reason:
+					"canonical_form_id != 2; detail is inside the hash, so redacting would break the chain. The personal data in these rows still exists.",
+			});
+		}
+		const redacted = [];
+		// One row at a time, record then clear, so a failure repeats at most
+		// one record on the next run.
+		for (const c of candidates) {
+			const record = this._buildRow({
+				code: REDACTION_CODE,
+				target: c.id,
+				detail: {
+					redacted_seq: c.monotonicSeq,
+					reason,
+					redacted_id: c.id,
+				},
+			});
+			try {
+				await store.insert(record);
+			} catch (err) {
+				throw new AuditStoreError(err);
+			}
+			redacted.push(...(await store.redactRows({ ids: [c.id] })));
+		}
+		return redacted;
 	}
 
 	queueStats() {
@@ -421,6 +569,7 @@ export class Engine {
 
 	resetForTests() {
 		this._uninstallDrainer();
+		this._stopRetention();
 		this.#config = {
 			serviceId: "",
 			nodeId: "",
@@ -433,6 +582,43 @@ export class Engine {
 	}
 
 	// ── Internal ────────────────────────────────────────────────────────────
+
+	// The in-flight pass lives on the engine, so a re-init can't start a second
+	// pass over the same rows and write their redaction records twice.
+	_startRetention(piiRetMs) {
+		const tick = async () => {
+			if (this._redactionPass) return;
+			let done;
+			this._redactionPass = new Promise((r) => {
+				done = r;
+			});
+			try {
+				await this.redactExpired({
+					before: new Date(Date.now() - piiRetMs),
+				});
+			} catch (err) {
+				// Type only: driver messages can carry row values.
+				this._drainerSysLog("error", "retention_purge_failed", {
+					stream: "audit/pii-redaction",
+					error_type: err?.cause?.name ?? err?.name ?? "Error",
+				});
+			} finally {
+				this._redactionPass = null;
+				done();
+			}
+		};
+		this._retentionTimer = setInterval(tick, RETENTION_CHECK_MS);
+		this._retentionTimer.unref();
+		this._retentionFirst = setImmediate(tick);
+		this._retentionFirst.unref();
+	}
+
+	_stopRetention() {
+		clearInterval(this._retentionTimer);
+		clearImmediate(this._retentionFirst);
+		this._retentionTimer = null;
+		this._retentionFirst = null;
+	}
 
 	_installDrainer(opts) {
 		const next = new AuditQueueDrainer(opts);
@@ -510,6 +696,9 @@ export function queueStats() {
 export async function flush(timeoutMs = 5000) {
 	return defaultEngine.flush(timeoutMs);
 }
+export async function redactExpired(opts) {
+	return defaultEngine.redactExpired(opts);
+}
 
 export const log = defaultEngine.log;
 
@@ -543,6 +732,9 @@ export default {
 	AuditStoreError,
 	queueStats,
 	flush,
+	redactExpired,
+	piiCodes,
+	parseDuration,
 	Domain,
 	Severity,
 	RetentionClass,

@@ -87,6 +87,14 @@ insert transaction, under the same per-node lock as the Python and Go
 stores; `hash` and `prev_hash` stay empty. `PostgresStore` writes into a
 table the Python or Go store created, and adds the columns it lacks.
 
+**PII retention.** `redactExpired({ before })` clears `detail` (to `null`)
+on rows of the PII codes older than `before`: codes with `piiInDetail` or
+`retentionClass: SHORT` (`piiCodes()`). Each redacted row gets an
+`AUDIT_ROW_REDACTED` row naming it, written before the row is cleared. Rows
+are never deleted. Set `retentionPii: '30d'` (or `FASTEN_RETENTION_PII`) in
+`init()` to run it on init and then hourly; the store must implement
+`listRedactionCandidates` and `redactRows`, as `PostgresStore` does.
+
 **Cross-language deviation.** Node is single-threaded — `emit()`
 cannot synchronously block on a counting semaphore the way Python /
 Go / Rust / C++ do. `queueCapacity` is the high-water-warn threshold
