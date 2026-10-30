@@ -268,3 +268,33 @@ func TestAuditDoctor_CountOnlyStoreStillReportsRows(t *testing.T) {
 		t.Errorf("scoped doctor must not report an unscoped count; got %v", store)
 	}
 }
+
+// Seq 30 is stamped 90 s before every other row. The newest 50 by timestamp
+// skip it, and that sample reads as a break on a clean chain.
+func TestAuditDoctor_SamplesBySeqAfterAClockStepBack(t *testing.T) {
+	resetGlobals(t)
+	registerTestCodes(t)
+	store, closeFn := newMemStore(t, "clock_step")
+	defer closeFn()
+	t0 := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	for i := 1; i <= 52; i++ {
+		ts := t0.Add(time.Duration(i) * time.Second)
+		if i == 30 {
+			ts = t0.Add(-90 * time.Second)
+		}
+		row := orderRow(int64(i), ts, "svc", "node")
+		row.MonotonicSeq = 0
+		if _, err := store.AllocateAndInsertOriginated(context.Background(), row); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	chain := body["chain"].(map[string]any)
+	if chain["verified"] != true || chain["breaks"] != float64(0) {
+		t.Errorf("clean chain must verify; got %v", chain)
+	}
+}

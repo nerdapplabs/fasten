@@ -476,3 +476,37 @@ func TestPostgres_DoctorCountsTheCallersRows(t *testing.T) {
 		t.Errorf("scoped doctor must count only tenant-a's rows; got %v", rows)
 	}
 }
+
+func TestPostgres_ChainTailKeepsTheNewestRowsInSeqOrder(t *testing.T) {
+	db := pgDB(t)
+	table := uniqueTable("fasten_tail")
+	store, err := NewPostgresStore(db, table)
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	t.Cleanup(func() { dropTable(t, db, table) })
+	ctx := context.Background()
+	for i := 1; i <= 5; i++ {
+		row := pgRow(fmt.Sprintf("tail-%d", i), "req")
+		row.MonotonicSeq = 0
+		if _, err := store.AllocateAndInsertOriginated(ctx, row); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	other := pgRow("tail-other", "req")
+	other.SourceNodeID = "node-2"
+	if _, err := store.AllocateAndInsertOriginated(ctx, other); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	rows, err := store.ChainTail(ctx, "node-1", 3)
+	if err != nil {
+		t.Fatalf("ChainTail: %v", err)
+	}
+	var seqs []int64
+	for _, r := range rows {
+		seqs = append(seqs, r.MonotonicSeq)
+	}
+	if fmt.Sprint(seqs) != "[3 4 5]" {
+		t.Errorf("want [3 4 5], got %v", seqs)
+	}
+}

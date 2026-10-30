@@ -1066,7 +1066,17 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		"last_verified_at": nil,
 	}
 	if store != nil {
-		recent, err := store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+		var recent []Row
+		var err error
+		if t, ok := store.(interface {
+			ChainTail(context.Context, string, int) ([]Row, error)
+		}); ok && e.nodeID != "" {
+			// By seq: a timestamp-ordered sample skips seqs after a clock
+			// step back and reads as a break.
+			recent, err = t.ChainTail(r.Context(), e.nodeID, 50)
+		} else {
+			recent, err = store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+		}
 		switch {
 		case err != nil:
 			// Store reachable but the query failed. Flag it so operators see

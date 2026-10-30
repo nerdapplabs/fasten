@@ -99,6 +99,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `first_break_at` or a `reason` naming another tenant's row.
 - The row count uses `CountFiltered`, so the Postgres store reports `rows` too.
   A custom store with only `Count` still reports `rows` to an unscoped caller.
+- The chain sample is the node's newest 50 rows by `monotonic_seq`, through the
+  new `ChainTail` on both built-in stores. The timestamp-ordered sample skipped
+  seqs after a clock step back and reported a break on a clean chain.
 - Reader 500s answer `internal error` and log a `reader_query_failed` sys line
   with the request id and the error type. The doctor's `last_error` and chain
   `reason` carry fixed text and log a `doctor_check_failed` sys line.
