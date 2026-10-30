@@ -1,7 +1,7 @@
 """
 `fasten doctor` — verify init config + store + correlation wiring.
 
-Read-only diagnostic. Runs each check, prints status + message, returns
+Read-only diagnostic: it opens stores without creating or altering anything. Runs each check, prints status + message, returns
 exit-code = number of failures. Six checks today:
 
   1. env vars (FASTEN_SERVICE_ID, FASTEN_NODE_ID required; tenant + dsn optional)
@@ -20,9 +20,13 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
+import sqlite3
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlsplit, urlunsplit
 
 
 @dataclass
@@ -31,6 +35,86 @@ class CheckResult:
     status: str       # "ok" | "warn" | "fail"
     message: str
     detail: dict[str, Any] | None = None
+
+
+# A libpq key=value DSN ("host=db password=...") has no scheme; init would
+# take it for a SQLite path, so doctor neither prints nor opens it.
+_KEYWORD_DSN = "unrecognised DSN (not shown; use a postgres:// URL)"
+_KEYWORD_RE = re.compile(r"^\s*\w+\s*=|\s\w+\s*=")
+_TABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?")
+
+
+def _describe(dsn: str, is_postgres: bool) -> str:
+    """Backend and, for SQLite, the file path. Never the DSN itself."""
+    if is_postgres:
+        return "postgres"
+    if "@" in dsn:
+        return "sqlite (path hidden: the DSN has credentials)"
+    if "://" not in dsn and _KEYWORD_RE.search(dsn):
+        return _KEYWORD_DSN
+    try:
+        path = urlsplit(dsn).path
+    except ValueError:
+        return "unparseable DSN"
+    return f"sqlite {path or '(no path)'}"
+
+
+def _error_text(e: Exception, dsn: str) -> str:
+    """``type: message``, unless the message may contain a DSN secret."""
+    try:
+        u = urlsplit(dsn)
+        secrets = [u.password or ""] + [
+            v for k, vs in parse_qs(u.query).items()
+            if k.lower() in ("password", "sslpassword") for v in vs]
+    except ValueError:
+        u, secrets = None, []
+    rest = dsn.partition("://")[2]
+    # With no password or a raw @ in it, drivers may split it differently.
+    unknown = u is None or (not u.password and "@" in rest) or rest.count("@") > 1
+    text = f"{type(e).__name__}: {e}"
+    forms = {f for s in secrets if s
+             for f in (s, unquote(s), quote_plus(s), repr(s)[1:-1])}
+    if unknown or any(f in text for f in forms):
+        return f"{type(e).__name__} (details hidden: they may include the DSN password)"
+    return text.replace(dsn, "<dsn>")
+
+
+def _probe(dsn: str, is_postgres: bool, sqlite_path: str, default_table: str) -> int:
+    """Rows a one-row sample of the table returns. Unlike the store
+    constructors, it creates no file and no table and alters nothing."""
+    u = urlsplit(dsn)
+    query = parse_qs(u.query)
+    table = query.pop("table", [default_table])[0]
+    if not _TABLE_RE.fullmatch(table):
+        raise ValueError("invalid table name")
+    if is_postgres:
+        import psycopg
+        conninfo = urlunsplit(u._replace(query=urlencode(query, doseq=True)))
+        with psycopg.connect(conninfo, connect_timeout=5) as conn:
+            return len(conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall())
+    if not sqlite_path or not os.path.isfile(sqlite_path):
+        raise FileNotFoundError("SQLite file not found")
+    lite = sqlite3.connect(Path(sqlite_path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return len(lite.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall())
+    finally:
+        lite.close()
+
+
+def _check_store(name: str, dsn: str, is_postgres: bool, sqlite_path: str,
+                 default_table: str) -> CheckResult:
+    backend = _describe(dsn, is_postgres)
+    if backend == _KEYWORD_DSN:
+        return CheckResult(name=name, status="fail", message=backend)
+    try:
+        rows = _probe(dsn, is_postgres, sqlite_path, default_table)
+    except Exception as e:  # noqa: BLE001 — diagnostic context, all failures relevant
+        return CheckResult(name=name, status="fail", message=f"{backend}: {_error_text(e, dsn)}")
+    return CheckResult(
+        name=name, status="ok",
+        message=f"{backend} (connected, sample query returned {rows} row[s])",
+        detail={"backend": backend, "sample_rows": rows},
+    )
 
 
 def _glyph(status: str) -> str:
@@ -62,24 +146,15 @@ def _check_audit_dsn() -> CheckResult:
         return CheckResult(
             name="audit_dsn",
             status="fail",
-            message="not set — fasten.init() will REFUSE TO START. Set FASTEN_AUDIT_DSN to durable storage.",
+            message="not set: audit rows go to stdout only. Set FASTEN_AUDIT_DSN for durable storage.",
         )
+    # Same scheme test and SQLite path as the engine's audit store.
     try:
-        from ..store.sqlite import SQLiteStore
-        store = SQLiteStore.from_dsn(dsn)
-        rows = store.query(limit=1)
-        return CheckResult(
-            name="audit_dsn",
-            status="ok",
-            message=f"{dsn} (connected, table accessible, sample query returned {len(rows)} row[s])",
-            detail={"dsn": dsn, "sample_rows": len(rows)},
-        )
-    except Exception as e:  # noqa: BLE001 — diagnostic context, all failures relevant
-        return CheckResult(
-            name="audit_dsn",
-            status="fail",
-            message=f"{dsn} → {type(e).__name__}: {e}",
-        )
+        path = urlsplit(dsn).path.lstrip("/")
+    except ValueError:
+        path = ""
+    return _check_store("audit_dsn", dsn, dsn.startswith(("postgres://", "postgresql://")),
+                        path, "audit_log")
 
 
 def _check_api_dsn() -> CheckResult:
@@ -90,18 +165,17 @@ def _check_api_dsn() -> CheckResult:
             status="ok",
             message="not configured — ring-buffer only (default; persist via FASTEN_API_DSN if needed)",
         )
+    # Same scheme test and SQLite path as the engine's stream store.
     try:
-        from ..store.sqlite import SQLiteStore
-        store = SQLiteStore.from_dsn(dsn)
-        rows = store.query(limit=1)
-        return CheckResult(
-            name="api_dsn",
-            status="ok",
-            message=f"{dsn} (connected, accessible, {len(rows)} sample row[s])",
-            detail={"dsn": dsn},
-        )
-    except Exception as e:  # noqa: BLE001
-        return CheckResult(name="api_dsn", status="fail", message=f"{dsn} → {type(e).__name__}: {e}")
+        u = urlsplit(dsn)
+    except ValueError:
+        return CheckResult(name="api_dsn", status="fail", message="unparseable DSN")
+    scheme = u.scheme.lower()
+    if scheme not in ("sqlite", "postgres", "postgresql", ""):
+        return CheckResult(name="api_dsn", status="fail",
+                           message=f"unsupported DSN scheme {scheme!r}")
+    path = u.path[1:] if scheme and u.path.startswith("/") else u.path
+    return _check_store("api_dsn", dsn, scheme in ("postgres", "postgresql"), path, "api_log")
 
 
 def _check_catalog() -> CheckResult:

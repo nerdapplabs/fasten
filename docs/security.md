@@ -116,7 +116,9 @@ Two trust boundaries exist at runtime:
 
 - The spdlog, glog, and Boost.Log C++ shims apply the same two-pass redaction to log message strings before pushing to the sys ring.
 - `fasten.shim.stdlib.LoggingHandler` applies redaction to the `extra` dict attached to a stdlib `LogRecord`. The `msg` string itself is not redacted — structured extras are (this mirrors the contract in Python logging where the message template is static but extras are structured data).
-- `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain; all structlog event_dict fields (including `event`) go through the key-pattern + value-shape pass.
+- `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain; all structlog event_dict fields (including `event`) go through the key-pattern + value-shape pass. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
+- JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
+- `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
 
 **Not mitigated:**
 

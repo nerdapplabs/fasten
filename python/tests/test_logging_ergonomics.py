@@ -178,6 +178,53 @@ def test_structlog_configure_end_to_end(initialized):
         logging.getLogger().setLevel(saved_level)
 
 
+def test_structlog_configure_extra_redact_keys(initialized):
+    """extra_redact_keys is applied on top of the engine's redaction rules."""
+    pytest.importorskip("structlog")
+    import structlog
+    from fasten.shim.structlog import configure
+
+    saved_handlers = list(logging.getLogger().handlers)
+    saved_level = logging.getLogger().level
+    try:
+        configure(json=True, quiet=(), extra_redact_keys=["ssn"])
+        structlog.get_logger().info("extra_keys_event", ssn="123-45-6789",
+                                    api_key="sk-secret", batch=7)
+
+        rows = fasten.transport().query_syslog(limit=20)
+        row = next(r for r in rows if r.get("event") == "extra_keys_event")
+        assert row["ssn"] == "***"
+        assert row["api_key"] == "***"
+        assert row["batch"] == 7
+    finally:
+        logging.getLogger().handlers = saved_handlers
+        logging.getLogger().setLevel(saved_level)
+
+
+def test_structlog_event_and_stdlib_extras_are_redacted(initialized, capsys):
+    """A secret in the event itself is redacted on stdout, and stdlib records
+    get the same extra_redact_keys as structlog."""
+    pytest.importorskip("structlog")
+    import structlog
+    from fasten.shim.structlog import configure
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl"
+    saved_handlers = list(logging.getLogger().handlers)
+    saved_level = logging.getLogger().level
+    try:
+        configure(json=True, quiet=(), extra_redact_keys=["ssn"])
+        structlog.get_logger().info(f"bearer {jwt}")
+        assert jwt not in capsys.readouterr().out
+
+        logging.getLogger("app").info("stdlib_evt", extra={"ssn": "123-45-6789"})
+        rows = fasten.transport().query_syslog(limit=20)
+        row = next(r for r in rows if r.get("event") == "stdlib_evt")
+        assert row["ssn"] == "***"
+    finally:
+        logging.getLogger().handlers = saved_handlers
+        logging.getLogger().setLevel(saved_level)
+
+
 # ── P1-10 — Meta.id optional + dict-form register ────────────────────────
 
 def test_register_dict_form_fills_id_from_key():

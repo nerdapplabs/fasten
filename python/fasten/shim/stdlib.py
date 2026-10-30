@@ -42,7 +42,13 @@ class LoggingHandler(logging.Handler):
     the addition.
 
     If ``fasten.init()`` has not been called, the handler is a no-op.
+    Records are redacted with ``redactor``, or ``fasten.redactor()`` when
+    none is given.
     """
+
+    def __init__(self, level: int = logging.NOTSET, redactor: Any = None) -> None:
+        super().__init__(level)
+        self._redactor = redactor
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: A003
         try:
@@ -99,7 +105,7 @@ class LoggingHandler(logging.Handler):
                 row[k] = v
 
             # Apply redaction to scrub secrets from any extras.
-            row = _redactor().redact(row)
+            row = (self._redactor or _redactor()).redact(row)
 
             transport.push_syslog(row)
         except Exception:

@@ -13,6 +13,10 @@ import {
     registry, _clearRustRegistry,
 } from '../src/index.js';
 
+// Outer redaction settings would change what these tests expect.
+delete process.env.FASTEN_REDACT_KEYS;
+delete process.env.FASTEN_REDACT_REPLACEMENT;
+
 function clear() {
     _clearRustRegistry();
     registry().clear();
@@ -158,5 +162,23 @@ describe('P1-5 emit: force-redact + passthrough', () => {
         assert.ok(!('_redacted' in row.detail));
         assert.ok(!('_pii_in_detail' in row.detail));
         assert.equal(row.pii_in_detail, false);
+    });
+});
+
+describe('emit with extra redact keys', () => {
+    beforeEach(clear);
+
+    test('passthrough keys match extra keys literally', () => {
+        init({ serviceId: 's', nodeId: 'n', extraRedactKeys: ['card('], redactReplacement: '[x]' });
+        register('pii_lit', {
+            PII_LIT: {
+                domain: 'pii_lit', category: 'p', action: 'view', severity: 'info',
+                description: 'x', emitter: 't', piiInDetail: true,
+                detailPassthroughKeys: ['card(no', 'region'],
+            },
+        });
+        const row = emit({ code: 'PII_LIT', target: 'u', detail: { 'card(no': '4111', region: 'MH' } });
+        assert.equal(row.detail['card(no'], '[x]');
+        assert.equal(row.detail.region, 'MH');
     });
 });

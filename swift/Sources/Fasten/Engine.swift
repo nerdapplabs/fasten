@@ -138,7 +138,9 @@ final class Engine: @unchecked Sendable {
         transport.log(level: level, event: event,
                       serviceID: serviceID.isEmpty ? nil : serviceID,
                       nodeID: nodeID.isEmpty ? nil : nodeID,
-                      requestID: requestID, fields: fields)
+                      requestID: requestID, fields: fields,
+                      // The whole line, as Go and Python do: a secret can be in the event.
+                      redact: redactor.redact)
     }
 
     func flush(timeout: TimeInterval) -> Bool {

@@ -32,6 +32,9 @@ def initialized(mem_store, monkeypatch):
     would silently fail on that path)."""
     monkeypatch.setenv("FASTEN_SERVICE_ID", "test-svc")
     monkeypatch.setenv("FASTEN_NODE_ID", "test-node")
+    for name in ("FASTEN_REDACT_KEYS", "FASTEN_REDACT_REPLACEMENT",
+                 "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"):
+        monkeypatch.delenv(name, raising=False)
     import fasten
     fasten.init(
         service_id="test-svc",

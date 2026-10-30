@@ -69,9 +69,11 @@ def _unredactable_marker(value: Any) -> Any:
     return marker["_summary"]
 
 
-# Structlog internals that are never redacted regardless of key name.
+# Structlog internals that are never redacted regardless of key name. Not
+# "event": it is the message, and a secret can be in it, so the processor
+# redacts it on its own.
 _STRUCTLOG_SKIP = frozenset({
-    "timestamp", "level", "logger", "event", "_record", "_from_structlog",
+    "timestamp", "level", "logger", "_record", "_from_structlog",
 })
 
 # Default key-pattern regex — same patterns as the Rust REDACT_PATTERNS.
@@ -174,16 +176,33 @@ class Redactor:
         except Exception:  # noqa: BLE001 — deep nesting, invalid utf, or core failure
             return _unredactable_marker(value)
 
+    def with_extra_keys(self, keys: Optional[list[str]]) -> "Redactor":
+        """Copy of this Redactor with ``keys`` added to the key patterns."""
+        if not keys:
+            return self
+        return Redactor(
+            extra_keys=[*self._extra_keys, *keys],
+            replacement=self._replacement,
+            extra_value_patterns=[("", pat, repl) for pat, repl in self._extra_vp],
+        )
+
     def as_structlog_processor(self) -> Callable[..., Any]:
         """Return a structlog processor that redacts sensitive keys from event_dict.
 
-        Structlog internal keys (timestamp, level, event, …) are always skipped.
-        All other keys are redacted via the Rust core.
+        Structlog internal keys (timestamp, level, logger, …) are always
+        skipped. The event gets the value-shape pass on its own, so an
+        oversize payload does not drop it. All other keys are redacted via
+        the Rust core.
         """
         def _processor(logger_: Any, method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
             # Separate structlog internals from user payload; redact payload; merge.
             internals = {k: v for k, v in event_dict.items() if k in _STRUCTLOG_SKIP}
-            payload   = {k: v for k, v in event_dict.items() if k not in _STRUCTLOG_SKIP}
+            payload   = {k: v for k, v in event_dict.items()
+                         if k not in _STRUCTLOG_SKIP and k != "event"}
+            if "event" in event_dict:
+                # A list has no keys, so only value shapes apply.
+                ev = self.redact([event_dict["event"]])
+                internals["event"] = ev[0] if isinstance(ev, list) else ev
             redacted  = self.redact(payload)
             return {**internals, **redacted}
         return _processor
