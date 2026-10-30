@@ -63,15 +63,15 @@ const TEST_META = {
     },
 };
 
-beforeEach(() => {
-    uninstallDrainer();
+beforeEach(async () => {
+    await uninstallDrainer();
     _clearRustRegistry();
     _reg().clear();
     register('user', TEST_META);
 });
 
-afterEach(() => {
-    uninstallDrainer();
+afterEach(async () => {
+    await uninstallDrainer();
 });
 
 function _initQueue(store, opts = {}) {
@@ -404,4 +404,29 @@ test('drainer degraded reports the backoff it is about to wait', async () => {
     assert.ok(degraded, 'audit_drain_degraded never fired');
     assert.ok(degraded.in_backoff_seconds > 0.15,
         `in_backoff_seconds was ${degraded.in_backoff_seconds}`);
+});
+
+test('stop gives up waiting after its timeout', async () => {
+    const store = { insert: () => new Promise(() => {}) };
+    _initQueue(store);
+    emit({ code: 'USER_CREATED', target: 'u-1' });
+    await new Promise(r => setTimeout(r, 20));
+    const t0 = Date.now();
+    assert.equal(await uninstallDrainer(100), false);
+    assert.ok(Date.now() - t0 < 1000);
+});
+
+test('flush counts a dead-lettered row as done', async () => {
+    _initQueue(new BrokenStore(), {
+        queueRetryInitialMs: 1,
+        queueRetryMaxMs: 5,
+        queueRetryJitter: false,
+        queueDrainMaxAttempts: 3,
+    });
+    emit({ code: 'USER_CREATED', target: 'u-1' });
+    const t0 = Date.now();
+    assert.equal(await flush(2000), true);
+    assert.ok(Date.now() - t0 < 1000);
+    assert.equal(queueStats().dead_lettered_total, 1);
+    assert.equal(queueStats().in_backoff_seconds, 0);
 });

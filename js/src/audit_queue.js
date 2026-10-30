@@ -129,21 +129,30 @@ class AuditQueueDrainer {
 		// Snapshot semantics (spec §6): capture the target drain count at call
 		// time so a steady incoming rate cannot keep flush() blocked indefinitely.
 		// target = rows already drained + rows currently in the pipeline.
-		const target = this._drainedTotal + this._q.length + this._inFlight;
-		if (this._drainedTotal >= target) return true;
+		// A dead-lettered row is done too.
+		const done = () => this._drainedTotal + this._deadLetteredTotal;
+		const target = done() + this._q.length + this._inFlight;
+		if (done() >= target) return true;
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			if (this._drainedTotal >= target) return true;
+			if (done() >= target) return true;
 			await new Promise((r) => setTimeout(r, 10));
 		}
-		return this._drainedTotal >= target;
+		return done() >= target;
 	}
 
 	// Spec §10: rows still queued get one attempt each, and a row that fails
-	// it is dead-lettered. The returned promise resolves once that is done.
-	stop() {
+	// it is dead-lettered. Resolves true once that is done, or false after
+	// timeoutMs, while the rest carries on in the background.
+	stop(timeoutMs = 5000) {
 		this._stopped = true;
-		return this._done;
+		let timer;
+		const timeout = new Promise((r) => {
+			timer = setTimeout(() => r(false), timeoutMs);
+		});
+		return Promise.race([this._done.then(() => true), timeout]).finally(() =>
+			clearTimeout(timer),
+		);
 	}
 
 	async _tick() {
@@ -186,6 +195,7 @@ class AuditQueueDrainer {
 		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
 		this._deadLetteredTotal++;
 		this._retryCount = 0;
+		this._inBackoffUntilMs = 0;
 		this._lastError = msg;
 		if (this._dlq.length >= 10) this._dlq.shift();
 		this._dlq.push(row);
@@ -278,8 +288,8 @@ export function installDrainer(opts) {
 	return _defaultEngine?._drainer ?? null;
 }
 
-export function uninstallDrainer() {
-	return _defaultEngine?._uninstallDrainer() ?? Promise.resolve();
+export function uninstallDrainer(timeoutMs) {
+	return _defaultEngine?._uninstallDrainer(timeoutMs) ?? Promise.resolve(true);
 }
 
 export function activeDrainer() {

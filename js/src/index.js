@@ -435,10 +435,10 @@ export class Engine {
 		}
 	}
 
-	_uninstallDrainer() {
+	_uninstallDrainer(timeoutMs) {
 		const old = this._drainer;
 		this._drainer = null;
-		return old ? old.stop() : Promise.resolve();
+		return old ? old.stop(timeoutMs) : Promise.resolve(true);
 	}
 
 	_drainerSysLog(level, event, fields) {
