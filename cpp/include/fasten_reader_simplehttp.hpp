@@ -23,6 +23,13 @@
  *       });
  *   t.detach();
  *
+ * Usage — tenant isolation on a shared multi-tenant store: return the caller's
+ * tenant from your auth ("" answers 401); rows are limited to that tenant:
+ *   fasten::reader::simplehttp::mount(server, "/api/v1/logs", auth_fn,
+ *       [](const SimpleWeb::CaseInsensitiveMultimap& h) {
+ *           return tenant_for_api_key(h);
+ *       });
+ *
  * Usage — mount onto an existing server (e.g. alongside app routes):
  *   HttpServer server;
  *   server.config.port = 9000;
@@ -43,6 +50,7 @@ namespace simplehttp {
 
 using HttpServer = SimpleWeb::Server<SimpleWeb::HTTP>;
 using AuthFn     = std::function<bool(const SimpleWeb::CaseInsensitiveMultimap&)>;
+using TenantFn   = std::function<std::string(const SimpleWeb::CaseInsensitiveMultimap&)>;
 
 namespace detail_ {
 
@@ -72,56 +80,49 @@ inline void unauthorized(std::shared_ptr<HttpServer::Response> response) {
 } // namespace detail_
 
 // Mount /sys, /api, /audit under `prefix` on an existing server.
+// With `tenant`, each request is scoped to the tenant it returns.
 // Call this before server.start().
 inline void mount(HttpServer& server,
                   const std::string& prefix = "/api/v1/logs",
-                  AuthFn auth = {})
+                  AuthFn auth = {},
+                  TenantFn tenant = {})
 {
     // Build regex route string — prefix is treated as a literal path.
     auto route = [&prefix](const std::string& s) {
         return "^" + prefix + s + "$";
     };
+    using Unscoped = fasten::reader::Response (*)(const fasten::reader::Params&);
+    using Scoped   = fasten::reader::Response (*)(const fasten::reader::Params&,
+                                                  const std::string&);
+    auto handler = [auth, tenant](Unscoped unscoped, Scoped scoped) {
+        return [auth, tenant, unscoped, scoped](auto resp, auto req) {
+            if (!detail_::check_auth(req->header, auth)) {
+                return detail_::unauthorized(resp);
+            }
+            auto params = detail_::to_params(req->parse_query_string());
+            detail_::send(resp, tenant ? scoped(params, tenant(req->header))
+                                       : unscoped(params));
+        };
+    };
 
     server.resource[route("/sys")]["GET"] =
-        [auth](auto resp, auto req) {
-            if (!detail_::check_auth(req->header, auth)) {
-                return detail_::unauthorized(resp);
-            }
-            detail_::send(resp,
-                fasten::reader::handle_sys(
-                    detail_::to_params(req->parse_query_string())));
-        };
-
+        handler(&fasten::reader::handle_sys, &fasten::reader::handle_sys);
     server.resource[route("/api")]["GET"] =
-        [auth](auto resp, auto req) {
-            if (!detail_::check_auth(req->header, auth)) {
-                return detail_::unauthorized(resp);
-            }
-            detail_::send(resp,
-                fasten::reader::handle_api(
-                    detail_::to_params(req->parse_query_string())));
-        };
-
+        handler(&fasten::reader::handle_api, &fasten::reader::handle_api);
     server.resource[route("/audit")]["GET"] =
-        [auth](auto resp, auto req) {
-            if (!detail_::check_auth(req->header, auth)) {
-                return detail_::unauthorized(resp);
-            }
-            detail_::send(resp,
-                fasten::reader::handle_audit(
-                    detail_::to_params(req->parse_query_string())));
-        };
+        handler(&fasten::reader::handle_audit, &fasten::reader::handle_audit);
 }
 
 // Start a dedicated HTTP server on `port` in a new thread.
 // Returns the thread — call detach() for fire-and-forget, join() to block.
 inline std::thread start(unsigned short     port   = 9000,
                           const std::string& prefix = "/api/v1/logs",
-                          AuthFn             auth   = {})
+                          AuthFn             auth   = {},
+                          TenantFn           tenant = {})
 {
     auto srv = std::make_shared<HttpServer>();
     srv->config.port = port;
-    mount(*srv, prefix, std::move(auth));
+    mount(*srv, prefix, std::move(auth), std::move(tenant));
     return std::thread([srv]() { srv->start(); });
 }
 

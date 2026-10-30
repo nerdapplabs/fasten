@@ -23,7 +23,6 @@ namespace {
 void reset() {
     auto& g = fasten::detail_::globals();
     g.registry.clear();
-    g.seq        = 0;
     g.service_id = "";
     g.node_id    = "";
     g.syslog_ring.clear();

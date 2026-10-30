@@ -16,7 +16,6 @@ int main() {
     fasten_registry_clear();
     auto& g = fasten::detail_::globals();
     g.registry.clear();
-    g.seq = 0;
     g.service_id = "";
     g.node_id = "";
 

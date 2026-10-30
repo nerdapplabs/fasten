@@ -266,11 +266,12 @@ inline std::string fields_to_json(const Fields& f) {
     return out;
 }
 
-// UTC ISO-8601 with milliseconds — thread-safe (gmtime_r / gmtime_s).
+// Canonical UTC timestamp (spec §4.3): six fractional digits and Z, e.g.
+// 2026-08-21T10:00:00.500000Z. Thread-safe (gmtime_r / gmtime_s).
 inline std::string now_iso8601() {
     using namespace std::chrono;
     auto now = system_clock::now();
-    auto ms  = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    auto us  = duration_cast<microseconds>(now.time_since_epoch()) % 1000000;
     auto t   = system_clock::to_time_t(now);
     struct tm tmb {};
 #ifdef _WIN32
@@ -278,12 +279,12 @@ inline std::string now_iso8601() {
 #else
     gmtime_r(&t, &tmb);
 #endif
-    char buf[32];
+    char buf[64];
     std::snprintf(buf, sizeof(buf),
-        "%04d-%02d-%02dT%02d:%02d:%02d.%03lldZ",
+        "%04d-%02d-%02dT%02d:%02d:%02d.%06lldZ",
         tmb.tm_year + 1900, tmb.tm_mon + 1, tmb.tm_mday,
         tmb.tm_hour, tmb.tm_min, tmb.tm_sec,
-        static_cast<long long>(ms.count()));
+        static_cast<long long>(us.count()));
     return buf;
 }
 
@@ -312,6 +313,59 @@ struct RedactConfig {
 
 // ── Flat-JSON helpers (used by redact / register_codes) ────────────────────
 
+// Appends the character a JSON escape stands for. pos is on the character
+// after the backslash and is left on the escape's last character. A "u"
+// escape with four hex digits, or a surrogate pair of them, is written as UTF-8.
+inline void json_unescape_(const std::string& j, size_t& pos, std::string& out) {
+    auto hex4 = [&j](size_t at, unsigned& cp) {
+        if (at + 4 > j.size()) return false;
+        cp = 0;
+        for (size_t k = at; k < at + 4; ++k) {
+            char c = j[k];
+            cp <<= 4;
+            if      (c >= '0' && c <= '9') cp |= static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f') cp |= static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') cp |= static_cast<unsigned>(c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+    switch (j[pos]) {
+        case 'n': out += '\n'; return;
+        case 'r': out += '\r'; return;
+        case 't': out += '\t'; return;
+        case 'b': out += '\b'; return;
+        case 'f': out += '\f'; return;
+        case 'u': break;
+        default:  out += j[pos]; return;  // " \\ / and anything else
+    }
+    unsigned cp = 0;
+    if (!hex4(pos + 1, cp)) { out += 'u'; return; }
+    pos += 4;
+    unsigned lo = 0;
+    if (cp >= 0xD800 && cp < 0xDC00 && pos + 6 < j.size() &&
+        j[pos + 1] == '\\' && j[pos + 2] == 'u' && hex4(pos + 3, lo) &&
+        lo >= 0xDC00 && lo < 0xE000) {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        pos += 6;
+    }
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
 // Parse a flat JSON object with string or boolean values back to Fields.
 // Used to round-trip fasten_redact output: {"key":"val","_pii_in_detail":true}
 inline Fields parse_flat_json_fields(const std::string& json) {
@@ -332,14 +386,7 @@ inline Fields parse_flat_json_fields(const std::string& json) {
         while (i < json.size() && json[i] != '"') {
             if (json[i] == '\\' && i + 1 < json.size()) {
                 ++i;
-                switch (json[i]) {
-                    case '"':  key += '"';  break;
-                    case '\\': key += '\\'; break;
-                    case 'n':  key += '\n'; break;
-                    case 'r':  key += '\r'; break;
-                    case 't':  key += '\t'; break;
-                    default:   key += json[i]; break;
-                }
+                json_unescape_(json, i, key);
             } else { key += json[i]; }
             ++i;
         }
@@ -351,14 +398,7 @@ inline Fields parse_flat_json_fields(const std::string& json) {
             while (i < json.size() && json[i] != '"') {
                 if (json[i] == '\\' && i + 1 < json.size()) {
                     ++i;
-                    switch (json[i]) {
-                        case '"':  val += '"';  break;
-                        case '\\': val += '\\'; break;
-                        case 'n':  val += '\n'; break;
-                        case 'r':  val += '\r'; break;
-                        case 't':  val += '\t'; break;
-                        default:   val += json[i]; break;
-                    }
+                    json_unescape_(json, i, val);
                 } else { val += json[i]; }
                 ++i;
             }
@@ -574,14 +614,7 @@ inline std::string json_decode_str_(const std::string& j, size_t pos) {
     while (pos < j.size() && j[pos] != '"') {
         if (j[pos] == '\\' && pos + 1 < j.size()) {
             ++pos;
-            switch (j[pos]) {
-                case '"':  val += '"';  break;
-                case '\\': val += '\\'; break;
-                case 'n':  val += '\n'; break;
-                case 'r':  val += '\r'; break;
-                case 't':  val += '\t'; break;
-                default:   val += j[pos]; break;
-            }
+            json_unescape_(j, pos, val);
         } else { val += j[pos]; }
         ++pos;
     }
@@ -728,10 +761,22 @@ struct SinkRef {
     std::function<void(const Row&)> sink;
 };
 
+inline void drainer_sys_log(const std::string& level,
+                            const std::string& event,
+                            const std::vector<std::pair<std::string, std::string>>& fields);
+
 // ── CFastenDrainer: wraps the shared fasten-core C ABI drainer ────────────
 //
 // Same public surface as the retired AuditQueueDrainer so all call sites
 // outside this class require no changes.
+//
+// Every call that uses store_ is counted in busy_ (see Use). shutdown() first
+// closes the core drainer, which wakes a put() blocked on a full queue and
+// drains with one attempt per row, then waits for busy_ to reach 0 before it
+// frees store_. A put() that starts after stopped_ is set, including one made
+// by the sink while the drain finishes, never touches store_. Closing while a
+// call is still inside the core needs a core where calls in progress keep
+// their drainer (fasten-core #161).
 
 class CFastenDrainer {
   public:
@@ -776,20 +821,32 @@ class CFastenDrainer {
     CFastenDrainer(const CFastenDrainer&)            = delete;
     CFastenDrainer& operator=(const CFastenDrainer&) = delete;
 
+    // A row that can't be queued is reported, not dropped (spec §4).
     void put(const Row& row) {
-        if (stopped_.load()) return;
+        Use use(*this);
+        if (!use.ok) {
+            drainer_sys_log("error", "audit_drain_abandoned",
+                {{"reason", "drainer_stopped"}, {"row_id", row.id}});
+            return;
+        }
         std::string json = row.to_json();
         char* err = nullptr;
-        fasten_drainer_enqueue(store_, json.c_str(), &err);
+        int32_t rc = fasten_drainer_enqueue(store_, json.c_str(), &err);
+        if (rc != 0) {
+            drainer_sys_log("error", "audit_drain_abandoned",
+                {{"reason", err ? err : "enqueue failed"}, {"row_id", row.id}});
+        }
         if (err) fasten_store_free_str(err);
     }
 
     QueueStats stats() const {
+        Use use(*this);
+        QueueStats s;
+        if (!use.ok) return s;
         char* out_json = nullptr;
         char* err      = nullptr;
         fasten_drainer_stats_json(store_, &out_json, &err);
         if (err) fasten_store_free_str(err);
-        QueueStats s;
         if (out_json) {
             std::string j(out_json);
             fasten_store_free_str(out_json);
@@ -808,6 +865,8 @@ class CFastenDrainer {
     }
 
     bool flush(std::chrono::milliseconds timeout) {
+        Use use(*this);
+        if (!use.ok) return true;
         int drained = 0;
         fasten_drainer_flush(store_,
             static_cast<uint64_t>(timeout.count()), &drained, nullptr);
@@ -817,6 +876,10 @@ class CFastenDrainer {
     void shutdown(std::chrono::milliseconds /*timeout*/) {
         if (stopped_.exchange(true)) return;
         fasten_drainer_close(store_);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            idle_.wait(lk, [this] { return busy_.load() == 0; });
+        }
         delete sink_ref_; sink_ref_ = nullptr;
         fasten_store_close(store_); store_ = nullptr;
     }
@@ -834,6 +897,25 @@ class CFastenDrainer {
     struct FastenStore*  store_    = nullptr;
     SinkRef*             sink_ref_ = nullptr;
     std::atomic<bool>    stopped_{false};
+
+    // Counts a call in busy_ for its lifetime; ok is false once stopped_ is
+    // set. Incrementing before reading stopped_ (both seq_cst) means
+    // shutdown() either sees this call in busy_ or this call sees stopped_.
+    struct Use {
+        const CFastenDrainer& d;
+        bool ok;
+        explicit Use(const CFastenDrainer& owner) : d(owner) {
+            ++d.busy_;
+            ok = !d.stopped_.load();
+        }
+        ~Use() {
+            std::lock_guard<std::mutex> lk(d.mu_);
+            if (--d.busy_ == 0) d.idle_.notify_all();
+        }
+    };
+    mutable std::atomic<int>        busy_{0};
+    mutable std::mutex              mu_;
+    mutable std::condition_variable idle_;
 };
 
 // All mutable global state lives in one Meyers-singleton struct.
@@ -847,11 +929,13 @@ struct Globals {
     std::string node_id;
     std::string tenant_id;
 
-    int64_t    seq{0};
-    std::mutex seq_mu;
-
     RingBuffer syslog_ring;
     RingBuffer api_ring;
+
+    // Sys rows with no request in scope carry this until the first real
+    // request_id is seen (spec persistent-streams §7). Set by init().
+    std::string       boot_request_id;
+    std::atomic<bool> boot_over{false};
 
     // Adopter-supplied audit sink — called for every emitted Row.
     std::function<void(const Row&)> audit_sink;
@@ -874,22 +958,24 @@ struct Globals {
     /// Mirrors `reset_for_tests()` / `ResetForTests()` / `resetForTests()` in
     /// Python / Go / JS / Rust.
     void reset_for_tests() {
+        // Shut down outside drainer_mu, as uninstall_drainer() does: a sink
+        // that emits during the final drain needs it.
+        std::shared_ptr<CFastenDrainer> old;
         {
             std::lock_guard<std::mutex> lk(drainer_mu);
-            if (drainer) {
-                drainer->shutdown(std::chrono::seconds(2));
-                drainer.reset();
-            }
+            old.swap(drainer);
         }
+        if (old) old->shutdown(std::chrono::seconds(2));
         service_id.clear();
         node_id.clear();
         tenant_id.clear();
-        { std::lock_guard<std::mutex> lk(seq_mu); seq = 0; }
         failure_strategy = "queue";
         { std::lock_guard<std::mutex> lk(sink_mu); audit_sink = nullptr; }
         redact_cfg = RedactConfig{};
         syslog_ring.clear();
         api_ring.clear();
+        boot_request_id.clear();
+        boot_over = false;
     }
 };
 
@@ -902,6 +988,42 @@ inline Globals& globals() {
 inline std::string& tl_request_id() {
     thread_local std::string rid;
     return rid;
+}
+
+// Sentinel request_ids (spec persistent-streams §7), recognised by prefix.
+inline bool is_sentinel(const std::string& rid) {
+    for (const char* p : {"boot-", "sched-", "bg-", "lib-", "orphan-"}) {
+        if (rid.compare(0, std::char_traits<char>::length(p), p) == 0) return true;
+    }
+    return false;
+}
+
+inline std::string mint_sentinel(const std::string& kind) {
+    const auto& svc = globals().service_id;
+    return kind + "-" + (svc.empty() ? "svc" : svc) + "-" + mint_id_bytes(6);
+}
+
+// The request_id for a sys row: the one in scope, else the boot sentinel until
+// a real id has been seen, else a fresh orphan sentinel. Never empty.
+inline std::string sys_request_id() {
+    auto& g = globals();
+    const std::string& rid = tl_request_id();
+    if (!rid.empty()) {
+        if (!is_sentinel(rid)) g.boot_over = true;
+        return rid;
+    }
+    if (!g.boot_over && !g.boot_request_id.empty()) return g.boot_request_id;
+    return mint_sentinel("orphan");
+}
+
+// Adds a sys row to the ring with its request_id and the engine's tenant_id,
+// so a tenant-scoped reader can return it.
+inline void push_sys_row(Fields row) {
+    auto& g = globals();
+    auto rid = row.find("request_id");
+    if (rid == row.end() || rid->second.empty()) row["request_id"] = sys_request_id();
+    if (!g.tenant_id.empty() && !row.count("tenant_id")) row["tenant_id"] = g.tenant_id;
+    g.syslog_ring.push(std::move(row));
 }
 
 // ── Redaction via libfasten_core ────────────────────────────────────
@@ -1155,6 +1277,7 @@ struct Config {
     int                      queue_retry_initial_ms = 100;
     int                      queue_retry_max_ms     = 60000;
     bool                     disable_queue_jitter   = false; // false = jitter ON
+    std::size_t              queue_drain_max_attempts = 50;  // then dead-letter
 };
 
 // Forward declaration — defined below set_audit_sink so it can read
@@ -1171,6 +1294,8 @@ inline void init(Config cfg = {}) {
     if (g.service_id.empty() || g.node_id.empty()) {
         throw InitError("init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required");
     }
+    g.boot_request_id = detail_::mint_sentinel("boot");
+    g.boot_over       = false;
 
     if (!cfg.extra_redact_keys.empty()) {
         g.redact_cfg.extra_keys = cfg.extra_redact_keys;
@@ -1239,11 +1364,13 @@ inline void drainer_sys_log(const std::string& level,
     // if self-reports share the wire stream (stdout backpressure deadlock).
     auto& g = globals();
     Fields ring_row;
+    const std::string rid = sys_request_id();
     std::string js = "{\"shape\":\"sys\"";
     js += ",\"level\":"      + json_str(level);
     js += ",\"event\":"      + json_str(event);
-    js += ",\"request_id\":" + json_str(tl_request_id());
+    js += ",\"request_id\":" + json_str(rid);
     js += ",\"service_id\":" + json_str(g.service_id);
+    if (!g.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(g.tenant_id);
     js += ",\"timestamp\":"  + json_str(now_iso8601());
     for (const auto& kv : fields) {
         js += ',' + json_str(kv.first) + ':' + json_str(kv.second);
@@ -1252,8 +1379,8 @@ inline void drainer_sys_log(const std::string& level,
     js += "}\n";
     ring_row["level"]      = level;
     ring_row["event"]      = event;
-    ring_row["request_id"] = tl_request_id();
-    g.syslog_ring.push(std::move(ring_row));
+    ring_row["request_id"] = rid;
+    push_sys_row(std::move(ring_row));
     std::cerr << js << std::flush;
 }
 
@@ -1283,7 +1410,8 @@ inline void install_drainer_(const Config& cfg) {
                 cfg.queue_capacity,
                 std::chrono::milliseconds(cfg.queue_retry_initial_ms),
                 std::chrono::milliseconds(cfg.queue_retry_max_ms),
-                !cfg.disable_queue_jitter);
+                !cfg.disable_queue_jitter,
+                cfg.queue_drain_max_attempts);
         }
     }
     std::shared_ptr<detail_::CFastenDrainer> old;
@@ -1433,19 +1561,15 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
     (void)dummy;
 
-    int64_t seq;
-    {
-        std::lock_guard<std::mutex> lk(g.seq_mu);
-        seq = ++g.seq;
-    }
-
     std::string rid = detail_::tl_request_id();
     if (rid.empty()) rid = mint_id();
+    else if (!detail_::is_sentinel(rid)) g.boot_over = true;
 
     Row row;
     row.id             = "evt-" + detail_::mint_id_bytes(10);
     row.origin_id      = row.id;
-    row.monotonic_seq  = seq;
+    // Spec §2.1 / §8: the store allocates seq; emit() never makes one up.
+    row.monotonic_seq  = 0;
     row.timestamp      = detail_::now_iso8601();
     row.code           = code;
     row.action         = meta.action;
@@ -1585,11 +1709,13 @@ inline void _write(const std::string& level, const std::string& event,
     auto clean = detail_::redact(fields);
 
     // Build NDJSON line.
+    const std::string rid = detail_::sys_request_id();
     std::string js = "{\"shape\":\"sys\"";
     js += ",\"level\":"      + detail_::json_str(level);
     js += ",\"event\":"      + detail_::json_str(event);
-    js += ",\"request_id\":" + detail_::json_str(detail_::tl_request_id());
+    js += ",\"request_id\":" + detail_::json_str(rid);
     js += ",\"service_id\":" + detail_::json_str(g.service_id);
+    if (!g.tenant_id.empty()) js += ",\"tenant_id\":" + detail_::json_str(g.tenant_id);
     js += ",\"timestamp\":"  + detail_::json_str(detail_::now_iso8601());
     for (auto& kv : clean) {
         js += ',' + detail_::json_str(kv.first) + ':' + detail_::json_str(kv.second);
@@ -1600,8 +1726,8 @@ inline void _write(const std::string& level, const std::string& event,
     auto row = clean;
     row["level"]      = level;
     row["event"]      = event;
-    row["request_id"] = detail_::tl_request_id();
-    g.syslog_ring.push(std::move(row));
+    row["request_id"] = rid;
+    detail_::push_sys_row(std::move(row));
 
     std::cout << js << std::flush;
 }
@@ -1617,7 +1743,7 @@ inline void error(const std::string& event, const Fields& f = {}) { _write("erro
 
 namespace scheduler {
 
-// Begin a scheduled-job scope — mints a "scheduler-<hex>" request id.
+// Begin a scheduled-job scope — mints a "sched-<hex>" request id (spec §7).
 // Returns a RequestScope; all emit/log calls in scope inherit the id.
 //
 //   auto scope = fasten::scheduler::job_run();
@@ -1625,7 +1751,7 @@ namespace scheduler {
 //   // scope destructs → previous request_id restored
 inline RequestScope job_run(const std::string& run_id = "") {
     std::string rid = run_id.empty()
-        ? "scheduler-" + detail_::mint_id_bytes(4)
+        ? "sched-" + detail_::mint_id_bytes(6)
         : run_id;
     return RequestScope(std::move(rid));
 }

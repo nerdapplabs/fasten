@@ -102,6 +102,39 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `detail` is bounded by the same scan, so a value containing `}` no longer
   cuts it short (#138, point 1).
 
+### Fixed — C++ drainer shutdown race, seq, request ids, reader scope (#138)
+
+- `put()` could pass the stopped check and then use a store handle that a
+  concurrent re-`init()` had just freed. put, stats and flush are now counted
+  while they use the handle. `shutdown()` closes the core drainer first, which
+  wakes a `put()` blocked on a full queue and drains the rest, then waits for
+  those calls before freeing the handle. A row put on a stopped drainer
+  (including one the sink puts during the drain), or refused by the core, is
+  reported as `audit_drain_abandoned`; it used to vanish.
+- `emit()` returns `monotonic_seq` 0 instead of a process counter that
+  started at 1 on every run (spec §2.1, §8). `SqliteStore` and
+  `PostgresStore` allocate the node's next seq in the insert's transaction
+  (Postgres under the same advisory lock as the other SDKs). `SqliteStore`
+  waits up to 5 s for a lock held elsewhere, and rolls back when a statement
+  or COMMIT fails, so the next insert can run.
+- Timestamps use the canonical form with six fractional digits (§4.3).
+- Sys rows always carry a `request_id`: the one in scope, else a
+  `boot-<service>-<id>` sentinel until the first real id, else a fresh
+  `orphan-<service>-<id>` one (persistent-streams §7). They also carry the
+  engine's `tenant_id`. `scheduler::job_run()` mints `sched-<id>`, not
+  `scheduler-<id>`.
+- The JSON decoder writes `\uXXXX` escapes (and surrogate pairs) as UTF-8,
+  and decodes `\b`, `\f` and `\/`; it used to keep the `u` and drop the
+  backslash.
+- The reader can be scoped to a tenant: `handle_sys/api/audit(params,
+  tenant)`, `set_scoped_audit_query()`, `enforce_tenant_isolation()`, and a
+  tenant resolver on the Simple-Web-Server adapter. An `/audit` 500 answers
+  `internal error` and logs the error type; it returned the store's message.
+- New `Config::queue_drain_max_attempts` (spec §2, default 50).
+- Tests cover drainer vectors V-1 to V-12. `sqlite_store_smoke` is built
+  again: CMake looked for `SQLite3::SQLite3`, but FindSQLite3 names the
+  target `SQLite::SQLite3`, so it was always skipped.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

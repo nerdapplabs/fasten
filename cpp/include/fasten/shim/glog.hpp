@@ -66,9 +66,7 @@ public:
         row["event"]      = fasten::detail_::redact(fasten::Fields{{"event", event}})["event"];
         row["level"]      = level_str;
         row["logger"]     = logger_name;
-        row["request_id"] = fasten::detail_::tl_request_id();
-
-        fasten::detail_::globals().syslog_ring.push(row);
+        fasten::detail_::push_sys_row(row);
 
         detail_::sink_active = false;
     }

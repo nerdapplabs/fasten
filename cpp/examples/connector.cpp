@@ -87,7 +87,7 @@ int main() {
     // ── Scheduled job with scheduler shim ──────────────────────────────────
 
     {
-        // Mints "scheduler-<hex>" id automatically.
+        // Mints a "sched-<hex>" id automatically.
         auto scope = fasten::scheduler::job_run();
         fasten::log::info("health_check_job",
             {{"status", "ok"}, {"latency_ms", "3"}});

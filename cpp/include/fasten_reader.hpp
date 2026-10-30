@@ -18,9 +18,23 @@
  *   fasten::reader::set_audit_query([](auto rid, auto code, auto dom, int lim) {
  *       return my_sqlite.query(rid, code, dom, lim);
  *   });
+ *
+ * Tenant isolation (shared-store multi-tenant deployments): resolve the
+ * caller's tenant from your own auth and call the handlers that take it.
+ * Rows are limited to that tenant and ?tenant_id= is ignored; an empty tenant
+ * answers 401. enforce_tenant_isolation() makes the handlers without a tenant
+ * answer 401 too, so a route that forgets to pass one fails closed.
+ *   auto r = fasten::reader::handle_audit(p, tenant_from_my_auth(req));
+ * set_scoped_audit_query() passes the tenant to your store query; with only
+ * set_audit_query(), rows from other tenants are dropped after the query.
  */
 
 #include "fasten.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <typeinfo>
 
 namespace fasten {
 namespace reader {
@@ -42,9 +56,22 @@ using AuditQueryFn = std::function<
         const std::string& domain,
         int                limit)>;
 
+// Same as AuditQueryFn, with the caller's tenant ("" when not scoped).
+using ScopedAuditQueryFn = std::function<
+    std::vector<fasten::Row>(
+        const std::string& request_id,
+        const std::string& code,
+        const std::string& domain,
+        const std::string& tenant_id,
+        int                limit)>;
+
 // Register the audit query function once at startup.
 // Without it, /audit returns empty rows + an informational warning field.
 inline void set_audit_query(AuditQueryFn fn);
+inline void set_scoped_audit_query(ScopedAuditQueryFn fn);
+
+// Make the handlers without a tenant answer 401.
+inline void enforce_tenant_isolation(bool on = true);
 
 // ── Handler functions ─────────────────────────────────────────────────────
 //
@@ -59,6 +86,11 @@ inline Response handle_sys  (const Params& p);
 inline Response handle_api  (const Params& p);
 inline Response handle_audit(const Params& p);
 
+// Scoped to `tenant`; an empty tenant answers 401.
+inline Response handle_sys  (const Params& p, const std::string& tenant);
+inline Response handle_api  (const Params& p, const std::string& tenant);
+inline Response handle_audit(const Params& p, const std::string& tenant);
+
 // ── Implementation ────────────────────────────────────────────────────────
 
 namespace detail_ {
@@ -66,6 +98,31 @@ namespace detail_ {
 inline AuditQueryFn& audit_query_fn() {
     static AuditQueryFn fn;
     return fn;
+}
+
+inline ScopedAuditQueryFn& scoped_audit_query_fn() {
+    static ScopedAuditQueryFn fn;
+    return fn;
+}
+
+inline std::atomic<bool>& isolation_enforced() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+
+inline Response unscoped() {
+    return {401, "{\"error\":\"unauthenticated: tenant scope unresolved\"}"};
+}
+
+// Stream rows carry tenant_id as a field; a row without it is dropped
+// (fail closed).
+inline std::vector<fasten::Fields> scope_rows(std::vector<fasten::Fields> rows,
+                                              const std::string& tenant) {
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const fasten::Fields& r) {
+        auto it = r.find("tenant_id");
+        return it == r.end() || it->second != tenant;
+    }), rows.end());
+    return rows;
 }
 
 inline std::string param(const Params& p, const std::string& key,
@@ -114,29 +171,47 @@ inline void set_audit_query(AuditQueryFn fn) {
     detail_::audit_query_fn() = std::move(fn);
 }
 
-inline Response handle_sys(const Params& p) {
-    using namespace detail_;
+inline void set_scoped_audit_query(ScopedAuditQueryFn fn) {
+    detail_::scoped_audit_query_fn() = std::move(fn);
+}
+
+inline void enforce_tenant_isolation(bool on) {
+    detail_::isolation_enforced() = on;
+}
+
+namespace detail_ {
+
+// The ring is scanned past `limit` when scoping, so a busy tenant can't hide
+// the caller's rows behind its own.
+inline Response sys_rows(const Params& p, const std::string* tenant) {
     auto level = param(p, "level");
     auto rid   = param(p, "request_id");
-    auto limit = clamp(param_int(p, "limit", 100), 1, 1000);
-    auto rows  = fasten::query_syslog(static_cast<size_t>(limit), level, rid);
+    auto limit = static_cast<size_t>(clamp(param_int(p, "limit", 100), 1, 1000));
+    auto rows  = fasten::query_syslog(tenant ? SIZE_MAX : limit, level, rid);
+    if (tenant) {
+        rows = scope_rows(std::move(rows), *tenant);
+        if (rows.size() > limit) rows.resize(limit);
+    }
     return {200, fields_rows_to_json(rows)};
 }
 
-inline Response handle_api(const Params& p) {
-    using namespace detail_;
+inline Response api_rows(const Params& p, const std::string* tenant) {
     auto meth  = param(p, "method");
     auto path  = param(p, "path");
     auto rid   = param(p, "request_id");
-    auto limit = clamp(param_int(p, "limit", 100), 1, 1000);
-    auto rows  = fasten::query_api(static_cast<size_t>(limit), rid, meth, path);
+    auto limit = static_cast<size_t>(clamp(param_int(p, "limit", 100), 1, 1000));
+    auto rows  = fasten::query_api(tenant ? SIZE_MAX : limit, rid, meth, path);
+    if (tenant) {
+        rows = scope_rows(std::move(rows), *tenant);
+        if (rows.size() > limit) rows.resize(limit);
+    }
     return {200, fields_rows_to_json(rows)};
 }
 
-inline Response handle_audit(const Params& p) {
-    using namespace detail_;
-    auto& fn = audit_query_fn();
-    if (!fn) {
+inline Response audit_rows(const Params& p, const std::string* tenant) {
+    auto& scoped = scoped_audit_query_fn();
+    auto& plain  = audit_query_fn();
+    if (!scoped && !plain) {
         return {200,
             "{\"rows\":[],"
             "\"warning\":\"call fasten::reader::set_audit_query() to enable this endpoint\"}"};
@@ -146,12 +221,64 @@ inline Response handle_audit(const Params& p) {
     auto dom   = param(p, "domain");
     auto limit = clamp(param_int(p, "limit", 100), 1, 1000);
     try {
-        auto rows = fn(rid, code, dom, limit);
+        std::vector<fasten::Row> rows;
+        if (scoped) {
+            rows = scoped(rid, code, dom, tenant ? *tenant : "", limit);
+        } else {
+            rows = plain(rid, code, dom, limit);
+        }
+        // Drop other tenants' rows even if the query didn't.
+        if (tenant) {
+            rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const fasten::Row& r) {
+                return r.tenant_id != *tenant;
+            }), rows.end());
+        }
         return {200, audit_rows_to_json(rows)};
     } catch (const std::exception& e) {
-        return {500,
-            "{\"error\":" + fasten::detail_::json_str(e.what()) + "}"};
+        // The store's message can quote SQL and the database host and user;
+        // log its type, not the text.
+#if defined(__cpp_rtti) || defined(__GXX_RTTI) || defined(_CPPRTTI)
+        const char* type = typeid(e).name();
+#else
+        (void)e;
+        const char* type = "std::exception";
+#endif
+        fasten::detail_::drainer_sys_log("error", "reader_query_failed",
+            {{"path", "/audit"}, {"error_type", type}});
+        return {500, "{\"error\":\"internal error\"}"};
     }
+}
+
+} // namespace detail_
+
+inline Response handle_sys(const Params& p) {
+    if (detail_::isolation_enforced()) return detail_::unscoped();
+    return detail_::sys_rows(p, nullptr);
+}
+
+inline Response handle_api(const Params& p) {
+    if (detail_::isolation_enforced()) return detail_::unscoped();
+    return detail_::api_rows(p, nullptr);
+}
+
+inline Response handle_audit(const Params& p) {
+    if (detail_::isolation_enforced()) return detail_::unscoped();
+    return detail_::audit_rows(p, nullptr);
+}
+
+inline Response handle_sys(const Params& p, const std::string& tenant) {
+    if (tenant.empty()) return detail_::unscoped();
+    return detail_::sys_rows(p, &tenant);
+}
+
+inline Response handle_api(const Params& p, const std::string& tenant) {
+    if (tenant.empty()) return detail_::unscoped();
+    return detail_::api_rows(p, &tenant);
+}
+
+inline Response handle_audit(const Params& p, const std::string& tenant) {
+    if (tenant.empty()) return detail_::unscoped();
+    return detail_::audit_rows(p, &tenant);
 }
 
 } // namespace reader

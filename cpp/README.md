@@ -79,7 +79,28 @@ backoff (100 ms → 60 s, ±20 % jitter). Sink exceptions stay off the
 request path. Set `audit_store_failure_strategy = "raise"` to opt
 into synchronous semantics with `fasten::AuditStoreError`.
 `fasten::queue_stats()` and `fasten::flush(timeout)` complete the
-public surface.
+public surface. `queue_drain_max_attempts` (default 50) sets how many
+inserts a row gets before it is dead-lettered.
+
+`emit()` returns the row with `monotonic_seq` 0. The bundled
+`SqliteStore` and `PostgresStore` give it the node's next seq in the
+insert's transaction; rows are not sealed. A row put on a drainer that
+`init()` has just replaced is reported as `audit_drain_abandoned`.
+
+## Reader tenant isolation
+
+On a store shared by several tenants, resolve the caller's tenant from
+your own auth and call the reader handlers that take it:
+
+```cpp
+auto r = fasten::reader::handle_audit(params, tenant_from_my_auth(req));
+fasten::reader::enforce_tenant_isolation();  // handlers without a tenant answer 401
+```
+
+Rows are limited to that tenant and `?tenant_id=` is ignored. Register
+`set_scoped_audit_query()` to pass the tenant to your store query. Sys
+rows carry the engine's `tenant_id`. The Simple-Web-Server adapter takes
+a tenant resolver as the fourth argument of `mount()` / `start()`.
 
 ## Tests
 
@@ -90,7 +111,8 @@ docker run --rm -v $PWD/cpp:/work gcc:14-bookworm sh -c \
    cmake /work -DFASTEN_BUILD_TESTS=ON && cmake --build . && ctest"
 ```
 
-Current: 3/3 ctest suites pass (pii_in_detail, redact_substring, codes_yaml).
+Add `-DFASTEN_CORE_LIB_DIR=<fasten-core/target/release>` and set
+`LD_LIBRARY_PATH` to the same directory.
 
 ## Docs + design
 
