@@ -363,6 +363,26 @@ impl crate::AuditStore for PostgresStore {
             .collect())
     }
 
+    fn count_skipped_legacy_form(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        codes: &[String],
+    ) -> Result<u64, crate::Error> {
+        if codes.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} \
+             WHERE timestamp < $1::text{} AND code = ANY($2) AND detail <> 'null' \
+             AND hash <> '' AND canonical_form_id <> '2'",
+            self.table, self.cols.ts_cast
+        );
+        let before = crate::canonical_ts(&before);
+        let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
+        let row = self.lock().query_one(&sql as &str, &[&before, &codes]).map_err(pg_err)?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
     fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, crate::Error> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -781,6 +801,76 @@ mod tests {
 
         // Nothing left to do on a second pass.
         assert!(engine.redact_expired(cutoff, "pii-30d").expect("again").is_empty());
+        engine.reset_for_tests();
+    }
+
+    // A sealed form-"1" PII row past the cutoff is left alone and reported.
+    #[test]
+    fn test_redact_reports_sealed_form1() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_redact_form1";
+        let store = std::sync::Arc::new(fresh_store(&dsn, table));
+        crate::register(
+            "pg_form1".into(),
+            [(
+                "PG_FORM1_PII".to_string(),
+                crate::Meta {
+                    domain: "pg_form1".into(),
+                    severity: crate::Severity::Info,
+                    pii_in_detail: true,
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        let sealed_id = uniq("evt");
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, origin_id, monotonic_seq, timestamp, code, \
+                     source_node_id, detail, prev_hash, hash, canonical_form_id) \
+                     VALUES ($1, $1, 1, '2020-01-01T00:00:00.000000Z', 'PG_FORM1_PII', \
+                     'node-f1', '{{\"email\":\"a@b.c\"}}', 'genesis', 'abc123', '1')"
+                ),
+                &[&sealed_id],
+            )
+            .expect("insert sealed");
+
+        let engine = crate::Engine::new();
+        engine
+            .init(crate::Config {
+                service_id: "svc-redact-form1".into(),
+                node_id: "node-f1".into(),
+                audit_store: Some(store.clone()),
+                audit_store_failure_strategy: Some("raise".into()),
+                ..Default::default()
+            })
+            .expect("init");
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let redacted = engine.redact_expired(cutoff, "pii-30d").expect("redact_expired");
+        assert!(redacted.is_empty());
+
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let detail: String = c
+            .query_one(&format!("SELECT detail FROM {table} WHERE id = $1"), &[&sealed_id])
+            .expect("query")
+            .get(0);
+        assert_eq!(detail, r#"{"email":"a@b.c"}"#);
+
+        let lines: Vec<serde_json::Value> = crate::engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| {
+                v["service_id"] == "svc-redact-form1"
+                    && v["event"] == "pii_redaction_skipped_legacy_form"
+            })
+            .cloned()
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["level"], "warn");
+        assert_eq!(lines[0]["rows"], 1);
         engine.reset_for_tests();
     }
 

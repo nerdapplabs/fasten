@@ -484,6 +484,17 @@ pub trait AuditStore: Send + Sync {
         Err(Error::Unsupported("list_redaction_candidates".into()))
     }
 
+    /// Rows older than `before` with a code in `codes` that still hold
+    /// detail but are sealed under a form other than "2", so cannot be
+    /// redacted (spec §7.1). Reported, not touched.
+    fn count_skipped_legacy_form(
+        &self,
+        _before: DateTime<Utc>,
+        _codes: &[String],
+    ) -> Result<u64, Error> {
+        Ok(0)
+    }
+
     /// Set `detail` to JSON null on these rows. Returns the ids.
     fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported("redact_rows".into()))
@@ -1247,6 +1258,119 @@ mod tests {
                 "redact evt-pii-1".to_string(),
             ]
         );
+    }
+
+    // Many candidates, each insert slow.
+    #[derive(Default)]
+    struct SlowStore {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AuditStore for SlowStore {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            std::thread::sleep(Duration::from_millis(20));
+            self.log.lock().unwrap().push(format!("insert {}", row.target));
+            Ok(())
+        }
+        fn list_redaction_candidates(
+            &self,
+            _: DateTime<Utc>,
+            _: &[String],
+        ) -> Result<Vec<RedactionCandidate>, Error> {
+            Ok((0..1000)
+                .map(|i| RedactionCandidate { id: format!("evt-{i}"), monotonic_seq: i })
+                .collect())
+        }
+        fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> {
+            self.log.lock().unwrap().push(format!("redact {}", ids.join(",")));
+            Ok(ids.to_vec())
+        }
+    }
+
+    fn purger_config(service_id: &str, store: Arc<dyn AuditStore>) -> Config {
+        Config {
+            service_id: service_id.into(),
+            node_id: "n".into(),
+            audit_store: Some(store),
+            audit_store_failure_strategy: Some("raise".into()),
+            retention_pii: Some("30d".into()),
+            ..Default::default()
+        }
+    }
+
+    // reset stops a purger with a backlog after the row it is on.
+    #[test]
+    fn purger_stops_between_rows() {
+        register(
+            "slowpurge".into(),
+            [("SLOWPURGE_PII".into(), Meta { pii_in_detail: true, ..plain_meta("slowpurge") })],
+        )
+        .unwrap();
+        let store = Arc::new(SlowStore::default());
+        let e = Engine::new();
+        e.init(purger_config("svc-slowpurge", store.clone())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store.log.lock().unwrap().iter().any(|l| l.starts_with("redact")) {
+            assert!(std::time::Instant::now() < deadline, "purger never redacted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = std::time::Instant::now();
+        e.reset_for_tests();
+        assert!(started.elapsed() < Duration::from_millis(500), "purger did not stop promptly");
+        let log = store.log.lock().unwrap().clone();
+        let inserts = log.iter().filter(|l| l.starts_with("insert")).count();
+        let redacts = log.iter().filter(|l| l.starts_with("redact")).count();
+        assert!(redacts < 1000, "purger ran the whole backlog");
+        // Every row it started was recorded, then redacted.
+        assert_eq!(inserts, redacts);
+        for pair in log.chunks(2) {
+            let id = pair[0].strip_prefix("insert ").expect("insert first");
+            assert_eq!(pair[1], format!("redact {id}"));
+        }
+    }
+
+    // A store call that never returns.
+    struct HungStore {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        entered: std::sync::atomic::AtomicBool,
+    }
+
+    impl AuditStore for HungStore {
+        fn insert(&self, _: &Row) -> Result<(), Error> { Ok(()) }
+        fn list_redaction_candidates(
+            &self,
+            _: DateTime<Utc>,
+            _: &[String],
+        ) -> Result<Vec<RedactionCandidate>, Error> {
+            self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.release.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn hung_purger_does_not_block_reset() {
+        register(
+            "hungpurge".into(),
+            [("HUNGPURGE_PII".into(), Meta { pii_in_detail: true, ..plain_meta("hungpurge") })],
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let store = Arc::new(HungStore {
+            release: std::sync::Mutex::new(rx),
+            entered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let e = Engine::new();
+        e.init(purger_config("svc-hungpurge", store.clone())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "purger never listed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = std::time::Instant::now();
+        e.reset_for_tests();
+        assert!(started.elapsed() < Duration::from_secs(3), "reset blocked on a hung purger");
+        drop(tx);
     }
 }
 

@@ -98,8 +98,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   restarted at 1, so two engines on one node wrote duplicate seqs (spec §2.1).
   `PostgresStore` now gives a seq-0 row the node's next seq in the insert
   transaction, under the same advisory lock as the Python, Go and JS stores.
-  Rows are not sealed: `Row` gains `prev_hash` and `hash`, both empty, and
-  `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
+  Rows are not sealed, and `init()` logs `audit_chain_unavailable` (error)
+  once to say so (§8.1).
+- **Breaking:** `Row` gains public fields `prev_hash` and `hash` (both empty),
+  so `Row { .. }` literals that list every field stop compiling.
 - **Breaking:** `PostgresStore` writes `timestamp` and `shipped_at` in the
   canonical form `YYYY-MM-DDTHH:MM:SS.ffffffZ` (§4.3), not `to_rfc3339()`.
 - `PostgresStore` can share a table with the Python and Go stores: it inserts
@@ -111,10 +113,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `"30d"`. A background thread redacts expired rows whose code is in
   `pii_codes()` (`pii_in_detail` or retention class Short): `detail` becomes
   `null` and an `AUDIT_ROW_REDACTED` row is written first (§7). Rows are never
-  deleted, and a sealed form-`"1"` row is never touched. `redact_expired()`
-  runs it by hand. `AuditStore` gains `list_redaction_candidates` and
-  `redact_rows`, which default to `Error::Unsupported`.
-- `Error` gains `Unsupported` and `InvalidRetention`.
+  deleted. `redact_expired()` runs it by hand. `AuditStore` gains
+  `list_redaction_candidates` and `redact_rows`, which default to
+  `Error::Unsupported`, and `count_skipped_legacy_form`, which defaults to 0.
+  `Config` gains `retention_pii`, so `Config { .. }` literals without
+  `..Default::default()` stop compiling.
+- `PostgresStore` redacts unsealed rows (`hash = ''`) whatever their
+  `canonical_form_id` (spec §7.1). A sealed form-`"1"` row is never redacted:
+  its detail is inside the hash. Such rows past the cutoff are counted and
+  logged as `pii_redaction_skipped_legacy_form` (warn).
+- Stopping the purger (`init()` again, `reset_for_tests()`) waits at most 2 s.
+  The purger stops after the row it is on.
+- **Breaking:** `Error` gains `Unsupported` and `InvalidRetention`, so
+  exhaustive `match`es on `Error` stop compiling.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

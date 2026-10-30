@@ -26,6 +26,7 @@ pub const AUDIT_ROW_REDACTED: &str = "AUDIT_ROW_REDACTED";
 const REDACTION_DOMAIN: &str = "fasten";
 
 const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Parse a retention duration: `"30d"`, `"24h"`, `"90m"`, `"3600s"`.
 /// No compound forms, no zero or negative values.
@@ -83,6 +84,17 @@ pub(crate) fn redact_expired(
     before: DateTime<Utc>,
     reason: &str,
 ) -> Result<Vec<String>, Error> {
+    redact_expired_until(cfg, before, reason, &|| false)
+}
+
+/// `redact_expired` that checks `stopped` before each row, so a purger
+/// being stopped finishes the row it is on and goes no further.
+fn redact_expired_until(
+    cfg: &Config,
+    before: DateTime<Utc>,
+    reason: &str,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Vec<String>, Error> {
     let store = cfg
         .audit_store
         .as_ref()
@@ -93,10 +105,27 @@ pub(crate) fn redact_expired(
     }
     ensure_redaction_code()?;
     let reason = if reason.is_empty() { "retention" } else { reason };
+    let skipped = store.count_skipped_legacy_form(before, &codes)?;
+    if skipped > 0 {
+        crate::engine::sys_line(
+            &cfg.service_id,
+            "warn",
+            "pii_redaction_skipped_legacy_form",
+            serde_json::json!({
+                "rows": skipped,
+                "reason": "canonical_form_id != 2; detail is inside the hash, \
+                    so redacting would break the chain. The personal data in \
+                    these rows still exists.",
+            }),
+        );
+    }
     let mut redacted = Vec::new();
     // One row at a time, record then destroy, so a failed destroy can only
     // repeat the record for that one row.
     for c in store.list_redaction_candidates(before, &codes)? {
+        if stopped() {
+            break;
+        }
         let mut detail = HashMap::new();
         detail.insert("redacted_seq".into(), serde_json::json!(c.monotonic_seq));
         detail.insert("reason".into(), serde_json::json!(reason));
@@ -142,7 +171,8 @@ impl Purger {
                 let before = Utc::now()
                     .checked_sub_signed(horizon)
                     .unwrap_or(DateTime::<Utc>::MIN_UTC);
-                if let Err(e) = redact_expired(&cfg, before, "retention") {
+                let stopped = || *flag.0.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = redact_expired_until(&cfg, before, "retention", &stopped) {
                     // Type only: a store error message can quote row values.
                     crate::engine::sys_line(
                         &cfg.service_id,
@@ -167,13 +197,21 @@ impl Purger {
         Self { stop, handle }
     }
 
+    /// Signal the thread and wait up to `STOP_TIMEOUT` for it. A thread
+    /// stuck in a store call is left to finish on its own.
     pub(crate) fn stop(mut self) {
         let (lock, cv) = &*self.stop;
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
         cv.notify_all();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        let Some(h) = self.handle.take() else { return };
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while !h.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let _ = h.join();
     }
 }
 
