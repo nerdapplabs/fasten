@@ -42,3 +42,40 @@ test('redactExpired refuses a store without the redaction methods', async () => 
     await assert.rejects(e.redactExpired({ before: new Date() }), /listRedactionCandidates/);
     e.resetForTests();
 });
+
+test('listRedactionCandidates canonicalises a string cutoff', async () => {
+    const { PostgresStore } = await import('../src/store/postgres.js');
+    const seen = [];
+    const store = Object.create(PostgresStore.prototype);
+    store._table = 't';
+    store._ensureReady = async () => {};
+    store._pool = { query: async (_sql, params) => { seen.push(params[0]); return { rows: [{ count: 0 }] }; } };
+    await store.listRedactionCandidates({ before: '2026-10-01T00:00:00+05:30', codes: ['X'] });
+    assert.equal(seen[0], '2026-09-30T18:30:00.000000Z');
+    await assert.rejects(store.listRedactionCandidates({ before: 'not a date', codes: ['X'] }));
+});
+
+test('a re-init during a redaction pass does not redact the same row twice', async () => {
+    const records = [];
+    let listed = 0;
+    const store = {
+        insert: async (row) => { if (row.code === 'AUDIT_ROW_REDACTED') records.push(row.target); },
+        listRedactionCandidates: async () => {
+            listed++;
+            await new Promise((r) => setTimeout(r, 50));
+            return records.length ? { candidates: [], skipped: 0 }
+                : { candidates: [{ id: 'evt-1', monotonicSeq: 1 }], skipped: 0 };
+        },
+        redactRows: async ({ ids }) => ids,
+    };
+    const e = new Engine();
+    const opts = { serviceId: 's', nodeId: 'n', auditStore: store, retentionPii: '30d',
+        auditStoreFailureStrategy: 'raise' };
+    e.init(opts);
+    await new Promise((r) => setTimeout(r, 10));
+    e.init(opts);
+    await new Promise((r) => setTimeout(r, 200));
+    e.resetForTests();
+    assert.equal(listed, 1);
+    assert.deepEqual(records, ['evt-1']);
+});

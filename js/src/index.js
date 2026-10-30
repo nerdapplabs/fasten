@@ -583,11 +583,15 @@ export class Engine {
 
 	// ── Internal ────────────────────────────────────────────────────────────
 
+	// The in-flight pass lives on the engine, so a re-init can't start a second
+	// pass over the same rows and write their redaction records twice.
 	_startRetention(piiRetMs) {
-		let running = false;
 		const tick = async () => {
-			if (running) return;
-			running = true;
+			if (this._redactionPass) return;
+			let done;
+			this._redactionPass = new Promise((r) => {
+				done = r;
+			});
 			try {
 				await this.redactExpired({
 					before: new Date(Date.now() - piiRetMs),
@@ -599,7 +603,8 @@ export class Engine {
 					error_type: err?.cause?.name ?? err?.name ?? "Error",
 				});
 			} finally {
-				running = false;
+				this._redactionPass = null;
+				done();
 			}
 		};
 		this._retentionTimer = setInterval(tick, RETENTION_CHECK_MS);

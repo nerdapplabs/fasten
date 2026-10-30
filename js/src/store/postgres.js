@@ -452,7 +452,12 @@ export class PostgresStore {
 	async listRedactionCandidates({ before, codes }) {
 		if (!codes || codes.length === 0) return { candidates: [], skipped: 0 };
 		await this._ensureReady();
-		const cutoff = before instanceof Date ? canonicalTS(before) : before;
+		// timestamp is compared as text, so the cutoff must be canonical too.
+		const d = before instanceof Date ? before : new Date(before);
+		if (Number.isNaN(d.getTime())) {
+			throw new Error(`fasten PostgresStore: bad before ${JSON.stringify(before)}`);
+		}
+		const cutoff = canonicalTS(d);
 		const skippedRes = await this._pool.query(
 			`SELECT COUNT(*) FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND hash <> '' AND canonical_form_id <> '2'`,
 			[cutoff, codes],
