@@ -52,16 +52,18 @@ function _ddlStatements(table, idx) {
     method         TEXT NOT NULL,
     request_id     TEXT NOT NULL,
     detail         TEXT NOT NULL,
-    pii_in_detail  SMALLINT NOT NULL DEFAULT 0,
     shipped_at     TEXT,
     prev_hash      TEXT NOT NULL DEFAULT 'genesis',
     hash           TEXT NOT NULL DEFAULT '',
     canonical_form_id TEXT NOT NULL DEFAULT '1',
     detail_salt       TEXT,
-    detail_commitment TEXT
+    detail_commitment TEXT,
+    pii_in_detail  SMALLINT NOT NULL DEFAULT 0
 )`,
-		// Columns the Python and Go stores have, for a table created by an
-		// older JS store; and pii_in_detail for a table Python created.
+		// The column order matches Python's table, which the Python store
+		// reads by position; pii_in_detail comes last, where the ALTER below
+		// puts it on a table Python created. The ALTERs add the columns the
+		// Python and Go stores have to a table an older JS store created.
 		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS pii_in_detail SMALLINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis'`,
 		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''`,
@@ -292,7 +294,7 @@ export class PostgresStore {
 				params[2] = Number(res.rows[0].seq);
 			}
 			await client.query(
-				`INSERT INTO ${this._table} (id, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, pii_in_detail, shipped_at, prev_hash, hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'','') ON CONFLICT (id) DO NOTHING`,
+				`INSERT INTO ${this._table} (id, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, pii_in_detail, shipped_at, prev_hash, hash, detail_salt, detail_commitment) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'','','','') ON CONFLICT (id) DO NOTHING`,
 				params,
 			);
 			await client.query("COMMIT");

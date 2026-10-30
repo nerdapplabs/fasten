@@ -316,3 +316,30 @@ for (const [name, ddl] of [['Python', PY_DDL], ['Go', GO_DDL]]) {
         }
     });
 }
+
+// The Python store reads SELECT * by position, and the Go store scans
+// detail_salt / detail_commitment into strings, so a table the JS store
+// creates must have Python's column order and no NULLs in those two.
+test('a table the JS store creates can be read by Python and Go', { skip }, async () => {
+    const { default: pg } = await import('pg');
+    const admin = new pg.Pool({ connectionString: DSN });
+    try {
+        const row = makeRow({ monotonic_seq: 0 });
+        await store.insert(row);
+        const cols = await admin.query(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_name = $1 ORDER BY ordinal_position`, [TABLE]);
+        assert.deepEqual(cols.rows.map(r => r.column_name), [
+            'id', 'origin_id', 'monotonic_seq', 'timestamp', 'code', 'action',
+            'severity', 'service_id', 'source_node_id', 'tenant_id', 'actor',
+            'actor_kind', 'target', 'category', 'domain', 'method', 'request_id',
+            'detail', 'shipped_at', 'prev_hash', 'hash', 'canonical_form_id',
+            'detail_salt', 'detail_commitment', 'pii_in_detail',
+        ]);
+        const raw = await admin.query(
+            `SELECT detail_salt, detail_commitment FROM ${TABLE} WHERE id = $1`, [row.id]);
+        assert.deepEqual(raw.rows[0], { detail_salt: '', detail_commitment: '' });
+    } finally {
+        await admin.end();
+    }
+});

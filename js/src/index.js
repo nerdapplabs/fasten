@@ -279,7 +279,7 @@ export class Engine {
 		}
 
 		// Spec §8.1: say once per init that rows are not chained.
-		this._drainerSysLog("warn", "audit_chain_unavailable", {
+		this._drainerSysLog("error", "audit_chain_unavailable", {
 			store: this.#config.auditStore?.constructor?.name ?? null,
 			reason:
 				"the JS SDK does not seal rows (spec 2.1); rows are written unsealed",

@@ -112,13 +112,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   restarted at 1 (spec §2.1, §8). It returns `monotonic_seq: 0`, and
   `PostgresStore` allocates the node's next seq in the insert transaction
   under the same advisory lock as Python and Go. Rows are still unsealed;
-  `init()` logs `audit_chain_unavailable` once to say so (§8.1).
+  `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
 - Audit row timestamps and `shipped_at` use the canonical form (§4.3).
 - `PostgresStore` can share a table with the Python and Go stores: it inserts
   with a column list, adds the chain columns (and `pii_in_detail` on a table
   Python made), writes `shipped_at` in the canonical form instead of `NOW()`,
   reads `TIMESTAMPTZ` columns back in that form, filters on `tenantId`, and
   orders `query()` by timestamp.
+- A table the JS store creates has the Python store's column order (Python
+  reads by position) and empty, not NULL, `detail_salt` / `detail_commitment`
+  (Go reads them as strings). A table an older JS store created keeps its old
+  column order, with `pii_in_detail` before `shipped_at`; Postgres can't move
+  a column, so recreate it before pointing a Python store at it.
 - JS CI runs the `PostgresStore` tests against Postgres; they were always
   skipped. Two purge tests that failed against a real database are fixed.
 
