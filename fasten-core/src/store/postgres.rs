@@ -248,13 +248,56 @@ impl PostgresStore {
             &shipped,            // $21 shipped_at    (NULL when None)
         ];
 
+        if row.monotonic_seq != 0 {
+            return self.with_reconnect(|inner| {
+                inner
+                    .client
+                    .execute(&inner.stmt, params)
+                    .map(|_| ())
+                    .map_err(Error::Postgres)
+            });
+        }
+
+        let exists_sql = format!("SELECT 1 FROM {} WHERE id = $1", self.table);
+        let seq_sql = format!(
+            "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} WHERE source_node_id = $1",
+            self.table
+        );
         self.with_reconnect(|inner| {
-            inner
-                .client
-                .execute(&inner.stmt, params)
-                .map(|_| ())
-                .map_err(Error::Postgres)
+            let Inner { client, stmt } = inner;
+            let mut tx = client.transaction()?;
+            // A retry after a lost commit ack must not take a new seq.
+            if tx.query_opt(exists_sql.as_str(), &[&row.id])?.is_some() {
+                tx.commit()?;
+                return Ok(());
+            }
+            // Same lock key as the Python and Go stores, so every writer for
+            // this node serialises here. An advisory lock rather than
+            // FOR UPDATE: an empty node has no tip row to lock.
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&row.source_node_id],
+            )?;
+            let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.get(0);
+            let mut p = params.to_vec();
+            p[3] = &seq; // $4 monotonic_seq
+            tx.execute(&*stmt, &p)?;
+            tx.commit()?;
+            Ok(())
         })
+    }
+
+    /// `" AND hash = ''"` when the table has a `hash` column, else `""`.
+    /// See the SQLite store.
+    fn unsealed_gate(&self, client: &mut pg::Client) -> Result<&'static str, Error> {
+        let row = client.query_one(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = COALESCE($1, current_schema()) \
+             AND table_name = $2 AND column_name = 'hash'",
+            &[&self.schema, &self.bare],
+        )?;
+        let n: i64 = row.get(0);
+        Ok(if n > 0 { " AND hash = ''" } else { "" })
     }
 }
 
@@ -406,6 +449,46 @@ impl Store for PostgresStore {
             Ok(seq.unsigned_abs())
         })
     }
+
+    fn list_redaction_candidates(
+        &self,
+        before: &str,
+        codes: &[String],
+    ) -> Result<Vec<(String, u64)>, Error> {
+        if codes.is_empty() {
+            return Ok(vec![]);
+        }
+        self.with_reconnect(|inner| {
+            let gate = self.unsealed_gate(&mut inner.client)?;
+            let sql = format!(
+                "SELECT id, monotonic_seq FROM {} \
+                 WHERE timestamp < $1 AND code = ANY($2) \
+                 AND detail <> 'null'{gate} ORDER BY monotonic_seq",
+                self.table
+            );
+            let rows = inner.client.query(sql.as_str(), &[&before, &codes])?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1).unsigned_abs()))
+                .collect())
+        })
+    }
+
+    fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        self.with_reconnect(|inner| {
+            let gate = self.unsealed_gate(&mut inner.client)?;
+            // 'null' is the JSON literal; see the SQLite store.
+            let sql = format!(
+                "UPDATE {} SET detail = 'null' WHERE id = ANY($1){gate}",
+                self.table
+            );
+            inner.client.execute(sql.as_str(), &[&ids])?;
+            Ok(ids.to_vec())
+        })
+    }
 }
 
 // ── Schema bootstrap ──────────────────────────────────────────────────────────
@@ -449,7 +532,9 @@ fn migrate(
                 detail          TEXT        NOT NULL DEFAULT '{{}}',
                 pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,
                 shipped_at      TEXT,
-                PRIMARY KEY (id)
+                PRIMARY KEY (id),
+                -- Same name as the Go store's index, so Go skips creating it.
+                CONSTRAINT uq_{bare}_node_seq UNIQUE (source_node_id, monotonic_seq)
             )"
         ),
     )?;
@@ -576,7 +661,7 @@ mod tests {
             wire_version: "1".into(),
             id: id.into(),
             origin_id: id.into(),
-            monotonic_seq: 42,
+            monotonic_seq: 0,
             timestamp: "2026-05-07T00:00:00.000Z".into(),
             code: code.into(),
             action: "test".into(),
@@ -665,6 +750,151 @@ mod tests {
         let Some(dsn) = dsn() else { return };
         let store = PostgresStore::connect(&dsn, "fasten_sc_pg_seqtest").unwrap();
         store.insert(&make_row("evt-pgseq-001", "TEST")).unwrap();
-        assert!(store.max_monotonic_seq().unwrap() >= 42);
+        assert!(store.max_monotonic_seq().unwrap() >= 1);
+    }
+
+    /// A fresh, empty table per test run so seqs start at 1.
+    fn fresh(dsn: &str, table: &str) -> PostgresStore {
+        let mut c = connect_client(dsn).unwrap();
+        c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]).unwrap();
+        PostgresStore::connect(dsn, table).unwrap()
+    }
+
+    fn row_on(id: &str, node: &str) -> Row {
+        let mut r = make_row(id, "TEST");
+        r.source_node_id = node.into();
+        r
+    }
+
+    fn seqs(store: &PostgresStore, node: &str) -> Vec<u64> {
+        let f = Filter { source_node_id: Some(node.into()), ..Default::default() };
+        store.query(&f).unwrap().iter().map(|r| r.monotonic_seq).collect()
+    }
+
+    #[test]
+    fn seq_zero_is_allocated_per_node() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_alloc");
+        store.insert(&row_on("evt-a1", "node-a")).unwrap();
+        store.insert(&row_on("evt-a2", "node-a")).unwrap();
+        store.insert(&row_on("evt-b1", "node-b")).unwrap();
+        let mut r = row_on("evt-rep", "node-a");
+        r.monotonic_seq = 7;
+        store.insert(&r).unwrap();
+        store.insert(&row_on("evt-a3", "node-a")).unwrap();
+        assert_eq!(seqs(&store, "node-a"), vec![1, 2, 7, 8]);
+        assert_eq!(seqs(&store, "node-b"), vec![1]);
+    }
+
+    #[test]
+    fn retried_id_does_not_take_a_seq() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_retry");
+        let r = row_on("evt-retry-1", "node-a");
+        store.insert(&r).unwrap();
+        store.insert(&r).unwrap();
+        store.insert(&row_on("evt-retry-2", "node-a")).unwrap();
+        assert_eq!(seqs(&store, "node-a"), vec![1, 2]);
+    }
+
+    #[test]
+    fn duplicate_node_seq_is_rejected() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_dup");
+        let mut a = row_on("evt-dup-1", "node-a");
+        a.monotonic_seq = 3;
+        let mut b = row_on("evt-dup-2", "node-a");
+        b.monotonic_seq = 3;
+        store.insert(&a).unwrap();
+        assert!(store.insert(&b).is_err());
+    }
+
+    /// #92: several stores, one node, inserting at once.
+    #[test]
+    fn concurrent_stores_allocate_contiguous_seqs() {
+        let Some(dsn) = dsn() else { return };
+        drop(fresh(&dsn, "fasten_sc_pg_conc"));
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let dsn = dsn.clone();
+                std::thread::spawn(move || {
+                    let store = PostgresStore::connect(&dsn, "fasten_sc_pg_conc").unwrap();
+                    for i in 0..25 {
+                        store.insert(&row_on(&format!("evt-{t}-{i}"), "node-1")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_conc").unwrap();
+        assert_eq!(seqs(&store, "node-1"), (1..=100).collect::<Vec<u64>>());
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string()
+    }
+
+    fn detail_of(store: &PostgresStore, id: &str) -> serde_json::Value {
+        let rows = store.query(&Filter::default()).unwrap();
+        rows.into_iter().find(|r| r.id == id).unwrap().detail
+    }
+
+    #[test]
+    fn redaction_blanks_only_expired_pii_rows() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_redact");
+        let mut pii = make_row("evt-pii-old", "USER_LOGIN");
+        pii.timestamp = days_ago(40);
+        let mut ops = make_row("evt-ops-old", "JOB_RAN");
+        ops.timestamp = days_ago(40);
+        store.insert(&pii).unwrap();
+        store.insert(&ops).unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let cutoff = days_ago(30);
+        let found = store.list_redaction_candidates(&cutoff, &codes).unwrap();
+        assert_eq!(found, vec![("evt-pii-old".to_string(), 1)]);
+        let ids: Vec<String> = found.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+
+        assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
+        assert_eq!(detail_of(&store, "evt-ops-old"), serde_json::json!({"k": "v"}));
+        assert_eq!(store.count(&Filter::default()).unwrap(), 2);
+
+        assert!(store.list_redaction_candidates(&cutoff, &codes).unwrap().is_empty());
+        assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+        assert_eq!(detail_of(&store, "evt-pii-old"), serde_json::Value::Null);
+        assert_eq!(store.count(&Filter::default()).unwrap(), 2);
+    }
+
+    #[test]
+    fn redaction_skips_sealed_rows() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_redact_sealed");
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(
+            "ALTER TABLE fasten_sc_pg_redact_sealed ADD COLUMN hash TEXT NOT NULL DEFAULT ''",
+        )
+        .unwrap();
+        for id in ["evt-sealed", "evt-unsealed"] {
+            let mut r = make_row(id, "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        c.batch_execute("UPDATE fasten_sc_pg_redact_sealed SET hash = 'abc' WHERE id = 'evt-sealed'")
+            .unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(found, vec![("evt-unsealed".to_string(), 2)]);
+        store
+            .redact_rows(&["evt-sealed".to_string(), "evt-unsealed".to_string()])
+            .unwrap();
+        assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"k": "v"}));
+        assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
     }
 }

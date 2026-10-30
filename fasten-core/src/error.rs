@@ -85,6 +85,11 @@ pub enum Error {
     /// reported as `InvalidTableName("insert callback rc=1")`).
     #[error("insert callback returned non-zero rc={0}")]
     CallbackFailed(i32),
+
+    /// The store does not implement this operation (e.g. redaction on a
+    /// callback-backed store).
+    #[error("{0} is not supported by this store")]
+    Unsupported(&'static str),
 }
 
 // When neither sqlite nor postgres feature is active, the #[from] impls above
@@ -130,6 +135,7 @@ impl From<&Error> for FastenErrorCode {
             Error::CallbackFailed(_)   => FastenErrorCode::ErrBackend,
             Error::TlsUnavailable(_)   => FastenErrorCode::ErrBackend,
             Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
+            Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

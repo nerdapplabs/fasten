@@ -127,6 +127,8 @@ pub unsafe extern "C" fn fasten_store_open(
 
 /// Insert a JSON-encoded audit row.
 ///
+/// `monotonic_seq` 0 means the store allocates the next seq for the node.
+///
 /// `handle`   — handle returned by `fasten_store_open`; must be non-null.
 /// `row_json` — UTF-8 JSON object matching the fasten wire schema.
 /// `out_err`  — set on error; may be NULL.
@@ -348,6 +350,7 @@ pub unsafe extern "C" fn fasten_store_purge(
 }
 
 /// Return the maximum `monotonic_seq` across all stored rows, or 0 if empty.
+/// Table-wide, not per node; do not use it to allocate a seq.
 ///
 /// `out_seq` — set to the maximum sequence number on success; must be non-null.
 /// `out_err` — set on error; may be NULL.
@@ -370,6 +373,81 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
             if !out_seq.is_null() {
                 *out_seq = seq;
             }
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// List rows a PII retention horizon would redact (spec §7.1).
+///
+/// `before_iso8601` — rows with `timestamp` strictly older are candidates.
+/// `codes_json`     — UTF-8 JSON array of codes, e.g. `["USER_LOGIN"]`.
+/// `out_json`       — on success, a JSON array of
+///                    `{"id": ..., "monotonic_seq": ...}` ordered by
+///                    `monotonic_seq`. Free with `fasten_store_free_str`.
+/// `out_err`        — set on error; may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
+    handle: *mut FastenStoreHandle,
+    before_iso8601: *const c_char,
+    codes_json: *const c_char,
+    out_json: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
+        let codes: Vec<String> = serde_json::from_str(read_str(codes_json).ok_or(Error::NullArg)?)?;
+        let rows = (*handle).store.list_redaction_candidates(before, &codes)?;
+        let out: Vec<_> = rows
+            .into_iter()
+            .map(|(id, seq)| serde_json::json!({"id": id, "monotonic_seq": seq}))
+            .collect();
+        Ok(serde_json::to_string(&out)?)
+    });
+    match r {
+        Ok(json) => {
+            set_error(out_json, &json);
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Set `detail` to JSON `null` on the rows in `ids_json` (spec §7.1).
+///
+/// `ids_json`     — UTF-8 JSON array of ids. Idempotent; sealed rows are
+///                  left alone.
+/// `out_ids_json` — on success, the JSON array of ids passed in. Free with
+///                  `fasten_store_free_str`. May be NULL.
+/// `out_err`      — set on error; may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_redact_rows(
+    handle: *mut FastenStoreHandle,
+    ids_json: *const c_char,
+    out_ids_json: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let ids: Vec<String> = serde_json::from_str(read_str(ids_json).ok_or(Error::NullArg)?)?;
+        let done = (*handle).store.redact_rows(&ids)?;
+        Ok(serde_json::to_string(&done)?)
+    });
+    match r {
+        Ok(json) => {
+            set_error(out_ids_json, &json);
             FastenErrorCode::Ok
         }
         Err((code, msg)) => {
@@ -405,6 +483,8 @@ impl Store for CallbackStore {
     fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
     fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
     fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+    // Redaction keeps the trait defaults (Unsupported): the callback can
+    // only insert.
 }
 
 /// Create a store handle backed by an insert callback.
@@ -514,5 +594,53 @@ mod tests {
             ud: SendRawPtr(std::ptr::null_mut()),
         };
         assert!(store.insert(&Row::default()).is_ok());
+    }
+
+    unsafe fn take(p: *mut c_char) -> String {
+        let s = std::ffi::CStr::from_ptr(p).to_str().unwrap().to_owned();
+        fasten_store_free_str(p);
+        s
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn redaction_exports_round_trip_json() {
+        let cs = |s: &str| CString::new(s).unwrap();
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = fasten_store_open(
+                cs("sqlite").as_ptr(), cs(":memory:").as_ptr(), cs("audit_log").as_ptr(), &mut err,
+            );
+            assert!(!h.is_null());
+            let row = serde_json::json!({
+                "wire_version": "1", "id": "evt-1", "origin_id": "evt-1", "monotonic_seq": 0,
+                "timestamp": "2020-01-01T00:00:00.000000Z", "code": "USER_LOGIN",
+                "action": "a", "severity": "info", "service_id": "s", "source_node_id": "n",
+                "actor": "u", "actor_kind": "user", "target": "t", "category": "c",
+                "domain": "d", "method": "sdk", "request_id": "r", "detail": {"email": "x"},
+            });
+            let rc = fasten_store_insert(h, cs(&row.to_string()).as_ptr(), &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = fasten_store_list_redaction_candidates(
+                h, cs("2021-01-01T00:00:00Z").as_ptr(), cs(r#"["USER_LOGIN"]"#).as_ptr(),
+                &mut out, &mut err,
+            );
+            assert_eq!(rc, FastenErrorCode::Ok);
+            assert_eq!(take(out), r#"[{"id":"evt-1","monotonic_seq":1}]"#);
+
+            let rc = fasten_store_redact_rows(h, cs(r#"["evt-1"]"#).as_ptr(), &mut out, &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+            assert_eq!(take(out), r#"["evt-1"]"#);
+            fasten_store_close(h);
+        }
+    }
+
+    #[test]
+    fn callback_store_has_no_redaction() {
+        extern "C" fn ok_cb(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 0 }
+        let store = CallbackStore { fn_ptr: ok_cb, ud: SendRawPtr(std::ptr::null_mut()) };
+        assert!(matches!(store.redact_rows(&["x".into()]), Err(Error::Unsupported(_))));
     }
 }

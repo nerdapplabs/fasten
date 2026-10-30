@@ -31,7 +31,11 @@ pub trait Store: Send + Sync {
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Persist `row`.  Duplicate IDs are silently ignored
-    /// (`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`).
+    /// (`ON CONFLICT (id) DO NOTHING`).
+    ///
+    /// When `row.monotonic_seq` is 0 the store assigns the next seq for
+    /// `row.source_node_id` inside the insert transaction (spec §2.1, §8.2).
+    /// The row is not sealed. A non-zero seq is written as given.
     fn insert(&self, row: &Row) -> Result<(), Error>;
 
     // ── Health ────────────────────────────────────────────────────────────────
@@ -66,7 +70,29 @@ pub trait Store: Send + Sync {
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
     /// the table is empty.
+    ///
+    /// Table-wide, not per node. Kept for existing callers; do not use it to
+    /// allocate a seq (insert a row with `monotonic_seq == 0` instead).
     fn max_monotonic_seq(&self) -> Result<u64, Error>;
+
+    // ── Redaction (spec §7.1) ────────────────────────────────────────────────
+
+    /// `(id, monotonic_seq)` of rows with `timestamp < before`, `code` in
+    /// `codes` and a `detail` not yet redacted, ordered by `monotonic_seq`.
+    /// Sealed rows are never returned.
+    fn list_redaction_candidates(
+        &self,
+        _before: &str,
+        _codes: &[String],
+    ) -> Result<Vec<(String, u64)>, Error> {
+        Err(Error::Unsupported("list_redaction_candidates"))
+    }
+
+    /// Set `detail` to the JSON literal `null` on the unsealed rows in `ids`.
+    /// Idempotent. Returns `ids`.
+    fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
+        Err(Error::Unsupported("redact_rows"))
+    }
 }
 
 #[cfg(feature = "sqlite")]

@@ -296,6 +296,9 @@ SDKs MUST refuse to redact a form-`"1"` row (its `detail` is hashed directly, so
 redaction would require re-sealing the entire suffix) and MUST report that the row
 predates form `"2"`.
 
+An unsealed row (`hash = ""`) is not in the chain, so it MAY be redacted
+whatever its `canonical_form_id`.
+
 ### §7.2 The redaction event
 
 Every redaction MUST itself be an originated, chained row:
@@ -348,3 +351,15 @@ that chaining is disabled. `verify_chain` already skips empty-hash rows (§2), s
 such a stream verifies vacuously rather than failing. An SDK MUST NOT fabricate
 an in-memory sequence in this mode — that is the exact non-conformance §2.1
 exists to forbid.
+
+### §8.2 Allocation without sealing
+
+A store MAY allocate `monotonic_seq` (§2.1) for an SDK that cannot seal, for
+example one writing through fasten-core. Such rows carry `hash = ""` and
+`prev_hash = ""`. They still hold their `monotonic_seq`, so later rows on the
+node, sealed or not, are allocated after them.
+
+`verify_chain` treats them as unsealed (§2): it skips them, and does not check a
+sealed row's `prev_hash` against an unsealed row before it. The SDK MUST log
+`audit_chain_unavailable` once per init, as in §8.1, so the stream is not taken
+for a verified chain.

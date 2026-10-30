@@ -92,6 +92,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — fasten-core stores assign monotonic_seq; PII redaction (#124)
+
+- `SqliteStore` and `PostgresStore` now allocate `monotonic_seq` when a row
+  arrives with `monotonic_seq: 0`: next seq for its `source_node_id`, in the
+  insert transaction (`BEGIN IMMEDIATE` on SQLite, the shared
+  `pg_advisory_xact_lock` on Postgres). Two handles on one store no longer
+  write duplicate seqs (#92). Rows stay unsealed (spec §8.2). A non-zero seq
+  is written as given. Fresh tables get `UNIQUE (source_node_id,
+  monotonic_seq)`, and SQLite inserts use `ON CONFLICT (id) DO NOTHING` so a
+  seq clash fails instead of dropping the row.
+- PII retention by redaction (spec §7.1): `list_redaction_candidates` and
+  `redact_rows` on the `Store` trait, exported as
+  `fasten_store_list_redaction_candidates` / `fasten_store_redact_rows`.
+  `detail` becomes JSON `null`; rows are never deleted. Sealed rows on a
+  table shared with a sealing SDK are left alone.
+- Spec: §8.2 (allocation without sealing), and §7.1 allows redacting any
+  unsealed row.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
