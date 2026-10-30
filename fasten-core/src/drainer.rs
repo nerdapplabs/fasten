@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::{row::Row, store::Store};
+use crate::{error::Error, row::Row, store::Store};
 
 // ── Conformance constants ──────────────────────────────────────────────────
 
@@ -140,8 +140,20 @@ struct DrainerInner {
     flush_cv: Condvar,
     slots: Sem,
     stop: AtomicBool,
+    /// Set (under the stats lock) once the drain thread has returned.
+    exited: AtomicBool,
+    /// Set with `exited` if the drain thread ended by panicking.
+    panicked: AtomicBool,
     stats: Mutex<InternalStats>,
+    sys_log: Option<SysLog>,
+    /// FFI calls still using this drainer; see `begin_call`.
+    calls: Mutex<usize>,
+    calls_cv: Condvar,
 }
+
+/// Receives each sys event as one JSON line (`shape`, `level`, `event`,
+/// `timestamp` and the event's fields).
+pub type SysLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 // SAFETY: `Box<dyn Store>` is `Send` (Store trait requires `Send`).
 // The inner mutex protects all shared state.
@@ -157,16 +169,30 @@ pub struct Drainer {
 
 impl Drainer {
     pub fn new(store: Box<dyn Store>, cfg: DrainerConfig) -> Arc<Self> {
+        Self::with_sys_log(store, cfg, None)
+    }
+
+    /// Like `new`, but sys events go to `sys_log` instead of stderr. It is
+    /// called with no drainer lock held, from the drain thread or from the
+    /// thread calling enqueue or stop.
+    pub fn with_sys_log(store: Box<dyn Store>, cfg: DrainerConfig, sys_log: Option<SysLog>) -> Arc<Self> {
         let capacity = cfg.capacity;
         let inner = Arc::new(DrainerInner {
             store,
             cfg,
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            // Not preallocated: the slots bound the depth, and a large
+            // capacity would otherwise allocate it all up front.
+            queue: Mutex::new(VecDeque::new()),
             queue_cv: Condvar::new(),
             flush_cv: Condvar::new(),
             slots: Sem::new(capacity),
             stop: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             stats: Mutex::new(InternalStats::default()),
+            sys_log,
+            calls: Mutex::new(0),
+            calls_cv: Condvar::new(),
         });
         let inner2 = inner.clone();
         let handle = thread::Builder::new()
@@ -180,7 +206,7 @@ impl Drainer {
     /// Returns `false` if the drainer is already stopped (row abandoned).
     pub fn enqueue(&self, row: Row) -> bool {
         if self.inner.stop.load(Ordering::SeqCst) {
-            sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+            self.inner.sys_event("error", "audit_drain_abandoned", &serde_json::json!({
                 "reason": "drainer_stopped",
                 "row_id": row.id,
             }));
@@ -191,37 +217,53 @@ impl Drainer {
         if self.inner.stop.load(Ordering::SeqCst) {
             // Shutdown raced us; release and abandon.
             self.inner.slots.release();
-            sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+            self.inner.sys_event("error", "audit_drain_abandoned", &serde_json::json!({
                 "reason": "drainer_stopped",
                 "row_id": row.id,
             }));
             return false;
         }
-        // Update high-water + threshold events.
-        {
+        // Update high-water + threshold events; the event goes out after the
+        // stats lock is released.
+        let capacity = self.inner.cfg.capacity;
+        let depth = self.inner.slots.used();
+        let threshold = {
             let mut st = lock_or_recover(&self.inner.stats);
-            let capacity = self.inner.cfg.capacity;
-            let depth = self.inner.slots.used();
             if depth > st.high_water {
                 st.high_water = depth;
             }
             let ratio = depth as f64 / capacity as f64;
             if ratio >= HW_ERR_PCT && !st.err_hw_fired {
                 st.err_hw_fired = true;
-                sys_event("error", "audit_queue_near_full", &serde_json::json!({
-                    "depth": depth, "capacity": capacity,
-                }));
+                Some(("error", "audit_queue_near_full"))
             } else if ratio >= HW_WARN_PCT && !st.warn_hw_fired {
                 st.warn_hw_fired = true;
-                sys_event("warn", "audit_queue_high_water", &serde_json::json!({
-                    "depth": depth, "capacity": capacity,
-                }));
-            } else if ratio < HW_WARN_PCT && (st.warn_hw_fired || st.err_hw_fired) {
-                st.warn_hw_fired = false;
-                st.err_hw_fired = false;
+                Some(("warn", "audit_queue_high_water"))
+            } else {
+                if ratio < HW_WARN_PCT && (st.warn_hw_fired || st.err_hw_fired) {
+                    st.warn_hw_fired = false;
+                    st.err_hw_fired = false;
+                }
+                None
             }
+        };
+        if let Some((level, event)) = threshold {
+            self.inner.sys_event(level, event, &serde_json::json!({
+                "depth": depth, "capacity": capacity,
+            }));
         }
         let mut q = lock_or_recover(&self.inner.queue);
+        // stop() may have run since the check above, and the drain loop may
+        // already have exited; under the queue lock this check is final.
+        if self.inner.stop.load(Ordering::SeqCst) {
+            drop(q);
+            self.inner.slots.release();
+            self.inner.sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+                "reason": "drainer_stopped",
+                "row_id": row.id,
+            }));
+            return false;
+        }
         q.push_back(row);
         self.inner.queue_cv.notify_one();
         true
@@ -239,8 +281,14 @@ impl Drainer {
         let mut st = lock_or_recover(&self.inner.stats);
         loop {
             let done = st.drained_total + st.dead_lettered_total;
-            if done >= target {
+            // Once stopping, slot counts no longer track queued rows; wait
+            // for the drain thread, which handles every queued row first.
+            let stopping = self.inner.stop.load(Ordering::SeqCst);
+            if done >= target && !stopping {
                 return true;
+            }
+            if self.inner.exited.load(Ordering::SeqCst) {
+                return stopping && !self.inner.panicked.load(Ordering::SeqCst);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -283,15 +331,32 @@ impl Drainer {
 
     /// Stop the drainer: signal the background thread to exit, then join.
     /// Remaining rows get one final drain attempt with no retry.
+    /// The join has no timeout: the thread may be inside a host callback,
+    /// and the host may drop that callback once stop returns. If the join
+    /// takes longer than `timeout`, an `audit_drain_stop_slow` event says so.
     pub fn stop(&self, timeout: Duration) {
         self.inner.stop.store(true, Ordering::SeqCst);
         self.inner.slots.release_all();
-        self.inner.queue_cv.notify_all();
-        let deadline = Instant::now() + timeout;
+        {
+            // Notify under the queue lock so the drain loop can't miss it
+            // between its stop check and its wait.
+            let _q = lock_or_recover(&self.inner.queue);
+            self.inner.queue_cv.notify_all();
+        }
         if let Some(h) = lock_or_recover(&self.handle).take() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = h.join(); // join ignores timeout — thread exits quickly on stop
-            let _ = remaining;
+            let started = Instant::now();
+            let joined = h.join();
+            let depth = lock_or_recover(&self.inner.queue).len();
+            if joined.is_err() {
+                self.inner.sys_event("error", "audit_drain_abandoned", &serde_json::json!({
+                    "reason": "drain_thread_panicked",
+                    "depth": depth,
+                }));
+            } else if started.elapsed() > timeout {
+                self.inner.sys_event("warn", "audit_drain_stop_slow", &serde_json::json!({
+                    "waited_seconds": started.elapsed().as_secs_f64(),
+                }));
+            }
         }
     }
 }
@@ -305,6 +370,21 @@ impl Drop for Drainer {
 // ── Drain loop (background thread) ────────────────────────────────────────
 
 fn drain_loop(inner: Arc<DrainerInner>) {
+    // Runs on normal return and on panic, so flush never waits on a dead thread.
+    struct Exit<'a>(&'a DrainerInner);
+    impl Drop for Exit<'_> {
+        fn drop(&mut self) {
+            let _st = lock_or_recover(&self.0.stats);
+            self.0.panicked.store(thread::panicking(), Ordering::SeqCst);
+            self.0.exited.store(true, Ordering::SeqCst);
+            self.0.flush_cv.notify_all();
+        }
+    }
+    let _exit = Exit(&inner);
+    drain_rows(&inner);
+}
+
+fn drain_rows(inner: &Arc<DrainerInner>) {
     loop {
         let row = {
             let mut q = lock_or_recover(&inner.queue);
@@ -315,7 +395,8 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                 if inner.stop.load(Ordering::Acquire) {
                     return; // exit cleanly
                 }
-                q = cv_wait_or_recover(&inner.queue_cv, q);
+                q = inner.queue_cv.wait_timeout(q, Duration::from_secs(1))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).0;
                 if inner.stop.load(Ordering::Acquire) && q.is_empty() {
                     return;
                 }
@@ -331,25 +412,29 @@ fn drain_loop(inner: Arc<DrainerInner>) {
             let result = match call {
                 Ok(r) => r,
                 Err(_) => {
-                    on_dead_letter(&inner, &row, attempt + 1, "store.insert panicked");
+                    on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
                     break;
                 }
             };
             match result {
                 Ok(()) => {
-                    on_success(&inner);
+                    on_success(inner);
                     break;
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     attempt += 1;
-                    if attempt >= inner.cfg.max_attempts || in_shutdown {
-                        on_dead_letter(&inner, &row, attempt, &msg);
+                    // Spec §10: no retry once stopping. Spec §3: no retry for
+                    // a row the store rejected.
+                    if attempt >= inner.cfg.max_attempts || in_shutdown
+                        || inner.stop.load(Ordering::Acquire) || rejected(&e)
+                    {
+                        on_dead_letter(inner, &row, attempt, &msg);
                         break;
                     }
-                    on_failure(&inner, &msg, attempt);
+                    on_failure(inner, &msg, attempt);
                     // Wait out the backoff
-                    let backoff = compute_backoff(&inner, attempt);
+                    let backoff = compute_backoff(inner, attempt);
                     let deadline = Instant::now() + backoff;
                     loop {
                         let rem = deadline.saturating_duration_since(Instant::now());
@@ -361,6 +446,12 @@ fn drain_loop(inner: Arc<DrainerInner>) {
             }
         }
     }
+}
+
+/// The store refused the row itself, so retrying cannot help: an insert
+/// callback returned a negative code (`FASTEN_INSERT_REJECTED`).
+fn rejected(e: &Error) -> bool {
+    matches!(e, Error::CallbackFailed(rc) if *rc < 0)
 }
 
 fn on_success(inner: &DrainerInner) {
@@ -376,16 +467,22 @@ fn on_success(inner: &DrainerInner) {
     st.failure_burst_at = None;
     st.last_error = None;
     st.degraded_fired = false;
-    st.drained_total += 1;
     drop(st);
-    inner.slots.release();
-    inner.flush_cv.notify_all();
+    // The event goes out before the row counts as drained, so it is visible
+    // once flush returns.
     if recovering {
         let r = (recovery_secs * 1000.0).round() / 1000.0;
-        sys_event("info", "audit_drain_recovered", &serde_json::json!({
+        inner.sys_event("info", "audit_drain_recovered", &serde_json::json!({
             "recovery_after_seconds": r,
         }));
     }
+    // Count and release together, so flush's target (counted + used) never
+    // sees the row twice.
+    let mut st = lock_or_recover(&inner.stats);
+    st.drained_total += 1;
+    inner.slots.release();
+    drop(st);
+    inner.flush_cv.notify_all();
 }
 
 fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
@@ -405,7 +502,7 @@ fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
     drop(st);
 
     if should_failed {
-        sys_event("warn", "audit_drain_failed", &serde_json::json!({ "error": msg }));
+        inner.sys_event("warn", "audit_drain_failed", &serde_json::json!({ "error": msg }));
     }
     if should_degraded {
         let st2 = lock_or_recover(&inner.stats);
@@ -417,7 +514,7 @@ fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
             .unwrap_or(0.0);
         drop(st2);
         lock_or_recover(&inner.stats).degraded_fired = true;
-        sys_event("error", "audit_drain_degraded", &serde_json::json!({
+        inner.sys_event("error", "audit_drain_degraded", &serde_json::json!({
             "retry_count": attempt,
             "in_backoff_seconds": remaining,
             "last_error": msg,
@@ -426,6 +523,12 @@ fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
 }
 
 fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
+    // As in on_success, the event goes out before the row counts as handled.
+    inner.sys_event("error", "audit_drain_dead_letter", &serde_json::json!({
+        "row_id": row.id,
+        "attempt_count": attempts,
+        "last_error": msg,
+    }));
     let mut st = lock_or_recover(&inner.stats);
     st.dead_lettered_total += 1;
     if st.dlq.len() >= DLQ_RING_SIZE {
@@ -435,14 +538,9 @@ fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
     st.retry_count = 0;
     st.in_backoff_until = None;
     st.failure_burst_at = None;
-    drop(st);
     inner.slots.release();
+    drop(st);
     inner.flush_cv.notify_all();
-    sys_event("error", "audit_drain_dead_letter", &serde_json::json!({
-        "row_id": row.id,
-        "attempt_count": attempts,
-        "last_error": msg,
-    }));
 }
 
 fn compute_backoff(inner: &DrainerInner, attempt: usize) -> Duration {
@@ -479,7 +577,61 @@ fn compute_backoff_val(
 
 // ── Sys-stream emission ────────────────────────────────────────────────────
 
-fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
+impl DrainerInner {
+    fn sys_event(&self, level: &str, event: &str, fields: &serde_json::Value) {
+        match &self.sys_log {
+            // A panicking host sink must not take the drain thread down.
+            Some(sink) => {
+                let line = sys_line(level, event, fields);
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| sink(&line)));
+            }
+            None => {
+                let _ = writeln!(std::io::stderr(), "{}", sys_line(level, event, fields));
+            }
+        }
+    }
+}
+
+/// Ends a call started by `Drainer::begin_call`.
+pub(crate) struct CallGuard(Arc<DrainerInner>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        *lock_or_recover(&self.0.calls) -= 1;
+        self.0.calls_cv.notify_all();
+    }
+}
+
+impl Drainer {
+    /// Count a call that may emit through the sys sink. The FFI starts it
+    /// under the handle's drainer lock, so none starts once the drainer is
+    /// taken off the handle, and `wait_calls` then bounds the rest.
+    pub(crate) fn begin_call(&self) -> CallGuard {
+        *lock_or_recover(&self.inner.calls) += 1;
+        CallGuard(Arc::clone(&self.inner))
+    }
+
+    /// Wait until no call started by `begin_call` is running. After stop
+    /// these calls return promptly: enqueue is refused and its wait released.
+    pub(crate) fn wait_calls(&self) {
+        let mut n = lock_or_recover(&self.inner.calls);
+        while *n > 0 {
+            n = self.inner.calls_cv.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn calls_in_flight(&self) -> usize {
+        *lock_or_recover(&self.inner.calls)
+    }
+
+    /// Emit a sys event through this drainer's sink (stderr when it has none).
+    pub(crate) fn sys_event(&self, level: &str, event: &str, fields: &serde_json::Value) {
+        self.inner.sys_event(level, event, fields);
+    }
+}
+
+fn sys_line(level: &str, event: &str, fields: &serde_json::Value) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut obj = serde_json::json!({
         "shape": "sys",
@@ -492,6 +644,42 @@ fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
             o.insert(k.clone(), v.clone());
         }
     }
-    let line = serde_json::to_string(&obj).unwrap_or_default();
-    let _ = writeln!(std::io::stderr(), "{line}");
+    serde_json::to_string(&obj).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use crate::store::Filter;
+
+    struct OkStore;
+
+    impl Store for OkStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> { Ok(()) }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// A slot flush counts but whose row never gets queued, as when enqueue
+    /// is refused at stop: flush must return once the drain thread is gone.
+    #[test]
+    fn flush_returns_once_the_drain_thread_has_exited() {
+        let d = Drainer::new(Box::new(OkStore), DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts: 3,
+        });
+        d.stop(Duration::from_secs(2));
+        d.inner.slots.acquire();
+        let start = Instant::now();
+        assert!(d.flush(Duration::from_secs(30)));
+        assert!(start.elapsed() < Duration::from_secs(5), "flush waited for its timeout");
+    }
 }

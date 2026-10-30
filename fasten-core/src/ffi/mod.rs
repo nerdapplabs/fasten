@@ -18,7 +18,7 @@ pub(crate) mod redact;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::panic;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{
     drainer::Drainer,
@@ -55,7 +55,13 @@ where
 /// Heap-allocated, type-erased store + optional drainer. C sees only `FastenStore*`.
 pub struct FastenStoreHandle {
     store: Arc<dyn Store>,
-    drainer: Option<Arc<Drainer>>,
+    // Callers clone the Arc under the lock, so a drainer closed by one thread
+    // stays usable for calls already in progress on others.
+    drainer: Mutex<Option<Arc<Drainer>>>,
+    // Drainers being flushed or stopped by install/close; flush waits for them.
+    retiring: Mutex<Vec<Arc<Drainer>>>,
+    // Signalled when a drainer leaves `retiring`.
+    retired: Condvar,
 }
 
 /// Write the error string and return the error code.
@@ -113,7 +119,12 @@ pub unsafe extern "C" fn fasten_store_open(
             other => return Err(Error::UnknownBackend(other.to_owned())),
         };
 
-        Ok(Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None })))
+        Ok(Box::into_raw(Box::new(FastenStoreHandle {
+            store,
+            drainer: Mutex::new(None),
+            retiring: Mutex::new(Vec::new()),
+            retired: Condvar::new(),
+        })))
     });
 
     match result {
@@ -381,7 +392,8 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
 
 // ── Callback-backed store ──────────────────────────────────────────────────
 
-/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`.
+/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`; a negative
+/// code means the row itself was rejected and is not retried.
 pub type CInsertFn = unsafe extern "C" fn(*const c_char, *mut std::ffi::c_void) -> i32;
 
 struct SendRawPtr(*mut std::ffi::c_void);
@@ -419,7 +431,12 @@ pub unsafe extern "C" fn fasten_store_from_callback(
     _out_err: *mut *mut c_char,
 ) -> *mut FastenStoreHandle {
     let store: Arc<dyn Store> = Arc::new(CallbackStore { fn_ptr, ud: SendRawPtr(userdata) });
-    Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None }))
+    Box::into_raw(Box::new(FastenStoreHandle {
+        store,
+        drainer: Mutex::new(None),
+        retiring: Mutex::new(Vec::new()),
+        retired: Condvar::new(),
+    }))
 }
 
 /// Close the store (and any attached drainer) and release all resources.
@@ -428,12 +445,13 @@ pub unsafe extern "C" fn fasten_store_from_callback(
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
     if !handle.is_null() {
-        // Stop drainer first so its background thread exits cleanly before
-        // the store Arc's ref-count drops to zero.
-        let h = &mut *handle;
-        if let Some(d) = h.drainer.take() {
-            d.stop(std::time::Duration::from_secs(2));
+        // Stop every drainer first, including one an install on another
+        // thread is retiring, so no drain thread outlives the handle.
+        let h = &*handle;
+        if let Some(d) = drainer::swap(h, None) {
+            drainer::retire(h, &d, None);
         }
+        drainer::wait_retired(h);
         drop(Box::from_raw(handle));
     }
 }
