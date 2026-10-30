@@ -75,6 +75,13 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME pii_in_detail_smoke COMMAND pii_in_detail_smoke)
 
+    add_executable(queue_row_columns_smoke tests/queue_row_columns_smoke.cpp)
+    target_link_libraries(queue_row_columns_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(queue_row_columns_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME queue_row_columns_smoke COMMAND queue_row_columns_smoke)
+
     # REVIEW.md item #1: substring-redact regression guard
     add_executable(redact_substring_smoke tests/redact_substring_smoke.cpp)
     target_link_libraries(redact_substring_smoke PRIVATE fasten)
