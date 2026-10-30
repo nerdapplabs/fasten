@@ -12,6 +12,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PostgresStore } from '../src/store/postgres.js';
+import { Engine, register as registerCodes } from '../src/index.js';
 
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
 const skip = !DSN;
@@ -342,4 +343,129 @@ test('a table the JS store creates can be read by Python and Go', { skip }, asyn
     } finally {
         await admin.end();
     }
+});
+
+// ── #124: two engines on one node (#92) and PII redaction (#90) ────────────
+
+registerCodes('t124', {
+    T124_EVENT: { domain: 't124', action: 'do', severity: 'info', retentionClass: 'long' },
+    T124_PII: {
+        domain: 't124', action: 'do', severity: 'info',
+        piiInDetail: true, detailPassthroughKeys: ['email'],
+    },
+    T124_PLAIN: { domain: 't124', action: 'do', severity: 'info', retentionClass: 'long' },
+});
+
+async function _withTable(fn) {
+    const { default: pg } = await import('pg');
+    const admin = new pg.Pool({ connectionString: DSN });
+    const t = `t124_${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+    const stores = [];
+    const mk = () => { const s = new PostgresStore(DSN, { table: t }); stores.push(s); return s; };
+    try {
+        await fn({ admin, t, mk });
+    } finally {
+        for (const s of stores) await s.close().catch(() => {});
+        await admin.query(`DROP TABLE IF EXISTS ${t}`);
+        await admin.end();
+    }
+}
+
+test('two engines on one node get seqs 1..N with no chain fields (#92)', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const engines = [new Engine(), new Engine()];
+        engines.forEach((e) => e.init({ serviceId: 'svc', nodeId: 'node-92', auditStore: mk() }));
+        try {
+            for (let i = 0; i < 20; i++) {
+                engines[i % 2].emit({ code: 'T124_EVENT', target: `x-${i}` });
+            }
+            for (const e of engines) assert.equal(await e.flush(10_000), true);
+            const r = await admin.query(
+                `SELECT monotonic_seq, prev_hash, hash FROM ${t} WHERE source_node_id = 'node-92' ORDER BY monotonic_seq`);
+            assert.deepEqual(r.rows.map((x) => Number(x.monotonic_seq)),
+                Array.from({ length: 20 }, (_, i) => i + 1));
+            for (const x of r.rows) assert.deepEqual([x.prev_hash, x.hash], ['', '']);
+        } finally {
+            engines.forEach((e) => e.resetForTests());
+        }
+    });
+});
+
+test('redactExpired clears old PII rows and records each one (#90)', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const e = new Engine();
+        e.init({ serviceId: 'svc', nodeId: 'node-90', auditStore: s, auditStoreFailureStrategy: 'raise' });
+        try {
+            const old = _daysAgo(40);
+            const pii = makeRow({ monotonic_seq: 0, source_node_id: 'node-90', code: 'T124_PII', timestamp: old, pii_in_detail: true, detail: { email: 'a@b.com' } });
+            const plain = makeRow({ monotonic_seq: 0, source_node_id: 'node-90', code: 'T124_PLAIN', timestamp: old });
+            const fresh = makeRow({ monotonic_seq: 0, source_node_id: 'node-90', code: 'T124_PII', pii_in_detail: true });
+            for (const r of [pii, plain, fresh]) await s.insert(r);
+            // A form-"1" row sealed by another SDK: its detail is hashed, so it stays.
+            const sealed = makeRow({ monotonic_seq: 99, source_node_id: 'node-90', code: 'T124_PII', timestamp: old });
+            await s.insert(sealed);
+            await admin.query(`UPDATE ${t} SET hash = 'abc', prev_hash = 'genesis' WHERE id = $1`, [sealed.id]);
+
+            const cutoff = new Date(Date.now() - 30 * 86_400_000);
+            assert.deepEqual(await e.redactExpired({ before: cutoff }), [pii.id]);
+
+            const byId = async (id) => (await admin.query(
+                `SELECT detail, detail_salt, hash FROM ${t} WHERE id = $1`, [id])).rows[0];
+            assert.deepEqual(await byId(pii.id), { detail: 'null', detail_salt: '', hash: '' });
+            assert.equal(JSON.parse((await byId(plain.id)).detail).email, 'a@b.com');
+            assert.notEqual((await byId(fresh.id)).detail, 'null');
+            assert.notEqual((await byId(sealed.id)).detail, 'null');
+
+            const rec = await admin.query(
+                `SELECT target, detail, monotonic_seq FROM ${t} WHERE code = 'AUDIT_ROW_REDACTED'`);
+            assert.equal(rec.rows.length, 1);
+            assert.equal(rec.rows[0].target, pii.id);
+            const [{ monotonic_seq: piiSeq }] = (await admin.query(
+                `SELECT monotonic_seq FROM ${t} WHERE id = $1`, [pii.id])).rows;
+            assert.deepEqual(JSON.parse(rec.rows[0].detail),
+                { redacted_seq: Number(piiSeq), reason: 'retention', redacted_id: pii.id });
+            assert.equal(await s.count(), 5);
+
+            // Idempotent: nothing left to redact, no second record.
+            assert.deepEqual(await e.redactExpired({ before: cutoff }), []);
+            assert.equal(await s.count({ code: 'AUDIT_ROW_REDACTED' }), 1);
+            assert.deepEqual(await s.redactRows({ ids: [pii.id, sealed.id] }), [pii.id]);
+        } finally {
+            e.resetForTests();
+        }
+    });
+});
+
+test('redactRows writes an empty salt on a table the Go store created', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        await admin.query(GO_DDL(t));
+        const s = mk();
+        const row = makeRow({ monotonic_seq: 0, code: 'T124_PII' });
+        await s.insert(row);
+        assert.deepEqual(await s.redactRows({ ids: [row.id] }), [row.id]);
+        const r = await admin.query(`SELECT detail, detail_salt FROM ${t} WHERE id = $1`, [row.id]);
+        assert.deepEqual(r.rows[0], { detail: 'null', detail_salt: '' });
+    });
+});
+
+test('retentionPii runs the redaction on init', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const row = makeRow({ monotonic_seq: 0, code: 'T124_PII', timestamp: _daysAgo(40) });
+        await s.insert(row);
+        const e = new Engine();
+        e.init({ serviceId: 'svc', nodeId: 'node-r', auditStore: s, retentionPii: '30d' });
+        try {
+            let detail;
+            for (let i = 0; i < 100 && detail !== 'null'; i++) {
+                await new Promise((r) => setTimeout(r, 50));
+                detail = (await admin.query(`SELECT detail FROM ${t} WHERE id = $1`, [row.id])).rows[0].detail;
+            }
+            assert.equal(detail, 'null');
+            assert.equal(await s.count({ code: 'AUDIT_ROW_REDACTED' }), 1);
+        } finally {
+            e.resetForTests();
+        }
+    });
 });

@@ -213,6 +213,12 @@ export class PostgresStore {
 		const client = await this._pool.connect();
 		try {
 			await client.query("BEGIN");
+			// Stores starting together on a new table race on CREATE TABLE.
+			// Same key as the Python store's bootstrap lock.
+			await client.query(
+				"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+				[`fasten.bootstrap.${this._table}`],
+			);
 			if (this._schema) {
 				await client.query(`CREATE SCHEMA IF NOT EXISTS ${this._schema}`);
 			}
@@ -432,6 +438,57 @@ export class PostgresStore {
 		if (respectUnshipped) sql += " AND shipped_at IS NOT NULL";
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
+	}
+
+	/**
+	 * Rows of `codes` older than `before` that redaction would clear (spec §7.1),
+	 * oldest seq first. A row is redactable when it is unsealed (`hash` empty,
+	 * as every JS row is) or sealed under form "2". `skipped` counts sealed
+	 * form-"1" rows past the cutoff: their detail is hashed, so they stay.
+	 *
+	 * @param {{ before: Date | string, codes: string[] }} opts
+	 * @returns {Promise<{ candidates: { id: string, monotonicSeq: number }[], skipped: number }>}
+	 */
+	async listRedactionCandidates({ before, codes }) {
+		if (!codes || codes.length === 0) return { candidates: [], skipped: 0 };
+		await this._ensureReady();
+		const cutoff = before instanceof Date ? canonicalTS(before) : before;
+		const skippedRes = await this._pool.query(
+			`SELECT COUNT(*) FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND hash <> '' AND canonical_form_id <> '2'`,
+			[cutoff, codes],
+		);
+		const res = await this._pool.query(
+			`SELECT id, monotonic_seq FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND (hash = '' OR canonical_form_id = '2') ORDER BY monotonic_seq`,
+			[cutoff, codes],
+		);
+		return {
+			candidates: res.rows.map((r) => ({
+				id: r.id,
+				monotonicSeq: Number(r.monotonic_seq),
+			})),
+			skipped: Number(skippedRes.rows[0].count),
+		};
+	}
+
+	/**
+	 * Clear `detail` (to the JSON literal `null`) and `detail_salt` on the
+	 * given rows. Never deletes. Returns the ids that are redacted now,
+	 * including ones an earlier call already redacted, so a retry returns the
+	 * same list.
+	 *
+	 * @param {{ ids: string[] }} opts
+	 * @returns {Promise<string[]>}
+	 */
+	async redactRows({ ids }) {
+		if (!ids || ids.length === 0) return [];
+		await this._ensureReady();
+		// '' rather than NULL: Go's table and the Go reader need a string, and
+		// Python treats '' as no salt.
+		const res = await this._pool.query(
+			`UPDATE ${this._table} SET detail = 'null', detail_salt = '' WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2') RETURNING id`,
+			[ids],
+		);
+		return res.rows.map((r) => r.id);
 	}
 
 	/**

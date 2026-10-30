@@ -53,6 +53,10 @@ export interface Meta {
 
 export function register(domain: Domain, codes: Record<string, Meta>): void;
 export function metaOf(code: string): Meta | undefined;
+/** Codes that declare piiInDetail or are classified SHORT, sorted. */
+export function piiCodes(): string[];
+/** "30d" / "24h" / "90m" / "3600s" to milliseconds. Throws on anything else. */
+export function parseDuration(s: string): number;
 export function dump(): string;
 
 // --- Row -----------------------------------------------------------------
@@ -107,6 +111,11 @@ export interface InitOptions {
 	queueRetryInitialMs?: number;
 	queueRetryMaxMs?: number;
 	queueRetryJitter?: boolean;
+	/**
+	 * Redact PII rows older than this ("30d", "24h"). Also read from
+	 * FASTEN_RETENTION_PII. Checked on init and then hourly.
+	 */
+	retentionPii?: string;
 }
 
 export function init(opts?: InitOptions): void;
@@ -160,6 +169,21 @@ export function queueStats(): QueueStats | null;
 // drained. No-op + true in raise mode.
 export function flush(timeoutMs?: number): Promise<boolean>;
 
+export interface RedactExpiredOptions {
+	before: Date | string;
+	/** Defaults to piiCodes(). */
+	codes?: string[];
+	/** Recorded in each AUDIT_ROW_REDACTED row. Defaults to "retention". */
+	reason?: string;
+}
+
+/**
+ * Sets `detail` to null on PII rows older than `before`, writing one
+ * AUDIT_ROW_REDACTED row per redacted row first (spec §7). Never deletes.
+ * Returns the ids redacted.
+ */
+export function redactExpired(opts: RedactExpiredOptions): Promise<string[]>;
+
 // --- Store interfaces ----------------------------------------------------
 
 export interface Filter {
@@ -182,6 +206,15 @@ export interface AuditRepository {
 		before: Date | string,
 		respectUnshipped: boolean,
 	): Promise<number> | number;
+	// Spec §7.1; needed by redactExpired and retentionPii.
+	listRedactionCandidates?(opts: {
+		before: Date | string;
+		codes: string[];
+	}): Promise<{
+		candidates: { id: string; monotonicSeq: number }[];
+		skipped: number;
+	}>;
+	redactRows?(opts: { ids: string[] }): Promise<string[]>;
 }
 
 export interface AuditOutboxRepository {
@@ -206,6 +239,9 @@ declare const _default: {
 	withRequestID: typeof withRequestID;
 	queueStats: typeof queueStats;
 	flush: typeof flush;
+	redactExpired: typeof redactExpired;
+	piiCodes: typeof piiCodes;
+	parseDuration: typeof parseDuration;
 	AuditStoreError: typeof AuditStoreError;
 };
 export default _default;
