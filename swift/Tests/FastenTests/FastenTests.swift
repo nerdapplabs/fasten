@@ -1,4 +1,9 @@
 import XCTest
+#if canImport(SQLite3)
+import SQLite3
+#else
+import CSQLite3
+#endif
 @testable import Fasten
 
 // MARK: - Codes + Registry
@@ -179,6 +184,87 @@ final class SQLiteStoreTests: XCTestCase {
 
     func testInvalidTableNameThrows() {
         XCTAssertThrowsError(try SQLiteStore(path: ":memory:", table: "bad-name!"))
+    }
+
+    private func row(_ id: String) -> AuditRow {
+        AuditRow(wireVersion: "1", id: id, originID: id, monotonicSeq: 1,
+                 timestamp: isoNow(), code: "TEST", action: "test", severity: "info",
+                 serviceID: "svc", sourceNodeID: "node", tenantID: nil, actor: "svc",
+                 actorKind: "service", target: "res", category: "test", domain: "test",
+                 method: "sdk", requestID: "req-001", detail: [:], shippedAt: nil,
+                 prevHash: "genesis", hash: "")
+    }
+
+    private func tempPath() -> String {
+        let path = NSTemporaryDirectory() + "fasten-\(UUID().uuidString).db"
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
+        return path
+    }
+
+    private func otherConnection(_ path: String, _ sql: String) -> OpaquePointer? {
+        var db: OpaquePointer?
+        sqlite3_open(path, &db)
+        sqlite3_exec(db, sql, nil, nil, nil)
+        return db
+    }
+
+    func testInsertThrowsWhenTableIsGone() throws {
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        sqlite3_close(otherConnection(path, "DROP TABLE audit_log"))
+        XCTAssertThrowsError(try store.insert(row("evt-gone")))
+    }
+
+    func testInsertThrowsWhenDatabaseIsLocked() throws {
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        let other = otherConnection(path, "BEGIN EXCLUSIVE")
+        defer { sqlite3_close(other) }
+        XCTAssertThrowsError(try store.insert(row("evt-locked")))
+    }
+
+    func testRaiseModeEmitThrowsWhenInsertFails() throws {
+        Fasten.register("user", codes: [
+            "USER_CREATED": Meta(id: "USER_CREATED", domain: "user",
+                                 category: "account", action: "create",
+                                 description: "Test", emitter: "test"),
+        ])
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        sqlite3_close(otherConnection(path, "DROP TABLE audit_log"))
+        XCTAssertThrowsError(try Fasten.emit("USER_CREATED", target: "res-1", actor: "admin"))
+    }
+
+    func testQueueModeRetriesWhileTheDatabaseIsLocked() throws {
+        Fasten.register("user", codes: [
+            "USER_CREATED": Meta(id: "USER_CREATED", domain: "user",
+                                 category: "account", action: "create",
+                                 description: "Test", emitter: "test"),
+        ])
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .queue)
+        let other = otherConnection(path, "BEGIN EXCLUSIVE")
+        try Fasten.emit("USER_CREATED", target: "res-1", actor: "admin")
+        XCTAssertFalse(Fasten.flush(timeout: 0.3))
+        XCTAssertEqual(store.maxMonotonicSeq(), 0)
+        sqlite3_exec(other, "COMMIT", nil, nil, nil)
+        sqlite3_close(other)
+        XCTAssertTrue(Fasten.flush(timeout: 5))
+        XCTAssertEqual(store.maxMonotonicSeq(), 1)
+    }
+
+    func testDrainerKeepsTheStoreErrorMessage() throws {
+        let path = tempPath()
+        let store = try SQLiteStore(path: path)
+        let other = otherConnection(path, "BEGIN EXCLUSIVE")
+        defer { sqlite3_close(other) }
+        let drainer = QueueDrainer(store: store, retryInitialMs: 20, retryMaxMs: 20, retryJitter: false)
+        defer { drainer.close() }
+        drainer.enqueue(row("evt-locked"))
+        XCTAssertFalse(drainer.flush(timeout: 0.2))
+        XCTAssertTrue(drainer.statsJSON.contains("SQLite insert failed"), drainer.statsJSON)
     }
 }
 

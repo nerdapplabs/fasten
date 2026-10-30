@@ -32,7 +32,10 @@ let package = Package(
         ),
         .testTarget(
             name: "FastenTests",
-            dependencies: ["Fasten"],
+            dependencies: [
+                "Fasten",
+                .target(name: "CSQLite3", condition: .when(platforms: [.linux])),
+            ],
             path: "Tests/FastenTests"
         ),
     ]

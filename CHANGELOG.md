@@ -92,6 +92,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — Swift `SQLiteStore.insert` reports SQLite errors
+
+- `insert` throws when prepare or step fails. Raise mode reports the error and
+  the queue drainer retries the row; before, the row was dropped silently.
+- `FastenError` conforms to `LocalizedError`, so `localizedDescription` carries
+  the store's message.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
