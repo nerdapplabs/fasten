@@ -102,9 +102,12 @@ successful insert so the next failure burst can re-emit `audit_drain_degraded`.
 **Rejected rows.** When the store rejects the row itself (bad content,
 a constraint it can never meet), retrying cannot help, and the row would
 hold up every row behind it for the whole retry budget. Such a failure
-MUST dead-letter the row on that attempt. Over the shared C ABI, an insert
+SHOULD dead-letter the row on that attempt. Over the shared C ABI, an insert
 callback signals it by returning a negative code (`FASTEN_INSERT_REJECTED`);
-any positive code is retried as usual.
+any positive code is retried as usual. Only insert callbacks can signal
+this for now: the native stores, the Rust SDK's store adapter and the JS
+and Swift drainers cannot tell a rejected row from a failed write yet, so
+they retry it.
 
 ---
 

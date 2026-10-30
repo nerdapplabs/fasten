@@ -69,7 +69,9 @@ pub(super) fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Optio
             "dead_lettered": dead,
         }));
     }
-    retiring(h).retain(|d| !Arc::ptr_eq(d, old));
+    // Notify under the lock: once it is released, close may free the handle.
+    let mut r = retiring(h);
+    r.retain(|d| !Arc::ptr_eq(d, old));
     h.retired.notify_all();
 }
 
@@ -612,6 +614,30 @@ mod tests {
         assert_eq!(RETIRE_CALLS.load(Ordering::SeqCst), 3, "close returned before the old drainer stopped");
         assert!(matches!(installer.join(), Ok(FastenErrorCode::Ok)));
         unsafe { fasten_store_close(h) };
+    }
+
+    /// `fasten_store_close` while an install on another thread is retiring
+    /// the old drainer: the handle is freed only after that install is done
+    /// with it. The race window is small, so this rarely fails without the fix.
+    #[test]
+    fn store_close_while_another_install_is_retiring() {
+        for _ in 0..50 {
+            let h = unsafe { fasten_store_from_callback(slow_ok, std::ptr::null_mut(), std::ptr::null_mut()) };
+            unsafe { fasten_drainer_install(h, 8, 5, 5, 0, 3, std::ptr::null_mut()) };
+            unsafe { fasten_drainer_enqueue(h, ROW.as_ptr().cast::<c_char>(), std::ptr::null_mut()) };
+            let addr = h as usize;
+            let installer = thread::spawn(move || unsafe {
+                fasten_drainer_install(addr as *mut FastenStoreHandle, 8, 5, 5, 0, 3, std::ptr::null_mut())
+            });
+            let start = std::time::Instant::now();
+            while unsafe { &*h }.retiring.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                thread::yield_now();
+            }
+            unsafe { fasten_store_close(h) };
+            assert!(matches!(installer.join(), Ok(FastenErrorCode::Ok)));
+        }
     }
 
     static SWAP_STORED: AtomicUsize = AtomicUsize::new(0);
