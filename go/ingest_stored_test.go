@@ -276,6 +276,20 @@ func TestIngestOneIDOnTwoNodesInABatchIsRejected(t *testing.T) {
 	}
 }
 
+func TestIngestOneIDTwiceOnOneNodeInABatchIsRejected(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(3, "svc", "node-1")
+	for i := range rows {
+		rows[i].ID, rows[i].OriginID = "evt-x", "evt-x"
+	}
+	res := ingestOK(t, s, resealFrom("genesis", rows))
+	if res.RejectedFromSeq != 2 || res.Inserted != 1 || !strings.Contains(res.Reason, "also in this batch") {
+		t.Fatalf("want a rejection at 2, got %+v", res)
+	}
+	if storedCount(t, s) != 1 {
+		t.Fatal("want only seq 1 stored")
+	}
+}
+
 func TestIngestARowAfterAStoredUnsealedRowLinksToGenesis(t *testing.T) {
 	s, rows := ingestStore(t), makeRemoteChain(2, "svc", "node-1")
 	unsealed := rows[0]

@@ -199,12 +199,14 @@ def stored_conflict(
     # The stored neighbours are checked even when the batch holds one too: the
     # batch neighbour may be cut by a later break, and if both are kept they
     # must agree anyway.
-    node_of: dict[str, str] = {}
+    seen: dict[str, tuple[str, int]] = {}
     for row in sorted(prefix, key=lambda r: (r.monotonic_seq, r.source_node_id)):
         node, seq = row.source_node_id, row.monotonic_seq
-        # id is unique across nodes, so only one of these could be stored.
-        if node_of.setdefault(row.id, node) != node:
-            return seq, f"row {row.id}: also in this batch on node {node_of[row.id]!r}"
+        # id is unique, so the store could keep only one row with it.
+        if row.id in seen:
+            n, s = seen[row.id]
+            return seq, f"row {row.id}: also in this batch at seq {s} on node {n!r}"
+        seen[row.id] = (node, seq)
         held = by_id(row.id)
         if held is not None:
             if held != row.hash:

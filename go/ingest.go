@@ -113,14 +113,14 @@ func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix []Row
 		}
 		return ordered[i].SourceNodeID < ordered[j].SourceNodeID
 	})
-	nodeOf := map[string]string{}
+	seen := map[string]Row{}
 	for _, row := range ordered {
 		node, seq := row.SourceNodeID, row.MonotonicSeq
-		// id is unique across nodes, so only one of these could be stored.
-		if other, seen := nodeOf[row.ID]; seen && other != node {
-			return seq, fmt.Sprintf("row %s: also in this batch on node '%s'", row.ID, other), nil
+		// id is unique, so the store could keep only one row with it.
+		if first, ok := seen[row.ID]; ok {
+			return seq, fmt.Sprintf("row %s: also in this batch at seq %d on node '%s'", row.ID, first.MonotonicSeq, first.SourceNodeID), nil
 		}
-		nodeOf[row.ID] = node
+		seen[row.ID] = row
 		held, ok, err := l.byID(ctx, tx, row.ID)
 		if err != nil {
 			return 0, "", err

@@ -112,6 +112,15 @@ def test_one_id_on_two_nodes_in_a_batch_is_rejected():
     assert _stored(store) == []
 
 
+def test_one_id_twice_on_one_node_in_a_batch_is_rejected():
+    store = SQLiteStore(":memory:")
+    rows = _chain([1, 2, 3], rid="evt-x")
+    result = ingest(store, rows)
+    assert result.rejected_from_seq == 2 and result.inserted == 1
+    assert "also in this batch" in result.reason
+    assert [s for s, _, _ in _stored(store)] == [1]
+
+
 def test_a_row_after_a_stored_unsealed_row_links_to_genesis():
     store = SQLiteStore(":memory:")
     store.insert_originated(dataclasses.replace(_row(1), hash="", prev_hash=""))
