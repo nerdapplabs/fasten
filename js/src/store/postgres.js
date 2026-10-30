@@ -455,7 +455,9 @@ export class PostgresStore {
 		// timestamp is compared as text, so the cutoff must be canonical too.
 		const d = before instanceof Date ? before : new Date(before);
 		if (Number.isNaN(d.getTime())) {
-			throw new Error(`fasten PostgresStore: bad before ${JSON.stringify(before)}`);
+			throw new Error(
+				`fasten PostgresStore: bad before ${JSON.stringify(before)}`,
+			);
 		}
 		const cutoff = canonicalTS(d);
 		const skippedRes = await this._pool.query(
