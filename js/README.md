@@ -81,6 +81,12 @@ raise-mode `emit()` returns a promise for the row; `await` it to see the
 the public surface. Re-`init()` stops the old drainer: rows still queued
 get one more attempt each and are dead-lettered if it fails.
 
+**Chain.** The JS SDK does not seal rows. `emit()` returns the row with
+`monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the
+insert transaction, under the same per-node lock as the Python and Go
+stores; `hash` and `prev_hash` stay empty. `PostgresStore` writes into a
+table the Python or Go store created, and adds the columns it lacks.
+
 **Cross-language deviation.** Node is single-threaded — `emit()`
 cannot synchronously block on a counting semaphore the way Python /
 Go / Rust / C++ do. `queueCapacity` is the high-water-warn threshold

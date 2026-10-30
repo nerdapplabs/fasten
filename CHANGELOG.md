@@ -92,20 +92,35 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
-### Fixed — JS async store errors and drainer stop (#137, items 1, 2, 5)
+### Fixed — JS async store errors, drainer stop and `PostgresStore` (#137)
 
 - Raise mode with a store whose `insert` returns a promise (such as
   `PostgresStore`): `emit()` returns a promise for the row that rejects with
   `AuditStoreError`. It used to return normally, and the rejection ended the
   process as an `unhandledRejection`. A sync store still throws from `emit()`.
+  The TypeScript return type is now `Row | Promise<Row>`.
 - The queue-mode fallback with no drainer logs `audit_sync_fallback_failed`
   for a rejected async insert too.
 - Stopping the drainer (re-`init()`, uninstall) no longer drops rows. It cuts
   any backoff short and gives each row still queued one more attempt; a row
   that fails it is dead-lettered (`audit_drain_dead_letter`), as spec §10
-  says. `stop()` returns a promise that resolves when this is done.
+  says. `stop(timeoutMs)` returns a promise: true once that is done, false if
+  the timeout (5 s) comes first. `flush()` counts a dead-lettered row as done.
 - `audit_drain_degraded` reports the backoff about to start in
   `in_backoff_seconds`; it was always 0.
+- `emit()` no longer makes up `monotonic_seq` from a per-process counter that
+  restarted at 1 (spec §2.1, §8). It returns `monotonic_seq: 0`, and
+  `PostgresStore` allocates the node's next seq in the insert transaction
+  under the same advisory lock as Python and Go. Rows are still unsealed;
+  `init()` logs `audit_chain_unavailable` once to say so (§8.1).
+- Audit row timestamps and `shipped_at` use the canonical form (§4.3).
+- `PostgresStore` can share a table with the Python and Go stores: it inserts
+  with a column list, adds the chain columns (and `pii_in_detail` on a table
+  Python made), writes `shipped_at` in the canonical form instead of `NOW()`,
+  reads `TIMESTAMPTZ` columns back in that form, filters on `tenantId`, and
+  orders `query()` by timestamp.
+- JS CI runs the `PostgresStore` tests against Postgres; they were always
+  skipped. Two purge tests that failed against a real database are fixed.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

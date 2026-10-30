@@ -10,6 +10,8 @@
  *   await store.init();          // run DDL once
  *   fasten.init({ auditStore: store });
  */
+import { canonicalTS } from "../canonical_ts.js";
+
 // pg is an optional peer dep — lazy import so the module loads without it installed.
 let _Pool = null;
 async function _getPool(connectionString) {
@@ -51,8 +53,21 @@ function _ddlStatements(table, idx) {
     request_id     TEXT NOT NULL,
     detail         TEXT NOT NULL,
     pii_in_detail  SMALLINT NOT NULL DEFAULT 0,
-    shipped_at     TEXT
+    shipped_at     TEXT,
+    prev_hash      TEXT NOT NULL DEFAULT 'genesis',
+    hash           TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT,
+    detail_commitment TEXT
 )`,
+		// Columns the Python and Go stores have, for a table created by an
+		// older JS store; and pii_in_detail for a table Python created.
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS pii_in_detail SMALLINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis'`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1'`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS detail_salt TEXT`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS detail_commitment TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_req       ON ${table}(request_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_code      ON ${table}(code)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_ts        ON ${table}(timestamp)`,
@@ -67,12 +82,17 @@ function _ddlStatements(table, idx) {
  * @param {Record<string,unknown>} r
  * @returns {Record<string,unknown>}
  */
+function _ts(v) {
+	// A Go-created table stores TIMESTAMPTZ, which pg returns as a Date.
+	return v instanceof Date ? canonicalTS(v) : (v ?? null);
+}
+
 function _mapRow(r) {
 	return {
 		id: r.id,
 		originId: r.origin_id,
 		monotonicSeq: Number(r.monotonic_seq),
-		timestamp: r.timestamp,
+		timestamp: _ts(r.timestamp),
 		code: r.code,
 		action: r.action,
 		severity: r.severity,
@@ -88,7 +108,9 @@ function _mapRow(r) {
 		requestId: r.request_id,
 		detail: typeof r.detail === "string" ? JSON.parse(r.detail) : r.detail,
 		piiInDetail: Number(r.pii_in_detail) === 1,
-		shippedAt: r.shipped_at ?? null,
+		shippedAt: _ts(r.shipped_at),
+		prevHash: r.prev_hash ?? "",
+		hash: r.hash ?? "",
 	};
 }
 
@@ -96,14 +118,23 @@ function _mapRow(r) {
  * Build a parameterised WHERE clause from filter options.
  * Returns { where, params } where params is already accumulated.
  *
- * @param {{ requestId?, code?, domain?, sourceNodeId?, actor?, target?, since?, until? }} filters
+ * @param {{ requestId?, code?, domain?, sourceNodeId?, tenantId?, actor?, target?, since?, until? }} filters
  * @returns {{ where: string, params: unknown[] }}
  */
 function _buildWhere(filters) {
 	const conds = [];
 	const params = [];
-	const { requestId, code, domain, sourceNodeId, actor, target, since, until } =
-		filters;
+	const {
+		requestId,
+		code,
+		domain,
+		sourceNodeId,
+		tenantId,
+		actor,
+		target,
+		since,
+		until,
+	} = filters;
 
 	if (requestId) {
 		params.push(requestId);
@@ -120,6 +151,10 @@ function _buildWhere(filters) {
 	if (sourceNodeId) {
 		params.push(sourceNodeId);
 		conds.push(`source_node_id = $${params.length}`);
+	}
+	if (tenantId) {
+		params.push(tenantId);
+		conds.push(`tenant_id = $${params.length}`);
 	}
 	if (actor) {
 		params.push(actor);
@@ -203,12 +238,17 @@ export class PostgresStore {
 	 * Insert one audit row.  Ignores duplicate IDs (ON CONFLICT DO NOTHING).
 	 * This is the method the fasten drainer calls.
 	 *
+	 * A row with `monotonic_seq` 0 (what `emit()` returns) gets the node's next
+	 * seq, allocated in the insert's transaction under the same per-node lock
+	 * as the Python and Go stores (spec §2.1). The row is not sealed: `hash`
+	 * and `prev_hash` are empty.
+	 *
 	 * @param {Record<string,unknown>} row  Raw row object from `fasten.emit()`.
 	 * @returns {Promise<void>}
 	 */
 	async insert(row) {
 		await this._ensureReady();
-		const piiFlag = row.pii_in_detail || row.piiInDetail ? 1 : 0;
+		const node = row.source_node_id ?? row.sourceNodeId;
 		const detailStr =
 			typeof row.detail === "string"
 				? row.detail
@@ -216,15 +256,15 @@ export class PostgresStore {
 		const params = [
 			row.id,
 			row.origin_id ?? row.originId,
-			row.monotonic_seq ?? row.monotonicSeq,
+			Number(row.monotonic_seq ?? row.monotonicSeq ?? 0),
 			row.timestamp instanceof Date
-				? row.timestamp.toISOString()
+				? canonicalTS(row.timestamp)
 				: row.timestamp,
 			row.code,
 			row.action,
 			row.severity,
 			row.service_id ?? row.serviceId,
-			row.source_node_id ?? row.sourceNodeId,
+			node,
 			row.tenant_id ?? row.tenantId ?? null,
 			row.actor,
 			row.actor_kind ?? row.actorKind,
@@ -234,13 +274,34 @@ export class PostgresStore {
 			row.method,
 			row.request_id ?? row.requestId,
 			detailStr,
-			piiFlag,
+			row.pii_in_detail || row.piiInDetail ? 1 : 0,
 			row.shipped_at ?? row.shippedAt ?? null,
 		];
-		await this._pool.query(
-			`INSERT INTO ${this._table} VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT (id) DO NOTHING`,
-			params,
-		);
+		const client = await this._pool.connect();
+		try {
+			await client.query("BEGIN");
+			if (!params[2]) {
+				await client.query(
+					"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+					[node],
+				);
+				const res = await client.query(
+					`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
+					[node],
+				);
+				params[2] = Number(res.rows[0].seq);
+			}
+			await client.query(
+				`INSERT INTO ${this._table} (id, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, pii_in_detail, shipped_at, prev_hash, hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'','') ON CONFLICT (id) DO NOTHING`,
+				params,
+			);
+			await client.query("COMMIT");
+		} catch (err) {
+			await client.query("ROLLBACK").catch(() => {});
+			throw err;
+		} finally {
+			client.release();
+		}
 	}
 
 	/**
@@ -248,7 +309,7 @@ export class PostgresStore {
 	 *
 	 * @param {{
 	 *   requestId?: string, code?: string, domain?: string,
-	 *   sourceNodeId?: string, actor?: string, target?: string,
+	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string,
 	 *   limit?: number, offset?: number
 	 * }} [opts]
@@ -259,6 +320,7 @@ export class PostgresStore {
 		code,
 		domain,
 		sourceNodeId,
+		tenantId,
 		actor,
 		target,
 		since,
@@ -272,6 +334,7 @@ export class PostgresStore {
 			code,
 			domain,
 			sourceNodeId,
+			tenantId,
 			actor,
 			target,
 			since,
@@ -279,7 +342,7 @@ export class PostgresStore {
 		});
 		const n = params.length;
 		params.push(limit, offset);
-		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
+		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
 		const res = await this._pool.query(sql, params);
 		return res.rows.map(_mapRow);
 	}
@@ -289,7 +352,7 @@ export class PostgresStore {
 	 *
 	 * @param {{
 	 *   requestId?: string, code?: string, domain?: string,
-	 *   sourceNodeId?: string, actor?: string, target?: string,
+	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string
 	 * }} [opts]
 	 * @returns {Promise<number>}
@@ -299,6 +362,7 @@ export class PostgresStore {
 		code,
 		domain,
 		sourceNodeId,
+		tenantId,
 		actor,
 		target,
 		since,
@@ -310,6 +374,7 @@ export class PostgresStore {
 			code,
 			domain,
 			sourceNodeId,
+			tenantId,
 			actor,
 			target,
 			since,
@@ -337,7 +402,8 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Mark rows as shipped by setting shipped_at to the current UTC time.
+	 * Mark rows as shipped by setting shipped_at to the current time, in the
+	 * canonical form the other SDKs parse (spec §4.3).
 	 *
 	 * @param {string[]} ids
 	 * @returns {Promise<void>}
@@ -346,8 +412,8 @@ export class PostgresStore {
 		if (!ids || ids.length === 0) return;
 		await this._ensureReady();
 		await this._pool.query(
-			`UPDATE ${this._table} SET shipped_at = NOW() WHERE id = ANY($1)`,
-			[ids],
+			`UPDATE ${this._table} SET shipped_at = $2 WHERE id = ANY($1)`,
+			[ids, canonicalTS()],
 		);
 	}
 

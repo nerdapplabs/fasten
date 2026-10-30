@@ -8,6 +8,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { canonicalTS } from "./canonical_ts.js";
 import {
 	coreMetaOf,
 	coreRedact,
@@ -239,7 +240,6 @@ export class Engine {
 		redactReplacement: null,
 		failureStrategy: "queue",
 	};
-	#seq = 0;
 	_drainer = null; // accessible by audit_queue.js shims via _setDefaultEngine
 
 	init(opts = {}) {
@@ -277,6 +277,13 @@ export class Engine {
 				"fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required",
 			);
 		}
+
+		// Spec §8.1: say once per init that rows are not chained.
+		this._drainerSysLog("warn", "audit_chain_unavailable", {
+			store: this.#config.auditStore?.constructor?.name ?? null,
+			reason:
+				"the JS SDK does not seal rows (spec 2.1); rows are written unsealed",
+		});
 
 		if (strategy === "queue" && this.#config.auditStore) {
 			this._installDrainer({
@@ -341,8 +348,10 @@ export class Engine {
 			wire_version: "1",
 			id,
 			origin_id: id,
-			monotonic_seq: ++this.#seq,
-			timestamp: new Date().toISOString(),
+			// Spec §8: JS does not allocate seq or seal, so the row goes out
+			// with seq 0, as phase-1 stdout lines do; a store allocates it.
+			monotonic_seq: 0,
+			timestamp: canonicalTS(),
 			code,
 			action: meta.action,
 			severity: severity ?? meta.severity,
@@ -421,7 +430,6 @@ export class Engine {
 			extraRedactKeys: [],
 			failureStrategy: "queue",
 		};
-		this.#seq = 0;
 	}
 
 	// ── Internal ────────────────────────────────────────────────────────────

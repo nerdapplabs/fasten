@@ -167,6 +167,7 @@ export interface Filter {
 	code?: string;
 	domain?: Domain;
 	sourceNodeId?: string;
+	tenantId?: string;
 	since?: string;
 	until?: string;
 	limit?: number;
