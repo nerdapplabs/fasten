@@ -71,6 +71,12 @@ def flush(timeout: float = 5.0) -> bool:
     return _default.flush(timeout=timeout)
 
 
+def close(timeout: float = 5.0) -> bool:
+    """Flush and stop the drainer within ``timeout``. Returns False if a row
+    was lost. Delegates to the default Engine."""
+    return _default.close(timeout=timeout)
+
+
 def queue_stats() -> Optional[dict[str, Any]]:
     """Drainer health snapshot. Delegates to the default Engine."""
     return _default.queue_stats()

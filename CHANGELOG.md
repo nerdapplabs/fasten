@@ -25,6 +25,30 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - The queue is no longer allocated up front, so a large `capacity` costs
   nothing until rows arrive.
 
+### Changed — Python queue mode goes through the shared drainer
+
+- In queue mode (the default), `emit()` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `monotonic_seq` is 0 and
+  `hash` is empty, and the store seals the row when it lands. Use
+  `audit_store_failure_strategy="raise"` to get the
+  sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `queue_drain_max_attempts`, instead of being dropped after one try. A row
+  the store rejects outright (DB-API `DataError` / `IntegrityError`) is
+  dead-lettered at once.
+- `emit()` blocks while the queue is full.
+- A forked child (gunicorn `--preload`, Celery prefork) installs its own
+  drainer. `fork()` waits for an in-flight store insert, so a child no
+  longer stops storing after inheriting SQLite mid-insert.
+- `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
+  of `timeout`, then stops the drainer and stores the rows it still holds.
+  It returns within about `timeout`: no store call starts after that, one
+  still running is left behind, and rows not stored are reported as
+  `audit_drain_lost_at_stop`. It returns False only if a row was lost. The
+  exit hook calls `close(5.0)`, so a hanging store no longer holds
+  interpreter exit. Emits after `close` are stored inline without an
+  `audit_drain_abandoned` event.
+
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 
 - **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),
