@@ -114,11 +114,14 @@ def test_doctor_reports_breaks_null_when_no_rows_to_verify():
 
 # ── clock step back ────────────────────────────────────────────────────────
 def test_doctor_samples_by_seq_after_a_clock_step_back():
-    """Seq 2 is stamped 90 s before seq 1. A newest-by-timestamp sample of 2
-    rows is [3, 1], which skips seq 2 and reads as a break."""
+    """Seq 30 is stamped 90 s before every other row. The newest 50 by
+    timestamp skip it, and that sample reads as a break on a clean chain."""
     _init()
     t0 = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
-    stamps = iter([t0, t0 - timedelta(seconds=90), t0 + timedelta(seconds=1)])
+    stamps = iter(
+        t0 - timedelta(seconds=90) if i == 30 else t0 + timedelta(seconds=i)
+        for i in range(1, 53)
+    )
 
     class _Clock(datetime):
         @classmethod
@@ -126,11 +129,8 @@ def test_doctor_samples_by_seq_after_a_clock_step_back():
             return next(stamps)
 
     with patch("fasten.engine.datetime", _Clock):
-        _emit_n(3)
-    store = fasten.audit_store()
-    with patch.object(store, "chain_tail", wraps=store.chain_tail) as tail:
-        resp = _client().get("/api/v1/logs/audit/doctor")
-    tail.assert_called_once()
+        _emit_n(52)
+    resp = _client().get("/api/v1/logs/audit/doctor")
     chain = resp.json()["chain"]
     assert chain["verified"] is True, chain
     assert chain["breaks"] == 0
