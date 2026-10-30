@@ -83,6 +83,19 @@ Some("raise".into())` to opt into synchronous semantics with
 `AuditStoreError`. `fasten::queue_stats()` and `fasten::flush(timeout)`
 complete the public surface.
 
+## Chain and retention
+
+The Rust SDK does not seal rows. `submit()` returns the row with
+`monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the
+insert transaction, under the same per-node lock as the Python, Go and JS
+stores; `hash` and `prev_hash` stay empty. `PostgresStore` can write into a
+table the Python or Go store created.
+
+Set `Config::retention_pii` (or `FASTEN_RETENTION_PII`) to a duration such as
+`"30d"` to redact personal data: every hour, rows older than that whose code
+has `pii_in_detail` or retention class Short get `detail` set to `null`, after
+an `AUDIT_ROW_REDACTED` row records it. Audit rows are never deleted.
+
 ## Tests
 
 ```bash

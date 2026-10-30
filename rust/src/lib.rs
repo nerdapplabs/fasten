@@ -17,6 +17,9 @@ use std::time::Duration;
 pub mod engine;
 pub use engine::{Engine, DEFAULT};
 
+pub mod retention;
+pub use retention::{parse_duration, RedactionCandidate, AUDIT_ROW_REDACTED};
+
 // ── P1-15 drainer public surface ─────────────────────────────────────────────
 
 /// Snapshot of the active drainer state. Re-exported from fasten-core.
@@ -180,8 +183,20 @@ pub struct Row {
     #[serde(default)]
     pub pii_in_detail: bool,
 
+    // The Rust SDK does not seal rows (spec §2.1), so both stay empty.
+    #[serde(default)]
+    pub prev_hash: String,
+    #[serde(default)]
+    pub hash: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shipped_at: Option<DateTime<Utc>>,
+}
+
+/// Canonical timestamp form shared by every SDK (spec §4.3):
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
+pub fn canonical_ts(dt: &DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 // --- Code catalog --------------------------------------------------------
@@ -232,6 +247,10 @@ pub enum Error {
     InvalidStrategy(String),
     #[error("audit store: {0}")]
     AuditStoreInsert(String),
+    #[error("not supported: {0}")]
+    Unsupported(String),
+    #[error("{0}")]
+    InvalidRetention(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -319,6 +338,19 @@ fn map_core_catalog_err(e: fasten_core::error::Error) -> Error {
 /// Look up Meta by code.
 pub fn meta_of(code: &str) -> Option<Meta> {
     registry().read().expect("registry poisoned").get(code).cloned()
+}
+
+/// Codes whose rows may carry personal data: `pii_in_detail`, or retention
+/// class Short. Sorted.
+pub fn pii_codes() -> Vec<String> {
+    let guard = registry().read().expect("registry poisoned");
+    let mut out: Vec<String> = guard
+        .iter()
+        .filter(|(_, m)| m.pii_in_detail || m.retention_class == RetentionClass::Short)
+        .map(|(id, _)| id.clone())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Dump `id,domain,severity` sorted one-per-line — feeds cross-language gate.
@@ -441,6 +473,21 @@ fn redact_detail(
 /// Adopter-supplied store. Sync trait so the core compiles without tokio.
 pub trait AuditStore: Send + Sync {
     fn insert(&self, row: &Row) -> Result<(), Error>;
+
+    /// Rows older than `before` with a code in `codes` whose detail can be
+    /// redacted, ordered by `monotonic_seq` (spec §7.1).
+    fn list_redaction_candidates(
+        &self,
+        _before: DateTime<Utc>,
+        _codes: &[String],
+    ) -> Result<Vec<RedactionCandidate>, Error> {
+        Err(Error::Unsupported("list_redaction_candidates".into()))
+    }
+
+    /// Set `detail` to JSON null on these rows. Returns the ids.
+    fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
+        Err(Error::Unsupported("redact_rows".into()))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -471,6 +518,10 @@ pub struct Config {
     pub disable_queue_jitter: bool,
     /// Max insert attempts before a row is dead-lettered. Default: 50.
     pub queue_drain_max_attempts: Option<usize>,
+    /// PII horizon, e.g. `"30d"`. Rows whose code is in [`pii_codes`] get
+    /// their detail redacted once older than this (spec §7). Needs an audit
+    /// store. None falls back to `FASTEN_RETENTION_PII`.
+    pub retention_pii: Option<String>,
 }
 
 /// Read env vars; return Config.
@@ -495,6 +546,7 @@ pub fn config_from_env() -> Result<Config, Error> {
         tenant_id: std::env::var("FASTEN_TENANT_ID").ok(),
         extra_redact_keys: extra,
         redact_replacement: replacement,
+        retention_pii: std::env::var("FASTEN_RETENTION_PII").ok().filter(|s| !s.is_empty()),
         ..Default::default()
     })
 }
@@ -505,6 +557,12 @@ pub fn config_from_env() -> Result<Config, Error> {
 /// is `"queue"` (default), this installs the shared fasten-core background
 /// drainer thread (see `fasten_core::drainer` for the full P1-15 contract).
 pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
+
+/// Redact PII rows older than `before` and write an `AUDIT_ROW_REDACTED`
+/// row for each (spec §7). Returns the redacted ids.
+pub fn redact_expired(before: DateTime<Utc>, reason: &str) -> Result<Vec<String>, Error> {
+    DEFAULT.redact_expired(before, reason)
+}
 
 /// Fluent-style Emit builder. Caller supplies `code`, `target`, optional
 /// `actor` / `method` / `detail`. Anchors auto-fill from Meta + ctx + config.
@@ -598,7 +656,7 @@ impl EmitBuilder {
         Ok(row)
     }
 
-    fn build_row(self, cfg: &Config) -> Result<Row, Error> {
+    pub(crate) fn build_row(self, cfg: &Config) -> Result<Row, Error> {
         let meta = meta_of(&self.code).ok_or_else(|| Error::UnknownCode(self.code.clone()))?;
         let hex = uuid::Uuid::new_v4().simple().to_string();
         let id = format!("evt-{}", &hex[..20]);
@@ -630,8 +688,10 @@ impl EmitBuilder {
             wire_version: "1".into(),
             id: id.clone(),
             origin_id: id,
-            monotonic_seq: DEFAULT.seq_next(),
-            timestamp: Utc::now(),
+            // Spec §8: the store allocates the seq.
+            monotonic_seq: 0,
+            // Microseconds, the precision the stores keep (spec §4.3).
+            timestamp: chrono::SubsecRound::trunc_subsecs(Utc::now(), 6),
             code: self.code,
             action: meta.action,
             severity: self.severity.unwrap_or(meta.severity),
@@ -647,12 +707,14 @@ impl EmitBuilder {
             request_id,
             detail,
             pii_in_detail: meta.pii_in_detail,
+            prev_hash: String::new(),
+            hash: String::new(),
             shipped_at: None,
         };
         Ok(row)
     }
 
-    fn write_audit_stdout(row: &Row) {
+    pub(crate) fn write_audit_stdout(row: &Row) {
         if let Ok(mut payload) = serde_json::to_value(row) {
             if let serde_json::Value::Object(map) = &mut payload {
                 map.insert("shape".into(), serde_json::Value::String("audit".into()));
@@ -998,6 +1060,193 @@ mod tests {
         assert_eq!(row.detail.get("api_key"), Some(&serde_json::json!("***")));
         assert!(!row.detail.contains_key("_redacted"));
         assert!(!row.detail.contains_key("_pii_in_detail"));
+    }
+
+    // ── #124: store-assigned seq, PII redaction ───────────────────────────
+
+    fn plain_meta(domain: &str) -> Meta {
+        Meta { domain: domain.into(), severity: Severity::Info, ..Default::default() }
+    }
+
+    // Spec §8: emit leaves seq, prev_hash and hash to the store.
+    #[test]
+    fn emit_returns_seq_zero_unsealed() {
+        register("seq0".into(), [("SEQ0_EVENT".into(), plain_meta("seq0"))]).unwrap();
+        init(Config { service_id: "svc".into(), node_id: "node".into(), ..Default::default() })
+            .unwrap();
+        for _ in 0..3 {
+            let row = EmitBuilder::new("SEQ0_EVENT", "t").submit().expect("emit");
+            assert_eq!(row.monotonic_seq, 0);
+            assert_eq!(row.prev_hash, "");
+            assert_eq!(row.hash, "");
+            let v = serde_json::to_value(&row).unwrap();
+            assert_eq!(v["prev_hash"], serde_json::json!(""));
+            assert_eq!(v["hash"], serde_json::json!(""));
+        }
+    }
+
+    fn sys_events(service_id: &str, event: &str) -> usize {
+        engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["service_id"] == service_id && v["event"] == event)
+            .count()
+    }
+
+    #[test]
+    fn init_logs_chain_unavailable_once() {
+        let e = Engine::new();
+        let cfg = Config {
+            service_id: "svc-chain-log".into(),
+            node_id: "n".into(),
+            ..Default::default()
+        };
+        e.init(cfg.clone()).unwrap();
+        let line = engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|v| v["service_id"] == "svc-chain-log")
+            .cloned()
+            .expect("sys line");
+        assert_eq!(line["event"], "audit_chain_unavailable");
+        assert_eq!(line["level"], "error");
+        assert!(line["reason"].as_str().unwrap().contains("does not seal"));
+        assert_eq!(sys_events("svc-chain-log", "audit_chain_unavailable"), 1);
+        e.init(cfg).unwrap();
+        assert_eq!(sys_events("svc-chain-log", "audit_chain_unavailable"), 2);
+    }
+
+    #[test]
+    fn pii_codes_lists_pii_and_short() {
+        register(
+            "piicodes".into(),
+            [
+                ("PIICODES_PII".into(), Meta { pii_in_detail: true, ..plain_meta("piicodes") }),
+                (
+                    "PIICODES_SHORT".into(),
+                    Meta { retention_class: RetentionClass::Short, ..plain_meta("piicodes") },
+                ),
+                (
+                    "PIICODES_LONG".into(),
+                    Meta { retention_class: RetentionClass::Long, ..plain_meta("piicodes") },
+                ),
+            ],
+        )
+        .unwrap();
+        let codes = pii_codes();
+        assert!(codes.contains(&"PIICODES_PII".to_string()));
+        assert!(codes.contains(&"PIICODES_SHORT".to_string()));
+        assert!(!codes.contains(&"PIICODES_LONG".to_string()));
+        let mut sorted = codes.clone();
+        sorted.sort();
+        assert_eq!(codes, sorted);
+    }
+
+    #[test]
+    fn init_rejects_bad_retention_pii() {
+        let e = Engine::new();
+        let r = e.init(Config {
+            service_id: "svc".into(),
+            node_id: "n".into(),
+            retention_pii: Some("30 days".into()),
+            ..Default::default()
+        });
+        assert!(matches!(r, Err(Error::InvalidRetention(_))));
+    }
+
+    #[test]
+    fn store_without_redaction_is_unsupported() {
+        struct InsertOnly;
+        impl AuditStore for InsertOnly {
+            fn insert(&self, _: &Row) -> Result<(), Error> { Ok(()) }
+        }
+        register(
+            "unsup".into(),
+            [("UNSUP_PII".into(), Meta { pii_in_detail: true, ..plain_meta("unsup") })],
+        )
+        .unwrap();
+        let e = Engine::new();
+        e.init(Config {
+            service_id: "svc".into(),
+            node_id: "n".into(),
+            audit_store: Some(Arc::new(InsertOnly)),
+            audit_store_failure_strategy: Some("raise".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(e.redact_expired(Utc::now(), "x"), Err(Error::Unsupported(_))));
+    }
+
+    // Records what the purger does, in order.
+    #[derive(Default)]
+    struct MemStore {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AuditStore for MemStore {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            self.log.lock().unwrap().push(format!("insert {} {}", row.code, row.target));
+            Ok(())
+        }
+        fn list_redaction_candidates(
+            &self,
+            _before: DateTime<Utc>,
+            codes: &[String],
+        ) -> Result<Vec<RedactionCandidate>, Error> {
+            let mut log = self.log.lock().unwrap();
+            let first = !log.iter().any(|l| l.starts_with("list"));
+            log.push("list".into());
+            assert!(codes.contains(&"PURGER_PII".to_string()));
+            Ok(if first {
+                vec![RedactionCandidate { id: "evt-pii-1".into(), monotonic_seq: 7 }]
+            } else {
+                vec![]
+            })
+        }
+        fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, Error> {
+            self.log.lock().unwrap().push(format!("redact {}", ids.join(",")));
+            Ok(ids.to_vec())
+        }
+    }
+
+    // retention_pii starts a purger that records, then redacts; reset stops it.
+    #[test]
+    fn retention_pii_runs_purger() {
+        register(
+            "purger".into(),
+            [("PURGER_PII".into(), Meta { pii_in_detail: true, ..plain_meta("purger") })],
+        )
+        .unwrap();
+        let store = Arc::new(MemStore::default());
+        let e = Engine::new();
+        e.init(Config {
+            service_id: "svc-purger".into(),
+            node_id: "n".into(),
+            audit_store: Some(store.clone()),
+            audit_store_failure_strategy: Some("raise".into()),
+            retention_pii: Some("30d".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store.log.lock().unwrap().iter().any(|l| l.starts_with("redact")) {
+            assert!(std::time::Instant::now() < deadline, "purger never redacted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = std::time::Instant::now();
+        e.reset_for_tests();
+        assert!(started.elapsed() < Duration::from_secs(2), "purger did not stop promptly");
+        let log = store.log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "list".to_string(),
+                format!("insert {AUDIT_ROW_REDACTED} evt-pii-1"),
+                "redact evt-pii-1".to_string(),
+            ]
+        );
     }
 }
 

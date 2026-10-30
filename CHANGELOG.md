@@ -92,6 +92,30 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — Rust SDK: store-assigned monotonic_seq, PII redaction (#124)
+
+- **Breaking:** `emit()` returns `monotonic_seq: 0`. The per-engine counter
+  restarted at 1, so two engines on one node wrote duplicate seqs (spec §2.1).
+  `PostgresStore` now gives a seq-0 row the node's next seq in the insert
+  transaction, under the same advisory lock as the Python, Go and JS stores.
+  Rows are not sealed: `Row` gains `prev_hash` and `hash`, both empty, and
+  `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
+- **Breaking:** `PostgresStore` writes `timestamp` and `shipped_at` in the
+  canonical form `YYYY-MM-DDTHH:MM:SS.ffffffZ` (§4.3), not `to_rfc3339()`.
+- `PostgresStore` can share a table with the Python and Go stores: it inserts
+  with a column list, adds the chain columns, writes `''` for `detail_salt` /
+  `detail_commitment`, and writes into `TIMESTAMPTZ` columns. Store bootstrap
+  takes the same advisory lock as Python, so stores starting together no
+  longer fail on concurrent `CREATE TABLE`.
+- PII retention: set `Config::retention_pii` (or `FASTEN_RETENTION_PII`), e.g.
+  `"30d"`. A background thread redacts expired rows whose code is in
+  `pii_codes()` (`pii_in_detail` or retention class Short): `detail` becomes
+  `null` and an `AUDIT_ROW_REDACTED` row is written first (§7). Rows are never
+  deleted, and a sealed form-`"1"` row is never touched. `redact_expired()`
+  runs it by hand. `AuditStore` gains `list_redaction_candidates` and
+  `redact_rows`, which default to `Error::Unsupported`.
+- `Error` gains `Unsupported` and `InvalidRetention`.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
