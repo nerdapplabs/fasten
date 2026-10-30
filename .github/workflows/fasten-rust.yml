@@ -88,3 +88,54 @@ jobs:
           files: rust/coverage.lcov
           flags: rust
           fail_ci_if_error: false
+
+  swift-binding:
+    # The Swift binding in fasten-core/bindings/swift links libfasten_core.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read toolchain from rust-toolchain.toml
+        id: rust-toolchain-file
+        run: |
+          ch=$(grep -oE 'channel = "[0-9.]+"' rust-toolchain.toml | grep -oE '[0-9.]+')
+          [ -n "$ch" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          echo "channel=$ch" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-toolchain-file.outputs.channel }}
+
+      - name: Build fasten-core
+        working-directory: fasten-core
+        run: cargo build --release --locked --features all
+
+      - name: Set up Swift 5.10
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+
+      - name: Test
+        working-directory: fasten-core/bindings/swift
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@localhost:5432/fasten_test?sslmode=disable
+        run: swift test -Xlinker -L../../target/release

@@ -92,6 +92,61 @@ final class SQLiteTests: XCTestCase {
             XCTAssertTrue(error is FastenStoreError)
         }
     }
+
+    func testCloseThenDeinit() throws {
+        do {
+            let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+            defer { store.close() }
+            try store.ping()
+        }
+    }
+
+    func testCloseTwiceAndUseAfterCloseThrows() throws {
+        let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+        store.close()
+        store.close()
+        assertClosed { try store.ping() }
+        assertClosed { try store.insert(makeRow("evt-after-close")) }
+        assertClosed { try store.insertJSON("{}") }
+    }
+
+    func testInsertsWhileClosing() throws {
+        let store = try FastenStore(backend: "sqlite", connstr: ":memory:")
+        let lock = NSLock()
+        var unexpected: [String] = []
+        var closedHits = 0
+        DispatchQueue.concurrentPerform(iterations: 5) { worker in
+            if worker == 0 {
+                usleep(1_000)
+                store.close()
+                return
+            }
+            for i in 0..<200 {
+                do {
+                    try store.insert(makeRow("evt-close-\(worker)-\(i)"))
+                } catch let e as FastenStoreError where e.message == "store is closed" {
+                    lock.lock()
+                    closedHits += 1
+                    lock.unlock()
+                    break
+                } catch {
+                    lock.lock()
+                    unexpected.append("\(error)")
+                    lock.unlock()
+                }
+            }
+        }
+        XCTAssertTrue(unexpected.isEmpty, "\(unexpected)")
+        // The workers really did run into the close.
+        XCTAssertGreaterThan(closedHits, 0)
+        assertClosed { try store.ping() }
+    }
+
+    private func assertClosed(_ body: () throws -> Void, line: UInt = #line) {
+        XCTAssertThrowsError(try body(), line: line) { error in
+            XCTAssertEqual((error as? FastenStoreError)?.message, "store is closed", line: line)
+        }
+    }
 }
 
 // ── PostgreSQL ────────────────────────────────────────────────────────────────

@@ -92,6 +92,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — Swift `FastenStore` binding (#149)
+
+- `close()` can be called more than once, and `deinit` goes through it. Calls
+  after `close()` throw `FastenStoreError` instead of using a stale handle.
+- The binding builds again: the status check compares with `FASTEN_OK`, the
+  module map links `fasten_core`, and the build points at
+  `fasten-core/target/release`.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,
