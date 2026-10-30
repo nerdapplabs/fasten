@@ -1,4 +1,4 @@
-//! Engine — wraps all per-deployment runtime state (config, seq, drainer).
+//! Engine — wraps all per-deployment runtime state (config, drainer, purger).
 //!
 //! The module-level free functions (`init`, `flush`, …) in `lib.rs` delegate
 //! to [`DEFAULT`]. Applications needing multiple isolated fasten deployments
@@ -6,13 +6,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use fasten_core::drainer::{Drainer, DrainerConfig};
 
+use crate::retention::{parse_duration, Purger};
 use crate::{current_request_id, AuditStore, Config, Error};
 
 // ── Poison-recovery helper ────────────────────────────────────────────────────
@@ -29,12 +29,15 @@ impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
 // ── Row conversion: SDK Row ↔ fasten_core::Row ────────────────────────────────
 
 pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
+    let mut extra = HashMap::new();
+    extra.insert("prev_hash".to_string(), serde_json::Value::String(r.prev_hash.clone()));
+    extra.insert("hash".to_string(), serde_json::Value::String(r.hash.clone()));
     fasten_core::Row {
         wire_version:   r.wire_version.clone(),
         id:             r.id.clone(),
         origin_id:      r.origin_id.clone(),
         monotonic_seq:  r.monotonic_seq,
-        timestamp:      r.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+        timestamp:      crate::canonical_ts(&r.timestamp),
         code:           r.code.clone(),
         action:         r.action.clone(),
         severity:       r.severity.to_string(), // Display impl → lowercase
@@ -50,9 +53,8 @@ pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
         request_id:     r.request_id.clone(),
         detail:         serde_json::Value::Object(r.detail.clone().into_iter().collect()),
         pii_in_detail:  r.pii_in_detail,
-        shipped_at:     r.shipped_at
-            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true)),
-        ..Default::default()
+        shipped_at:     r.shipped_at.as_ref().map(crate::canonical_ts),
+        extra,
     }
 }
 
@@ -63,6 +65,9 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
         "error"    => crate::Severity::Error,
         "critical" => crate::Severity::Critical,
         _          => crate::Severity::Info,
+    };
+    let extra_str = |k: &str| {
+        r.extra.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string()
     };
     let detail: HashMap<String, serde_json::Value> = match &r.detail {
         serde_json::Value::Object(m) => m.clone().into_iter().collect(),
@@ -89,6 +94,8 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
         request_id:     r.request_id.clone(),
         detail,
         pii_in_detail:  r.pii_in_detail,
+        prev_hash:      extra_str("prev_hash"),
+        hash:           extra_str("hash"),
         shipped_at:     r.shipped_at.as_deref().and_then(|s| s.parse().ok()),
     }
 }
@@ -111,6 +118,7 @@ impl fasten_core::store::Store for SdkStoreAdapter {
     fn list_unshipped(&self, _: u32)
         -> Result<Vec<fasten_core::Row>, fasten_core::Error> { Ok(vec![]) }
     fn mark_shipped(&self, _: &[String]) -> Result<(), fasten_core::Error> { Ok(()) }
+    // Audit rows are never purged for age (spec §7); PII is redacted instead.
     fn purge(&self, _: &str, _: bool) -> Result<u64, fasten_core::Error> { Ok(0) }
     fn max_monotonic_seq(&self) -> Result<u64, fasten_core::Error> { Ok(0) }
 }
@@ -119,16 +127,16 @@ impl fasten_core::store::Store for SdkStoreAdapter {
 
 pub struct Engine {
     pub(crate) config:  Mutex<Option<Config>>,
-    pub(crate) seq:     AtomicU64,
     pub(crate) drainer: Mutex<Option<Arc<Drainer>>>,
+    purger:             Mutex<Option<Purger>>,
 }
 
 impl Engine {
     pub const fn new() -> Self {
         Self {
             config:  Mutex::new(None),
-            seq:     AtomicU64::new(0),
             drainer: Mutex::new(None),
+            purger:  Mutex::new(None),
         }
     }
 
@@ -145,6 +153,13 @@ impl Engine {
         if strategy != "queue" && strategy != "raise" {
             return Err(Error::InvalidStrategy(strategy));
         }
+        let retention_pii = cfg
+            .retention_pii
+            .clone()
+            .or_else(|| std::env::var("FASTEN_RETENTION_PII").ok())
+            .filter(|s| !s.is_empty());
+        let pii_horizon = retention_pii.as_deref().map(parse_duration).transpose()?;
+        self.stop_purger();
 
         let store = cfg.audit_store.clone();
         let capacity     = cfg.queue_capacity.unwrap_or(100);
@@ -155,7 +170,13 @@ impl Engine {
 
         let mut cfg_stored = cfg;
         cfg_stored.audit_store_failure_strategy = Some(strategy.clone());
-        *self.config.lock_or_recover() = Some(cfg_stored);
+        cfg_stored.retention_pii = retention_pii;
+        *self.config.lock_or_recover() = Some(cfg_stored.clone());
+
+        // Spec §8.1: say once per init that rows are not chained.
+        self.log_sys("error", "audit_chain_unavailable", serde_json::json!({
+            "reason": "the Rust SDK does not seal rows (spec 2.1); rows are written unsealed",
+        }));
 
         if strategy == "queue" {
             if let Some(s) = store {
@@ -168,15 +189,28 @@ impl Engine {
         } else {
             self.uninstall_drainer();
         }
+
+        if let Some(horizon) = pii_horizon.filter(|_| cfg_stored.audit_store.is_some()) {
+            *self.purger.lock_or_recover() = Some(Purger::start(cfg_stored, horizon));
+        }
         Ok(())
+    }
+
+    /// Redact PII rows older than `before` and record each one (spec §7).
+    /// Returns the redacted ids.
+    pub fn redact_expired(&self, before: DateTime<Utc>, reason: &str) -> Result<Vec<String>, Error> {
+        crate::retention::redact_expired(&self.current_config()?, before, reason)
+    }
+
+    pub(crate) fn stop_purger(&self) {
+        let old = self.purger.lock_or_recover().take();
+        if let Some(p) = old {
+            p.stop();
+        }
     }
 
     pub fn current_config(&self) -> Result<Config, Error> {
         self.config.lock_or_recover().clone().ok_or(Error::NotInitialised)
-    }
-
-    pub fn seq_next(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub(crate) fn active_drainer(&self) -> Option<Arc<Drainer>> {
@@ -211,29 +245,38 @@ impl Engine {
     }
 
     pub fn reset_for_tests(&self) {
+        self.stop_purger();
         self.uninstall_drainer();
         *self.config.lock_or_recover() = None;
-        self.seq.store(0, Ordering::SeqCst);
     }
 
     pub fn log_sys(&self, level: &str, event: &str, fields: serde_json::Value) {
         let service_id = self.current_config().map(|c| c.service_id).unwrap_or_default();
-        let mut payload = serde_json::json!({
-            "shape": "sys",
-            "level": level,
-            "event": event,
-            "request_id": current_request_id().unwrap_or_default(),
-            "service_id": service_id,
-            "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        });
-        if let serde_json::Value::Object(merge_into) = &mut payload {
-            if let serde_json::Value::Object(extra) = fields {
-                for (k, v) in extra { merge_into.insert(k, v); }
-            }
-        }
-        println!("{payload}");
+        sys_line(&service_id, level, event, fields);
     }
 }
+
+pub(crate) fn sys_line(service_id: &str, level: &str, event: &str, fields: serde_json::Value) {
+    let mut payload = serde_json::json!({
+        "shape": "sys",
+        "level": level,
+        "event": event,
+        "request_id": current_request_id().unwrap_or_default(),
+        "service_id": service_id,
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    if let serde_json::Value::Object(merge_into) = &mut payload {
+        if let serde_json::Value::Object(extra) = fields {
+            for (k, v) in extra { merge_into.insert(k, v); }
+        }
+    }
+    #[cfg(test)]
+    SYS_CAPTURE.lock_or_recover().push(payload.clone());
+    println!("{payload}");
+}
+
+#[cfg(test)]
+pub(crate) static SYS_CAPTURE: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
 impl Default for Engine {
     fn default() -> Self { Self::new() }
