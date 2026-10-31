@@ -42,7 +42,7 @@ func main() {
     }); err != nil {
         panic(err)
     }
-    defer fasten.Flush(5 * time.Second) // drain pending audit rows on exit
+    defer fasten.Close(5 * time.Second) // drain pending audit rows on exit
 
     ctx := fasten.WithRequestID(context.Background(), fasten.MintID())
     fasten.Emit(ctx, "USER_CREATED",
@@ -103,12 +103,25 @@ set the pragma in your DSN so every pooled connection gets it).
 
 ## P1-15: audit-store failure handling
 
-`fasten.Emit()` defaults to **queue mode** — rows go onto a bounded
-channel, drained by a goroutine with exponential backoff (100 ms →
-60 s, ±20 % jitter). Store failures stay off the request path. Set
+`fasten.Emit()` defaults to **queue mode** — rows go onto the bounded
+fasten-core queue, drained by a background thread with exponential
+backoff (100 ms → 60 s, ±20 % jitter) and dead-lettered after
+`QueueDrainMaxAttempts`. A failed insert doesn't fail the request, but
+when the queue is full `Emit()` blocks until a slot frees, so in a long
+outage it waits on the drainer's retries; size `QueueCapacity` and the
+retry settings for that. A row the store rejects outright (a Postgres
+class 22/23 error, a SQLite constraint) is dead-lettered at once rather
+than retried. `Emit()` returns the row before it is stored, so its
+`MonotonicSeq` and `Hash` are zero; the store seals it. Set
 `Config.AuditStoreFailureStrategy = "raise"` to opt into synchronous
-semantics with `*fasten.AuditStoreError`. `fasten.GetQueueStats()` and
-`fasten.Flush(timeout)` complete the public surface.
+semantics with `*fasten.AuditStoreError` and get the sealed row back.
+`fasten.GetQueueStats()`, `fasten.Flush(timeout)` and
+`fasten.Close(timeout)` complete the public surface; call `Close` on
+shutdown so a row still being retried is stored or reported. `Close`
+returns within about `timeout`, reports rows not stored by then as
+`audit_drain_lost_at_stop`, and returns false if any row was lost. A store
+call still running then, such as a lib/pq query to a server that stopped
+answering, is left to finish in the background.
 
 ## Tests
 

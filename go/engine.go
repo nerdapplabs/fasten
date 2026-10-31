@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"reflect"
@@ -46,8 +47,6 @@ type Engine struct {
 
 	// P1-23: tamper-evidence hash chain. hashMu serialises seq + prevHash
 	// assignment so concurrent Emit calls produce a consistent, gapless chain.
-	drainerAllocates      atomic.Bool
-	drainerBypassLogged   atomic.Bool
 	unchainedStoreLogged  atomic.Bool
 	auditChainUnavailable atomic.Bool
 	hashMu                sync.Mutex
@@ -55,6 +54,10 @@ type Engine struct {
 
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
+	retired   chan struct{} // closed once the last drainer taken out has been retired
+	closing   *closeCall    // the Close in progress, if any
+	storeGen  atomic.Int64  // bumped when Init switches to another audit store
+	closed    atomic.Bool   // Close has run and Init has not since
 
 	// Engine-side "at least one audit-store insert was swallowed" flag.
 	// Tracked here (not only on the store) because AuditRepository does not
@@ -148,6 +151,12 @@ func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
 }
 
 func (e *Engine) Init(cfg Config) error {
+	if n := cfg.QueueDrainMaxAttempts; n > 0 && uint64(n) > math.MaxUint32 {
+		return fmt.Errorf("fasten.Init: QueueDrainMaxAttempts must be at most %d (got %d)",
+			uint32(math.MaxUint32), n)
+	}
+	prevStore := e.auditStore
+
 	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
 	e.nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
 	e.tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
@@ -170,7 +179,10 @@ func (e *Engine) Init(cfg Config) error {
 	}
 	// Re-init on a fresh store clears the sticky degrade — a hole in the
 	// previous store's history doesn't apply to this one.
-	e.auditWriteSwallowed.Store(false)
+	if !sameStore(prevStore, e.auditStore) {
+		e.storeGen.Add(1)
+		e.auditWriteSwallowed.Store(false)
+	}
 
 	// Seed monotonic_seq from the store if it supports it, so post-restart
 	// rows never collide with pre-restart rows on (timestamp, seq). Scoped to
@@ -270,6 +282,7 @@ func (e *Engine) Init(cfg Config) error {
 	}
 	e.failureStrategy = strategy
 
+	var next *cFastenDrainer
 	if strategy == "queue" && e.auditStore != nil {
 		capacity := cfg.QueueCapacity
 		if capacity <= 0 {
@@ -287,13 +300,16 @@ func (e *Engine) Init(cfg Config) error {
 		if maxAttempts <= 0 {
 			maxAttempts = 50
 		}
-		e.installDrainer(
+		next = e.newDrainer(
 			e.auditStore,
 			capacity, retryInitialMs, retryMaxMs, !cfg.DisableQueueJitter, maxAttempts,
 		)
-	} else {
-		e.uninstallDrainer()
 	}
+	// Swap in the new drainer, then retire the old one: emits keep being
+	// queued while it drains, and its rows and events keep its own config.
+	old, done := e.swapDrainer(next)
+	e.closed.Store(false)
+	e.retireOld(old, done, 5*time.Second, time.Time{})
 
 	// FR1 retention (§1). Env-var overrides zero-valued fields.
 	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
@@ -582,27 +598,37 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 
 	if e.auditStore != nil {
 		if e.failureStrategy == "queue" {
-			// The drainer inserts asynchronously and cannot allocate, so a row
-			// enqueued there is written unsealed with seq 0 — silently
-			// disabling the chain. Correctness beats throughput: take the
-			// allocating path and say so once. Matches the Python SDK, which
-			// bypasses its FFI drainer for the same reason.
+			// The drainer retries the insert; the store seals the row when it
+			// lands (spec §2.1, §8). A durable emit must not return before the
+			// row is persisted, so it takes the synchronous path, and so does
+			// a row the drainer refuses.
+			gen := e.storeGen.Load()
 			d := e.activeDrainer()
-			if d != nil && durable {
-				// enqueue reports success before the row is persisted.
-				d = nil
-			}
-			if d != nil && !e.drainerAllocates.Load() {
-				if e.drainerBypassLogged.CompareAndSwap(false, true) {
-					e.drainerSysLog("warn", "drainer_bypassed_for_chain_allocation",
-						map[string]any{"reason": "drainer cannot allocate monotonic_seq (spec 2.1)"})
+			refused := false
+			switch {
+			case durable:
+			case d != nil && d.gen != gen:
+				// Init is switching stores: store it inline in the new one.
+			case d == nil && e.closed.Load():
+				// After Close, rows are stored inline.
+			case d == nil:
+				// No drainer to take the row (spec §7 V-12).
+				refused = true
+				e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+					"reason": "no_drainer", "row_id": row.ID,
+				})
+			default:
+				queued, reported := d.enqueue(row)
+				refused = !queued
+				if refused && !reported {
+					// fasten-core reports only the rows it refused at stop.
+					e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+						"reason": "enqueue_refused", "row_id": row.ID,
+					})
 				}
-				d = nil
 			}
-			if d != nil {
-				d.enqueue(row)
-			} else {
-				sealed, ferr := e.allocateAndStore(ctx, row)
+			if durable || d == nil || refused {
+				sealed, ferr := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
 				if ferr == nil {
 					row = sealed
 				}
@@ -611,25 +637,22 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 				}
 				if ferr != nil {
 					// Swallowed on the hot path → durable history has a hole;
-					// degrade the audit completeness flag. Set the engine flag
-					// unconditionally (adopter stores may not implement
-					// NoteWriteFailure); also call the store's notifier when
-					// present so store-side reporting is accurate too.
-					e.auditWriteSwallowed.Store(true)
-					if nwf, ok := e.auditStore.(interface{ NoteWriteFailure() }); ok {
-						nwf.NoteWriteFailure()
-					}
+					// degrade the audit completeness flag.
+					e.markWriteLost(e.auditStore, gen)
 					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
 						// Type-only — see retention_purge_failed comment.
 						"error_type": fmt.Sprintf("%T", ferr),
 						"row_id":     row.ID,
 					})
+				} else if refused {
+					// Follows the abandoned event.
+					e.drainerSysLog("info", "audit_drain_stored_inline", map[string]any{"row_id": row.ID})
 				}
 			}
 		} else {
 			// "raise" strategy — same allocating path as the queue branch
 			// (spec §2.1); only the error handling differs.
-			sealed, err := e.allocateAndStore(ctx, row)
+			sealed, err := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
 			if err != nil {
 				return row, &AuditStoreError{Err: err}
 			}
@@ -661,11 +684,86 @@ func (e *Engine) GetQueueStats() *QueueStats {
 
 // Flush blocks until pending audit rows drain, or timeout elapses.
 func (e *Engine) Flush(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	e.drainerMu.Lock()
+	retired := e.retired
+	e.drainerMu.Unlock()
+	if retired != nil {
+		select {
+		case <-retired:
+		case <-time.After(timeout):
+			return false
+		}
+	}
 	d := e.activeDrainer()
 	if d == nil {
 		return true
 	}
-	return d.flush(timeout)
+	return d.flush(time.Until(deadline))
+}
+
+// Close flushes pending audit rows for up to half of timeout, then stops the
+// drainer and stores any row it still holds. A row not stored once timeout
+// has passed is reported lost (audit_drain_lost_at_stop); the store must
+// honour ctx for Close to return by then. Call it on shutdown: Flush alone
+// leaves a row that is still being retried unreported at exit. Emits after
+// Close are stored synchronously. Returns false if a row was lost.
+//
+// A store call still running at timeout is left to finish in the background,
+// and its row is reported lost then. A second Close while one is running
+// waits for it, up to its own timeout, and returns the same result.
+func (e *Engine) Close(timeout time.Duration) bool {
+	e.drainerMu.Lock()
+	if c := e.closing; c != nil {
+		e.drainerMu.Unlock()
+		select {
+		case <-c.done:
+			return c.ok
+		case <-time.After(timeout):
+			return false
+		}
+	}
+	c := &closeCall{done: make(chan struct{})}
+	e.closing = c
+	e.drainerMu.Unlock()
+
+	c.ok = e.close(timeout)
+	e.drainerMu.Lock()
+	e.closing = nil
+	e.drainerMu.Unlock()
+	close(c.done)
+	return c.ok
+}
+
+// closeCall is a Close in progress; ok is set before done is closed.
+type closeCall struct {
+	done chan struct{}
+	ok   bool
+}
+
+func (e *Engine) close(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	d := e.activeDrainer()
+	var lost int64
+	if d != nil {
+		lost = d.lost.Load()
+	}
+	e.closed.Store(true)
+	e.Flush(timeout / 2)
+	old, done := e.swapDrainer(nil)
+	if old != nil {
+		retired := make(chan struct{})
+		go func() {
+			e.retireOld(old, done, 0, deadline)
+			close(retired)
+		}()
+		select {
+		case <-retired:
+		case <-time.After(time.Until(deadline)):
+			old.reportUnstored()
+		}
+	}
+	return d == nil || d.lost.Load() == lost
 }
 
 // marshalWithShape renders row as a JSON line tagged with its stream shape
@@ -730,6 +828,7 @@ func (e *Engine) ResetForTests() {
 	e.searchEnabled = false
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""
+	e.closed.Store(false)
 	e.auditWriteSwallowed.Store(false)
 	e.hashMu.Lock()
 	e.prevHash = ""
@@ -755,39 +854,61 @@ func isTruthy(s string) bool {
 
 // ── Drainer management (per-Engine) ──────────────────────────────────────────
 
-func (e *Engine) installDrainer(
+// newDrainer builds a drainer for store, capturing the engine's current
+// transport, service id and store generation. Nil if it could not start.
+func (e *Engine) newDrainer(
 	store AuditRepository,
 	capacity int,
 	retryInitialMs, retryMaxMs int64,
 	retryJitter bool,
 	maxAttempts int,
-) {
+) *cFastenDrainer {
 	d, err := newCFastenDrainer(
-		store, capacity, retryInitialMs, retryMaxMs, retryJitter, uint32(maxAttempts),
+		e, store, capacity, retryInitialMs, retryMaxMs, retryJitter, maxAttempts,
 	)
 	if err != nil {
 		e.drainerSysLog("error", "audit_drainer_install_failed",
 			map[string]any{"error_type": fmt.Sprintf("%T", err)})
+		return nil
+	}
+	return d
+}
+
+// swapDrainer installs next (nil removes the drainer) and returns the one it
+// replaced, with a channel Flush waits on until retireOld closes it. With no
+// drainer to replace, Flush keeps waiting on the one still being retired.
+func (e *Engine) swapDrainer(next *cFastenDrainer) (*cFastenDrainer, chan struct{}) {
+	e.drainerMu.Lock()
+	defer e.drainerMu.Unlock()
+	old := e.drainer
+	e.drainer = next
+	if old == nil {
+		return nil, nil
+	}
+	done := make(chan struct{})
+	e.retired = done
+	return old, done
+}
+
+// testHookRetire, when set, runs before a replaced drainer is retired.
+var testHookRetire func()
+
+// retireOld gives old up to flushFor to drain, then stops it and stores what
+// it did not write, up to deadline if one is set.
+func (e *Engine) retireOld(old *cFastenDrainer, done chan struct{}, flushFor time.Duration, deadline time.Time) {
+	if old == nil {
 		return
 	}
-	e.drainerMu.Lock()
-	old := e.drainer
-	e.drainer = d
-	e.drainerMu.Unlock()
-	if old != nil {
-		old.flush(5 * time.Second)
-		old.close()
+	if testHookRetire != nil {
+		testHookRetire()
 	}
+	old.retire(flushFor, deadline)
+	close(done)
 }
 
 func (e *Engine) uninstallDrainer() {
-	e.drainerMu.Lock()
-	old := e.drainer
-	e.drainer = nil
-	e.drainerMu.Unlock()
-	if old != nil {
-		old.close()
-	}
+	old, done := e.swapDrainer(nil)
+	e.retireOld(old, done, 0, time.Time{})
 }
 
 func (e *Engine) activeDrainer() *cFastenDrainer {
@@ -803,29 +924,52 @@ func (e *Engine) activeDrainer() *cFastenDrainer {
 // Falls back to the legacy unallocated Insert for adopter stores that predate
 // the interface — and says so once, because VerifyChain SKIPS hashless rows and
 // would otherwise report verified over a fully unchained table.
-func (e *Engine) allocateAndStore(ctx context.Context, row Row) (Row, error) {
+func (e *Engine) allocateAndStore(ctx context.Context, store AuditRepository, out sysOut, row Row) (Row, error) {
 	type allocator interface {
 		AllocateAndInsertOriginated(context.Context, Row) (Row, error)
 	}
-	a, ok := e.auditStore.(allocator)
+	a, ok := store.(allocator)
 	if !ok {
 		if e.unchainedStoreLogged.CompareAndSwap(false, true) {
 			e.auditChainUnavailable.Store(true)
-			e.drainerSysLog("error", "audit_chain_unavailable", map[string]any{
-				"store":  fmt.Sprintf("%T", e.auditStore),
+			e.sysLogTo(out, "error", "audit_chain_unavailable", map[string]any{
+				"store":  fmt.Sprintf("%T", store),
 				"reason": "store has no AllocateAndInsertOriginated (spec 2.1); rows written unsealed",
 			})
 		}
-		return row, e.auditStore.Insert(ctx, row)
+		return row, store.Insert(ctx, row)
 	}
 	sealed, err := a.AllocateAndInsertOriginated(ctx, row)
 	if err != nil {
 		return row, err
 	}
-	if e.xport != nil && sealed.Hash != "" {
-		e.xport.WriteAudit(rowToMap(sealed))
+	if out.xport != nil && sealed.Hash != "" {
+		out.xport.WriteAudit(rowToMap(sealed))
 	}
 	return sealed, nil
+}
+
+// markWriteLost records that a row did not reach store, of store generation
+// gen: durable history has a hole. The engine flag only covers its current
+// store; re-init onto another store clears it, onto the same store keeps it.
+func (e *Engine) markWriteLost(store AuditRepository, gen int64) {
+	if gen == e.storeGen.Load() {
+		e.auditWriteSwallowed.Store(true)
+	}
+	if nwf, ok := store.(interface{ NoteWriteFailure() }); ok {
+		nwf.NoteWriteFailure()
+	}
+}
+
+// sameStore reports whether a and b are the same store. Unlike a == b it
+// does not panic on a store type that isn't comparable; such a store counts
+// as a different one.
+func sameStore(a, b AuditRepository) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	t := reflect.TypeOf(a)
+	return t == reflect.TypeOf(b) && t.Comparable() && a == b
 }
 
 // isTypedNil reports whether v is an interface holding a nil pointer, map,
@@ -844,13 +988,26 @@ func isTypedNil(v any) bool {
 	return false
 }
 
+// sysOut is where a sealed row's stdout line and sys events go: the engine's
+// current transport, or the one a drainer captured at install.
+type sysOut struct {
+	xport     *Transport
+	serviceID string
+}
+
+func (e *Engine) out() sysOut { return sysOut{e.xport, e.serviceID} }
+
 func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
+	e.sysLogTo(e.out(), level, event, fields)
+}
+
+func (e *Engine) sysLogTo(out sysOut, level, event string, fields map[string]any) {
 	row := SyslogRow{
 		"level":      level,
 		"event":      event,
 		"timestamp":  canonicalTS(time.Now()),
 		"request_id": "",
-		"service_id": e.serviceID,
+		"service_id": out.serviceID,
 	}
 	for k, v := range fields {
 		row[k] = v
@@ -861,8 +1018,8 @@ func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {
 	// push AND the direct stderr write — PushSyslog would redact its
 	// own copy, but the stderr line uses this local `row`.
 	row = SyslogRow(e.redactDetail(row))
-	if e.xport != nil {
-		e.xport.PushSyslog(row)
+	if out.xport != nil {
+		out.xport.PushSyslog(row)
 	}
 	if b, err := marshalWithShape(row, "sys"); err == nil {
 		fmt.Fprintln(os.Stderr, string(b))

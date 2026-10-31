@@ -456,10 +456,13 @@ type QueueStats struct {
 // AuditStoreFailureStrategy (P1-15) governs how Emit reacts when the
 // store rejects a row:
 //
-//   - "queue" (default) — Emit pushes rows onto a bounded in-memory
-//     queue and returns immediately. A background drainer goroutine
-//     writes to the store with exponential backoff. Emit blocks only
-//     when QueueCapacity (queued + in-flight retry) is saturated.
+//   - "queue" (default) — Emit hands rows to the fasten-core drainer,
+//     whose background thread stores them with exponential backoff and
+//     dead-letters a row after QueueDrainMaxAttempts, or at once when the
+//     store rejects the row itself. The returned row is not sealed yet
+//     (spec §8): MonotonicSeq and Hash are zero. Emit blocks only when
+//     QueueCapacity (queued + in-flight retry) is saturated, and that
+//     wait does not observe ctx.
 //   - "raise" — Emit calls Insert synchronously and returns the
 //     wrapped error (*AuditStoreError). Useful for tests and adopters
 //     who want loud failures during configuration debugging.
@@ -534,6 +537,10 @@ func GetTransport() *Transport { return Default.GetTransport() }
 
 // Flush blocks until the Default engine's pending rows drain.
 func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
+
+// Close flushes and stops the Default engine's drainer; call it on shutdown.
+// It returns within about timeout, and false if a row was lost.
+func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.
 func GetQueueStats() *QueueStats { return Default.GetQueueStats() }

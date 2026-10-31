@@ -86,7 +86,9 @@ func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
 	// spec §8.1: with no audit store there is nothing to allocate against, so
 	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
 	// about seq/hash must attach one — as real deployments do.
-	if err := Init(Config{ServiceID: "svc-1", NodeID: "node-1", AuditStore: store}); err != nil {
+	if err := Init(Config{ServiceID: "svc-1", NodeID: "node-1", AuditStore: store,
+		// Raise mode stores synchronously, so Emit returns the sealed row.
+		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
