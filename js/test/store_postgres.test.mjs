@@ -343,3 +343,44 @@ test('a table the JS store creates can be read by Python and Go', { skip }, asyn
         await admin.end();
     }
 });
+
+// A Go-created table stores TIMESTAMPTZ with microseconds. Reading it back as
+// a Date dropped the last three digits, so count({ until: row.timestamp })
+// missed the row. The session's time zone must not shift it either.
+test('TIMESTAMPTZ keeps its microseconds and reads back in UTC', { skip }, async () => {
+    const { default: pg } = await import('pg');
+    const admin = new pg.Pool({ connectionString: DSN });
+    const t = `t_go_us_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    const sep = DSN.includes('?') ? '&' : '?';
+    const kolkata = `${DSN}${sep}options=${encodeURIComponent('-c TimeZone=Asia/Kolkata')}`;
+    const s = new PostgresStore(kolkata, { table: t });
+    try {
+        await admin.query(GO_DDL(t));
+        const ts = '2026-08-21T10:00:00.123456Z';
+        const row = makeRow({ timestamp: ts });
+        await s.insert(row);
+        const [got] = await s.query({ requestId: row.request_id });
+        assert.equal(got.timestamp, ts);
+        assert.equal(await s.count({ requestId: row.request_id, until: got.timestamp }), 1);
+    } finally {
+        await s.close().catch(() => {});
+        await admin.query(`DROP TABLE IF EXISTS ${t}`);
+        await admin.end();
+    }
+});
+
+test('the seq allocation has an index on (source_node_id, monotonic_seq)', { skip }, async () => {
+    await store.insert(makeRow({ monotonic_seq: 0 }));
+    const { default: pg } = await import('pg');
+    const admin = new pg.Pool({ connectionString: DSN });
+    try {
+        const res = await admin.query(
+            'SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2',
+            [TABLE, `idx_${TABLE}_node_seq`]);
+        assert.equal(res.rows.length, 1);
+        assert.match(res.rows[0].indexdef, /\(source_node_id, monotonic_seq\)/);
+        assert.doesNotMatch(res.rows[0].indexdef, /UNIQUE/);
+    } finally {
+        await admin.end();
+    }
+});
