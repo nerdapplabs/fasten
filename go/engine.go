@@ -55,6 +55,7 @@ type Engine struct {
 	drainerMu sync.Mutex
 	drainer   *cFastenDrainer
 	retired   chan struct{} // closed once the last drainer taken out has been retired
+	closing   *closeCall    // the Close in progress, if any
 	storeGen  atomic.Int64  // bumped when Init switches to another audit store
 	closed    atomic.Bool   // Close has run and Init has not since
 
@@ -707,7 +708,40 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 // honour ctx for Close to return by then. Call it on shutdown: Flush alone
 // leaves a row that is still being retried unreported at exit. Emits after
 // Close are stored synchronously. Returns false if a row was lost.
+//
+// A store call still running at timeout is left to finish in the background,
+// and its row is reported lost then. A second Close while one is running
+// waits for it, up to its own timeout, and returns the same result.
 func (e *Engine) Close(timeout time.Duration) bool {
+	e.drainerMu.Lock()
+	if c := e.closing; c != nil {
+		e.drainerMu.Unlock()
+		select {
+		case <-c.done:
+			return c.ok
+		case <-time.After(timeout):
+			return false
+		}
+	}
+	c := &closeCall{done: make(chan struct{})}
+	e.closing = c
+	e.drainerMu.Unlock()
+
+	c.ok = e.close(timeout)
+	e.drainerMu.Lock()
+	e.closing = nil
+	e.drainerMu.Unlock()
+	close(c.done)
+	return c.ok
+}
+
+// closeCall is a Close in progress; ok is set before done is closed.
+type closeCall struct {
+	done chan struct{}
+	ok   bool
+}
+
+func (e *Engine) close(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	d := e.activeDrainer()
 	var lost int64
@@ -717,7 +751,18 @@ func (e *Engine) Close(timeout time.Duration) bool {
 	e.closed.Store(true)
 	e.Flush(timeout / 2)
 	old, done := e.swapDrainer(nil)
-	e.retireOld(old, done, 0, deadline)
+	if old != nil {
+		retired := make(chan struct{})
+		go func() {
+			e.retireOld(old, done, 0, deadline)
+			close(retired)
+		}()
+		select {
+		case <-retired:
+		case <-time.After(time.Until(deadline)):
+			old.reportUnstored()
+		}
+	}
 	return d == nil || d.lost.Load() == lost
 }
 
@@ -830,12 +875,16 @@ func (e *Engine) newDrainer(
 }
 
 // swapDrainer installs next (nil removes the drainer) and returns the one it
-// replaced, with a channel Flush waits on until retireOld closes it.
+// replaced, with a channel Flush waits on until retireOld closes it. With no
+// drainer to replace, Flush keeps waiting on the one still being retired.
 func (e *Engine) swapDrainer(next *cFastenDrainer) (*cFastenDrainer, chan struct{}) {
 	e.drainerMu.Lock()
 	defer e.drainerMu.Unlock()
 	old := e.drainer
 	e.drainer = next
+	if old == nil {
+		return nil, nil
+	}
 	done := make(chan struct{})
 	e.retired = done
 	return old, done
@@ -847,12 +896,13 @@ var testHookRetire func()
 // retireOld gives old up to flushFor to drain, then stops it and stores what
 // it did not write, up to deadline if one is set.
 func (e *Engine) retireOld(old *cFastenDrainer, done chan struct{}, flushFor time.Duration, deadline time.Time) {
-	if old != nil {
-		if testHookRetire != nil {
-			testHookRetire()
-		}
-		old.retire(flushFor, deadline)
+	if old == nil {
+		return
 	}
+	if testHookRetire != nil {
+		testHookRetire()
+	}
+	old.retire(flushFor, deadline)
 	close(done)
 }
 

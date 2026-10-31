@@ -126,6 +126,9 @@ type cFastenDrainer struct {
 	pending   map[string]*pendingRow
 	next      uint64
 	lost      atomic.Int64 // rows dead-lettered or lost at stop
+	// Close gave up waiting and reported the pending rows lost; retire still
+	// stores what it can, but does not report those rows again.
+	reported bool
 
 	// Inserts run under ctx; retire cancels it at its deadline.
 	ctx    context.Context
@@ -257,6 +260,42 @@ func rejectsRow(err error) bool {
 		return c == 19 || c == 20
 	}
 	return false
+}
+
+func (d *cFastenDrainer) loseAtStop(row Row, err error) {
+	d.lost.Add(1)
+	d.engine.markWriteLost(d.store, d.gen)
+	d.engine.sysLogTo(d.out, "error", "audit_drain_lost_at_stop", map[string]any{
+		"error_type": fmt.Sprintf("%T", err),
+		"row_id":     row.ID,
+	})
+}
+
+// reportUnstored reports the rows d still holds as lost, once. Close calls it
+// when its deadline passes with a store call still running.
+func (d *cFastenDrainer) reportUnstored() {
+	d.pendingMu.Lock()
+	if d.reported {
+		d.pendingMu.Unlock()
+		return
+	}
+	d.reported = true
+	d.pendingMu.Unlock()
+	for _, p := range d.pendingRows() {
+		d.loseAtStop(p.row, context.DeadlineExceeded)
+	}
+}
+
+// pendingRows returns the rows d holds, oldest first.
+func (d *cFastenDrainer) pendingRows() []*pendingRow {
+	d.pendingMu.Lock()
+	rows := make([]*pendingRow, 0, len(d.pending))
+	for _, p := range d.pending {
+		rows = append(rows, p)
+	}
+	d.pendingMu.Unlock()
+	sort.Slice(rows, func(i, j int) bool { return rows[i].order < rows[j].order })
+	return rows
 }
 
 func (d *cFastenDrainer) isPending(id string) bool {
@@ -393,24 +432,21 @@ func (d *cFastenDrainer) retire(flushFor time.Duration, deadline time.Time) {
 	C.fasten_store_close((*C.FastenStore)(d.handle))
 
 	// Rows still pending were not stored: the drainer abandoned them or gave
-	// them one try at shutdown, and may have reported them lost.
-	d.pendingMu.Lock()
-	rows := make([]*pendingRow, 0, len(d.pending))
-	for _, p := range d.pending {
-		rows = append(rows, p)
-	}
-	d.pending = map[string]*pendingRow{}
-	d.pendingMu.Unlock()
-	sort.Slice(rows, func(i, j int) bool { return rows[i].order < rows[j].order })
+	// them one try at shutdown, and may have reported them lost. Each stays
+	// pending until it is handled, so a Close that stops waiting meanwhile
+	// reports it.
 	var recovered []string
-	for _, p := range rows {
-		if err := d.storeRow(p.row); err != nil {
-			d.lost.Add(1)
-			d.engine.markWriteLost(d.store, d.gen)
-			d.engine.sysLogTo(d.out, "error", "audit_drain_lost_at_stop", map[string]any{
-				"error_type": fmt.Sprintf("%T", err),
-				"row_id":     p.row.ID,
-			})
+	for _, p := range d.pendingRows() {
+		err := d.storeRow(p.row)
+		d.pendingMu.Lock()
+		reported := d.reported
+		delete(d.pending, p.row.ID)
+		d.pendingMu.Unlock()
+		if reported {
+			continue
+		}
+		if err != nil {
+			d.loseAtStop(p.row, err)
 			continue
 		}
 		recovered = append(recovered, p.row.ID)

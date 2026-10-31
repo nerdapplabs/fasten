@@ -851,6 +851,63 @@ func TestQueueCloseReturnsByTimeoutWhenTheStoreHangs(t *testing.T) {
 	}
 }
 
+// stuckStore ignores ctx, like lib/pq waiting on a server that has stopped
+// answering: an insert returns only once release is closed.
+type stuckStore struct {
+	*SQLiteStore
+	release chan struct{}
+}
+
+func (s stuckStore) AllocateAndInsertOriginated(_ context.Context, row Row) (Row, error) {
+	<-s.release
+	return row, errors.New("released")
+}
+
+func TestQueueCloseReturnsByTimeoutWhenTheStoreIgnoresCtx(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := stuckStore{newFlakyStore(t, 0).SQLiteStore, make(chan struct{})}
+	initQueue(t, store, Config{})
+	rows := emitN(t, 3)
+	start := time.Now()
+	ok := Close(300 * time.Millisecond)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("Close took %v with a 300ms timeout", took)
+	}
+	if ok {
+		t.Fatal("Close reported no loss, but no row was stored")
+	}
+	if lost := sysEvents(t, "audit_drain_lost_at_stop"); len(lost) != len(rows) {
+		t.Fatalf("lost events = %v, want %d", lost, len(rows))
+	}
+	// The stuck call finishing later must not report its rows again.
+	close(store.release)
+	time.Sleep(200 * time.Millisecond)
+	if lost := sysEvents(t, "audit_drain_lost_at_stop"); len(lost) != len(rows) {
+		t.Fatalf("lost events after release = %v, want %d", lost, len(rows))
+	}
+}
+
+func TestQueueConcurrentCloseWaitsForTheFirst(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := hangingStore{newFlakyStore(t, 0).SQLiteStore, make(chan struct{})}
+	initQueue(t, store, Config{})
+	rows := emitN(t, 2)
+	results := make(chan bool, 2)
+	for i := 0; i < 2; i++ {
+		go func() { results <- Close(time.Second) }()
+	}
+	for i := 0; i < 2; i++ {
+		if <-results {
+			t.Fatal("a Close reported no loss, but no row was stored")
+		}
+	}
+	if lost := sysEvents(t, "audit_drain_lost_at_stop"); len(lost) != len(rows) {
+		t.Fatalf("lost events = %v, want %d", lost, len(rows))
+	}
+}
+
 func TestQueueEmitAfterCloseIsStoredWithoutAbandonedEvent(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)

@@ -119,7 +119,9 @@ semantics with `*fasten.AuditStoreError` and get the sealed row back.
 `fasten.Close(timeout)` complete the public surface; call `Close` on
 shutdown so a row still being retried is stored or reported. `Close`
 returns within about `timeout`, reports rows not stored by then as
-`audit_drain_lost_at_stop`, and returns false if any row was lost.
+`audit_drain_lost_at_stop`, and returns false if any row was lost. A store
+call still running then, such as a lib/pq query to a server that stopped
+answering, is left to finish in the background.
 
 ## Tests
 
