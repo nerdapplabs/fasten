@@ -69,9 +69,53 @@ public:
     PostgresStore& operator=(const PostgresStore&) = delete;
 
     /// Insert one audit row. Thread-safe via internal mutex.
+    ///
+    /// A row with monotonic_seq 0 (what emit() returns) gets the node's next
+    /// seq in the insert's transaction, under the same per-node advisory lock
+    /// as the Python, Go and JS stores (spec §2.1). The row is not sealed.
     void insert(const Row& row) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (row.monotonic_seq != 0) {
+            insert_row(row, row.monotonic_seq);
+            return;
+        }
+        exec("BEGIN");
+        try {
+            const char* node[1] = {row.source_node_id.c_str()};
+            query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", 1, node);
+            std::string seq = query(
+                "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM " + table_ +
+                " WHERE source_node_id = $1", 1, node);
+            insert_row(row, std::stoll(seq));
+            exec("COMMIT");
+        } catch (...) {
+            PQclear(PQexec(conn_, "ROLLBACK"));
+            throw;
+        }
+    }
+
+private:
+    void exec(const char* sql) { query(sql, 0, nullptr); }
+
+    // Runs sql and returns the first column of the first row, or "".
+    std::string query(const std::string& sql, int n, const char* const* params) {
+        PGresult* res = PQexecParams(conn_, sql.c_str(), n, nullptr, params,
+                                     nullptr, nullptr, 0);
+        ExecStatusType status = PQresultStatus(res);
+        if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            std::string msg = PQerrorMessage(conn_);
+            PQclear(res);
+            throw std::runtime_error("fasten PostgresStore: " + msg);
+        }
+        std::string out = (status == PGRES_TUPLES_OK && PQntuples(res) > 0)
+            ? PQgetvalue(res, 0, 0) : "";
+        PQclear(res);
+        return out;
+    }
+
+    void insert_row(const Row& row, int64_t seq) {
         std::string detail_json = detail_::fields_to_json(row.detail);
-        std::string mono_str    = std::to_string(row.monotonic_seq);
+        std::string mono_str    = std::to_string(seq);
         const char* pii_str     = row.pii_in_detail ? "1" : "0";
 
         // nullptr → SQL NULL for nullable columns
@@ -111,8 +155,6 @@ public:
             " ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"
             " ON CONFLICT (id) DO NOTHING";
 
-        std::lock_guard<std::mutex> lk(mu_);
-
         PGresult* res = PQexecParams(
             conn_,
             sql.c_str(),
@@ -133,6 +175,7 @@ public:
         PQclear(res);
     }
 
+public:
     /// Returns an AuditSink that calls insert(). The PostgresStore must
     /// outlive the returned sink.
     AuditSink sink() {
@@ -211,6 +254,10 @@ private:
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_code ON " + table_ + " (code)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_ts   ON " + table_ + " (timestamp)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_svc  ON " + table_ + " (service_id)");
+        // For the seq allocation in insert(). Not unique: rows from the old
+        // per-process counter repeat seqs.
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_node_seq ON " + table_ +
+                " (source_node_id, monotonic_seq)");
     }
 
     PGconn*     conn_   = nullptr;

@@ -80,9 +80,7 @@ public:
             fasten::Fields{{"event", formatted_message}})["event"];
         row["level"]      = level_str;
         row["logger"]     = "boost_log";
-        row["request_id"] = fasten::detail_::tl_request_id();
-
-        fasten::detail_::globals().syslog_ring.push(row);
+        fasten::detail_::push_sys_row(row);
 
         detail_::sink_active = false;
     }

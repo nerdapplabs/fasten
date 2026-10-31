@@ -50,6 +50,10 @@ public:
             throw std::runtime_error("fasten SqliteStore: " + msg);
         }
 
+        // Wait for a lock held by another connection instead of failing at
+        // once with SQLITE_BUSY (the Go store waits 5 s too).
+        sqlite3_busy_timeout(db_, 5000);
+
         if (wal && path != ":memory:") {
             sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
         }
@@ -67,16 +71,31 @@ public:
     SqliteStore& operator=(const SqliteStore&) = delete;
 
     /// Insert one audit row. Thread-safe via internal mutex.
+    ///
+    /// A row with monotonic_seq 0 (what emit() returns) gets the node's next
+    /// seq in the insert's transaction (spec §2.1). The row is not sealed.
     void insert(const Row& row) {
         std::string detail_json = detail_::fields_to_json(row.detail);
         int         pii_int     = row.pii_in_detail ? 1 : 0;
 
         std::lock_guard<std::mutex> lk(mu_);
 
+        const bool allocate = row.monotonic_seq == 0;
+        int64_t seq = row.monotonic_seq;
+        if (allocate) {
+            exec("BEGIN IMMEDIATE");
+            try {
+                seq = next_seq(row.source_node_id);
+            } catch (...) {
+                rollback();
+                throw;
+            }
+        }
+
         int idx = 1;
         sqlite3_bind_text (stmt_, idx++, row.id.c_str(),             -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt_, idx++, row.origin_id.c_str(),      -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt_, idx++, row.monotonic_seq);
+        sqlite3_bind_int64(stmt_, idx++, seq);
         sqlite3_bind_text (stmt_, idx++, row.timestamp.c_str(),      -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt_, idx++, row.code.c_str(),           -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt_, idx++, row.action.c_str(),         -1, SQLITE_TRANSIENT);
@@ -109,8 +128,17 @@ public:
         sqlite3_clear_bindings(stmt_);
 
         if (step != SQLITE_DONE && step != SQLITE_ROW) {
-            throw std::runtime_error(
-                std::string("fasten SqliteStore insert: ") + sqlite3_errmsg(db_));
+            std::string msg = sqlite3_errmsg(db_);
+            if (allocate) rollback();
+            throw std::runtime_error("fasten SqliteStore insert: " + msg);
+        }
+        if (allocate) {
+            try {
+                exec("COMMIT");
+            } catch (...) {
+                rollback();  // else the connection stays in the transaction
+                throw;
+            }
         }
     }
 
@@ -121,6 +149,36 @@ public:
     }
 
 private:
+    void exec(const char* sql) {
+        char* errmsg = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+            std::string msg = errmsg ? errmsg : sqlite3_errmsg(db_);
+            sqlite3_free(errmsg);
+            throw std::runtime_error(std::string("fasten SqliteStore ") + sql + ": " + msg);
+        }
+    }
+
+    // Ends an open transaction without throwing, so the original error is the
+    // one reported. SQLite may have rolled back already.
+    void rollback() noexcept {
+        if (!sqlite3_get_autocommit(db_)) {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    }
+
+    int64_t next_seq(const std::string& node) {
+        const std::string sql = "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM " +
+                                table_ + " WHERE source_node_id = ?";
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &q, nullptr) != SQLITE_OK)
+            throw std::runtime_error(
+                std::string("fasten SqliteStore next seq: ") + sqlite3_errmsg(db_));
+        sqlite3_bind_text(q, 1, node.c_str(), -1, SQLITE_TRANSIENT);
+        int64_t seq = sqlite3_step(q) == SQLITE_ROW ? sqlite3_column_int64(q, 0) : 1;
+        sqlite3_finalize(q);
+        return seq;
+    }
+
     static bool is_valid_identifier(const std::string& s) {
         if (s.empty()) return false;
         if (!std::isalpha(static_cast<unsigned char>(s[0])) && s[0] != '_')
@@ -175,7 +233,11 @@ private:
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_req  ON " + table_ + "(request_id);"
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_code ON " + table_ + "(code);"
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_ts   ON " + table_ + "(timestamp);"
-            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_svc  ON " + table_ + "(service_id);";
+            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_svc  ON " + table_ + "(service_id);"
+            // For next_seq(). Not unique: rows from the old per-process
+            // counter repeat seqs.
+            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_node_seq ON " + table_ +
+            "(source_node_id, monotonic_seq);";
 
         rc = sqlite3_exec(db_, idx_sql.c_str(), nullptr, nullptr, &errmsg);
         if (rc != SQLITE_OK) {
