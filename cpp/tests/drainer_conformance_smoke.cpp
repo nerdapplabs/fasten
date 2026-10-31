@@ -255,7 +255,7 @@ void v12_abandoned_after_stop() {
     fasten::Row row;
     row.id = "evt-abandoned";
     Stderr err; err.start();
-    d.put(row);
+    assert(!d.put(row));
     err.stop();
     bool found = false;
     for (auto& r : fasten::query_syslog(100)) {
@@ -263,6 +263,26 @@ void v12_abandoned_after_stop() {
     }
     assert(found);
     std::cout << "V-12: PASS\n";
+}
+
+// An emit that still holds a drainer a re-init has stopped stores its row
+// synchronously, and the refusal is reported once.
+void refused_row_is_stored_synchronously() {
+    reset_state();
+    std::vector<std::string> stored;
+    fasten::set_audit_sink([&](const fasten::Row& r) { stored.push_back(r.target); });
+    fasten::init(cfg("queue"));
+    {
+        auto& g = fasten::detail_::globals();
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        g.drainer->shutdown(milliseconds(1000));
+    }
+    Stderr err; err.start();
+    emit_one("u-refused");
+    std::string out = err.stop();
+    assert(stored.size() == 1 && stored[0] == "u-refused");
+    assert(count(out, "audit_drain_abandoned") == 1);
+    std::cout << "refused row stored synchronously: PASS\n";
 }
 
 // Runs fn on a thread and fails the test if it takes longer than limit.
@@ -321,8 +341,9 @@ void shutdown_with_a_sink_that_puts() {
     std::cout << "shutdown with a re-entrant sink: PASS\n";
 }
 
-// Re-init swaps and shuts down the drainer while other threads emit. Before
-// the fix a put() could pass the stopped check and then use the freed store.
+// Re-init swaps and shuts down the drainer while other threads emit and log.
+// Before the fix a put() could pass the stopped check and then use the freed
+// store, and a sys line could copy a boot request id init() was freeing.
 void reinit_under_load() {
     reset_state();
     std::atomic<int> stored{0};
@@ -333,6 +354,8 @@ void reinit_under_load() {
     for (int i = 0; i < 4; ++i) {
         ts.emplace_back([&] { while (!stop) emit_one(); });
     }
+    // Sys lines read the ids and the boot request id that init() replaces.
+    ts.emplace_back([&] { while (!stop) fasten::log::info("tick"); });
     Stderr err; err.start();
     for (int i = 0; i < 30; ++i) fasten::init(cfg("queue"));
     stop = true;
@@ -358,6 +381,7 @@ int main() {
     v10_dead_letter();
     v11_events_in_order();
     v12_abandoned_after_stop();
+    refused_row_is_stored_synchronously();
     shutdown_with_a_put_blocked_on_a_full_queue();
     shutdown_with_a_sink_that_puts();
     reinit_under_load();

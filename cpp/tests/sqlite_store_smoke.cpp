@@ -152,6 +152,29 @@ void test_seq_allocated_per_node() {
     std::cout << "  test_seq_allocated_per_node: PASS\n";
 }
 
+// Picking the next seq seeks the node's rows instead of scanning the table.
+void test_next_seq_uses_index() {
+    const std::string path = "/tmp/fasten_seqidx_" + fasten::mint_id() + ".db";
+    { fasten::SqliteStore store(path); }
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db,
+        "EXPLAIN QUERY PLAN SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM audit_log "
+        "WHERE source_node_id = 'node-1'",
+        -1, &q, nullptr);
+    std::string plan;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        plan += reinterpret_cast<const char*>(sqlite3_column_text(q, 3));
+        plan += "\n";
+    }
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    std::remove(path.c_str());
+    assert(plan.find("idx_audit_log_node_seq") != std::string::npos);
+    std::cout << "  test_next_seq_uses_index: PASS\n";
+}
+
 // A COMMIT that fails (another connection holds a read lock, rollback
 // journal) must not leave the connection inside the transaction.
 void test_failed_commit_does_not_wedge_the_store() {
@@ -192,6 +215,7 @@ int main() {
     test_invalid_table_name();
     test_custom_table_name();
     test_seq_allocated_per_node();
+    test_next_seq_uses_index();
     test_failed_commit_does_not_wedge_the_store();
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;

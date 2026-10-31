@@ -233,7 +233,11 @@ private:
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_req  ON " + table_ + "(request_id);"
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_code ON " + table_ + "(code);"
             "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_ts   ON " + table_ + "(timestamp);"
-            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_svc  ON " + table_ + "(service_id);";
+            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_svc  ON " + table_ + "(service_id);"
+            // For next_seq(). Not unique: rows from the old per-process
+            // counter repeat seqs.
+            "CREATE INDEX IF NOT EXISTS idx_" + table_ + "_node_seq ON " + table_ +
+            "(source_node_id, monotonic_seq);";
 
         rc = sqlite3_exec(db_, idx_sql.c_str(), nullptr, nullptr, &errmsg);
         if (rc != SQLITE_OK) {

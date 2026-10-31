@@ -821,22 +821,25 @@ class CFastenDrainer {
     CFastenDrainer(const CFastenDrainer&)            = delete;
     CFastenDrainer& operator=(const CFastenDrainer&) = delete;
 
-    // A row that can't be queued is reported, not dropped (spec §4).
-    void put(const Row& row) {
+    // Returns false if the row was not queued, so the caller can store it
+    // itself (spec §10). Each refusal is reported once: the core reports the
+    // rows it refuses at stop, and this reports the rest.
+    bool put(const Row& row) {
         Use use(*this);
         if (!use.ok) {
             drainer_sys_log("error", "audit_drain_abandoned",
                 {{"reason", "drainer_stopped"}, {"row_id", row.id}});
-            return;
+            return false;
         }
         std::string json = row.to_json();
         char* err = nullptr;
         int32_t rc = fasten_drainer_enqueue(store_, json.c_str(), &err);
-        if (rc != 0) {
+        if (rc != 0 && rc != kErrDrainerStopped) {
             drainer_sys_log("error", "audit_drain_abandoned",
                 {{"reason", err ? err : "enqueue failed"}, {"row_id", row.id}});
         }
         if (err) fasten_store_free_str(err);
+        return rc == 0;
     }
 
     QueueStats stats() const {
@@ -885,6 +888,10 @@ class CFastenDrainer {
     }
 
   private:
+    // fasten_drainer_enqueue's FASTEN_ERR_DRAINER_STOPPED: the drainer is
+    // stopping, the row was not queued, and the core has reported it.
+    static constexpr int32_t kErrDrainerStopped = 10;
+
     static int32_t bridge_(const char* row_json, void* userdata) {
         auto* ref = static_cast<SinkRef*>(userdata);
         if (!ref || !row_json) return 1;
@@ -925,6 +932,10 @@ struct Globals {
     std::mutex                            reg_mu;
     std::unordered_map<std::string, Meta> registry;
 
+    // init() replaces the strings guarded by cfg_mu while other threads may
+    // be emitting or logging, so readers copy them under it (identity(),
+    // strategy(), redaction()) and a re-init can't free one mid-copy.
+    mutable std::mutex cfg_mu;
     std::string service_id;
     std::string node_id;
     std::string tenant_id;
@@ -933,7 +944,8 @@ struct Globals {
     RingBuffer api_ring;
 
     // Sys rows with no request in scope carry this until the first real
-    // request_id is seen (spec persistent-streams §7). Set by init().
+    // request_id is seen (spec persistent-streams §7). Set by init(), guarded
+    // by cfg_mu.
     std::string       boot_request_id;
     std::atomic<bool> boot_over{false};
 
@@ -941,13 +953,35 @@ struct Globals {
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
 
-    // P1-15: failure-strategy + drainer ownership.
+    // P1-15: failure-strategy (guarded by cfg_mu) + drainer ownership.
     std::string                                 failure_strategy{"queue"};
     std::shared_ptr<CFastenDrainer>          drainer;
     std::mutex                                  drainer_mu;
 
     // Redactor config — built by init(), defaults to built-in pattern + "***".
+    // Guarded by cfg_mu.
     RedactConfig redact_cfg;
+
+    struct Identity {
+        std::string service_id;
+        std::string node_id;
+        std::string tenant_id;
+    };
+
+    Identity identity() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return Identity{service_id, node_id, tenant_id};
+    }
+
+    std::string strategy() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return failure_strategy;
+    }
+
+    RedactConfig redaction() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return redact_cfg;
+    }
 
     /// Reset all runtime state for test isolation.
     ///
@@ -966,15 +1000,18 @@ struct Globals {
             old.swap(drainer);
         }
         if (old) old->shutdown(std::chrono::seconds(2));
-        service_id.clear();
-        node_id.clear();
-        tenant_id.clear();
-        failure_strategy = "queue";
+        {
+            std::lock_guard<std::mutex> lk(cfg_mu);
+            service_id.clear();
+            node_id.clear();
+            tenant_id.clear();
+            failure_strategy = "queue";
+            redact_cfg = RedactConfig{};
+            boot_request_id.clear();
+        }
         { std::lock_guard<std::mutex> lk(sink_mu); audit_sink = nullptr; }
-        redact_cfg = RedactConfig{};
         syslog_ring.clear();
         api_ring.clear();
-        boot_request_id.clear();
         boot_over = false;
     }
 };
@@ -998,8 +1035,7 @@ inline bool is_sentinel(const std::string& rid) {
     return false;
 }
 
-inline std::string mint_sentinel(const std::string& kind) {
-    const auto& svc = globals().service_id;
+inline std::string mint_sentinel(const std::string& kind, const std::string& svc) {
     return kind + "-" + (svc.empty() ? "svc" : svc) + "-" + mint_id_bytes(6);
 }
 
@@ -1012,8 +1048,11 @@ inline std::string sys_request_id() {
         if (!is_sentinel(rid)) g.boot_over = true;
         return rid;
     }
-    if (!g.boot_over && !g.boot_request_id.empty()) return g.boot_request_id;
-    return mint_sentinel("orphan");
+    if (!g.boot_over) {
+        std::lock_guard<std::mutex> lk(g.cfg_mu);
+        if (!g.boot_request_id.empty()) return g.boot_request_id;
+    }
+    return mint_sentinel("orphan", g.identity().service_id);
 }
 
 // Adds a sys row to the ring with its request_id and the engine's tenant_id,
@@ -1022,7 +1061,8 @@ inline void push_sys_row(Fields row) {
     auto& g = globals();
     auto rid = row.find("request_id");
     if (rid == row.end() || rid->second.empty()) row["request_id"] = sys_request_id();
-    if (!g.tenant_id.empty() && !row.count("tenant_id")) row["tenant_id"] = g.tenant_id;
+    const std::string tenant = g.identity().tenant_id;
+    if (!tenant.empty() && !row.count("tenant_id")) row["tenant_id"] = tenant;
     g.syslog_ring.push(std::move(row));
 }
 
@@ -1030,7 +1070,7 @@ inline void push_sys_row(Fields row) {
 // Delegates all key-pattern + value-shape logic to the shared Rust engine.
 inline Fields redact(const Fields& f) {
     if (f.empty()) return f;
-    const auto& cfg = globals().redact_cfg;
+    const RedactConfig cfg = globals().redaction();
     const std::string in_json = fields_to_json(f);
     char* out_json = nullptr;
     char* out_err  = nullptr;
@@ -1287,18 +1327,17 @@ inline void install_drainer_(const Config& cfg);
 inline void init(Config cfg = {}) {
     using detail_::env_or;
     auto& g = detail_::globals();
-    g.service_id = cfg.service_id.empty() ? env_or("FASTEN_SERVICE_ID") : cfg.service_id;
-    g.node_id    = cfg.node_id.empty()    ? env_or("FASTEN_NODE_ID")    : cfg.node_id;
-    g.tenant_id  = cfg.tenant_id.empty()  ? env_or("FASTEN_TENANT_ID")  : cfg.tenant_id;
+    std::string service_id = cfg.service_id.empty() ? env_or("FASTEN_SERVICE_ID") : cfg.service_id;
+    std::string node_id    = cfg.node_id.empty()    ? env_or("FASTEN_NODE_ID")    : cfg.node_id;
+    std::string tenant_id  = cfg.tenant_id.empty()  ? env_or("FASTEN_TENANT_ID")  : cfg.tenant_id;
 
-    if (g.service_id.empty() || g.node_id.empty()) {
+    if (service_id.empty() || node_id.empty()) {
         throw InitError("init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required");
     }
-    g.boot_request_id = detail_::mint_sentinel("boot");
-    g.boot_over       = false;
 
+    detail_::RedactConfig redact_cfg = g.redaction();
     if (!cfg.extra_redact_keys.empty()) {
-        g.redact_cfg.extra_keys = cfg.extra_redact_keys;
+        redact_cfg.extra_keys = cfg.extra_redact_keys;
     } else {
         // env FASTEN_REDACT_KEYS (comma-separated), parity with the other SDKs.
         std::string env_keys = env_or("FASTEN_REDACT_KEYS", "");
@@ -1308,12 +1347,12 @@ inline void init(Config cfg = {}) {
             while (std::getline(ss, tok, ',')) {
                 size_t a = tok.find_first_not_of(" \t");
                 size_t b = tok.find_last_not_of(" \t");
-                if (a != std::string::npos) g.redact_cfg.extra_keys.push_back(tok.substr(a, b - a + 1));
+                if (a != std::string::npos) redact_cfg.extra_keys.push_back(tok.substr(a, b - a + 1));
             }
         }
     }
-    g.redact_cfg.replacement = cfg.redact_replacement.empty()
-        ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
+    redact_cfg.replacement = cfg.redact_replacement.empty()
+        ? env_or("FASTEN_REDACT_REPLACEMENT", redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
 
     // P1-15: failure-strategy + drainer wiring.
@@ -1322,7 +1361,18 @@ inline void init(Config cfg = {}) {
     if (strategy != "queue" && strategy != "raise") {
         throw InitError("init: audit_store_failure_strategy must be \"queue\" or \"raise\"");
     }
-    g.failure_strategy = strategy;
+
+    std::string boot_id = detail_::mint_sentinel("boot", service_id);
+    {
+        std::lock_guard<std::mutex> lk(g.cfg_mu);
+        g.service_id       = std::move(service_id);
+        g.node_id          = std::move(node_id);
+        g.tenant_id        = std::move(tenant_id);
+        g.redact_cfg       = std::move(redact_cfg);
+        g.failure_strategy = std::move(strategy);
+        g.boot_request_id  = std::move(boot_id);
+    }
+    g.boot_over = false;
     install_drainer_(cfg);
 }
 
@@ -1362,15 +1412,15 @@ inline void drainer_sys_log(const std::string& level,
     // pushes to the sys ring. Never recurses through the sink.
     // stderr is mandatory: a slow stdout consumer stalls the drainer thread
     // if self-reports share the wire stream (stdout backpressure deadlock).
-    auto& g = globals();
+    const auto id = globals().identity();
     Fields ring_row;
     const std::string rid = sys_request_id();
     std::string js = "{\"shape\":\"sys\"";
     js += ",\"level\":"      + json_str(level);
     js += ",\"event\":"      + json_str(event);
     js += ",\"request_id\":" + json_str(rid);
-    js += ",\"service_id\":" + json_str(g.service_id);
-    if (!g.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(g.tenant_id);
+    js += ",\"service_id\":" + json_str(id.service_id);
+    if (!id.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(id.tenant_id);
     js += ",\"timestamp\":"  + json_str(now_iso8601());
     for (const auto& kv : fields) {
         js += ',' + json_str(kv.first) + ':' + json_str(kv.second);
@@ -1394,11 +1444,11 @@ inline void install_drainer_(const Config& cfg) {
     // block every concurrent emit() on the request path.
     //
     // Concurrent emit() that snapshotted the old drainer before the
-    // swap and lands a put() after we shutdown self-aborts via the
-    // put() stop check (audit_drain_abandoned sys event) — no silent
-    // loss into a dead queue.
+    // swap and lands a put() after we shutdown is refused (an
+    // audit_drain_abandoned sys event) and stores the row synchronously,
+    // so nothing is lost into a dead queue.
     std::shared_ptr<detail_::CFastenDrainer> next;
-    if (g.failure_strategy == "queue") {
+    if (g.strategy() == "queue") {
         std::function<void(const Row&)> sink_copy;
         {
             std::lock_guard<std::mutex> sk(g.sink_mu);
@@ -1542,9 +1592,11 @@ inline std::function<void(EmitOpts&)> method(const std::string& m) {
 template<typename... Opts>
 inline Row emit(const std::string& code, Opts&&... opts) {
     auto& g = detail_::globals();
-    if (g.service_id.empty()) {
+    const auto id = g.identity();
+    if (id.service_id.empty()) {
         throw InitError("emit: fasten::init() must be called first");
     }
+    const std::string strategy = g.strategy();
 
     Meta meta;
     {
@@ -1574,9 +1626,9 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     row.code           = code;
     row.action         = meta.action;
     row.severity       = detail_::sev_str(meta.severity);
-    row.service_id     = g.service_id;
-    row.source_node_id = g.node_id;
-    row.tenant_id      = g.tenant_id;
+    row.service_id     = id.service_id;
+    row.source_node_id = id.node_id;
+    row.tenant_id      = id.tenant_id;
     row.actor          = o.actor;
     row.actor_kind     = o.actor_kind;
     row.target         = o.target;
@@ -1634,16 +1686,16 @@ inline Row emit(const std::string& code, Opts&&... opts) {
             std::lock_guard<std::mutex> lk(g.drainer_mu);
             drainer_copy = g.drainer;
         }
-        if (drainer_copy && g.failure_strategy == "queue") {
-            drainer_copy->put(row);
-        } else {
+        // A row the drainer refuses (a re-init stopped it) is stored below.
+        const bool queued = drainer_copy && strategy == "queue" && drainer_copy->put(row);
+        if (!queued) {
             std::function<void(const Row&)> sink_copy;
             {
                 std::lock_guard<std::mutex> lk(g.sink_mu);
                 sink_copy = g.audit_sink;
             }
             if (sink_copy) {
-                if (g.failure_strategy == "raise") {
+                if (strategy == "raise") {
                     try {
                         sink_copy(row);
                     } catch (const std::exception& e) {
@@ -1653,8 +1705,9 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                     }
                 } else {
                     // Queue strategy but no drainer (sink registered
-                    // after init()) — fall back to sync to avoid
-                    // silently dropping rows. Surface any sink error
+                    // after init()), or the drainer refused the row —
+                    // fall back to sync to avoid silently dropping
+                    // rows. Surface any sink error
                     // on the sys stream instead of swallowing it; an
                     // adopter watching `/logs/sys` (or queue_stats())
                     // sees the failure instead of it vanishing.
@@ -1705,7 +1758,7 @@ namespace log {
 inline void _write(const std::string& level, const std::string& event,
                    const Fields& fields)
 {
-    auto& g = detail_::globals();
+    const auto id = detail_::globals().identity();
     auto clean = detail_::redact(fields);
 
     // Build NDJSON line.
@@ -1714,8 +1767,8 @@ inline void _write(const std::string& level, const std::string& event,
     js += ",\"level\":"      + detail_::json_str(level);
     js += ",\"event\":"      + detail_::json_str(event);
     js += ",\"request_id\":" + detail_::json_str(rid);
-    js += ",\"service_id\":" + detail_::json_str(g.service_id);
-    if (!g.tenant_id.empty()) js += ",\"tenant_id\":" + detail_::json_str(g.tenant_id);
+    js += ",\"service_id\":" + detail_::json_str(id.service_id);
+    if (!id.tenant_id.empty()) js += ",\"tenant_id\":" + detail_::json_str(id.tenant_id);
     js += ",\"timestamp\":"  + detail_::json_str(detail_::now_iso8601());
     for (auto& kv : clean) {
         js += ',' + detail_::json_str(kv.first) + ':' + detail_::json_str(kv.second);

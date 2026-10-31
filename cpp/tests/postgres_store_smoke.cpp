@@ -11,6 +11,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
+
+#include <libpq-fe.h>
 
 namespace {
 
@@ -119,6 +123,48 @@ void test_schema_qualified_table(const std::string& dsn) {
     std::cout << "  test_schema_qualified_table: PASS\n";
 }
 
+// Two stores inserting seq-0 rows for one node at once get 1..N with no
+// repeats (the advisory lock); another node starts at 1.
+void test_seq_allocated_per_node(const std::string& dsn) {
+    const std::string table = "fasten_cpp_seq_" + fasten::mint_id();
+    {
+        fasten::PostgresStore a(dsn, table);
+        fasten::PostgresStore b(dsn, table);
+        auto insert_many = [](fasten::PostgresStore& store, const std::string& prefix) {
+            for (int i = 0; i < 10; ++i) {
+                auto row = make_row(prefix + std::to_string(i), "TEST_SEQ");
+                row.monotonic_seq = 0;
+                store.insert(row);
+            }
+        };
+        std::thread ta([&] { insert_many(a, "evt-seq-a"); });
+        std::thread tb([&] { insert_many(b, "evt-seq-b"); });
+        ta.join();
+        tb.join();
+        auto other = make_row("evt-seq-other", "TEST_SEQ");
+        other.monotonic_seq  = 0;
+        other.source_node_id = "node-2";
+        a.insert(other);
+    }
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    assert(PQstatus(conn) == CONNECTION_OK);
+    PGresult* res = PQexec(conn, ("SELECT source_node_id, monotonic_seq FROM " + table +
+                                  " ORDER BY source_node_id, monotonic_seq").c_str());
+    assert(PQresultStatus(res) == PGRES_TUPLES_OK);
+    std::string got;
+    for (int i = 0; i < PQntuples(res); ++i) {
+        got += std::string(PQgetvalue(res, i, 0)) + ":" + PQgetvalue(res, i, 1) + " ";
+    }
+    PQclear(res);
+    PQclear(PQexec(conn, ("DROP TABLE " + table).c_str()));
+    PQfinish(conn);
+    std::string want;
+    for (int i = 1; i <= 20; ++i) want += "node-1:" + std::to_string(i) + " ";
+    want += "node-2:1 ";
+    assert(got == want);
+    std::cout << "  test_seq_allocated_per_node: PASS\n";
+}
+
 } // namespace
 
 int main() {
@@ -141,6 +187,7 @@ int main() {
     test_populated_nullable_columns(dsn);
     test_pii_in_detail(dsn);
     test_schema_qualified_table(dsn);
+    test_seq_allocated_per_node(dsn);
 
     std::cout << "All PostgreSQL store smoke tests passed.\n";
     return 0;

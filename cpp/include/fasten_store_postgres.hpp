@@ -254,6 +254,10 @@ private:
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_code ON " + table_ + " (code)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_ts   ON " + table_ + " (timestamp)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_svc  ON " + table_ + " (service_id)");
+        // For the seq allocation in insert(). Not unique: rows from the old
+        // per-process counter repeat seqs.
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_node_seq ON " + table_ +
+                " (source_node_id, monotonic_seq)");
     }
 
     PGconn*     conn_   = nullptr;
