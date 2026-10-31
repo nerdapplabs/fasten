@@ -86,6 +86,9 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
+    # Seq allocation and the doctor's chain sample. Not unique: unchained
+    # rows all sit at seq 0.
+    "CREATE INDEX IF NOT EXISTS idx_{p}_node_seq  ON {t}(source_node_id, monotonic_seq)",
 ]
 
 
@@ -823,6 +826,21 @@ class PostgresStore:
                 else:
                     cur.execute(f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}")
                 return int(cur.fetchone()[0])
+
+        return self._execute_with_retry(_run)
+
+    def chain_tail(self, source_node_id: str, limit: int) -> list[AuditRow]:
+        """The node's newest ``limit`` rows by monotonic_seq, oldest first.
+        See SQLiteStore.chain_tail."""
+
+        def _run(conn: Any) -> list[AuditRow]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {self._table} WHERE source_node_id = %s "
+                    "ORDER BY monotonic_seq DESC LIMIT %s",
+                    (source_node_id, limit),
+                )
+                return [self._row(r) for r in reversed(cur.fetchall())]
 
         return self._execute_with_retry(_run)
 

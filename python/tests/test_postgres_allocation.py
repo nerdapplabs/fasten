@@ -146,3 +146,12 @@ def test_redact_expired_respects_cutoff_and_codes(store):
     assert store.redact_expired(before=datetime(2099, 1, 1, tzinfo=timezone.utc),
                                 codes=[]) == []
     assert {r.id: r for r in store.query(limit=50)}[fresh.id].detail is not None
+
+
+def test_chain_tail_keeps_the_newest_rows_in_seq_order(store):
+    for i in range(1, 6):
+        store.allocate_and_insert_originated(_row(i))
+    store.allocate_and_insert_originated(_row(1, service_id="svc-b", node="node-2"))
+    rows = store.chain_tail("node-1", 3)
+    assert [r.monotonic_seq for r in rows] == [3, 4, 5]
+    assert [r.source_node_id for r in store.chain_tail("node-2", 3)] == ["node-2"]

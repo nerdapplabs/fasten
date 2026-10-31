@@ -7,6 +7,7 @@
   previous silent collapse to breaks: 0 that reads as green on a status
   page (finding #10 in the PR #59 review).
 """
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -97,7 +98,7 @@ def test_doctor_reports_error_when_verify_raises():
     assert chain["verified"] is None
     assert chain["breaks"] is None
     assert chain["error"] == "RuntimeError"
-    assert "simulated failure" in chain["reason"]
+    assert "simulated failure" not in chain["reason"]
 
 
 def test_doctor_reports_breaks_null_when_no_rows_to_verify():
@@ -109,3 +110,100 @@ def test_doctor_reports_breaks_null_when_no_rows_to_verify():
     chain = resp.json()["chain"]
     assert chain["verified"] is None
     assert chain["breaks"] is None
+
+
+# ── clock step back ────────────────────────────────────────────────────────
+def test_doctor_samples_by_seq_after_a_clock_step_back():
+    """Seq 30 is stamped 90 s before every other row. The newest 50 by
+    timestamp skip it, and that sample reads as a break on a clean chain."""
+    _init()
+    t0 = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+    stamps = iter(
+        t0 - timedelta(seconds=90) if i == 30 else t0 + timedelta(seconds=i)
+        for i in range(1, 53)
+    )
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(stamps)
+
+    with patch("fasten.engine.datetime", _Clock):
+        _emit_n(52)
+    resp = _client().get("/api/v1/logs/audit/doctor")
+    chain = resp.json()["chain"]
+    assert chain["verified"] is True, chain
+    assert chain["breaks"] == 0
+
+
+def test_chain_tail_keeps_the_newest_rows_in_seq_order():
+    _init()
+    _emit_n(5)
+    rows = fasten.audit_store().chain_tail("node", 3)
+    assert [r.monotonic_seq for r in rows] == [3, 4, 5]
+
+
+# ── store errors stay out of the response ──────────────────────────────────
+def test_doctor_logs_store_errors_by_type_only():
+    _init()
+    _emit_n(1)
+    secret = "connection to host=db.internal user=svc failed"
+    store = fasten.audit_store()
+    with patch.object(store, "count", side_effect=RuntimeError(secret)), \
+            patch.object(store, "chain_tail", side_effect=RuntimeError(secret)), \
+            patch.object(fasten.emitter._default, "_drainer_sys_log") as log:
+        resp = _client().get("/api/v1/logs/audit/doctor")
+    body = resp.json()
+    assert secret not in resp.text
+    assert body["store"]["last_error"] == "store check failed; see the service log"
+    assert body["chain"]["reason"] == "chain check failed; see the service log"
+    logged = [c.args for c in log.call_args_list]
+    assert ("error", "doctor_check_failed",
+            {"check": "store", "error_type": "RuntimeError"}) in logged
+    assert ("error", "doctor_check_failed",
+            {"check": "chain", "error_type": "RuntimeError"}) in logged
+
+
+def test_reinit_with_a_sealing_store_clears_chain_unavailable():
+    class _Unchained(SQLiteStore):
+        allocate_and_insert_originated = None
+
+    fasten.init(service_id="svc", node_id="node", audit_store=_Unchained(":memory:"),
+                audit_store_failure_strategy="raise")
+    _emit_n(1)
+    assert _client().get("/api/v1/logs/audit/doctor").json()["chain"]["verified"] is False
+    _init()
+    _emit_n(1)
+    assert _client().get("/api/v1/logs/audit/doctor").json()["chain"]["verified"] is True
+
+
+def test_doctor_reports_an_unchained_store_before_the_first_emit():
+    class _Unchained(SQLiteStore):
+        allocate_and_insert_originated = None
+
+    store = _Unchained(":memory:")
+    fasten.init(service_id="svc", node_id="node", audit_store=store,
+                audit_store_failure_strategy="raise")
+    _emit_n(1)
+    # A new process, or a re-init over the same store, hasn't emitted yet.
+    fasten.init(service_id="svc", node_id="node", audit_store=store,
+                audit_store_failure_strategy="raise")
+    assert _client().get("/api/v1/logs/audit/doctor").json()["chain"]["verified"] is False
+
+
+def test_chain_tail_and_seq_allocation_use_the_node_seq_index(tmp_path):
+    import sqlite3
+    path = tmp_path / "audit.db"
+    SQLiteStore(str(path))
+    conn = sqlite3.connect(path)
+    plans = [
+        " ".join(r[3] for r in conn.execute(f"EXPLAIN QUERY PLAN {sql}", ("node",)))
+        for sql in (
+            "SELECT * FROM audit_log WHERE source_node_id = ? "
+            "ORDER BY monotonic_seq DESC LIMIT 50",
+            "SELECT COALESCE(MAX(monotonic_seq), 0) FROM audit_log WHERE source_node_id = ?",
+        )
+    ]
+    conn.close()
+    for plan in plans:
+        assert "idx_audit_log_node_seq" in plan, plan
