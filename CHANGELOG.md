@@ -96,15 +96,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `SQLiteStore.from_dsn` keeps `sqlite:////abs/path.db` absolute, as the
   stream store already did. It used to create the file under the working
-  directory.
+  directory. A relative path is made absolute when the store is built, so a
+  thread that opens its connection after an `os.chdir()` uses the same file.
 - `/audit/doctor` samples the node's newest 50 rows by `monotonic_seq` through
   the new `chain_tail()` on both built-in stores. The timestamp-ordered sample
   skipped seqs after a clock step back and reported a break on a clean chain.
-  A store without `chain_tail()` keeps the old sample.
+  A store without `chain_tail()` keeps the old sample. Both stores add a
+  `(source_node_id, monotonic_seq)` index, which this sample and the seq
+  allocation use; it is not unique, since unchained rows all sit at seq 0.
 - A scoped caller no longer sees the host `tenant_id`, or the row a chain break
   is on. The doctor's `last_error` and chain `reason` carry fixed text and log
   a `doctor_check_failed` sys line with the error type.
-- `init()` clears the chain-unavailable flag a previous store set.
+- `init()` sets the chain-unavailable flag from the new store: a store without
+  `allocate_and_insert_originated` reports `verified: false` from the start,
+  not only after its first emit.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

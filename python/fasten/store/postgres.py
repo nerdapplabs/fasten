@@ -86,6 +86,9 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
+    # Seq allocation and the doctor's chain sample. Not unique: unchained
+    # rows all sit at seq 0.
+    "CREATE INDEX IF NOT EXISTS idx_{p}_node_seq  ON {t}(source_node_id, monotonic_seq)",
 ]
 
 

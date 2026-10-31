@@ -383,9 +383,13 @@ class Engine:
         # Re-init on a fresh store clears the sticky degrade — a hole in the
         # previous store's history doesn't apply to this one.
         self._audit_write_swallowed = False
-        # Same for the unchained-store flag: it describes the old store.
+        # The unchained-store flags describe the old store. A store without
+        # allocate_and_insert_originated can't be verified, so /audit/doctor
+        # says so from init, before the first emit logs it.
         self._unchained_store_logged = False
-        self._audit_chain_unavailable = False
+        self._audit_chain_unavailable = cfg.audit_store is not None and not callable(
+            getattr(cfg.audit_store, "allocate_and_insert_originated", None)
+        )
 
         # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
         # (spec §2.1) and happens inside the insert transaction, so an engine

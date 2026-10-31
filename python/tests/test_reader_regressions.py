@@ -87,6 +87,22 @@ def test_audit_store_from_dsn_preserves_absolute_path(tmp_path, monkeypatch):
     assert (tmp_path / "rel.db").exists()
 
 
+def test_relative_audit_path_survives_chdir(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.chdir(tmp_path)
+    store = SQLiteStore.from_dsn("sqlite:///rel.db")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    # A new thread opens its own connection after the chdir.
+    got = []
+    t = threading.Thread(target=lambda: got.append(store.count()))
+    t.start()
+    t.join()
+    assert got == [0]
+    assert not (elsewhere / "rel.db").exists()
+
+
 # PR #59 finding 11: reject unknown DSN schemes rather than silently opening
 # a local SQLite file named after the DSN's path component. Any of these
 # used to create a container-local file that reads then reports

@@ -175,3 +175,35 @@ def test_reinit_with_a_sealing_store_clears_chain_unavailable():
     _init()
     _emit_n(1)
     assert _client().get("/api/v1/logs/audit/doctor").json()["chain"]["verified"] is True
+
+
+def test_doctor_reports_an_unchained_store_before_the_first_emit():
+    class _Unchained(SQLiteStore):
+        allocate_and_insert_originated = None
+
+    store = _Unchained(":memory:")
+    fasten.init(service_id="svc", node_id="node", audit_store=store,
+                audit_store_failure_strategy="raise")
+    _emit_n(1)
+    # A new process, or a re-init over the same store, hasn't emitted yet.
+    fasten.init(service_id="svc", node_id="node", audit_store=store,
+                audit_store_failure_strategy="raise")
+    assert _client().get("/api/v1/logs/audit/doctor").json()["chain"]["verified"] is False
+
+
+def test_chain_tail_and_seq_allocation_use_the_node_seq_index(tmp_path):
+    import sqlite3
+    path = tmp_path / "audit.db"
+    SQLiteStore(str(path))
+    conn = sqlite3.connect(path)
+    plans = [
+        " ".join(r[3] for r in conn.execute(f"EXPLAIN QUERY PLAN {sql}", ("node",)))
+        for sql in (
+            "SELECT * FROM audit_log WHERE source_node_id = ? "
+            "ORDER BY monotonic_seq DESC LIMIT 50",
+            "SELECT COALESCE(MAX(monotonic_seq), 0) FROM audit_log WHERE source_node_id = ?",
+        )
+    ]
+    conn.close()
+    for plan in plans:
+        assert "idx_audit_log_node_seq" in plan, plan

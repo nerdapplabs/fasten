@@ -10,6 +10,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -72,6 +73,9 @@ CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
 CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
 CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
+-- Seq allocation and the doctor's chain sample. Not unique: unchained rows
+-- all sit at seq 0.
+CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monotonic_seq);
 """
 
 
@@ -101,7 +105,9 @@ class SQLiteStore:
                 f"fasten SQLiteStore: table name {table!r} is not a valid SQL identifier. "
                 "Use only letters, digits, and underscores."
             )
-        self._path = path
+        # Absolute, because each thread opens its own connection later and a
+        # relative path would follow an os.chdir() in between.
+        self._path = path if path == ":memory:" else os.path.abspath(path)
         self._table = table
         self._wal = wal
         # Swallowed persist-failure counter (mirrors StreamStore). At least one
