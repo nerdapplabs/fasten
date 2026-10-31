@@ -121,7 +121,11 @@ export interface EmitInput {
 	method?: Method;
 }
 
-export function emit(input: EmitInput): Row;
+/**
+ * Returns the row. In raise mode with a store whose `insert` returns a
+ * promise, returns a promise for the row that rejects with AuditStoreError.
+ */
+export function emit(input: EmitInput): Row | Promise<Row>;
 
 export interface Logger {
 	debug(event: string, fields?: Record<string, unknown>): void;
@@ -156,6 +160,11 @@ export function queueStats(): QueueStats | null;
 // drained. No-op + true in raise mode.
 export function flush(timeoutMs?: number): Promise<boolean>;
 
+// Call on shutdown: flushes for up to half of timeoutMs, then stops the
+// drainer, giving queued rows one attempt. Resolves false if a row was lost
+// (audit_drain_lost_at_stop). Emits after close skip the queue.
+export function close(timeoutMs?: number): Promise<boolean>;
+
 // --- Store interfaces ----------------------------------------------------
 
 export interface Filter {
@@ -163,6 +172,7 @@ export interface Filter {
 	code?: string;
 	domain?: Domain;
 	sourceNodeId?: string;
+	tenantId?: string;
 	since?: string;
 	until?: string;
 	limit?: number;
@@ -201,6 +211,7 @@ declare const _default: {
 	withRequestID: typeof withRequestID;
 	queueStats: typeof queueStats;
 	flush: typeof flush;
+	close: typeof close;
 	AuditStoreError: typeof AuditStoreError;
 };
 export default _default;

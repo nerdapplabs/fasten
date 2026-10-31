@@ -21,6 +21,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: js
@@ -40,6 +55,8 @@ jobs:
         run: npx biome check src/
 
       - name: Unit tests with coverage
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgresql://fasten:fasten@localhost:5432/fasten_test
         run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
 
       - name: Upload coverage to Codecov

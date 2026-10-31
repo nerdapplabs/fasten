@@ -207,7 +207,8 @@ describe('emit', () => {
         assert.equal(row.source_node_id, 'test-node');
         assert.match(row.id, /^evt-[0-9a-f]{20}$/);
         assert.match(row.request_id, /^[0-9a-f]{12}$/);
-        assert.ok(row.monotonic_seq >= 1);
+        assert.equal(row.monotonic_seq, 0);
+        assert.match(row.timestamp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
         assert.equal(row.method, 'sdk');
     });
 
@@ -281,11 +282,13 @@ describe('emit', () => {
         assert.equal(row.severity, 'warn');
     });
 
-    test('monotonic_seq increases', () => {
+    // Spec §2.1 / §8: the store allocates seq; emit() never makes one up.
+    test('emit leaves monotonic_seq to the store', () => {
         initTestSDK();
         const r1 = emit({ code: 'USER_CREATED', target: 'u-1' });
         const r2 = emit({ code: 'USER_DELETED', target: 'u-1' });
-        assert.ok(r2.monotonic_seq > r1.monotonic_seq);
+        assert.equal(r1.monotonic_seq, 0);
+        assert.equal(r2.monotonic_seq, 0);
     });
 
     test('PII redaction in detail', () => {

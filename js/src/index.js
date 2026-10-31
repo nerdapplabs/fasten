@@ -8,6 +8,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { canonicalTS } from "./canonical_ts.js";
 import {
 	coreMetaOf,
 	coreRedact,
@@ -239,8 +240,8 @@ export class Engine {
 		redactReplacement: null,
 		failureStrategy: "queue",
 	};
-	#seq = 0;
 	_drainer = null; // accessible by audit_queue.js shims via _setDefaultEngine
+	#closing = null;
 
 	init(opts = {}) {
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
@@ -277,6 +278,13 @@ export class Engine {
 				"fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required",
 			);
 		}
+
+		// Spec §8.1: say once per init that rows are not chained.
+		this._drainerSysLog("error", "audit_chain_unavailable", {
+			store: this.#config.auditStore?.constructor?.name ?? null,
+			reason:
+				"the JS SDK does not seal rows (spec 2.1); rows are written unsealed",
+		});
 
 		if (strategy === "queue" && this.#config.auditStore) {
 			this._installDrainer({
@@ -341,8 +349,10 @@ export class Engine {
 			wire_version: "1",
 			id,
 			origin_id: id,
-			monotonic_seq: ++this.#seq,
-			timestamp: new Date().toISOString(),
+			// Spec §8: JS does not allocate seq or seal, so the row goes out
+			// with seq 0, as phase-1 stdout lines do; a store allocates it.
+			monotonic_seq: 0,
+			timestamp: canonicalTS(),
 			code,
 			action: meta.action,
 			severity: severity ?? meta.severity,
@@ -367,20 +377,34 @@ export class Engine {
 				if (d) {
 					d.put(row);
 				} else {
-					try {
-						cfg.auditStore.insert(row);
-					} catch (err) {
+					const failed = (err) =>
 						this._drainerSysLog("error", "audit_sync_fallback_failed", {
 							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
 							row_id: row?.id ?? null,
 						});
+					try {
+						const p = cfg.auditStore.insert(row);
+						if (typeof p?.then === "function") p.then(undefined, failed);
+					} catch (err) {
+						failed(err);
 					}
 				}
 			} else {
+				let p;
 				try {
-					cfg.auditStore.insert(row);
+					p = cfg.auditStore.insert(row);
 				} catch (err) {
 					throw new AuditStoreError(err);
+				}
+				// An async store fails after emit() returns, so hand the caller a
+				// promise for the row that rejects with AuditStoreError.
+				if (typeof p?.then === "function") {
+					return p.then(
+						() => row,
+						(err) => {
+							throw new AuditStoreError(err);
+						},
+					);
 				}
 			}
 		}
@@ -396,6 +420,31 @@ export class Engine {
 		return this._drainer.flush(timeoutMs);
 	}
 
+	/**
+	 * Flush pending audit rows for up to half of timeoutMs, then stop the
+	 * drainer. Rows still queued get one attempt; a row not stored by
+	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Call it on
+	 * shutdown: flush() alone leaves a row in backoff unreported at exit.
+	 * Emits after close are stored without the queue. Resolves false if a
+	 * row was lost.
+	 */
+	close(timeoutMs = 5000) {
+		// A second close while one is running waits for the same outcome.
+		if (!this.#closing) {
+			this.#closing = this.#close(timeoutMs).finally(() => {
+				this.#closing = null;
+			});
+		}
+		return this.#closing;
+	}
+
+	async #close(timeoutMs) {
+		if (!this._drainer) return true;
+		const deadline = Date.now() + timeoutMs;
+		await this.flush(timeoutMs / 2);
+		return this._uninstallDrainer(Math.max(0, deadline - Date.now()));
+	}
+
 	resetForTests() {
 		this._uninstallDrainer();
 		this.#config = {
@@ -407,7 +456,6 @@ export class Engine {
 			extraRedactKeys: [],
 			failureStrategy: "queue",
 		};
-		this.#seq = 0;
 	}
 
 	// ── Internal ────────────────────────────────────────────────────────────
@@ -421,10 +469,10 @@ export class Engine {
 		}
 	}
 
-	_uninstallDrainer() {
+	_uninstallDrainer(timeoutMs) {
 		const old = this._drainer;
 		this._drainer = null;
-		if (old) old.stop();
+		return old ? old.stop(timeoutMs) : Promise.resolve(true);
 	}
 
 	_drainerSysLog(level, event, fields) {
@@ -488,6 +536,9 @@ export function queueStats() {
 export async function flush(timeoutMs = 5000) {
 	return defaultEngine.flush(timeoutMs);
 }
+export function close(timeoutMs = 5000) {
+	return defaultEngine.close(timeoutMs);
+}
 
 export const log = defaultEngine.log;
 
@@ -521,6 +572,7 @@ export default {
 	AuditStoreError,
 	queueStats,
 	flush,
+	close,
 	Domain,
 	Severity,
 	RetentionClass,

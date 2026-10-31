@@ -92,6 +92,46 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — JS async store errors, drainer stop and `PostgresStore` (#137)
+
+- Raise mode with a store whose `insert` returns a promise (such as
+  `PostgresStore`): `emit()` returns a promise for the row that rejects with
+  `AuditStoreError`. It used to return normally, and the rejection ended the
+  process as an `unhandledRejection`. A sync store still throws from `emit()`.
+  The TypeScript return type is now `Row | Promise<Row>`.
+- The queue-mode fallback with no drainer logs `audit_sync_fallback_failed`
+  for a rejected async insert too.
+- Stopping the drainer (re-`init()`, uninstall) no longer drops rows
+  silently. It cuts any backoff short and gives each row still queued one
+  more attempt (spec §10). A row that fails it, or is still unstored when the
+  timeout (5 s) passes, is reported as `audit_drain_lost_at_stop`, as in Go
+  and Python, and `stop(timeoutMs)` resolves false. `flush()` counts a
+  dead-lettered or lost row as done.
+- New `close(timeoutMs)` (and `Engine.close()`) for shutdown: it flushes for
+  up to half the timeout, then stops the drainer, and resolves false if a row
+  was lost. A second `close()` while one runs waits for the same result.
+- `audit_drain_degraded` reports the backoff about to start in
+  `in_backoff_seconds`; it was always 0.
+- `emit()` no longer makes up `monotonic_seq` from a per-process counter that
+  restarted at 1 (spec §2.1, §8). It returns `monotonic_seq: 0`, and
+  `PostgresStore` allocates the node's next seq in the insert transaction
+  under the same advisory lock as Python and Go, using a new
+  `(source_node_id, monotonic_seq)` index. Rows are still unsealed;
+  `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
+- Audit row timestamps and `shipped_at` use the canonical form (§4.3).
+- `PostgresStore` can share a table with the Python and Go stores: it inserts
+  with a column list, adds the chain columns (and `pii_in_detail` on a table
+  Python made), writes `shipped_at` in the canonical form instead of `NOW()`,
+  reads `TIMESTAMPTZ` columns back in that form with their microseconds, filters on `tenantId`, and
+  orders `query()` by timestamp.
+- A table the JS store creates has the Python store's column order (Python
+  reads by position) and empty, not NULL, `detail_salt` / `detail_commitment`
+  (Go reads them as strings). A table an older JS store created keeps its old
+  column order, with `pii_in_detail` before `shipped_at`; Postgres can't move
+  a column, so recreate it before pointing a Python store at it.
+- JS CI runs the `PostgresStore` tests against Postgres; they were always
+  skipped. Two purge tests that failed against a real database are fixed.
+
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 
 - `PostgresStore` read methods (`query`, `count`, `list_unshipped`, `sources`,

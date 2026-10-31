@@ -142,6 +142,8 @@ both.
 | `audit_drain_recovered` | `info` | Insert succeeds after one or more failures |
 | `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts` |
 | `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
+| `audit_drain_lost_at_stop` | `error` | Row not stored at shutdown (§10) |
+| `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
 
 **`audit_drain_failed` fields:**
 
@@ -179,6 +181,18 @@ both.
 
 ```json
 { "reason": "drainer_stopped", "row_id": "<string|null>" }
+```
+
+**`audit_drain_lost_at_stop` fields** (one event per row):
+
+```json
+{ "error_type": "<ExceptionType>", "row_id": "<string|null>" }
+```
+
+**`audit_drain_recovered_at_stop` fields** (one event per stop):
+
+```json
+{ "row_ids": ["<string>", ...] }
 ```
 
 ---
@@ -432,6 +446,12 @@ When `jitter=false` the first five delays (with `retry_initial=100ms`,
 3. Drain remaining queue entries with at most one attempt each
    (no retry in shutdown path).
 4. Join the drainer thread with a short timeout.
+
+A row that fails its shutdown attempt, or is still unstored when the
+shutdown timeout passes, is reported with `audit_drain_lost_at_stop`, not
+`audit_drain_dead_letter`, and the SDK's `close()` / `Close()` returns
+false. An SDK that stores rows its drainer still held after stopping it
+reports them with `audit_drain_recovered_at_stop`.
 
 `install_drainer()` / `init()` on a running engine MUST:
 
