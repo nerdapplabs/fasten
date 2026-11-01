@@ -90,7 +90,8 @@ func goSysLogCallback(eventJSON *C.char, userdata unsafe.Pointer) {
 	}
 	level, _ := fields["level"].(string)
 	event, _ := fields["event"].(string)
-	if id, _ := fields["row_id"].(string); event == "audit_drain_dead_letter" && d.isPending(id) {
+	stopEvent := event == "audit_drain_dead_letter" || event == "audit_drain_lost_at_stop"
+	if id, _ := fields["row_id"].(string); stopEvent && d.isPending(id) {
 		// A row still pending failed its one try at stop; retire then stores
 		// it or reports it lost, so this would count it twice.
 		return
