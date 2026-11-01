@@ -514,7 +514,7 @@ class TestFormCompatibility:
             logger.removeHandler(handler)
 
         assert got == [], "a form-1 row was redacted — its hash is now wrong"
-        assert any("canonical_form_id != '2'" in r.getMessage() for r in records), \
+        assert any("sealed under form '1'" in r.getMessage() for r in records), \
             "form-1 rows were skipped with no warning"
         assert rows_by_id(db)[row.id].detail == {"email": "a@b.c"}
 
