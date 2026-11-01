@@ -704,10 +704,10 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 
 // Close flushes pending audit rows for up to half of timeout, then stops the
 // drainer and stores any row it still holds. A row not stored once timeout
-// has passed is reported lost (audit_drain_lost_at_stop); the store must
-// honour ctx for Close to return by then. Call it on shutdown: Flush alone
-// leaves a row that is still being retried unreported at exit. Emits after
-// Close are stored synchronously. Returns false if a row was lost.
+// has passed is reported lost (audit_drain_lost_at_stop). Call it on
+// shutdown: Flush alone leaves a row that is still being retried unreported
+// at exit. Emits after Close are stored synchronously. Returns false if a row
+// was lost.
 //
 // A store call still running at timeout is left to finish in the background,
 // and its row is reported lost then. A second Close while one is running
@@ -761,6 +761,12 @@ func (e *Engine) close(timeout time.Duration) bool {
 		case <-retired:
 		case <-time.After(time.Until(deadline)):
 			old.reportUnstored()
+			// Flush on a drainer a later Init installs must not wait on this one.
+			e.drainerMu.Lock()
+			if e.retired == done {
+				e.retired = nil
+			}
+			e.drainerMu.Unlock()
 		}
 	}
 	return d == nil || d.lost.Load() == lost

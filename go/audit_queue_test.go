@@ -852,21 +852,26 @@ func TestQueueCloseReturnsByTimeoutWhenTheStoreHangs(t *testing.T) {
 }
 
 // stuckStore ignores ctx, like lib/pq waiting on a server that has stopped
-// answering: an insert returns only once release is closed.
+// answering: an insert returns err, or "released", only once release is
+// closed.
 type stuckStore struct {
 	*SQLiteStore
 	release chan struct{}
+	err     error
 }
 
 func (s stuckStore) AllocateAndInsertOriginated(_ context.Context, row Row) (Row, error) {
 	<-s.release
+	if s.err != nil {
+		return row, s.err
+	}
 	return row, errors.New("released")
 }
 
 func TestQueueCloseReturnsByTimeoutWhenTheStoreIgnoresCtx(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
-	store := stuckStore{newFlakyStore(t, 0).SQLiteStore, make(chan struct{})}
+	store := stuckStore{SQLiteStore: newFlakyStore(t, 0).SQLiteStore, release: make(chan struct{})}
 	initQueue(t, store, Config{})
 	rows := emitN(t, 3)
 	start := time.Now()
@@ -885,6 +890,50 @@ func TestQueueCloseReturnsByTimeoutWhenTheStoreIgnoresCtx(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if lost := sysEvents(t, "audit_drain_lost_at_stop"); len(lost) != len(rows) {
 		t.Fatalf("lost events after release = %v, want %d", lost, len(rows))
+	}
+}
+
+func TestQueueFlushAfterTimedOutCloseAndInitDoesNotWait(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	stuck := stuckStore{SQLiteStore: newFlakyStore(t, 0).SQLiteStore, release: make(chan struct{})}
+	defer close(stuck.release)
+	initQueue(t, stuck, Config{})
+	emitN(t, 1)
+	if Close(200 * time.Millisecond) {
+		t.Fatal("Close reported no loss, but no row was stored")
+	}
+	initQueue(t, newFlakyStore(t, 0), Config{})
+	emitN(t, 1)
+	start := time.Now()
+	if !Flush(2 * time.Second) {
+		t.Fatal("Flush waited on the drainer the timed-out Close gave up on")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Flush took %v with an empty queue", took)
+	}
+}
+
+func TestQueueRowFailingAfterTimedOutCloseIsNotDeadLettered(t *testing.T) {
+	registerTestCodes(t)
+	resetGlobals(t)
+	store := stuckStore{
+		SQLiteStore: newFlakyStore(t, 0).SQLiteStore,
+		release:     make(chan struct{}),
+		err:         sqlStateErr("22021"),
+	}
+	initQueue(t, store, Config{})
+	rows := emitN(t, 2)
+	if Close(200 * time.Millisecond) {
+		t.Fatal("Close reported no loss, but no row was stored")
+	}
+	close(store.release)
+	time.Sleep(200 * time.Millisecond)
+	if ev := sysEvents(t, "audit_drain_dead_letter"); len(ev) != 0 {
+		t.Fatalf("dead letter events = %v, want none after lost_at_stop", ev)
+	}
+	if lost := sysEvents(t, "audit_drain_lost_at_stop"); len(lost) != len(rows) {
+		t.Fatalf("lost events = %v, want %d", lost, len(rows))
 	}
 }
 

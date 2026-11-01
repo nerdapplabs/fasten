@@ -230,9 +230,18 @@ func (d *cFastenDrainer) insert(rowJSON string) C.int32_t {
 	if err := d.storeRow(p.row); err != nil {
 		rejected := rejectsRow(err)
 		if rejected || p.attempts >= d.maxAttempts {
-			d.settle(head.ID) // the drainer dead-letters it now
-			d.lost.Add(1)
-			d.engine.markWriteLost(d.store, d.gen)
+			// The drainer dead-letters it now. If Close already reported it
+			// lost, keep it pending so the dead letter is not reported too.
+			d.pendingMu.Lock()
+			reported := d.reported
+			if !reported {
+				delete(d.pending, head.ID)
+			}
+			d.pendingMu.Unlock()
+			if !reported {
+				d.lost.Add(1)
+				d.engine.markWriteLost(d.store, d.gen)
+			}
 		}
 		if rejected {
 			return C.FASTEN_INSERT_REJECTED
