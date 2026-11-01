@@ -98,13 +98,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `canonical_form_id`, `detail_salt` and `detail_commitment` and read them
   back. A sealed row passed to `fasten_store_insert` used to be stored without
   its hash, so every `fasten-core/bindings/*` package lost the chain.
+  A row sent with `monotonic_seq: 0` gets a store-allocated seq and is stored
+  unsealed: its chain fields are dropped, as Python and Go overwrite them on
+  allocation, since a hash sealed over another seq could never verify.
 - `Row` has these as typed optional fields instead of leaving them in
   `extra`. A row passed through the C interface or the drainer keeps an
   absent field absent. A row read back from a store carries `prev_hash` and
   `hash` (`""` when unsealed) and `canonical_form_id` (`"1"` by default), as
   Python's rows do; salt and commitment only on a form "2" row.
 - Opening a store adds the five columns to a table an older fasten-core
-  created. Salt and commitment are written as `''` when absent, so a table the
+  created. It checks the table first and only alters what is missing, so
+  opening an up-to-date table takes no write lock (SQLite) and runs no
+  `ALTER TABLE` (Postgres). Salt and commitment are written as `''` when absent, so a table the
   Go store created (NOT NULL there) accepts the row; both read back as absent.
 - Redaction checks `hash` on every table now that it always exists.
 

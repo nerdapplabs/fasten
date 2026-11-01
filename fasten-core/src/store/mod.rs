@@ -104,6 +104,21 @@ pub trait Store: Send + Sync {
     }
 }
 
+/// `row` without its chain fields, as an allocating insert stores it: the
+/// store picks the seq, so a hash the caller sealed over another seq could
+/// never verify.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn unsealed(row: &Row) -> Row {
+    Row {
+        prev_hash: None,
+        hash: None,
+        canonical_form_id: None,
+        detail_salt: None,
+        detail_commitment: None,
+        ..row.clone()
+    }
+}
+
 /// Chain columns (spec §1, §2), in table order. A table an older
 /// fasten-core created lacks them; `migrate` adds them. `detail_salt` and
 /// `detail_commitment` are written as `''` when absent, since a table the Go

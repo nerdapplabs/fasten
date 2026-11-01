@@ -113,7 +113,9 @@ void fasten_store_close(FastenStore* store);
  *
  * monotonic_seq 0 means "allocate": the store assigns the next seq for the
  * row's source_node_id inside the insert transaction (spec §2.1, §8.2). The
- * row is stored unsealed. A non-zero monotonic_seq is written as given; on a
+ * row is stored unsealed: any chain fields it carries are dropped (stored as
+ * prev_hash "", hash "", canonical_form_id "1", no salt or commitment). A
+ * non-zero monotonic_seq is written as given, chain fields included; on a
  * table created by this library a (source_node_id, monotonic_seq) clash is
  * an error.
  *
@@ -125,7 +127,8 @@ void fasten_store_close(FastenStore* store);
  *                 category, domain, method, request_id, detail.
  *                 Optional: tenant_id, pii_in_detail, shipped_at, and the
  *                 chain fields prev_hash, hash, canonical_form_id,
- *                 detail_salt, detail_commitment, stored as given.
+ *                 detail_salt, detail_commitment, stored as given when
+ *                 monotonic_seq is non-zero.
  * @param out_err  Set on error; may be NULL.
  *
  * @return  FASTEN_OK on success, error code otherwise (out_err set).

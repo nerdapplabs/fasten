@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{non_empty, unsealed, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // ── Connection holder ─────────────────────────────────────────────────────────
 //
@@ -214,6 +214,13 @@ impl PostgresStore {
     }
 
     fn insert_with_reconnect(&self, row: &Row) -> Result<(), Error> {
+        let cleared;
+        let row = if row.monotonic_seq == 0 {
+            cleared = unsealed(row);
+            &cleared
+        } else {
+            row
+        };
         let detail_str = serde_json::to_string(&row.detail)?;
         let seq: i64 = row.monotonic_seq as i64;
         let pii: i16 = row.pii_in_detail as i16;
@@ -524,7 +531,7 @@ fn migrate(
 ) -> Result<(), Error> {
     // Probe first, so opening an up-to-date table runs no DDL and waits on
     // no lock.
-    if index_missing(client, bare, schema)?.is_none() {
+    if schema_missing(client, bare, schema)?.is_nothing() {
         return Ok(());
     }
 
@@ -578,9 +585,10 @@ fn migrate(
         ),
     )?;
 
+    let missing = schema_missing(client, bare, schema)?;
     // A table an older fasten-core created has no chain columns.
-    for (name, def) in CHAIN_COLUMNS {
-        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {def}"))?;
+    for (name, def) in missing.columns {
+        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN {name} {def}"))?;
     }
 
     for sql in &[
@@ -594,7 +602,7 @@ fn migrate(
 
     // A table created before the UNIQUE constraint has no node-seq index and
     // may already repeat seqs on a node, so this one is not unique.
-    if index_missing(client, bare, schema)? == Some(NODE_SEQ) {
+    if missing.node_seq_index {
         pg_exec(
             client,
             &format!(
@@ -608,16 +616,25 @@ fn migrate(
     Ok(())
 }
 
-const NODE_SEQ: &str = "node_seq";
+struct Missing {
+    indexes: bool,
+    node_seq_index: bool,
+    columns: Vec<(&'static str, &'static str)>,
+}
 
-/// The first index `migrate` creates that the table lacks (`req`, `code`,
-/// `ts`, `svc` or [`NODE_SEQ`]), or `None` when it is up to date. A missing
-/// table lacks them all.
-fn index_missing(
+impl Missing {
+    fn is_nothing(&self) -> bool {
+        !self.indexes && !self.node_seq_index && self.columns.is_empty()
+    }
+}
+
+/// What `migrate` still has to create on the table. A missing table lacks
+/// everything.
+fn schema_missing(
     client: &mut impl pg::GenericClient,
     bare: &str,
     schema: Option<&str>,
-) -> Result<Option<&'static str>, Error> {
+) -> Result<Missing, Error> {
     // Unquoted identifiers fold to lower case.
     let bare = bare.to_lowercase();
     let schema = schema.map(str::to_lowercase);
@@ -630,16 +647,24 @@ fn index_missing(
         .iter()
         .map(|r| r.get(0))
         .collect();
+    let have: Vec<String> = client
+        .query(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = COALESCE($1, current_schema()) AND table_name = $2",
+            &[&schema, &bare],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     let has = |n: String| names.contains(&n);
-    for s in ["req", "code", "ts", "svc"] {
-        if !has(format!("idx_{bare}_{s}")) {
-            return Ok(Some(s));
-        }
-    }
-    if !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")) {
-        return Ok(Some(NODE_SEQ));
-    }
-    Ok(None)
+    Ok(Missing {
+        indexes: !["req", "code", "ts", "svc"].iter().all(|s| has(format!("idx_{bare}_{s}"))),
+        node_seq_index: !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")),
+        columns: CHAIN_COLUMNS
+            .into_iter()
+            .filter(|(name, _)| !have.iter().any(|h| h == name))
+            .collect(),
+    })
 }
 
 // ── SQL builders ──────────────────────────────────────────────────────────────
@@ -941,7 +966,7 @@ mod tests {
             .unwrap()
             .get(0);
         assert!(!def.contains("UNIQUE"), "{def}");
-        assert_eq!(index_missing(&mut c, table, None).unwrap(), None);
+        assert!(schema_missing(&mut c, table, None).unwrap().is_nothing());
     }
 
     /// Opening an up-to-date table runs no DDL, so it does not wait for the
@@ -1042,6 +1067,7 @@ mod tests {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
             if id == "evt-sealed" {
+                r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
             }
             store.insert(&r).unwrap();
@@ -1056,6 +1082,27 @@ mod tests {
             .unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"k": "v"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// The store picks the seq, so a hash sealed over another one is dropped.
+    #[test]
+    fn allocating_insert_drops_chain_fields() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_alloc_chain");
+        let mut row = make_row("evt-alloc", "TEST");
+        row.prev_hash = Some("genesis".into());
+        row.hash = Some("h1".into());
+        row.canonical_form_id = Some("2".into());
+        row.detail_salt = Some("salt".into());
+        row.detail_commitment = Some("commit".into());
+        store.insert(&row).unwrap();
+        let got = &store.query(&Filter::default()).unwrap()[0];
+        assert_eq!(got.monotonic_seq, 1);
+        assert_eq!(
+            [got.prev_hash.as_deref(), got.hash.as_deref(), got.canonical_form_id.as_deref()],
+            [Some(""), Some(""), Some("1")]
+        );
+        assert_eq!((got.detail_salt.as_deref(), got.detail_commitment.as_deref()), (None, None));
     }
 
     /// #139: a sealed row came back without its hash.

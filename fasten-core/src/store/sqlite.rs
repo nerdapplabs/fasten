@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{non_empty, unsealed, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // ── SqliteStore ───────────────────────────────────────────────────────────────
 
@@ -180,6 +180,7 @@ impl Store for SqliteStore {
         if row.monotonic_seq != 0 {
             return insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64);
         }
+        let row = &unsealed(row);
 
         // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
         // handles on one file cannot both read the same tip (spec §2.1).
@@ -894,6 +895,7 @@ mod tests {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
             if id == "evt-sealed" {
+                r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
             }
             store.insert(&r).unwrap();
@@ -968,6 +970,18 @@ mod tests {
         let got = store.query(&Filter::default()).unwrap();
         assert_eq!(chain_of(&got[0]), chain_of(&row));
         assert_eq!(chain_of(&store.list_unshipped(0).unwrap()[0]), chain_of(&row));
+    }
+
+    /// The store picks the seq, so a hash sealed over another one is dropped.
+    #[test]
+    fn allocating_insert_drops_chain_fields() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut row = sealed("evt-alloc");
+        row.monotonic_seq = 0;
+        store.insert(&row).unwrap();
+        let got = &store.query(&Filter::default()).unwrap()[0];
+        assert_eq!(got.monotonic_seq, 1);
+        assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
     }
 
     #[test]
