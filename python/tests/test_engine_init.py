@@ -292,7 +292,7 @@ def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
     t = fasten.transport()
     assert t is not None
     orig = t.write_drainer_syslog
-    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+    t.write_drainer_syslog = lambda r, **kw: (captured.append(r), orig(r, **kw))[-1]  # type: ignore[assignment,attr-defined]
 
     # emit() must not raise even though the store is broken.
     fasten.emit(code="USER_CREATED", target="u-1")

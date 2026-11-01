@@ -148,7 +148,7 @@ class StdoutTransport:
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
 
-    def write_drainer_syslog(self, row: dict[str, Any]) -> None:
+    def write_drainer_syslog(self, row: dict[str, Any], persist: bool = True) -> None:
         """Drainer self-report path. Buffers + writes to STDERR, never stdout.
 
         The audit queue drainer cannot share the stdout fd with emit() and
@@ -166,12 +166,14 @@ class StdoutTransport:
         attached, reads are served from the store, so skipping the persist
         would make drainer events vanish from the reader API. The store
         insert touches SQLite, not stdout, so it cannot reintroduce the
-        stdout-backpressure deadlock above.
+        stdout-backpressure deadlock above. ``persist=False`` skips it, for
+        a caller that must not wait on the store.
         """
         self._stamp_request_id(row)
         row = self._redact(row)
         self._syslog.push(row)
-        self._persist(self._syslog_store, row, "syslog")
+        if persist:
+            self._persist(self._syslog_store, row, "syslog")
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stderr.flush()
 

@@ -726,8 +726,9 @@ class Engine:
         the drainer and store any row it still holds. Returns within about
         ``timeout``: a row not stored by then is reported lost
         (audit_drain_lost_at_stop), and a store call still running is left
-        behind. Emits after close are stored inline. Returns False if a row
-        was lost."""
+        behind (audit_drain_recovered_at_stop if it later stores its row).
+        Emits after close are stored inline. Returns False if a row was
+        lost."""
         deadline = time.monotonic() + timeout
         with self._drainer_lock:
             self._closed = True
@@ -996,9 +997,10 @@ class Engine:
                     self._drainer_idle.notify_all()
 
     def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any],
-                         via: Optional[_QueueDrainer] = None) -> None:
+                         via: Optional[_QueueDrainer] = None, persist: bool = True) -> None:
         """Route drainer events to stderr (not stdout) to avoid backpressure
-        deadlock. ``via`` sends a drainer's own events to its transport."""
+        deadlock. ``via`` sends a drainer's own events to its transport.
+        ``persist=False`` skips the syslog store."""
         stdout, service_id = (via.stdout, via.service_id) if via else (self._stdout, self._service_id)
         if stdout is None:
             return
@@ -1010,7 +1012,7 @@ class Engine:
             "timestamp": canonical_now(),
             **fields,
         }
-        stdout.write_drainer_syslog(payload)
+        stdout.write_drainer_syslog(payload, persist=persist)
 
     def _install_drainer(
         self,
@@ -1046,7 +1048,11 @@ class Engine:
                 entry[1] += 1
                 with self._insert_lock:
                     self._allocate_and_store(entry[0], store, d.stdout)
-                pending.pop(row_id, None)
+                with d.lock:
+                    # close() gave up on this call and reported the row lost.
+                    recovered = pending.pop(row_id, None) is None and d.reported
+                if recovered:
+                    self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
                 return 0
             except Exception as e:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
                 cb_logger.exception("insert_cb failed for row %s", row_id)
@@ -1099,12 +1105,15 @@ class Engine:
         return old
 
     def _insert_lock_before_fork(self) -> None:
-        self._fork_lock = self._insert_lock
-        self._fork_lock.acquire()
+        # An insert stuck on a database lock must not hold up fork(); the
+        # child replaces the lock either way.
+        lock = self._insert_lock
+        self._fork_lock = lock if lock.acquire(timeout=1.0) else None
 
     def _insert_lock_after_fork(self) -> None:
-        if self._fork_lock is not None:
-            self._fork_lock.release()
+        lock, self._fork_lock = self._fork_lock, None
+        if lock is not None:
+            lock.release()
 
     def _reinstall_after_fork(self) -> None:
         """A forked child (gunicorn --preload, Celery prefork) inherits the
@@ -1179,10 +1188,12 @@ class Engine:
     def _lose_at_stop(self, d: _QueueDrainer, row: AuditRow, error_type: str) -> None:
         d.lost += 1
         self._mark_write_lost(d.store, d.gen)
+        # Past the deadline the syslog store may be as stuck as the audit
+        # store, and close() must still return.
         self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
             "error_type": error_type,
             "row_id": row.id,
-        }, via=d)
+        }, via=d, persist=not d.past_deadline())
 
     def _atexit_close(self) -> None:
         self.close(5.0)
