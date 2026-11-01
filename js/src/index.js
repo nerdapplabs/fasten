@@ -586,8 +586,14 @@ export class Engine {
 	// The in-flight pass lives on the engine, so a re-init can't start a second
 	// pass over the same rows and write their redaction records twice.
 	_startRetention(piiRetMs) {
-		const tick = async () => {
-			if (this._redactionPass) return;
+		// The first tick waits out a pass a re-init left running, so the new
+		// config gets its pass now rather than at the next hourly tick.
+		const tick = async (wait) => {
+			while (this._redactionPass) {
+				if (!wait) return;
+				await this._redactionPass;
+				if (this._retentionTimer !== timer) return;
+			}
 			let done;
 			this._redactionPass = new Promise((r) => {
 				done = r;
@@ -607,9 +613,10 @@ export class Engine {
 				done();
 			}
 		};
-		this._retentionTimer = setInterval(tick, RETENTION_CHECK_MS);
-		this._retentionTimer.unref();
-		this._retentionFirst = setImmediate(tick);
+		const timer = setInterval(() => tick(false), RETENTION_CHECK_MS);
+		timer.unref();
+		this._retentionTimer = timer;
+		this._retentionFirst = setImmediate(() => tick(true));
 		this._retentionFirst.unref();
 	}
 

@@ -237,7 +237,11 @@ export class PostgresStore {
 	/** Ensure DDL has run exactly once, lazily. */
 	async _ensureReady() {
 		if (!this._ready) {
-			this._ready = this.init();
+			// Drop a failed init so the next call retries once Postgres is up.
+			this._ready = this.init().catch((err) => {
+				this._ready = null;
+				throw err;
+			});
 		}
 		return this._ready;
 	}

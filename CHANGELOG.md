@@ -136,7 +136,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   deleted, and a row sealed under form "1" is left alone and counted in
   `pii_redaction_skipped_legacy_form`.
 - `init({ retentionPii: '30d' })` or `FASTEN_RETENTION_PII` runs it on init
-  and then hourly.
+  and then hourly. A re-`init()` during a pass runs the new config once that
+  pass ends.
+- `PostgresStore` retries its table setup on the next call when it fails,
+  such as when Postgres isn't up yet; it used to fail every call until a
+  restart.
 - `PostgresStore` has `listRedactionCandidates()` and `redactRows()`, and
   takes an advisory lock while it creates its table, so two stores starting
   on a new table no longer fail with a duplicate-key error.

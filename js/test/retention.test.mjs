@@ -58,10 +58,13 @@ test('listRedactionCandidates canonicalises a string cutoff', async () => {
 test('a re-init during a redaction pass does not redact the same row twice', async () => {
     const records = [];
     let listed = 0;
+    let started;
+    const firstList = new Promise((r) => { started = r; });
     const store = {
         insert: async (row) => { if (row.code === 'AUDIT_ROW_REDACTED') records.push(row.target); },
         listRedactionCandidates: async () => {
             listed++;
+            started();
             await new Promise((r) => setTimeout(r, 50));
             return records.length ? { candidates: [], skipped: 0 }
                 : { candidates: [{ id: 'evt-1', monotonicSeq: 1 }], skipped: 0 };
@@ -72,10 +75,53 @@ test('a re-init during a redaction pass does not redact the same row twice', asy
     const opts = { serviceId: 's', nodeId: 'n', auditStore: store, retentionPii: '30d',
         auditStoreFailureStrategy: 'raise' };
     e.init(opts);
-    await new Promise((r) => setTimeout(r, 10));
+    await firstList;
     e.init(opts);
     await new Promise((r) => setTimeout(r, 200));
     e.resetForTests();
-    assert.equal(listed, 1);
+    assert.equal(listed, 2);
     assert.deepEqual(records, ['evt-1']);
+});
+
+test('a re-init during a redaction pass runs the new config once the pass ends', async () => {
+    const cutoffs = [];
+    let started;
+    const firstList = new Promise((r) => { started = r; });
+    const store = {
+        insert: async () => {},
+        listRedactionCandidates: async ({ before }) => {
+            cutoffs.push(before.getTime());
+            started();
+            await new Promise((r) => setTimeout(r, 50));
+            return { candidates: [], skipped: 0 };
+        },
+        redactRows: async ({ ids }) => ids,
+    };
+    const e = new Engine();
+    const opts = { serviceId: 's', nodeId: 'n', auditStore: store, auditStoreFailureStrategy: 'raise' };
+    e.init({ ...opts, retentionPii: '30d' });
+    await firstList;
+    e.init({ ...opts, retentionPii: '1d' });
+    await new Promise((r) => setImmediate(r));
+    e.init({ ...opts, retentionPii: '2d' });
+    await new Promise((r) => setTimeout(r, 200));
+    e.resetForTests();
+    assert.equal(cutoffs.length, 2);
+    const ageDays = (Date.now() - cutoffs[1]) / 86_400_000;
+    assert.ok(ageDays > 1.9 && ageDays < 2.1, String(ageDays));
+});
+
+test('_ensureReady retries after a failed init', async () => {
+    const { PostgresStore } = await import('../src/store/postgres.js');
+    const store = Object.create(PostgresStore.prototype);
+    store._ready = null;
+    let calls = 0;
+    store.init = async () => {
+        calls++;
+        if (calls === 1) throw new Error('connection refused');
+    };
+    await assert.rejects(store._ensureReady(), /connection refused/);
+    await store._ensureReady();
+    await store._ensureReady();
+    assert.equal(calls, 2);
 });
