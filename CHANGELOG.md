@@ -159,8 +159,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   the adopter calls it on a schedule.
 - `SqliteStore` and `PostgresStore` gain `list_redaction_candidates()` and
   `redact_rows()`, and the `prev_hash`, `hash`, `canonical_form_id`,
-  `detail_salt` and `detail_commitment` columns (added to existing tables).
-  C++ rows are unsealed; a sealed form-"1" row is never redacted.
+  `detail_salt` and `detail_commitment` columns. They are added to existing
+  tables, with `pii_in_detail` for a table the Python store made; `SqliteStore`
+  adds them under one write lock, so stores opening an old file at once don't
+  fail. C++ rows are unsealed; a sealed form-"1" row is never redacted.
+- `redacted_seq` is a JSON number only in an `AUDIT_ROW_REDACTED` row's
+  `detail`. In any other code's `detail` it stays a string, so the redactor's
+  value checks still see it.
 - Test for #92: two `SqliteStore`s on one file and one node get seqs 1..N.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)

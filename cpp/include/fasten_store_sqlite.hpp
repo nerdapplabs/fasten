@@ -80,7 +80,7 @@ public:
     /// A row with monotonic_seq 0 (what emit() returns) gets the node's next
     /// seq in the insert's transaction (spec §2.1). The row is not sealed.
     void insert(const Row& row) {
-        std::string detail_json = detail_::fields_to_json(row.detail);
+        std::string detail_json = detail_::fields_to_json(row.detail, row.code);
         int         pii_int     = row.pii_in_detail ? 1 : 0;
 
         std::lock_guard<std::mutex> lk(mu_);
@@ -292,6 +292,27 @@ private:
                 "fasten SqliteStore: invalid table name '" + table + "'");
     }
 
+    std::vector<const char* const*> missing_columns() {
+        static const char* const cols[][2] = {
+            {"pii_in_detail",     "INTEGER NOT NULL DEFAULT 0"},
+            {"prev_hash",         "TEXT NOT NULL DEFAULT ''"},
+            {"hash",              "TEXT NOT NULL DEFAULT ''"},
+            {"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+            {"detail_salt",       "TEXT NOT NULL DEFAULT ''"},
+            {"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
+        };
+        std::set<std::string> have;
+        {
+            Stmt q(db_, "PRAGMA table_info(" + table_ + ")");
+            while (sqlite3_step(q.s) == SQLITE_ROW)
+                have.insert(reinterpret_cast<const char*>(sqlite3_column_text(q.s, 1)));
+        }
+        std::vector<const char* const*> out;
+        for (const auto& col : cols)
+            if (!have.count(col[0])) out.push_back(col);
+        return out;
+    }
+
     void migrate() {
         const std::string ddl =
             "CREATE TABLE IF NOT EXISTS " + table_ + " ("
@@ -330,24 +351,21 @@ private:
             throw std::runtime_error("fasten SqliteStore migrate: " + msg);
         }
 
-        // Chain columns for a table created before they were added, with the
-        // Go store's definitions so the table can be shared.
-        std::set<std::string> have;
-        {
-            Stmt q(db_, "PRAGMA table_info(" + table_ + ")");
-            while (sqlite3_step(q.s) == SQLITE_ROW)
-                have.insert(reinterpret_cast<const char*>(sqlite3_column_text(q.s, 1)));
-        }
-        const char* const chain_cols[][2] = {
-            {"prev_hash",         "TEXT NOT NULL DEFAULT ''"},
-            {"hash",              "TEXT NOT NULL DEFAULT ''"},
-            {"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
-            {"detail_salt",       "TEXT NOT NULL DEFAULT ''"},
-            {"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
-        };
-        for (const auto& col : chain_cols) {
-            if (have.count(col[0])) continue;
-            exec_sql("ALTER TABLE " + table_ + " ADD COLUMN " + col[0] + " " + col[1]);
+        // Columns a table created before them (or by the Python store, which
+        // has no pii_in_detail) lacks, with the Go store's definitions so the
+        // table can be shared. Checked again under the write lock, so
+        // concurrent openers of an old file wait instead of adding a column
+        // twice.
+        if (!missing_columns().empty()) {
+            exec("BEGIN IMMEDIATE");
+            try {
+                for (const auto* col : missing_columns())
+                    exec_sql("ALTER TABLE " + table_ + " ADD COLUMN " + col[0] + " " + col[1]);
+                exec("COMMIT");
+            } catch (...) {
+                rollback();
+                throw;
+            }
         }
 
         const std::string idx_sql =

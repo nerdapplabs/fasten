@@ -92,9 +92,9 @@ void json_escapes_decode() {
 
 }  // namespace
 
-// redacted_seq is written as a JSON number only when it is a canonical
-// integer; "007" stays a string, so the detail stays valid JSON and the
-// redactor still masks the password next to it.
+// redacted_seq is a JSON number only in an AUDIT_ROW_REDACTED row's detail,
+// and only when it is a canonical integer; "007" stays a string, so the
+// detail stays valid JSON and the redactor still masks the password next to it.
 void redacted_seq_is_a_number_only_when_canonical() {
     reset_state();
     fasten::Meta m;
@@ -104,11 +104,29 @@ void redacted_seq_is_a_number_only_when_canonical() {
     auto row = fasten::emit("USER_X", fasten::target("u-1"),
         fasten::detail({{"redacted_seq", "007"}, {"password", "hunter2"}}));
     assert(row.detail["password"] != "hunter2");
-    auto js = fasten::detail_::fields_to_json(row.detail);
+    const std::string redacted = fasten::kAuditRowRedacted;
+    auto js = fasten::detail_::fields_to_json(row.detail, redacted);
     assert(js.find("\"redacted_seq\":\"007\"") != std::string::npos);
-    assert(fasten::detail_::fields_to_json({{"redacted_seq", "42"}}) == "{\"redacted_seq\":42}");
-    assert(fasten::detail_::fields_to_json({{"redacted_seq", "0"}}) == "{\"redacted_seq\":0}");
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "42"}}, redacted) ==
+           "{\"redacted_seq\":42}");
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "0"}}, redacted) ==
+           "{\"redacted_seq\":0}");
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "42"}}, "USER_X") ==
+           "{\"redacted_seq\":\"42\"}");
+    assert(fasten::detail_::fields_to_json({{"redacted_seq", "42"}}) ==
+           "{\"redacted_seq\":\"42\"}");
     std::cout << "redacted_seq JSON: PASS\n";
+}
+
+// A card number under redacted_seq in another code's detail reaches the
+// redactor as a string, so its value-shape check masks it.
+void redacted_seq_card_number_is_redacted() {
+    reset_state();
+    auto row = fasten::emit("USER_CREATED", fasten::target("u-1"),
+        fasten::detail({{"redacted_seq", "4539578763621486"}}));
+    assert(row.detail["redacted_seq"] != "4539578763621486");
+    assert(row.to_json().find("4539578763621486") == std::string::npos);
+    std::cout << "redacted_seq card number redacted: PASS\n";
 }
 
 int main() {
@@ -118,5 +136,6 @@ int main() {
     emit_leaves_seq_to_the_store_and_stamps_canonical_time();
     json_escapes_decode();
     redacted_seq_is_a_number_only_when_canonical();
+    redacted_seq_card_number_is_redacted();
     return 0;
 }

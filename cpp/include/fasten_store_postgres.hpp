@@ -192,7 +192,7 @@ private:
     }
 
     void insert_row(const Row& row, int64_t seq) {
-        std::string detail_json = detail_::fields_to_json(row.detail);
+        std::string detail_json = detail_::fields_to_json(row.detail, row.code);
         std::string mono_str    = std::to_string(seq);
         const char* pii_str     = row.pii_in_detail ? "1" : "0";
 
@@ -350,9 +350,11 @@ private:
             ")"
         );
 
-        // Chain columns for a table created before they were added, with the
-        // Go store's definitions so the table can be shared.
+        // Columns a table created before them (or by the Python store, which
+        // has no pii_in_detail) lacks, with the Go store's definitions so the
+        // table can be shared.
         for (const char* col : {
+                 "pii_in_detail SMALLINT NOT NULL DEFAULT 0",
                  "prev_hash TEXT NOT NULL DEFAULT ''",
                  "hash TEXT NOT NULL DEFAULT ''",
                  "canonical_form_id TEXT NOT NULL DEFAULT '1'",

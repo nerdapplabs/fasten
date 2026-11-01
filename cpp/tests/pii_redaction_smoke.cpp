@@ -2,11 +2,16 @@
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -166,6 +171,108 @@ void test_migrates_legacy_table() {
     std::cout << "  test_migrates_legacy_table: PASS\n";
 }
 
+// A store whose insert() fails: the record must come before the data goes.
+struct FailingInsert {
+    fasten::SqliteStore& store;
+    void insert(const fasten::Row&) { throw std::runtime_error("insert failed"); }
+    std::vector<std::pair<std::string, int64_t>> list_redaction_candidates(
+        clock_type::time_point before, const std::vector<std::string>& codes,
+        int64_t* skipped = nullptr) {
+        return store.list_redaction_candidates(before, codes, skipped);
+    }
+    std::vector<std::string> redact_rows(const std::vector<std::string>& ids) {
+        return store.redact_rows(ids);
+    }
+};
+
+void test_failed_record_leaves_row() {
+    const std::string path = "/tmp/fasten_pii_fail_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        store.insert(make_row("evt-pii-kept", "USER_EMAIL_SEEN", days_ago(40)));
+        Db db(path);
+        const std::string before = db.detail("evt-pii-kept");
+
+        FailingInsert failing{store};
+        bool threw = false;
+        try {
+            fasten::redact_expired(failing, clock_type::now() - days(30));
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+        assert(db.detail("evt-pii-kept") == before);
+        assert(db.detail("evt-pii-kept") != "null");
+        assert(db.text("SELECT COUNT(*) FROM audit_log WHERE code = 'AUDIT_ROW_REDACTED'") == "0");
+    }
+    std::remove(path.c_str());
+    std::cout << "  test_failed_record_leaves_row: PASS\n";
+}
+
+// Stores opening a pre-chain file at once each add the columns or find them.
+void test_concurrent_open_legacy_file() {
+    const std::string path = "/tmp/fasten_pii_conc_" + fasten::mint_id() + ".db";
+    {
+        Db db(path);
+        db.exec("CREATE TABLE audit_log (id TEXT PRIMARY KEY, origin_id TEXT NOT NULL,"
+                " monotonic_seq INTEGER NOT NULL DEFAULT 0, timestamp TEXT NOT NULL,"
+                " code TEXT NOT NULL, action TEXT NOT NULL DEFAULT '',"
+                " severity TEXT NOT NULL DEFAULT 'info', service_id TEXT NOT NULL DEFAULT '',"
+                " source_node_id TEXT NOT NULL DEFAULT '', tenant_id TEXT,"
+                " actor TEXT NOT NULL DEFAULT '', actor_kind TEXT NOT NULL DEFAULT '',"
+                " target TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',"
+                " domain TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '',"
+                " request_id TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '{}',"
+                " pii_in_detail INTEGER NOT NULL DEFAULT 0, shipped_at TEXT)");
+    }
+    std::atomic<int> failed{0}, ready{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 16; ++i) {
+        threads.emplace_back([&] {
+            ++ready;
+            while (ready < 16) std::this_thread::yield();
+            try {
+                fasten::SqliteStore store(path);
+            } catch (const std::exception& e) {
+                std::cerr << "    open failed: " << e.what() << "\n";
+                ++failed;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    assert(failed == 0);
+    std::remove(path.c_str());
+    std::cout << "  test_concurrent_open_legacy_file: PASS\n";
+}
+
+// A table the Python store made has no pii_in_detail column; it gets one.
+void test_migrates_python_table() {
+    const std::string path = "/tmp/fasten_pii_py_" + fasten::mint_id() + ".db";
+    {
+        Db db(path);
+        db.exec("CREATE TABLE audit_log (id TEXT PRIMARY KEY, origin_id TEXT NOT NULL,"
+                " monotonic_seq INTEGER NOT NULL DEFAULT 0, timestamp TEXT NOT NULL,"
+                " code TEXT NOT NULL, action TEXT NOT NULL DEFAULT '',"
+                " severity TEXT NOT NULL DEFAULT 'info', service_id TEXT NOT NULL DEFAULT '',"
+                " source_node_id TEXT NOT NULL DEFAULT '', tenant_id TEXT,"
+                " actor TEXT NOT NULL DEFAULT '', actor_kind TEXT NOT NULL DEFAULT '',"
+                " target TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',"
+                " domain TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '',"
+                " request_id TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '{}',"
+                " shipped_at TEXT)");
+    }
+    {
+        fasten::SqliteStore store(path);
+        auto row = make_row("evt-py", "USER_EMAIL_SEEN", days_ago(1));
+        row.pii_in_detail = true;
+        store.insert(row);
+        Db db(path);
+        assert(db.text("SELECT pii_in_detail FROM audit_log WHERE id = 'evt-py'") == "1");
+    }
+    std::remove(path.c_str());
+    std::cout << "  test_migrates_python_table: PASS\n";
+}
+
 }  // namespace
 
 int main() {
@@ -174,6 +281,9 @@ int main() {
     fasten::init("svc", "node-1");
     test_redacts_expired_pii_rows();
     test_migrates_legacy_table();
+    test_failed_record_leaves_row();
+    test_concurrent_open_legacy_file();
+    test_migrates_python_table();
     std::cout << "All PII redaction smoke tests passed.\n";
     return 0;
 }

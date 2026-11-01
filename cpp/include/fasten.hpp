@@ -140,6 +140,8 @@ struct Method {
 constexpr const char* kRedactReplacement = "***";
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
+constexpr const char* kAuditRowRedacted = "AUDIT_ROW_REDACTED";
+
 using Fields = std::unordered_map<std::string, std::string>;
 
 struct Meta {
@@ -246,12 +248,16 @@ inline std::string json_str(const std::string& s) {
 //
 // Fields can only hold strings. Two keys other SDKs write as JSON scalars
 // are special-cased so the shape matches: `_pii_in_detail` (boolean, P1-5)
-// and `redacted_seq` (number, spec §7.2) when it is a canonical JSON integer
-// (no leading zero, fits int64). Anything else stays a string, so the line
-// is always valid JSON.
-inline std::string field_json_value_(const std::string& key, const std::string& val) {
+// and, in the detail of an AUDIT_ROW_REDACTED row (`code`), `redacted_seq`
+// (number, spec §7.2) when it is a canonical JSON integer (no leading zero,
+// fits int64). Anything else stays a string, so the line is always valid
+// JSON, and the redactor's value-shape checks, which only look at strings,
+// see every other value.
+inline std::string field_json_value_(const std::string& key, const std::string& val,
+                                     const std::string& code = "") {
     if (key == "_pii_in_detail") return val == "true" ? "true" : "false";
-    if (key == "redacted_seq" && !val.empty() && val.size() <= 18 &&
+    if (key == "redacted_seq" && code == kAuditRowRedacted &&
+        !val.empty() && val.size() <= 18 &&
         (val == "0" || val[0] != '0') &&
         std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; })) {
         return val;
@@ -259,14 +265,14 @@ inline std::string field_json_value_(const std::string& key, const std::string& 
     return json_str(val);
 }
 
-inline std::string fields_to_json(const Fields& f) {
+inline std::string fields_to_json(const Fields& f, const std::string& code = "") {
     std::vector<std::pair<std::string, std::string>> pairs(f.begin(), f.end());
     std::sort(pairs.begin(), pairs.end());
     std::string out = "{";
     bool first = true;
     for (auto& kv : pairs) {
         if (!first) out += ',';
-        out += json_str(kv.first) + ':' + field_json_value_(kv.first, kv.second);
+        out += json_str(kv.first) + ':' + field_json_value_(kv.first, kv.second, code);
         first = false;
     }
     out += '}';
@@ -1141,7 +1147,7 @@ inline std::string Row::to_json() const {
     js += ",\"domain\":"         + detail_::json_str(domain);
     js += ",\"method\":"         + detail_::json_str(method);
     js += ",\"request_id\":"     + detail_::json_str(request_id);
-    js += ",\"detail\":"         + detail_::fields_to_json(detail);
+    js += ",\"detail\":"         + detail_::fields_to_json(detail, code);
     js += ",\"pii_in_detail\":";
     js += (pii_in_detail ? "true" : "false");
     if (!shipped_at.empty()) {
@@ -1158,7 +1164,7 @@ inline std::string Row::to_cloud_event_json() const {
     for (auto& kv : detail) {
         if (!first) data += ',';
         data += detail_::json_str(kv.first) + ':' +
-                detail_::field_json_value_(kv.first, kv.second);
+                detail_::field_json_value_(kv.first, kv.second, code);
         first = false;
     }
     if (!first) data += ',';
@@ -1679,7 +1685,7 @@ inline Row make_row_(const std::string& code, const EmitOpts& o) {
               << ",\"domain\":"         << detail_::json_str(row.domain)
               << ",\"method\":"         << detail_::json_str(row.method)
               << ",\"request_id\":"     << detail_::json_str(row.request_id)
-              << ",\"detail\":"         << detail_::fields_to_json(row.detail)
+              << ",\"detail\":"         << detail_::fields_to_json(row.detail, row.code)
               << ",\"pii_in_detail\":"  << (row.pii_in_detail ? "true" : "false")
               << "}\n" << std::flush;
     return row;
@@ -1771,8 +1777,6 @@ inline std::vector<std::string> pii_codes() {
     std::sort(out.begin(), out.end());
     return out;
 }
-
-constexpr const char* kAuditRowRedacted = "AUDIT_ROW_REDACTED";
 
 namespace detail_ {
 
