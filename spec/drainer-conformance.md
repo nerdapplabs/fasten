@@ -144,6 +144,7 @@ both.
 | `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
 | `audit_drain_lost_at_stop` | `error` | Row not stored at shutdown (§10) |
 | `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
+| `audit_drain_stored_inline` | `info` | A row the drainer refused is stored synchronously by the SDK |
 
 **`audit_drain_failed` fields:**
 
@@ -193,6 +194,13 @@ both.
 
 ```json
 { "row_ids": ["<string>", ...] }
+```
+
+**`audit_drain_stored_inline` fields** (follows the row's
+`audit_drain_abandoned`):
+
+```json
+{ "row_id": "<string>" }
 ```
 
 ---

@@ -118,6 +118,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   under the same advisory lock as Python and Go, using a new
   `(source_node_id, monotonic_seq)` index. Rows are still unsealed;
   `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
+  The first start after upgrading builds that index while the column
+  ALTERs hold the table's exclusive lock, so on a large table create it
+  beforehand (for the default table: `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+  idx_audit_log_node_seq ON audit_log (source_node_id, monotonic_seq)`).
 - Audit row timestamps and `shipped_at` use the canonical form (§4.3).
 - `PostgresStore` can share a table with the Python and Go stores: it inserts
   with a column list, adds the chain columns (and `pii_in_detail` on a table
