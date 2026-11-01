@@ -123,7 +123,9 @@ void fasten_store_close(FastenStore* store);
  *                 monotonic_seq, timestamp, code, action, severity,
  *                 service_id, source_node_id, actor, actor_kind, target,
  *                 category, domain, method, request_id, detail.
- *                 Optional: tenant_id, pii_in_detail, shipped_at.
+ *                 Optional: tenant_id, pii_in_detail, shipped_at, and the
+ *                 chain fields prev_hash, hash, canonical_form_id,
+ *                 detail_salt, detail_commitment, stored as given.
  * @param out_err  Set on error; may be NULL.
  *
  * @return  FASTEN_OK on success, error code otherwise (out_err set).
@@ -274,8 +276,8 @@ FastenErrorCode fasten_store_max_monotonic_seq(
 
 /**
  * List rows a PII retention horizon would redact: timestamp < before, code
- * in codes, detail not already redacted. Sealed rows (a non-empty hash, on a
- * table shared with an SDK that seals) are never listed.
+ * in codes, detail not already redacted. Sealed rows (a non-empty hash) are
+ * never listed.
  *
  * @param store          Non-null handle.
  * @param before_iso8601 ISO-8601 UTC cutoff; rows strictly older qualify.

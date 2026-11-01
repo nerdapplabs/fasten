@@ -92,6 +92,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `concurrent map read and map write` crash and a store-vs-ring `shape`
   divergence.
 
+### Fixed — fasten-core stores keep the chain fields (#139, item 1)
+
+- `SqliteStore` and `PostgresStore` store `prev_hash`, `hash`,
+  `canonical_form_id`, `detail_salt` and `detail_commitment` and read them
+  back. A sealed row passed to `fasten_store_insert` used to be stored without
+  its hash, so every `fasten-core/bindings/*` package lost the chain.
+- `Row` has these as typed optional fields instead of leaving them in
+  `extra`; a field that was absent is still absent when the row is written
+  out as JSON.
+- Opening a store adds the five columns to a table an older fasten-core
+  created. Salt and commitment are written as `''` when absent, so a table the
+  Go store created (NOT NULL there) accepts the row; both read back as absent.
+- Redaction checks `hash` on every table now that it always exists.
+
 ### Fixed — fasten-core stores assign monotonic_seq; PII redaction (#124)
 
 - `SqliteStore` and `PostgresStore` now allocate `monotonic_seq` when a row

@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{RedactionCandidates, Store};
+use super::{non_empty, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // ── Connection holder ─────────────────────────────────────────────────────────
 //
@@ -223,6 +223,11 @@ impl PostgresStore {
         let pii: i16 = row.pii_in_detail as i16;
         let tenant: Option<&str> = row.tenant_id.as_deref();
         let shipped: Option<&str> = row.shipped_at.as_deref();
+        let prev_hash = row.prev_hash.as_deref().unwrap_or("");
+        let hash = row.hash.as_deref().unwrap_or("");
+        let form = row.canonical_form_id.as_deref().unwrap_or("1");
+        let salt = row.detail_salt.as_deref().unwrap_or("");
+        let commitment = row.detail_commitment.as_deref().unwrap_or("");
 
         let params: &[&(dyn ToSql + Sync)] = &[
             &row.id,             // $1  id
@@ -246,6 +251,11 @@ impl PostgresStore {
             &detail_str,         // $19 detail
             &pii,                // $20 pii_in_detail (SMALLINT)
             &shipped,            // $21 shipped_at    (NULL when None)
+            &prev_hash,          // $22 prev_hash
+            &hash,               // $23 hash
+            &form,               // $24 canonical_form_id
+            &salt,               // $25 detail_salt
+            &commitment,         // $26 detail_commitment
         ];
 
         let bare = self.bare.as_str();
@@ -287,18 +297,6 @@ impl PostgresStore {
             Ok(())
         })
     }
-
-    /// Whether the table has a `hash` column. See the SQLite store.
-    fn has_hash_column(&self, client: &mut pg::Client) -> Result<bool, Error> {
-        let row = client.query_one(
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = COALESCE($1, current_schema()) \
-             AND table_name = $2 AND column_name = 'hash'",
-            &[&self.schema, &self.bare],
-        )?;
-        let n: i64 = row.get(0);
-        Ok(n > 0)
-    }
 }
 
 impl Store for PostgresStore {
@@ -319,11 +317,7 @@ impl Store for PostgresStore {
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
         let (where_clause, mut all_params) = build_filter_where(filter);
         let mut sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {}{} ORDER BY monotonic_seq ASC",
+            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY monotonic_seq ASC",
             self.table, where_clause
         );
         if filter.limit > 0 {
@@ -367,11 +361,8 @@ impl Store for PostgresStore {
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
         let effective: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
         let sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1",
+            "SELECT {SELECT_COLUMNS} FROM {} \
+             WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1",
             self.table
         );
         self.with_reconnect(|inner| {
@@ -459,12 +450,10 @@ impl Store for PostgresStore {
             return Ok(RedactionCandidates::default());
         }
         self.with_reconnect(|inner| {
-            let has_hash = self.has_hash_column(&mut inner.client)?;
             let base = format!(
                 "FROM {} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null'",
                 self.table
             );
-            let gate = if has_hash { " AND hash = ''" } else { "" };
             // REPEATABLE READ so the list and the count see the same rows.
             let mut tx = inner
                 .client
@@ -473,18 +462,16 @@ impl Store for PostgresStore {
                 .read_only(true)
                 .start()?;
             let rows = tx.query(
-                format!("SELECT id, monotonic_seq {base}{gate} ORDER BY monotonic_seq").as_str(),
+                format!("SELECT id, monotonic_seq {base} AND hash = '' ORDER BY monotonic_seq")
+                    .as_str(),
                 &[&before, &codes],
             )?;
-            let skipped: i64 = if has_hash {
-                tx.query_one(
+            let skipped: i64 = tx
+                .query_one(
                     format!("SELECT COUNT(*) {base} AND hash <> ''").as_str(),
                     &[&before, &codes],
                 )?
-                .get(0)
-            } else {
-                0
-            };
+                .get(0);
             tx.commit()?;
             Ok(RedactionCandidates {
                 rows: rows
@@ -501,11 +488,10 @@ impl Store for PostgresStore {
             return Ok(vec![]);
         }
         self.with_reconnect(|inner| {
-            let gate = if self.has_hash_column(&mut inner.client)? { " AND hash = ''" } else { "" };
             // 'null' is the JSON literal; see the SQLite store. ids go in one
             // array parameter, so there is no per-id bind limit here.
             let sql = format!(
-                "UPDATE {} SET detail = 'null' WHERE id = ANY($1){gate}",
+                "UPDATE {} SET detail = 'null' WHERE id = ANY($1) AND hash = ''",
                 self.table
             );
             inner.client.execute(sql.as_str(), &[&ids])?;
@@ -560,6 +546,10 @@ fn migrate(
         pg_exec(client, &format!("CREATE SCHEMA IF NOT EXISTS {s}"))?;
     }
 
+    let chain: String = CHAIN_COLUMNS
+        .iter()
+        .map(|(name, def)| format!("{name} {def},\n                "))
+        .collect();
     pg_exec(
         client,
         &format!(
@@ -585,12 +575,17 @@ fn migrate(
                 detail          TEXT        NOT NULL DEFAULT '{{}}',
                 pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,
                 shipped_at      TEXT,
-                PRIMARY KEY (id),
+                {chain}PRIMARY KEY (id),
                 -- Same name as the Go store's index, so Go skips creating it.
                 CONSTRAINT uq_{bare}_node_seq UNIQUE (source_node_id, monotonic_seq)
             )"
         ),
     )?;
+
+    // A table an older fasten-core created has no chain columns.
+    for (name, def) in CHAIN_COLUMNS {
+        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {def}"))?;
+    }
 
     for sql in &[
         format!("CREATE INDEX IF NOT EXISTS idx_{bare}_req  ON {table} (request_id)"),
@@ -659,9 +654,11 @@ fn build_insert_sql(table: &str) -> String {
          (id, wire_version, origin_id, monotonic_seq, timestamp, \
           code, action, severity, service_id, source_node_id, tenant_id, \
           actor, actor_kind, target, category, domain, method, \
-          request_id, detail, pii_in_detail, shipped_at) \
+          request_id, detail, pii_in_detail, shipped_at, \
+          prev_hash, hash, canonical_form_id, detail_salt, detail_commitment) \
          VALUES \
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,\
+          $22,$23,$24,$25,$26) \
          ON CONFLICT (id) DO NOTHING"
     )
 }
@@ -742,6 +739,11 @@ fn row_from_pg(r: &pg::Row) -> Row {
         detail,
         pii_in_detail:  pii != 0,
         shipped_at:     r.get(20),
+        prev_hash:         r.get(21),
+        hash:              r.get(22),
+        canonical_form_id: r.get(23),
+        detail_salt:       non_empty(r.get(24)),
+        detail_commitment: non_empty(r.get(25)),
         ..Default::default()
     }
 }
@@ -1040,18 +1042,14 @@ mod tests {
     fn redaction_skips_sealed_rows() {
         let Some(dsn) = dsn() else { return };
         let store = fresh(&dsn, "fasten_sc_pg_redact_sealed");
-        let mut c = connect_client(&dsn).unwrap();
-        c.batch_execute(
-            "ALTER TABLE fasten_sc_pg_redact_sealed ADD COLUMN hash TEXT NOT NULL DEFAULT ''",
-        )
-        .unwrap();
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            if id == "evt-sealed" {
+                r.hash = Some("abc".into());
+            }
             store.insert(&r).unwrap();
         }
-        c.batch_execute("UPDATE fasten_sc_pg_redact_sealed SET hash = 'abc' WHERE id = 'evt-sealed'")
-            .unwrap();
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
@@ -1062,5 +1060,100 @@ mod tests {
             .unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"k": "v"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// #139: a sealed row came back without its hash.
+    #[test]
+    fn chain_fields_round_trip() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_chain");
+        let mut row = make_row("evt-sealed", "TEST");
+        row.monotonic_seq = 1;
+        row.prev_hash = Some("genesis".into());
+        row.hash = Some("h1".into());
+        row.canonical_form_id = Some("2".into());
+        row.detail_salt = Some("salt".into());
+        row.detail_commitment = Some("commit".into());
+        store.insert(&row).unwrap();
+        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        let chain = |r: &Row| {
+            [
+                r.prev_hash.clone(),
+                r.hash.clone(),
+                r.canonical_form_id.clone(),
+                r.detail_salt.clone(),
+                r.detail_commitment.clone(),
+            ]
+        };
+        assert_eq!(chain(&got[0]), chain(&row));
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(chain(&got[1]), [s(""), s(""), s("1"), None, None]);
+    }
+
+    /// A table the Go store created declares salt and commitment NOT NULL.
+    #[test]
+    fn writes_into_a_go_shaped_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_goshape";
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL,
+                timestamp TEXT NOT NULL, code TEXT NOT NULL, action TEXT NOT NULL,
+                severity TEXT NOT NULL, service_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL, tenant_id TEXT, actor TEXT NOT NULL,
+                actor_kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL,
+                domain TEXT NOT NULL, method TEXT NOT NULL, request_id TEXT NOT NULL,
+                detail TEXT NOT NULL, pii_in_detail SMALLINT NOT NULL DEFAULT 0,
+                shipped_at TEXT, hash TEXT NOT NULL DEFAULT '',
+                prev_hash TEXT NOT NULL DEFAULT '',
+                canonical_form_id TEXT NOT NULL DEFAULT '1',
+                detail_salt TEXT NOT NULL DEFAULT '',
+                detail_commitment TEXT NOT NULL DEFAULT '')"
+        ))
+        .unwrap();
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        store.insert(&make_row("evt-go", "TEST")).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(got[0].detail_salt, None);
+        assert_eq!(got[0].hash.as_deref(), Some(""));
+    }
+
+    /// A table an older fasten-core created gets the chain columns on connect.
+    #[test]
+    fn connect_adds_chain_columns_to_an_old_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_oldshape";
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '{{}}', pii_in_detail SMALLINT NOT NULL DEFAULT 0,
+                shipped_at TEXT);
+             INSERT INTO {table} (id, origin_id, timestamp, code, monotonic_seq)
+             VALUES ('evt-old', 'evt-old', '2026-05-07T00:00:00.000000Z', 'TEST', 1);"
+        ))
+        .unwrap();
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        let mut row = make_row("evt-new", "TEST");
+        row.monotonic_seq = 2;
+        row.hash = Some("h2".into());
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(got[0].hash.as_deref(), Some(""));
+        assert_eq!(got[0].canonical_form_id.as_deref(), Some("1"));
+        assert_eq!(got[1].hash.as_deref(), Some("h2"));
     }
 }

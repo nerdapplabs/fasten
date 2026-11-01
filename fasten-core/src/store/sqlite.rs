@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{RedactionCandidates, Store};
+use super::{non_empty, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // ── SqliteStore ───────────────────────────────────────────────────────────────
 
@@ -59,6 +59,10 @@ impl SqliteStore {
 
     fn migrate(&self) -> Result<(), Error> {
         let t = &self.table;
+        let chain: String = CHAIN_COLUMNS
+            .iter()
+            .map(|(name, def)| format!("{name} {def},\n                "))
+            .collect();
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {t} (
                 id              TEXT    PRIMARY KEY,
@@ -82,7 +86,7 @@ impl SqliteStore {
                 detail          TEXT    NOT NULL DEFAULT '{{}}',
                 pii_in_detail   INTEGER NOT NULL DEFAULT 0,
                 shipped_at      TEXT,
-                UNIQUE (source_node_id, monotonic_seq)
+                {chain}UNIQUE (source_node_id, monotonic_seq)
             );
             CREATE INDEX IF NOT EXISTS idx_{t}_req  ON {t}(request_id);
             CREATE INDEX IF NOT EXISTS idx_{t}_code ON {t}(code);
@@ -92,14 +96,20 @@ impl SqliteStore {
 
         // Probe first, so opening an up-to-date table takes no write lock.
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if Self::schema_missing(&guard, t)? == Missing::Nothing {
+        if Self::schema_missing(&guard, t)?.is_nothing() {
             return Ok(());
         }
+        // One write transaction, so a second process opening the same old
+        // table waits here, then sees what this one added.
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(&ddl)?;
+        let missing = Self::schema_missing(&tx, t)?;
+        for (name, def) in missing.columns {
+            tx.execute_batch(&format!("ALTER TABLE {t} ADD COLUMN {name} {def}"))?;
+        }
         // A table created before the UNIQUE constraint has no index here and
         // may already repeat seqs on a node, so this one is not unique.
-        if Self::schema_missing(&tx, t)? == Missing::NodeSeqIndex {
+        if missing.node_seq_index {
             tx.execute_batch(&format!(
                 "CREATE INDEX IF NOT EXISTS idx_{t}_node_seq ON {t}(source_node_id, monotonic_seq)"
             ))?;
@@ -110,15 +120,17 @@ impl SqliteStore {
 
     /// What `migrate` still has to create on `table`.
     fn schema_missing(conn: &Connection, table: &str) -> Result<Missing, Error> {
+        let (schema, bare) = split_table(table);
+        let schema = schema.unwrap_or("main");
         let mut stmt = conn.prepare(
             "SELECT l.name,
-                    (SELECT name FROM pragma_index_info(l.name) WHERE seqno = 0),
-                    (SELECT name FROM pragma_index_info(l.name) WHERE seqno = 1)
-             FROM pragma_index_list(?1) l",
+                    (SELECT name FROM pragma_index_info(l.name, ?2) WHERE seqno = 0),
+                    (SELECT name FROM pragma_index_info(l.name, ?2) WHERE seqno = 1)
+             FROM pragma_index_list(?1, ?2) l",
         )?;
         let mut names = Vec::new();
         let mut node_seq = false;
-        let mut rows = stmt.query([table])?;
+        let mut rows = stmt.query([bare, schema])?;
         while let Some(r) = rows.next()? {
             names.push(r.get::<_, String>(0)?);
             let first: Option<String> = r.get(1)?;
@@ -126,39 +138,32 @@ impl SqliteStore {
             node_seq |= first.as_deref() == Some("source_node_id")
                 && second.as_deref() == Some("monotonic_seq");
         }
-        let all_named = ["req", "code", "ts", "svc"]
+        let indexes = ["req", "code", "ts", "svc"]
             .iter()
-            .all(|s| names.iter().any(|n| n.eq_ignore_ascii_case(&format!("idx_{table}_{s}"))));
-        Ok(if !all_named {
-            Missing::TableOrIndexes
-        } else if !node_seq {
-            Missing::NodeSeqIndex
-        } else {
-            Missing::Nothing
-        })
-    }
+            .all(|s| names.iter().any(|n| n.eq_ignore_ascii_case(&format!("idx_{bare}_{s}"))));
 
-    /// Whether the table has a `hash` column.
-    ///
-    /// Tables created here have no chain columns, so every row is unsealed.
-    /// A table shared with an SDK that seals (Go adds `hash` on open) may hold
-    /// sealed rows, which redaction leaves alone.
-    fn has_hash_column(conn: &Connection, table: &str) -> Result<bool, Error> {
-        let (schema, bare) = split_table(table);
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1, ?2) WHERE name = 'hash'",
-            rusqlite::params![bare, schema.unwrap_or("main")],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
+        let have: Vec<String> = stmt
+            .query_map([bare, schema], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let columns = CHAIN_COLUMNS
+            .into_iter()
+            .filter(|(name, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(name)))
+            .collect();
+        Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum Missing {
-    Nothing,
-    NodeSeqIndex,
-    TableOrIndexes,
+struct Missing {
+    table_or_indexes: bool,
+    node_seq_index: bool,
+    columns: Vec<(&'static str, &'static str)>,
+}
+
+impl Missing {
+    fn is_nothing(&self) -> bool {
+        !self.table_or_indexes && !self.node_seq_index && self.columns.is_empty()
+    }
 }
 
 /// Ids or codes bound per statement. SQLite caps bound variables per
@@ -210,11 +215,7 @@ impl Store for SqliteStore {
         let (where_clause, params_owned) = build_filter_where(filter);
         // LIMIT / OFFSET are integers, interpolated directly — no injection risk.
         let mut sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {} {} ORDER BY monotonic_seq ASC",
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
             self.table, where_clause
         );
         if filter.limit > 0 {
@@ -255,11 +256,8 @@ impl Store for SqliteStore {
             i64::from(limit)
         };
         let sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1",
+            "SELECT {SELECT_COLUMNS} FROM {} \
+             WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1",
             self.table
         );
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,7 +339,6 @@ impl Store for SqliteStore {
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // One read transaction so every chunk sees the same rows.
         let tx = guard.transaction()?;
-        let has_hash = Self::has_hash_column(&tx, &self.table)?;
         for chunk in codes.chunks(BIND_CHUNK) {
             let base = format!(
                 "FROM {} WHERE timestamp < ?1 AND code IN ({}) AND detail <> 'null'",
@@ -353,22 +350,19 @@ impl Store for SqliteStore {
             for c in chunk {
                 params.push(*c);
             }
-            let gate = if has_hash { " AND hash = ''" } else { "" };
-            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{gate}"))?;
+            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base} AND hash = ''"))?;
             let rows = stmt.query_map(params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
             })?;
             for r in rows {
                 out.rows.push(r?);
             }
-            if has_hash {
-                let n: i64 = tx.query_row(
-                    &format!("SELECT COUNT(*) {base} AND hash <> ''"),
-                    params.as_slice(),
-                    |r| r.get(0),
-                )?;
-                out.skipped += n.unsigned_abs();
-            }
+            let n: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) {base} AND hash <> ''"),
+                params.as_slice(),
+                |r| r.get(0),
+            )?;
+            out.skipped += n.unsigned_abs();
         }
         tx.commit()?;
         out.rows.sort_by_key(|(_, seq)| *seq);
@@ -381,12 +375,11 @@ impl Store for SqliteStore {
         }
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let gate = if Self::has_hash_column(&tx, &self.table)? { " AND hash = ''" } else { "" };
         for chunk in ids.chunks(BIND_CHUNK) {
             // 'null' is the JSON literal: detail is NOT NULL, and it reads
             // back as a null detail.
             let sql = format!(
-                "UPDATE {} SET detail = 'null' WHERE id IN ({}){gate}",
+                "UPDATE {} SET detail = 'null' WHERE id IN ({}) AND hash = ''",
                 self.table,
                 placeholders(1, chunk.len())
             );
@@ -427,6 +420,11 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         detail_str,
         pii,
         row.shipped_at,     // Option<String> → NULL when None
+        row.prev_hash.as_deref().unwrap_or(""),
+        row.hash.as_deref().unwrap_or(""),
+        row.canonical_form_id.as_deref().unwrap_or("1"),
+        row.detail_salt.as_deref().unwrap_or(""),
+        row.detail_commitment.as_deref().unwrap_or(""),
     ])
     .map_err(seq_clash)?;
 
@@ -455,8 +453,10 @@ fn build_insert_sql(table: &str) -> String {
          (id, wire_version, origin_id, monotonic_seq, timestamp, \
           code, action, severity, service_id, source_node_id, tenant_id, \
           actor, actor_kind, target, category, domain, method, \
-          request_id, detail, pii_in_detail, shipped_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+          request_id, detail, pii_in_detail, shipped_at, \
+          prev_hash, hash, canonical_form_id, detail_salt, detail_commitment) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,\
+                 ?22,?23,?24,?25,?26) \
          ON CONFLICT (id) DO NOTHING"
     )
 }
@@ -530,6 +530,11 @@ fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         detail,
         pii_in_detail:  pii != 0,
         shipped_at:     r.get(20)?,
+        prev_hash:         r.get(21)?,
+        hash:              r.get(22)?,
+        canonical_form_id: r.get(23)?,
+        detail_salt:       non_empty(r.get(24)?),
+        detail_commitment: non_empty(r.get(25)?),
         ..Default::default()
     })
 }
@@ -774,7 +779,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unique, 0);
-        assert_eq!(SqliteStore::schema_missing(&conn, "audit_log").unwrap(), Missing::Nothing);
+        assert!(SqliteStore::schema_missing(&conn, "audit_log").unwrap().is_nothing());
     }
 
     /// Opening an up-to-date table takes no write lock, so it does not wait
@@ -885,25 +890,14 @@ mod tests {
     #[test]
     fn redaction_skips_sealed_rows() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
-        {
-            let c = store.conn.lock().unwrap();
-            c.execute_batch(
-                "ALTER TABLE audit_log ADD COLUMN hash TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE audit_log ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1';",
-            )
-            .unwrap();
-        }
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            if id == "evt-sealed" {
+                r.hash = Some("abc".into());
+            }
             store.insert(&r).unwrap();
         }
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute("UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-sealed'", [])
-            .unwrap();
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
@@ -942,5 +936,84 @@ mod tests {
         assert_eq!(rows.len(), n);
         assert!(rows.iter().all(|r| r.detail.is_null()));
         assert_eq!(store.redact_rows(&ids).unwrap(), ids);
+    }
+
+    fn sealed(id: &str) -> Row {
+        let mut r = make_row(id, "TEST");
+        r.monotonic_seq = 1;
+        r.prev_hash = Some("genesis".into());
+        r.hash = Some("h1".into());
+        r.canonical_form_id = Some("2".into());
+        r.detail_salt = Some("salt".into());
+        r.detail_commitment = Some("commit".into());
+        r
+    }
+
+    fn chain_of(r: &Row) -> [Option<&str>; 5] {
+        [
+            r.prev_hash.as_deref(),
+            r.hash.as_deref(),
+            r.canonical_form_id.as_deref(),
+            r.detail_salt.as_deref(),
+            r.detail_commitment.as_deref(),
+        ]
+    }
+
+    /// #139: a sealed row came back without its hash.
+    #[test]
+    fn chain_fields_round_trip() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let row = sealed("evt-sealed");
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(chain_of(&got[0]), chain_of(&row));
+        assert_eq!(chain_of(&store.list_unshipped(0).unwrap()[0]), chain_of(&row));
+    }
+
+    #[test]
+    fn unsealed_row_reads_back_with_empty_hash_and_no_salt() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let got = &store.query(&Filter::default()).unwrap()[0];
+        assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
+    }
+
+    /// A table an older fasten-core created gets the chain columns on open.
+    #[test]
+    fn open_adds_chain_columns_to_an_old_table() {
+        let dir = std::env::temp_dir().join(format!("fasten-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.db");
+        let _ = std::fs::remove_file(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE audit_log (
+                    id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                    origin_id TEXT NOT NULL, monotonic_seq INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                    service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                    tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                    actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                    method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '{}', pii_in_detail INTEGER NOT NULL DEFAULT 0,
+                    shipped_at TEXT, UNIQUE (source_node_id, monotonic_seq));
+                 INSERT INTO audit_log (id, origin_id, timestamp, code, monotonic_seq)
+                 VALUES ('evt-old', 'evt-old', '2026-05-07T00:00:00.000000Z', 'TEST', 1);",
+            )
+            .unwrap();
+        let store = SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
+        let mut row = sealed("evt-new");
+        row.monotonic_seq = 2;
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(chain_of(&got[0]), [Some(""), Some(""), Some("1"), None, None]);
+        assert_eq!(chain_of(&got[1]), chain_of(&row));
+        // Opening again finds the columns there.
+        drop(store);
+        SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
