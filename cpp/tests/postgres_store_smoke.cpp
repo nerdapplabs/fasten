@@ -6,6 +6,7 @@
 #include "fasten.hpp"
 #include "fasten_store_postgres.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
@@ -165,6 +166,43 @@ void test_seq_allocated_per_node(const std::string& dsn) {
     std::cout << "  test_seq_allocated_per_node: PASS\n";
 }
 
+// Stores opening a table from before the seq index all at once (a rolling
+// deploy) each construct without racing on the CREATE INDEX.
+void test_concurrent_open_existing_table(const std::string& dsn) {
+    const std::string table = "fasten_cpp_open_" + fasten::mint_id();
+    { fasten::PostgresStore first(dsn, table); }
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    assert(PQstatus(conn) == CONNECTION_OK);
+    PQclear(PQexec(conn, ("DROP INDEX idx_" + table + "_node_seq").c_str()));
+    // Enough rows that building the index takes a while.
+    PQclear(PQexec(conn, ("INSERT INTO " + table + " (id, origin_id, timestamp, code)"
+                          " SELECT 'evt-' || g, 'evt-' || g, '', 'TEST'"
+                          " FROM generate_series(1, 200000) g").c_str()));
+
+    std::atomic<int> failed{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&] {
+            try {
+                fasten::PostgresStore store(dsn, table);
+            } catch (const std::exception& e) {
+                std::cerr << "    open failed: " << e.what() << "\n";
+                ++failed;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    PGresult* res = PQexec(conn, ("SELECT 1 FROM pg_indexes WHERE indexname = 'idx_" +
+                                  table + "_node_seq'").c_str());
+    assert(PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1);
+    PQclear(res);
+    PQclear(PQexec(conn, ("DROP TABLE " + table).c_str()));
+    PQfinish(conn);
+    assert(failed == 0);
+    std::cout << "  test_concurrent_open_existing_table: PASS\n";
+}
+
 } // namespace
 
 int main() {
@@ -188,6 +226,7 @@ int main() {
     test_pii_in_detail(dsn);
     test_schema_qualified_table(dsn);
     test_seq_allocated_per_node(dsn);
+    test_concurrent_open_existing_table(dsn);
 
     std::cout << "All PostgreSQL store smoke tests passed.\n";
     return 0;

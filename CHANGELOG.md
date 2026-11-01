@@ -121,13 +121,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   those calls before freeing the handle. A row put on a stopped drainer
   (including one the sink puts during the drain), or refused by the core, is
   reported once as `audit_drain_abandoned`, and `emit()` stores it
-  synchronously; it used to vanish.
+  synchronously, logging `audit_drain_stored_inline` when the sink takes it;
+  it used to vanish.
 - `init()` builds its settings first and publishes them under one lock, which
   every reader takes, so a re-init no longer races an emit or a log line on
   another thread for the ids, the strategy or the redact config.
 - `SqliteStore` and `PostgresStore` allocate the node's next seq in the
   insert's transaction (Postgres under the same advisory lock as the other
-  SDKs), using a new `(source_node_id, monotonic_seq)` index. `SqliteStore`
+  SDKs), using a new `(source_node_id, monotonic_seq)` index. `PostgresStore`
+  runs its schema setup under the Python store's bootstrap advisory lock, so
+  stores opening an existing table at once no longer fail creating the index. `SqliteStore`
   waits up to 5 s for a lock held elsewhere, and rolls back when a statement
   or COMMIT fails, so the next insert can run.
 - Timestamps use the canonical form with six fractional digits (§4.3).

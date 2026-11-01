@@ -266,7 +266,7 @@ void v12_abandoned_after_stop() {
 }
 
 // An emit that still holds a drainer a re-init has stopped stores its row
-// synchronously, and the refusal is reported once.
+// synchronously, and the refusal is reported once, followed by the inline store.
 void refused_row_is_stored_synchronously() {
     reset_state();
     std::vector<std::string> stored;
@@ -282,6 +282,8 @@ void refused_row_is_stored_synchronously() {
     std::string out = err.stop();
     assert(stored.size() == 1 && stored[0] == "u-refused");
     assert(count(out, "audit_drain_abandoned") == 1);
+    assert(count(out, "audit_drain_stored_inline") == 1);
+    assert(out.find("audit_drain_abandoned") < out.find("audit_drain_stored_inline"));
     std::cout << "refused row stored synchronously: PASS\n";
 }
 

@@ -220,7 +220,22 @@ private:
         PQclear(res);
     }
 
+    // Concurrent openers serialise on the Python store's bootstrap lock:
+    // CREATE ... IF NOT EXISTS does not stop two sessions racing on the
+    // catalog. table_ is a validated identifier, so it is safe in the literal.
     void migrate() {
+        const std::string key = "hashtextextended('fasten.bootstrap." + table_ + "', 0)";
+        pg_exec("SELECT pg_advisory_lock(" + key + ")");
+        try {
+            migrate_locked();
+        } catch (...) {
+            PQclear(PQexec(conn_, ("SELECT pg_advisory_unlock(" + key + ")").c_str()));
+            throw;
+        }
+        pg_exec("SELECT pg_advisory_unlock(" + key + ")");
+    }
+
+    void migrate_locked() {
         if (!schema_.empty())
             pg_exec("CREATE SCHEMA IF NOT EXISTS " + schema_);
 

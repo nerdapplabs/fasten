@@ -1687,7 +1687,8 @@ inline Row emit(const std::string& code, Opts&&... opts) {
             drainer_copy = g.drainer;
         }
         // A row the drainer refuses (a re-init stopped it) is stored below.
-        const bool queued = drainer_copy && strategy == "queue" && drainer_copy->put(row);
+        const bool offered = drainer_copy && strategy == "queue";
+        const bool queued  = offered && drainer_copy->put(row);
         if (!queued) {
             std::function<void(const Row&)> sink_copy;
             {
@@ -1713,6 +1714,12 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                     // sees the failure instead of it vanishing.
                     try {
                         sink_copy(row);
+                        if (offered) {
+                            // Follows the abandoned event.
+                            detail_::drainer_sys_log("info",
+                                "audit_drain_stored_inline",
+                                {{"row_id", row.id}});
+                        }
                     } catch (const std::exception& e) {
                         detail_::drainer_sys_log("error",
                             "audit_sync_fallback_failed",
