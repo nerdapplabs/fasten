@@ -49,6 +49,7 @@ class AuditQueueDrainer {
 
 		this._q = [];
 		this._inFlight = 0; // row popped but insert not yet resolved
+		this._current = null; // that row, until stop() gives up on it
 		this._stopped = false;
 
 		// Stats
@@ -60,6 +61,7 @@ class AuditQueueDrainer {
 		this._failureBurstStartedAt = null;
 		this._deadLetteredTotal = 0;
 		this._dlq = []; // bounded ring, max 10 entries
+		this._lostTotal = 0; // rows not stored at stop (audit_drain_lost_at_stop)
 
 		// Threshold debouncing
 		this._warnHWFired = false;
@@ -129,8 +131,9 @@ class AuditQueueDrainer {
 		// Snapshot semantics (spec §6): capture the target drain count at call
 		// time so a steady incoming rate cannot keep flush() blocked indefinitely.
 		// target = rows already drained + rows currently in the pipeline.
-		// A dead-lettered row is done too.
-		const done = () => this._drainedTotal + this._deadLetteredTotal;
+		// A dead-lettered or lost row is done too.
+		const done = () =>
+			this._drainedTotal + this._deadLetteredTotal + this._lostTotal;
 		const target = done() + this._q.length + this._inFlight;
 		if (done() >= target) return true;
 		const deadline = Date.now() + timeoutMs;
@@ -141,18 +144,23 @@ class AuditQueueDrainer {
 		return done() >= target;
 	}
 
-	// Spec §10: rows still queued get one attempt each, and a row that fails
-	// it is dead-lettered. Resolves true once that is done, or false after
-	// timeoutMs, while the rest carries on in the background.
+	// Spec §10: rows still queued get one attempt each. A row that fails it,
+	// or is still unstored after timeoutMs, is reported lost
+	// (audit_drain_lost_at_stop). Resolves false if a row was lost.
 	stop(timeoutMs = 5000) {
 		this._stopped = true;
+		const lost = this._lostTotal;
 		let timer;
 		const timeout = new Promise((r) => {
-			timer = setTimeout(() => r(false), timeoutMs);
+			timer = setTimeout(() => {
+				this._loseUnstored();
+				r(false);
+			}, timeoutMs);
 		});
-		return Promise.race([this._done.then(() => true), timeout]).finally(() =>
-			clearTimeout(timer),
-		);
+		return Promise.race([
+			this._done.then(() => this._lostTotal === lost),
+			timeout,
+		]).finally(() => clearTimeout(timer));
 	}
 
 	async _tick() {
@@ -163,10 +171,12 @@ class AuditQueueDrainer {
 			}
 			const row = this._q.shift();
 			this._inFlight++;
+			this._current = row;
 			try {
 				await this._drainOne(row);
 			} finally {
 				this._inFlight--;
+				this._current = null;
 			}
 		}
 	}
@@ -180,7 +190,12 @@ class AuditQueueDrainer {
 				this._onSuccess();
 				return;
 			} catch (err) {
-				if (attempt >= this._maxAttempts || this._stopped) {
+				if (this._stopped) {
+					// stop() may have reported it already, on timeout.
+					if (this._current === row) this._onLostAtStop(row, err);
+					return;
+				}
+				if (attempt >= this._maxAttempts) {
 					this._onDeadLetter(row, attempt, err);
 					return;
 				}
@@ -204,6 +219,25 @@ class AuditQueueDrainer {
 			attempt_count: attempt,
 			last_error: msg,
 		});
+	}
+
+	_onLostAtStop(row, err) {
+		this._lostTotal++;
+		this._sysLog("error", "audit_drain_lost_at_stop", {
+			error_type: err?.name ?? "Error",
+			row_id: row?.id ?? null,
+		});
+	}
+
+	// stop() timed out: what is still queued or in flight is reported lost
+	// now, since the process may exit before it is tried.
+	_loseUnstored() {
+		const timedOut = { name: "TimeoutError" };
+		if (this._current) {
+			this._onLostAtStop(this._current, timedOut);
+			this._current = null;
+		}
+		for (const row of this._q.splice(0)) this._onLostAtStop(row, timedOut);
 	}
 
 	_onFailure(err) {

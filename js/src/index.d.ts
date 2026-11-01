@@ -169,6 +169,11 @@ export function queueStats(): QueueStats | null;
 // drained. No-op + true in raise mode.
 export function flush(timeoutMs?: number): Promise<boolean>;
 
+// Call on shutdown: flushes for up to half of timeoutMs, then stops the
+// drainer, giving queued rows one attempt. Resolves false if a row was lost
+// (audit_drain_lost_at_stop). Emits after close skip the queue.
+export function close(timeoutMs?: number): Promise<boolean>;
+
 export interface RedactExpiredOptions {
 	before: Date | string;
 	/** Defaults to piiCodes(). */
@@ -239,6 +244,8 @@ declare const _default: {
 	withRequestID: typeof withRequestID;
 	queueStats: typeof queueStats;
 	flush: typeof flush;
+	close: typeof close;
+
 	redactExpired: typeof redactExpired;
 	piiCodes: typeof piiCodes;
 	parseDuration: typeof parseDuration;

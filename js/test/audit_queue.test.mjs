@@ -11,7 +11,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush, _clearRustRegistry,
+    AuditStoreError, queueStats, flush, close, _clearRustRegistry,
 } from '../src/index.js';
 import { uninstallDrainer } from '../src/audit_queue.js';
 
@@ -366,8 +366,9 @@ test('stop writes the rows still queued', async () => {
     assert.equal(store.rows.length, 5);
 });
 
-test('stop dead-letters rows whose last attempt fails', async () => {
+test('stop reports rows whose last attempt fails as lost', async () => {
     const store = new BrokenStore();
+    let stopped;
     const captured = await captureSys(async () => {
         _initQueue(store, {
             queueRetryInitialMs: 60_000,
@@ -378,11 +379,15 @@ test('stop dead-letters rows whose last attempt fails', async () => {
         emit({ code: 'USER_CREATED', target: 'u-2' });
         while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
         const t0 = Date.now();
-        await uninstallDrainer();
+        stopped = await uninstallDrainer();
         assert.ok(Date.now() - t0 < 1000, 'stop must cut the backoff short');
     });
-    const dead = captured.filter(r => r.event === 'audit_drain_dead_letter');
-    assert.equal(dead.length, 2, `got ${JSON.stringify(captured.map(c => c.event))}`);
+    const events = captured.map(c => c.event);
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    assert.equal(lost.length, 2, `got ${JSON.stringify(events)}`);
+    assert.equal(lost[0].error_type, 'Error');
+    assert.ok(!events.includes('audit_drain_dead_letter'));
+    assert.equal(stopped, false);
     // u-1: its first attempt, then one after the stop. u-2: one, after the stop.
     assert.equal(store.attempts, 3);
 });
@@ -406,14 +411,49 @@ test('drainer degraded reports the backoff it is about to wait', async () => {
         `in_backoff_seconds was ${degraded.in_backoff_seconds}`);
 });
 
-test('stop gives up waiting after its timeout', async () => {
+test('stop gives up after its timeout and reports what it holds as lost', async () => {
     const store = { insert: () => new Promise(() => {}) };
+    const captured = await captureSys(async () => {
+        _initQueue(store);
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        emit({ code: 'USER_CREATED', target: 'u-2' });
+        await new Promise(r => setTimeout(r, 20));
+        const t0 = Date.now();
+        assert.equal(await uninstallDrainer(100), false);
+        assert.ok(Date.now() - t0 < 1000);
+    });
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    assert.deepEqual(lost.map(r => r.error_type), ['TimeoutError', 'TimeoutError']);
+});
+
+test('close resolves true once every row is stored', async () => {
+    const store = new SlowStore(5);
     _initQueue(store);
-    emit({ code: 'USER_CREATED', target: 'u-1' });
+    for (let i = 0; i < 3; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    assert.equal(await close(2000), true);
+    assert.equal(store.rows.length, 3);
+    assert.equal(queueStats(), null);
+    // After close the row skips the queue.
+    emit({ code: 'USER_CREATED', target: 'u-after' });
     await new Promise(r => setTimeout(r, 20));
-    const t0 = Date.now();
-    assert.equal(await uninstallDrainer(100), false);
-    assert.ok(Date.now() - t0 < 1000);
+    assert.equal(store.rows.at(-1).target, 'u-after');
+});
+
+test('close resolves false for a row in backoff, and a second close agrees', async () => {
+    const store = new BrokenStore();
+    let results;
+    const captured = await captureSys(async () => {
+        _initQueue(store, {
+            queueRetryInitialMs: 60_000,
+            queueRetryMaxMs: 60_000,
+            queueRetryJitter: false,
+        });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
+        results = await Promise.all([close(200), close(200)]);
+    });
+    assert.deepEqual(results, [false, false]);
+    assert.equal(captured.filter(r => r.event === 'audit_drain_lost_at_stop').length, 1);
 });
 
 test('flush counts a dead-lettered row as done', async () => {

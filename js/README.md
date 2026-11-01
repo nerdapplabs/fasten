@@ -49,7 +49,7 @@ await withRequestID('req-a1b2c3', async () => {
     fasten.log.info('signup_complete', { user_id: 'u-42' });
 });
 
-await fasten.flush();   // drain pending audit rows
+await fasten.close();   // on shutdown: store pending audit rows, stop the drainer
 ```
 
 Both lines stream NDJSON to stdout under the same `request_id`.
@@ -77,9 +77,12 @@ failures stay off the request path. Set
 `auditStoreFailureStrategy: 'raise'` to opt into synchronous semantics
 with `AuditStoreError`. With an async store such as `PostgresStore`,
 raise-mode `emit()` returns a promise for the row; `await` it to see the
-`AuditStoreError`. `queueStats()` and `flush(timeoutMs)` complete
-the public surface. Re-`init()` stops the old drainer: rows still queued
-get one more attempt each and are dead-lettered if it fails.
+`AuditStoreError`. `queueStats()`, `flush(timeoutMs)` and
+`close(timeoutMs)` complete the public surface. Call `close()` on
+shutdown: it flushes, then stops the drainer, giving rows still queued one
+more attempt each. A row that fails it, or is still unstored at the
+timeout, is reported as `audit_drain_lost_at_stop`, and `close()` resolves
+false. Re-`init()` stops the old drainer the same way.
 
 **Chain.** The JS SDK does not seal rows. `emit()` returns the row with
 `monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the

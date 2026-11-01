@@ -14,12 +14,38 @@ import { canonicalTS } from "../canonical_ts.js";
 
 // pg is an optional peer dep — lazy import so the module loads without it installed.
 let _Pool = null;
+let _types = null;
 async function _getPool(connectionString) {
 	if (!_Pool) {
 		const mod = await import("pg");
-		_Pool = mod.default.Pool ?? mod.Pool;
+		const pg = mod.default ?? mod;
+		_Pool = pg.Pool;
+		const base = pg.types;
+		// timestamptz (1184) and timestamp (1114) as text: a Date keeps only
+		// milliseconds, so a Go-written .123456 would come back as .123000.
+		// Set on this pool only, not on pg globally.
+		_types = {
+			getTypeParser: (oid, format) =>
+				oid === 1184 || oid === 1114
+					? _pgTimestamp
+					: base.getTypeParser(oid, format),
+		};
 	}
-	return new _Pool({ connectionString });
+	return new _Pool({ connectionString, types: _types });
+}
+
+// "2026-08-21 10:00:00.123456+05:30" → "2026-08-21T04:30:00.123456Z".
+// A timestamp with no offset is UTC.
+function _pgTimestamp(v) {
+	const m =
+		/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:([+-]\d{2})(?::?(\d{2}))?)?$/.exec(
+			v,
+		);
+	if (!m) return v;
+	const [, date, time, frac = "", offH, offM = "00"] = m;
+	const offset = offH ? `${offH}:${offM}` : "Z";
+	const secs = new Date(`${date}T${time}${offset}`).toISOString().slice(0, 19);
+	return `${secs}.${frac.padEnd(6, "0")}Z`;
 }
 
 // Bare name ("audit_log") or schema-qualified ("fasten.audit_log").
@@ -75,6 +101,9 @@ function _ddlStatements(table, idx) {
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_ts        ON ${table}(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_unshipped ON ${table}(shipped_at) WHERE shipped_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_pii       ON ${table}(pii_in_detail) WHERE pii_in_detail = 1`,
+		// For the seq allocation in insert(). Not unique: rows from the old
+		// per-process counter repeat seqs.
+		`CREATE INDEX IF NOT EXISTS idx_${idx}_node_seq  ON ${table}(source_node_id, monotonic_seq)`,
 	];
 }
 
@@ -84,17 +113,12 @@ function _ddlStatements(table, idx) {
  * @param {Record<string,unknown>} r
  * @returns {Record<string,unknown>}
  */
-function _ts(v) {
-	// A Go-created table stores TIMESTAMPTZ, which pg returns as a Date.
-	return v instanceof Date ? canonicalTS(v) : (v ?? null);
-}
-
 function _mapRow(r) {
 	return {
 		id: r.id,
 		originId: r.origin_id,
 		monotonicSeq: Number(r.monotonic_seq),
-		timestamp: _ts(r.timestamp),
+		timestamp: r.timestamp,
 		code: r.code,
 		action: r.action,
 		severity: r.severity,
@@ -110,7 +134,7 @@ function _mapRow(r) {
 		requestId: r.request_id,
 		detail: typeof r.detail === "string" ? JSON.parse(r.detail) : r.detail,
 		piiInDetail: Number(r.pii_in_detail) === 1,
-		shippedAt: _ts(r.shipped_at),
+		shippedAt: r.shipped_at ?? null,
 		prevHash: r.prev_hash ?? "",
 		hash: r.hash ?? "",
 	};
