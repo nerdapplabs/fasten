@@ -110,18 +110,26 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   reported those rows as tampered. Rows are written unsealed, and `configure`
   logs `audit_chain_unavailable` once. A store given a non-zero seq writes it
   as given.
-- `SQLiteStore` sets a 5 s busy timeout (`busyTimeoutMs`) and adds the
+- `SQLiteStore` sets a 5 s busy timeout (`busyTimeoutMs`), adds the
   `pii_in_detail`, `canonical_form_id`, `detail_salt` and `detail_commitment`
-  columns.
+  columns, and indexes `(source_node_id, monotonic_seq)` so the seq lookup on
+  insert does not scan the table. `pii_in_detail` is set from the code's
+  `Meta`.
 - `Fasten.redactExpired(before:reason:)` sets `detail` to null on rows of
   `Fasten.piiCodes()` older than `before`, after writing an
   `AUDIT_ROW_REDACTED` row for each one (spec §7). Rows are never deleted, and
   sealed form-"1" rows are not touched; their count is logged as
   `pii_redaction_skipped_legacy_form`. The SDK runs no retention loop, so
   call it on a schedule. `Meta` gains `piiInDetail`.
+- Rows written by the previous Swift release are form "1" with a hash that
+  never covered `detail`, so `redactExpired` refuses them. If only Swift has
+  written to the table, call `SQLiteStore.clearLegacySwiftHashes()` once to
+  unseal them and let `redactExpired` reach them. Do not call it on a table Go
+  or Python also write: their form "1" hashes do cover `detail`.
 - The swift-crypto dependency is gone. `SQLiteStore.ping` and
   `maxMonotonicSeq` take the store lock, so calling them while the drainer
-  inserts no longer crashes.
+  inserts no longer crashes. The connection is opened with
+  `SQLITE_OPEN_NOMUTEX`, so that lock is what serializes it on every platform.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

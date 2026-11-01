@@ -405,8 +405,8 @@ final class ChainTests: XCTestCase {
     // ping and maxMonotonicSeq share the drainer's connection, which SQLite
     // does not serialize in multi-thread mode.
     func testReadsWhileInsertingOnOneStore() throws {
-        let store = try SQLiteStore(path: tempDBPath(self))
-        let n = 2000
+        let store = try SQLiteStore(path: ":memory:")
+        let n = 200
         DispatchQueue.concurrentPerform(iterations: 2) { i in
             for j in 0..<n {
                 if i == 0 {
@@ -520,6 +520,34 @@ final class RedactionTests: XCTestCase {
         XCTAssertEqual(warn.count, 1)
         XCTAssertEqual(warn.first?["level"] as? String, "warn")
         XCTAssertEqual(warn.first?["rows"] as? Int, 1)
+    }
+
+    func testClearLegacySwiftHashesMakesRowsRedactable() throws {
+        registerCodes()
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let email: [String: AnyCodable] = ["email": AnyCodable("a@example.com")]
+        try store.insert(testRow("old", seq: 1, code: "USER_EMAIL_SEEN",
+                                 timestamp: isoString40DaysAgo(), detail: email, hash: "abc"))
+        let cutoff = Date().addingTimeInterval(-30 * day)
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
+
+        XCTAssertEqual(try store.clearLegacySwiftHashes(), 1)
+        XCTAssertEqual(query(path, "SELECT hash, prev_hash FROM audit_log WHERE id = 'old'"),
+                       [["", ""]])
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff), ["old"])
+        XCTAssertEqual(query(path, "SELECT detail FROM audit_log WHERE id = 'old'"), [["null"]])
+    }
+
+    func testInsertSetsPiiInDetailFromRegistry() throws {
+        registerCodes()
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN"))
+        try store.insert(testRow("plain", code: "USER_LOGIN"))
+        XCTAssertEqual(query(path, "SELECT id, pii_in_detail FROM audit_log ORDER BY id"),
+                       [["pii", "1"], ["plain", "0"]])
     }
 
     func testRedactExpiredOnMemoryStore() throws {

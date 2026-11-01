@@ -31,7 +31,10 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             throw FastenError("invalid table name: \(table)")
         }
         self.table = table
-        if sqlite3_open(path, &db) != SQLITE_OK {
+        // NOMUTEX: `lock` is the only thing serializing this connection, on
+        // every platform, whatever threading mode the system SQLite was built with.
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
+        if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             throw FastenError("cannot open SQLite at \(path)")
         }
         sqlite3_busy_timeout(db, busyTimeoutMs)
@@ -74,6 +77,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_\(table)_req  ON \(table)(request_id);
         CREATE INDEX IF NOT EXISTS idx_\(table)_code ON \(table)(code);
         CREATE INDEX IF NOT EXISTS idx_\(table)_ts   ON \(table)(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_\(table)_node_seq ON \(table)(source_node_id, monotonic_seq);
         """
         try exec(ddl)
         // Columns added after the first release; same names and defaults as
@@ -138,8 +142,8 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         (id,origin_id,monotonic_seq,timestamp,code,action,severity,
          service_id,source_node_id,tenant_id,actor,actor_kind,
          target,category,domain,method,request_id,detail,shipped_at,
-         prev_hash,hash,detail_salt,detail_commitment)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','')
+         prev_hash,hash,pii_in_detail,detail_salt,detail_commitment)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','')
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -175,6 +179,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         }
         sqlite3_bind_text(stmt, 20, row.prevHash,      -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(stmt, 21, row.hash,          -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt,  22, CodeRegistry.shared.lookup(row.code)?.piiInDetail == true ? 1 : 0)
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw FastenError("SQLite insert failed: \(lastError())")
         }
@@ -241,6 +246,21 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
                 throw FastenError("SQLite query failed: \(lastError())")
             }
             return Int(sqlite3_column_int64(stmt, 0))
+        }
+    }
+
+    /// Clears `hash` and `prev_hash` on sealed form "1" rows so
+    /// `redactExpired` can reach them. The Swift release before store-assigned
+    /// seqs sealed rows with a hash that never covered `detail`, and those
+    /// rows are form "1" too. Only safe on a table Swift alone wrote: a Go or
+    /// Python form "1" hash does cover `detail` and cannot be told apart.
+    /// Returns the number of rows cleared.
+    @discardableResult
+    public func clearLegacySwiftHashes() throws -> Int {
+        try lock.withLock {
+            try exec("UPDATE \(table) SET hash = '', prev_hash = '' "
+                + "WHERE canonical_form_id = '1' AND hash <> ''")
+            return Int(sqlite3_changes(db))
         }
     }
 
