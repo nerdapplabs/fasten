@@ -1071,7 +1071,7 @@ class Engine:
                 fields = json.loads(event_json.decode("utf-8"))
                 # A row still pending failed its one try at stop; retire then
                 # stores it or reports it lost, so this would count it twice.
-                if fields.get("event") == "audit_drain_dead_letter" and (
+                if fields.get("event") in ("audit_drain_dead_letter", "audit_drain_lost_at_stop") and (
                         d.reported or fields.get("row_id") in pending):
                     return
                 fields.pop("shape", None)
