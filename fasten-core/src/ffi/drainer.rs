@@ -56,17 +56,17 @@ pub(super) fn wait_retired(h: &FastenStoreHandle) {
 /// handle. Until it returns, `fasten_drainer_flush` also waits for it.
 /// Install reports rows the old drainer could not write.
 pub(super) fn retire(h: &FastenStoreHandle, old: &Arc<Drainer>, flush_for: Option<Duration>) {
-    let dead_before = old.stats().dead_lettered_total;
+    let unstored_before = old.unstored_total();
     let flushed = flush_for.is_none_or(|t| old.flush(t));
     old.stop(Duration::from_secs(2));
     // Enqueues still running may emit through the sys sink; the host may
     // release it once this returns.
     old.wait_calls();
-    let dead = old.stats().dead_lettered_total - dead_before;
-    if flush_for.is_some() && (!flushed || dead > 0) {
+    let unstored = old.unstored_total() - unstored_before;
+    if flush_for.is_some() && (!flushed || unstored > 0) {
         old.sys_event("warn", "audit_drain_install_incomplete", &serde_json::json!({
             "flushed": flushed,
-            "dead_lettered": dead,
+            "unstored": unstored,
         }));
     }
     // Notify under the lock: once it is released, close may free the handle.

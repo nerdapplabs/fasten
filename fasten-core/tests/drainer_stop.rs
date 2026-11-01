@@ -113,9 +113,15 @@ fn stop_releases_enqueue_blocked_on_a_full_queue() {
 
 #[test]
 fn no_retry_after_stop() {
+    use fasten_core::drainer::SysLog;
     let store = TestStore::new(true, Duration::ZERO);
     let attempts = store.attempts.clone();
-    let d = Drainer::new(Box::new(store), cfg(4, Duration::from_secs(10)));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: SysLog = {
+        let events = events.clone();
+        Arc::new(move |line: &str| events.lock().unwrap().push(line.to_owned()))
+    };
+    let d = Drainer::with_sys_log(Box::new(store), cfg(4, Duration::from_secs(10)), Some(sink));
     d.enqueue(row("r-1"));
     thread::sleep(Duration::from_millis(50)); // first attempt failed, now backing off
     within(Duration::from_secs(5), {
@@ -123,7 +129,17 @@ fn no_retry_after_stop() {
         move || d.stop(Duration::from_secs(2))
     });
     assert!(attempts.load(Ordering::SeqCst) <= 2, "retried after stop");
-    assert_eq!(d.stats().dead_lettered_total, 1);
+    // A row that fails at stop is lost, not dead-lettered.
+    assert_eq!(d.stats().dead_lettered_total, 0);
+    assert_eq!(d.stats().dead_letter_depth, 0);
+    let lost: Vec<serde_json::Value> = events.lock().unwrap().iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &serde_json::Value| e["event"] == "audit_drain_lost_at_stop")
+        .collect();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0]["row_id"], "r-1");
+    assert_eq!(lost[0]["error_type"], "CallbackFailed");
+    assert!(!events.lock().unwrap().iter().any(|l| l.contains("audit_drain_dead_letter")));
 }
 
 #[test]

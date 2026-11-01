@@ -22,6 +22,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - An insert callback can return `FASTEN_INSERT_REJECTED` (any negative code)
   for a row the store will never accept; it is dead-lettered at once
   instead of being retried for the whole retry budget.
+- A row that fails its one attempt at stop is now reported with
+  `audit_drain_lost_at_stop` (`error_type`, `row_id`) instead of
+  `audit_drain_dead_letter`, and no longer counts in `dead_lettered_total`
+  or the dead-letter ring. `audit_drain_install_incomplete` reports
+  `unstored` (rows dead-lettered or lost at stop) in place of
+  `dead_lettered`.
 - The queue is no longer allocated up front, so a large `capacity` costs
   nothing until rows arrive.
 
