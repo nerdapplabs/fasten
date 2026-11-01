@@ -150,10 +150,12 @@ both.
 | `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` 0→1) |
 | `audit_drain_degraded` | `error` | `retry_count` reaches 5 within the burst |
 | `audit_drain_recovered` | `info` | Insert succeeds after one or more failures |
-| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts`, is rejected by the store (§3), or fails its one attempt at stop (§10) |
+| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts` |
 | `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
 | `audit_drain_stop_slow` | `warn` | Joining the drainer thread at stop took longer than the stop timeout (§10) |
-| `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or it dead-lettered rows (§10) |
+| `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or rows it held were not stored (§10) |
+| `audit_drain_lost_at_stop` | `error` | Row not stored at shutdown (§10) |
+| `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
 
 **`audit_drain_failed` fields:**
 
@@ -202,7 +204,21 @@ both.
 **`audit_drain_install_incomplete` fields:**
 
 ```json
-{ "flushed": <bool>, "dead_lettered": <int> }
+{ "flushed": <bool>, "unstored": <int> }
+```
+
+`unstored` counts rows dead-lettered or lost at stop.
+
+**`audit_drain_lost_at_stop` fields** (one event per row):
+
+```json
+{ "error_type": "<ExceptionType>", "row_id": "<string|null>" }
+```
+
+**`audit_drain_recovered_at_stop` fields** (one event per stop):
+
+```json
+{ "row_ids": ["<string>", ...] }
 ```
 
 ---
@@ -461,6 +477,12 @@ When `jitter=false` the first five delays (with `retry_initial=100ms`,
    the stop timeout, emit `audit_drain_stop_slow`. Other implementations
    MAY join with a short timeout.
 
+A row that fails its shutdown attempt, or is still unstored when the
+shutdown timeout passes, is reported with `audit_drain_lost_at_stop`, not
+`audit_drain_dead_letter`, and the SDK's `close()` / `Close()` returns
+false. An SDK that stores rows its drainer still held after stopping it
+reports them with `audit_drain_recovered_at_stop`.
+
 `install_drainer()` / `init()` on a running engine MUST:
 
 1. Build the new drainer first.
@@ -468,7 +490,7 @@ When `jitter=false` the first five delays (with `retry_initial=100ms`,
    visible to `flush()` throughout, so a flush during the swap waits for
    its rows too.
 3. Flush the old drainer (outside the mutex, up to 5 s) then stop it. If
-   the flush timed out or rows were dead-lettered, emit
+   the flush timed out or rows were not stored, emit
    `audit_drain_install_incomplete`.
 
 This race-safe swap prevents dropping in-flight rows during re-init.

@@ -127,6 +127,7 @@ struct InternalStats {
     err_hw_fired: bool,
     degraded_fired: bool,
     dead_lettered_total: usize,
+    lost_at_stop_total: usize,
     dlq: VecDeque<Row>,
 }
 
@@ -275,12 +276,13 @@ impl Drainer {
         // Snapshot the target: drained_total + current depth.
         let target = {
             let st = lock_or_recover(&self.inner.stats);
-            st.drained_total + st.dead_lettered_total + self.inner.slots.used()
+            st.drained_total + st.dead_lettered_total + st.lost_at_stop_total
+                + self.inner.slots.used()
         };
         let deadline = Instant::now() + timeout;
         let mut st = lock_or_recover(&self.inner.stats);
         loop {
-            let done = st.drained_total + st.dead_lettered_total;
+            let done = st.drained_total + st.dead_lettered_total + st.lost_at_stop_total;
             // Once stopping, slot counts no longer track queued rows; wait
             // for the drain thread, which handles every queued row first.
             let stopping = self.inner.stop.load(Ordering::SeqCst);
@@ -322,6 +324,12 @@ impl Drainer {
             dead_letter_depth: st.dlq.len(),
             capacity_semantics: "block",
         }
+    }
+
+    /// Rows dead-lettered or lost at stop so far.
+    pub(crate) fn unstored_total(&self) -> usize {
+        let st = lock_or_recover(&self.inner.stats);
+        st.dead_lettered_total + st.lost_at_stop_total
     }
 
     /// Snapshot queue stats as a JSON string.
@@ -412,7 +420,11 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
             let result = match call {
                 Ok(r) => r,
                 Err(_) => {
-                    on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
+                    if in_shutdown || inner.stop.load(Ordering::Acquire) {
+                        on_lost_at_stop(inner, &row, "panic");
+                    } else {
+                        on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
+                    }
                     break;
                 }
             };
@@ -426,9 +438,11 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                     attempt += 1;
                     // Spec §10: no retry once stopping. Spec §3: no retry for
                     // a row the store rejected.
-                    if attempt >= inner.cfg.max_attempts || in_shutdown
-                        || inner.stop.load(Ordering::Acquire) || rejected(&e)
-                    {
+                    if in_shutdown || inner.stop.load(Ordering::Acquire) {
+                        on_lost_at_stop(inner, &row, &error_type(&e));
+                        break;
+                    }
+                    if attempt >= inner.cfg.max_attempts || rejected(&e) {
                         on_dead_letter(inner, &row, attempt, &msg);
                         break;
                     }
@@ -452,6 +466,12 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
 /// callback returned a negative code (`FASTEN_INSERT_REJECTED`).
 fn rejected(e: &Error) -> bool {
     matches!(e, Error::CallbackFailed(rc) if *rc < 0)
+}
+
+/// The variant name, e.g. `CallbackFailed`.
+fn error_type(e: &Error) -> String {
+    let debug = format!("{e:?}");
+    debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
 }
 
 fn on_success(inner: &DrainerInner) {
@@ -538,6 +558,18 @@ fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
     st.retry_count = 0;
     st.in_backoff_until = None;
     st.failure_burst_at = None;
+    inner.slots.release();
+    drop(st);
+    inner.flush_cv.notify_all();
+}
+
+fn on_lost_at_stop(inner: &DrainerInner, row: &Row, error_type: &str) {
+    inner.sys_event("error", "audit_drain_lost_at_stop", &serde_json::json!({
+        "error_type": error_type,
+        "row_id": row.id,
+    }));
+    let mut st = lock_or_recover(&inner.stats);
+    st.lost_at_stop_total += 1;
     inner.slots.release();
     drop(st);
     inner.flush_cv.notify_all();
