@@ -663,14 +663,14 @@ func (s *PostgresStore) ListRedactionCandidates(
 	var skipped int64
 	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
 		`SELECT COUNT(*) FROM %s WHERE timestamp < $1 AND code IN (%s) `+
-			`AND canonical_form_id <> '2' AND detail <> 'null'`, s.table, in),
+			`AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'`, s.table, in),
 		args...).Scan(&skipped); err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
 		`SELECT id, monotonic_seq FROM %s WHERE timestamp < $1 AND code IN (%s) `+
-			`AND canonical_form_id = '2' AND detail <> 'null' `+
+			`AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' `+
 			`ORDER BY monotonic_seq`, s.table, in),
 		args...)
 	if err != nil {
@@ -703,7 +703,7 @@ func (s *PostgresStore) RedactRows(ctx context.Context, ids []string) ([]string,
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 		`UPDATE %s SET detail = 'null', detail_salt = '' `+
-			`WHERE id IN (%s) AND canonical_form_id = '2'`,
+			`WHERE id IN (%s) AND (canonical_form_id = '2' OR hash = '')`,
 		s.table, strings.Join(placeholders, ",")), args...); err != nil {
 		return nil, err
 	}

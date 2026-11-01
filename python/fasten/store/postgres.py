@@ -528,15 +528,15 @@ class PostgresStore:
                 cur.execute(
                     f"SELECT COUNT(*) FROM {self._table} "
                     "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id <> '2' AND detail <> 'null'",
+                    "AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'",
                     (_utc_iso(before), list(codes)),
                 )
                 skipped = cur.fetchone()[0]
                 if skipped:
                     logger.warning(
                         "fasten redact_expired: %d row(s) past the PII horizon "
-                        "were NOT redacted because canonical_form_id != '2' — "
-                        "their detail is inside the hash, so redacting would "
+                        "were NOT redacted because they are sealed under form "
+                        "'1' — their detail is inside the hash, so redacting would "
                         "break the chain. Personal data in these rows still "
                         "exists. Re-seal under form '2' or erase the chain "
                         "segment.",
@@ -545,7 +545,7 @@ class PostgresStore:
                 cur.execute(
                     f"SELECT id, monotonic_seq FROM {self._table} "
                     "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "
                     "ORDER BY monotonic_seq",
                     (_utc_iso(before), list(codes)),
                 )
@@ -576,7 +576,7 @@ class PostgresStore:
                 cur.execute(
                     f"UPDATE {self._table} "
                     "SET detail = 'null', detail_salt = NULL "
-                    "WHERE id = ANY(%s) AND canonical_form_id = '2'",
+                    "WHERE id = ANY(%s) AND (canonical_form_id = '2' OR hash = '')",
                     (list(ids),),
                 )
             conn.commit()

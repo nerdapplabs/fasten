@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Python and Go redact unsealed rows (spec §7.1)
+
+- PII redaction now covers unsealed rows (an empty `hash`) as well as form
+  "2" rows: no hash covers their `detail`, so destroying it breaks nothing.
+  These are the rows the core, Rust, JS, C++ and Swift SDKs write to a shared
+  table. Python and Go used to skip them and count them as legacy rows on
+  every pass, so their personal data outlived the horizon.
+- Sealed form "1" rows are still skipped, and are now the only rows counted in
+  the `pii_redaction_skipped_legacy_form` event and the Python warning.
+- Adopters relying on unsealed rows keeping their `detail` past the PII
+  horizon: it is now set to null after an `AUDIT_ROW_REDACTED` record, as for
+  form "2" rows.
+
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 
 - **FR1 persistence** — opt-in durable `api`/`sys` streams (SQLite + Postgres),

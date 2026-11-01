@@ -456,9 +456,10 @@ class SQLiteStore:
         ``detail = {"redacted_seq": <n>, ...}``, and the seq is not derivable
         from the id.
 
-        Skips form-"1" rows: their ``detail`` IS hashed, so redacting one would
-        change its hash and cascade a re-seal down the rest of the chain. They
-        are counted and logged at WARNING rather than skipped quietly — on a
+        Lists form-"2" rows and unsealed rows (empty ``hash``): no hash covers
+        their ``detail`` (spec §7.1). Skips sealed form-"1" rows: their
+        ``detail`` IS hashed, so redacting one would change its hash and cascade
+        a re-seal down the rest of the chain. They are counted and logged at WARNING rather than skipped quietly — on a
         store written before the form-"2" upgrade, silence here would let an
         operator watch redaction "succeed" while the personal data it was
         supposed to destroy survives untouched.
@@ -470,14 +471,14 @@ class SQLiteStore:
         skipped = conn.execute(
             f"SELECT COUNT(*) FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id <> '2' AND detail <> 'null'",
+            "AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'",
             (_utc_iso(before), *codes),
         ).fetchone()[0]
         if skipped:
             logger.warning(
                 "fasten redact_expired: %d row(s) past the PII horizon were "
-                "NOT redacted because canonical_form_id != '2' — their "
-                "detail is inside the hash, so redacting would break the "
+                "NOT redacted because they are sealed under form '1' — "
+                "their detail is inside the hash, so redacting would break the "
                 "chain. Personal data in these rows still exists. "
                 "Re-seal under form '2' or erase the chain segment.",
                 skipped,
@@ -485,7 +486,7 @@ class SQLiteStore:
         rows = conn.execute(
             f"SELECT id, monotonic_seq FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id = '2' AND detail <> 'null' "
+            "AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "
             "ORDER BY monotonic_seq",
             (_utc_iso(before), *codes),
         ).fetchall()
@@ -513,7 +514,7 @@ class SQLiteStore:
                 # reads back with detail=None exactly as spec §1.4 requires,
                 # and the bytes are genuinely gone either way.
                 f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
-                f"WHERE id IN ({placeholders}) AND canonical_form_id = '2'",
+                f"WHERE id IN ({placeholders}) AND (canonical_form_id = '2' OR hash = '')",
                 tuple(ids),
             )
             conn.commit()

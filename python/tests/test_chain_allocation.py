@@ -195,3 +195,33 @@ def test_redact_expired_respects_the_cutoff(store):
         before=datetime.now(timezone.utc) - timedelta(days=30),
         codes=["USER_EXPORTED"]) == []
     assert {r.id: r for r in store.query(limit=10)}[fresh.id].detail is not None
+
+
+def test_redact_expired_redacts_unsealed_rows_and_skips_sealed_form_1(store):
+    """Spec §7.1: no hash covers an unsealed row's detail, so it is redacted
+    like a form "2" row. A sealed form "1" row's detail is inside its hash, so
+    it is left alone and counted."""
+    import dataclasses
+    from datetime import timedelta
+    old = datetime.now(timezone.utc) - timedelta(days=40)
+    unsealed = dataclasses.replace(
+        _unsealed(4), code="USER_EXPORTED", timestamp=old,
+        detail={"email": "u@v.w"}, monotonic_seq=7)
+    legacy = dataclasses.replace(
+        _unsealed(5), code="USER_EXPORTED", timestamp=old,
+        detail={"email": "l@m.n"}, monotonic_seq=8,
+        canonical_form_id="1", prev_hash="genesis", hash="f" * 64)
+    store._insert_row(unsealed)
+    store._insert_row(legacy)
+
+    redacted = store.redact_expired(
+        before=datetime.now(timezone.utc) - timedelta(days=30),
+        codes=["USER_EXPORTED"])
+    assert redacted == [unsealed.id]
+
+    rows = {r.id: r for r in store.query(limit=10)}
+    assert rows[unsealed.id].detail is None
+    assert rows[legacy.id].detail == {"email": "l@m.n"}
+    # redact_rows refuses the sealed form "1" row even when named directly.
+    store.redact_rows(ids=[legacy.id])
+    assert {r.id: r for r in store.query(limit=10)}[legacy.id].detail == {"email": "l@m.n"}
