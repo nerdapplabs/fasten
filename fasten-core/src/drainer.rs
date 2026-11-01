@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::{row::Row, store::Store};
+use crate::{error::Error, row::Row, store::Store};
 
 // ── Conformance constants ──────────────────────────────────────────────────
 
@@ -343,7 +343,10 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                 Err(e) => {
                     let msg = e.to_string();
                     attempt += 1;
-                    if attempt >= inner.cfg.max_attempts || in_shutdown {
+                    // A seq clash is the same on every retry.
+                    if attempt >= inner.cfg.max_attempts || in_shutdown
+                        || matches!(e, Error::SeqClash(_))
+                    {
                         on_dead_letter(&inner, &row, attempt, &msg);
                         break;
                     }

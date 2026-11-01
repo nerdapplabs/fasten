@@ -90,6 +90,11 @@ pub enum Error {
     /// callback-backed store).
     #[error("{0} is not supported by this store")]
     Unsupported(&'static str),
+
+    /// Another row already holds this `(source_node_id, monotonic_seq)`.
+    /// Retrying cannot help, so the drainer dead-letters the row at once.
+    #[error("seq clash: {0}")]
+    SeqClash(String),
 }
 
 // When neither sqlite nor postgres feature is active, the #[from] impls above
@@ -136,6 +141,7 @@ impl From<&Error> for FastenErrorCode {
             Error::TlsUnavailable(_)   => FastenErrorCode::ErrBackend,
             Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
             Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
+            Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

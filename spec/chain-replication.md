@@ -171,8 +171,8 @@ form `"1"`.
 - `monotonic_seq` is strictly increasing and **unique** within a
   `source_node_id`. Two originated rows on one node MUST NOT share a
   `monotonic_seq`.
-- `prev_hash` is the hex SHA-256 of the preceding row in that sequence, or the
-  literal `"genesis"` for the first row.
+- `prev_hash` is the `hash` of the preceding sealed row in that sequence, or
+  the literal `"genesis"` for the node's first sealed row (§2.1).
 - Rows with an empty `hash` (written before hash-chain support, or emitted in
   stdout-only mode per §8) are skipped by `verify_chain`, not rejected.
 
@@ -223,7 +223,8 @@ See §8 for what the stdout stream carries in the interim.
 1. Sort by `monotonic_seq`.
 2. For each hash-bearing row, recompute the §1 hash for its `canonical_form_id`
    and compare to the stored `hash`.
-3. Compare each row's `prev_hash` to the preceding row's `hash`.
+3. Compare each hash-bearing row's `prev_hash` to the `hash` of the preceding
+   hash-bearing row (`"genesis"` for the first).
 4. On the first failure, stop and report `first_break_at` = that row's
    `monotonic_seq`.
 
@@ -300,8 +301,10 @@ SDKs MUST refuse to redact a form-`"1"` row (its `detail` is hashed directly, so
 redaction would require re-sealing the entire suffix) and MUST report that the row
 predates form `"2"`.
 
-An unsealed row (`hash = ""`) is not in the chain, so it MAY be redacted
-whatever its `canonical_form_id`.
+An unsealed row (`hash = ""`) is not in the chain, so SDKs MUST redact it
+like any other candidate, whatever its `canonical_form_id`; the form-`"1"`
+refusal above applies only to sealed rows. The Python and Go SDKs still skip
+unsealed form-`"1"` rows and need a follow-up to conform.
 
 ### §7.2 The redaction event
 

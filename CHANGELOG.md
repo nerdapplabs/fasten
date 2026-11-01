@@ -99,9 +99,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   insert transaction (`BEGIN IMMEDIATE` on SQLite, the shared
   `pg_advisory_xact_lock` on Postgres). Two handles on one store no longer
   write duplicate seqs (#92). Rows stay unsealed (spec §8.2). A non-zero seq
-  is written as given. Fresh tables get `UNIQUE (source_node_id,
-  monotonic_seq)`, and SQLite inserts use `ON CONFLICT (id) DO NOTHING` so a
-  seq clash fails instead of dropping the row.
+  is written as given.
+- **Breaking:** fresh tables get `UNIQUE (source_node_id, monotonic_seq)`.
+  A row that reuses a node's seq there now fails with the new
+  `Error::SeqClash`, and the drainer dead-letters it at once instead of
+  retrying; before, the row was stored with the duplicate seq. A repeated
+  `id` is still a no-op (`ON CONFLICT (id) DO NOTHING`).
+- Opening a table created before this release adds a non-unique
+  `idx_<table>_node_seq` index, so seq allocation does not scan the table.
+  The first open builds it while holding the write lock (SQLite) or a
+  `SHARE` lock on the table (Postgres); create it beforehand on a big,
+  busy table. Opening a table that is already up to date runs no DDL and
+  takes no write lock.
 - PII retention by redaction (spec §7.1): `list_redaction_candidates` and
   `redact_rows` on the `Store` trait, exported as
   `fasten_store_list_redaction_candidates` / `fasten_store_redact_rows`.
@@ -114,8 +123,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `PostgresStore` takes the `fasten.bootstrap.<table>` advisory lock (same key
   as Python) around its schema bootstrap, so stores opening a fresh database
   at once no longer fail on a duplicate `pg_type` key.
-- Spec: §8.2 (allocation without sealing), §2.1 states `prev_hash` comes from
-  the node's last sealed row, and §7.1 allows redacting any unsealed row.
+- Spec: §8.2 (allocation without sealing), §2 and §2.1 state `prev_hash`
+  comes from the node's last sealed row, and §7.1 makes redacting unsealed
+  rows the rule for every SDK.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

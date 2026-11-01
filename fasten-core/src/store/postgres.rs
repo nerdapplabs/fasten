@@ -248,13 +248,14 @@ impl PostgresStore {
             &shipped,            // $21 shipped_at    (NULL when None)
         ];
 
+        let bare = self.bare.as_str();
         if row.monotonic_seq != 0 {
             return self.with_reconnect(|inner| {
                 inner
                     .client
                     .execute(&inner.stmt, params)
                     .map(|_| ())
-                    .map_err(Error::Postgres)
+                    .map_err(|e| seq_clash(e, bare))
             });
         }
 
@@ -281,7 +282,7 @@ impl PostgresStore {
             let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.get(0);
             let mut p = params.to_vec();
             p[3] = &seq; // $4 monotonic_seq
-            tx.execute(&*stmt, &p)?;
+            tx.execute(&*stmt, &p).map_err(|e| seq_clash(e, bare))?;
             tx.commit()?;
             Ok(())
         })
@@ -513,6 +514,20 @@ impl Store for PostgresStore {
     }
 }
 
+/// A unique violation on `uq_<bare>_node_seq`. A repeated id never gets
+/// here: the insert is `ON CONFLICT (id) DO NOTHING`.
+fn seq_clash(e: pg::Error, bare: &str) -> Error {
+    let clash = e.as_db_error().is_some_and(|db| {
+        *db.code() == pg::error::SqlState::UNIQUE_VIOLATION
+            && db.constraint().is_some_and(|c| c.eq_ignore_ascii_case(&format!("uq_{bare}_node_seq")))
+    });
+    if clash {
+        Error::SeqClash(e.to_string())
+    } else {
+        Error::Postgres(e)
+    }
+}
+
 // ── Schema bootstrap ──────────────────────────────────────────────────────────
 
 fn pg_exec(client: &mut pg::Transaction<'_>, sql: &str) -> Result<(), Error> {
@@ -525,6 +540,12 @@ fn migrate(
     bare: &str,
     schema: Option<&str>,
 ) -> Result<(), Error> {
+    // Probe first, so opening an up-to-date table runs no DDL and waits on
+    // no lock.
+    if index_missing(client, bare, schema)?.is_none() {
+        return Ok(());
+    }
+
     // Concurrent CREATE ... IF NOT EXISTS on a fresh database can fail with a
     // duplicate key on pg_type. Same lock key as the Python store; the xact
     // lock is released on commit, or on rollback when `tx` drops on error.
@@ -580,8 +601,54 @@ fn migrate(
         pg_exec(client, sql)?;
     }
 
+    // A table created before the UNIQUE constraint has no node-seq index and
+    // may already repeat seqs on a node, so this one is not unique.
+    if index_missing(client, bare, schema)? == Some(NODE_SEQ) {
+        pg_exec(
+            client,
+            &format!(
+                "CREATE INDEX IF NOT EXISTS idx_{bare}_node_seq \
+                 ON {table} (source_node_id, monotonic_seq)"
+            ),
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
+}
+
+const NODE_SEQ: &str = "node_seq";
+
+/// The first index `migrate` creates that the table lacks (`req`, `code`,
+/// `ts`, `svc` or [`NODE_SEQ`]), or `None` when it is up to date. A missing
+/// table lacks them all.
+fn index_missing(
+    client: &mut impl pg::GenericClient,
+    bare: &str,
+    schema: Option<&str>,
+) -> Result<Option<&'static str>, Error> {
+    // Unquoted identifiers fold to lower case.
+    let bare = bare.to_lowercase();
+    let schema = schema.map(str::to_lowercase);
+    let names: Vec<String> = client
+        .query(
+            "SELECT indexname FROM pg_indexes \
+             WHERE schemaname = COALESCE($1, current_schema()) AND tablename = $2",
+            &[&schema, &bare],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let has = |n: String| names.contains(&n);
+    for s in ["req", "code", "ts", "svc"] {
+        if !has(format!("idx_{bare}_{s}")) {
+            return Ok(Some(s));
+        }
+    }
+    if !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")) {
+        return Ok(Some(NODE_SEQ));
+    }
+    Ok(None)
 }
 
 // ── SQL builders ──────────────────────────────────────────────────────────────
@@ -839,7 +906,68 @@ mod tests {
         let mut b = row_on("evt-dup-2", "node-a");
         b.monotonic_seq = 3;
         store.insert(&a).unwrap();
-        assert!(store.insert(&b).is_err());
+        assert!(matches!(store.insert(&b), Err(Error::SeqClash(_))));
+    }
+
+    /// A table from before the UNIQUE constraint already repeats seqs, so
+    /// it gets a plain index.
+    #[test]
+    fn old_table_gets_a_non_unique_node_seq_index() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_old";
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '{{}}', pii_in_detail SMALLINT NOT NULL DEFAULT 0,
+                shipped_at TEXT);
+             INSERT INTO {table} (id, origin_id, monotonic_seq, timestamp, code, source_node_id)
+             VALUES ('a', 'a', 1, 't', 'C', 'node-a'), ('b', 'b', 1, 't', 'C', 'node-a');"
+        ))
+        .unwrap();
+        drop(PostgresStore::connect(&dsn, table).unwrap());
+        let def: String = c
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = $1",
+                &[&format!("idx_{table}_node_seq")],
+            )
+            .unwrap()
+            .get(0);
+        assert!(!def.contains("UNIQUE"), "{def}");
+        assert_eq!(index_missing(&mut c, table, None).unwrap(), None);
+    }
+
+    /// Opening an up-to-date table runs no DDL, so it does not wait for the
+    /// bootstrap lock another opener holds.
+    #[test]
+    fn opening_an_up_to_date_table_skips_the_bootstrap() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_current";
+        drop(fresh(&dsn, table));
+        let mut holder = connect_client(&dsn).unwrap();
+        holder
+            .execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                &[&format!("fasten.bootstrap.{table}")],
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            tx.send(PostgresStore::connect(&dsn, table).is_ok()).unwrap();
+        });
+        let opened = rx.recv_timeout(std::time::Duration::from_secs(5));
+        holder.batch_execute("SELECT pg_advisory_unlock_all()").unwrap();
+        opener.join().unwrap();
+        assert_eq!(opened, Ok(true));
     }
 
     /// #92: several stores, one node, inserting at once.

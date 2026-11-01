@@ -90,9 +90,52 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_{t}_svc  ON {t}(service_id);"
         );
 
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        guard.execute_batch(&ddl)?;
+        // Probe first, so opening an up-to-date table takes no write lock.
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if Self::schema_missing(&guard, t)? == Missing::Nothing {
+            return Ok(());
+        }
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(&ddl)?;
+        // A table created before the UNIQUE constraint has no index here and
+        // may already repeat seqs on a node, so this one is not unique.
+        if Self::schema_missing(&tx, t)? == Missing::NodeSeqIndex {
+            tx.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_{t}_node_seq ON {t}(source_node_id, monotonic_seq)"
+            ))?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// What `migrate` still has to create on `table`.
+    fn schema_missing(conn: &Connection, table: &str) -> Result<Missing, Error> {
+        let mut stmt = conn.prepare(
+            "SELECT l.name,
+                    (SELECT name FROM pragma_index_info(l.name) WHERE seqno = 0),
+                    (SELECT name FROM pragma_index_info(l.name) WHERE seqno = 1)
+             FROM pragma_index_list(?1) l",
+        )?;
+        let mut names = Vec::new();
+        let mut node_seq = false;
+        let mut rows = stmt.query([table])?;
+        while let Some(r) = rows.next()? {
+            names.push(r.get::<_, String>(0)?);
+            let first: Option<String> = r.get(1)?;
+            let second: Option<String> = r.get(2)?;
+            node_seq |= first.as_deref() == Some("source_node_id")
+                && second.as_deref() == Some("monotonic_seq");
+        }
+        let all_named = ["req", "code", "ts", "svc"]
+            .iter()
+            .all(|s| names.iter().any(|n| n.eq_ignore_ascii_case(&format!("idx_{table}_{s}"))));
+        Ok(if !all_named {
+            Missing::TableOrIndexes
+        } else if !node_seq {
+            Missing::NodeSeqIndex
+        } else {
+            Missing::Nothing
+        })
     }
 
     /// Whether the table has a `hash` column.
@@ -109,6 +152,13 @@ impl SqliteStore {
         )?;
         Ok(n > 0)
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum Missing {
+    Nothing,
+    NodeSeqIndex,
+    TableOrIndexes,
 }
 
 /// Ids or codes bound per statement. SQLite caps bound variables per
@@ -377,9 +427,24 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         detail_str,
         pii,
         row.shipped_at,     // Option<String> → NULL when None
-    ])?;
+    ])
+    .map_err(seq_clash)?;
 
     Ok(())
+}
+
+/// A UNIQUE failure on insert is the (source_node_id, monotonic_seq) index:
+/// a repeated id is `ON CONFLICT (id) DO NOTHING`.
+fn seq_clash(e: rusqlite::Error) -> Error {
+    match &e {
+        rusqlite::Error::SqliteFailure(f, Some(msg))
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                && msg.contains("source_node_id") =>
+        {
+            Error::SeqClash(msg.clone())
+        }
+        _ => e.into(),
+    }
 }
 
 // ON CONFLICT (id), not INSERT OR IGNORE: a repeated id is a no-op, but a
@@ -670,8 +735,60 @@ mod tests {
         let mut b = row_on("evt-dup-2", "node-a");
         b.monotonic_seq = 3;
         store.insert(&a).unwrap();
-        assert!(store.insert(&b).is_err());
+        assert!(matches!(store.insert(&b), Err(Error::SeqClash(_))));
         assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    /// A table from before the UNIQUE constraint already repeats seqs, so
+    /// it gets a plain index.
+    #[test]
+    fn old_table_gets_a_non_unique_node_seq_index() {
+        let db = TempDb::new("old_table");
+        {
+            let conn = Connection::open(&db.0).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                    origin_id TEXT NOT NULL, monotonic_seq INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                    service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                    tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                    actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                    method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '{}', pii_in_detail INTEGER NOT NULL DEFAULT 0,
+                    shipped_at TEXT);
+                 INSERT INTO audit_log (id, origin_id, monotonic_seq, timestamp, code, source_node_id)
+                 VALUES ('a', 'a', 1, 't', 'C', 'node-a'), ('b', 'b', 1, 't', 'C', 'node-a');",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&db.0, "audit_log", false).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let unique: i64 = conn
+            .query_row(
+                "SELECT \"unique\" FROM pragma_index_list('audit_log') WHERE name = 'idx_audit_log_node_seq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique, 0);
+        assert_eq!(SqliteStore::schema_missing(&conn, "audit_log").unwrap(), Missing::Nothing);
+    }
+
+    /// Opening an up-to-date table takes no write lock, so it does not wait
+    /// for another connection's write transaction.
+    #[test]
+    fn opening_an_up_to_date_table_takes_no_write_lock() {
+        let db = TempDb::new("no_write_lock");
+        drop(SqliteStore::open(&db.0, "audit_log", true).unwrap());
+        let other = Connection::open(&db.0).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        drop(SqliteStore::open(&db.0, "audit_log", true).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        other.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
