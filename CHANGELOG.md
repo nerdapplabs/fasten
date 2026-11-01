@@ -99,8 +99,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   back. A sealed row passed to `fasten_store_insert` used to be stored without
   its hash, so every `fasten-core/bindings/*` package lost the chain.
 - `Row` has these as typed optional fields instead of leaving them in
-  `extra`; a field that was absent is still absent when the row is written
-  out as JSON.
+  `extra`. A row passed through the C interface or the drainer keeps an
+  absent field absent. A row read back from a store carries `prev_hash` and
+  `hash` (`""` when unsealed) and `canonical_form_id` (`"1"` by default), as
+  Python's rows do; salt and commitment only on a form "2" row.
 - Opening a store adds the five columns to a table an older fasten-core
   created. Salt and commitment are written as `''` when absent, so a table the
   Go store created (NOT NULL there) accepts the row; both read back as absent.

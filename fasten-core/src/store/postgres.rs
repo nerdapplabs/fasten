@@ -146,7 +146,6 @@ pub struct PostgresStore {
     inner: Mutex<Inner>,
     table: String,
     bare: String,          // bare name used for index identifiers
-    schema: Option<String>,
     dsn: String,           // retained for reconnect
     insert_sql: String,    // retained for re-prepare after reconnect
 }
@@ -182,20 +181,17 @@ impl PostgresStore {
     pub fn connect(dsn: &str, table: &str) -> Result<Self, Error> {
         validate_table_name(table)?;
 
-        let (schema_opt, bare) = split_table(table);
-        let schema = schema_opt.map(str::to_owned);
-        let bare = bare.to_owned();
+        let (schema, bare) = split_table(table);
         let insert_sql = build_insert_sql(table);
 
         let mut client = connect_client(dsn)?;
-        migrate(&mut client, table, &bare, schema.as_deref())?;
+        migrate(&mut client, table, bare, schema)?;
         let stmt = client.prepare(&insert_sql)?;
 
         Ok(Self {
             inner: Mutex::new(Inner { client, stmt }),
             table: table.to_owned(),
-            bare,
-            schema,
+            bare: bare.to_owned(),
             dsn: dsn.to_owned(),
             insert_sql,
         })

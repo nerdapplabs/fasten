@@ -1016,4 +1016,43 @@ mod tests {
         SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A table that already has some chain columns, as the Go store creates
+    /// them (salt and commitment NOT NULL), gets the rest.
+    #[test]
+    fn open_adds_only_the_missing_chain_columns() {
+        let dir = std::env::temp_dir().join(format!("fasten-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.db");
+        let _ = std::fs::remove_file(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE audit_log (
+                    id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                    origin_id TEXT NOT NULL, monotonic_seq INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                    service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                    tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                    actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                    method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '{}', pii_in_detail INTEGER NOT NULL DEFAULT 0,
+                    shipped_at TEXT, hash TEXT NOT NULL DEFAULT '',
+                    detail_salt TEXT NOT NULL DEFAULT '',
+                    detail_commitment TEXT NOT NULL DEFAULT '',
+                    UNIQUE (source_node_id, monotonic_seq));",
+            )
+            .unwrap();
+        let store = SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
+        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let mut row = sealed("evt-sealed");
+        row.monotonic_seq = 2;
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(chain_of(&got[0]), [Some(""), Some(""), Some("1"), None, None]);
+        assert_eq!(chain_of(&got[1]), chain_of(&row));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
