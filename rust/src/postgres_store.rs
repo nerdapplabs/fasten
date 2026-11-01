@@ -31,7 +31,7 @@ fn validate_table_name(table: &str) -> Result<(), crate::Error> {
         Some((s, t)) => (Some(s), t),
         None => (None, table),
     };
-    let ok = schema.map_or(true, is_valid_identifier) && is_valid_identifier(bare);
+    let ok = schema.is_none_or(is_valid_identifier) && is_valid_identifier(bare);
     if ok {
         Ok(())
     } else {
