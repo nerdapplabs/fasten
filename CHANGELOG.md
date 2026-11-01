@@ -102,13 +102,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   once to say so (§8.1).
 - **Breaking:** `Row` gains public fields `prev_hash` and `hash` (both empty),
   so `Row { .. }` literals that list every field stop compiling.
-- **Breaking:** `PostgresStore` writes `timestamp` and `shipped_at` in the
-  canonical form `YYYY-MM-DDTHH:MM:SS.ffffffZ` (§4.3), not `to_rfc3339()`.
+- **Breaking:** `timestamp` and `shipped_at` use the canonical form
+  `YYYY-MM-DDTHH:MM:SS.ffffffZ` (§4.3) in `PostgresStore`, in `Row`'s serde
+  output (stdout audit lines included) and in sys-line `timestamp`s, which
+  were milliseconds.
 - `PostgresStore` can share a table with the Python and Go stores: it inserts
   with a column list, adds the chain columns, writes `''` for `detail_salt` /
-  `detail_commitment`, and writes into `TIMESTAMPTZ` columns. Store bootstrap
+  `detail_commitment`, and writes into `TIMESTAMPTZ` columns, mixed-case
+  table names included. Store bootstrap
   takes the same advisory lock as Python, so stores starting together no
-  longer fail on concurrent `CREATE TABLE`.
+  longer fail on concurrent `CREATE TABLE`. Bootstrap adds a non-unique
+  `(source_node_id, monotonic_seq)` index so the next-seq lookup stays cheap.
 - PII retention: set `Config::retention_pii` (or `FASTEN_RETENTION_PII`), e.g.
   `"30d"`. A background thread redacts expired rows whose code is in
   `pii_codes()` (`pii_in_detail` or retention class Short): `detail` becomes
@@ -123,9 +127,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   its detail is inside the hash. Such rows past the cutoff are counted and
   logged as `pii_redaction_skipped_legacy_form` (warn).
 - Stopping the purger (`init()` again, `reset_for_tests()`) waits at most 2 s.
-  The purger stops after the row it is on.
-- **Breaking:** `Error` gains `Unsupported` and `InvalidRetention`, so
-  exhaustive `match`es on `Error` stop compiling.
+  The purger stops after the row it is on. Dropping an `Engine` stops its
+  purger too.
+- **Breaking:** `Error` gains `Unsupported` and `InvalidRetention` and is now
+  `#[non_exhaustive]`, so `match`es on `Error` need a wildcard arm. Later
+  variants will not be breaking.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

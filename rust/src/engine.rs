@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 
 use fasten_core::drainer::{Drainer, DrainerConfig};
 
@@ -263,7 +263,7 @@ pub(crate) fn sys_line(service_id: &str, level: &str, event: &str, fields: serde
         "event": event,
         "request_id": current_request_id().unwrap_or_default(),
         "service_id": service_id,
-        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "timestamp": crate::canonical_ts(&Utc::now()),
     });
     if let serde_json::Value::Object(merge_into) = &mut payload {
         if let serde_json::Value::Object(extra) = fields {

@@ -157,6 +157,7 @@ pub struct Row {
     pub origin_id: String,
     pub monotonic_seq: u64,
 
+    #[serde(with = "canonical_ts_serde")]
     pub timestamp: DateTime<Utc>,
 
     pub code: String,
@@ -189,7 +190,7 @@ pub struct Row {
     #[serde(default)]
     pub hash: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "canonical_ts_serde::option")]
     pub shipped_at: Option<DateTime<Utc>>,
 }
 
@@ -197,6 +198,34 @@ pub struct Row {
 /// `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 pub fn canonical_ts(dt: &DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+mod canonical_ts_serde {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::canonical_ts(dt))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        DateTime::<Utc>::deserialize(d)
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(dt: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+            match dt {
+                Some(dt) => s.serialize_str(&crate::canonical_ts(dt)),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+            Option::<DateTime<Utc>>::deserialize(d)
+        }
+    }
 }
 
 // --- Code catalog --------------------------------------------------------
@@ -226,6 +255,7 @@ pub struct Meta {
 
 /// Library error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("duplicate code: {0}")]
     DuplicateCode(String),
@@ -1371,6 +1401,51 @@ mod tests {
         e.reset_for_tests();
         assert!(started.elapsed() < Duration::from_secs(3), "reset blocked on a hung purger");
         drop(tx);
+    }
+    fn ts_row(ts: &str, shipped: serde_json::Value) -> Row {
+        serde_json::from_value(serde_json::json!({
+            "wire_version": "1", "id": "i", "origin_id": "i", "monotonic_seq": 1,
+            "timestamp": ts, "code": "C", "action": "a", "severity": "Info",
+            "service_id": "s", "source_node_id": "n", "tenant_id": null,
+            "actor": "u", "actor_kind": "user", "target": "t", "category": "c",
+            "domain": "d", "method": "m", "request_id": "r", "detail": {},
+            "shipped_at": shipped,
+        }))
+        .unwrap()
+    }
+
+    // Spec §4.3: six fractional digits on the wire, whole seconds included.
+    #[test]
+    fn row_serializes_canonical_timestamps() {
+        let row = ts_row("2026-01-02T03:04:05Z", serde_json::json!("2026-01-02T03:04:05.120Z"));
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["timestamp"], "2026-01-02T03:04:05.000000Z");
+        assert_eq!(v["shipped_at"], "2026-01-02T03:04:05.120000Z");
+
+        let row = ts_row("2026-01-02T03:04:05.120Z", serde_json::Value::Null);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["timestamp"], "2026-01-02T03:04:05.120000Z");
+        assert!(v.get("shipped_at").is_none());
+
+        let back: Row = serde_json::from_value(v).unwrap();
+        assert_eq!(back.timestamp, row.timestamp);
+        assert!(back.shipped_at.is_none());
+    }
+
+    #[test]
+    fn sys_line_uses_canonical_timestamp() {
+        engine::sys_line("svc-sys-ts", "info", "sys_ts_probe", serde_json::json!({}));
+        let line = engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|v| v["service_id"] == "svc-sys-ts")
+            .cloned()
+            .expect("sys line");
+        let ts = line["timestamp"].as_str().unwrap();
+        assert_eq!(ts.len(), "2026-01-02T03:04:05.000000Z".len(), "{ts}");
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[19..20], ".");
     }
 }
 

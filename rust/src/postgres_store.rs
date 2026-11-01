@@ -114,6 +114,8 @@ fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), 
         format!("CREATE INDEX IF NOT EXISTS idx_{bare}_code ON {table} (code)"),
         format!("CREATE INDEX IF NOT EXISTS idx_{bare}_ts   ON {table} (timestamp)"),
         format!("CREATE INDEX IF NOT EXISTS idx_{bare}_svc  ON {table} (service_id)"),
+        // Not unique: older Rust tables repeat seqs per node.
+        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_node_seq ON {table} (source_node_id, monotonic_seq)"),
     ] {
         client.execute(sql.as_str(), &[]).map_err(pg_err)?;
     }
@@ -133,6 +135,9 @@ fn inspect_columns(
     schema: Option<&str>,
     bare: &str,
 ) -> Result<Columns, crate::Error> {
+    // Unquoted identifiers fold to lowercase in Postgres.
+    let schema = schema.map(str::to_ascii_lowercase);
+    let bare = bare.to_ascii_lowercase();
     let rows = client
         .query(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
@@ -660,12 +665,7 @@ mod tests {
         assert_eq!(r.get::<_, Option<&str>>(1), Some("2026-01-02T03:04:06.500000Z"));
     }
 
-    // Rows go into a Go-shaped table: TIMESTAMPTZ timestamps, NOT NULL salt.
-    #[test]
-    fn test_insert_into_go_shaped_table() {
-        let Some(dsn) = dsn() else { return };
-        let table = "fasten_pg_go_shape";
-        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+    fn create_go_table(c: &mut pg::Client, table: &str) {
         c.batch_execute(&format!(
             "DROP TABLE IF EXISTS {table};
              CREATE TABLE {table} (
@@ -681,6 +681,15 @@ mod tests {
                 detail_salt TEXT NOT NULL DEFAULT '', detail_commitment TEXT NOT NULL DEFAULT '')"
         ))
         .expect("create go table");
+    }
+
+    // Rows go into a Go-shaped table: TIMESTAMPTZ timestamps, NOT NULL salt.
+    #[test]
+    fn test_insert_into_go_shaped_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_go_shape";
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        create_go_table(&mut c, table);
         let store = PostgresStore::new(&dsn, table).expect("PostgresStore::new");
         let mut row = make_row(&uniq("evt"), "TEST_GO");
         row.monotonic_seq = 0;
@@ -701,6 +710,42 @@ mod tests {
         assert_eq!(r.get::<_, i64>(0), 1);
         assert_eq!(r.get::<_, &str>(1), "null");
         assert_eq!(r.get::<_, &str>(2), "");
+    }
+
+    // A mixed-case name folds to lowercase, so the TIMESTAMPTZ cast still applies.
+    #[test]
+    fn test_insert_into_mixed_case_go_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "Fasten_Go_Mixed";
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        create_go_table(&mut c, table);
+        let store = PostgresStore::new(&dsn, table).expect("PostgresStore::new");
+        let mut row = make_row(&uniq("evt"), "TEST_GO_MIXED");
+        row.monotonic_seq = 0;
+        row.shipped_at = Some(chrono::Utc::now());
+        crate::AuditStore::insert(&store, &row).expect("insert");
+        let n: i64 = c
+            .query_one(&format!("SELECT count(*) FROM {table} WHERE id = $1"), &[&row.id])
+            .expect("query")
+            .get(0);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_node_seq_index_created() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_seq_index";
+        let _store = fresh_store(&dsn, table);
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let r = c
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+                &[&table, &format!("idx_{table}_node_seq")],
+            )
+            .expect("index exists");
+        let def: &str = r.get(0);
+        assert!(def.contains("(source_node_id, monotonic_seq)"), "{def}");
+        assert!(!def.contains("UNIQUE"), "{def}");
     }
 
     // ── PII redaction (spec §7) ───────────────────────────────────────────

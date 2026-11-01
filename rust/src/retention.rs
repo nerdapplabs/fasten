@@ -200,9 +200,7 @@ impl Purger {
     /// Signal the thread and wait up to `STOP_TIMEOUT` for it. A thread
     /// stuck in a store call is left to finish on its own.
     pub(crate) fn stop(mut self) {
-        let (lock, cv) = &*self.stop;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        cv.notify_all();
+        self.signal();
         let Some(h) = self.handle.take() else { return };
         let deadline = std::time::Instant::now() + STOP_TIMEOUT;
         while !h.is_finished() {
@@ -213,11 +211,37 @@ impl Purger {
         }
         let _ = h.join();
     }
+
+    fn signal(&self) {
+        let (lock, cv) = &*self.stop;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+// Dropping without stop() still ends the thread; it is not joined.
+impl Drop for Purger {
+    fn drop(&mut self) {
+        self.signal();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_purger_thread_exits() {
+        let cfg = Config { service_id: "svc-purger-drop".into(), ..Default::default() };
+        let mut p = Purger::start_with_interval(cfg, Duration::from_secs(1), Duration::from_secs(3600));
+        let h = p.handle.take().expect("purger thread");
+        drop(p);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !h.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "purger outlived its drop");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn parse_duration_accepts_units() {

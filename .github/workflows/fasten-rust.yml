@@ -27,6 +27,20 @@ jobs:
     container:
       image: rust:1.90
 
+    # The job runs in a container, so the service is reached by name.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: rust
@@ -51,16 +65,20 @@ jobs:
       - name: Lint (clippy)
         # --locked: the lockfiles ARE committed now, so a transitive MSRV bump
         # fails loudly here instead of silently breaking the build.
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --features store-postgres -- -D warnings
 
       - name: Unit tests
-        run: cargo test --locked --quiet
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
+        run: cargo test --locked --quiet --features store-postgres
 
       # rust/Cargo.toml pulls fasten-core with default-features = false, so a
       # `cargo test` in rust/ never compiles store/postgres.rs — tls_tests has
       # never run. Test the core in its own directory with all features on.
       - name: Test fasten-core (all features)
         working-directory: fasten-core
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
         # native-tls links OpenSSL, which needs pkg-config + headers. Without
         # them the job fails at build, which is how tls_tests stayed unrun.
         # The job runs in a rust container — root, and no sudo binary,
