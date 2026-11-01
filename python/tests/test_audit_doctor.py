@@ -207,3 +207,21 @@ def test_chain_tail_and_seq_allocation_use_the_node_seq_index(tmp_path):
     conn.close()
     for plan in plans:
         assert "idx_audit_log_node_seq" in plan, plan
+
+
+def test_node_filtered_reads_keep_their_own_indexes(tmp_path):
+    store = SQLiteStore(str(tmp_path / "audit.db"))
+    conn = store._connect()
+    traced: list[str] = []
+    conn.set_trace_callback(traced.append)
+    store.list_unshipped(service_id="svc", source_node_id="node")
+    store.query(source_node_id="node")
+    store.chain_tail("node", 50)
+    conn.set_trace_callback(None)
+    unshipped, query, tail = (
+        " ".join(r[3] for r in conn.execute(f"EXPLAIN QUERY PLAN {sql}"))
+        for sql in traced if sql.lstrip().upper().startswith("SELECT")
+    )
+    assert "idx_audit_log_unshipped" in unshipped, unshipped
+    assert "idx_audit_log_node_seq" not in query, query
+    assert "idx_audit_log_node_seq" in tail, tail

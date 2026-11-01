@@ -104,6 +104,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   A store without `chain_tail()` keeps the old sample. Both stores add a
   `(source_node_id, monotonic_seq)` index, which this sample and the seq
   allocation use; it is not unique, since unchained rows all sit at seq 0.
+  On an existing table the first `init()` after upgrading builds the index
+  while holding the write lock, a couple of seconds at a million SQLite rows,
+  so a busy node may want to create it beforehand.
 - A scoped caller no longer sees the host `tenant_id`, or the row a chain break
   is on. The doctor's `last_error` and chain `reason` carry fixed text and log
   a `doctor_check_failed` sys line with the error type.

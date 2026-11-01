@@ -378,9 +378,11 @@ class SQLiteStore:
         scoped = service_id is not None and source_node_id is not None
         with self._txn():
             if scoped:
+                # Unary + keeps SQLite off idx_node_seq, which would walk the
+                # node's whole history; the unshipped partial index is smaller.
                 cur = self._connect().execute(
                     f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-                    "AND service_id = ? AND source_node_id = ? AND origin_id = id "
+                    "AND service_id = ? AND +source_node_id = ? AND origin_id = id "
                     "ORDER BY monotonic_seq ASC LIMIT ?",
                     (service_id, source_node_id, limit),
                 )
@@ -579,7 +581,9 @@ class SQLiteStore:
             conds.append("domain = ?")
             params.append(domain)
         if source_node_id:
-            conds.append("source_node_id = ?")
+            # Unary +: without statistics SQLite would pick idx_node_seq and
+            # sort the node's whole history instead of walking idx_ts.
+            conds.append("+source_node_id = ?")
             params.append(source_node_id)
         # `is not None`, not truthiness: an empty tenant_id must filter to
         # nothing, never silently widen the query to every tenant. Matches the
