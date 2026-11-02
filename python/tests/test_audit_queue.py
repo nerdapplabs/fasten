@@ -931,6 +931,35 @@ def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     _default._insert_lock.release()
 
 
+class SlowRetireStore(FlakyStore):
+    """Fails the drain thread's two tries, then holds the retire thread's
+    try until ``release`` is set and stores the row."""
+
+    def __init__(self, path):
+        super().__init__(path, fail=2)
+        self.release = threading.Event()
+
+    def allocate_and_insert_originated(self, row):
+        if self.attempts >= 2:
+            assert self.release.wait(10)
+        return super().allocate_and_insert_originated(row)
+
+
+def test_row_retire_stores_after_close_gave_up_is_reported_recovered(tmp_path):
+    store = SlowRetireStore(str(tmp_path / "a.db"))
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_in_backoff()
+    try:
+        assert not fasten.close(timeout=0.4)    # retire's try is still running
+    finally:
+        _release_hung_store(store)
+    assert [r.id for r in _rows(store)] == [row.id]
+    recovered = [e for e in fasten.transport().query_syslog(limit=1000)
+                 if e.get("event") == "audit_drain_recovered_at_stop"]
+    assert [e["row_ids"] for e in recovered] == [[row.id]]
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)

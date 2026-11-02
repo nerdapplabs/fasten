@@ -1278,10 +1278,10 @@ class Engine:
                 if lost:
                     self._lose_at_stop(d, [row.id], type(e).__name__)
             else:
+                # Stored, whether or not close has reported it lost meanwhile.
                 with d.lock:
-                    if not d.reported:
-                        d.pending.pop(row.id, None)
-                        recovered.append(row.id)
+                    d.pending.pop(row.id, None)
+                recovered.append(row.id)
         if recovered:
             self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
         self._report_unstored(d)
