@@ -61,8 +61,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     shipped_at       TEXT,
     canonical_form_id TEXT NOT NULL DEFAULT '1',
     -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
-    -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, '' once redacted.
+    -- can be destroyed for retention without moving the row hash. '' (NULL
+    -- in older rows) on form-"1" rows and once redacted.
     detail_salt       TEXT,
     detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
@@ -237,8 +237,10 @@ class SQLiteStore:
                 row.canonical_form_id,
                 row.prev_hash,
                 row.hash,
-                row.detail_salt,
-                row.detail_commitment,
+                # '' rather than NULL: a Go-created table has them NOT NULL,
+                # and OR IGNORE would drop the row without a word.
+                row.detail_salt or "",
+                row.detail_commitment or "",
             ),
         )
 
@@ -805,10 +807,10 @@ class SQLiteStore:
             detail=json.loads(r["detail"]),
             shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
-            # '' (Go's column default, and what redaction writes) is no salt.
+            # '' (what the stores write, and what redaction leaves) is none.
             detail_salt=(r["detail_salt"] or None) if "detail_salt" in keys else None,
             detail_commitment=(
-                r["detail_commitment"] if "detail_commitment" in keys else None),
+                (r["detail_commitment"] or None) if "detail_commitment" in keys else None),
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",
         )

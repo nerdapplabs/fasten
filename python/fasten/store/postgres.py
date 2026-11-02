@@ -37,6 +37,25 @@ def _utc_iso(dt: datetime) -> str:
     return canonical_ts(dt)
 
 
+def _read_ts(value: Any) -> datetime:
+    """A stored timestamp: canonical TEXT here, TIMESTAMPTZ in a table the Go
+    SDK created (microsecond precision, so nothing is lost)."""
+    from ..canonical_ts import parse_canonical
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    return parse_canonical(value)
+
+
+# Named, not SELECT *: a table the Go SDK created orders its columns
+# differently and has pii_in_detail and wire_version too.
+_COLUMNS = (
+    "id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+    "service_id,source_node_id,tenant_id,actor,actor_kind,"
+    "target,category,domain,method,request_id,detail,shipped_at,"
+    "prev_hash,hash,canonical_form_id,detail_salt,detail_commitment"
+)
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
     id               TEXT PRIMARY KEY,
@@ -62,8 +81,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     hash             TEXT NOT NULL DEFAULT '',
     canonical_form_id TEXT NOT NULL DEFAULT '1',
     -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
-    -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, '' once redacted.
+    -- can be destroyed for retention without moving the row hash. '' (NULL
+    -- in older rows) on form-"1" rows and once redacted.
     detail_salt       TEXT,
     detail_commitment TEXT
 )
@@ -257,8 +276,9 @@ class PostgresStore:
             row.prev_hash,
             row.hash,
             row.canonical_form_id,
-            row.detail_salt,
-            row.detail_commitment,
+            # '' rather than NULL: a Go-created table has them NOT NULL.
+            row.detail_salt or "",
+            row.detail_commitment or "",
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
@@ -415,14 +435,14 @@ class PostgresStore:
             with conn.cursor() as cur:
                 if scoped:
                     cur.execute(
-                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        f"SELECT {_COLUMNS} FROM {self._table} WHERE shipped_at IS NULL "
                         "AND service_id = %s AND source_node_id = %s AND origin_id = id "
                         "ORDER BY monotonic_seq ASC LIMIT %s",
                         (service_id, source_node_id, limit),
                     )
                 else:
                     cur.execute(
-                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        f"SELECT {_COLUMNS} FROM {self._table} WHERE shipped_at IS NULL "
                         "ORDER BY monotonic_seq ASC LIMIT %s",
                         (limit,),
                     )
@@ -682,7 +702,7 @@ class PostgresStore:
                     # Wall-clock first: monotonic_seq is a per-(service_id,
                     # source_node_id) counter, meaningless across sub-chains —
                     # it stays as the same-timestamp tie-breaker only (#68).
-                    f"SELECT * FROM {self._table} {where} "
+                    f"SELECT {_COLUMNS} FROM {self._table} {where} "
                     "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s OFFSET %s",
                     (*params, limit, offset),
                 )
@@ -746,7 +766,7 @@ class PostgresStore:
             params.append(tenant_id)
         params.append(limit)
         sql = (
-            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            f"SELECT {_COLUMNS} FROM {self._table} WHERE {' AND '.join(conds)} "
             "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s"
         )
 
@@ -791,8 +811,9 @@ class PostgresStore:
                         "service_id": r[1],
                         "tenant_id": r[2],
                         "rows": int(r[3]),
-                        "first_seen": first_seen.isoformat() if hasattr(first_seen, "isoformat") else first_seen,
-                        "last_seen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else last_seen,
+                        # TIMESTAMPTZ in a Go-created table: same canonical form.
+                        "first_seen": _utc_iso(first_seen) if isinstance(first_seen, datetime) else first_seen,
+                        "last_seen": _utc_iso(last_seen) if isinstance(last_seen, datetime) else last_seen,
                     })
                 return out
 
@@ -833,27 +854,23 @@ class PostgresStore:
     # ------------------------------------------------------------------
 
     def _row(self, r: tuple) -> AuditRow:
-        from ..canonical_ts import parse_canonical
+        """A row selected as ``_COLUMNS``."""
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            # Strict canonical parse (spec §4.3). Every row in this table was
-            # written by _utc_iso → canonical_ts, so anything else is a bug at
-            # the source and must fail loudly instead of round-tripping.
-            timestamp=parse_canonical(r[3]),
+            # TEXT gets the strict canonical parse (spec §4.3): anything but
+            # what _utc_iso wrote is a bug at the source and must fail loudly.
+            timestamp=_read_ts(r[3]),
             code=r[4], action=r[5], severity=r[6],
             service_id=r[7], source_node_id=r[8], tenant_id=r[9],
             actor=r[10], actor_kind=r[11],
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            shipped_at=parse_canonical(r[18]) if r[18] else None,
-            prev_hash=r[19] if len(r) > 19 else "genesis",
-            hash=r[20] if len(r) > 20 else "",
-            canonical_form_id=r[21] if len(r) > 21 else "1",
-            # SELECT * — positional. detail_salt / detail_commitment follow
-            # canonical_form_id both in the fresh DDL and when appended by
-            # ALTER TABLE on a migrated table, so the index is stable. ''
-            # (Go's column default, and what redaction writes) is no salt.
-            detail_salt=(r[22] or None) if len(r) > 22 else None,
-            detail_commitment=r[23] if len(r) > 23 else None,
+            shipped_at=_read_ts(r[18]) if r[18] else None,
+            prev_hash=r[19],
+            hash=r[20],
+            canonical_form_id=r[21],
+            # '' (what the stores write, and what redaction leaves) is none.
+            detail_salt=r[22] or None,
+            detail_commitment=r[23] or None,
         )
