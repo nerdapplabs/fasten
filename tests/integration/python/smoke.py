@@ -9,14 +9,14 @@ os.environ.setdefault("FASTEN_SERVICE_ID", "itest-python")
 os.environ.setdefault("FASTEN_NODE_ID", "host-itest")
 os.environ.setdefault("FASTEN_AUDIT_DSN", "sqlite:///audit.db")
 
-register("user", [
-    ("USER_CREATED", Meta(
+register("user", {
+    "USER_CREATED": Meta(
         id="USER_CREATED", domain="user", category="account",
         action="create", severity=Severity.INFO,
         description="New user account created", emitter="auth-service",
         retention_class=RetentionClass.LONG,
-    )),
-])
+    ),
+})
 
 fasten.init()
 

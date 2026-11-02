@@ -12,7 +12,7 @@ which asserts the wire contract against the canonical
 | Python   | `python:3.10-slim`   | audit · sys · **api** | [`python/`](python/) |
 | Go       | `golang:1.26-bookworm` | audit · sys          | [`go/`](go/)         |
 | Node.js  | `node:24-alpine`     | audit · sys          | [`node/`](node/)     |
-| Rust     | `rust:1.85-slim`     | audit · sys          | [`rust/`](rust/)     |
+| Rust     | `rust:1.90-slim-bookworm` | audit · sys          | [`rust/`](rust/)     |
 | C++14    | `gcc:13-bookworm`    | audit · sys          | [`cpp/`](cpp/)       |
 | Java     | _coming soon_        | —                    | _placeholder SDK; emit() throws today._ |
 
@@ -88,7 +88,7 @@ For every smoke, `verify.py` asserts:
 | Python | 3.10    | Lowest currently-maintained interpreter; `pyproject.toml` requires `>=3.10` |
 | Go     | 1.26    | Module's `go 1.26.0` directive; Debian for the cgo build against fasten-core |
 | Node   | 24      | Matches `js/package.json` engines `>=24` |
-| Rust   | 1.85    | Matches `rust/Cargo.toml` `rust-version = "1.85"` |
+| Rust   | 1.90    | fasten-core's `rust-version` (the SDK builds it as a path dependency) |
 | C++    | gcc 13  | C++14 support clean; bookworm-stable toolchain |
 
 ## Local CI integration
