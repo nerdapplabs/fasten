@@ -735,6 +735,23 @@ mod tests {
         assert_eq!(store.count(&Filter::default()).unwrap(), 1);
     }
 
+    /// A replayed row keeps its id and seq, so storing it again is a no-op;
+    /// another row on that node and seq is a clash.
+    #[test]
+    fn replayed_explicit_seq_row_is_stored_once() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut r = row_on("evt-replay-1", "node-a");
+        r.monotonic_seq = 7;
+        store.insert(&r).unwrap();
+        store.insert(&r).unwrap();
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+        let mut other = row_on("evt-replay-2", "node-a");
+        other.monotonic_seq = 7;
+        assert!(matches!(store.insert(&other), Err(Error::SeqClash(_))));
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+        assert_eq!(seqs(&store, "node-a"), vec![7]);
+    }
+
     /// A table from before the UNIQUE constraint already repeats seqs, so
     /// it gets a plain index.
     #[test]
