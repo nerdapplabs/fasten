@@ -291,11 +291,14 @@ impl PostgresStore {
 
     /// Whether the table has a `hash` column. See the SQLite store.
     fn has_hash_column(&self, client: &mut pg::Client) -> Result<bool, Error> {
+        // Unquoted identifiers fold to lower case.
+        let bare = self.bare.to_lowercase();
+        let schema = self.schema.as_deref().map(str::to_lowercase);
         let row = client.query_one(
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = COALESCE($1, current_schema()) \
              AND table_name = $2 AND column_name = 'hash'",
-            &[&self.schema, &self.bare],
+            &[&schema, &bare],
         )?;
         let n: i64 = row.get(0);
         Ok(n > 0)
@@ -1107,5 +1110,29 @@ mod tests {
             .unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"k": "v"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// Postgres folds unquoted names to lower case, so the column probe must
+    /// too, or a mixed-case table looks hash-less and its sealed rows get
+    /// redacted.
+    #[test]
+    fn redaction_skips_sealed_rows_in_mixed_case_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "FastenScMixed.AuditLog";
+        let store = fresh(&dsn, table);
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!("ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"))
+            .unwrap();
+        let mut r = make_row("evt-mixed-sealed", "USER_LOGIN");
+        r.timestamp = days_ago(40);
+        store.insert(&r).unwrap();
+        c.batch_execute(&format!("UPDATE {table} SET hash = 'abc'")).unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert!(found.rows.is_empty());
+        assert_eq!(found.skipped, 1);
+        store.redact_rows(&["evt-mixed-sealed".to_string()]).unwrap();
+        assert_eq!(detail_of(&store, "evt-mixed-sealed"), serde_json::json!({"k": "v"}));
     }
 }
