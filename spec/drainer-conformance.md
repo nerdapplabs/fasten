@@ -150,7 +150,7 @@ both.
 | `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` 0→1) |
 | `audit_drain_degraded` | `error` | `retry_count` reaches 5 within the burst |
 | `audit_drain_recovered` | `info` | Insert succeeds after one or more failures |
-| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts` |
+| `audit_drain_dead_letter` | `error` | Row exhausts `max_attempts`, or the store rejects it (§3) |
 | `audit_drain_abandoned` | `error` | `put()` called after drainer is stopped |
 | `audit_drain_stop_slow` | `warn` | Joining the drainer thread at stop took longer than the stop timeout (§10) |
 | `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or rows it held were not stored (§10) |
