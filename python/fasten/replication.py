@@ -1,16 +1,11 @@
-"""
-Replication ingest — decoupled from the Engine.
+"""Replication ingest for a store, without an Engine.
 
-A replication sink (an upstream aggregator receiving rows reverse-synced from a
-node) needs only a store. It does NOT need ``fasten.init()``, a service identity,
-a redactor, or a drainer. This module exposes that store-scoped path directly:
+An aggregator receiving rows from nodes only needs a store:
 
     from fasten.replication import ingest
-    result = ingest(my_store, rows)   # no fasten.init() required
+    result = ingest(my_store, rows)
 
-``fasten.ingest_replicated(rows)`` remains as a convenience that delegates to the
-default Engine's store, for adopters who already run a configured engine — but it
-is no longer the only path.
+``fasten.ingest_replicated(rows)`` does the same with the default Engine's store.
 """
 from __future__ import annotations
 
@@ -26,16 +21,12 @@ __all__ = ["ingest", "IngestResult"]
 
 
 def ingest(store: "AuditRepository", rows: "list[AuditRow]") -> IngestResult:
-    """Verify + insert the verified prefix of a replicated batch into ``store``.
+    """Verify a replicated batch and insert its verified prefix into ``store``.
 
-    Uses the store's own transactional verified-prefix path when it exposes one
-    (SQLiteStore / PostgresStore implement ``ingest_replicated`` with real
-    single-transaction atomicity); otherwise falls back to the shared
-    row-by-row verified-prefix insert. Never raises on a chain break — the
-    returned :class:`IngestResult` carries ``rejected_from_seq`` so the sender
-    resyncs from the break.
-
-    No Engine, no ``fasten.init()``: a sink constructs a store and calls this.
+    Uses ``store.ingest_replicated`` (one transaction in SQLiteStore and
+    PostgresStore) when present, otherwise inserts row by row. Does not raise
+    on a chain break; :class:`IngestResult` carries ``rejected_from_seq``, the
+    seq to resend from.
     """
     store_ingest = getattr(store, "ingest_replicated", None)
     if callable(store_ingest):

@@ -1,10 +1,5 @@
-"""Tests for P1-9 — Python logging ergonomics.
-
-Covers:
-  #1 — fasten.shim.structlog.configure(...) end-to-end
-  #2 — fasten.shim.stdlib.LoggingHandler standalone + recursion guard
-  #3 — fasten.log.bound(name, **fields)
-"""
+"""Logging helpers: fasten.log.bound(), the stdlib LoggingHandler, and
+fasten.shim.structlog.configure()."""
 import logging
 
 import pytest
@@ -12,7 +7,7 @@ import pytest
 import fasten
 
 
-# ── #3 fasten.log.bound() ────────────────────────────────────────────────
+# fasten.log.bound()
 
 def test_log_bound_stamps_logger_field(initialized):
     """bound() returns a new logger that stamps `logger` on every emission."""
@@ -64,7 +59,7 @@ def test_log_bound_explicit_field_overrides_bound(initialized):
     assert rows["event_b"]["phase"] == "run"
 
 
-# ── #2 fasten.shim.stdlib.LoggingHandler ─────────────────────────────────
+# fasten.shim.stdlib.LoggingHandler
 
 def test_stdlib_logging_handler_pushes_to_ring(initialized):
     """LoggingHandler bridges stdlib logging into fasten's syslog ring."""
@@ -138,7 +133,7 @@ def test_stdlib_logging_handler_skips_fasten_internal_records(initialized):
         root.handlers = saved
 
 
-# ── #1 fasten.shim.structlog.configure() ─────────────────────────────────
+# fasten.shim.structlog.configure()
 
 def test_structlog_configure_end_to_end(initialized):
     """configure() installs both bridges; structlog + stdlib reach the ring."""
@@ -152,11 +147,11 @@ def test_structlog_configure_end_to_end(initialized):
     try:
         configure(json=True, debug=False, quiet=())
 
-        # structlog logger — fasten processor pushes to the ring
+        # structlog logger: the fasten processor pushes to the ring
         log = structlog.get_logger().bind(logger="buffer-manager")
         log.info("structlog_event", batch=42, api_key="sk-secret")
 
-        # stdlib logger — LoggingHandler pushes to the same ring
+        # stdlib logger: LoggingHandler pushes to the same ring
         logging.getLogger("legacy.lib").info("stdlib_event")
 
         rows = fasten.transport().query_syslog(limit=20)
@@ -164,7 +159,7 @@ def test_structlog_configure_end_to_end(initialized):
         assert "structlog_event" in events
         assert "stdlib_event" in events
 
-        # Redaction wired up: api_key scrubbed
+        # api_key is redacted
         s_row = next(r for r in rows if r.get("event") == "structlog_event")
         assert s_row["api_key"] == "***"
         assert s_row["batch"] == 42
@@ -178,19 +173,19 @@ def test_structlog_configure_end_to_end(initialized):
         logging.getLogger().setLevel(saved_level)
 
 
-# ── P1-10 — Meta.id optional + dict-form register ────────────────────────
+# Meta.id is optional; register() fills it from the dict key
 
 def test_register_dict_form_fills_id_from_key():
     from fasten.codes import register, Meta, Severity, RetentionClass, registry, _registry
 
     # Use a domain unlikely to clash with session-registered codes
-    code = "P1_10_FILLED"
+    code = "DICT_FORM_FILLED"
     if code in _registry:
         del _registry[code]
 
-    register("p1_10", {
+    register("dict_form", {
         code: Meta(
-            domain="p1_10", category="x", action="x",
+            domain="dict_form", category="x", action="x",
             severity=Severity.INFO, description="x", emitter="t",
             retention_class=RetentionClass.SHORT,
         ),
@@ -203,14 +198,14 @@ def test_register_dict_form_explicit_id_must_match():
     from fasten.codes import register, Meta, Severity, AuditCatalogError, _registry
 
     # Use a unique key to avoid duplicate-collision with prior runs
-    code = "P1_10_MISMATCH"
+    code = "DICT_FORM_MISMATCH"
     if code in _registry:
         del _registry[code]
 
     with pytest.raises(AuditCatalogError, match="disagrees with Meta.id"):
-        register("p1_10b", {
+        register("dict_form_b", {
             code: Meta(
-                id="WRONG_ID", domain="p1_10b", category="x", action="x",
+                id="WRONG_ID", domain="dict_form_b", category="x", action="x",
                 severity=Severity.INFO, description="x", emitter="t",
             ),
         })
@@ -220,11 +215,9 @@ def test_register_invalid_key_shape():
     from fasten.codes import register, Meta, Severity, AuditCatalogError
 
     with pytest.raises(AuditCatalogError, match="UPPER_SNAKE_CASE"):
-        register("p1_10c", {
+        register("dict_form_c", {
             "lowercase_bad": Meta(
-                domain="p1_10c", category="x", action="x",
+                domain="dict_form_c", category="x", action="x",
                 severity=Severity.INFO, description="x", emitter="t",
             ),
         })
-
-
