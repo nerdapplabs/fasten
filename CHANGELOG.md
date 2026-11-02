@@ -46,14 +46,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - A forked child (gunicorn `--preload`, Celery prefork) installs its own
   drainer. `fork()` waits up to 1 s for an in-flight store insert, so a
   child no longer stops storing after inheriting SQLite mid-insert, and an
-  insert stuck on a database lock does not hold up `fork()`.
+  insert stuck on a database lock does not hold up `fork()`; the parent then
+  emits `audit_drain_fork_during_insert`. A failed reinstall in the child
+  emits `audit_drain_reinstall_failed`.
 - `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
   of `timeout`, then stops the drainer and stores the rows it still holds.
   It returns within about `timeout`: no store call starts after that, one
   still running is left behind, and rows not stored are reported as
   `audit_drain_lost_at_stop`. It returns False only if a row was lost.
-  Rows reported lost past the deadline go to stderr and the ring but not
-  the syslog store. A left-behind call that later stores its row emits
+  Sys events past the deadline go to stderr and the ring but not the
+  syslog store, which is then marked degraded. A row reported lost and
+  stored later, by a left-behind call, retire or an inline emit, gets
+  `audit_drain_recovered_at_stop`. A left-behind call that later stores its row emits
   `audit_drain_recovered_at_stop`. The exit hook calls `close(5.0)`, so a
   hanging store no longer holds interpreter exit, and the process exits
   normally: exit status and other atexit hooks are unaffected. Emits after
@@ -66,6 +70,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   per drainer); fasten-core's drain thread waits for each. A store call
   left behind at exit can no longer abort the process during interpreter
   finalization (CPython before 3.14 on Linux).
+- Drainer sys events are written to stderr before the syslog store, so a
+  hung syslog store can't hold them back.
+- A flush that fails in fasten-core is reported as
+  `audit_drain_flush_failed` (and `flush()` returns False) instead of
+  looking like a timeout.
 
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 

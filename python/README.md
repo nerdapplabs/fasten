@@ -123,8 +123,11 @@ synchronous-with-`AuditStoreError` semantics and get the sealed row back.
 calls it): it flushes for half of `timeout`, then stores the rows still
 held. It returns within about `timeout`, reports rows not stored by then
 as `audit_drain_lost_at_stop`, and returns False if any row was lost. A
-store call still running at that point is left behind on its thread, not
-interrupted, and does not hold up or affect interpreter exit.
+store call still running at that point is left behind on its thread
+(`fasten-store`), not interrupted, and does not hold up or affect
+interpreter exit: the exit status and other atexit hooks are unchanged.
+Re-running `fasten.init()` waits at most 10 s for the drainer it replaces
+in the same way.
 
 ## Tests
 
