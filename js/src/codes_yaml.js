@@ -43,6 +43,7 @@ async function _loadYaml() {
 	} catch (e) {
 		throw new Error(
 			"fasten codes yaml loader requires js-yaml; install with: npm install js-yaml",
+			{ cause: e },
 		);
 	}
 }

@@ -221,9 +221,9 @@ export function _clearRustRegistry() {
 // --- Engine ---------------------------------------------------------------
 
 import {
+	_setDefaultEngine,
 	AuditQueueDrainer,
 	AuditStoreError,
-	_setDefaultEngine,
 } from "./audit_queue.js";
 
 export { AuditStoreError };
