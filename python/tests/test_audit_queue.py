@@ -1128,6 +1128,39 @@ def test_failed_reinstall_after_fork_is_reported(tmp_path, monkeypatch):
     assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
 
 
+def test_reinit_does_not_wait_forever_on_a_hanging_store(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_default, "_reinit_timeout", 0.6, raising=False)
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store)
+    try:
+        row = fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        start = time.monotonic()
+        _init(FlakyStore(str(tmp_path / "b.db")))
+        assert time.monotonic() - start < 2
+        err = capsys.readouterr().err
+    finally:
+        _release_hung_store(store)
+    assert f'"row_id": "{row.id}"' in err and "audit_drain_lost_at_stop" in err
+    assert fasten.emit(code="USER_CREATED", target="u-2") and fasten.flush(timeout=2.0)
+
+
+def test_reset_does_not_wait_forever_on_a_hanging_store(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_default, "_reset_timeout", 0.3, raising=False)
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store)
+    try:
+        row = fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        start = time.monotonic()
+        _default.reset_for_tests()
+        assert time.monotonic() - start < 2
+        err = capsys.readouterr().err
+    finally:
+        _release_hung_store(store)
+    assert f'"row_id": "{row.id}"' in err and "audit_drain_lost_at_stop" in err
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)

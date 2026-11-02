@@ -58,6 +58,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   hanging store no longer holds interpreter exit, and the process exits
   normally: exit status and other atexit hooks are unaffected. Emits after
   `close` are stored inline without an `audit_drain_abandoned` event.
+- Re-`init` waits at most 10 s for the drainer it replaces (flushing it
+  for up to 5 s, as before), and reports rows still held then as
+  `audit_drain_lost_at_stop`, so a hanging store no longer blocks
+  `fasten.init()`.
 - The drainer's store calls run on a Python thread (`fasten-store`, one
   per drainer); fasten-core's drain thread waits for each. A store call
   left behind at exit can no longer abort the process during interpreter

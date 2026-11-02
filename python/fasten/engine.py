@@ -265,6 +265,11 @@ class Engine:
     drainer state for one deployment context.  Thread-safe.
     """
 
+    # How long re-init and reset_for_tests wait for the drainer they replace,
+    # as close(timeout) does; re-init flushes for the first half.
+    _reinit_timeout = 10.0
+    _reset_timeout = 5.0
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._boot_request_id: Optional[str] = None  # sentinel boot-window id
@@ -542,7 +547,7 @@ class Engine:
         else:
             old_drainer = self._take_drainer()
         if old_drainer is not None:
-            self._retire_drainer(old_drainer, flush_ms=5_000)
+            self._retire(old_drainer, time.monotonic() + self._reinit_timeout, flush=True)
 
         # FR1 retention (§1). Only when a store is attached AND a retention
         # is set; running a background purger over a nil store is a no-op
@@ -824,13 +829,7 @@ class Engine:
         self.flush(timeout / 2)
         old = self._take_drainer()
         if old is not None:
-            old.deadline = deadline
-            t = threading.Thread(target=self._retire_drainer, args=(old, 0),
-                                 name="fasten-retire", daemon=True)
-            t.start()
-            t.join(max(0.0, deadline - time.monotonic()))
-            if t.is_alive():
-                self._give_up(old)
+            self._retire(old, deadline)
         return d.lost == lost
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
@@ -1261,21 +1260,33 @@ class Engine:
     def _uninstall_drainer(self) -> None:
         old = self._take_drainer()
         if old is not None:
-            self._retire_drainer(old, flush_ms=0)
+            self._retire(old, time.monotonic() + self._reset_timeout)
 
-    def _retire_drainer(self, d: _QueueDrainer, flush_ms: int) -> None:
+    def _retire(self, d: _QueueDrainer, deadline: float, flush: bool = False) -> None:
+        """Retire ``d`` on a thread, flushing it first for half the time
+        left if ``flush``. Waits until ``deadline``, then gives up on it: the
+        rows it still holds are reported lost and the thread is left behind."""
+        d.deadline = deadline
+        if flush:
+            self._flush_drainer(d, max(0.0, deadline - time.monotonic()) / 2)
+        t = threading.Thread(target=self._retire_drainer, args=(d,),
+                             name="fasten-retire", daemon=True)
+        t.start()
+        t.join(max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            self._give_up(d)
+
+    def _retire_drainer(self, d: _QueueDrainer) -> None:
         """Stop a drainer that is no longer installed and store what it didn't."""
         try:
-            self._stop_drainer(d, flush_ms)
+            self._stop_drainer(d)
         finally:
             d.calls.put(None)       # ends the store thread once it is free
             with self._drainer_lock:
                 if d in self._retiring:
                     self._retiring.remove(d)
 
-    def _stop_drainer(self, d: _QueueDrainer, flush_ms: int) -> None:
-        if flush_ms:
-            self._flush_drainer(d, flush_ms / 1000)
+    def _stop_drainer(self, d: _QueueDrainer) -> None:
         # Close refuses new rows and waits for the drain thread, so the
         # callback is not called after it returns. Calls still using the
         # handle get an error and store their row inline.
