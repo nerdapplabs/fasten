@@ -14,7 +14,7 @@ func main() {
 			ID: "USER_CREATED", Domain: "user", Category: "account",
 			Action: "create", Severity: fasten.SevInfo,
 			Description: "New user account created", Emitter: "auth-service",
-			RetentionClass: fasten.RetentionLong,
+			RetentionClass: fasten.RetLong,
 		},
 	}); err != nil {
 		log.Fatal(err)

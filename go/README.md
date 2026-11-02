@@ -112,10 +112,15 @@ semantics with `*fasten.AuditStoreError`. `fasten.GetQueueStats()` and
 
 ## Tests
 
+The SDK calls fasten-core through cgo, so build it first:
+
 ```bash
-docker run --rm -v $PWD/go:/work -w /work -e CGO_ENABLED=0 \
-  golang:1.26-alpine go test -count=1 ./...
+(cd fasten-core && cargo build --release --locked --features all)
+cd go && CGO_ENABLED=1 LD_LIBRARY_PATH=../fasten-core/target/release \
+  go test -count=1 ./...
 ```
+
+On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`.
 
 ## Docs + design
 
