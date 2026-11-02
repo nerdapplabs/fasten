@@ -168,7 +168,8 @@ class StdoutTransport:
         insert touches SQLite, not stdout, so it cannot reintroduce the
         stdout-backpressure deadlock above. It runs after the stderr write,
         so a hung store cannot hold the line back. ``persist=False`` skips
-        it, for a caller that must not wait on the store.
+        it, for a caller that must not wait on the store; the store then has
+        a hole and is marked degraded, as for a failed persist.
         """
         self._stamp_request_id(row)
         row = self._redact(row)
@@ -177,6 +178,8 @@ class StdoutTransport:
         sys.stderr.flush()
         if persist:
             self._persist(self._syslog_store, row, "syslog")
+        elif self._syslog_store is not None:
+            self._syslog_store.note_write_failure()
 
     def query_syslog(
         self,

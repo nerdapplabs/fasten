@@ -1021,6 +1021,19 @@ def test_row_reported_lost_then_stored_inline_is_reported_recovered(tmp_path, mo
     assert [e["row_ids"] for e in recovered] == [[row.id]]
 
 
+def test_lost_at_stop_left_out_of_the_syslog_store_degrades_it(tmp_path):
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store, syslog_store=StreamStore(":memory:", table="syslog"))
+    try:
+        fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        assert not fasten.transport().stream_degraded("sys")
+        assert not fasten.close(timeout=0.3)
+        assert fasten.transport().stream_degraded("sys")
+    finally:
+        _release_hung_store(store)
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
