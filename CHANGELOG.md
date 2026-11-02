@@ -18,6 +18,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Adopters relying on unsealed rows keeping their `detail` past the PII
   horizon: it is now set to null after an `AUDIT_ROW_REDACTED` record, as for
   form "2" rows.
+- Python's `fasten.chain.redact()` accepts unsealed rows too, matching the
+  stores; it still raises on a sealed form "1" row.
 - Python redaction now writes an empty `detail_salt` instead of SQL NULL, as
   Go does. On a table the Go store created the column is `NOT NULL`, so the
   update failed after the redaction record was written: on Postgres every pass

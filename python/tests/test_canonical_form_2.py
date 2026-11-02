@@ -168,9 +168,18 @@ def test_commitment_still_proves_the_original():
 
 def test_redacting_form_1_row_is_refused():
     """Form-"1" detail is hashed directly; redacting it would cascade."""
-    r = dataclasses.replace(_row(), canonical_form_id="1")
+    r = dataclasses.replace(_row(), canonical_form_id="1", prev_hash="genesis")
+    r = dataclasses.replace(r, hash=_row_hash_form_1(r.to_dict()))
     with pytest.raises(ValueError, match="form"):
         redact(r)
+
+
+def test_redacting_unsealed_row_is_allowed():
+    """No hash covers an unsealed row's detail, matching the stores."""
+    r = dataclasses.replace(_row(), canonical_form_id="1")
+    assert r.hash == ""
+    gone = redact(r)
+    assert gone.detail is None and gone.detail_salt is None
 
 
 def test_redaction_is_idempotent():

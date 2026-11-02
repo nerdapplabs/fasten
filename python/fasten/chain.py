@@ -197,14 +197,16 @@ def redact(row: "AuditRow") -> "AuditRow":
     ``prev_hash``, ``monotonic_seq`` and ``canonical_form_id`` are untouched, so
     verification passes before and after and no other row is affected.
 
-    Raises on a form-"1" row: its ``detail`` is hashed directly, so redacting it
-    would change its hash and force a re-seal of every following row.
+    Unsealed rows (empty ``hash``) are redacted too: no hash covers their
+    detail. Raises on a sealed form-"1" row: its ``detail`` is hashed directly,
+    so redacting it would change its hash and force a re-seal of every
+    following row.
     """
-    if str(row.canonical_form_id) != "2":
+    if str(row.canonical_form_id) != "2" and row.hash:
         raise ValueError(
             f"row {row.id!r} is canonical form {row.canonical_form_id!r}; only "
-            'form "2" rows can be redacted without re-sealing the chain suffix '
-            "(spec §7.1). This row predates committed detail."
+            'form "2" and unsealed rows can be redacted without re-sealing the '
+            "chain suffix (spec §7.1). This row predates committed detail."
         )
     return dataclasses.replace(row, detail=None, detail_salt=None)
 
