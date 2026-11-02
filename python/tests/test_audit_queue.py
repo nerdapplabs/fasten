@@ -1212,18 +1212,31 @@ class Store(SQLiteStore):
 register("t", {{"USER_CREATED": Meta(domain="t", category="auth", action="create",
     severity=Severity.INFO, description="x", emitter="t",
     retention_class=RetentionClass.LONG)}})
-fasten.init(service_id="svc", node_id="node", audit_store=Store({db!r}))
+from fasten.store.stream import StreamStore
+
+class Syslog(StreamStore):
+    hang = False
+
+    def insert(self, row):
+        while self.hang:
+            time.sleep(0.01)
+        return super().insert(row)
+
+syslog = Syslog({db!r} + ".sys", table="syslog")
+fasten.init(service_id="svc", node_id="node", audit_store=Store({db!r}), syslog_store=syslog)
 for i in range(3):
     fasten.emit(code="USER_CREATED", target=f"u-{{i}}")
 time.sleep(0.2)
 print("buffered output")
+syslog.hang = {syslog_hangs}
 {ending}
 """
 
 
-def _run_exit_script(tmp_path, hang, ending):
+def _run_exit_script(tmp_path, hang, ending, syslog_hangs=False):
     import subprocess
-    script = _EXIT_SCRIPT.format(hang=hang, db=str(tmp_path / "a.db"), ending=ending)
+    script = _EXIT_SCRIPT.format(hang=hang, db=str(tmp_path / "a.db"), ending=ending,
+                                 syslog_hangs=syslog_hangs)
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=30, env={**os.environ, "PYTHONPATH": os.getcwd()})
 
@@ -1248,6 +1261,17 @@ def test_exit_is_not_held_by_a_hanging_store(tmp_path, ending, status):
     start = time.monotonic()
     proc = _run_exit_script(tmp_path, 3600, ending)
     assert proc.returncode == status, proc.stderr
+    assert time.monotonic() - start < 15
+    lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
+    assert len(lost) == 3
+    assert _printed(proc) == ["buffered output", "earlier hook ran"]
+
+
+def test_exit_is_not_held_by_a_hanging_syslog_store(tmp_path):
+    # Nothing on the exit path waits on a store without a bound.
+    start = time.monotonic()
+    proc = _run_exit_script(tmp_path, 3600, "sys.exit(3)", syslog_hangs=True)
+    assert proc.returncode == 3, proc.stderr
     assert time.monotonic() - start < 15
     lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
     assert len(lost) == 3
