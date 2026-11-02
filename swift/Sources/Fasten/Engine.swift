@@ -123,8 +123,8 @@ final class Engine: @unchecked Sendable {
     /// Redacts detail on PII rows older than `before` (spec 7). For each row it
     /// first writes an AUDIT_ROW_REDACTED record straight to the store, then
     /// redacts that row, so a failure never leaves destroyed data unrecorded.
-    /// Returns the redacted ids.
-    func redactExpired(before: Date, reason: String) throws -> [String] {
+    /// Returns the redacted ids. `codes` defaults to the registry's PII codes.
+    func redactExpired(before: Date, reason: String, codes: [Code]? = nil) throws -> [String] {
         guard let store = lock.withLock({ self.store }) else {
             throw FastenError("redactExpired needs an audit store")
         }
@@ -138,7 +138,13 @@ final class Engine: @unchecked Sendable {
         guard let meta = CodeRegistry.shared.lookup(Self.redactionCode) else {
             throw FastenError("cannot register \(Self.redactionCode)")
         }
-        let codes = CodeRegistry.shared.piiCodes()
+        let codes = codes ?? CodeRegistry.shared.piiCodes()
+        if codes.isEmpty {
+            log(level: "warn", event: "pii_redaction_no_codes", fields: [
+                "reason": "no PII codes registered in this process and none passed; nothing redacted",
+            ])
+            return []
+        }
         let refused = try store.countRefusedLegacyRows(before: before, codes: codes)
         if refused > 0 {
             log(level: "warn", event: "pii_redaction_skipped_legacy_form", fields: [

@@ -580,6 +580,37 @@ final class RedactionTests: XCTestCase {
         XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
     }
 
+    // A retention job that never calls register() passes the codes itself.
+    func testRedactExpiredWithExplicitCodes() throws {
+        let store = MemoryStore()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN", timestamp: isoString40DaysAgo(),
+                                 detail: ["email": AnyCodable("a@example.com")]))
+        let cutoff = Date().addingTimeInterval(-30 * day)
+        XCTAssertEqual(try Fasten.redactExpired(before: cutoff, codes: ["USER_EMAIL_SEEN"]), ["pii"])
+        XCTAssertTrue(store.isRedacted("pii"))
+    }
+
+    func testRedactExpiredWithNoCodesWarns() throws {
+        let store = MemoryStore()
+        let engine = Engine()
+        engine.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let lines = Lock()
+        var captured: [String] = []
+        engine.transport.write = { line in lines.withLock { captured.append(line) } }
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN", timestamp: isoString40DaysAgo(),
+                                 detail: ["email": AnyCodable("a@example.com")]))
+
+        XCTAssertEqual(try engine.redactExpired(before: Date(), reason: "retention"), [])
+        let warn = lines.withLock { captured }.compactMap { line -> [String: Any]? in
+            let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            return obj?["event"] as? String == "pii_redaction_no_codes" ? obj : nil
+        }
+        XCTAssertEqual(warn.count, 1)
+        XCTAssertEqual(warn.first?["level"] as? String, "warn")
+        XCTAssertFalse(store.isRedacted("pii"))
+    }
+
     func testStoreWithoutRedactionSupportThrows() throws {
         registerCodes()
         try Fasten.configure(serviceID: "svc", nodeID: "node", store: CapturingStore(),
