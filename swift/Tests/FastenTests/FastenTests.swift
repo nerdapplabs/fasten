@@ -195,6 +195,21 @@ final class SQLiteStoreTests: XCTestCase {
         XCTAssertNoThrow(try store.insert(row))  // INSERT OR IGNORE
     }
 
+    func testMigrationErrorOtherThanDuplicateColumnThrows() throws {
+        let path = tempPath()
+        _ = try SQLiteStore(path: path)
+        sqlite3_close(otherConnection(path, "ALTER TABLE audit_log DROP COLUMN detail_commitment"))
+        // Holds the write lock, so adding the missing column fails as busy.
+        let other = otherConnection(path, "BEGIN IMMEDIATE")
+        defer { sqlite3_close(other) }
+        XCTAssertThrowsError(try SQLiteStore(path: path, busyTimeoutMs: 0)) { error in
+            XCTAssertTrue("\(error)".contains("locked"), "\(error)")
+        }
+        sqlite3_exec(other, "ROLLBACK", nil, nil, nil)
+        XCTAssertNoThrow(try SQLiteStore(path: path, busyTimeoutMs: 0))
+        XCTAssertNoThrow(try SQLiteStore(path: path, busyTimeoutMs: 0))
+    }
+
     func testInvalidTableNameThrows() {
         XCTAssertThrowsError(try SQLiteStore(path: ":memory:", table: "bad-name!"))
     }

@@ -114,7 +114,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `pii_in_detail`, `canonical_form_id`, `detail_salt` and `detail_commitment`
   columns, and indexes `(source_node_id, monotonic_seq)` so the seq lookup on
   insert does not scan the table. `pii_in_detail` is set from the code's
-  `Meta`.
+  `Meta`. `init` throws if adding a column fails for any reason other than
+  the column already existing.
 - `Fasten.redactExpired(before:codes:reason:)` sets `detail` to null on rows
   of `codes` older than `before`, after writing an `AUDIT_ROW_REDACTED` row
   for each one (spec §7). `codes` defaults to `Fasten.piiCodes()`, which only

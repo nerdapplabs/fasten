@@ -91,7 +91,9 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             "ALTER TABLE \(table) ADD COLUMN detail_commitment TEXT DEFAULT ''",
         ]
         for m in migrations {
-            try? exec(m)   // ignore if column already exists
+            do {
+                try exec(m)
+            } catch let e as FastenError where e.message.hasPrefix("duplicate column name") {}
         }
     }
 
