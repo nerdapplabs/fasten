@@ -876,11 +876,12 @@ def test_close_does_not_wait_on_a_hung_syslog_store(tmp_path, capsys):
         start = time.monotonic()
         assert not fasten.close(timeout=0.3)
         assert time.monotonic() - start < 1.5
+        # On stderr while the syslog store still hangs.
+        err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+               if line.startswith("{")]
     finally:
         syslog.release.set()
         _release_hung_store(store)
-    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
-           if line.startswith("{")]
     lost = [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"]
     assert sorted(lost) == sorted(r.id for r in rows)
 
@@ -898,13 +899,14 @@ def test_close_does_not_wait_on_a_hung_syslog_store_after_a_fast_failure(tmp_pat
         start = time.monotonic()
         assert not fasten.close(timeout=0.5)
         assert time.monotonic() - start < 1.0
+        # On stderr while the syslog store still hangs.
+        err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+               if line.startswith("{")]
     finally:
         syslog.release.set()
         for t in threading.enumerate():
             if t.name == "fasten-retire":
                 t.join(timeout=5)
-    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
-           if line.startswith("{")]
     lost = [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"]
     assert sorted(lost) == sorted(r.id for r in rows)
 

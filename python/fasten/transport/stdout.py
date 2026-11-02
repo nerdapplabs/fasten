@@ -166,16 +166,17 @@ class StdoutTransport:
         attached, reads are served from the store, so skipping the persist
         would make drainer events vanish from the reader API. The store
         insert touches SQLite, not stdout, so it cannot reintroduce the
-        stdout-backpressure deadlock above. ``persist=False`` skips it, for
-        a caller that must not wait on the store.
+        stdout-backpressure deadlock above. It runs after the stderr write,
+        so a hung store cannot hold the line back. ``persist=False`` skips
+        it, for a caller that must not wait on the store.
         """
         self._stamp_request_id(row)
         row = self._redact(row)
         self._syslog.push(row)
-        if persist:
-            self._persist(self._syslog_store, row, "syslog")
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stderr.flush()
+        if persist:
+            self._persist(self._syslog_store, row, "syslog")
 
     def query_syslog(
         self,
