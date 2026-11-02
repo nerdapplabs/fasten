@@ -2,8 +2,10 @@
 
 Vectors from spec/drainer-conformance.md §7.
 """
+import faulthandler
 import json
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -746,6 +748,10 @@ def test_fork_never_lands_mid_insert(tmp_path):
     # inherited its global mutex or file lock state and never stored a row.
     store = SQLiteStore(str(tmp_path / "a.db"))
     _init(store)
+    # A child still running at the deadline gets SIGABRT, so its stack
+    # shows where it hung.
+    if not faulthandler.is_enabled():
+        faulthandler.enable()
     pids = []
     for rnd in range(3):
         for i in range(300):
@@ -763,20 +769,21 @@ def test_fork_never_lands_mid_insert(tmp_path):
                     os._exit(code)
             pids.append(pid)
     deadline = time.monotonic() + 20
-    failed = 0
+    failed = []
     for pid in pids:
         while True:
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
-                failed += os.waitstatus_to_exitcode(status) != 0
+                if os.waitstatus_to_exitcode(status) != 0:
+                    failed.append(f"exit {os.waitstatus_to_exitcode(status)}")
                 break
             if time.monotonic() > deadline:
-                os.kill(pid, 9)
+                os.kill(pid, signal.SIGABRT)
                 os.waitpid(pid, 0)
-                failed += 1
+                failed.append("hung")
                 break
             time.sleep(0.02)
-    assert failed == 0, f"{failed} of {len(pids)} forked children did not store"
+    assert not failed, f"{len(failed)} of {len(pids)} forked children did not store: {failed}"
     assert fasten.flush(timeout=10.0)
     targets = {r.target for r in store.query(limit=10000)}
     assert all(f"child-{r}-{k}" in targets for r in range(3) for k in range(8))
