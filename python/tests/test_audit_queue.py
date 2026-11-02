@@ -1053,6 +1053,36 @@ def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     assert "audit_drain_fork_during_insert" in _sys_events()
 
 
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_does_not_wait_on_a_hung_syslog_store(tmp_path):
+    # The audit and sys streams share a database that stops answering: fork
+    # gives up on the insert lock, and reporting that must not wait on the
+    # syslog store, nor leave a hole in it.
+    store = HangingStore(str(tmp_path / "a.db"))
+    syslog = BlockingSyslogStore()
+    _init(store, syslog_store=syslog)
+    try:
+        fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        syslog.armed.set()
+        start = time.monotonic()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+            pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        assert time.monotonic() - start < 3
+        assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+    finally:
+        syslog.release.set()
+        _release_hung_store(store)
+    deadline = time.monotonic() + 5
+    while "audit_drain_fork_during_insert" not in _sys_events() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "audit_drain_fork_during_insert" in _sys_events()
+    assert not fasten.transport().stream_degraded("sys")
+
 def test_forks_from_two_threads_do_not_leak_the_insert_lock(tmp_path):
     # One thread holds the lock across its fork while another gives up
     # waiting for it.

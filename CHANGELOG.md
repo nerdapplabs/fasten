@@ -47,8 +47,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   drainer. `fork()` waits up to 1 s for an in-flight store insert, so a
   child no longer stops storing after inheriting SQLite mid-insert, and an
   insert stuck on a database lock does not hold up `fork()`; the parent then
-  emits `audit_drain_fork_during_insert`. A failed reinstall in the child
-  emits `audit_drain_reinstall_failed`.
+  emits `audit_drain_fork_during_insert`, stored from another thread so a
+  stalled syslog store does not hold up `fork()` either. A failed reinstall
+  in the child emits `audit_drain_reinstall_failed`.
 - `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
   of `timeout`, then stops the drainer and stores the rows it still holds.
   It returns within about `timeout`: no store call starts after that, one

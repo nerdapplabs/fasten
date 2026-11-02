@@ -1125,10 +1125,12 @@ class Engine:
                     self._drainer_idle.notify_all()
 
     def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any],
-                         via: Optional[_QueueDrainer] = None, persist: bool = True) -> None:
+                         via: Optional[_QueueDrainer] = None, persist: bool = True,
+                         background: bool = False) -> None:
         """Route drainer events to stderr (not stdout) to avoid backpressure
         deadlock. ``via`` sends a drainer's own events to its transport.
-        ``persist=False`` skips the syslog store."""
+        ``persist=False`` skips the syslog store; ``background=True`` writes
+        to it from another thread."""
         stdout, service_id = (via.stdout, via.service_id) if via else (self._stdout, self._service_id)
         if stdout is None:
             return
@@ -1140,7 +1142,7 @@ class Engine:
             "timestamp": canonical_now(),
             **fields,
         }
-        stdout.write_drainer_syslog(payload, persist=persist)
+        stdout.write_drainer_syslog(payload, persist=persist, background=background)
 
     def _install_drainer(
         self,
@@ -1288,7 +1290,10 @@ class Engine:
         for lock in held:
             lock.release()
         if gave_up:
-            self._drainer_sys_log("warn", "audit_drain_fork_during_insert", {"waited_seconds": 1.0})
+            # The syslog store may be stalled with the audit store, and
+            # fork() returns only after this hook.
+            self._drainer_sys_log("warn", "audit_drain_fork_during_insert", {"waited_seconds": 1.0},
+                                  background=True)
 
     def _reinstall_after_fork(self) -> None:
         """A forked child (gunicorn --preload, Celery prefork) inherits the

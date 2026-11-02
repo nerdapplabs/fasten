@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from typing import Any
 
 from ..context import is_sentinel, mint_sentinel
@@ -148,7 +149,8 @@ class StdoutTransport:
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
 
-    def write_drainer_syslog(self, row: dict[str, Any], persist: bool = True) -> None:
+    def write_drainer_syslog(self, row: dict[str, Any], persist: bool = True,
+                             background: bool = False) -> None:
         """Drainer self-report path. Buffers + writes to STDERR, never stdout.
 
         The audit queue drainer cannot share the stdout fd with emit() and
@@ -170,13 +172,18 @@ class StdoutTransport:
         so a hung store cannot hold the line back. ``persist=False`` skips
         it, for a caller that must not wait on the store; the store then has
         a hole and is marked degraded, as for a failed persist.
+        ``background=True`` stores the row from a new thread instead, for a
+        caller that must not wait but whose row should still be stored.
         """
         self._stamp_request_id(row)
         row = self._redact(row)
         self._syslog.push(row)
         sys.stderr.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
         sys.stderr.flush()
-        if persist:
+        if persist and background and self._syslog_store is not None:
+            threading.Thread(target=self._persist, args=(self._syslog_store, row, "syslog"),
+                             name="fasten-sys-persist", daemon=True).start()
+        elif persist:
             self._persist(self._syslog_store, row, "syslog")
         elif self._syslog_store is not None:
             self._syslog_store.note_write_failure()
