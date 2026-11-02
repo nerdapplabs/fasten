@@ -20,7 +20,10 @@ public struct RedactionCandidate: Sendable, Equatable {
 public protocol AuditStore: Sendable {
     func insert(_ row: AuditRow) throws
     func ping() throws
-    func maxMonotonicSeq() -> Int
+
+    /// Highest `monotonic_seq` stored for `sourceNodeID`, or across every
+    /// node when it is nil; 0 when there is none. Each node has its own seq.
+    func maxMonotonicSeq(sourceNodeID: String?) -> Int
 
     /// Rows of `codes` older than `before` whose detail can be redacted
     /// without breaking a chain: unsealed rows, or form "2" rows.
@@ -49,6 +52,11 @@ extension AuditStore {
 }
 
 /// In-memory store — tests + stdout-only deployments.
+public extension AuditStore {
+    /// The highest `monotonic_seq` across every node.
+    func maxMonotonicSeq() -> Int { maxMonotonicSeq(sourceNodeID: nil) }
+}
+
 public final class MemoryStore: AuditStore, @unchecked Sendable {
     private var rows: [AuditRow] = []
     private var redacted: Set<String> = []
@@ -70,8 +78,11 @@ public final class MemoryStore: AuditStore, @unchecked Sendable {
 
     public func ping() throws {}
 
-    public func maxMonotonicSeq() -> Int {
-        lock.withLock { rows.map(\.monotonicSeq).max() ?? 0 }
+    public func maxMonotonicSeq(sourceNodeID: String?) -> Int {
+        lock.withLock {
+            rows.filter { sourceNodeID == nil || $0.sourceNodeID == sourceNodeID }
+                .map(\.monotonicSeq).max() ?? 0
+        }
     }
 
     public func listRedactionCandidates(before: Date, codes: [Code]) throws -> [RedactionCandidate] {

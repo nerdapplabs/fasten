@@ -300,12 +300,16 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         }
     }
 
-    public func maxMonotonicSeq() -> Int {
+    public func maxMonotonicSeq(sourceNodeID: String?) -> Int {
         lock.withLock {
             var stmt: OpaquePointer?
-            let sql = "SELECT COALESCE(MAX(monotonic_seq),0) FROM \(table)"
+            var sql = "SELECT COALESCE(MAX(monotonic_seq),0) FROM \(table)"
+            if sourceNodeID != nil { sql += " WHERE source_node_id = ?" }
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
             defer { sqlite3_finalize(stmt) }
+            if let node = sourceNodeID {
+                sqlite3_bind_text(stmt, 1, node, -1, SQLITE_TRANSIENT)
+            }
             guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
             return Int(sqlite3_column_int64(stmt, 0))
         }

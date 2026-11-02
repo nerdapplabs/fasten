@@ -130,6 +130,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `maxMonotonicSeq` take the store lock, so calling them while the drainer
   inserts no longer crashes. The connection is opened with
   `SQLITE_OPEN_NOMUTEX`, so that lock is what serializes it on every platform.
+- `AuditStore.maxMonotonicSeq(sourceNodeID:)` returns one node's highest seq,
+  or the table's with nil; `maxMonotonicSeq()` is the table-wide shorthand.
+  A custom `AuditStore` implements the new requirement.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

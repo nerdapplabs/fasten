@@ -167,6 +167,19 @@ final class SQLiteStoreTests: XCTestCase {
         XCTAssertEqual(store.maxMonotonicSeq(), 1)
     }
 
+    func testMaxMonotonicSeqIsPerNode() throws {
+        let stores: [AuditStore] = [try SQLiteStore(path: ":memory:"), MemoryStore()]
+        for store in stores {
+            try store.insert(testRow("evt-a1", node: "node-a"))
+            try store.insert(testRow("evt-a2", node: "node-a"))
+            try store.insert(testRow("evt-b1", node: "node-b"))
+            XCTAssertEqual(store.maxMonotonicSeq(sourceNodeID: "node-a"), 2, "\(type(of: store))")
+            XCTAssertEqual(store.maxMonotonicSeq(sourceNodeID: "node-b"), 1, "\(type(of: store))")
+            XCTAssertEqual(store.maxMonotonicSeq(sourceNodeID: "node-c"), 0, "\(type(of: store))")
+            XCTAssertEqual(store.maxMonotonicSeq(), 2, "\(type(of: store))")
+        }
+    }
+
     func testInsertIdempotent() throws {
         let store = try SQLiteStore(path: ":memory:")
         let row = AuditRow(wireVersion: "1", id: "evt-idem-001",
@@ -304,10 +317,10 @@ private func tempDBPath(_ test: XCTestCase) -> String {
 
 private func testRow(_ id: String, seq: Int = 0, code: String = "TEST",
                      timestamp: String = isoNow(), detail: [String: AnyCodable] = [:],
-                     hash: String = "") -> AuditRow {
+                     hash: String = "", node: String = "node") -> AuditRow {
     AuditRow(wireVersion: "1", id: id, originID: id, monotonicSeq: seq,
              timestamp: timestamp, code: code, action: "test", severity: "info",
-             serviceID: "svc", sourceNodeID: "node", tenantID: nil, actor: "svc",
+             serviceID: "svc", sourceNodeID: node, tenantID: nil, actor: "svc",
              actorKind: "service", target: "res", category: "test", domain: "test",
              method: "sdk", requestID: "req-001", detail: detail, shippedAt: nil,
              prevHash: hash.isEmpty ? "" : "genesis", hash: hash)
@@ -335,7 +348,7 @@ private final class CapturingStore: AuditStore, @unchecked Sendable {
     private var captured: [AuditRow] = []
     func insert(_ row: AuditRow) throws { lock.withLock { captured.append(row) } }
     func ping() throws {}
-    func maxMonotonicSeq() -> Int { 0 }
+    func maxMonotonicSeq(sourceNodeID: String?) -> Int { 0 }
     var rows: [AuditRow] { lock.withLock { captured } }
 }
 
