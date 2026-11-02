@@ -931,6 +931,21 @@ def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     # The parent did not release the lock the stuck insert held.
     assert _default._insert_lock.acquire(timeout=5)
     _default._insert_lock.release()
+    assert "audit_drain_fork_during_insert" in _sys_events()
+
+
+def test_forks_from_two_threads_do_not_leak_the_insert_lock(tmp_path):
+    # One thread holds the lock across its fork while another gives up
+    # waiting for it.
+    _init(FlakyStore(str(tmp_path / "a.db")))
+    _default._insert_lock_before_fork()
+    other = threading.Thread(target=lambda: (_default._insert_lock_before_fork(),
+                                             _default._insert_lock_after_fork()))
+    other.start()
+    other.join(timeout=5)
+    _default._insert_lock_after_fork()
+    assert _default._insert_lock.acquire(timeout=1)
+    _default._insert_lock.release()
 
 
 class SlowRetireStore(FlakyStore):

@@ -290,7 +290,8 @@ class Engine:
         # Held around the drainer's store call and across fork(), so a child
         # never inherits a store (or SQLite's global mutex) mid-insert.
         self._insert_lock = threading.Lock()
-        self._fork_lock: Optional[threading.Lock] = None   # the one held across fork()
+        # The lock each forking thread holds across fork(), None if it gave up.
+        self._fork_locks: dict[int, Optional[threading.Lock]] = {}
         self._closed = False    # close() has run and init has not since
         self._atexit_registered = False
         self._retiring: list[_QueueDrainer] = []
@@ -1211,14 +1212,16 @@ class Engine:
 
     def _insert_lock_before_fork(self) -> None:
         # An insert stuck on a database lock must not hold up fork(); the
-        # child replaces the lock either way.
+        # child replaces the lock either way, and the parent reports it.
         lock = self._insert_lock
-        self._fork_lock = lock if lock.acquire(timeout=1.0) else None
+        self._fork_locks[threading.get_ident()] = lock if lock.acquire(timeout=1.0) else None
 
     def _insert_lock_after_fork(self) -> None:
-        lock, self._fork_lock = self._fork_lock, None
+        lock = self._fork_locks.pop(threading.get_ident(), None)
         if lock is not None:
             lock.release()
+        else:
+            self._drainer_sys_log("warn", "audit_drain_fork_during_insert", {"waited_seconds": 1.0})
 
     def _reinstall_after_fork(self) -> None:
         """A forked child (gunicorn --preload, Celery prefork) inherits the
@@ -1229,6 +1232,7 @@ class Engine:
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
         self._insert_lock = threading.Lock()
+        self._fork_locks = {}
         self._retiring = []     # their threads are the parent's
         old, self._drainer = self._drainer, None
         if old is not None:
