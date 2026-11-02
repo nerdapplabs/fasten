@@ -1043,6 +1043,38 @@ def test_row_reported_lost_then_stored_inline_is_reported_recovered(tmp_path, mo
     assert [e["row_ids"] for e in recovered] == [[row.id]]
 
 
+def test_close_returns_false_when_a_racing_emit_fails_inline(tmp_path, monkeypatch):
+    # The drainer refuses the row because close is stopping it, and the
+    # inline store fails too.
+    from fasten import core_ffi
+    store = FlakyStore(str(tmp_path / "a.db"))
+    good = store.allocate_and_insert_originated
+
+    def insert(row):
+        if row.target == "racing":
+            raise OSError("store down")
+        return good(row)
+    store.allocate_and_insert_originated = insert
+    _init(store)
+    closed = _signal_drainer_close(monkeypatch)
+
+    def refused(handle, row_json):
+        assert closed.wait(5)
+        raise core_ffi.EnqueueError(core_ffi.ERR_DRAINER_STOPPED, "drainer stopped")
+
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", refused)
+    emitter = threading.Thread(target=fasten.emit,
+                               kwargs={"code": "USER_CREATED", "target": "racing"})
+    emitter.start()
+    deadline = time.monotonic() + 5
+    while _default._drainer.users == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not fasten.close(timeout=2.0)
+    emitter.join(timeout=5)
+    assert _rows(store) == []
+    assert _default.audit_write_swallowed()
+
+
 def test_lost_at_stop_left_out_of_the_syslog_store_degrades_it(tmp_path):
     store = HangingStore(str(tmp_path / "a.db"))
     _init(store, syslog_store=StreamStore(":memory:", table="syslog"))

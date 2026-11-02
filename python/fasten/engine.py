@@ -734,7 +734,9 @@ class Engine:
                 # before the row is persisted, so it takes the synchronous path.
                 queued = refused = False
                 store, gen = self._audit_store, self._store_gen
-                if not _durable:
+                if _durable:
+                    row = self._store_inline(row, store, gen, durable=True)
+                else:
                     with self._using_drainer() as d:
                         if d is None and self._closed:
                             pass    # after close, rows are stored inline
@@ -762,30 +764,10 @@ class Engine:
                                     self._drainer_sys_log("error", "audit_drain_abandoned", {
                                         "reason": "enqueue_refused", "row_id": row.id,
                                     })
-                if not queued:
-                    try:
-                        row = self._allocate_and_store(row, store, self._stdout)
-                    except Exception as e:  # noqa: BLE001
-                        if _durable:
-                            # Not hot-path telemetry. The caller is relying on
-                            # this row existing before it does something
-                            # irreversible, so the failure has to reach it.
-                            raise
-                        # Swallowed on the hot path → durable history now has a
-                        # hole; degrade the audit completeness flag.
-                        self._mark_write_lost(store, gen)
-                        self._drainer_sys_log("error", "audit_sync_fallback_failed", {
-                            # Type-only — see retention_purge_failed comment.
-                            "error_type": type(e).__name__,
-                            "row_id": row.id,
-                        })
-                    else:
-                        if refused:  # follows the abandoned event
-                            self._drainer_sys_log("info", "audit_drain_stored_inline", {"row_id": row.id})
-                            # close gave up meanwhile and reported it lost
-                            if d is not None and row.id in d.reported:
-                                self._drainer_sys_log("info", "audit_drain_recovered_at_stop",
-                                                      {"row_ids": [row.id]}, via=d)
+                        if not queued:
+                            # Still using d, so retire waits for this and
+                            # close counts the row if it is lost.
+                            row = self._store_inline(row, store, gen, refused=refused, d=d)
             else:
                 try:
                     row = self._allocate_and_store(row, self._audit_store, self._stdout)
@@ -1019,6 +1001,38 @@ class Engine:
             )
             redacted.extend(store.redact_rows(ids=[row_id]))
         return redacted
+
+    def _store_inline(self, row: AuditRow, store: Any, gen: int, *, durable: bool = False,
+                      refused: bool = False, d: Optional[_QueueDrainer] = None) -> AuditRow:
+        """Store a queue-mode row synchronously; ``refused`` if drainer ``d``
+        (or a missing one) would not take it."""
+        try:
+            row = self._allocate_and_store(row, store, self._stdout)
+        except Exception as e:  # noqa: BLE001
+            if durable:
+                # Not hot-path telemetry. The caller is relying on
+                # this row existing before it does something
+                # irreversible, so the failure has to reach it.
+                raise
+            if refused and d is not None:
+                with d.lock:
+                    d.lost += 1
+            # Swallowed on the hot path → durable history now has a
+            # hole; degrade the audit completeness flag.
+            self._mark_write_lost(store, gen)
+            self._drainer_sys_log("error", "audit_sync_fallback_failed", {
+                # Type-only — see retention_purge_failed comment.
+                "error_type": type(e).__name__,
+                "row_id": row.id,
+            })
+            return row
+        if refused:  # follows the abandoned event
+            self._drainer_sys_log("info", "audit_drain_stored_inline", {"row_id": row.id})
+            # close gave up meanwhile and reported it lost
+            if d is not None and row.id in d.reported:
+                self._drainer_sys_log("info", "audit_drain_recovered_at_stop",
+                                      {"row_ids": [row.id]}, via=d)
+        return row
 
     def _allocate_and_store(self, row: AuditRow, store: Any, stdout: Any) -> AuditRow:
         """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
