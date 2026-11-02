@@ -113,6 +113,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   takes the same advisory lock as Python, so stores starting together no
   longer fail on concurrent `CREATE TABLE`. Bootstrap adds a non-unique
   `(source_node_id, monotonic_seq)` index so the next-seq lookup stays cheap.
+- Index names for tables whose `idx_{table}_{suffix}` would pass 63 bytes
+  (table names of about 50 characters or more) now cut the table part and add
+  a hash of the full name. Postgres truncated the old names to one, so only
+  the first index was made and the seq index was missing. Shorter names keep
+  their index names.
 - PII retention: set `Config::retention_pii` (or `FASTEN_RETENTION_PII`), e.g.
   `"30d"`. A background thread redacts expired rows whose code is in
   `pii_codes()` (`pii_in_detail` or retention class Short): `detail` becomes

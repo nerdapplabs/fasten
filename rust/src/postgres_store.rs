@@ -59,6 +59,24 @@ fn ensure_schema(client: &mut pg::Client, schema: &str) -> Result<(), crate::Err
     Ok(())
 }
 
+/// `idx_{bare}_{suffix}`, unless that passes Postgres's 63-byte identifier
+/// limit, where long names truncate to one name and only the first index
+/// gets made. Then the table part is cut and a hash of the full name added.
+fn index_name(bare: &str, suffix: &str) -> String {
+    const MAX: usize = 63;
+    let name = format!("idx_{bare}_{suffix}");
+    if name.len() <= MAX {
+        return name;
+    }
+    // FNV-1a over the folded name: unquoted `Foo` and `foo` are one table.
+    let mut h: u32 = 0x811c_9dc5;
+    for b in bare.to_ascii_lowercase().bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    let keep = MAX - "idx___".len() - 8 - suffix.len();
+    format!("idx_{}_{h:08x}_{suffix}", &bare[..keep])
+}
+
 // Column order follows the Python store, which reads rows by position.
 // pii_in_detail and wire_version, which Python lacks, go last.
 fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), crate::Error> {
@@ -109,14 +127,16 @@ fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), 
         client.execute(sql.as_str(), &[]).map_err(pg_err)?;
     }
 
-    for sql in &[
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_req  ON {table} (request_id)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_code ON {table} (code)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_ts   ON {table} (timestamp)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_svc  ON {table} (service_id)"),
+    for (suffix, cols) in [
+        ("req", "request_id"),
+        ("code", "code"),
+        ("ts", "timestamp"),
+        ("svc", "service_id"),
         // Not unique: older Rust tables repeat seqs per node.
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_node_seq ON {table} (source_node_id, monotonic_seq)"),
+        ("node_seq", "source_node_id, monotonic_seq"),
     ] {
+        let name = index_name(bare, suffix);
+        let sql = format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})");
         client.execute(sql.as_str(), &[]).map_err(pg_err)?;
     }
     Ok(())
@@ -746,6 +766,43 @@ mod tests {
         let def: &str = r.get(0);
         assert!(def.contains("(source_node_id, monotonic_seq)"), "{def}");
         assert!(!def.contains("UNIQUE"), "{def}");
+    }
+
+    #[test]
+    fn test_index_name_fits_identifier_limit() {
+        assert_eq!(index_name("audit_logs", "node_seq"), "idx_audit_logs_node_seq");
+        let long = "a".repeat(63);
+        let names: std::collections::HashSet<String> = ["req", "code", "ts", "svc", "node_seq"]
+            .iter()
+            .map(|s| index_name(&long, s))
+            .collect();
+        assert_eq!(names.len(), 5);
+        for n in &names {
+            assert!(n.len() <= 63, "{n}");
+        }
+        let other = format!("{}b", "a".repeat(62));
+        assert_ne!(index_name(&long, "node_seq"), index_name(&other, "node_seq"));
+    }
+
+    #[test]
+    fn test_node_seq_index_created_for_long_table_name() {
+        let Some(dsn) = dsn() else { return };
+        let table = format!("fasten_pg_long_{}", "x".repeat(45));
+        assert_eq!(table.len(), 60);
+        let _store = fresh_store(&dsn, &table);
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let defs: Vec<String> = c
+            .query("SELECT indexdef FROM pg_indexes WHERE tablename = $1", &[&table])
+            .expect("indexes")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert!(
+            defs.iter().any(|d| d.contains("(source_node_id, monotonic_seq)")),
+            "{defs:?}"
+        );
+        // Five indexes plus the primary key.
+        assert_eq!(defs.len(), 6, "{defs:?}");
     }
 
     // ── PII redaction (spec §7) ───────────────────────────────────────────
