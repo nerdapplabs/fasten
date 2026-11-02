@@ -367,6 +367,35 @@ private final class CapturingStore: AuditStore, @unchecked Sendable {
     var rows: [AuditRow] { lock.withLock { captured } }
 }
 
+// A MemoryStore that refuses to write the AUDIT_ROW_REDACTED record.
+private final class RecordFailingStore: AuditStore, @unchecked Sendable {
+    let inner = MemoryStore()
+    func insert(_ row: AuditRow) throws {
+        if row.code == Engine.redactionCode { throw FastenError("record write failed") }
+        try inner.insert(row)
+    }
+    func ping() throws {}
+    func maxMonotonicSeq(sourceNodeID: String?) -> Int { inner.maxMonotonicSeq(sourceNodeID: sourceNodeID) }
+    func listRedactionCandidates(before: Date, codes: [Code]) throws -> [RedactionCandidate] {
+        try inner.listRedactionCandidates(before: before, codes: codes)
+    }
+    func redactRows(ids: [String]) throws -> [String] { try inner.redactRows(ids: ids) }
+    func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int {
+        try inner.countRefusedLegacyRows(before: before, codes: codes)
+    }
+}
+
+private func captureLogs(_ engine: Engine) -> () -> [[String: Any]] {
+    let lock = Lock()
+    var lines: [String] = []
+    engine.transport.write = { line in lock.withLock { lines.append(line) } }
+    return {
+        lock.withLock { lines }.compactMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+        }
+    }
+}
+
 private let userCreated: [Code: Meta] = [
     "USER_CREATED": Meta(id: "USER_CREATED", domain: "user", category: "account",
                          action: "create", description: "Test", emitter: "test"),
@@ -384,6 +413,21 @@ final class ChainTests: XCTestCase {
         XCTAssertEqual(store.rows.map(\.monotonicSeq), [0, 0])
         XCTAssertEqual(store.rows.map(\.hash), ["", ""])
         XCTAssertEqual(store.rows.map(\.prevHash), ["", ""])
+    }
+
+    func testSeqIsAllocatedPerNodeWhenNodesInterleave() throws {
+        let path = tempDBPath(self)
+        let sqlite = try SQLiteStore(path: path)
+        let mem = MemoryStore()
+        for store in [sqlite, mem] as [AuditStore] {
+            try store.insert(testRow("a", node: "n1"))
+            try store.insert(testRow("b", node: "n2"))
+            try store.insert(testRow("c", node: "n1"))
+            try store.insert(testRow("d", node: "n2"))
+        }
+        XCTAssertEqual(query(path, "SELECT id, monotonic_seq FROM audit_log ORDER BY id"),
+                       [["a", "1"], ["b", "1"], ["c", "2"], ["d", "2"]])
+        XCTAssertEqual(mem.all().map(\.monotonicSeq), [1, 1, 2, 2])
     }
 
     func testMemoryStoreAssignsSeqPerNode() throws {
@@ -534,7 +578,10 @@ final class RedactionTests: XCTestCase {
         let records = query(path, "SELECT target, detail FROM audit_log WHERE code = 'AUDIT_ROW_REDACTED'")
         XCTAssertEqual(records.count, 1)
         XCTAssertEqual(records.first?[0], "pii")
-        XCTAssertTrue(records.first?[1].contains(#""redacted_seq":1"#) ?? false, "\(records)")
+        let record = try JSONSerialization.jsonObject(
+            with: Data((records.first?[1] ?? "").utf8)) as? [String: Any]
+        XCTAssertEqual(record?["redacted_seq"] as? Int, 1, "\(records)")
+        XCTAssertEqual(record?["redacted_id"] as? String, "pii")
 
         XCTAssertEqual(try Fasten.redactExpired(before: cutoff), [])
         XCTAssertEqual(query(path, "SELECT COUNT(*) FROM audit_log"), [["5"]])
@@ -565,6 +612,56 @@ final class RedactionTests: XCTestCase {
         XCTAssertEqual(warn.count, 1)
         XCTAssertEqual(warn.first?["level"] as? String, "warn")
         XCTAssertEqual(warn.first?["rows"] as? Int, 1)
+    }
+
+    func testRedactRowsLeavesASealedFormOneRowIntact() throws {
+        let path = tempDBPath(self)
+        let sqlite = try SQLiteStore(path: path)
+        let mem = MemoryStore()
+        let email: [String: AnyCodable] = ["email": AnyCodable("a@example.com")]
+        for store in [sqlite, mem] as [AuditStore] {
+            try store.insert(testRow("sealed", seq: 1, code: "USER_EMAIL_SEEN",
+                                     timestamp: isoString40DaysAgo(), detail: email, hash: "abc"))
+            _ = try store.redactRows(ids: ["sealed"])
+        }
+        XCTAssertEqual(query(path, "SELECT detail FROM audit_log WHERE id = 'sealed'"),
+                       [[#"{"email":"a@example.com"}"#]])
+        XCTAssertEqual(mem.all().first?.detail["email"]?.value as? String, "a@example.com")
+        XCTAssertFalse(mem.isRedacted("sealed"))
+    }
+
+    // Under form "2" the hash covers detail_commitment, not detail.
+    func testSealedFormTwoRowIsRedactedAndNotRefused() throws {
+        registerCodes()
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path)
+        let engine = Engine()
+        engine.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let logs = captureLogs(engine)
+        try store.insert(testRow("f2", seq: 1, code: "USER_EMAIL_SEEN", timestamp: isoString40DaysAgo(),
+                                 detail: ["email": AnyCodable("a@example.com")], hash: "abc"))
+        _ = query(path, "UPDATE audit_log SET canonical_form_id = '2' WHERE id = 'f2'")
+        XCTAssertEqual(query(path, "SELECT canonical_form_id FROM audit_log WHERE id = 'f2'"), [["2"]])
+
+        XCTAssertEqual(try engine.redactExpired(before: Date().addingTimeInterval(-30 * day),
+                                                reason: "retention"), ["f2"])
+        XCTAssertEqual(query(path, "SELECT detail, hash FROM audit_log WHERE id = 'f2'"),
+                       [["null", "abc"]])
+        XCTAssertTrue(logs().filter { $0["event"] as? String == "pii_redaction_skipped_legacy_form" }
+            .isEmpty)
+    }
+
+    // The record is written before the detail is destroyed (spec 7.2).
+    func testFailedRecordWriteDestroysNothing() throws {
+        registerCodes()
+        let store = RecordFailingStore()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let email: [String: AnyCodable] = ["email": AnyCodable("a@example.com")]
+        try store.insert(testRow("pii", code: "USER_EMAIL_SEEN", timestamp: isoString40DaysAgo(),
+                                 detail: email))
+        XCTAssertThrowsError(try Fasten.redactExpired(before: Date().addingTimeInterval(-30 * day)))
+        XCTAssertFalse(store.inner.isRedacted("pii"))
+        XCTAssertEqual(store.inner.all().first?.detail["email"]?.value as? String, "a@example.com")
     }
 
     func testClearLegacySwiftHashesMakesRowsRedactable() throws {
