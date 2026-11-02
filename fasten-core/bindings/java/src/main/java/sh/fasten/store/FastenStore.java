@@ -32,7 +32,7 @@ public final class FastenStore implements AutoCloseable {
         this.handle = handle;
     }
 
-    // ── Factory ───────────────────────────────────────────────────────────────
+    // Factory
 
     /**
      * Open an audit store.
@@ -51,12 +51,12 @@ public final class FastenStore implements AutoCloseable {
         return new FastenStore(h);
     }
 
-    /** Convenience overload — uses {@code "audit_log"} as the table name. */
+    /** Uses {@code "audit_log"} as the table name. */
     public static FastenStore open(String backend, String connstr) {
         return open(backend, connstr, "audit_log");
     }
 
-    // ── Write path ────────────────────────────────────────────────────────────
+    // Write path
 
     /**
      * Insert one audit row.  Accepts any {@link Map} or POJO that Jackson
@@ -87,7 +87,7 @@ public final class FastenStore implements AutoCloseable {
         }
     }
 
-    // ── Health ────────────────────────────────────────────────────────────────
+    // Health
 
     /**
      * Verify the backend is reachable (runs {@code SELECT 1}).
@@ -102,7 +102,7 @@ public final class FastenStore implements AutoCloseable {
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // Lifecycle
 
     /** Release all resources.  Safe to call multiple times. */
     @Override
@@ -113,14 +113,14 @@ public final class FastenStore implements AutoCloseable {
         }
     }
 
-    // ── Metadata ──────────────────────────────────────────────────────────────
+    // Metadata
 
     /** Return the library version string, e.g. {@code "0.1.0"}. */
     public static String version() {
         return LIB.fasten_store_version();
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────────
+    // Internal
 
     private static String takeError(PointerByReference errRef) {
         Pointer p = errRef.getValue();

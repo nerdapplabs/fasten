@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Sentinel request_id invariant — every stream row always carries a
+// Sentinel request_id invariant: every stream row always carries a
 // request_id, so /correlate is a contract. Context-less rows get the shared
 // boot id during startup, a unique orphan id afterwards.
 
@@ -72,8 +72,7 @@ func TestSentinel_ExplicitRequestIDUntouched(t *testing.T) {
 	}
 }
 
-// Conformance: the contract under which /correlate and completeness are
-// designed — no stream row ever lacks a request_id, across a mixed workload.
+// No stream row ever lacks a request_id, across a mixed workload.
 func TestSentinel_NoStreamRowLacksRequestID(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {

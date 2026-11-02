@@ -1,4 +1,4 @@
-//! `fasten-core` — shared audit-store library with a stable C ABI.
+//! `fasten-core`: shared audit-store library with a stable C ABI.
 //!
 //! # Architecture
 //!
@@ -36,20 +36,19 @@
 //!
 //! # Feature flags
 //!
-//! | Feature    | Enabled by default | Adds                        |
-//! |------------|--------------------|-----------------------------|
-//! | `sqlite`   | yes                | `SqliteStore`, bundled SQLite|
-//! | `postgres` | no                 | `PostgresStore`             |
-//! | `all`      | no                 | both backends               |
+//! | Feature        | Enabled by default | Adds                             |
+//! |----------------|--------------------|----------------------------------|
+//! | `sqlite`       | yes                | `SqliteStore`, bundled SQLite    |
+//! | `postgres`     | yes                | `PostgresStore`                  |
+//! | `postgres-tls` | yes                | TLS for `PostgresStore` (`sslmode`) |
+//! | `all`          | no                 | all of the above                 |
 
-// Pedantic lints — keep the library clean, but allow a few known patterns.
 #![warn(
     clippy::all,
     clippy::pedantic,
     clippy::unwrap_used,
     clippy::expect_used
 )]
-// Deliberate exceptions:
 #![allow(
     clippy::module_name_repetitions, // e.g. SqliteStore in store::sqlite
     clippy::missing_errors_doc,      // internal types; C header is the contract
