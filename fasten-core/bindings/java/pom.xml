@@ -11,7 +11,7 @@
     <packaging>jar</packaging>
 
     <name>fasten-store-core</name>
-    <description>Java binding for libfasten_store_core — SQLite + PostgreSQL audit store via C ABI</description>
+    <description>Java binding for libfasten_store_core: SQLite and PostgreSQL audit store via C ABI</description>
     <url>https://fasten.sh</url>
 
     <licenses>
@@ -29,7 +29,7 @@
 
     <dependencies>
         <!--
-            JNA 5.14.0  —  Apache-2.0
+            JNA 5.14.0, Apache-2.0
             Maps Java interface methods directly to C symbols; no JNI stubs,
             no javah, no native compilation step required.
         -->
@@ -40,7 +40,7 @@
         </dependency>
 
         <!--
-            Jackson  —  Apache-2.0
+            Jackson, Apache-2.0
             Serialises Row objects / Maps to JSON for the FFI boundary.
             Version pinned to match the main fasten Java SDK.
         -->
@@ -50,7 +50,7 @@
             <version>2.17.1</version>
         </dependency>
 
-        <!-- Test framework — same as the main Java SDK -->
+        <!-- Test framework, same as the main Java SDK -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

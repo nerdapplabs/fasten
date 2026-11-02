@@ -8,10 +8,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// FR3 — constrained free-text search over persisted sys history. sys-only,
-// opt-in (SearchEnabled), since= mandatory, hard-capped, no ranking. A match
-// carries request_id so a consumer can hand it to /correlate. Parity with the
-// Python test_search.py contract.
+// Free-text search over persisted sys history: sys-only, opt-in
+// (SearchEnabled), since= required, hard-capped, no ranking. A match carries
+// request_id so a consumer can hand it to /correlate.
 
 const searchSince = "2026-01-01T00:00:00Z"
 
@@ -91,12 +90,11 @@ func TestSearch_SinceMandatory(t *testing.T) {
 }
 
 func TestSearch_RequiresPersistence(t *testing.T) {
-	initSearch(t, true, false) // ring-only sys — no durable history
+	initSearch(t, true, false) // ring-only sys, no durable history
 	seedSearch()
 	body, _ := getJSON(t, NewReader(), "/search?q=reset&since="+searchSince)
-	// Per-stream error since #16 restoration — a global "error" key is only
-	// for policy failures (search-disabled, since-missing); ring-only stream
-	// reports errors.sys.
+	// The top-level "error" key is only for policy failures (search disabled,
+	// since missing); a ring-only stream reports errors.sys.
 	perStream, _ := body["errors"].(map[string]any)
 	msg, _ := perStream["sys"].(string)
 	if !strings.Contains(msg, "persistence") {
@@ -109,7 +107,7 @@ func TestSearch_ResultCap(t *testing.T) {
 	tr := GetTransport()
 	for i := 0; i < 10; i++ {
 		tr.PushSyslog(SyslogRow{"event": "boom",
-			"timestamp": "2026-08-01T00:00:0" + string(rune('0'+i)) + "Z",
+			"timestamp":  "2026-08-01T00:00:0" + string(rune('0'+i)) + "Z",
 			"request_id": "r"})
 	}
 	body, _ := getJSON(t, NewReader(), "/search?q=boom&since="+searchSince+"&limit=3")
@@ -178,9 +176,9 @@ func TestSysQParamGatedAndBounded(t *testing.T) {
 	}
 }
 
-// TestSysQParamRejectsStructuredFilterCombination (PR #59 finding 6):
-// /sys?q=... combined with a structured filter (level/request_id/service_id/
-// event) must 400, not silently discard the filter. Matches /api?q= policy.
+// TestSysQParamRejectsStructuredFilterCombination: /sys?q=... combined with a
+// structured filter (level/request_id/service_id/event) is a 400, not an
+// ignored filter.
 func TestSysQParamRejectsStructuredFilterCombination(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()

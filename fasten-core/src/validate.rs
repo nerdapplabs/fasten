@@ -11,10 +11,8 @@ fn is_valid_ident(s: &str) -> bool {
 
 /// Accept `table` or `schema.table`; reject everything else.
 ///
-/// Both `schema` and `table` must independently match
-/// `[A-Za-z_][A-Za-z0-9_]*`.  The check is intentionally strict —
-/// no quoting, no dollar signs — so the bare names are safe to interpolate
-/// into DDL without parameterisation.
+/// Both parts must match `[A-Za-z_][A-Za-z0-9_]*`. No quoting or `$` is
+/// allowed, so the names can be interpolated into DDL directly.
 pub fn validate_table_name(name: &str) -> Result<(), Error> {
     let ok = match name.split_once('.') {
         Some((schema, bare)) => is_valid_ident(schema) && is_valid_ident(bare),
@@ -27,8 +25,8 @@ pub fn validate_table_name(name: &str) -> Result<(), Error> {
     }
 }
 
-/// Split `"schema.table"` into `(Some("schema"), "table")`,
-/// or `None` → `(None, name)`.
+/// Split `"schema.table"` into `(Some("schema"), "table")`; a bare name
+/// gives `(None, name)`.
 pub fn split_table(name: &str) -> (Option<&str>, &str) {
     match name.split_once('.') {
         Some((s, t)) => (Some(s), t),

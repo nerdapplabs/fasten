@@ -1,4 +1,4 @@
-"""P1-44 — cross-tenant isolation on reader endpoints.
+"""Cross-tenant isolation on reader endpoints.
 
 Pins the enforcement contract: when ``router(tenant_scope=...)`` is
 wired, every reader endpoint (`/audit`, `/correlate`, `/search`,
@@ -81,7 +81,7 @@ def _init_shared_store():
     return audit
 
 
-# ── baseline: no scope hook, behaviour unchanged ─────────────────────────
+# No scope hook
 
 def test_no_scope_hook_keeps_current_behaviour():
     _init_shared_store()
@@ -91,7 +91,7 @@ def test_no_scope_hook_keeps_current_behaviour():
     assert tenants == {"tenant-a", "tenant-b"}
 
 
-# ── enforce_tenant_isolation refuses to construct without hook ───────────
+# enforce_tenant_isolation without a hook
 
 def test_enforce_without_hook_refuses_construction():
     pytest.importorskip("fastapi")
@@ -100,7 +100,7 @@ def test_enforce_without_hook_refuses_construction():
         build_router(dependencies=[], enforce_tenant_isolation=True)
 
 
-# ── with scope: audit endpoint filters ───────────────────────────────────
+# /audit
 
 def test_audit_endpoint_scopes_to_resolved_tenant():
     _init_shared_store()
@@ -130,7 +130,7 @@ def test_audit_endpoint_401s_when_scope_returns_none():
     assert resp.status_code == 401
 
 
-# ── /correlate: X-Request-ID pivot attack blocked ────────────────────────
+# /correlate
 
 def test_correlate_cannot_pivot_across_tenants_via_request_id():
     """The known attack: tenant B knows tenant A's request_id (leaked
@@ -155,7 +155,7 @@ def test_correlate_scoped_returns_own_tenant_rows():
         assert r["tenant_id"] == "tenant-a"
 
 
-# ── /search: substring-across-tenants blocked ───────────────────────────
+# /search
 
 def test_search_audit_stream_scoped_to_tenant():
     _init_shared_store()
@@ -181,7 +181,7 @@ def test_search_sys_stream_scoped_to_tenant():
     assert body["counts"]["sys"] == 0
 
 
-# ── /sys and /api: post-filter blocks cross-tenant rows ──────────────────
+# /sys and /api
 
 def test_sys_endpoint_scoped_post_filter():
     _init_shared_store()
@@ -199,7 +199,7 @@ def test_api_endpoint_scoped_post_filter():
         assert r["tenant_id"] == "tenant-a"
 
 
-# ── /topology: fleet enumeration blocked ────────────────────────────────
+# /topology
 
 def test_topology_scoped_to_tenant():
     _init_shared_store()
