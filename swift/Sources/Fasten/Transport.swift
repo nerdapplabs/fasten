@@ -1,6 +1,6 @@
 import Foundation
 
-/// Stdout NDJSON transport — same wire format as all other SDKs.
+/// Writes audit rows and log lines to stdout as NDJSON, one object per line.
 final class StdoutTransport: @unchecked Sendable {
     private let lock = Lock()
     private let encoder: JSONEncoder = {

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Generate spec/python-sealed-forms.json — the Python->Go cross-SDK vector.
+"""Generate spec/python-sealed-forms.json, rows sealed by Python for Go to verify.
 
-Rows are sealed by the Python SDK's own code paths, never hand-written, so the
-file always reflects what Python actually produces. Go reads it in
-TestCrossLanguage_GoAcceptsEveryPythonSealedForm; Python checks the committed
-copy still matches in test_canonical_form_2.py.
+The rows come from the Python SDK's own sealing code, not written by hand. Go
+reads the file in TestCrossLanguage_GoAcceptsEveryPythonSealedForm; Python
+checks the committed copy is current in test_canonical_form_2.py.
 
-Deterministic by construction — fixed instants and PINNED salts. seal() reuses
-row.detail_salt when set and mints one otherwise, so without pinning every run
-would differ and a regenerate-and-compare test could not exist.
+Timestamps and salts are fixed so the output is the same on every run. seal()
+reuses row.detail_salt when set and mints a random one otherwise.
 
 Usage:  python3 scripts/gen_cross_sdk_vectors.py [--check]
         --check exits 1 if the committed file differs from a fresh build.
@@ -34,29 +32,22 @@ from fasten.chain import (                                           # noqa: E40
 
 OUT = REPO / "spec" / "python-sealed-forms.json"
 
-# Two instants: microseconds present, and a whole second. The whole-second case
-# is the one that diverges under both halves of the #91 defect at once (the
-# offset spelling AND the omitted fractional part), so it must be covered
-# explicitly — a suffix-only fix still passes the microsecond case.
+# One timestamp with microseconds and one on a whole second. The whole second
+# covers both parts of #91 (the "+00:00" offset and the dropped fraction); the
+# microsecond case alone passes with only the offset fixed.
 MICROS = datetime(2026, 6, 15, 10, 30, 45, 123456, tzinfo=timezone.utc)
 WHOLE = datetime(2026, 6, 15, 10, 30, 45, 0, tzinfo=timezone.utc)
 
-# A row sealed by a REAL pre-conformance release, captured once and frozen.
+# A row sealed by a release from before the spec 1.2 hashed form, stored as
+# literals. The other legacy-Z cases are built with today's
+# _row_hash_form_1_legacy_z, so only this row checks that function against
+# what an old release really wrote.
 #
-# Every other legacy-Z case here is built by today's _row_hash_form_1_legacy_z,
-# so on its own it only proves both SDKs agree with the current reconstruction.
-# If that reconstruction drifted from what the old release actually wrote, the
-# vector would not notice. This row and its hash are LITERALS — nothing here
-# recomputes them — so the test that compares them to today's function is the
-# one non-circular check in the file.
+# Sealed on commit 99bd8f4 (parent of 5a8f684, which introduced the spec 1.2
+# hashed form) by calling chain._row_hash on this row without "hash".
 #
-# Provenance: sealed on commit 99bd8f4 (parent of 5a8f684, which introduced the
-# spec 1.2 hashed form). To re-capture, check out that tree and call
-# chain._row_hash on the row below with "hash" removed.
-#
-# Do NOT regenerate this. If today's reconstruction stops reproducing this hash,
-# the fallback has stopped accepting real legacy rows — that is a defect, not a
-# reason to update the constant.
+# Don't update it to match new code: if today's function no longer reproduces
+# this hash, the legacy fallback is broken.
 FROZEN_PREFIX_ROW = {
     "action": "create",
     "actor": "alice",
@@ -106,7 +97,7 @@ def build() -> dict:
             "row": json.loads(json.dumps(row.to_dict(), default=str)),
         })
 
-    # Form "1" as this SDK seals it: spec §1.2 hashed form ("+00:00",
+    # Form "1" as Python seals it now: spec §1.2 hashed form ("+00:00",
     # microseconds only when nonzero).
     for label, ts in (("form1_micros", MICROS), ("form1_whole_second", WHOLE)):
         r = dataclasses.replace(_row(f"evt-{label}", ts), canonical_form_id="1")
@@ -115,9 +106,8 @@ def build() -> dict:
         add(label, dataclasses.replace(r, prev_hash="genesis",
                                        hash=_row_hash_form_1(d)))
 
-    # Form "1" as PRE-CONFORMANCE Python sealed it: the always-"Z" wire
-    # timestamp hashed verbatim. These rows exist in deployments and are not
-    # tampered; both SDKs need their legacy fallback to accept them.
+    # Form "1" as older Python releases sealed it: the "Z" wire timestamp
+    # hashed as is. Deployed stores hold such rows, so both SDKs must accept them.
     for label, ts in (("form1_legacy_Z_micros", MICROS),
                       ("form1_legacy_Z_whole", WHOLE)):
         r = dataclasses.replace(_row(f"evt-{label}", ts), canonical_form_id="1")
@@ -132,7 +122,7 @@ def build() -> dict:
                                 detail_salt=PINNED_SALT)
         add(label, seal("genesis", r))
 
-    # The frozen real-release row, passed through verbatim.
+    # The row from the old release, unchanged.
     cases.append({"label": "form1_real_prefix_release",
                   "row": dict(FROZEN_PREFIX_ROW)})
 

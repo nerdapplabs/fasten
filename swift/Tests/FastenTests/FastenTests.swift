@@ -122,7 +122,7 @@ final class RedactorTests: XCTestCase {
 
     func testCcLuhnValidRedacted() {
         let r = Redactor()
-        // Visa test card — passes Luhn
+        // Visa test card number; passes the Luhn check.
         let out = r.redact(["notes": "4111111111111111"])
         XCTAssertEqual(out["notes"] as? String, "***CC***")
     }

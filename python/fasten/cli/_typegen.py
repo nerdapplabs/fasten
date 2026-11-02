@@ -1,18 +1,11 @@
-"""
-fasten codes typegen — generate IDE / type-checker stubs from a yaml catalog.
-
-Adopters who use ``fasten.codes.load("fleet.codes.yaml")`` at runtime can
-also run this offline tool to produce dev-only type stubs giving them
-autocomplete on code names. Stubs are dev-time artefacts (``.pyi`` / ``.d.ts``
-/ ``.go``); no runtime impact, no SDK dep.
-
-Usage:
+"""`fasten codes typegen`: write type stubs for the codes in a yaml catalog,
+for editor completion and type checking. The output does not depend on fasten.
 
     fasten codes typegen fleet.codes.yaml --lang python > fleet_codes.pyi
     fasten codes typegen fleet.codes.yaml --lang ts     > fleet_codes.d.ts
     fasten codes typegen fleet.codes.yaml --lang go     > fleet_codes_gen.go
 
-The yaml schema matches what ``fasten.codes.load()`` accepts.
+The yaml format is the one ``fasten.codes.load()`` reads.
 """
 from __future__ import annotations
 
@@ -46,12 +39,7 @@ def _read_catalog(path: Path) -> tuple[str, dict[str, dict]]:
 
 
 def _gen_python(domain: str, codes: dict[str, dict], src: Path) -> str:
-    """Generate a Python type stub (.pyi) declaring each code as a string Literal.
-
-    Adopters do:
-      from fleet_codes_pyi import FleetCode
-      def emit_one(code: FleetCode): ...
-    """
+    """A .pyi stub with a Literal type of all codes and one constant per code."""
     sorted_codes = sorted(codes)
     literals = ", ".join(f'"{c}"' for c in sorted_codes)
     body_lines = [
@@ -64,7 +52,6 @@ def _gen_python(domain: str, codes: dict[str, dict], src: Path) -> str:
         ),
         "",
     ]
-    # Also expose each code as a module-level constant for autocomplete.
     body_lines.append("# Module-level constants for autocomplete:")
     for c in sorted_codes:
         body_lines.append(f"{c}: str")

@@ -1,33 +1,24 @@
-"""
-Mountable /logs/{sys,api,audit} router.
+"""FastAPI router for /logs/{sys,api,audit} and the related reads.
 
-Framework-agnostic core + FastAPI adapter. Adopters on other frameworks
-(Flask, Sanic, aiohttp) wrap the core handler functions.
-
-Usage — recommended (gated with adopter auth):
+With your own auth:
 
     import fasten
     from fasten.reader import router
     from fastapi import Depends
 
-    fasten.init()  # reads env: FASTEN_SERVICE_ID, FASTEN_NODE_ID, FASTEN_AUDIT_DSN
+    fasten.init()
 
     app.include_router(
         router(dependencies=[Depends(require_admin)]),
         prefix="/api/v1/logs",
     )
 
-Usage — internal / trusted-network only:
+Without auth, on a trusted network only:
 
-    app.include_router(router(), prefix="/api/v1/logs")
+    app.include_router(router(dependencies=[]), prefix="/api/v1/logs")
 
-The router pulls the audit store + transport from ``fasten.init()`` at
-request time. Pass ``store=`` / ``transport=`` to ``router()`` to
-override (tests, read-replica, multi-store).
-
-WARNING: This router has no built-in authentication. /sys, /api, and
-/audit return data to any caller who can reach them. Always pass
-``dependencies=[Depends(...)]`` or mount behind a trusted-network boundary.
+The store and transport come from the default Engine at request time unless
+``store=`` or ``transport=`` is passed. The router has no auth of its own.
 """
 from __future__ import annotations
 
@@ -42,14 +33,11 @@ from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
 from .. import search_enabled as _active_search_enabled
 
-# starlette.requests.Request is hard-depended on by fastapi; import it at
-# module top so `from __future__ import annotations` stringified type hints
-# (`request: Request`) resolve via typing.get_type_hints(). Without this the
-# endpoint functions' Request annotation is unresolvable in the module
-# globals and FastAPI misclassifies `request` as a query param → 422.
+# Imported at module level so FastAPI can resolve the string annotation
+# `request: Request`; otherwise it treats `request` as a query parameter.
 try:
     from starlette.requests import Request
-except ImportError:  # pragma: no cover — fastapi missing; router() raises anyway
+except ImportError:  # pragma: no cover  fastapi missing; router() raises anyway
     pass
 from .. import transport as _active_transport
 
@@ -58,7 +46,7 @@ _UNSET: Any = object()
 
 
 def router(
-    dependencies: list[Any] | None = _UNSET,  # required — explicit [] for no-auth
+    dependencies: list[Any] | None = _UNSET,  # required; [] for no auth
     *,
     store: Any = None,
     transport: Any = None,
@@ -70,25 +58,15 @@ def router(
     """Build a FastAPI APIRouter exposing /sys, /api, /audit sub-paths.
 
     Args:
-        dependencies: FastAPI dependencies applied to every route, e.g.
-            ``[Depends(require_admin)]``. **Required** — the earlier
-            no-default reader shipped unauthenticated by accident on
-            every misconfigured proxy (P1-45). Explicit opt-in for the
-            no-auth case: pass ``dependencies=[]`` when you deliberately
-            want the reader unauthenticated (dev / localhost / a proxy
-            that already enforces auth). No default means the "I forgot
-            to wire auth" bug produces a startup error, not a silently
-            public audit log.
-        store: Optional AuditRepository override. Default: pulled from
-            ``fasten.init()`` at request time via ``fasten.audit_store()``.
-        transport: Optional StdoutTransport override. Default: same.
-        persist_streams: Streams backed by the durable store rather than a
-            bounded ring. Drives the per-stream ``completeness`` flag on
-            every read (``store`` vs ``ring``). Default: resolved per request
-            from the live engine config (``fasten.persisted_streams()``) —
-            ``audit`` when an audit store is attached (``ring`` on a
-            stdout-only engine), plus ``api``/``sys`` when a stream store is
-            configured. Pass an explicit set to override.
+        dependencies: FastAPI dependencies for every route, e.g.
+            ``[Depends(require_admin)]``. Required, so a missing auth hook
+            fails at startup. Pass ``[]`` for the no-auth case.
+        store: AuditRepository to read. Default: ``fasten.audit_store()``
+            at request time.
+        transport: StdoutTransport to read. Default: ``fasten.transport()``.
+        persist_streams: Streams reported as ``store`` rather than ``ring``
+            in ``completeness``. Default: ``fasten.persisted_streams()`` at
+            request time.
         tenant_scope: Callable ``(request) -> str | None`` invoked per
             request to resolve the caller's tenant from the (already-
             authenticated) request. When supplied, EVERY reader endpoint
@@ -98,16 +76,13 @@ def router(
             ``None`` (unauthenticated / no scope) rejects the request
             with 401. Without this hook, ``?tenant_id=`` is honoured
             as-is — safe for single-tenant deployments, unsafe on any
-            shared-store multi-tenant deployment (P1-44).
+            shared-store multi-tenant deployment.
         enforce_tenant_isolation: When True, refuse to construct the
             router unless ``tenant_scope`` is wired. Set this on any
             shared-store multi-tenant deployment so a mis-configured
             reader can't ship without tenant enforcement.
     """
     try:
-        # Request is imported at module top (from starlette.requests) so
-        # endpoint type hints resolve under `from __future__ import
-        # annotations`. Local fastapi import stays scoped to router().
         from fastapi import APIRouter, HTTPException, Query
     except ImportError as e:
         raise RuntimeError(
@@ -117,19 +92,19 @@ def router(
     if dependencies is None:
         raise RuntimeError(
             "fasten.reader.router: `dependencies=None` is not a valid no-auth "
-            "opt-in — it was the old spelling and now reads as 'unset'. Pass "
+            "opt-in; it is treated as unset. Pass "
             "`dependencies=[]` to deliberately mount without auth, or an auth "
             "hook such as `[Depends(require_admin)]`."
         )
     if dependencies is _UNSET:
         raise RuntimeError(
             "fasten.reader.router: `dependencies=` is required. Pass an "
-            "auth hook — e.g. `[Depends(require_admin)]` or the bundled "
-            "helper `fasten.reader.require_bearer()` — or pass "
+            "auth hook, e.g. `[Depends(require_admin)]` or the bundled "
+            "helper `fasten.reader.require_bearer()`, or pass "
             "`dependencies=[]` to opt into unauthenticated mode "
             "explicitly (dev / localhost / a proxy that enforces auth "
             "already). No default so a mis-configured production deploy "
-            "can't ship an unauthenticated audit reader (P1-45)."
+            "can't ship an unauthenticated audit reader."
         )
 
     if enforce_tenant_isolation and tenant_scope is None:
@@ -137,7 +112,7 @@ def router(
             "fasten.reader.router(enforce_tenant_isolation=True) requires a "
             "tenant_scope callable. Wire (request) -> str | None from your "
             "auth layer, or pass enforce_tenant_isolation=False for a "
-            "single-tenant deployment (see P1-44)."
+            "single-tenant deployment."
         )
 
     r = APIRouter(dependencies=dependencies or [])
@@ -167,7 +142,7 @@ def router(
         scoped caller would leak). Scope=None (single-tenant mode)
         returns rows unchanged.
 
-        This is the (P1-44) enforcement point for /logs/sys, /logs/api,
+        This is the enforcement point for /logs/sys, /logs/api,
         /correlate api+sys, and /search api+sys."""
         if scope is None:
             return rows
@@ -183,13 +158,9 @@ def router(
         return search_enabled if search_enabled is not None else _active_search_enabled()
 
     def _parse_window_ts(name: str, s: Optional[str]) -> Optional[str]:
-        """Parse a ``?since=`` / ``?until=`` reader input and return it in the
-        canonical form (spec §4.3) — the exact string every fasten writer
-        stamps into the timestamp column. Downstream compares are
-        lexicographic against canonical rows, so an operator writing
-        ``?since=2026-08-21T10:00:00Z`` (20-char short form) reads the same
-        rows a caller writing the full 27-char form would. None / empty
-        stays None (no filter). Malformed → HTTPException(422)."""
+        """Convert ``?since=`` / ``?until=`` to the canonical timestamp form,
+        since stored timestamps are compared as strings. Empty gives None;
+        anything that is not RFC 3339 raises a 422."""
         if s is None or s == "":
             return None
         try:
@@ -202,8 +173,8 @@ def router(
         return canonical_ts(dt)
 
     def _search_guard(q: Optional[str], since: Optional[str]) -> Optional[str]:
-        """Shared FR3 preconditions: search must be enabled and time-bounded.
-        Returns an error message when a ``q=`` read is not allowed, else None."""
+        """Return an error message if a ``q=`` read is not allowed (search
+        disabled, or no ``since``), else None."""
         if not _search_on():
             return (
                 "search disabled — set search.enabled "
@@ -214,14 +185,8 @@ def router(
         return None
 
     def _audit_degraded() -> bool:
-        """Audit durable history has known holes when either the audit store
-        swallowed a persist failure (sync fallback path) or the drainer
-        dead-lettered at least one row (async path). Unlike api/sys, audit
-        durability spans the store *and* the drainer, so both are consulted.
-
-        The engine-side flag is checked even when the store itself doesn't
-        expose ``degraded`` (an adopter AuditRepository may not implement
-        ``note_write_failure`` — see engine._audit_write_swallowed)."""
+        """True if stored audit history has gaps: an insert failed and was
+        dropped (engine or store flag), or the drainer dead-lettered a row."""
         from ..emitter import _default as _default_engine
         if _default_engine.audit_write_swallowed():
             return True
@@ -234,30 +199,17 @@ def router(
         return False
 
     def _source(stream: str) -> str:
-        """Report whether a stream is backed by the durable store or a bounded
-        ring — its configured durability class, not a per-response gap signal.
+        """``ring``, ``store`` or ``store-degraded`` for a stream.
 
-        It says whether the stream *can* lose rows, never whether *this*
-        response did: a ring that overflowed and evicted older matching rows
-        still reports ``ring``, identical to an empty ring that lost nothing.
-        This is a durability class, not a truncation signal — ``/correlate``
-        reports truncation separately via the counts/totals pair and the
-        derived per-stream ``truncated`` boolean. When
-        ``persist_streams`` is not pinned, resolve it from the live engine
-        config so the flag tracks which streams actually persist (FR1).
-
-        A store-backed stream whose sink has swallowed at least one persist
-        failure reports ``store-degraded``: reads are still served from the
-        store, but durable history has known holes (rows that live only in
-        the ring, which store-backed reads never consult), so plain ``store``
-        would assert a durability the data no longer has. Sticky for the
-        store's lifetime."""
+        This says whether the stream can lose rows, not whether this response
+        did; /correlate reports truncation separately. ``store-degraded``
+        means a write to the store failed at some point, so its history has
+        gaps.
+        """
         persisted = persist_streams if persist_streams is not None else _active_persisted_streams()
         if stream not in persisted:
             return "ring"
         if stream == "audit":
-            # Audit is not a transport stream — its degraded signal comes from
-            # the audit store + drainer, not transport.stream_degraded (api/sys).
             return "store-degraded" if _audit_degraded() else "store"
         t = _transport()
         if t is not None and getattr(t, "stream_degraded", None) and t.stream_degraded(stream):
@@ -287,15 +239,10 @@ def router(
         since = _parse_window_ts("since", since)
         until = _parse_window_ts("until", until)
         if q is not None:
-            # FR3 escape hatch on the sys read: gated + time-bounded (§4.1).
             err = _search_guard(q, since)
             if err is not None:
                 return {"rows": [], "completeness": {"sys": _source("sys")}, "error": err}
-            # Reject q= combined with structured chips rather than silently
-            # dropping them. Matches /api?q= policy: an operator who narrows
-            # with ?q=timeout&level=error must not get a superset back with
-            # no signal that the chip was ignored. Callers use q= alone, or
-            # structured filters alone.
+            # q= cannot be combined with filters; reject rather than ignore them.
             dropped = [
                 name for name, val in (
                     ("level", level), ("request_id", request_id),
@@ -317,7 +264,7 @@ def router(
                 return {
                     "rows": [],
                     "completeness": {"sys": _source("sys")},
-                    "error": "search requires sys persistence — configure a syslog store (FR1)",
+                    "error": "search requires sys persistence: configure a syslog store",
                 }
             return {"rows": _scope_stream_rows(rows, tenant),
                     "completeness": {"sys": _source("sys")}}
@@ -347,9 +294,7 @@ def router(
     ) -> dict[str, Any]:
         tenant = _resolve_tenant(request)
         if q is not None:
-            # Free-text search is sys-only in v1 (§9). Reject rather than
-            # silently drop, so callers (and copy-pasted handlers) can't
-            # assume q= works on the api stream.
+            # Free-text search on api goes through /search.
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -392,7 +337,7 @@ def router(
         offset: int = Query(default=0, ge=0),
         after: Optional[int] = Query(default=None, ge=1),
     ) -> dict[str, Any]:
-        # P1-44: when tenant_scope is wired, IGNORE any ?tenant_id= from
+        # When tenant_scope is wired, IGNORE any ?tenant_id= from
         # the caller and inject the resolved scope. Without the hook,
         # ?tenant_id= is honoured as-is (single-tenant deployments and
         # legacy call sites).
@@ -417,22 +362,18 @@ def router(
             since=since, until=until,
         )
         rows = s.query(limit=limit, offset=offset, after_seq=(after or 0), **filters)
-        # total is None when the store doesn't implement count, OR when a
-        # count call fails. A null total is honest; falling back to len(rows)
-        # would lie (len is capped at limit, so a paginating caller can't tell
-        # page N is the last), and raising a 500 kills the row set the caller
-        # actually got. Mirrors Go's handleAudit — same wire behaviour on
-        # both SDKs (PR #59 finding 9 + branch-review #4).
+        # total is None if the store has no count() or it fails. len(rows)
+        # would be wrong (it is capped at limit), and a 500 would lose the
+        # rows. Go's handleAudit does the same.
         total: int | None = None
         if hasattr(s, "count"):
             try:
                 total = s.count(**filters)
             except Exception:  # noqa: BLE001
                 total = None
-        # Dual pagination (FR5): offset (total/limit/offset) for page-number UIs
-        # and cursor (next_after) as the canonical, insert-stable model. Rows are
-        # newest-first, so the last row carries the smallest monotonic_seq — pass
-        # it back as ?after= to continue. Both models are always reported.
+        # Offset paging (total/limit/offset) and cursor paging (next_after)
+        # are both returned. Rows are newest first, so next_after is the
+        # smallest monotonic_seq; pass it back as ?after=.
         next_after = rows[-1].monotonic_seq if rows else None
         return {
             "rows": [dataclasses.asdict(row) for row in rows],
@@ -449,20 +390,13 @@ def router(
         request_id: str = Query(..., min_length=1),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
-        """Unified correlation read — every stream for one ``request_id``.
+        """Rows from every stream for one ``request_id``.
 
-        Fans out to the existing per-stream query paths (audit store + sys/api
-        rings-or-stores) and assembles them, so a consumer holding a
-        ``request_id`` gets the whole operation in one call instead of
-        stitching three. Adds no new query semantics beyond fan-out +
-        assembly. ``completeness`` reports each stream's durability class,
-        and ``totals`` reports how many matching rows the backing source
-        holds — ``counts`` is how many this capped response returned, so
-        ``counts < totals`` means the response is truncated (raise ``limit``
-        or page the per-stream endpoints); the per-stream ``truncated`` boolean
-        reports that inequality directly so callers don't re-derive it.
+        ``counts`` is how many rows this response holds per stream and
+        ``totals`` how many match; ``truncated`` is ``counts < totals`` (None
+        when the total is unknown).
 
-        P1-44: when ``tenant_scope`` is wired, every stream is scoped to
+        When ``tenant_scope`` is wired, every stream is scoped to
         the caller's tenant. Otherwise the ``X-Request-ID`` header a
         tenant sends could be used to pivot into another tenant's rows
         via a known/guessed request_id.
@@ -502,13 +436,9 @@ def router(
             "sys": len(sys) if tenant is not None
             else (t.count_syslog(request_id=request_id) if t is not None else 0),
         }
-        # Truncation is counts < totals per stream. The pair is authoritative;
-        # this boolean is a convenience so every caller doesn't re-derive the
-        # inequality (and get it subtly wrong). Reported per stream. A null
-        # total (audit only, on stores without count) means "unknown" — the
-        # truncated flag mirrors that as None rather than a spurious False.
+        # None when the total is unknown (audit store without count()).
         def _trunc(k: str) -> Optional[bool]:
-            total = totals[k]                # pull into a local so mypy narrows
+            total = totals[k]
             return None if total is None else counts[k] < total
         truncated = {k: _trunc(k) for k in ("audit", "api", "sys")}
         return {
@@ -537,26 +467,15 @@ def router(
         limit: int = Query(default=50, ge=1, le=200),
         streams: Optional[str] = Query(default=None),
     ) -> dict[str, Any]:
-        """FR3 free-text search across audit / api / sys — the time-bounded
-        escape hatch (§4.1).
+        """Case-insensitive substring search over stored rows, newest first.
 
-        Case-insensitive substring scan over persisted history. Each match
-        carries ``request_id`` so a consumer can hand it to ``/correlate``.
-        Deliberately constrained — opt-in (``search.enabled``), ``since``
-        mandatory (no unbounded scans), hard result cap, and no relevance
-        ranking (newest-first per stream). Not a log query language; structured
-        field reads are the primary discovery path.
-
-        ``streams=`` is a comma-separated subset of ``{audit, api, sys}``.
-        Default: ``sys`` — the linear scan stays opt-in per stream, so an
-        operator hitting /search without ``streams=`` doesn't fan out
-        across audit + api unless they ask for it. Each named stream must
-        have a store — for ring-only streams the response reports a
-        per-stream error, not an empty list that reads as "no matches".
+        Needs search enabled and a ``since`` bound. ``streams=`` is a
+        comma-separated subset of audit, api and sys (default sys). A stream
+        without a store gets an entry in ``errors`` rather than no matches.
+        Each match carries its ``request_id`` for /correlate.
         """
         tenant = _resolve_tenant(request)
-        # Parse + validate streams param before hitting the search guard so
-        # a bad ?streams=foo fails loudly rather than falling through.
+        # Validate streams before the search guard so a bad value gets a 400.
         requested = streams.split(",") if streams else ["sys"]
         parsed = {s.strip() for s in requested if s.strip()}
         unknown = parsed - _VALID_SEARCH_STREAMS
@@ -573,11 +492,7 @@ def router(
 
         completeness = {s: _source(s) for s in parsed}
         empty_counts = {s: 0 for s in parsed}
-        # Canonicalise the window BEFORE the guard so /search's own
-        # since-mandatory check and the store's lex compare both see the
-        # same shape. Raises 422 on non-RFC3339 input. `since` is Query(...)
-        # required, but Query("") sends an empty string past that check —
-        # normalise to None so the guard's ``if not since`` catches it.
+        # since="" passes Query(...), so the guard has to catch it.
         since = _parse_window_ts("since", since) or ""
         until = _parse_window_ts("until", until)
         err = _search_guard(q, since)
@@ -595,16 +510,14 @@ def router(
         matches: list[dict[str, Any]] = []
         counts: dict[str, int] = {}
         errors: dict[str, str] = {}
-        # Stable stream order in the response so a UI can render tabs
-        # deterministically. Sys first (the historical default), then api,
-        # then audit — mirrors the /correlate response order.
+        # Fixed order: sys, api, audit.
         for stream in ("sys", "api", "audit"):
             if stream not in parsed:
                 continue
             if stream == "sys":
                 rows = t.search_syslog(q=q, since=since, until=until, limit=limit)
                 if rows is None:
-                    errors["sys"] = "requires sys persistence — configure a syslog store (FR1)"
+                    errors["sys"] = "requires sys persistence: configure a syslog store"
                     counts["sys"] = 0
                     continue
                 rows = _scope_stream_rows(rows, tenant)
@@ -620,7 +533,7 @@ def router(
             elif stream == "api":
                 rows = t.search_api(q=q, since=since, until=until, limit=limit)
                 if rows is None:
-                    errors["api"] = "requires api persistence — configure an api store (FR1)"
+                    errors["api"] = "requires api persistence: configure an api store"
                     counts["api"] = 0
                     continue
                 rows = _scope_stream_rows(rows, tenant)
@@ -635,7 +548,7 @@ def router(
                     })
             elif stream == "audit":
                 if s is None or not hasattr(s, "search"):
-                    errors["audit"] = "requires an audit store with a search method (FR1)"
+                    errors["audit"] = "requires an audit store with a search method"
                     counts["audit"] = 0
                     continue
                 # Tenant scope pushed into the store (SQL WHERE tenant_id=?),
@@ -666,16 +579,12 @@ def router(
         since: Optional[datetime] = Query(default=None),
         until: Optional[datetime] = Query(default=None),
     ) -> dict[str, Any]:
-        """Fleet topology — who is emitting into this store.
+        """Who is writing to this store.
 
-        Groups the audit rows by ``(source_node_id, service_id,
-        tenant_id)`` and returns the per-source row counts and
-        first/last-seen timestamps, plus distinct node/service/tenant
-        counts. No separate topology table: the fleet view falls out of
-        the rows already recorded, so it can never drift from reality.
-
-        Same auth as ``/audit`` (router-level dependencies). Optional
-        ``since``/``until`` window the aggregation. P1-44: when
+        Audit rows grouped by ``(source_node_id, service_id, tenant_id)``
+        with row counts and first/last seen times, plus distinct node,
+        service and tenant counts. Optional
+        ``since``/``until`` window the aggregation. When
         ``tenant_scope`` is wired, the aggregation is post-filtered to
         the resolved tenant only — mild fleet enumeration
         (`service_id` / `node_id` values of other tenants) is not
@@ -700,7 +609,7 @@ def router(
 
     @r.get("/audit/doctor")
     def get_audit_doctor(request: "Request") -> dict[str, Any]:
-        """P1-15: read-side audit-pipeline health snapshot.
+        """Read-side audit-pipeline health snapshot.
 
         Takes ``request`` and calls ``_resolve_tenant`` like every other
         handler. It previously took no argument, so it could not scope and
@@ -776,12 +685,12 @@ def router(
             "node_id": _default_engine._node_id or None,
             "tenant_id": _default_engine._tenant_id,
             "failure_strategy": _default_engine._failure_strategy,
-            # P1-19: multi-worker awareness — callers can confirm which
+            # Multi-worker awareness: callers can confirm which
             # OS process they are hitting (relevant under uvicorn --workers N).
             "worker_pid": os.getpid(),
         }
 
-        # P1-23: hash chain verification — spot-check latest 50 rows.
+        # Hash chain verification: spot-check latest 50 rows.
         # breaks is None until verification actually runs; 0 when the chain is
         # clean, 1+ when broken. Never report 0 for "we didn't check", which
         # would read as green on a status page colouring on this field.

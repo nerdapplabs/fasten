@@ -1,6 +1,6 @@
 #pragma once
 /**
- * fasten_reader_simplehttp.hpp — Simple-Web-Server adapter for fasten reader.
+ * fasten_reader_simplehttp.hpp: Simple-Web-Server adapter for fasten_reader.hpp.
  *
  * Requires:
  *   - fasten_reader.hpp (included automatically)
@@ -11,11 +11,11 @@
  *   target_include_directories(mytarget PRIVATE path/to/Simple-Web-Server)
  *   target_link_libraries(mytarget PRIVATE fasten pthread)
  *
- * Usage — no auth (trusted network only):
+ * No auth (trusted network only):
  *   auto t = fasten::reader::simplehttp::start(9000);
  *   t.detach();
  *
- * Usage — API key auth:
+ * API key auth:
  *   auto t = fasten::reader::simplehttp::start(9000, "/api/v1/logs",
  *       [](const SimpleWeb::CaseInsensitiveMultimap& h) {
  *           auto it = h.find("x-api-key");
@@ -23,7 +23,7 @@
  *       });
  *   t.detach();
  *
- * Usage — mount onto an existing server (e.g. alongside app routes):
+ * On an existing server, next to the app routes:
  *   HttpServer server;
  *   server.config.port = 9000;
  *   // ... register your own routes ...
@@ -77,7 +77,7 @@ inline void mount(HttpServer& server,
                   const std::string& prefix = "/api/v1/logs",
                   AuthFn auth = {})
 {
-    // Build regex route string — prefix is treated as a literal path.
+    // Routes are regexes and `prefix` is not escaped.
     auto route = [&prefix](const std::string& s) {
         return "^" + prefix + s + "$";
     };
@@ -114,7 +114,7 @@ inline void mount(HttpServer& server,
 }
 
 // Start a dedicated HTTP server on `port` in a new thread.
-// Returns the thread — call detach() for fire-and-forget, join() to block.
+// Returns the thread; detach() it or join() it.
 inline std::thread start(unsigned short     port   = 9000,
                           const std::string& prefix = "/api/v1/logs",
                           AuthFn             auth   = {})
