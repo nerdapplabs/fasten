@@ -933,6 +933,7 @@ def test_close_does_not_wait_on_a_hung_syslog_store_after_a_fast_failure(tmp_pat
 def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     store = HangingStore(str(tmp_path / "a.db"))
     _init(store)
+    lock = _default._drainer.insert_lock
     try:
         fasten.emit(code="USER_CREATED", target="u-1")
         _wait_for_attempts(store, 1)
@@ -947,8 +948,8 @@ def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     finally:
         _release_hung_store(store)
     # The parent did not release the lock the stuck insert held.
-    assert _default._insert_lock.acquire(timeout=5)
-    _default._insert_lock.release()
+    assert lock.acquire(timeout=5)
+    lock.release()
     assert "audit_drain_fork_during_insert" in _sys_events()
 
 
@@ -962,8 +963,8 @@ def test_forks_from_two_threads_do_not_leak_the_insert_lock(tmp_path):
     other.start()
     other.join(timeout=5)
     _default._insert_lock_after_fork()
-    assert _default._insert_lock.acquire(timeout=1)
-    _default._insert_lock.release()
+    assert _default._drainer.insert_lock.acquire(timeout=1)
+    _default._drainer.insert_lock.release()
 
 
 class SlowRetireStore(FlakyStore):
@@ -1193,6 +1194,31 @@ def test_reinit_does_not_wait_forever_on_a_hanging_store(tmp_path, monkeypatch, 
         _release_hung_store(store)
     assert f'"row_id": "{row.id}"' in err and "audit_drain_lost_at_stop" in err
     assert fasten.emit(code="USER_CREATED", target="u-2") and fasten.flush(timeout=2.0)
+
+
+def test_rows_emitted_while_a_hung_store_retires_reach_the_new_store(tmp_path, monkeypatch):
+    # The old store's stuck call must not hold up the new drainer's inserts.
+    from fasten import core_ffi
+    monkeypatch.setattr(_default, "_reinit_timeout", 0.6, raising=False)
+    old = HangingStore(str(tmp_path / "old.db"))
+    _init(old)
+    try:
+        fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(old, 1)
+        flush, emitted = core_ffi.drainer_flush, []
+
+        def emit_while_retiring(handle, timeout_ms):
+            emitted.append(fasten.emit(code="USER_CREATED", target="during-reinit"))
+            return flush(handle, timeout_ms)
+
+        monkeypatch.setattr(core_ffi, "drainer_flush", emit_while_retiring)
+        new = FlakyStore(str(tmp_path / "new.db"))
+        _init(new)
+        monkeypatch.setattr(core_ffi, "drainer_flush", flush)
+        assert fasten.flush(timeout=2.0)
+        assert [r.id for r in _rows(new)] == [r.id for r in emitted]
+    finally:
+        _release_hung_store(old)
 
 
 def test_reset_does_not_wait_forever_on_a_hanging_store(tmp_path, monkeypatch, capsys):

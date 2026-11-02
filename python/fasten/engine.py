@@ -190,6 +190,9 @@ class _QueueDrainer:
     lost: int = 0                       # rows dead-lettered or lost at stop
     reported: set[str] = dataclasses.field(default_factory=set)   # rows reported lost at stop
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    # Held around the store call and across fork(), so a child never
+    # inherits a store (or SQLite's global mutex) mid-insert.
+    insert_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     # The store thread's calls; see call_on_worker.
     calls: queue.SimpleQueue = dataclasses.field(default_factory=queue.SimpleQueue)
     inflight: Optional[_StoreCall] = None
@@ -304,11 +307,9 @@ class Engine:
         self._store_gen = 0         # bumped when init switches to another store
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
-        # Held around the drainer's store call and across fork(), so a child
-        # never inherits a store (or SQLite's global mutex) mid-insert.
-        self._insert_lock = threading.Lock()
-        # The lock each forking thread holds across fork(), None if it gave up.
-        self._fork_locks: dict[int, Optional[threading.Lock]] = {}
+        # The drainers' insert locks each forking thread holds across
+        # fork(), and whether it gave up waiting for one.
+        self._fork_locks: dict[int, tuple[list[threading.Lock], bool]] = {}
         self._closed = False    # close() has run and init has not since
         self._atexit_registered = False
         self._retiring: list[_QueueDrainer] = []
@@ -1162,7 +1163,7 @@ class Engine:
                     self._drainer_sys_log("error", "audit_drain_row_not_pending", {"row_id": row_id}, via=d)
                     return 0
                 entry[1] += 1
-                with self._insert_lock:
+                with d.insert_lock:
                     self._allocate_and_store(entry[0], store, d.stdout)
                 with d.lock:
                     pending.pop(row_id, None)
@@ -1244,15 +1245,25 @@ class Engine:
 
     def _insert_lock_before_fork(self) -> None:
         # An insert stuck on a database lock must not hold up fork(); the
-        # child replaces the lock either way, and the parent reports it.
-        lock = self._insert_lock
-        self._fork_locks[threading.get_ident()] = lock if lock.acquire(timeout=1.0) else None
+        # child installs a new drainer either way, and the parent reports it.
+        # A drainer close gave up on keeps its stuck call's lock.
+        with self._drainer_lock:
+            drainers = [d for d in [self._drainer, *self._retiring]
+                        if d is not None and not d.abandoned]
+        deadline = time.monotonic() + 1.0
+        held, gave_up = [], False
+        for d in drainers:
+            if d.insert_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                held.append(d.insert_lock)
+            else:
+                gave_up = True
+        self._fork_locks[threading.get_ident()] = (held, gave_up)
 
     def _insert_lock_after_fork(self) -> None:
-        lock = self._fork_locks.pop(threading.get_ident(), None)
-        if lock is not None:
+        held, gave_up = self._fork_locks.pop(threading.get_ident(), ([], False))
+        for lock in held:
             lock.release()
-        else:
+        if gave_up:
             self._drainer_sys_log("warn", "audit_drain_fork_during_insert", {"waited_seconds": 1.0})
 
     def _reinstall_after_fork(self) -> None:
@@ -1263,7 +1274,6 @@ class Engine:
         # Another thread may have held these at the fork.
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
-        self._insert_lock = threading.Lock()
         self._fork_locks = {}
         self._retiring = []     # their threads are the parent's
         old, self._drainer = self._drainer, None
@@ -1355,9 +1365,6 @@ class Engine:
         wake its drain thread from a store call still running."""
         self._report_unstored(d)
         d.abandon()
-        # The stuck call keeps the old lock; fork() and a later drainer
-        # must not wait for it.
-        self._insert_lock = threading.Lock()
 
     def _report_unstored(self, d: _QueueDrainer) -> None:
         """Report the rows a retiring drainer still holds as lost."""
