@@ -27,6 +27,19 @@ jobs:
     container:
       image: rust:1.90
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: rust
@@ -65,6 +78,9 @@ jobs:
         # them the job fails at build, which is how tls_tests stayed unrun.
         # The job runs in a rust container — root, and no sudo binary,
         # so `sudo apt-get` fails with "sudo: not found". Install directly.
+        # Without the DSN the Postgres store tests return early and pass.
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test?sslmode=disable
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
