@@ -1,4 +1,4 @@
-"""Structured filters on the sys and api endpoints (spec §3.4).
+"""Structured filters on the sys and api endpoints (persistent-streams §3).
 
 event (sys), status (api) and since/until behave the same whether the stream
 is ring-only or persisted.

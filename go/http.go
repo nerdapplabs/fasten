@@ -303,7 +303,8 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	comp := map[string]string{"sys": e.streamSource("sys")}
 	if qtext := q.Get("q"); qtext != "" {
-		// Free-text search must be enabled and time-bounded (§4.1).
+		// Free-text search must be enabled and time-bounded
+		// (persistent-streams §9).
 		if msg := e.searchGuard(qtext, q.Get("since")); msg != "" {
 			writeJSON(w, map[string]any{"rows": []any{}, "completeness": comp, "error": msg})
 			return
@@ -393,9 +394,9 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 const MaxQueryLength = 1024
 
 // searchGuard returns "" when a q= read is allowed, else the reason it is not:
-// search must be explicitly enabled (§4.1) and time-bounded (since= mandatory,
-// no unbounded scans). Also caps q= length so a caller can't hand the store
-// a multi-MB LIKE pattern that runs quadratic per row.
+// search must be explicitly enabled (persistent-streams §9) and time-bounded
+// (since= mandatory, no unbounded scans). Also caps q= length so a caller
+// can't hand the store a multi-MB LIKE pattern that runs quadratic per row.
 func (e *Engine) searchGuard(q, since string) string {
 	// Count runes, not bytes, to match Python's max_length (characters).
 	if utf8.RuneCountInString(q) > MaxQueryLength {
@@ -410,8 +411,8 @@ func (e *Engine) searchGuard(q, since string) string {
 	return ""
 }
 
-// handleSearch serves free-text search (§4.1): enabled via SearchEnabled,
-// time-bounded, capped, unranked. Each match carries its request_id for
+// handleSearch serves free-text search (persistent-streams §9): enabled via
+// SearchEnabled, time-bounded, capped, unranked. Each match carries its request_id for
 // /correlate.
 //
 // ?streams= is a comma-separated subset of audit, api, sys (default sys). A

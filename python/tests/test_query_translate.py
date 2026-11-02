@@ -1,4 +1,4 @@
-"""Search box text to structured chips (spec §3.7, §6.3).
+"""Search box text to structured chips (gh #58 §3.7, §6.3).
 
 Text maps to structured filters, a correlation request_id, or the bounded q=.
 The translator never invents a filter the store doesn't support.

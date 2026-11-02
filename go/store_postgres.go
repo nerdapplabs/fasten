@@ -408,9 +408,9 @@ func (s *PostgresStore) CountFiltered(ctx context.Context, f Filter) (int, error
 }
 
 // Search does a case-insensitive substring match of q against detail
-// (§4.1), from since, newest-first, up to limit, with no ranking. LIKE
-// wildcards in q match literally. A non-empty tenantID scopes the query to
-// one tenant; see SQLiteStore.Search.
+// (persistent-streams §9), from since, newest-first, up to limit, with no
+// ranking. LIKE wildcards in q match literally. A non-empty tenantID scopes
+// the query to one tenant; see SQLiteStore.Search.
 func (s *PostgresStore) Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error) {
 	esc := escapeLikeLiteral(q)
 	conds := []string{"timestamp >= $1", `detail::text ILIKE $2 ESCAPE E'\\'`}

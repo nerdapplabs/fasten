@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Free-text query to structured chips (§3.7, §6.3), same contract as the
+// Free-text query to structured chips (gh #58 §3.7, §6.3), same contract as the
 // Python test_query_translate.py.
 
 func TestTranslate_StructuredFieldChip(t *testing.T) {

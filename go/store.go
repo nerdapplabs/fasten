@@ -401,8 +401,8 @@ func (s *SQLiteStore) CountFiltered(ctx context.Context, f Filter) (int, error) 
 }
 
 // Search does a case-insensitive substring match of q against detail
-// (§4.1), from since, newest-first, up to limit, with no ranking. LIKE
-// wildcards in q match literally.
+// (persistent-streams §9), from since, newest-first, up to limit, with no
+// ranking. LIKE wildcards in q match literally.
 // A non-empty tenantID scopes the query to one tenant (SQL WHERE
 // tenant_id=?); the reader wires the caller's authenticated tenant here
 // so a shared multi-tenant store doesn't leak substring matches across

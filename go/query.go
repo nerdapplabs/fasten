@@ -6,7 +6,7 @@ import (
 )
 
 // Query translation turns search-box text into the reader's own parameters
-// (field filters, a request_id, and free-text q), spec §3.7 and §6.3. An
+// (field filters, a request_id, and free-text q), gh #58 §3.7 and §6.3. An
 // unknown field:value becomes search text rather than a new filter.
 
 // knownQueryFields are the structured filter fields the reader supports. A
@@ -39,8 +39,8 @@ type Translator interface {
 	Translate(text string) Chips
 }
 
-// RuleTranslator applies the §6.3 rules. It doesn't try to parse prose like
-// "yesterday 2pm".
+// RuleTranslator applies the gh #58 §6.3 rules. It doesn't try to parse
+// prose like "yesterday 2pm".
 type RuleTranslator struct{}
 
 func (RuleTranslator) Translate(text string) Chips {

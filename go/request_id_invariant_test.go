@@ -8,9 +8,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// §8.7: every persisted sys row carries a request_id. Drives a service through
-// boot, first request, background tick and shutdown, and checks every stored
-// sys row has a non-empty request_id (real inside a request, sentinel outside).
+// persistent-streams §7: every persisted sys row carries a request_id.
+// Drives a service through boot, first request, background tick and
+// shutdown, and checks every stored sys row has a non-empty request_id (real inside a request, sentinel outside).
 
 func TestRequestIDInvariant_EveryPersistedSysRow(t *testing.T) {
 	resetGlobals(t)

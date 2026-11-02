@@ -7,9 +7,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// §3.4: indexed structured-field filters on the sys/api reader endpoints:
-// event (sys), status (api), and since/until windows, honoured identically
-// whether the stream is ring-only or persisted.
+// persistent-streams §3: indexed structured-field filters on the sys/api
+// reader endpoints: event (sys), status (api), and since/until windows,
+// honoured identically whether the stream is ring-only or persisted.
 
 func seedFilterRows(tr *Transport) {
 	tr.PushSyslog(SyslogRow{"level": "error", "event": "db.timeout", "request_id": "r1", "timestamp": "2026-06-25T10:00:00Z"})

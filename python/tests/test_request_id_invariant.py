@@ -1,4 +1,4 @@
-"""Every persisted sys row carries a request_id (spec §8.7).
+"""Every persisted sys row carries a request_id (persistent-streams §7).
 
 Runs boot, a request, a background tick and shutdown, and checks that every
 stored sys row has a real request_id or a sentinel. The Go suite runs the same

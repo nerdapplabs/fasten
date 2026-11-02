@@ -358,7 +358,7 @@ func RequestIDFromContext(ctx context.Context) string {
 
 // Background returns ctx with a bg- sentinel request_id if it has none, so
 // work outside a request (goroutines, workers) still gets a request_id
-// (spec §5.1, §8.1). Use BackgroundKind for "sched" or "lib".
+// (persistent-streams §7). Use BackgroundKind for "sched" or "lib".
 func Background(ctx context.Context) context.Context { return BackgroundKind(ctx, "bg") }
 
 // BackgroundKind is Background with an explicit sentinel namespace.
