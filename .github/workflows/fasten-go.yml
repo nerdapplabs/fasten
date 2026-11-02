@@ -61,10 +61,10 @@ jobs:
         working-directory: fasten-core
         run: cargo build --release --locked --features all
 
-      - name: Set up Go 1.22
+      - name: Set up Go 1.26
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26"
 
       - name: Vet
         working-directory: go

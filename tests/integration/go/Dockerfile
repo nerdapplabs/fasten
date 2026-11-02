@@ -1,5 +1,5 @@
 # Go integration smoke. Build context = fasten repo root.
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /workspace
 

@@ -10,7 +10,7 @@ go get github.com/nerdapplabs/fasten/go
 
 ## Quickstart
 
-Verified to run as-is on Go 1.22+:
+Verified to run as-is on Go 1.26+:
 
 ```go
 package main
@@ -114,7 +114,7 @@ semantics with `*fasten.AuditStoreError`. `fasten.GetQueueStats()` and
 
 ```bash
 docker run --rm -v $PWD/go:/work -w /work -e CGO_ENABLED=0 \
-  golang:1.22-alpine go test -count=1 ./...
+  golang:1.26-alpine go test -count=1 ./...
 ```
 
 ## Docs + design

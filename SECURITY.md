@@ -62,7 +62,7 @@ commit SHA. The first published release will land at the v1.0.0 GA tag.
 ## Current scan posture
 
 CI runs three vulnerability scanners on every push against the
-minimum supported language version (Python 3.10-slim, Go 1.22-alpine,
+minimum supported language version (Python 3.10-slim, Go 1.26-alpine,
 Node 24-alpine). All three are CLEAN as of the latest commit:
 
 | Language | Scanner          | Status | Notes |
