@@ -18,6 +18,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Adopters relying on unsealed rows keeping their `detail` past the PII
   horizon: it is now set to null after an `AUDIT_ROW_REDACTED` record, as for
   form "2" rows.
+- Python redaction now writes an empty `detail_salt` instead of SQL NULL, as
+  Go does. On a table the Go store created the column is `NOT NULL`, so the
+  update failed after the redaction record was written: on Postgres every pass
+  added another record and the row was never blanked, and on SQLite the
+  connection stayed in its transaction and other writers got "database is
+  locked". The SQLite store now rolls back when the update fails, and both
+  stores read an empty salt back as `None`.
 
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 

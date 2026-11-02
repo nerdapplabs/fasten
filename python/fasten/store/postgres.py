@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     canonical_form_id TEXT NOT NULL DEFAULT '1',
     -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
     -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, and NULL again once redacted.
+    -- NULL on form-"1" rows, '' once redacted.
     detail_salt       TEXT,
     detail_commitment TEXT
 )
@@ -575,7 +575,9 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {self._table} "
-                    "SET detail = 'null', detail_salt = NULL "
+                    # '' not NULL: a table the Go store created declares
+                    # detail_salt NOT NULL. Both read back as None.
+                    "SET detail = 'null', detail_salt = '' "
                     "WHERE id = ANY(%s) AND (canonical_form_id = '2' OR hash = '')",
                     (list(ids),),
                 )
@@ -850,7 +852,8 @@ class PostgresStore:
             canonical_form_id=r[21] if len(r) > 21 else "1",
             # SELECT * — positional. detail_salt / detail_commitment follow
             # canonical_form_id both in the fresh DDL and when appended by
-            # ALTER TABLE on a migrated table, so the index is stable.
-            detail_salt=r[22] if len(r) > 22 else None,
+            # ALTER TABLE on a migrated table, so the index is stable. ''
+            # (Go's column default, and what redaction writes) is no salt.
+            detail_salt=(r[22] or None) if len(r) > 22 else None,
             detail_commitment=r[23] if len(r) > 23 else None,
         )

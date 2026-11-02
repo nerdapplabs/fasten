@@ -225,3 +225,83 @@ def test_redact_expired_redacts_unsealed_rows_and_skips_sealed_form_1(store):
     # redact_rows refuses the sealed form "1" row even when named directly.
     store.redact_rows(ids=[legacy.id])
     assert {r.id: r for r in store.query(limit=10)}[legacy.id].detail == {"email": "l@m.n"}
+
+
+# The table go/store.go creates: detail_salt and detail_commitment are
+# NOT NULL DEFAULT '', where the Python DDL leaves them nullable.
+_GO_SQLITE_DDL = """
+CREATE TABLE fasten_audit (
+    id TEXT PRIMARY KEY, origin_id TEXT NOT NULL,
+    monotonic_seq INTEGER NOT NULL, timestamp TEXT NOT NULL,
+    code TEXT NOT NULL, action TEXT NOT NULL, severity TEXT NOT NULL,
+    service_id TEXT NOT NULL, source_node_id TEXT NOT NULL, tenant_id TEXT,
+    actor TEXT NOT NULL, actor_kind TEXT NOT NULL, target TEXT NOT NULL,
+    category TEXT NOT NULL, domain TEXT NOT NULL, method TEXT NOT NULL,
+    request_id TEXT NOT NULL, detail TEXT NOT NULL,
+    pii_in_detail INTEGER NOT NULL DEFAULT 0, shipped_at TEXT,
+    wire_version TEXT NOT NULL DEFAULT '1',
+    hash TEXT NOT NULL DEFAULT '', prev_hash TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt TEXT NOT NULL DEFAULT '',
+    detail_commitment TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+@pytest.fixture()
+def go_table_store():
+    import sqlite3
+    path = os.path.join(tempfile.mkdtemp(), "audit.db")
+    conn = sqlite3.connect(path)
+    conn.execute(_GO_SQLITE_DDL)
+    conn.commit()
+    conn.close()
+    return SQLiteStore(path=path, table="fasten_audit")
+
+
+def test_redact_rows_on_a_go_created_table(go_table_store):
+    """The salt is NOT NULL on a table Go created, so redaction writes '' like
+    Go does, and '' reads back as no salt."""
+    import dataclasses
+    store = go_table_store
+    sealed = store.allocate_and_insert_originated(_unsealed(1))
+    # An unsealed row as the core-backed SDKs write it: no salt, no commitment.
+    unsealed = dataclasses.replace(
+        _unsealed(2), monotonic_seq=2, detail_salt="", detail_commitment="")
+    store._insert_row(unsealed)
+
+    assert store.redact_rows(ids=[sealed.id, unsealed.id]) == [sealed.id, unsealed.id]
+
+    rows = {r.id: r for r in store.query(limit=10)}
+    for rid in (sealed.id, unsealed.id):
+        assert rows[rid].detail is None
+        assert rows[rid].detail_salt is None
+    assert verify_chain([rows[sealed.id]]).ok
+    assert store.list_redaction_candidates(
+        before=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        codes=["USER_CREATED"]) == []
+
+
+def test_failed_redact_update_leaves_no_open_transaction(go_table_store):
+    """A failed UPDATE must not leave the connection holding SQLite's write
+    lock, or every other writer gets "database is locked"."""
+    import sqlite3
+    store = go_table_store
+    sealed = store.allocate_and_insert_originated(_unsealed(1))
+    conn = store._connect()
+    conn.execute(
+        "CREATE TRIGGER fail_redact BEFORE UPDATE ON fasten_audit "
+        "BEGIN SELECT RAISE(ABORT, 'forced'); END")
+    conn.commit()
+
+    with pytest.raises(sqlite3.DatabaseError, match="forced"):
+        store.redact_rows(ids=[sealed.id])
+    assert not conn.in_transaction
+
+    other = sqlite3.connect(store._path, timeout=0)
+    try:
+        other.execute("DROP TRIGGER fail_redact")
+        other.commit()
+    finally:
+        other.close()
+    assert {r.id: r for r in store.query(limit=10)}[sealed.id].detail == {"n": 1}

@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     canonical_form_id TEXT NOT NULL DEFAULT '1',
     -- spec §1.4 (form "2"): detail is COMMITTED to, not hashed directly, so it
     -- can be destroyed for retention without moving the row hash. Nullable:
-    -- NULL on form-"1" rows, and NULL again once redacted.
+    -- NULL on form-"1" rows, '' once redacted.
     detail_salt       TEXT,
     detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
@@ -507,17 +507,26 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in ids)
         with self._txn():
             conn = self._connect()
-            conn.execute(
-                # 'null' (the JSON literal), not SQL NULL: the detail column is
-                # NOT NULL, and dropping that constraint on SQLite needs a full
-                # table rebuild. json.loads('null') is Python None, so the row
-                # reads back with detail=None exactly as spec §1.4 requires,
-                # and the bytes are genuinely gone either way.
-                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
-                f"WHERE id IN ({placeholders}) AND (canonical_form_id = '2' OR hash = '')",
-                tuple(ids),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    # 'null' (the JSON literal), not SQL NULL: the detail column
+                    # is NOT NULL, and dropping that constraint on SQLite needs a
+                    # full table rebuild. json.loads('null') is Python None, so
+                    # the row reads back with detail=None exactly as spec §1.4
+                    # requires, and the bytes are genuinely gone either way.
+                    # The salt gets '' for the same reason: a table the Go store
+                    # created declares it NOT NULL. Both read back as None.
+                    f"UPDATE {self._table} SET detail = 'null', detail_salt = '' "
+                    f"WHERE id IN ({placeholders}) AND (canonical_form_id = '2' OR hash = '')",
+                    tuple(ids),
+                )
+                conn.commit()
+            except BaseException:
+                # The UPDATE opened an implicit transaction; left open, this
+                # connection keeps the write lock and other writers get
+                # "database is locked".
+                conn.rollback()
+                raise
             return list(ids)
 
     def redact_expired(self, *, before: datetime,
@@ -796,7 +805,8 @@ class SQLiteStore:
             detail=json.loads(r["detail"]),
             shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
-            detail_salt=r["detail_salt"] if "detail_salt" in keys else None,
+            # '' (Go's column default, and what redaction writes) is no salt.
+            detail_salt=(r["detail_salt"] or None) if "detail_salt" in keys else None,
             detail_commitment=(
                 r["detail_commitment"] if "detail_commitment" in keys else None),
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
