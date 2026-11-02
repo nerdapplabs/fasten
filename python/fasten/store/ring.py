@@ -1,16 +1,8 @@
-"""
-In-memory ring buffer — fixed-size deque for syslog and api-log streams.
+"""Fixed-size in-memory buffer for the sys and api streams.
 
-Thread-safe, never blocks writers. Oldest entries drop off the tail when
-the buffer is full. Restarting the process clears it (intentional — these
-streams are for live observability, not durable storage).
-
-Filters are exact-match (including ``level``, matching the Go SDK and the
-stream store). The since/until window compares timestamps lexicographically:
-correct for the canonical UTC timestamps fasten's own writers stamp, but
-mixed formats ("…+00:00" vs "…Z", differing fractional precision) do not
-order lexicographically — keep caller-supplied timestamps in one canonical
-UTC format.
+The oldest rows are dropped when it is full, and it is empty after a restart.
+Filters are exact matches, as in the stream stores. since/until compare
+timestamps as strings, which only works for the canonical format.
 """
 from __future__ import annotations
 
@@ -20,12 +12,8 @@ from typing import Any
 
 
 def _row_ts(row: dict[str, Any]) -> str:
-    """Timestamp of a row for windowing, coalescing a missing or ``None`` value
-    to the empty string — matching the store's ``COALESCE(timestamp, '')`` so a
-    ring read and a store read window a timestamp-less row identically. Without
-    this, an explicit ``timestamp: None`` becomes ``str(None) == "None"``, which
-    sorts above real ISO timestamps and is silently kept where the store drops
-    it."""
+    """The row's timestamp as a string, "" if missing or None, like the
+    stores' ``COALESCE(timestamp, '')``."""
     t = row.get("timestamp")
     return "" if t is None else str(t)
 
@@ -78,9 +66,7 @@ class RingBuffer:
         return self._matching(**filters)[:limit]
 
     def count(self, **filters: Any) -> int:
-        """Total rows matching the filters in the ring's current window — the
-        uncapped counterpart of query(), so capped reads can report
-        truncation."""
+        """Number of rows matching the filters, with no limit."""
         return len(self._matching(**filters))
 
     def __len__(self) -> int:

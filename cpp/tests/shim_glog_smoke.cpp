@@ -1,9 +1,7 @@
-// P1-12 — glog → fasten syslog shim integration test.
-//
-// Compiled against the stub headers in tests/shim_stubs/ so no real glog
-// install is required. Tests:
+// fasten/shim/glog.hpp, built against the stubs in tests/shim_stubs/ so
+// glog need not be installed. Covers:
 //   1. install() populates the ring when send() is called
-//   2. Level mapping (INFO/WARNING/ERROR/FATAL → fasten level strings)
+//   2. Level mapping (INFO/WARNING/ERROR/FATAL to fasten levels)
 //   3. Recursion guard (no infinite re-entry)
 //   4. install() is idempotent (second call returns same pointer)
 
@@ -94,6 +92,6 @@ int main() {
     test_level_mapping();
     test_recursion_guard();
     test_install_idempotent();
-    std::cout << "\nALL P1-12 glog SHIM TESTS PASSED\n";
+    std::cout << "\nALL GLOG SHIM TESTS PASSED\n";
     return 0;
 }

@@ -19,7 +19,7 @@ int main() {
     // 1. sys row
     fasten::log::info("startup_ok", {{"lang", "cpp"}});
 
-    // 2. audit row with PII detail (flat Fields — no nested map in C++ adapter)
+    // 2. audit row with PII detail. C++ detail is flat, so no nested map.
     fasten::emit("USER_CREATED",
         fasten::target("u-42"),
         fasten::actor("admin", "user"),

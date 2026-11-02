@@ -4,7 +4,7 @@ package fasten
 
 import "testing"
 
-// PostgresStreamStore parity with the SQLite StreamStore (FR1). Integration-only
+// PostgresStreamStore must behave like the SQLite StreamStore. Integration-only
 // (needs a Postgres via FASTEN_TEST_POSTGRES_DSN and the lib/pq driver, as with
 // the audit Postgres tests): go test -tags integration ./...
 
@@ -41,14 +41,14 @@ func TestPostgresStreamStore_Parity(t *testing.T) {
 		t.Errorf("level filter should be exact-match: %v", r)
 	}
 
-	// status compared numerically (parsed to int) — the text-in-eq path
+	// status is compared numerically (parsed to int)
 	rows, err = s.Query(10, map[string]string{"status": "502"}, "", "")
 	must(t, err)
 	if len(rows) != 1 || rows[0]["request_id"] != "r-3" {
 		t.Errorf("status filter: %v", rows)
 	}
-	// non-canonical numeric form must still match the integer column (FR5-10;
-	// parity with the Python SDK, which binds status as int).
+	// a non-canonical numeric form still matches the integer column, as in
+	// the Python SDK, which binds status as int.
 	rows, err = s.Query(10, map[string]string{"status": "0502"}, "", "")
 	must(t, err)
 	if len(rows) != 1 || rows[0]["request_id"] != "r-3" {
@@ -95,10 +95,9 @@ func TestPostgresStreamStore_Parity(t *testing.T) {
 		t.Errorf("search escape: %v", esc)
 	}
 
-	// PR #59 test-coverage gap: the ESCAPE E'\\' construction that spec §9
-	// singles out is exercised only for % — but Postgres LIKE treats _ as a
-	// single-char wildcard, and \ becomes a metacharacter under that ESCAPE
-	// clause. If the query for either isn't escaped, they match too much.
+	// Postgres LIKE treats _ as a single-char wildcard, and \ is a
+	// metacharacter under the ESCAPE E'\\' clause (spec §9). Both must be
+	// escaped or they match too much.
 	must(t, s.Insert(map[string]any{"event": "a_b", "timestamp": "2026-08-01T00:00:07Z", "request_id": "r-u1"}))
 	must(t, s.Insert(map[string]any{"event": "aXb", "timestamp": "2026-08-01T00:00:08Z", "request_id": "r-u2"}))
 	uh, err := s.Search("a_b", "2026-01-01T00:00:00Z", "", 50)
@@ -109,7 +108,7 @@ func TestPostgresStreamStore_Parity(t *testing.T) {
 	// event c\d is stored in the JSON payload as c\\d (json.Marshal escapes the
 	// backslash), so the substring query over the payload carries two
 	// backslashes; each is escaped so it matches as data, not as the ESCAPE
-	// metacharacter. cXd must NOT match.
+	// metacharacter. cXd must not match.
 	must(t, s.Insert(map[string]any{"event": "c\\d", "timestamp": "2026-08-01T00:00:09Z", "request_id": "r-bs"}))
 	must(t, s.Insert(map[string]any{"event": "cXd", "timestamp": "2026-08-01T00:00:10Z", "request_id": "r-bs2"}))
 	bh, err := s.Search("c\\\\d", "2026-01-01T00:00:00Z", "", 50)

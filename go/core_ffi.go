@@ -12,8 +12,7 @@ import (
 	"unsafe"
 )
 
-// coreRedactJSON passes in_json through the Rust redaction engine and
-// returns the redacted JSON string.
+// coreRedactJSON redacts inJSON with fasten-core's default rules.
 func coreRedactJSON(inJSON string) (string, error) {
 	cs := C.CString(inJSON)
 	defer C.free(unsafe.Pointer(cs))
@@ -38,10 +37,9 @@ func coreRedactJSON(inJSON string) (string, error) {
 	return C.GoString(outJSON), nil
 }
 
-// coreRedactJSONFull redacts with extra key patterns and a custom replacement
-// token (extra value-shape patterns unused here). extraKeysJSON is a JSON array
-// of key strings ("" = none); replacement is the token for key-pattern hits
-// ("" = the core default "***"). Extra keys AUGMENT the built-in patterns.
+// coreRedactJSONFull redacts with extra key patterns added to the built-in
+// ones. extraKeysJSON is a JSON array of patterns ("" for none); replacement
+// is used for key matches ("" means the core default "***").
 func coreRedactJSONFull(inJSON, extraKeysJSON, replacement string) (string, error) {
 	cIn := C.CString(inJSON)
 	defer C.free(unsafe.Pointer(cIn))
@@ -75,8 +73,8 @@ func coreRedactJSONFull(inJSON, extraKeysJSON, replacement string) (string, erro
 	return C.GoString(outJSON), nil
 }
 
-// coreRegisterCodes delegates code registration to the Rust catalog engine.
-// On validation failure the Rust error string is returned as a Go error.
+// coreRegisterCodes registers codes in fasten-core's catalog. Validation
+// errors from the core are returned as Go errors.
 func coreRegisterCodes(domain, codesJSON string) error {
 	cDomain := C.CString(domain)
 	defer C.free(unsafe.Pointer(cDomain))
@@ -97,8 +95,7 @@ func coreRegisterCodes(domain, codesJSON string) error {
 	return nil
 }
 
-// coreMetaOfJSON looks up a single code in the Rust registry and returns
-// its JSON representation, or "{}" when not found.
+// coreMetaOfJSON returns the code's metadata as JSON, or "{}" if unknown.
 func coreMetaOfJSON(code string) (string, error) {
 	cs := C.CString(code)
 	defer C.free(unsafe.Pointer(cs))
@@ -119,8 +116,7 @@ func coreMetaOfJSON(code string) (string, error) {
 	return C.GoString(outJSON), nil
 }
 
-// coreRegistryClear wipes the Rust global registry. Call in test teardown
-// whenever programmatic Register() calls must be rolled back.
+// coreRegistryClear empties fasten-core's catalog. Used by tests.
 func coreRegistryClear() {
 	C.fasten_registry_clear()
 }
