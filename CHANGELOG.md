@@ -127,8 +127,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   as Python) around its schema bootstrap, so stores opening a fresh database
   at once no longer fail on a duplicate `pg_type` key.
 - Spec: §8.2 (allocation without sealing), §2 and §2.1 state `prev_hash`
-  comes from the node's last sealed row, and §7.1 makes redacting unsealed
-  rows the rule for every SDK.
+  comes from the node's last sealed row, §2.1 makes the node-keyed
+  `pg_advisory_xact_lock` the required Postgres lock, and §7.1 makes
+  redacting unsealed rows the rule for every SDK.
 
 ### Fixed — PostgresStore idle-in-transaction deadlock (Python)
 

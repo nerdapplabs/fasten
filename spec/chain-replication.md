@@ -201,8 +201,11 @@ node's sealed row (`hash <> ''`) with the highest `monotonic_seq`, or
 `"genesis"` when the node has no sealed row.
 
 The transaction MUST serialise against concurrent allocations for the same
-`source_node_id` (SQLite: `BEGIN IMMEDIATE`; Postgres: `SELECT … FOR UPDATE` on
-the node's tip row, or a node-scoped advisory lock).
+`source_node_id`. SQLite: `BEGIN IMMEDIATE`. Postgres: the transaction MUST
+first run `SELECT pg_advisory_xact_lock(hashtextextended(source_node_id, 0))`.
+Every SDK takes this same lock, so writers from different SDKs on one table
+exclude each other; `SELECT … FOR UPDATE` on the tip row does not, and locks
+nothing when the node has no rows yet.
 
 ### §2.2 Sealing
 
@@ -303,8 +306,7 @@ predates form `"2"`.
 
 An unsealed row (`hash = ""`) is not in the chain, so SDKs MUST redact it
 like any other candidate, whatever its `canonical_form_id`; the form-`"1"`
-refusal above applies only to sealed rows. The Python and Go SDKs still skip
-unsealed form-`"1"` rows and need a follow-up to conform.
+refusal above applies only to sealed rows.
 
 ### §7.2 The redaction event
 
