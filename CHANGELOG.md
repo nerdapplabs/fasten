@@ -55,14 +55,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   Rows reported lost past the deadline go to stderr and the ring but not
   the syslog store. A left-behind call that later stores its row emits
   `audit_drain_recovered_at_stop`. The exit hook calls `close(5.0)`, so a
-  hanging store no longer holds interpreter exit. If a store call is still
-  running after that, the hook flushes stdout, stderr and logging handlers
-  and ends the process with `os._exit`, skipping interpreter finalization
-  (where CPython before 3.14 can abort on the stuck thread) and any atexit
-  hooks registered before fasten's. The exit status is kept: the last
-  `sys.exit()` code on the main thread, 1 after an uncaught exception, 0
-  otherwise. Emits after `close` are stored inline without an
-  `audit_drain_abandoned` event.
+  hanging store no longer holds interpreter exit, and the process exits
+  normally: exit status and other atexit hooks are unaffected. Emits after
+  `close` are stored inline without an `audit_drain_abandoned` event.
+- The drainer's store calls run on a Python thread (`fasten-store`, one
+  per drainer); fasten-core's drain thread waits for each. A store call
+  left behind at exit can no longer abort the process during interpreter
+  finalization (CPython before 3.14 on Linux).
 
 ### Added — Unified correlation, search & stream persistence (gh #58, Python + Go)
 

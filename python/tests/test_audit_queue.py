@@ -805,8 +805,10 @@ class HangingStore(FlakyStore):
 
 def _release_hung_store(store):
     store.release.set()
+    installed = _default._drainer
     for t in threading.enumerate():
-        if t.name == "fasten-retire":
+        if t.name == "fasten-retire" or (
+                t.name == "fasten-store" and (installed is None or t is not installed.worker)):
             t.join(timeout=5)
 
 
@@ -961,6 +963,8 @@ def test_emit_after_close_is_stored_without_an_abandoned_event(tmp_path):
     assert not fasten.emit(code="USER_CREATED", target="u-2").hash
 
 
+
+
 _EXIT_SCRIPT = """
 import atexit, sys, time, fasten
 from fasten.codes import Meta, RetentionClass, Severity, register
@@ -968,16 +972,17 @@ from fasten.store.sqlite import SQLiteStore
 
 atexit.register(print, "earlier hook ran")
 
-class Hanging(SQLiteStore):
+class Store(SQLiteStore):
     def allocate_and_insert_originated(self, row):
-        while {stuck}:
+        until = time.monotonic() + {hang}
+        while time.monotonic() < until:
             time.sleep(0.01)
         return super().allocate_and_insert_originated(row)
 
 register("t", {{"USER_CREATED": Meta(domain="t", category="auth", action="create",
     severity=Severity.INFO, description="x", emitter="t",
     retention_class=RetentionClass.LONG)}})
-fasten.init(service_id="svc", node_id="node", audit_store=Hanging({db!r}))
+fasten.init(service_id="svc", node_id="node", audit_store=Store({db!r}))
 for i in range(3):
     fasten.emit(code="USER_CREATED", target=f"u-{{i}}")
 time.sleep(0.2)
@@ -986,9 +991,9 @@ print("buffered output")
 """
 
 
-def _run_exit_script(tmp_path, stuck, ending):
+def _run_exit_script(tmp_path, hang, ending):
     import subprocess
-    script = _EXIT_SCRIPT.format(stuck=stuck, db=str(tmp_path / "a.db"), ending=ending)
+    script = _EXIT_SCRIPT.format(hang=hang, db=str(tmp_path / "a.db"), ending=ending)
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=30, env={**os.environ, "PYTHONPATH": os.getcwd()})
 
@@ -1001,26 +1006,38 @@ def _printed(proc):
 @pytest.mark.parametrize("ending,status", [
     ("assert not fasten.close(timeout=0.3)", 0),
     ("fasten.close(timeout=0.3); sys.exit(3)", 3),
+    ("fasten.close(timeout=0.3); raise SystemExit(4)", 4),
     ("fasten.close(timeout=0.3); raise RuntimeError('boom')", 1),
     pytest.param("fasten.close(timeout=0.3); raise KeyboardInterrupt", -2,
                  marks=pytest.mark.skipif(os.name != "posix", reason="POSIX signal status")),
     ("pass", 0),    # the exit hook's own close gives up
 ])
 def test_exit_is_not_held_by_a_hanging_store(tmp_path, ending, status):
+    # On CPython before 3.14 on Linux, a drain thread still inside the
+    # insert callback at finalization aborted the process.
     start = time.monotonic()
-    proc = _run_exit_script(tmp_path, True, ending)
+    proc = _run_exit_script(tmp_path, 3600, ending)
     assert proc.returncode == status, proc.stderr
     assert time.monotonic() - start < 15
     lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
     assert len(lost) == 3
-    # Finalization was skipped, after stdout was flushed.
-    assert _printed(proc) == ["buffered output"]
+    assert _printed(proc) == ["buffered output", "earlier hook ran"]
+
+
+@pytest.mark.parametrize("hang", [0.25, 0.3, 0.35])
+def test_exit_as_a_left_behind_store_call_returns(tmp_path, hang):
+    # The store call close gave up on returns around the time the
+    # interpreter finalizes.
+    proc = _run_exit_script(tmp_path, hang, "fasten.close(timeout=0.3)")
+    assert proc.returncode == 0, proc.stderr
+    assert _printed(proc) == ["buffered output", "earlier hook ran"]
 
 
 @pytest.mark.parametrize("ending,status", [("pass", 0), ("sys.exit(3)", 3),
+                                           ("raise SystemExit(4)", 4),
                                            ("raise RuntimeError('boom')", 1)])
 def test_exit_with_a_working_store_finalizes_as_usual(tmp_path, ending, status):
-    proc = _run_exit_script(tmp_path, False, ending)
+    proc = _run_exit_script(tmp_path, 0, ending)
     assert proc.returncode == status, proc.stderr
     assert _printed(proc) == ["buffered output", "earlier hook ran"]
     assert len(SQLiteStore(str(tmp_path / "a.db")).query(limit=10)) == 3

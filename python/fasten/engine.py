@@ -19,18 +19,16 @@ from __future__ import annotations
 import atexit
 import contextlib
 import dataclasses
-import functools
 import json
 import logging
 import math
 import os
-import signal
-import sys
+import queue
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterator, NoReturn, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .attrs import AuditRow
 from .canonical_ts import canonical_now
@@ -180,9 +178,65 @@ class _QueueDrainer:
     lost: int = 0                       # rows dead-lettered or lost at stop
     reported: bool = False              # rows left at stop have been reported
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    # The store thread's calls; see call_on_worker.
+    calls: queue.SimpleQueue = dataclasses.field(default_factory=queue.SimpleQueue)
+    inflight: Optional[_StoreCall] = None
+    abandoned: bool = False             # close gave up: no more waiting on the store
+    worker: Optional[threading.Thread] = None
+    drain_ident: Optional[int] = None   # fasten-core's drain thread
+    drain_stopped: threading.Event = dataclasses.field(default_factory=threading.Event)
 
     def past_deadline(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def call_on_worker(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Run ``fn`` on the store thread and wait for its result; None once
+        close has given up on this drainer.
+
+        For fasten-core's drain thread. On CPython before 3.14 a thread that
+        takes the GIL after finalization has begun is ended with
+        pthread_exit, and the unwind aborts the process when it reaches the
+        drain thread's Rust frames. So the store call, which may hang, runs
+        on a Python thread, and the drain thread waits in a lock acquire
+        with no timeout. Only the store thread or close giving up wakes it,
+        and the exit hook gives up before finalization."""
+        call = _StoreCall(fn, args)
+        with self.lock:
+            if self.abandoned:
+                return None
+            self.inflight = call
+        self.calls.put(call)
+        call.done.acquire()
+        return call.result
+
+    def settle(self, call: _StoreCall, result: Any) -> None:
+        with self.lock:
+            if call.result is not _UNSET:
+                return
+            call.result = result
+            if self.inflight is call:
+                self.inflight = None
+        call.done.release()
+
+    def abandon(self) -> None:
+        """Fail the store call in flight now and later ones without making them."""
+        with self.lock:
+            self.abandoned = True
+            call = self.inflight
+        if call is not None:
+            self.settle(call, 1)
+
+    def run_store_calls(self) -> None:
+        while True:
+            call = self.calls.get()
+            if call is None:
+                return
+            try:
+                result = call.fn(*call.args)
+            except BaseException:  # noqa: BLE001 — the drain thread is waiting on it
+                logging.getLogger("fasten").exception("drainer store call failed")
+                result = 1
+            self.settle(call, result)
 
 
 def _rejects_row(exc: BaseException) -> bool:
@@ -191,57 +245,16 @@ def _rejects_row(exc: BaseException) -> bool:
     return any(c.__name__ in ("DataError", "IntegrityError") for c in type(exc).__mro__)
 
 
-# The status of the last sys.exit() on the main thread. CPython clears the
-# SystemExit before atexit hooks run, so this is the only way the exit hook
-# can learn it.
-_exit_code: Any = None
+_UNSET: Any = object()
 
 
-def _record_exit_codes() -> None:
-    real_exit = sys.exit
-    if getattr(real_exit, "_fasten_records", False):
-        return
+class _StoreCall:
+    __slots__ = ("fn", "args", "result", "done")
 
-    @functools.wraps(real_exit)
-    def recording_exit(status: Any = None) -> NoReturn:
-        global _exit_code
-        if threading.current_thread() is threading.main_thread():
-            _exit_code = status
-        real_exit(status)
-
-    recording_exit._fasten_records = True    # type: ignore[attr-defined]
-    sys.exit = recording_exit
-
-
-def _exit_without_finalizing() -> None:
-    """End the process from an atexit hook with the status the interpreter
-    was exiting with, skipping finalization and the atexit hooks not yet
-    run."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            if stream is not None:
-                stream.flush()
-        except Exception:  # noqa: BLE001
-            pass
-    logging.shutdown()
-    # PyErr_Print sets these for an uncaught exception; the REPL also sets
-    # them for each error it prints.
-    exc = None if hasattr(sys, "ps1") else getattr(sys, "last_exc", None) or getattr(sys, "last_value", None)
-    if isinstance(exc, KeyboardInterrupt):
-        # As CPython ends a process on an unhandled Ctrl-C.
-        if os.name == "posix":
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            os.kill(os.getpid(), signal.SIGINT)
-        status = 128 + signal.SIGINT
-    elif exc is not None and not isinstance(exc, SystemExit):
-        status = 1
-    elif _exit_code is None:
-        status = 0
-    elif isinstance(_exit_code, int):
-        status = _exit_code
-    else:
-        status = 1  # CPython printed the message already
-    os._exit(status)
+    def __init__(self, fn: Callable[..., Any], args: tuple[Any, ...]) -> None:
+        self.fn, self.args, self.result = fn, args, _UNSET
+        self.done = threading.Lock()
+        self.done.acquire()
 
 
 class Engine:
@@ -280,7 +293,7 @@ class Engine:
         self._fork_lock: Optional[threading.Lock] = None   # the one held across fork()
         self._closed = False    # close() has run and init has not since
         self._atexit_registered = False
-        self._retire_threads: list[threading.Thread] = []   # started by close()
+        self._retiring: list[_QueueDrainer] = []
         self._last_init_at: Optional[datetime] = None
 
         # Engine-side "at least one audit-store insert was swallowed" flag.
@@ -785,16 +798,7 @@ class Engine:
         (audit_drain_lost_at_stop), and a store call still running is left
         behind (audit_drain_recovered_at_stop if it later stores its row).
         Emits after close are stored inline. Returns False if a row was
-        lost.
-
-        The exit hook calls ``close(5.0)``. If a store call is still running
-        after that, the hook ends the process with ``os._exit``: a thread
-        waking during interpreter finalization can abort the process on
-        CPython before 3.14. It flushes stdout, stderr and the logging
-        handlers first and keeps the exit status (that of the last
-        ``sys.exit()`` on the main thread, 1 after an uncaught exception, 0
-        otherwise), but atexit hooks registered before fasten's first
-        ``init`` do not run."""
+        lost. The exit hook calls ``close(5.0)``."""
         deadline = time.monotonic() + timeout
         with self._drainer_lock:
             self._closed = True
@@ -810,13 +814,9 @@ class Engine:
             t = threading.Thread(target=self._retire_drainer, args=(old, 0),
                                  name="fasten-retire", daemon=True)
             t.start()
-            self._retire_threads = [x for x in self._retire_threads if x.is_alive()] + [t]
             t.join(max(0.0, deadline - time.monotonic()))
             if t.is_alive():
-                self._report_unstored(old)
-                # The stuck call keeps the old lock; fork() and a later
-                # drainer must not wait for it.
-                self._insert_lock = threading.Lock()
+                self._give_up(old)
         return d.lost == lost
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
@@ -1103,8 +1103,18 @@ class Engine:
                          max_attempts=max_attempts)
 
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
+            try:
+                d.drain_ident = threading.get_ident()
+                if d.past_deadline():
+                    return 1    # close reports it lost
+                rc = d.call_on_worker(_insert, row_json)
+                return 1 if rc is None else rc
+            except BaseException:  # noqa: BLE001 — must not escape: ctypes would return 0, "stored"
+                return 1
+
+        def _insert(row_json: bytes) -> int:
             if d.past_deadline():
-                return 1    # close reports it lost
+                return 1
             row_id = "<unparsed>"
             try:
                 row_id = json.loads(row_json.decode("utf-8"))["id"]
@@ -1121,7 +1131,7 @@ class Engine:
                 if recovered:
                     self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
                 return 0
-            except BaseException as e:  # noqa: BLE001 — must not escape: ctypes would return 0, "stored"
+            except BaseException as e:  # noqa: BLE001 — a failed insert, never "stored"
                 cb_logger.exception("insert_cb failed for row %s", row_id)
                 rejected = _rejects_row(e)
                 failed = pending.get(row_id)
@@ -1133,37 +1143,53 @@ class Engine:
                 return _ffi.INSERT_REJECTED if rejected else 1
 
         def _sys_cb(event_json: bytes, _userdata: int) -> None:
-            # fasten-core's drainer events join the sys stream (spec §4).
+            # fasten-core's drainer events join the sys stream (spec §4). The
+            # drain thread's go through the store thread too: the syslog
+            # store can hang like the audit store.
             try:
-                fields = json.loads(event_json.decode("utf-8"))
-                # A row still pending failed its one try at stop; retire then
-                # stores it or reports it lost, so this would count it twice.
-                if fields.get("event") in ("audit_drain_dead_letter", "audit_drain_lost_at_stop") and (
-                        d.reported or fields.get("row_id") in pending):
+                if (threading.get_ident() == d.drain_ident and not d.past_deadline()
+                        and d.call_on_worker(_sys_event, event_json) is not None):
                     return
-                fields.pop("shape", None)
-                fields.pop("timestamp", None)
-                self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields, via=d)
-            except Exception:  # noqa: BLE001 — a sys event must not fail the drainer
+                _sys_event(event_json)
+            except BaseException:  # noqa: BLE001 — a sys event must not fail the drainer
                 cb_logger.exception("drainer sys event failed: %r", event_json)
+
+        def _sys_event(event_json: bytes) -> int:
+            fields = json.loads(event_json.decode("utf-8"))
+            # A row still pending failed its one try at stop; retire then
+            # stores it or reports it lost, so this would count it twice.
+            if fields.get("event") in ("audit_drain_dead_letter", "audit_drain_lost_at_stop") and (
+                    d.reported or fields.get("row_id") in pending):
+                return 0
+            fields.pop("shape", None)
+            fields.pop("timestamp", None)
+            self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields, via=d)
+            return 0
 
         cb = _ffi.InsertCallbackFn(_insert_cb)
         sys_cb = _ffi.SysLogCallbackFn(_sys_cb)
-        new_handle = _ffi.store_from_callback(cb)
-        _ffi.drainer_install(
-            new_handle,
-            capacity=capacity,
-            retry_initial_ms=retry_initial_ms,
-            retry_max_ms=retry_max_ms,
-            retry_jitter=retry_jitter,
-            max_attempts=max_attempts,
-            sys_log=sys_cb,
-        )
+        d.worker = threading.Thread(target=d.run_store_calls, name="fasten-store", daemon=True)
+        d.worker.start()
+        try:
+            new_handle = _ffi.store_from_callback(cb)
+            _ffi.drainer_install(
+                new_handle,
+                capacity=capacity,
+                retry_initial_ms=retry_initial_ms,
+                retry_max_ms=retry_max_ms,
+                retry_jitter=retry_jitter,
+                max_attempts=max_attempts,
+                sys_log=sys_cb,
+            )
+        except BaseException:
+            d.calls.put(None)
+            raise
         d.handle, d.callback, d.sys_callback = new_handle, cb, sys_cb
         with self._drainer_lock:
             old, self._drainer = self._drainer, d
+            if old is not None:
+                self._retiring.append(old)
         if not self._atexit_registered:
-            _record_exit_codes()
             atexit.register(self._atexit_close)
             if hasattr(os, "register_at_fork"):
                 os.register_at_fork(before=self._insert_lock_before_fork,
@@ -1192,6 +1218,7 @@ class Engine:
         self._drainer_lock = threading.Lock()
         self._drainer_idle = threading.Condition(self._drainer_lock)
         self._insert_lock = threading.Lock()
+        self._retiring = []     # their threads are the parent's
         old, self._drainer = self._drainer, None
         if old is not None:
             try:
@@ -1200,8 +1227,11 @@ class Engine:
                 logging.getLogger("fasten").exception("drainer reinstall after fork failed")
 
     def _take_drainer(self) -> Optional[_QueueDrainer]:
+        """Uninstall the drainer, for the caller to retire."""
         with self._drainer_lock:
             old, self._drainer = self._drainer, None
+            if old is not None:
+                self._retiring.append(old)
         return old
 
     def _uninstall_drainer(self) -> None:
@@ -1211,12 +1241,22 @@ class Engine:
 
     def _retire_drainer(self, d: _QueueDrainer, flush_ms: int) -> None:
         """Stop a drainer that is no longer installed and store what it didn't."""
+        try:
+            self._stop_drainer(d, flush_ms)
+        finally:
+            d.calls.put(None)       # ends the store thread once it is free
+            with self._drainer_lock:
+                if d in self._retiring:
+                    self._retiring.remove(d)
+
+    def _stop_drainer(self, d: _QueueDrainer, flush_ms: int) -> None:
         if flush_ms:
             _ffi.drainer_flush(d.handle, flush_ms)
         # Close refuses new rows and waits for the drain thread, so the
         # callback is not called after it returns. Calls still using the
         # handle get an error and store their row inline.
         _ffi.drainer_close(d.handle)
+        d.drain_stopped.set()
         with self._drainer_lock:
             self._drainer_idle.wait_for(lambda: d.users == 0)
         _ffi.store_close(d.handle)
@@ -1246,6 +1286,15 @@ class Engine:
             self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
         self._report_unstored(d)
 
+    def _give_up(self, d: _QueueDrainer) -> None:
+        """Past the deadline: report the rows ``d`` still holds as lost and
+        wake its drain thread from a store call still running."""
+        self._report_unstored(d)
+        d.abandon()
+        # The stuck call keeps the old lock; fork() and a later drainer
+        # must not wait for it.
+        self._insert_lock = threading.Lock()
+
     def _report_unstored(self, d: _QueueDrainer) -> None:
         """Report the rows a retiring drainer still holds as lost, once."""
         with d.lock:
@@ -1272,10 +1321,20 @@ class Engine:
             }, via=d, persist=not d.past_deadline())
 
     def _atexit_close(self) -> None:
+        deadline = time.monotonic() + 5.0
         self.close(5.0)
         self._stop_retention_threads()
-        if any(t.is_alive() for t in self._retire_threads):
-            _exit_without_finalizing()
+        # Every drain thread must be gone before finalization (see
+        # call_on_worker). Give up on drainers still retiring by the
+        # deadline, which lets their drain threads finish.
+        with self._drainer_lock:
+            retiring = list(self._retiring)
+        for d in retiring:
+            if not d.drain_stopped.wait(max(0.0, deadline - time.monotonic())):
+                self._give_up(d)
+        grace = time.monotonic() + 2.0
+        for d in retiring:
+            d.drain_stopped.wait(max(0.0, grace - time.monotonic()))
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────
