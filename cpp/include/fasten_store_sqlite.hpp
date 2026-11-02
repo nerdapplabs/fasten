@@ -1,4 +1,4 @@
-// fasten_store_sqlite.hpp — header-only SQLite audit store for fasten.hpp
+// fasten_store_sqlite.hpp: header-only SQLite audit store for fasten.hpp
 //
 // Requires: sqlite3 development headers + library
 // CMake:    target_link_libraries(mytarget PRIVATE SQLite3::SQLite3)
@@ -28,13 +28,12 @@ namespace fasten {
 
 class SqliteStore {
 public:
-    /// Open (or create) the SQLite database at `path`, bootstrap the audit
-    /// table + indexes, and prepare the INSERT statement.
+    /// Open or create the database at `path`, create the audit table and
+    /// indexes if missing, and prepare the INSERT statement.
     ///
-    /// `path`  — filesystem path, or ":memory:" for in-process databases.
-    /// `table` — table name; must match [A-Za-z_][A-Za-z0-9_]*.
-    /// `wal`   — if true (default) enables WAL journal mode for better
-    ///           write concurrency. Ignored for ":memory:" databases.
+    /// `path`:  file path, or ":memory:".
+    /// `table`: must match [A-Za-z_][A-Za-z0-9_]*.
+    /// `wal`:   enable WAL journal mode (default true). Ignored for ":memory:".
     explicit SqliteStore(const std::string& path,
                          const std::string& table = "audit_log",
                          bool wal = true)
@@ -66,7 +65,7 @@ public:
     SqliteStore(const SqliteStore&)            = delete;
     SqliteStore& operator=(const SqliteStore&) = delete;
 
-    /// Insert one audit row. Thread-safe via internal mutex.
+    /// Insert one audit row. Thread-safe.
     void insert(const Row& row) {
         std::string detail_json = detail_::fields_to_json(row.detail);
         int         pii_int     = row.pii_in_detail ? 1 : 0;

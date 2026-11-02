@@ -51,7 +51,7 @@ public struct Meta: Sendable {
     }
 }
 
-// Thread-safe global code registry — pure Swift, no native dependencies.
+// Process-wide code registry, guarded by a lock.
 final class CodeRegistry: @unchecked Sendable {
     static let shared = CodeRegistry()
     private var cache: [Code: Meta] = [:]
@@ -62,7 +62,7 @@ final class CodeRegistry: @unchecked Sendable {
     }()
 
     func register(_ domain: String, _ codes: [Code: Meta]) {
-        // Two-pass: validate all before committing any.
+        // Validate every entry before adding any, so a bad batch adds nothing.
         for (key, meta) in codes {
             let range = NSRange(key.startIndex..., in: key)
             guard CodeRegistry.upperSnakeRE.firstMatch(in: key, range: range) != nil else {

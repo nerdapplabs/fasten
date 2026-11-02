@@ -1,7 +1,7 @@
-"""FR3 — constrained free-text search over persisted sys history.
+"""Free-text search over persisted stream history.
 
-sys-only, opt-in (search.enabled), since= mandatory, hard-capped, no ranking.
-A match returns its request_id so a consumer can hand it to /correlate.
+Opt-in (search_enabled), since= required, capped, no ranking. Each match
+carries its request_id for a follow-up /correlate.
 """
 import pytest
 
@@ -79,12 +79,11 @@ def test_search_since_mandatory():
 
 
 def test_search_requires_persistence():
-    _init(search=True, with_store=False)  # ring-only sys — no durable history
+    _init(search=True, with_store=False)  # ring-only sys
     _seed()
     body = _client().get("/api/v1/logs/search", params={"q": "reset", "since": SINCE}).json()
-    # Per-stream error since #16: ring-only sys reports errors.sys, not a
-    # top-level error (a global error is only for policy failures like
-    # search-disabled or since-missing).
+    # A missing store is a per-stream error. The top-level error is only for
+    # policy failures such as search disabled or since missing.
     assert "persistence" in body["errors"]["sys"]
 
 
@@ -106,32 +105,30 @@ def test_search_wildcard_escaped():
     t.push_syslog({"event": "100%done", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-w"})
     t.push_syslog({"event": "100XYZdone", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
     body = _client().get("/api/v1/logs/search", params={"q": "100%done", "since": SINCE}).json()
-    assert body["counts"]["sys"] == 1  # literal %, not a LIKE wildcard → only r-w
+    assert body["counts"]["sys"] == 1  # literal %, not a LIKE wildcard
     assert body["matches"][0]["request_id"] == "r-w"
 
 
 def test_search_wildcard_escaped_underscore():
     # `_` is the single-char LIKE wildcard; it must be escaped to match literally.
-    # Regression guard for the escape order in stream.py / stream_store.go.
     _init(search=True)
     t = fasten.transport()
     t.push_syslog({"event": "ab_cd", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-u"})
     t.push_syslog({"event": "abXcd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
     body = _client().get("/api/v1/logs/search", params={"q": "ab_cd", "since": SINCE}).json()
-    assert body["counts"]["sys"] == 1  # literal _, not a wildcard → only r-u (not abXcd)
+    assert body["counts"]["sys"] == 1  # literal _, so abXcd does not match
     assert body["matches"][0]["request_id"] == "r-u"
 
 
 def test_search_backslash_escaped():
-    # `\` is the ESCAPE char itself; it must be escaped so it is matched as data,
-    # not treated as a metacharacter that consumes the next char. The event value
-    # c\d (one backslash) is stored in the JSON payload as c\\d.
+    # `\` is the ESCAPE char, so it must itself be escaped to match as data.
+    # The event value c\d (one backslash) is stored in the JSON payload as c\\d.
     _init(search=True)
     t = fasten.transport()
     t.push_syslog({"event": "c\\d", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-bs"})
     t.push_syslog({"event": "cXd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-dec"})
     body = _client().get("/api/v1/logs/search", params={"q": "c\\\\d", "since": SINCE}).json()
-    assert body["counts"]["sys"] == 1  # backslashes matched literally → only r-bs
+    assert body["counts"]["sys"] == 1  # backslashes matched literally
     assert body["matches"][0]["request_id"] == "r-bs"
 
 
@@ -149,18 +146,14 @@ def test_sys_q_param_gated_and_bounded():
 
 
 def test_search_non_ascii_utf8(tmp_path):
-    """PR #59 finding 7: json.dumps default ensure_ascii=True stored 'café'
-    as '\\u00e9'; a search for the raw UTF-8 substring returned zero.
-    ensure_ascii=False keeps the row bytes queryable and matches Go's
-    json.Marshal, which never escapes."""
+    """Payloads are stored with ensure_ascii=False, so a UTF-8 substring
+    matches. With escaping, 'café' would be stored as 'caf\\u00e9'."""
     _init(search=True)
     t = fasten.transport()
     t.push_syslog({"event": "de.prüfung.failed", "message": "Prüfung fehlgeschlagen",
                    "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-de"})
     t.push_syslog({"event": "fr.café.opened",
                    "timestamp": "2026-08-01T00:00:01Z", "request_id": "r-fr"})
-    # Substring q= over the UTF-8 payload must match; with ensure_ascii=True
-    # the store held '\\u00fc' / '\\u00e9', so these q= values missed.
     for q, expected_rid in (("prüfung", "r-de"), ("café", "r-fr")):
         body = _client().get(
             "/api/v1/logs/search", params={"q": q, "since": SINCE}
@@ -170,8 +163,7 @@ def test_search_non_ascii_utf8(tmp_path):
 
 
 def test_search_streams_param_rejects_unknown():
-    """?streams=foo must fail loudly — a typo silently searching sys is
-    the exact "silent narrowing" the finding #6 fix prevented on /sys?q=."""
+    """A typo in ?streams= is a 400 rather than a narrower search."""
     _init(search=True)
     _seed()
     resp = _client().get(
@@ -183,8 +175,7 @@ def test_search_streams_param_rejects_unknown():
 
 
 def test_search_api_stream():
-    """PR #59 finding 16 (phase0 restoration): /search?streams=api must
-    scan persisted api history the same way sys does."""
+    """?streams=api searches persisted api history the same way as sys."""
     from fasten.store.stream import StreamStore
     fasten.init(
         service_id="svc", node_id="n",
@@ -209,9 +200,7 @@ def test_search_api_stream():
 
 
 def test_search_audit_stream():
-    """PR #59 finding 16 restoration: /search?streams=audit scans the
-    detail column so operators can find rows by an error string they only
-    have from a support ticket."""
+    """?streams=audit searches the detail column."""
     _init(search=True)
     fasten.emit(code="USER_CREATED", target="u-99", actor="a",
                 detail={"message": "onboarding hit gateway timeout on retry"})
@@ -225,9 +214,8 @@ def test_search_audit_stream():
 
 
 def test_search_all_three_streams_fan_out():
-    """?streams=audit,api,sys returns matches from every named stream that
-    has a store. Stream order in the response is stable (sys → api → audit)
-    for UI-friendly tab rendering."""
+    """Matches come from every named stream with a store, always in the
+    order sys, api, audit."""
     from fasten.store.stream import StreamStore
     fasten.init(
         service_id="svc", node_id="n",
@@ -255,9 +243,8 @@ def test_search_all_three_streams_fan_out():
 
 
 def test_search_stream_without_store_reports_per_stream_error():
-    """?streams=api on a ring-only api engine must NOT return an empty
-    counts.api=0 with no explanation — that would read as "no matches"
-    when the caller actually has no store. Per-stream errors dict."""
+    """A stream with no store reports errors[stream], so counts=0 isn't read
+    as "no matches"."""
     _init(search=True)  # syslog_store attached, api_store not
     body = _client().get(
         "/api/v1/logs/search",
@@ -269,9 +256,8 @@ def test_search_stream_without_store_reports_per_stream_error():
 
 
 def test_sys_q_param_rejects_structured_filter_combination():
-    """PR #59 finding 6: /sys?q=... combined with a structured filter
-    (level/request_id/service_id/event) must 400, not silently discard the
-    filter. Parity with the existing /api?q= reject policy."""
+    """/sys?q= with a structured filter (level, request_id, service_id,
+    event) is a 400 rather than ignoring the filter."""
     _init(search=True)
     _seed()
     c = _client()
@@ -283,6 +269,5 @@ def test_sys_q_param_rejects_structured_filter_combination():
         assert resp.status_code == 400, (
             f"chip={chip} should 400 (structured + q=); got {resp.status_code} {resp.text}"
         )
-        # The error names the dropped chip so the caller knows which filter
-        # was refused, not just "bad request".
+        # The error names the refused filter.
         assert chip in resp.json()["detail"]

@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// FR1 — opt-in persistence for the api/sys streams. When a StreamStore is
+// Opt-in persistence for the api/sys streams. When a StreamStore is
 // attached the ring stays the hot write path and the store is a write-through
 // sink; reads come from the store (durable history) and the completeness flag
 // flips ring -> store. With no store, behaviour is unchanged (ring-only).
@@ -46,7 +46,7 @@ func TestStreamStore_RoundtripAndFilter(t *testing.T) {
 	if len(one) != 1 || one[0]["path"] != "/v1/checkout" {
 		t.Fatalf("request_id filter: got %v", one)
 	}
-	// method/path are exact-match — parity with the ring and the Python SDK.
+	// method/path are exact-match, as in the ring.
 	if got, _ := s.Query(100, map[string]string{"method": "POST"}, "", ""); len(got) != 1 {
 		t.Errorf("method=POST exact: got %d, want 1", len(got))
 	}
@@ -173,11 +173,9 @@ func must(t *testing.T, err error) {
 }
 
 func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
-	// A swallowed persist failure must not leave completeness lying: reads
-	// for a store-backed stream come only from the store, so a row that
-	// failed to persist is silently missing — the flag degrades to
-	// "store-degraded" instead of asserting durability. Sticky: recovery of
-	// the sink does not clear it (the hole in history remains).
+	// Reads for a store-backed stream come only from the store, so a row
+	// that failed to persist is missing. The flag degrades to
+	// "store-degraded" and stays there after the sink recovers.
 	resetGlobals(t)
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -187,8 +185,8 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStreamStore: %v", err)
 	}
-	// A real audit store on its own DB, so "audit unaffected" below is a
-	// genuine store-backed audit — not the old unconditional default.
+	// A real audit store on its own DB, so "audit unaffected" below checks
+	// a store-backed audit stream.
 	auditDB, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open (audit): %v", err)
@@ -208,16 +206,15 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 		t.Fatalf("healthy sink: completeness=%v, want store", comp["api"])
 	}
 
-	db.Close() // sink fails from here on: every Insert errors
+	// The sink fails from here on: every Insert errors.
+	db.Close()
 	tr.PushAPI(APIRow{"method": "GET", "path": "/lost", "request_id": "r1"}) // must not panic
 
 	if !apiStore.Degraded() || apiStore.WriteFailures() != 1 {
 		t.Fatalf("degraded=%v failures=%d, want true/1", apiStore.Degraded(), apiStore.WriteFailures())
 	}
-	// /api reads now fail (store is closed), but /correlate's completeness
-	// block and streamSource are what carry the degraded class; check the
-	// engine-level classification directly plus the correlate response shape
-	// is exercised elsewhere — here assert streamSource via Default.
+	// /api reads now fail (store is closed), so check streamSource directly.
+	// The /correlate response shape is covered elsewhere.
 	if got := Default.streamSource("api"); got != "store-degraded" {
 		t.Fatalf("streamSource(api)=%q, want store-degraded", got)
 	}
