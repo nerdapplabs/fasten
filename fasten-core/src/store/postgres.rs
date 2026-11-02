@@ -587,9 +587,11 @@ fn migrate(
     )?;
 
     let missing = schema_missing(client, bare, schema)?;
-    // A table an older fasten-core created has no chain columns.
+    // A table an older fasten-core created has no chain columns. IF NOT
+    // EXISTS: an opener that names the table differently (`t`, `public.t`)
+    // takes a different bootstrap lock and may have just added them.
     for (name, def) in missing.columns {
-        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN {name} {def}"))?;
+        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {def}"))?;
     }
 
     for sql in &[
@@ -1216,6 +1218,54 @@ mod tests {
         let Some(dsn) = dsn() else { return };
         let table = "fasten_sc_pg_oldshape";
         let mut c = connect_client(&dsn).unwrap();
+        create_pre_chain_table(&mut c, table);
+        c.execute(
+            &format!(
+                "INSERT INTO {table} (id, origin_id, timestamp, code, monotonic_seq) \
+                 VALUES ('evt-old', 'evt-old', '2026-05-07T00:00:00.000000Z', 'TEST', 1)"
+            ),
+            &[],
+        )
+        .unwrap();
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        let mut row = make_row("evt-new", "TEST");
+        row.monotonic_seq = 2;
+        row.hash = Some("h2".into());
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(got[0].hash.as_deref(), Some(""));
+        assert_eq!(got[0].canonical_form_id.as_deref(), Some("1"));
+        assert_eq!(got[1].hash.as_deref(), Some("h2"));
+    }
+
+    /// Two stores upgrading one old table, one naming it `t` and the other
+    /// `public.t`, take different bootstrap locks.
+    #[test]
+    fn old_table_upgraded_under_two_names_at_once() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_twonames";
+        let mut c = connect_client(&dsn).unwrap();
+        for _ in 0..10 {
+            create_pre_chain_table(&mut c, table);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let openers: Vec<_> = [table.to_string(), format!("public.{table}")]
+                .into_iter()
+                .map(|name| {
+                    let (dsn, start) = (dsn.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        PostgresStore::connect(&dsn, &name).map(drop)
+                    })
+                })
+                .collect();
+            for h in openers {
+                h.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    /// The table shape from before the chain columns and the node-seq index.
+    fn create_pre_chain_table(c: &mut pg::Client, table: &str) {
         c.batch_execute(&format!(
             "DROP TABLE IF EXISTS {table};
              CREATE TABLE {table} (
@@ -1229,19 +1279,8 @@ mod tests {
                 category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
                 method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
                 detail TEXT NOT NULL DEFAULT '{{}}', pii_in_detail SMALLINT NOT NULL DEFAULT 0,
-                shipped_at TEXT);
-             INSERT INTO {table} (id, origin_id, timestamp, code, monotonic_seq)
-             VALUES ('evt-old', 'evt-old', '2026-05-07T00:00:00.000000Z', 'TEST', 1);"
+                shipped_at TEXT);"
         ))
         .unwrap();
-        let store = PostgresStore::connect(&dsn, table).unwrap();
-        let mut row = make_row("evt-new", "TEST");
-        row.monotonic_seq = 2;
-        row.hash = Some("h2".into());
-        store.insert(&row).unwrap();
-        let got = store.query(&Filter::default()).unwrap();
-        assert_eq!(got[0].hash.as_deref(), Some(""));
-        assert_eq!(got[0].canonical_form_id.as_deref(), Some("1"));
-        assert_eq!(got[1].hash.as_deref(), Some("h2"));
     }
 }
