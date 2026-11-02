@@ -99,7 +99,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   insert transaction (`BEGIN IMMEDIATE` on SQLite, the shared
   `pg_advisory_xact_lock` on Postgres). Two handles on one store no longer
   write duplicate seqs (#92). Rows stay unsealed (spec §8.2). A non-zero seq
-  is written as given.
+  is written as given, under the same lock on Postgres, so it cannot take
+  the seq a concurrent seq-0 insert has just picked.
 - **Breaking:** fresh tables get `UNIQUE (source_node_id, monotonic_seq)`.
   A row that reuses a node's seq there now fails with the new
   `Error::SeqClash`, and the drainer dead-letters it at once instead of

@@ -249,13 +249,20 @@ impl PostgresStore {
         ];
 
         let bare = self.bare.as_str();
+        // Same lock key as the Python and Go stores, so every writer for
+        // this node serialises here. An advisory lock rather than
+        // FOR UPDATE: an empty node has no tip row to lock.
+        let node_lock = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
         if row.monotonic_seq != 0 {
+            // Locked too, or this row could take the seq a seq-0 insert
+            // has just picked and make that insert fail.
             return self.with_reconnect(|inner| {
-                inner
-                    .client
-                    .execute(&inner.stmt, params)
-                    .map(|_| ())
-                    .map_err(|e| seq_clash(e, bare))
+                let Inner { client, stmt } = inner;
+                let mut tx = client.transaction()?;
+                tx.execute(node_lock, &[&row.source_node_id])?;
+                tx.execute(&*stmt, params).map_err(|e| seq_clash(e, bare))?;
+                tx.commit()?;
+                Ok(())
             });
         }
 
@@ -272,13 +279,7 @@ impl PostgresStore {
                 tx.commit()?;
                 return Ok(());
             }
-            // Same lock key as the Python and Go stores, so every writer for
-            // this node serialises here. An advisory lock rather than
-            // FOR UPDATE: an empty node has no tip row to lock.
-            tx.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                &[&row.source_node_id],
-            )?;
+            tx.execute(node_lock, &[&row.source_node_id])?;
             let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.get(0);
             let mut p = params.to_vec();
             p[3] = &seq; // $4 monotonic_seq
@@ -991,6 +992,50 @@ mod tests {
         }
         let store = PostgresStore::connect(&dsn, "fasten_sc_pg_conc").unwrap();
         assert_eq!(seqs(&store, "node-1"), (1..=100).collect::<Vec<u64>>());
+    }
+
+    /// One writer picks its own seqs (MAX + 1, like another SDK) while
+    /// others insert seq 0 on the same node. A seq-0 row never clashes; the
+    /// explicit writer retries when its pick was taken first.
+    #[test]
+    fn explicit_and_allocated_seqs_on_one_node() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_mixed";
+        drop(fresh(&dsn, table));
+        let explicit = {
+            let dsn = dsn.clone();
+            std::thread::spawn(move || {
+                let store = PostgresStore::connect(&dsn, table).unwrap();
+                for i in 0..200 {
+                    let mut r = row_on(&format!("evt-x-{i}"), "node-1");
+                    loop {
+                        r.monotonic_seq = store.max_monotonic_seq().unwrap() + 1;
+                        match store.insert(&r) {
+                            Ok(()) => break,
+                            Err(Error::SeqClash(_)) => continue,
+                            Err(e) => panic!("{e}"),
+                        }
+                    }
+                }
+            })
+        };
+        let allocating: Vec<_> = (0..3)
+            .map(|t| {
+                let dsn = dsn.clone();
+                std::thread::spawn(move || {
+                    let store = PostgresStore::connect(&dsn, table).unwrap();
+                    for i in 0..200 {
+                        store.insert(&row_on(&format!("evt-{t}-{i}"), "node-1")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        explicit.join().unwrap();
+        for h in allocating {
+            h.join().unwrap();
+        }
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        assert_eq!(seqs(&store, "node-1"), (1..=800).collect::<Vec<u64>>());
     }
 
     fn days_ago(days: i64) -> String {
