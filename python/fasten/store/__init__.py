@@ -1,12 +1,7 @@
-"""
-Store — where audit rows persist.
+"""Audit and stream stores.
 
-Interfaces:
-  - AuditRepository            (long-term store: edge, EM, adopter default)
-  - AuditOutboxRepository      (drain-to-remote: edge-sync, relay patterns)
-
-Bundled implementations: SQLite, Postgres. Adopters plug in ClickHouse /
-DynamoDB / Kinesis / whatever by implementing the interface.
+``AuditRepository`` is the audit store protocol and ``AuditOutboxRepository``
+a queue of rows to send upstream. SQLite and Postgres implementations are included.
 """
 from __future__ import annotations
 

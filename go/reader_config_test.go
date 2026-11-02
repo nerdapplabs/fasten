@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// A reader bound to a separately-configured *Engine has its own search/persist
-// policy and stores — the Go equivalent of Python's router(search_enabled=,
-// persist_streams=, store=, transport=) overrides (A3 parity).
+// A reader bound to a separately configured *Engine has its own search/persist
+// policy and stores, like Python's router(search_enabled=, persist_streams=,
+// store=, transport=) overrides.
 func TestPerEngineReaderConfig(t *testing.T) {
 	registerTestCodes(t)
 	// Default engine: search disabled.
@@ -22,7 +22,7 @@ func TestPerEngineReaderConfig(t *testing.T) {
 		t.Fatalf("Default reader: expected search disabled, got %s", body)
 	}
 
-	// A second engine: search enabled + its own syslog store — independent reader.
+	// A second engine with search enabled and its own syslog store.
 	db, _ := sql.Open("sqlite", ":memory:")
 	sysStore, err := NewStreamStore(db, "syslog")
 	if err != nil {

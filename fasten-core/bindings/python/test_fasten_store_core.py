@@ -16,7 +16,7 @@ import json
 import os
 import pytest
 
-# ── Library availability guard ────────────────────────────────────────────────
+# Library availability guard
 
 try:
     from fasten_core import FastenStore, FastenStoreError
@@ -26,10 +26,10 @@ except (ImportError, OSError):
 
 pytestmark = pytest.mark.skipif(
     not _LIB_AVAILABLE,
-    reason="libfasten_core not built — run `cargo build --release --features all`",
+    reason="libfasten_core not built; run `cargo build --release --features all`",
 )
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# Fixtures
 
 def make_row(row_id: str, code: str = "TEST") -> dict:
     return {
@@ -61,7 +61,7 @@ def sqlite_store():
     store.close()
 
 
-# ── SQLite tests ──────────────────────────────────────────────────────────────
+# SQLite tests
 
 def test_version_is_string():
     assert isinstance(FastenStore.version(), str)
@@ -79,7 +79,7 @@ def test_sqlite_insert(sqlite_store):
 def test_sqlite_insert_idempotent(sqlite_store):
     row = make_row("evt-py-idem-001")
     sqlite_store.insert(row)
-    sqlite_store.insert(row)  # INSERT OR IGNORE — must not raise
+    sqlite_store.insert(row)  # duplicate id is ignored
 
 
 def test_sqlite_insert_json_string(sqlite_store):
@@ -117,7 +117,7 @@ def test_invalid_backend_raises():
         FastenStore.open("unknown_backend", ":memory:", "audit_log")
 
 
-# ── PostgreSQL tests (skipped without DSN) ────────────────────────────────────
+# PostgreSQL tests (skipped without DSN)
 
 _PG_DSN = os.environ.get("FASTEN_TEST_POSTGRES_DSN")
 

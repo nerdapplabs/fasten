@@ -25,22 +25,16 @@ pub struct Filter {
 
 /// Shared contract for all audit-store backends.
 ///
-/// All methods must be thread-safe; implementations wrap internals in a
-/// `Mutex` and implement `Send + Sync`.
+/// Implementations must be `Send + Sync`; methods are called from several
+/// threads.
 pub trait Store: Send + Sync {
-    // ── Write ─────────────────────────────────────────────────────────────────
-
     /// Persist `row`.  Duplicate IDs are silently ignored
     /// (`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`).
     fn insert(&self, row: &Row) -> Result<(), Error>;
 
-    // ── Health ────────────────────────────────────────────────────────────────
-
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
     /// sufficient; on PostgreSQL, a lost connection is re-established first.
     fn ping(&self) -> Result<(), Error>;
-
-    // ── Read path ─────────────────────────────────────────────────────────────
 
     /// Return rows matching `filter`, ordered by `monotonic_seq ASC`.
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error>;

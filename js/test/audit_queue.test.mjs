@@ -1,21 +1,14 @@
-/**
- * P1-15 cross-language: same wire/API semantics as Python's
- * tests/test_audit_queue.py — happy path, slow store, outage+recovery,
- * raise mode, sys self-report, queue_stats, flush.
- *
- * JS deviation: emit() doesn't block on capacity (single-threaded
- * event loop). queueCapacity is the high-water-warn threshold; the
- * drainer + retry-forever-with-backoff matches Python exactly.
- */
+// Queue mode and raise mode against stub stores. Mirrors
+// python/tests/test_audit_queue.py, except emit() never blocks here.
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush, _clearRustRegistry,
+    AuditStoreError, queueStats, flush, _clearCoreRegistry,
 } from '../src/index.js';
 import { uninstallDrainer } from '../src/audit_queue.js';
 
-// ── stub stores ────────────────────────────────────────────────────────────
+// Stub stores
 
 class RecordingStore {
     constructor() { this.rows = []; }
@@ -53,7 +46,7 @@ class FlakyStore {
     }
 }
 
-// ── fixtures ───────────────────────────────────────────────────────────────
+// Fixtures
 
 const TEST_META = {
     USER_CREATED: {
@@ -65,7 +58,7 @@ const TEST_META = {
 
 beforeEach(() => {
     uninstallDrainer();
-    _clearRustRegistry();
+    _clearCoreRegistry();
     _reg().clear();
     register('user', TEST_META);
 });
@@ -94,7 +87,7 @@ function _initRaise(store) {
     });
 }
 
-// ── #1 happy path ──────────────────────────────────────────────────────────
+// Happy path
 
 test('queue mode drains within one second', async () => {
     const store = new RecordingStore();
@@ -116,7 +109,7 @@ test('queue mode emit returns immediately under slow store', async () => {
     assert.equal(store.rows.length, 10);
 });
 
-// ── #2 raise mode ──────────────────────────────────────────────────────────
+// Raise mode
 
 test('raise mode throws AuditStoreError on failure', () => {
     const store = new BrokenStore();
@@ -133,7 +126,7 @@ test('raise mode does not install drainer', () => {
     assert.equal(queueStats(), null);
 });
 
-// ── #3 outage + recovery ───────────────────────────────────────────────────
+// Outage + recovery
 
 test('outage then recovery drains pending rows', async () => {
     const store = new FlakyStore(2);
@@ -148,7 +141,7 @@ test('outage then recovery drains pending rows', async () => {
     assert.ok(store.attempts >= 3, `want >=3 attempts (2 fail + 1 success); got ${store.attempts}`);
 });
 
-// ── #5 sys self-report ────────────────────────────────────────────────────
+// Sys self-report
 
 test('drainer first failure emits warn to sys (captured via stderr)', async () => {
     const store = new FlakyStore(1);
@@ -239,7 +232,7 @@ test('queue high water emits warn at 50%', async () => {
     );
 });
 
-// ── #6 queueStats + flush ──────────────────────────────────────────────────
+// QueueStats + flush
 
 test('public flush blocks until drained', async () => {
     const store = new RecordingStore();

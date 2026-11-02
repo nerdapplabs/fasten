@@ -1,13 +1,12 @@
-"""Scenario 1 + 2: concurrent writers — single Postgres and multi-tenant.
+"""Scenarios 1 and 2: concurrent writers, single tenant and multi-tenant.
 
-Spawns K worker processes, each emitting M rows/s for duration_s seconds.
-Verifies all rows present with no duplicates and that per-tenant counts
-match expectations when --tenants > 1.
+Spawns worker processes, each emitting rows_per_s rows/s for duration_s
+seconds, with workers spread across `tenants` tenant ids.
 
-Pass criteria (from P1-16 spec):
-  - All rows present (row_count == expected_total)
-  - No deadlocks (no DeadlockDetected exceptions)
-  - p99 emit < 50 ms
+Passes when:
+  - the table row count equals the number of successful emits
+  - no emit raised
+  - the worst worker p99 emit latency is under 50 ms
 """
 import argparse
 import json

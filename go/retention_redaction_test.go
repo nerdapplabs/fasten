@@ -17,8 +17,7 @@ import (
 // without a durable record, including in queue mode (the default).
 //
 // Every test drives Config through Init rather than calling the purger
-// directly — the Python equivalent passed against wiring that did not exist
-// because it called the purger with a stream name the Engine never produced.
+// directly, so the tests cover the real wiring.
 
 const (
 	piiCode Code = "GOPII_USER_EXPORTED"
@@ -172,8 +171,6 @@ func TestRetention_RowsAreRedactedNotDeleted(t *testing.T) {
 	}
 	defer e.stopRetention()
 
-	// The goto version of this fell through on timeout and then only asserted
-	// the row existed — which it did, unredacted. It could not fail.
 	redacted := false
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && !redacted {
