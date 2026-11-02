@@ -304,9 +304,12 @@ def drainer_flush(handle: ctypes.c_void_p, timeout_ms: int) -> bool:
     lib = get_lib()
     drained = ctypes.c_int(0)
     err     = ctypes.c_char_p(None)
-    lib.fasten_drainer_flush(handle, timeout_ms, ctypes.byref(drained), ctypes.byref(err))
+    rc = lib.fasten_drainer_flush(handle, timeout_ms, ctypes.byref(drained), ctypes.byref(err))
+    msg = err.value.decode("utf-8", errors="replace") if err.value else f"rc={rc}"
     if err.value:
         lib.fasten_store_free_str(err)
+    if rc != 0:
+        raise RuntimeError(f"fasten_drainer_flush: {msg}")
     return bool(drained.value)
 
 

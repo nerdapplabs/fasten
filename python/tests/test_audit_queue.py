@@ -1086,6 +1086,48 @@ def test_a_failed_lost_event_does_not_stop_retire(tmp_path, monkeypatch):
     assert sorted(reported) == sorted(r.id for r in rows)
 
 
+def test_drainer_flush_raises_on_an_ffi_error():
+    from fasten import core_ffi
+    with pytest.raises(RuntimeError, match="fasten_drainer_flush"):
+        core_ffi.drainer_flush(None, 10)
+
+
+def test_flush_failure_is_reported_not_a_timeout(tmp_path, monkeypatch):
+    from fasten import core_ffi
+    _init(FlakyStore(str(tmp_path / "a.db")))
+
+    def broken(handle, timeout_ms):
+        raise RuntimeError("fasten_drainer_flush: null argument")
+
+    monkeypatch.setattr(core_ffi, "drainer_flush", broken)
+    assert not fasten.flush(timeout=1.0)
+    failed = [e for e in fasten.transport().query_syslog(limit=1000)
+              if e.get("event") == "audit_drain_flush_failed"]
+    assert [e["error"] for e in failed] == ["fasten_drainer_flush: null argument"]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_failed_reinstall_after_fork_is_reported(tmp_path, monkeypatch):
+    _init(FlakyStore(str(tmp_path / "a.db")))
+
+    def broken(**kwargs):
+        raise OSError("no threads")
+
+    monkeypatch.setattr(_default, "_install_drainer", broken)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+        pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            failed = [e for e in fasten.transport().query_syslog(limit=1000)
+                      if e.get("event") == "audit_drain_reinstall_failed"]
+            code = 0 if [e["error_type"] for e in failed] == ["OSError"] else 2
+        finally:
+            os._exit(code)
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)

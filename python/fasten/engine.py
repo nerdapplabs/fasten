@@ -795,8 +795,15 @@ class Engine:
         with self._using_drainer() as d:
             if d is None:
                 return True
+            return self._flush_drainer(d, timeout)
+
+    def _flush_drainer(self, d: _QueueDrainer, timeout: float) -> bool:
+        try:
             # Round up: fasten-core reads 0 ms as no timeout.
             return _ffi.drainer_flush(d.handle, max(1, math.ceil(timeout * 1000)))
+        except RuntimeError as e:
+            self._drainer_sys_log("error", "audit_drain_flush_failed", {"error": str(e)}, via=d)
+            return False
 
     def close(self, timeout: float = 5.0) -> bool:
         """Flush pending audit rows for up to half of ``timeout``, then stop
@@ -1238,8 +1245,10 @@ class Engine:
         if old is not None:
             try:
                 self._install_drainer(**old.install)
-            except Exception:  # noqa: BLE001 — emits then store inline (no drainer)
+            except Exception as e:  # noqa: BLE001 — emits then store inline (no drainer)
                 logging.getLogger("fasten").exception("drainer reinstall after fork failed")
+                self._drainer_sys_log("error", "audit_drain_reinstall_failed",
+                                      {"error_type": type(e).__name__})
 
     def _take_drainer(self) -> Optional[_QueueDrainer]:
         """Uninstall the drainer, for the caller to retire."""
@@ -1266,7 +1275,7 @@ class Engine:
 
     def _stop_drainer(self, d: _QueueDrainer, flush_ms: int) -> None:
         if flush_ms:
-            _ffi.drainer_flush(d.handle, flush_ms)
+            self._flush_drainer(d, flush_ms / 1000)
         # Close refuses new rows and waits for the drain thread, so the
         # callback is not called after it returns. Calls still using the
         # handle get an error and store their row inline.
