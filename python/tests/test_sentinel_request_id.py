@@ -1,8 +1,7 @@
-"""Sentinel request_id invariant — every stream row always carries a
-request_id, so /logs/correlate is a contract, not a best-effort.
+"""Every stream row carries a request_id.
 
-Rows written outside a real request context get a namespaced sentinel:
-the shared boot id during startup, a unique orphan id afterwards.
+Rows written outside a request get a sentinel: a shared boot id during
+startup, then a unique orphan id per row.
 """
 import pytest
 
@@ -12,10 +11,6 @@ from fasten.store.sqlite import SQLiteStore
 
 
 def _init():
-    # service_id / node_id are passed explicitly to fasten.init, so the
-    # earlier os.environ writes were dead code that leaked env across
-    # tests. Removed — the explicit kwargs are the sole configuration
-    # surface this test needs.
     fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
@@ -23,7 +18,7 @@ def _init():
     )
 
 
-# ── helpers ───────────────────────────────────────────────────────────────
+# Helpers
 
 def test_mint_and_classify_sentinels():
     rid = mint_sentinel("orphan", "svc")
@@ -35,7 +30,7 @@ def test_mint_and_classify_sentinels():
         mint_sentinel("bogus")
 
 
-# ── the invariant at the transport chokepoint ─────────────────────────────
+# Stamping in the transport
 
 def test_contextless_push_gets_boot_sentinel_during_startup():
     _init()
@@ -53,7 +48,7 @@ def test_real_request_ends_boot_window_then_orphan():
     with with_request_id("real-123"):
         from fasten import current_request_id
         t.push_api({"method": "GET", "path": "/b", "request_id": current_request_id()})
-    t.push_api({"method": "GET", "path": "/c"})             # now orphan
+    t.push_api({"method": "GET", "path": "/c"})             # orphan
 
     by_path = {r["path"]: r["request_id"] for r in t.query_api()}
     assert request_id_kind(by_path["/a"]) == "boot"
@@ -68,12 +63,10 @@ def test_explicit_request_id_is_untouched():
     assert t.query_syslog()[0]["request_id"] == "my-own-id"
 
 
-# ── conformance: nothing is ever orphaned with an empty id ────────────────
+# No row has an empty request_id
 
 def test_no_stream_row_ever_lacks_request_id():
-    """The contract under which /correlate and the completeness flags are
-    designed: scan a mixed boot/real/context-less workload and assert every
-    persisted row carries a non-empty request_id."""
+    """Boot, in-request and context-less rows all have a request_id."""
     _init()
     t = fasten.transport()
     t.push_syslog({"level": "info", "event": "boot.init"})           # boot
@@ -92,8 +85,7 @@ def test_no_stream_row_ever_lacks_request_id():
 
 
 def test_boot_rows_are_correlatable():
-    """A boot-window id resolves to its startup rows via /correlate — the
-    boot-error-diagnosis workflow the invariant unlocks."""
+    """/correlate with a boot id returns the startup rows."""
     pytest.importorskip("fastapi")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

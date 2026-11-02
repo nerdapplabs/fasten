@@ -1,17 +1,5 @@
-// REVIEW.md item #1 — guard against the anchored-regex regression that
-// caused C++ to silently leak fields the other 4 SDKs scrubbed.
-//
-// The default REDACT_PATTERNS (api_key, password, token, secret, ...) are
-// substring matches in Python (re.search) and JS (RegExp without anchors).
-// Before this fix C++ wrapped them in `^...$`, so:
-//
-//   { "customer_token": "tok-abc" }   redacted in Py / JS / Go / Rust
-//                                     leaked through C++
-//
-// This test asserts the substring-match behaviour: any key containing one
-// of the default patterns gets redacted regardless of surrounding chars.
-//
-// Build (via CMake -DFASTEN_BUILD_TESTS=ON) — wired in CMakeLists.
+// Default redact patterns match anywhere in the key, so "customer_token"
+// is redacted as well as "token".
 
 #include "fasten.hpp"
 
@@ -50,14 +38,14 @@ void test_substring_match_redacts() {
     fasten::Row row = fasten::emit("REDACT_SUBSTRING",
         fasten::target("k-1"),
         fasten::detail({
-            // exact-match cases (always worked):
+            // exact matches:
             {"api_key",    "should-redact"},
             {"password",   "should-redact"},
-            // substring cases — would leak with anchored regex:
+            // pattern inside a longer key:
             {"customer_token",     "tok-abc"},
             {"user_password",      "pw-xyz"},
             {"oauth_bearer_token", "tok-deep"},
-            // safe key — must NOT be redacted:
+            // not a secret, kept as is:
             {"email",      "alice@example.com"},
         }));
 
@@ -95,6 +83,6 @@ void test_substring_match_redacts() {
 
 int main() {
     test_substring_match_redacts();
-    std::cout << "\nALL P1-15 redact-substring TESTS PASSED\n";
+    std::cout << "\nALL REDACT_SUBSTRING TESTS PASSED\n";
     return 0;
 }

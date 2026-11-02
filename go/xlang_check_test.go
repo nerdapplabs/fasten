@@ -6,11 +6,8 @@ import (
 	"testing"
 )
 
-// TestCrossLanguage_PythonSealedRowsVerifyInGo seals through Python's PUBLIC
-// path (chain.seal) and verifies through Go's PUBLIC path (VerifyChain).
-//
-// The previous vector was a hand-pinned constant compared against Go's own
-// output — it could never detect the two SDKs disagreeing. This can.
+// TestCrossLanguage_PythonSealedRowsVerifyInGo seals through Python's public
+// path (chain.seal) and verifies through Go's public path (VerifyChain).
 //
 // whole_second / one_micro exist because spec §1.2 renders microseconds "only
 // when nonzero": micros==0 takes a different branch in both implementations,

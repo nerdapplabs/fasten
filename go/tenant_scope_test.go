@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// P1-44 — cross-tenant isolation on reader endpoints (Go).
+// Cross-tenant isolation on reader endpoints (Go).
 //
 // Pins the enforcement contract: when NewReader(WithTenantScope(fn)) is
 // wired, every reader endpoint (/audit, /correlate, /search, /sys, /api,

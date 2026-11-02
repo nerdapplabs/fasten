@@ -8,11 +8,11 @@ import (
 
 // IngestResult reports the outcome of an IngestReplicated call.
 //
-// IngestReplicated inserts the longest VERIFIED prefix of the batch (from the
+// IngestReplicated inserts the longest verified prefix of the batch (from the
 // chain start up to, but not including, the first break) in a single
 // transaction and never returns a chain-break error. Inserted counts the rows
 // committed. When the chain breaks partway, RejectedFromSeq carries the
-// MonotonicSeq of the first broken row (rows at/after it are NOT inserted) and
+// MonotonicSeq of the first broken row (rows at/after it are not inserted) and
 // Reason explains where it diverged, so the sender resyncs from that point
 // instead of re-shipping a poison-pilled batch forever. On a fully-verified
 // batch RejectedFromSeq is 0 and Reason is "".
@@ -29,14 +29,14 @@ type execContext interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// verifiedPrefix returns the longest VERIFIED run of rows from the chain start.
+// verifiedPrefix returns the longest verified run of rows from the chain start.
 //
 // Rows are sorted by MonotonicSeq, then the hash chain is verified:
 //   - intact -> (allSorted, rejectedFromSeq=0, reason="")
 //   - broken -> (rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
 //
-// No I/O — the caller inserts the prefix and reports firstBreakAt as
-// RejectedFromSeq. This is the Go counterpart of the Python verified_prefix.
+// No I/O; the caller inserts the prefix and reports firstBreakAt as
+// RejectedFromSeq.
 func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason string) {
 	sorted := make([]Row, len(rows))
 	copy(sorted, rows)
@@ -62,7 +62,7 @@ func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason str
 // commits nothing), unlike per-row autocommit inserts.
 //
 // It is the shared core behind SQLiteStore.IngestReplicated and
-// PostgresStore.IngestReplicated. A chain break is NOT an error: only the
+// PostgresStore.IngestReplicated. A chain break is not an error: only the
 // verified prefix is inserted and RejectedFromSeq names the first broken
 // sequence so the sender resyncs. Inserts are idempotent (INSERT OR IGNORE /
 // ON CONFLICT DO NOTHING on the id PK), so re-delivery after a commit is a
@@ -106,9 +106,7 @@ func ingestReplicatedTx(
 // inserted in a single transaction; a chain break inserts only the prefix and
 // reports RejectedFromSeq (no error). See ingestReplicatedTx.
 //
-// Decoupled from the Engine: this is store-scoped (a method on the store), so a
-// replication sink calls it with only a store — no fasten.Init, no service
-// identity, no drainer required:
+// It needs only the store, not fasten.Init:
 //
 //	store, _ := fasten.NewSQLiteStore(db, "audit")
 //	res, _ := store.IngestReplicated(ctx, rows) // no fasten.Init needed

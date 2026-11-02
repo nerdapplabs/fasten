@@ -1,7 +1,6 @@
-"""PostgresStreamStore — FR1 Postgres backend for api/sys, parity with SQLite.
+"""StreamStore behaviour on SQLite and PostgresStreamStore.
 
-The suite is parametrized over both backends. Postgres cases are skipped unless
-FASTEN_TEST_POSTGRES_DSN is set:
+Postgres cases are skipped unless FASTEN_TEST_POSTGRES_DSN is set:
 
     FASTEN_TEST_POSTGRES_DSN=postgresql://fasten:fasten@localhost:5432/fasten_test pytest
 """
@@ -20,7 +19,7 @@ def _sqlite():
 def _postgres():
     dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
     if not dsn:
-        pytest.skip("FASTEN_TEST_POSTGRES_DSN not set — skipping Postgres stream tests")
+        pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
     from fasten.store.stream_postgres import PostgresStreamStore
     return PostgresStreamStore(dsn=dsn, table="sst_" + uuid.uuid4().hex[:10])
 
@@ -80,20 +79,16 @@ def test_search_case_insensitive_and_escape(store):
 
 
 def test_search_escapes_underscore_and_backslash(store):
-    """PR #59 test-coverage gap: Postgres LIKE treats _ as a single-char
-    wildcard and \\ as the escape metacharacter under ESCAPE E'\\\\'. The
-    existing suite only tested %, so a regression in the _ / \\ escape path
-    would ship."""
+    """LIKE treats _ as a single-char wildcard and \\ as the escape
+    character, so both must be escaped to match literally."""
     store.insert({"event": "a_b", "timestamp": "2026-08-01T00:00:07Z", "request_id": "r-u1"})
     store.insert({"event": "aXb", "timestamp": "2026-08-01T00:00:08Z", "request_id": "r-u2"})
     uh = store.search(q="a_b", since="2026-01-01T00:00:00Z")
     assert {r["request_id"] for r in uh} == {"r-u1"}, (
         f"underscore must be a literal, not a single-char wildcard; got {uh}"
     )
-    # event c\d (one real backslash) → JSON payload has "c\\d" (two chars, per
-    # JSON string encoding). To find it via LIKE the query needs to match the
-    # payload bytes, so pass "c\\\\d" here (Python source → two backslashes).
-    # Same shape as the existing test_search_backslash_escaped test.
+    # The event c\d (one backslash) is stored in the JSON payload as "c\\d",
+    # so the query is "c\\\\d" in Python source (two backslashes).
     store.insert({"event": "c\\d", "timestamp": "2026-08-01T00:00:09Z", "request_id": "r-bs"})
     store.insert({"event": "cXd", "timestamp": "2026-08-01T00:00:10Z", "request_id": "r-bs2"})
     bh = store.search(q="c\\\\d", since="2026-01-01T00:00:00Z")
