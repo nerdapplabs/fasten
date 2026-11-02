@@ -489,6 +489,17 @@ def test_reinit_keeps_the_flag_for_the_same_store(tmp_path):
     assert not _default.audit_write_swallowed()
 
 
+def test_reinit_onto_the_same_database_keeps_the_flag(tmp_path, monkeypatch):
+    # FASTEN_AUDIT_DSN builds a new store object on every init.
+    monkeypatch.setattr(_default, "_reinit_timeout", 1.0, raising=False)
+    path = str(tmp_path / "a.db")
+    _init(FlakyStore(path, fail=10**6), queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_in_backoff()
+    _init(SQLiteStore(path))        # the old drainer loses its row at stop
+    assert _default.audit_write_swallowed()
+
+
 def test_refused_enqueue_stored_inline_is_reported(tmp_path, monkeypatch, capsys):
     from fasten import core_ffi
     store = FlakyStore(str(tmp_path / "a.db"))

@@ -111,6 +111,18 @@ def _store_from_dsn(dsn: str) -> Any:
     return SQLiteStore.from_dsn(dsn)
 
 
+def _store_key(store: Any) -> Any:
+    """What ``store`` writes to: a store built again from the same DSN (as
+    FASTEN_AUDIT_DSN does on every init) is the same store."""
+    path = getattr(store, "_path", None)
+    if isinstance(path, str) and path != ":memory:":
+        return ("sqlite", os.path.realpath(path), getattr(store, "_table", None))
+    dsn = getattr(store, "_dsn", None)
+    if isinstance(dsn, str):
+        return ("postgres", dsn, getattr(store, "_table", None))
+    return ("object", id(store))
+
+
 _STREAM_DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
 
 
@@ -501,9 +513,9 @@ class Engine:
         prev_store, self._audit_store = self._audit_store, cfg.audit_store
         self._api_store   = cfg.api_store
         self._syslog_store = cfg.syslog_store
-        # Re-init on a fresh store clears the sticky degrade — a hole in the
+        # Re-init on another store clears the sticky degrade — a hole in the
         # previous store's history doesn't apply to this one.
-        if cfg.audit_store is not prev_store:
+        if _store_key(cfg.audit_store) != _store_key(prev_store):
             self._store_gen += 1
             self._audit_write_swallowed = False
 
