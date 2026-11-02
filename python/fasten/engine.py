@@ -201,9 +201,14 @@ class _QueueDrainer:
     drain_ident: Optional[int] = None   # fasten-core's drain thread
     retire_ident: Optional[int] = None  # the thread stopping it
     drain_stopped: threading.Event = dataclasses.field(default_factory=threading.Event)
+    retired: threading.Event = dataclasses.field(default_factory=threading.Event)  # or given up
 
     def past_deadline(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def cut_deadline(self, deadline: float) -> None:
+        if self.deadline is None or deadline < self.deadline:
+            self.deadline = deadline
 
     def call_on_worker(self, fn: Callable[..., Any], *args: Any) -> Any:
         """Run ``fn`` on the store thread and wait for its result; None once
@@ -792,11 +797,18 @@ class Engine:
     # ── Queue / drainer ───────────────────────────────────────────────────
 
     def flush(self, timeout: float = 5.0) -> bool:
-        """Block until pending audit rows drain (or timeout). Returns True iff drained."""
+        """Block until pending audit rows drain (or timeout), including the
+        rows of a drainer re-init is still retiring. Returns True iff drained."""
+        deadline = time.monotonic() + timeout
         with self._using_drainer() as d:
-            if d is None:
-                return True
-            return self._flush_drainer(d, timeout)
+            # Taken after d: a drainer swapped out before is on the list.
+            with self._drainer_lock:
+                retiring = [r for r in self._retiring if r is not d and not r.abandoned]
+            drained = d is None or self._flush_drainer(d, timeout)
+        for r in retiring:
+            drained = (r.retired.wait(max(0.0, deadline - time.monotonic()))
+                       and not r.abandoned and drained)
+        return drained
 
     def _flush_drainer(self, d: _QueueDrainer, timeout: float) -> bool:
         try:
@@ -812,21 +824,29 @@ class Engine:
         ``timeout``: a row not stored by then is reported lost
         (audit_drain_lost_at_stop), and a store call still running is left
         behind (audit_drain_recovered_at_stop if it later stores its row).
-        Emits after close are stored inline. Returns False if a row was
-        lost. The exit hook calls ``close(5.0)``."""
+        Emits after close are stored inline. A drainer a concurrent re-init
+        is still retiring is waited for in the same way. Returns False if a
+        row was lost. The exit hook calls ``close(5.0)``."""
         deadline = time.monotonic() + timeout
         with self._drainer_lock:
             self._closed = True
             d = self._drainer
-        if d is None:
+            retiring = [r for r in self._retiring if not r.abandoned]
+        drainers = ([d] if d is not None else []) + retiring
+        if not drainers:
             return True
-        lost = d.lost
-        d.deadline = deadline
+        lost = sum(x.lost for x in drainers)
+        for x in drainers:
+            x.cut_deadline(deadline)
         self.flush(timeout / 2)
         old = self._take_drainer()
         if old is not None:
             self._retire(old, deadline)
-        return d.lost == lost
+        # d too, if a re-init has swapped it out since.
+        for r in drainers:
+            if r is not old and not r.retired.wait(max(0.0, deadline - time.monotonic())):
+                self._give_up(r)
+        return sum(x.lost for x in drainers) == lost
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
         """Drainer health snapshot. Returns None in raise mode."""
@@ -1305,16 +1325,23 @@ class Engine:
     def _retire(self, d: _QueueDrainer, deadline: float, flush: bool = False) -> None:
         """Retire ``d`` on a thread, flushing it first for half the time
         left if ``flush``. Waits until ``deadline``, then gives up on it: the
-        rows it still holds are reported lost and the thread is left behind."""
-        d.deadline = deadline
+        rows it still holds are reported lost and the thread is left behind.
+        After a flush, rows not flushed or not stored are reported with
+        audit_drain_install_incomplete (spec §10)."""
+        d.cut_deadline(deadline)
+        lost, flushed = d.lost, True
         if flush:
-            self._flush_drainer(d, max(0.0, deadline - time.monotonic()) / 2)
+            flushed = self._flush_drainer(d, max(0.0, deadline - time.monotonic()) / 2)
         t = threading.Thread(target=self._retire_drainer, args=(d,),
                              name="fasten-retire", daemon=True)
         t.start()
         t.join(max(0.0, deadline - time.monotonic()))
         if t.is_alive():
             self._give_up(d)
+        if flush and (not flushed or d.lost > lost):
+            self._drainer_sys_log("warn", "audit_drain_install_incomplete", {
+                "flushed": flushed, "unstored": d.lost - lost,
+            }, via=d, persist=not d.past_deadline())
 
     def _retire_drainer(self, d: _QueueDrainer) -> None:
         """Stop a drainer that is no longer installed and store what it didn't."""
@@ -1326,6 +1353,7 @@ class Engine:
             with self._drainer_lock:
                 if d in self._retiring:
                     self._retiring.remove(d)
+            d.retired.set()
 
     def _stop_drainer(self, d: _QueueDrainer) -> None:
         # Close refuses new rows and waits for the drain thread, so the
@@ -1370,6 +1398,7 @@ class Engine:
         wake its drain thread from a store call still running."""
         self._report_unstored(d)
         d.abandon()
+        d.retired.set()
 
     def _report_unstored(self, d: _QueueDrainer) -> None:
         """Report the rows a retiring drainer still holds as lost."""

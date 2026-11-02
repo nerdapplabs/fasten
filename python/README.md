@@ -127,7 +127,9 @@ store call still running at that point is left behind on its thread
 (`fasten-store`), not interrupted, and does not hold up or affect
 interpreter exit: the exit status and other atexit hooks are unchanged.
 Re-running `fasten.init()` waits at most 10 s for the drainer it replaces
-in the same way.
+in the same way, and emits `audit_drain_install_incomplete` if that
+drainer's flush timed out or a row it held was not stored. Until it is
+retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
 ## Tests
 

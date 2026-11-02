@@ -66,7 +66,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   for up to 5 s, as before), and reports rows still held then as
   `audit_drain_lost_at_stop`, so a hanging store no longer blocks
   `fasten.init()`, and a store call stuck in the old store no longer holds
-  up the new drainer's inserts. Rows the old drainer loses keep the engine's
+  up the new drainer's inserts. If the old drainer's flush timed out or a
+  row it held was not stored, re-init emits `audit_drain_install_incomplete`
+  (`flushed`, `unstored`). While it retires, `flush()` also waits for its
+  rows, and `close()` waits for it within its own timeout and reports the
+  rows it still holds then as lost. Rows the old drainer loses keep the engine's
   `audit_write_swallowed()` flag set when re-init builds a new store over
   the same database (the same SQLite file or Postgres DSN and table, as
   `FASTEN_AUDIT_DSN` does); only a different store clears it.

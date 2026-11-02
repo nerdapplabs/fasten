@@ -634,6 +634,103 @@ def test_emits_while_the_old_drainer_retires_are_queued(tmp_path, monkeypatch):
     assert not _default.audit_write_swallowed()
 
 
+def _reinit_in_background(store):
+    """Start re-init onto ``store``; return its thread once the old drainer
+    is swapped out and retiring."""
+    old = _default._drainer
+    t = threading.Thread(target=_init, args=(store,))
+    t.start()
+    deadline = time.monotonic() + 5
+    while _default._drainer is old and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert _default._drainer is not old
+    return t
+
+
+def test_flush_during_reinit_waits_for_the_old_drainer(tmp_path):
+    old = FlakyStore(str(tmp_path / "old.db"))
+    gate = _hold_first_insert(old)
+    _init(old)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    reinit = _reinit_in_background(FlakyStore(str(tmp_path / "new.db")))
+    try:
+        assert not fasten.flush(timeout=0.3)
+    finally:
+        gate.set()
+    assert fasten.flush(timeout=5.0)
+    assert [r.id for r in _rows(old)] == [row.id]
+    reinit.join(timeout=5)
+
+
+def _install_incomplete(capsys):
+    return [{k: e[k] for k in ("flushed", "unstored")}
+            for e in (json.loads(line) for line in capsys.readouterr().err.splitlines()
+                      if line.startswith("{"))
+            if e.get("event") == "audit_drain_install_incomplete"]
+
+
+def test_reinit_reports_rows_the_old_drainer_did_not_store(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_default, "_reinit_timeout", 1.0, raising=False)
+    old = FlakyStore(str(tmp_path / "old.db"), fail=10**6)
+    _init(old, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    _init(old)                      # nothing pending: complete
+    assert _install_incomplete(capsys) == []
+    fasten.emit(code="USER_CREATED", target="u-1")
+    _wait_in_backoff()
+    _init(FlakyStore(str(tmp_path / "new.db")))
+    assert _install_incomplete(capsys) == [{"flushed": False, "unstored": 1}]
+
+
+def test_close_waits_for_a_drainer_reinit_is_retiring(tmp_path):
+    old = FlakyStore(str(tmp_path / "old.db"))
+    gate = _hold_first_insert(old)
+    _init(old)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    reinit = _reinit_in_background(FlakyStore(str(tmp_path / "new.db")))
+    threading.Timer(0.3, gate.set).start()
+    assert fasten.close(timeout=5.0)
+    assert [r.id for r in _rows(old)] == [row.id]
+    reinit.join(timeout=5)
+
+
+def test_close_waits_for_its_drainer_when_reinit_swaps_it_out(tmp_path, monkeypatch):
+    old = FlakyStore(str(tmp_path / "old.db"))
+    gate = _hold_first_insert(old)
+    _init(old)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    flush, reinits = _default.flush, []
+
+    def reinit_then_flush(timeout):
+        reinits.append(_reinit_in_background(FlakyStore(str(tmp_path / "new.db"))))
+        threading.Timer(1.3, gate.set).start()   # after this flush gives up
+        return flush(timeout)
+
+    monkeypatch.setattr(_default, "flush", reinit_then_flush)
+    assert fasten.close(timeout=2.0)
+    assert [r.id for r in _rows(old)] == [row.id]
+    reinits[0].join(timeout=5)
+
+
+def test_close_reports_rows_a_retiring_drainer_still_holds(tmp_path, capsys):
+    old = HangingStore(str(tmp_path / "old.db"))
+    _init(old)
+    try:
+        row = fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(old, 1)
+        reinit = _reinit_in_background(FlakyStore(str(tmp_path / "new.db")))
+        start = time.monotonic()
+        assert not fasten.close(timeout=0.4)
+        assert time.monotonic() - start < 1.5
+        reinit.join(timeout=5)
+        assert not reinit.is_alive()
+        err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+               if line.startswith("{")]
+    finally:
+        _release_hung_store(old)
+    lost = [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"]
+    assert lost == [row.id]
+
+
 def test_concurrent_inits_retire_every_drainer(tmp_path, monkeypatch):
     from fasten import core_ffi
     opened, closed = [], []
