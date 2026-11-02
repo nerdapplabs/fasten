@@ -1,6 +1,6 @@
 import Foundation
 
-/// fasten — audit + correlation SDK for Swift.
+/// fasten: audit and request correlation SDK for Swift.
 ///
 /// ```swift
 /// import Fasten
@@ -31,25 +31,13 @@ import Foundation
 /// ```
 public enum Fasten {
 
-    // ── Setup ─────────────────────────────────────────────────────────────
-
-    /// Register audit codes.  Call once per domain at process start.
+    /// Register audit codes. Call once per domain at process start.
     public static func register(_ domain: String, codes: [Code: Meta]) {
         CodeRegistry.shared.register(domain, codes)
     }
 
-    /// Configure fasten.  Must be called before `emit()`.
-    ///
-    /// - Parameters:
-    ///   - serviceID: Logical service name (e.g. "auth-service").
-    ///   - nodeID:    Instance/hostname identifier.
-    ///   - tenantID:  Optional tenant for multi-tenant deployments.
-    ///   - store:     Audit store; `nil` = stdout-only (no persistence).
-    ///   - strategy:  `.queue` (default, non-blocking) or `.raise`.
-    ///   - extraRedactKeys: Additional key names to redact in `detail`.
-    /// Extra redact key patterns from FASTEN_REDACT_KEYS (comma-separated), or
-    /// [] if unset. Used as the default for `configure(extraRedactKeys:)` so an
-    /// explicit arg still wins — parity with the other SDKs.
+    /// Extra redact keys from FASTEN_REDACT_KEYS (comma-separated), or [] if
+    /// unset. Default for `configure(extraRedactKeys:)`; an explicit argument wins.
     public static func envRedactKeys() -> [String] {
         guard let s = ProcessInfo.processInfo.environment["FASTEN_REDACT_KEYS"], !s.isEmpty
         else { return [] }
@@ -64,6 +52,18 @@ public enum Fasten {
         return s.isEmpty ? "***" : s
     }
 
+    /// Configure fasten. Must be called before `emit()`.
+    ///
+    /// - Parameters:
+    ///   - serviceID: Logical service name (e.g. "auth-service").
+    ///   - nodeID:    Instance/hostname identifier.
+    ///   - tenantID:  Optional tenant for multi-tenant deployments.
+    ///   - store:     Audit store; `nil` writes to stdout only.
+    ///   - strategy:  `.queue` (default) writes to the store on a background
+    ///                thread; `.raise` writes inline and rethrows store errors.
+    ///   - queueCapacity: Queue size for `.queue`; `emit()` blocks when full.
+    ///   - extraRedactKeys: Additional key names to redact in `detail`.
+    ///   - redactReplacement: Value written in place of redacted fields.
     public static func configure(
         serviceID: String,
         nodeID: String,
@@ -82,9 +82,8 @@ public enum Fasten {
         )
     }
 
-    // ── Emit ──────────────────────────────────────────────────────────────
-
-    /// Emit an audit row.  Non-blocking in `.queue` mode.
+    /// Emit an audit row. In `.queue` mode this returns once the row is queued,
+    /// and blocks only while the queue is full.
     public static func emit(
         _ code: Code,
         target: String,
@@ -98,8 +97,6 @@ public enum Fasten {
                                 actorKind: actorKind, detail: detail,
                                 method: method, severity: severity)
     }
-
-    // ── Structured logging ────────────────────────────────────────────────
 
     public enum log {
         public static func debug(_ event: String, fields: [String: Any] = [:]) {
@@ -116,9 +113,7 @@ public enum Fasten {
         }
     }
 
-    // ── Context ───────────────────────────────────────────────────────────
-
-    /// Run `body` with a pinned request_id (async-safe via TaskLocal).
+    /// Run `body` with request_id set on the current thread (see RequestScope).
     public static func withRequestID<T>(
         _ id: String,
         operation body: () throws -> T
@@ -128,7 +123,7 @@ public enum Fasten {
         return try body()
     }
 
-    /// Run `body` with a pinned request_id in a structured-concurrency Task.
+    /// Run `body` with request_id bound as a TaskLocal, so child tasks see it too.
     public static func withRequestID<T>(
         _ id: String,
         operation body: () async throws -> T
@@ -144,8 +139,6 @@ public enum Fasten {
     /// Mint a new unique request_id.
     public static func mintID() -> String { _mintID() }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────
-
     /// Block until all queued rows are drained (or timeout elapses).
     /// Returns true iff fully drained.
     @discardableResult
@@ -153,7 +146,7 @@ public enum Fasten {
         _defaultEngine.flush(timeout: timeout)
     }
 
-    /// Reset the default engine — for tests only.
+    /// Reset the default engine. For tests only.
     public static func _resetForTests() {
         _defaultEngine.reset()
     }

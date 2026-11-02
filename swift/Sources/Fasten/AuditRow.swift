@@ -1,6 +1,6 @@
 import Foundation
 
-/// Wire-format audit row — matches spec/row-schema.json v1.
+/// Audit row as written to stdout and the store (spec/row-schema.json, wire_version "1").
 public struct AuditRow: Codable, Sendable {
     public let wireVersion:    String
     public let id:             String
@@ -42,7 +42,7 @@ public struct AuditRow: Codable, Sendable {
     }
 }
 
-/// Syslog row — for /logs/sys stream.
+/// A structured log line from Fasten.log.
 public struct SysRow: Codable, Sendable {
     public let timestamp:  String
     public let level:      String

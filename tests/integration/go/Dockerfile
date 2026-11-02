@@ -3,9 +3,8 @@ FROM golang:1.22-alpine AS build
 
 WORKDIR /workspace
 
-# SDK source goes to ../sdk-go from the test build dir; rewrite the
-# go.mod replace path so the build works inside this container layout
-# (the same go.mod uses a different relative path when run locally).
+# go.mod's replace points at ../../../go for local runs; in the image the SDK
+# is at ../sdk-go.
 COPY go/ /workspace/sdk-go/
 COPY tests/integration/go/ /workspace/test/
 

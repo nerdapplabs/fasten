@@ -1,8 +1,7 @@
-//! Engine — wraps all per-deployment runtime state (config, seq, drainer).
+//! `Engine` holds the runtime state: config, sequence counter and drainer.
 //!
-//! The module-level free functions (`init`, `flush`, …) in `lib.rs` delegate
-//! to [`DEFAULT`]. Applications needing multiple isolated fasten deployments
-//! can construct `Engine` instances directly.
+//! The free functions in `lib.rs` (`init`, `flush`, ...) and
+//! `EmitBuilder::submit()` all use [`DEFAULT`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,8 +14,6 @@ use fasten_core::drainer::{Drainer, DrainerConfig};
 
 use crate::{current_request_id, AuditStore, Config, Error};
 
-// ── Poison-recovery helper ────────────────────────────────────────────────────
-
 trait LockOrRecover<T: ?Sized> {
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
 }
@@ -25,8 +22,6 @@ impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
         self.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
-
-// ── Row conversion: SDK Row ↔ fasten_core::Row ────────────────────────────────
 
 pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
     fasten_core::Row {
@@ -37,7 +32,7 @@ pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
         timestamp:      r.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
         code:           r.code.clone(),
         action:         r.action.clone(),
-        severity:       r.severity.to_string(), // Display impl → lowercase
+        severity:       r.severity.to_string(), // lowercase
         service_id:     r.service_id.clone(),
         source_node_id: r.source_node_id.clone(),
         tenant_id:      r.tenant_id.clone(),
@@ -93,7 +88,7 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
     }
 }
 
-// ── SdkStoreAdapter: bridges Arc<dyn AuditStore> → fasten_core::Store ─────────
+// Lets the fasten-core drainer write through an SDK `AuditStore`.
 
 struct SdkStoreAdapter(Arc<dyn AuditStore>);
 
@@ -114,8 +109,6 @@ impl fasten_core::store::Store for SdkStoreAdapter {
     fn purge(&self, _: &str, _: bool) -> Result<u64, fasten_core::Error> { Ok(0) }
     fn max_monotonic_seq(&self) -> Result<u64, fasten_core::Error> { Ok(0) }
 }
-
-// ── Engine ���───────────────────────────────────────────────────────────────────
 
 pub struct Engine {
     pub(crate) config:  Mutex<Option<Config>>,
@@ -239,5 +232,5 @@ impl Default for Engine {
     fn default() -> Self { Self::new() }
 }
 
-/// The default engine used by all free-function API calls (`init`, `emit`, …).
+/// The engine behind the free functions (`init`, `flush`, ...).
 pub static DEFAULT: Engine = Engine::new();
