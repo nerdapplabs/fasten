@@ -10,8 +10,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// ── duration parser ──────────────────────────────────────────────────────
-
 func TestParseRetentionDuration_Accepts(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -37,15 +35,13 @@ func TestParseRetentionDuration_Accepts(t *testing.T) {
 }
 
 func TestParseRetentionDuration_Rejects(t *testing.T) {
-	// Rejects everything except a single positive integer + one unit from
-	// {s,m,h,d}. Compound forms (2h30m, 1d12h) and fractional forms (1.5h,
-	// 500ms) are refused deliberately — the Python parser accepts the same
-	// set, and matching it keeps FASTEN_RETENTION_API meaning one thing
-	// across both SDKs.
+	// Only a single positive integer plus one unit from {s,m,h,d}. Compound
+	// and fractional forms are refused so FASTEN_RETENTION_API means the same
+	// thing here as in the Python SDK.
 	bad := []string{
 		"7", "d", "0d", "-1d", "week",
 		"1d12h", "2h30m", "1h5m3s", // compound
-		"3.5d", "1.5h", "500ms",     // fractional / sub-second
+		"3.5d", "1.5h", "500ms", // fractional / sub-second
 	}
 	for _, s := range bad {
 		if _, err := parseRetentionDuration(s); err == nil {
@@ -54,9 +50,7 @@ func TestParseRetentionDuration_Rejects(t *testing.T) {
 	}
 }
 
-// ── purger loop ──────────────────────────────────────────────────────────
-
-// fakeStreamStore counts Purge invocations + captures cutoff strings, so a
+// fakeStreamStore counts Purge invocations and captures cutoff strings, so a
 // test can assert both cadence and the exact cutoff formula (now-retention).
 type fakeStreamStore struct {
 	StreamRepository
@@ -123,8 +117,7 @@ func TestStartPurger_KeepsRunningAfterError(t *testing.T) {
 	}
 }
 
-// failingStreamStore always errors on Purge — used to prove the loop
-// survives repeated failures.
+// failingStreamStore always errors on Purge.
 type failingStreamStore struct{ StreamRepository }
 
 func (*failingStreamStore) Purge(string) (int64, error) {
@@ -136,8 +129,6 @@ type errStrRet string
 func (e errStrRet) Error() string { return string(e) }
 
 var errPurgeFail = errStrRet("simulated purge failure")
-
-// ── engine wiring ────────────────────────────────────────────────────────
 
 func TestEngine_RetentionSpawnsCancellableGoroutine(t *testing.T) {
 	registerTestCodes(t)

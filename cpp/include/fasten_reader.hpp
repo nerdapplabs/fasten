@@ -1,20 +1,20 @@
 #pragma once
 /**
- * fasten_reader.hpp — framework-agnostic /logs reader core.
+ * fasten_reader.hpp: framework-independent handlers for the /logs endpoints.
  *
- * Exposes three pure handler functions that any HTTP framework can call.
- * Each takes a flat string map of query params and returns {status, body}.
+ * Each handler takes the query params as a flat string map and returns
+ * {status, JSON body}.
  *
  * Usage pattern (any framework):
  *   fasten::reader::Params p = {{"level","warn"},{"limit","50"}};
  *   auto r = fasten::reader::handle_sys(p);
  *   // r.status == 200, r.body == {"rows":[...]}
- *   // → set Content-Type: application/json and write r.body
+ *   // send r.body with Content-Type: application/json
  *
  * For Simple-Web-Server: include fasten_reader_simplehttp.hpp instead.
  * For Crow / Drogon / Pistache / custom server: call handle_* directly.
  *
- * Audit endpoint requires an adopter-provided query callback:
+ * /audit needs a query callback:
  *   fasten::reader::set_audit_query([](auto rid, auto code, auto dom, int lim) {
  *       return my_sqlite.query(rid, code, dom, lim);
  *   });
@@ -25,7 +25,7 @@
 namespace fasten {
 namespace reader {
 
-// Flat query-param map — framework fills this from its own parsed query string.
+// Query params, filled in by the HTTP framework.
 using Params = std::unordered_map<std::string, std::string>;
 
 struct Response {
@@ -33,8 +33,7 @@ struct Response {
     std::string body;          // always JSON; Content-Type: application/json
 };
 
-// Adopter-provided audit store query — called by handle_audit().
-// Returns rows matching the supplied filters (empty string = no filter).
+// Audit store query used by handle_audit(). An empty filter matches all.
 using AuditQueryFn = std::function<
     std::vector<fasten::Row>(
         const std::string& request_id,
@@ -42,24 +41,18 @@ using AuditQueryFn = std::function<
         const std::string& domain,
         int                limit)>;
 
-// Register the audit query function once at startup.
-// Without it, /audit returns empty rows + an informational warning field.
+// Set once at startup. Without it /audit returns no rows and a "warning".
 inline void set_audit_query(AuditQueryFn fn);
 
-// ── Handler functions ─────────────────────────────────────────────────────
-//
-// All three are safe to call from multiple threads simultaneously.
-//
-// Recognised params:
-//   /sys   — level, request_id, limit (default 100, max 1000)
-//   /api   — method, path, request_id, limit
-//   /audit — request_id, code, domain, limit
+// Safe to call from several threads once set_audit_query() has run.
+// Params (limit defaults to 100, clamped to 1..1000):
+//   /sys:   level, request_id, limit
+//   /api:   method, path, request_id, limit
+//   /audit: request_id, code, domain, limit
 
 inline Response handle_sys  (const Params& p);
 inline Response handle_api  (const Params& p);
 inline Response handle_audit(const Params& p);
-
-// ── Implementation ────────────────────────────────────────────────────────
 
 namespace detail_ {
 

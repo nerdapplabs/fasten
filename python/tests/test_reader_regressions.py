@@ -1,12 +1,11 @@
-"""Regression tests for the gh #58 conformance fixes that were verified
-ad-hoc during development but lacked a committed test:
+"""Reader and DSN edge cases (GitHub #58).
 
-- C1   empty ?request_id= on /correlate -> 422 (not just a missing param)
-- FR3-1 empty ?q= on /logs/sys -> 422
-- FR3-3 q= on /logs/api -> 400 (sys-only)
-- M3    absolute sqlite DSN path preserved (sqlite:////abs)
-- M4    non-string request_id -> sentinel string
-- FR5-9 /audit dual pagination: total/limit/offset + next_after cursor
+- empty ?request_id= on /correlate is a 422, same as a missing one
+- empty ?q= on /logs/sys is a 422
+- q= on /logs/api is a 400 (search is sys-only)
+- an absolute sqlite DSN path is kept (sqlite:////abs)
+- a non-string request_id becomes a sentinel string
+- /audit supports both total/limit/offset and the next_after cursor
 """
 import pytest
 
@@ -27,8 +26,8 @@ def _client():
 
 
 def _init(search=False, **stores):
-    # Pass config explicitly (no global env mutation, so tests stay isolated —
-    # setting FASTEN_SEARCH_ENABLED here would leak into other tests).
+    # Pass search_enabled directly; setting FASTEN_SEARCH_ENABLED would
+    # carry over into other tests.
     fasten.init(
         service_id="svc", node_id="node",
         audit_store=SQLiteStore(":memory:"),
@@ -38,7 +37,6 @@ def _init(search=False, **stores):
     )
 
 
-# ── C1 ────────────────────────────────────────────────────────────────────
 def test_correlate_empty_request_id_rejected():
     _init()
     c = _client()
@@ -47,7 +45,6 @@ def test_correlate_empty_request_id_rejected():
     assert c.get("/api/v1/logs/correlate?request_id=r1").status_code == 200
 
 
-# ── FR3-1 ─────────────────────────────────────────────────────────────────
 def test_sys_empty_q_rejected():
     _init(search=True)
     c = _client()
@@ -55,7 +52,6 @@ def test_sys_empty_q_rejected():
     assert c.get("/api/v1/logs/sys").status_code == 200  # absent q is fine
 
 
-# ── FR3-3 ─────────────────────────────────────────────────────────────────
 def test_api_q_rejected_sys_only():
     _init()
     c = _client()
@@ -64,7 +60,6 @@ def test_api_q_rejected_sys_only():
     assert c.get("/api/v1/logs/api").status_code == 200
 
 
-# ── M3 ────────────────────────────────────────────────────────────────────
 def test_stream_store_from_dsn_preserves_absolute_path(tmp_path):
     from fasten.engine import _stream_store_from_dsn
     abs_db = tmp_path / "streams.db"
@@ -76,10 +71,9 @@ def test_stream_store_from_dsn_preserves_absolute_path(tmp_path):
     assert getattr(s2, "path", getattr(s2, "_path", None)) == "rel.db"
 
 
-# PR #59 finding 11: reject unknown DSN schemes rather than silently opening
-# a local SQLite file named after the DSN's path component. Any of these
-# used to create a container-local file that reads then reports
-# completeness=store — durability asserted over an ephemeral file.
+# Unknown schemes are rejected instead of being opened as a local SQLite
+# file named after the DSN path, which would report completeness=store for
+# a file that may not survive a restart.
 def test_stream_store_dsn_rejects_unknown_schemes():
     import pytest as _pytest
     from fasten.engine import _stream_store_from_dsn
@@ -92,7 +86,6 @@ def test_stream_store_dsn_rejects_unknown_schemes():
             _stream_store_from_dsn(dsn, "api_log")
 
 
-# ── M4 ────────────────────────────────────────────────────────────────────
 def test_stamp_request_id_non_string_becomes_sentinel():
     from fasten.transport.stdout import StdoutTransport
     tr = StdoutTransport(service_id="svc")
@@ -104,7 +97,6 @@ def test_stamp_request_id_non_string_becomes_sentinel():
     assert real["request_id"] == "real-abc"  # a real string id is untouched
 
 
-# ── FR5-9 ─────────────────────────────────────────────────────────────────
 def test_audit_dual_pagination_cursor_and_offset():
     _init()
     with with_request_id("rq"):

@@ -1,13 +1,7 @@
-// P1-5 smoke test for C++: pii_in_detail enforcement.
-//
-// Build:
-//   g++ -std=c++14 -Wall -Wextra -Wpedantic -I../include
-//       pii_in_detail_smoke.cpp -o pii_smoke
-//
-// Three behaviours, mirrored from Python / Go / JS / Rust:
+// pii_in_detail handling:
 //   1. register_codes() forces Retention::Short and warns on stderr
-//   2. emit() force-redacts detail; detail_passthrough_keys survive
-//   3. Row.pii_in_detail mirrors Meta.pii_in_detail
+//   2. emit() drops detail except detail_passthrough_keys
+//   3. Row.pii_in_detail is copied from Meta.pii_in_detail
 #include "fasten.hpp"
 
 #include <cassert>
@@ -34,8 +28,6 @@ std::string capture_stderr(Fn fn) {
     std::cerr.rdbuf(old);
     return buf.str();
 }
-
-// ── #1 force Short at registration ────────────────────────────────────────
 
 void test_register_forces_short() {
     reset_state();
@@ -80,8 +72,6 @@ void test_register_already_short_no_warn() {
     std::cout << "register_already_short_no_warn: PASS\n";
 }
 
-// ── #2 emit force-redact + passthrough ────────────────────────────────────
-
 void test_emit_force_redacts_detail() {
     reset_state();
     fasten::Meta m;
@@ -105,8 +95,7 @@ void test_emit_force_redacts_detail() {
     assert(row.detail["_redacted"] == fasten::kRedactReplacement);
     assert(row.detail["_pii_in_detail"] == "true");
 
-    // Wire-format parity with Python/Go/JS/Rust: the marker MUST emit
-    // as a JSON boolean inside detail, not the C++ Fields string "true".
+    // The marker is a JSON boolean on the wire, not the string "true".
     auto js = row.to_json();
     assert(js.find("\"_pii_in_detail\":true") != std::string::npos);
     assert(js.find("\"_pii_in_detail\":\"true\"") == std::string::npos);
@@ -167,8 +156,7 @@ void test_passthrough_secret_still_redacted() {
         fasten::target("u-42"),
         fasten::detail({{"api_key", "sk-secret"}}));
 
-    // Even when an adopter explicitly opts api_key into passthrough,
-    // the secret-key redactor still scrubs the value.
+    // A passthrough key is still redacted if it looks like a secret.
     assert(row.detail["api_key"] == fasten::kRedactReplacement);
     std::cout << "passthrough_secret_still_redacted: PASS\n";
 }
@@ -207,6 +195,6 @@ int main() {
     test_emit_passthrough_keys();
     test_passthrough_secret_still_redacted();
     test_non_pii_keeps_detail();
-    std::cout << "\nALL P1-5 CPP TESTS PASSED\n";
+    std::cout << "\nALL PII_IN_DETAIL TESTS PASSED\n";
     return 0;
 }

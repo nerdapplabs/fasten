@@ -1,8 +1,7 @@
-"""FR1 retention (spec §1) — background age-based purger for stream stores.
+"""Age-based purger for stream stores (spec §1).
 
-Tests the standalone driver + the engine wiring. The driver is deterministic
-(injected clock + inline wait); the engine test is a smoke that init()
-actually spawns and shuts a purger down for a configured stream store.
+The driver tests use an injected clock. The engine tests check that init()
+starts and stops a purger for a configured stream store.
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from fasten.store.sqlite import SQLiteStore
 from fasten.store.stream import StreamStore
 
 
-# ── duration parser ──────────────────────────────────────────────────────
+# Duration parser
 
 @pytest.mark.parametrize("s, want", [
     ("1s", timedelta(seconds=1)),
@@ -39,24 +38,17 @@ def test_parse_duration_ok(s, want):
 
 @pytest.mark.parametrize("s", [
     "", "7", "d", "0d", "-1d", "7x", "1d12h", "week", None,
-    "3.5d",  # no fractional support in v1
+    "3.5d",  # fractions are not supported
 ])
 def test_parse_duration_rejects(s):
     with pytest.raises((RetentionConfigError, TypeError)):
         parse_duration(s)
 
 
-# ── purger loop ──────────────────────────────────────────────────────────
+# Purger loop
 
 class _FakeStore:
-    """Minimal stream-store shim capturing purge() invocations.
-
-    `before` is a datetime: both store families now take one and canonicalise
-    internally. This shim previously declared `before: str`, which agreed with
-    what the purger passed and disagreed with every real audit store — so the
-    mock made the loop look correct while `SQLiteStore.purge` would have raised
-    on the same argument.
-    """
+    """Records purge() calls. Real stores take `before` as a datetime."""
     def __init__(self, raise_on_calls: list[int] | None = None):
         self.calls: list[datetime] = []
         self._raise_on = set(raise_on_calls or [])
@@ -70,9 +62,8 @@ class _FakeStore:
 
 
 def test_purger_runs_immediately_and_uses_now_minus_retention():
-    """First tick fires without waiting the interval — operators must see the
-    purge take effect on init, not an hour later. Cutoff must be exactly
-    now - retention (checked to ms via the injected clock)."""
+    """The first tick runs on init rather than after the interval, and the
+    cutoff is exactly now - retention."""
     store = _FakeStore()
     fixed_now = datetime(2026, 8, 21, 10, 0, 0, tzinfo=timezone.utc)
     stop = threading.Event()
@@ -84,8 +75,7 @@ def test_purger_runs_immediately_and_uses_now_minus_retention():
         stop_event=stop,
         now_fn=lambda: fixed_now,
     )
-    # Loop must have fired once by the time the process reaches this line —
-    # small polling avoids a race without needing a long sleep.
+    # Poll briefly; the first tick runs on the purger thread.
     for _ in range(50):
         if store.calls:
             break
@@ -94,14 +84,12 @@ def test_purger_runs_immediately_and_uses_now_minus_retention():
     t.join(timeout=1.0)
 
     assert store.calls, "purger must fire the first purge before waiting"
-    # Cutoff = now - 7d, exactly, as a datetime.
     assert store.calls[0] == datetime(2026, 8, 14, 10, 0, 0, tzinfo=timezone.utc)
 
 
 def test_purger_errors_do_not_stop_the_loop():
-    """A store.purge() raise on the first tick must not kill the thread —
-    the next tick must still run. Piped through on_error so the caller can
-    log the miss (Engine wires this into drainer_sys_log)."""
+    """A failing tick is reported through on_error and the next tick still
+    runs. Engine passes an on_error that writes to _drainer_sys_log."""
     store = _FakeStore(raise_on_calls=[0])  # first call raises
     stop = threading.Event()
     errors: list[tuple[str, str]] = []
@@ -115,7 +103,7 @@ def test_purger_errors_do_not_stop_the_loop():
         check_interval=timedelta(milliseconds=50),
         stop_event=stop, on_error=_err,
     )
-    # Wait for at least a second call (the recovery).
+    # Wait for a second call.
     for _ in range(100):
         if len(store.calls) >= 2:
             break
@@ -124,16 +112,13 @@ def test_purger_errors_do_not_stop_the_loop():
     t.join(timeout=1.0)
 
     assert len(store.calls) >= 2, "loop must survive a purge failure"
-    # The label is phase-qualified ("sys/age-purge") so an operator can tell
-    # which horizon stopped working — a PII redaction failure and an age purge
-    # failure used to arrive under the same bare stream name.
+    # The label says which job failed: "sys/age-purge" or "sys/pii-redaction".
     assert errors and errors[0][0].startswith("sys")
     assert errors[0][0] == "sys/age-purge"
 
 
 def test_purger_shuts_down_within_interval_on_stop():
-    """stop_event.set() must wake the sleep before the interval fires; a
-    long interval must not delay shutdown."""
+    """stop_event.set() wakes the wait, so a long interval doesn't delay shutdown."""
     store = _FakeStore()
     stop = threading.Event()
     t = start_purger(
@@ -148,7 +133,7 @@ def test_purger_shuts_down_within_interval_on_stop():
     assert not t.is_alive(), "stop must terminate the purger promptly"
 
 
-# ── engine wiring ────────────────────────────────────────────────────────
+# Engine wiring
 
 def test_engine_init_spawns_purger_thread_for_configured_stream():
     fasten.init(
@@ -171,7 +156,6 @@ def test_engine_init_no_retention_spawns_no_thread():
         audit_store=SQLiteStore(":memory:"),
         syslog_store=StreamStore(":memory:", table="syslog"),
         audit_store_failure_strategy="raise",
-        # no retention_syslog / retention_api → no purger
     )
     from fasten.emitter import _default as eng
     assert eng._retention_threads == [], (
@@ -180,9 +164,8 @@ def test_engine_init_no_retention_spawns_no_thread():
 
 
 def test_engine_reinit_stops_previous_purgers(monkeypatch):
-    """Repeat init on the same Engine must join the old threads before
-    starting new ones — an orphan thread hammering a closed store is a
-    real failure mode."""
+    """Re-init joins the old threads before starting new ones, so no thread
+    keeps purging a closed store."""
     fasten.init(
         service_id="svc", node_id="n",
         audit_store=SQLiteStore(":memory:"),
@@ -194,7 +177,6 @@ def test_engine_reinit_stops_previous_purgers(monkeypatch):
     old_threads = list(eng._retention_threads)
     assert old_threads and old_threads[0].is_alive()
 
-    # Re-init with a fresh store; the old thread must be joined.
     fasten.init(
         service_id="svc", node_id="n",
         audit_store=SQLiteStore(":memory:"),
@@ -206,7 +188,6 @@ def test_engine_reinit_stops_previous_purgers(monkeypatch):
         t.join(timeout=1.0)
         assert not t.is_alive(), "old retention thread must stop on re-init"
 
-    # And a new one is now running.
     assert any(
         t.name == "fasten-retention-sys" and t.is_alive()
         for t in eng._retention_threads
