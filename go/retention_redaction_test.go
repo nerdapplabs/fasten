@@ -312,13 +312,21 @@ func TestRetention_QueueModeDoesNotDestroyWithoutARecord(t *testing.T) {
 // form-"2" row. A sealed form-"1" row's detail is inside its hash, so it is
 // left alone and counted.
 func TestRetention_RedactsUnsealedRowsAndSkipsSealedForm1(t *testing.T) {
-	registerPIICodes(t)
 	db, _ := sql.Open("sqlite", t.TempDir()+"/audit.db")
 	defer db.Close()
 	store, err := NewSQLiteStore(db, "fasten_audit")
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkRedactsUnsealedAndSkipsSealedForm1(t, store)
+}
+
+func checkRedactsUnsealedAndSkipsSealedForm1(t *testing.T, store interface {
+	AuditRepository
+	RedactionRepository
+}) {
+	t.Helper()
+	registerPIICodes(t)
 	ctx := context.Background()
 	old := time.Now().UTC().Add(-40 * 24 * time.Hour).Truncate(time.Microsecond)
 	row := func(id string, seq int64, hash, form string) Row {
