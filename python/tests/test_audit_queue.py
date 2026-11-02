@@ -960,6 +960,65 @@ def test_row_retire_stores_after_close_gave_up_is_reported_recovered(tmp_path):
     assert [e["row_ids"] for e in recovered] == [[row.id]]
 
 
+def _core_event(d, event, row_id):
+    d.sys_callback(json.dumps({"event": event, "level": "error", "row_id": row_id}).encode(), None)
+
+
+def test_core_event_for_a_row_close_did_not_report_still_goes_out(tmp_path):
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store)
+    d = _default._drainer
+    try:
+        fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        assert not fasten.close(timeout=0.3)
+        _core_event(d, "audit_drain_dead_letter", "evt-never-reported")
+    finally:
+        _release_hung_store(store)
+    dead = [e for e in fasten.transport().query_syslog(limit=1000)
+            if e.get("event") == "audit_drain_dead_letter"]
+    assert [e["row_id"] for e in dead] == ["evt-never-reported"]
+
+
+def test_core_event_past_the_deadline_skips_the_syslog_store(tmp_path):
+    store = HangingStore(str(tmp_path / "a.db"))
+    syslog = BlockingSyslogStore()
+    _init(store, syslog_store=syslog)
+    d = _default._drainer
+    try:
+        fasten.emit(code="USER_CREATED", target="u-1")
+        _wait_for_attempts(store, 1)
+        assert not fasten.close(timeout=0.3)
+        syslog.armed.set()
+        t = threading.Thread(target=_core_event, args=(d, "audit_drain_failed", "evt-x"))
+        t.start()
+        t.join(timeout=2)
+        assert not t.is_alive()
+    finally:
+        syslog.release.set()
+        _release_hung_store(store)
+
+
+def test_row_reported_lost_then_stored_inline_is_reported_recovered(tmp_path, monkeypatch):
+    # close gives up on the drainer while an emit is between queueing the
+    # row and fasten-core refusing it.
+    from fasten import core_ffi
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+    d = _default._drainer
+
+    def refused(handle, row_json):
+        _default._report_unstored(d)
+        raise core_ffi.EnqueueError(core_ffi.ERR_DRAINER_STOPPED, "drainer stopped")
+
+    monkeypatch.setattr(core_ffi, "drainer_enqueue", refused)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    assert row.hash
+    recovered = [e for e in fasten.transport().query_syslog(limit=1000)
+                 if e.get("event") == "audit_drain_recovered_at_stop"]
+    assert [e["row_ids"] for e in recovered] == [[row.id]]
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)

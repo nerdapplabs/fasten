@@ -176,7 +176,7 @@ class _QueueDrainer:
     install: dict[str, Any] = dataclasses.field(default_factory=dict)  # to reinstall after fork
     deadline: Optional[float] = None    # time.monotonic(); close starts no insert after it
     lost: int = 0                       # rows dead-lettered or lost at stop
-    reported: bool = False              # rows left at stop have been reported
+    reported: set[str] = dataclasses.field(default_factory=set)   # rows reported lost at stop
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     # The store thread's calls; see call_on_worker.
     calls: queue.SimpleQueue = dataclasses.field(default_factory=queue.SimpleQueue)
@@ -742,12 +742,14 @@ class Engine:
                             pass    # init is switching stores: store it inline in the new one
                         else:
                             store = d.store
-                            d.pending[row.id] = [row, 0]
+                            with d.lock:
+                                d.pending[row.id] = [row, 0]
                             try:
                                 _ffi.drainer_enqueue(d.handle, json.dumps(row.to_dict(), default=str))
                                 queued = True
                             except Exception as e:  # noqa: BLE001 — enqueue refused; store it inline
-                                d.pending.pop(row.id, None)
+                                with d.lock:
+                                    d.pending.pop(row.id, None)
                                 refused = True
                                 if getattr(e, "rc", None) != _ffi.ERR_DRAINER_STOPPED:
                                     # fasten-core reports only the rows it refused at stop.
@@ -774,6 +776,10 @@ class Engine:
                     else:
                         if refused:  # follows the abandoned event
                             self._drainer_sys_log("info", "audit_drain_stored_inline", {"row_id": row.id})
+                            # close gave up meanwhile and reported it lost
+                            if d is not None and row.id in d.reported:
+                                self._drainer_sys_log("info", "audit_drain_recovered_at_stop",
+                                                      {"row_ids": [row.id]}, via=d)
             else:
                 try:
                     row = self._allocate_and_store(row, self._audit_store, self._stdout)
@@ -1126,19 +1132,22 @@ class Engine:
                 with self._insert_lock:
                     self._allocate_and_store(entry[0], store, d.stdout)
                 with d.lock:
+                    pending.pop(row_id, None)
                     # close() gave up on this call and reported the row lost.
-                    recovered = pending.pop(row_id, None) is None and d.reported
+                    recovered = row_id in d.reported
                 if recovered:
                     self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
                 return 0
             except BaseException as e:  # noqa: BLE001 — a failed insert, never "stored"
                 cb_logger.exception("insert_cb failed for row %s", row_id)
                 rejected = _rejects_row(e)
-                failed = pending.get(row_id)
-                if failed is not None and (rejected or failed[1] >= max_attempts):
-                    pending.pop(row_id, None)  # the drainer dead-letters it now
-                    with d.lock:
+                with d.lock:
+                    failed = pending.get(row_id)
+                    dead = failed is not None and (rejected or failed[1] >= max_attempts)
+                    if dead:
+                        pending.pop(row_id, None)  # the drainer dead-letters it now
                         d.lost += 1
+                if dead:
                     self._mark_write_lost(store, d.gen)
                 return _ffi.INSERT_REJECTED if rejected else 1
 
@@ -1158,12 +1167,14 @@ class Engine:
             fields = json.loads(event_json.decode("utf-8"))
             # A row still pending failed its one try at stop; retire then
             # stores it or reports it lost, so this would count it twice.
-            if fields.get("event") in ("audit_drain_dead_letter", "audit_drain_lost_at_stop") and (
-                    d.reported or fields.get("row_id") in pending):
-                return 0
+            if fields.get("event") in ("audit_drain_dead_letter", "audit_drain_lost_at_stop"):
+                with d.lock:
+                    if fields.get("row_id") in d.reported or fields.get("row_id") in pending:
+                        return 0
             fields.pop("shape", None)
             fields.pop("timestamp", None)
-            self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields, via=d)
+            self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields,
+                                  via=d, persist=not d.past_deadline())
             return 0
 
         cb = _ffi.InsertCallbackFn(_insert_cb)
@@ -1271,9 +1282,10 @@ class Engine:
                 self._allocate_and_store(row, d.store, d.stdout)
             except Exception as e:  # noqa: BLE001
                 with d.lock:
-                    lost = not d.reported
+                    lost = row.id not in d.reported
                     if lost:
                         d.pending.pop(row.id, None)
+                        d.reported.add(row.id)
                         d.lost += 1
                 if lost:
                     self._lose_at_stop(d, [row.id], type(e).__name__)
@@ -1296,12 +1308,10 @@ class Engine:
         self._insert_lock = threading.Lock()
 
     def _report_unstored(self, d: _QueueDrainer) -> None:
-        """Report the rows a retiring drainer still holds as lost, once."""
+        """Report the rows a retiring drainer still holds as lost."""
         with d.lock:
-            if d.reported:
-                return
-            d.reported = True
             row_ids = list(d.pending)
+            d.reported.update(row_ids)
             d.pending.clear()
             d.lost += len(row_ids)
         self._lose_at_stop(d, row_ids, "TimeoutError")
