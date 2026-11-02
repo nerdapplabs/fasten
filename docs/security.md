@@ -1,7 +1,7 @@
 # fasten threat model
 
 **Version:** 1.0.0-beta  
-**Last reviewed:** 2026-10-26  
+**Last reviewed:** 2026-05-08  
 **Scope:** Python (reference SDK), Go, JS/TS, Rust, C++, Swift
 
 This document covers the security model of the fasten SDK: what it protects, what it explicitly does not protect, and the attack surfaces to consider when embedding fasten in a production service.
@@ -101,7 +101,7 @@ The runtime layout:
 - The `tenant_id` column is part of the row schema and is stored in the audit table. The `query()` / `count()` methods accept `tenant_id` as a filter.
 - The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithTenantScope(...))` in Go) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`) refuses to build the reader without the hook.
 - Adopters can also enforce per-tenant filtering in their own auth dependency by extracting the tenant from the authenticated identity and passing it explicitly to `fasten.audit_store().query(tenant_id=...)`.
-- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`).
+- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`). They all run on in-memory SQLite; no test checks cross-tenant reads against Postgres in CI.
 
 **Not mitigated:**
 
@@ -138,7 +138,7 @@ The runtime layout:
 
 **Not mitigated:**
 
-- A value in `detail` that is not JSON-serialisable (such as a class instance) is written as its `str()` form. It is never turned back into an object, so it cannot execute code. This is a fail-safe rather than a mitigation.
+- A value in `detail` that is not JSON-serialisable (such as a class instance) makes `emit()` raise `TypeError`. It does not silently succeed or execute code. This is a fail-safe rather than a mitigation, but the failure mode is a visible error.
 
 ---
 
