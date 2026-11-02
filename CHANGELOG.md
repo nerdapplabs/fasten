@@ -12,9 +12,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   configure a syslog store`, and the same shape for `requires api
   persistence` and `requires an audit store with a search method`. The
   em dash and the `(FR1)` suffix are gone.
-- Catalog-loader, init, reader-auth and table-name errors read `x: y`
-  where they read `x — y`; Python `create_router` and Go `NewReader`
-  config errors drop their `P1-44` / `P1-45` references.
+- These errors read `x: y` where they read `x — y`: the catalog loaders,
+  init, reader auth and table names; Go's unknown audit code at emit;
+  Python's `requires an audit store` from `verify` and `redact`; the
+  core's `sslmode` TLS error; and Java's not-implemented message. Others
+  still use the dash, such as Go's `NewReader` tenant panic, the
+  search-disabled and transport-not-initialised bodies, Python's
+  durable-storage DSN error and Swift's `register` errors.
+- Python `fasten.reader.router` and Go `NewReader` config errors drop
+  their `P1-44` / `P1-45` references.
 - JS: the `_clearRustRegistry` test hook is now `_clearCoreRegistry`.
 - Spec: `drainer-conformance.md` now says a dip into the 50–80 % band
   re-arms neither threshold flag, which is what the drainer does; it said
