@@ -244,6 +244,29 @@ def test_rows_failing_at_shutdown_mark_the_engine_degraded(tmp_path):
     assert _default.audit_write_swallowed()
 
 
+class _StoreAborted(BaseException):
+    pass
+
+
+def test_base_exception_from_the_store_is_a_failed_insert(tmp_path):
+    # Escaping the ctypes callback, it would make the callback return 0,
+    # which fasten-core reads as stored.
+    store = FlakyStore(str(tmp_path / "a.db"))
+    good, calls = store.allocate_and_insert_originated, []
+
+    def insert(row):
+        calls.append(row.id)
+        if len(calls) == 1:
+            raise _StoreAborted()
+        return good(row)
+    store.allocate_and_insert_originated = insert
+    _init(store)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=2.0)
+    assert calls == [row.id, row.id]
+    assert [r.id for r in _rows(store)] == [row.id]
+
+
 def test_stdout_failure_after_store_is_not_a_failed_insert(tmp_path, monkeypatch):
     store = FlakyStore(str(tmp_path / "a.db"))
     _init(store)

@@ -1121,7 +1121,7 @@ class Engine:
                 if recovered:
                     self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
                 return 0
-            except Exception as e:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
+            except BaseException as e:  # noqa: BLE001 — must not escape: ctypes would return 0, "stored"
                 cb_logger.exception("insert_cb failed for row %s", row_id)
                 rejected = _rejects_row(e)
                 failed = pending.get(row_id)
