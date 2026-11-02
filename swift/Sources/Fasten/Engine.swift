@@ -143,8 +143,9 @@ final class Engine: @unchecked Sendable {
         if refused > 0 {
             log(level: "warn", event: "pii_redaction_skipped_legacy_form", fields: [
                 "rows": refused,
-                "reason": "canonical_form_id != 2; detail is inside the hash, so redacting "
-                    + "would break the chain. The personal data in these rows still exists.",
+                "reason": "canonical_form_id != 2; redacting would break the chain. The "
+                    + "personal data in these rows still exists. On a table only Swift wrote, "
+                    + "SQLiteStore.clearLegacySwiftHashes() makes them redactable.",
             ])
         }
         let candidates = try store.listRedactionCandidates(before: before, codes: codes)

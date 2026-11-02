@@ -406,7 +406,7 @@ final class ChainTests: XCTestCase {
     // does not serialize in multi-thread mode.
     func testReadsWhileInsertingOnOneStore() throws {
         let store = try SQLiteStore(path: ":memory:")
-        let n = 200
+        let n = 2000
         DispatchQueue.concurrentPerform(iterations: 2) { i in
             for j in 0..<n {
                 if i == 0 {
