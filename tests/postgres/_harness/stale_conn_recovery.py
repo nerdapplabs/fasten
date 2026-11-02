@@ -1,14 +1,9 @@
-"""Scenario 4 + 9: stale-connection recovery.
+"""Scenario 9: emit after the store's connection has been idle.
 
-Verifies that the fasten Postgres store reconnects automatically after:
-  - Postgres restart (scenario 4)
-  - Long idle period where the server closes the connection (scenario 9)
+Emits a row, idles for idle_s seconds with the server's tcp_keepalives_idle
+lowered, then emits again. Only --mode idle is implemented.
 
-Run scenario 4 via --mode restart (requires docker-compose in PATH and
-COMPOSE_FILE set).  Scenario 9 via --mode idle (sets server idle timeout
-low via ALTER SYSTEM).
-
-Pass criteria: all rows present after recovery; no unhandled exceptions.
+Passes when both rows are stored and neither emit raised.
 """
 import argparse
 import json
@@ -18,7 +13,7 @@ from datetime import datetime, timezone
 
 
 def run_idle(dsn, table, idle_s):
-    """Emit once, idle for idle_s, emit again — stale retry must recover."""
+    """Emit once, idle for idle_s, emit again; the second emit must succeed."""
     import fasten
     from fasten.store.postgres import PostgresStore
     import psycopg
@@ -51,7 +46,7 @@ def run_idle(dsn, table, idle_s):
 
     _emit("before-idle")
 
-    # Lower server idle timeout so the connection goes stale quickly.
+    # Lower the server's TCP keepalive idle time for the duration of the test.
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(f"ALTER SYSTEM SET tcp_keepalives_idle = {max(1, idle_s // 2)}")
         c.execute("SELECT pg_reload_conf()")

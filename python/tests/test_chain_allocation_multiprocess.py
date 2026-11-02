@@ -1,9 +1,8 @@
-"""P0-9 — allocation must serialise across PROCESSES, not just threads.
+"""Sequence allocation must serialise across processes, not just threads.
 
-The reported bug was a forking supervisor / `uvicorn --workers` / two services
-sharing a store. Those are separate processes with separate SQLite connections,
-so an in-process lock proves nothing. Only `BEGIN IMMEDIATE` taking a RESERVED
-lock in the database file makes this correct.
+A forking supervisor, `uvicorn --workers`, or two services sharing a store are
+separate processes with separate SQLite connections, so an in-process lock is
+not enough. `BEGIN IMMEDIATE` takes a RESERVED lock on the database file.
 
 These tests fork real processes.
 """
@@ -54,12 +53,8 @@ def _worker(db: str, pid: int, q: mp.Queue, barrier) -> None:
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
 def test_concurrent_processes_produce_one_verifiable_chain():
-    """THE REAL P0-9 GUARD.
-
-    N processes, N service ids, one node, one SQLite file. The chain must come
-    out contiguous and verifiable. Before store-allocated sequencing each
-    process minted from 1 and verify_chain reported a false tamper signal.
-    """
+    """N processes, N service ids, one node, one SQLite file. The chain must
+    come out contiguous and verifiable."""
     db = os.path.join(tempfile.mkdtemp(), "audit.db")
     SQLiteStore(path=db, table="fasten_audit")     # create schema once
 
@@ -84,7 +79,7 @@ def test_concurrent_processes_produce_one_verifiable_chain():
 
     seqs = sorted(r.monotonic_seq for r in rows)
     assert seqs == list(range(1, total + 1)), (
-        "monotonic_seq is not contiguous — allocation did not serialise across "
+        "monotonic_seq is not contiguous: allocation did not serialise across "
         f"processes. got {seqs}"
     )
     assert len({r.monotonic_seq for r in rows}) == total, "duplicate seq"
@@ -97,14 +92,8 @@ def test_concurrent_processes_produce_one_verifiable_chain():
 def test_no_writer_starves_or_errors_under_simultaneous_start():
     """Contention must not surface as errors to the caller.
 
-    All N processes are released from a barrier at once, so they pile onto the
-    RESERVED lock simultaneously. SQLite serialises writers — in practice one
-    process tends to run to completion before the next is scheduled, which is
-    lock handoff, not absence of contention. What must NOT happen is a worker
-    seeing "database is locked" and dropping an audit row on the floor.
-
-    This is the guard for the throughput/robustness side of spec §2.1: the
-    allocation is correct, but it IS a serialisation point.
+    All N processes are released from a barrier at once and contend for the
+    RESERVED lock. No worker may see "database is locked" and drop a row.
     """
     db = os.path.join(tempfile.mkdtemp(), "audit.db")
     SQLiteStore(path=db, table="fasten_audit")

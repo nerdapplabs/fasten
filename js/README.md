@@ -1,18 +1,19 @@
-# fasten — Node / TypeScript
+# fasten for Node / TypeScript
 
-Audit + correlation SDK for Node services. v1.0.0-beta.
+Audit and correlation SDK for Node services. v1.0.0-beta.
 
 ## Install
 
-From source today (npm publish lands with the v1.0 GA tag):
+Install from source for now; the npm package will be published with the
+v1.0 GA tag.
 
 ```bash
 npm install ./js
-# or, when published:
+# or, once published:
 npm install @nerdapplabs/fasten
 ```
 
-Requires Node ≥ 24 (uses `AsyncLocalStorage`, `node:test`, ESM).
+Requires Node 24 or later (uses `AsyncLocalStorage`, `node:test`, ESM).
 
 ## Quickstart
 
@@ -52,13 +53,13 @@ await withRequestID('req-a1b2c3', async () => {
 await fasten.flush();   // drain pending audit rows
 ```
 
-Both lines stream NDJSON to stdout under the same `request_id`.
+Both lines go to stdout as NDJSON with the same `request_id`.
 
-## Worked example — node:http service
+## Worked example: node:http service
 
-A minimal HTTP service with `X-Request-ID` propagation, an audit row
-per request: see [`examples/server.mjs`](examples/server.mjs). Zero
-external deps — uses Node's built-in `http`.
+A minimal HTTP service with `X-Request-ID` propagation and one audit row per
+request: see [`examples/server.mjs`](examples/server.mjs). It has no external
+dependencies and uses Node's built-in `http`.
 
 ```bash
 cd js/examples
@@ -68,32 +69,29 @@ curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 curl http://localhost:8080/users/u-42
 ```
 
-## P1-15: audit-store failure handling
+## Audit-store failure handling
 
-`fasten.emit()` defaults to **queue mode** — rows are pushed onto an
-in-memory queue and a `setImmediate`-driven drainer writes to the
-sink with exponential backoff (100 ms → 60 s, ±20 % jitter). Sink
-failures stay off the request path. Set
-`auditStoreFailureStrategy: 'raise'` to opt into synchronous semantics
-with `AuditStoreError`. `queueStats()` and `flush(timeoutMs)` complete
-the public surface.
+`fasten.emit()` defaults to **queue mode**: rows go onto an in-memory queue,
+and a `setImmediate`-driven drainer writes them to the sink with exponential
+backoff (100 ms to 60 s, plus or minus 20 % jitter). Sink failures stay off
+the request path. Set `auditStoreFailureStrategy: 'raise'` for synchronous
+writes that throw `AuditStoreError`. `queueStats()` and `flush(timeoutMs)`
+complete the public surface.
 
-**Cross-language deviation.** Node is single-threaded — `emit()`
-cannot synchronously block on a counting semaphore the way Python /
-Go / Rust / C++ do. `queueCapacity` is the high-water-warn threshold
-(`audit_queue_high_water` / `audit_queue_near_full` sys events), not
-a hard cap.
+**Differs from the other SDKs:** Node is single-threaded, so `emit()` cannot
+block on a counting semaphore the way Python, Go, Rust and C++ do.
+`queueCapacity` is a warning threshold (it drives the
+`audit_queue_high_water` / `audit_queue_near_full` sys events), not a hard
+cap.
 
 ## Tests
 
 ```bash
-docker run --rm -v $PWD/js:/work -w /work node:20 \
-  sh -c "npm install --silent && node --test test/*.test.mjs"
+docker run --rm -v $PWD/js:/work -w /work node:24 \
+  sh -c "npm install --silent && npm test"
 ```
 
-Current: 52 passed.
+## Docs and design
 
-## Docs + design
-
-Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/) ·
-Design + cross-language design: [README.md](../README.md).
+Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/).
+Design and cross-language design: [README.md](../README.md).

@@ -1,8 +1,8 @@
-"""Regression tests from the Phase 1 review:
+"""Stream write-through failures, null-timestamp windows, and combined filters.
 
-- write-through persist failure must not break the hot logging path
-- null-timestamp rows agree between ring and store under since/until windows
-- combined filters compose (AND), limit truncates to the newest N
+- a failed persist does not break the logging call
+- rows without a timestamp filter the same way in the ring and the store
+- filters combine with AND, and limit keeps the newest N
 """
 import pytest
 
@@ -23,9 +23,7 @@ def _client():
 
 
 def _init(**stores):
-# service_id / node_id are passed explicitly to fasten.init below; the
-    # earlier os.environ writes were dead code that leaked env across tests.
-        fasten.init(
+    fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
@@ -33,7 +31,7 @@ def _init(**stores):
     )
 
 
-# ── write-through resilience ──────────────────────────────────────────────
+# Write-through failures
 
 class _BrokenStore(StreamStore):
     def __init__(self):
@@ -44,8 +42,7 @@ class _BrokenStore(StreamStore):
 
 
 def test_persist_failure_does_not_break_hot_path(capsys):
-    """A store insert that raises must be swallowed (logged to stderr), the
-    ring copy kept, and the push call must return normally."""
+    """The error goes to stderr, the ring keeps the row, and push returns."""
     _init()
     t = fasten.transport()
     t._api_store = _BrokenStore()  # simulate a failing sink
@@ -55,11 +52,9 @@ def test_persist_failure_does_not_break_hot_path(capsys):
 
 
 def test_persist_failure_degrades_completeness_flag(capsys):
-    """A swallowed persist failure must not leave completeness lying: reads
-    for a store-backed stream come only from the store, so a row that failed
-    to persist is silently missing — the flag degrades to "store-degraded"
-    instead of asserting durability. Sticky: a later successful write does
-    not clear it (the hole in history remains)."""
+    """Reads for a store-backed stream come only from the store, so a failed
+    persist leaves a gap and completeness becomes "store-degraded". It stays
+    that way after later writes succeed, since the lost row is still lost."""
     store = StreamStore(":memory:", table="api_log")
     _init(api_store=store)
     t = fasten.transport()
@@ -75,19 +70,19 @@ def test_persist_failure_degrades_completeness_flag(capsys):
     assert body["completeness"] == {"api": "store-degraded"}
     assert store.degraded and store.write_failures == 1
 
-    # sink recovers — the flag stays degraded, because the lost row does not come back
+    # The store recovers but the flag stays degraded.
     store.insert = lambda row: real_insert(store, row)
     t.push_api({"method": "GET", "path": "/kept", "request_id": "r2"})
     body = _client().get("/api/v1/logs/api").json()
     assert body["completeness"] == {"api": "store-degraded"}
-    assert [r["path"] for r in body["rows"]] == ["/kept"]  # /lost is gone — the hole
+    assert [r["path"] for r in body["rows"]] == ["/kept"]  # /lost is gone
 
     # /correlate carries the same degraded class
     corr = _client().get("/api/v1/logs/correlate?request_id=r2").json()
     assert corr["completeness"]["api"] == "store-degraded"
 
 
-# ── null-timestamp ring/store agreement ───────────────────────────────────
+# Null timestamps, ring vs store
 
 def test_null_timestamp_window_agrees_ring_vs_store():
     # ring-only
@@ -107,7 +102,7 @@ def test_null_timestamp_window_agrees_ring_vs_store():
     assert len(ring_since) == 0 and len(store_since) == 0
 
 
-# ── combined filters + limit ──────────────────────────────────────────────
+# Combined filters and limit
 
 def test_combined_status_and_since_compose():
     _init(api_store=StreamStore(":memory:", table="api_log"))
