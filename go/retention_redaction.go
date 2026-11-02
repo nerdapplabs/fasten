@@ -116,8 +116,9 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	// for that one row on the next run, not for the whole batch.
 	redacted := make([]string, 0, len(candidates))
 	for _, c := range candidates {
-		// durable=true: in queue mode a plain Emit returns before the row is
-		// stored, and the destroy must not run unless the record persisted.
+		// durable=true: in queue mode a plain Emit either swallows the store
+		// error or returns before the row is stored, and the destroy must not
+		// run unless the record persisted.
 		if _, err := e.emitRow(ctx, CodeAuditRowRedacted, true,
 			Target(c.ID),
 			// spec §7.2 shape; redacted_id too, since seq is only unique per
