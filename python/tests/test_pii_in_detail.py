@@ -1,21 +1,16 @@
-"""P1-5: pii_in_detail enforcement tests.
+"""pii_in_detail codes.
 
-Two runtime behaviours, all verified here:
-
-1. Force ``RetentionClass.SHORT`` at registration; WARN if adopter set otherwise
-2. Force-redact ``detail`` on emit unless adopter declared
-   ``detail_passthrough_keys``; PII rows carry ``_pii_in_detail: True`` marker
-   in detail payload
+1. Registration forces ``RetentionClass.SHORT`` and warns if another class was set.
+2. emit replaces ``detail`` except for ``detail_passthrough_keys``, and marks
+   the row with ``_pii_in_detail: True``.
 """
 import logging
-
 
 import fasten
 from fasten.codes import Meta, RetentionClass, Severity, _registry, register
 
 
 def _meta(**overrides):
-    """Build a Meta with sensible defaults; overridable per test."""
     base = dict(
         domain="pii",
         category="profile",
@@ -33,7 +28,7 @@ def _clear(*codes):
         _registry.pop(c, None)
 
 
-# ── #1 force SHORT at registration ────────────────────────────────────────
+# Retention forced to SHORT at registration
 
 def test_pii_forces_retention_short_with_warning(caplog):
     _clear("PII_LONG_OVERRIDE")
@@ -63,7 +58,6 @@ def test_pii_already_short_no_warning(caplog):
                 retention_class=RetentionClass.SHORT,
             ),
         })
-    # No warning when adopter already declared SHORT
     pii_warnings = [
         r for r in caplog.records
         if "PII_ALREADY_SHORT" in r.message and "forced" in r.message
@@ -83,7 +77,7 @@ def test_non_pii_code_unaffected():
     assert _registry["NON_PII_LONG"].retention_class is RetentionClass.LONG
 
 
-# ── #2 force-redact detail on emit ────────────────────────────────────────
+# detail replaced on emit
 
 def test_emit_force_redacts_pii_detail(initialized):
     _clear("PII_VIEWED")
@@ -99,7 +93,7 @@ def test_emit_force_redacts_pii_detail(initialized):
         actor="admin",
         detail={"city": "Mumbai", "ip": "203.0.113.1"},
     )
-    # Whole detail map is replaced; no original keys leak through
+    # The whole detail map is replaced.
     assert "city" not in row.detail
     assert "ip" not in row.detail
     assert row.detail["_redacted"] == "***"
@@ -124,9 +118,8 @@ def test_emit_pii_passthrough_keys(initialized):
     assert row.detail["region"] == "MH"            # passthrough survives
     assert row.detail["_redacted"] == "***"        # marker present
     assert row.detail["_pii_in_detail"] is True
-    assert "city" not in row.detail                # not in passthrough → gone
-    # api_key redacted via the normal redactor even when in passthrough — but
-    # it's NOT in passthrough here, so it's gone entirely
+    assert "city" not in row.detail                # not in passthrough
+    # api_key is not a passthrough key either, so it is dropped.
     assert "api_key" not in row.detail
 
 
@@ -137,7 +130,7 @@ def test_emit_pii_passthrough_redacts_secret_keys(initialized):
         "PII_PASSTHROUGH_SECRET": _meta(
             domain="pii",
             pii_in_detail=True,
-            detail_passthrough_keys=("api_key",),  # adopter explicitly opts in
+            detail_passthrough_keys=("api_key",),
         ),
     })
     row = fasten.emit(
@@ -146,7 +139,6 @@ def test_emit_pii_passthrough_redacts_secret_keys(initialized):
         actor="admin",
         detail={"api_key": "sk-secret"},
     )
-    # Even though api_key is a passthrough, the secret-key redactor still runs
     assert row.detail["api_key"] == "***"
 
 
@@ -168,7 +160,7 @@ def test_emit_non_pii_redacts_only_secret_keys(initialized):
     assert "_pii_in_detail" not in row.detail
 
 
-# ── #3 detail payload markers (no wire column) ───────────────────────────
+# Marker in the detail payload (there is no wire column)
 
 def test_pii_detail_marker_present_in_detail(initialized):
     """PII rows carry _pii_in_detail: True in the detail payload."""
@@ -185,7 +177,6 @@ def test_pii_detail_marker_present_in_detail(initialized):
 
 
 def test_non_pii_row_has_no_pii_marker_in_detail(initialized):
-    """Non-PII rows do NOT have _pii_in_detail in their detail payload."""
     _clear("NORMAL_ROW")
     register("nonpii", {
         "NORMAL_ROW": _meta(domain="nonpii"),
@@ -195,7 +186,7 @@ def test_non_pii_row_has_no_pii_marker_in_detail(initialized):
 
 
 def test_sqlite_round_trip_preserves_pii_detail_marker(mem_store):
-    """End-to-end: emit → SQLite insert → query → _pii_in_detail marker in detail survives."""
+    """The _pii_in_detail marker survives a SQLite insert and query."""
     from fasten.attrs import AuditRow
     from datetime import datetime, timezone
     from fasten.codes import Severity as S
@@ -220,8 +211,7 @@ def test_sqlite_round_trip_preserves_pii_detail_marker(mem_store):
 
 
 def test_sqlite_legacy_table_rows_still_queryable(tmp_path):
-    """Adopter opens a pre-existing SQLite table without pii_in_detail column.
-    Existing rows are still queryable by the store."""
+    """A table created without a pii_in_detail column still reads."""
     import sqlite3
     from fasten.store.sqlite import SQLiteStore
 
@@ -259,7 +249,6 @@ def test_sqlite_legacy_table_rows_still_queryable(tmp_path):
     legacy.commit()
     legacy.close()
 
-    # Open via SQLiteStore — existing rows should be queryable.
     store = SQLiteStore(str(db))
     rows = store.query(code="OLD_CODE")
     assert len(rows) == 1
