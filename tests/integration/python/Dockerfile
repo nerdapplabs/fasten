@@ -23,7 +23,7 @@ WORKDIR /app
 COPY --from=core /workspace/fasten-core/target/release/libfasten_core.so /usr/local/lib/
 ENV FASTEN_CORE_LIB=/usr/local/lib/libfasten_core.so
 
-# Install fasten from local source + structlog for shim test
+# fasten from local source, plus structlog for the shim test.
 COPY python/ /app/sdk/
 RUN pip install --no-cache-dir /app/sdk "structlog>=21.5"
 

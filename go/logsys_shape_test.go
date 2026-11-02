@@ -29,11 +29,9 @@ func TestLogSys_DoesNotTagRingRowWithShape(t *testing.T) {
 	}
 }
 
-// TestLogSys_ConcurrentWithReadsNoRace hammers LogSys and reader queries
-// concurrently. Before the fix, LogSys set row["shape"] after the ring already
-// held the row by reference, so a concurrent reader iterating the snapshot hit
-// "fatal error: concurrent map read and map write". Run under -race to catch
-// the data race deterministically; it also guards against a plain crash.
+// TestLogSys_ConcurrentWithReadsNoRace runs LogSys and reader queries
+// concurrently. Writing row["shape"] after the ring holds the row would race
+// with readers; run under -race to catch it.
 func TestLogSys_ConcurrentWithReadsNoRace(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -55,7 +53,7 @@ func TestLogSys_ConcurrentWithReadsNoRace(t *testing.T) {
 				}
 				rows, _ := tr.QuerySyslog(50, StreamQuery{})
 				for _, r := range rows {
-					_ = r["event"] // reads the shared map — races the old post-push write
+					_ = r["event"] // reads the shared map
 				}
 			}
 		}()

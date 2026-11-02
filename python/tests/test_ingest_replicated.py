@@ -1,4 +1,4 @@
-"""#52: ingest_replicated sink + module-level outbox exposure."""
+"""ingest_replicated and the module-level outbox functions (#52)."""
 import dataclasses
 
 import pytest
@@ -26,7 +26,7 @@ def _emit_rows(n):
     return rows
 
 
-# ── store-level ingest_replicated ──────────────────────────────────────────────
+# store-level ingest_replicated
 
 def test_ingest_replicated_inserts_valid_chain(initialized):
     rows = _emit_rows(3)
@@ -38,13 +38,13 @@ def test_ingest_replicated_inserts_valid_chain(initialized):
 
 
 def test_ingest_replicated_inserts_verified_prefix_on_break(initialized):
-    """Fix #4: a chain break does NOT raise — the verified prefix is inserted
-    and rejected_from_seq points the sender at the break."""
+    """A chain break does not raise. The verified prefix is inserted and
+    rejected_from_seq points the sender at the break."""
     rows = _emit_rows(3)
     tampered = dataclasses.replace(rows[1], actor="evil")  # hash now invalid
     chain = [rows[0], tampered, rows[2]]
     dest = SQLiteStore(":memory:")
-    result = dest.ingest_replicated(chain)  # must NOT raise
+    result = dest.ingest_replicated(chain)  # does not raise
     assert result.inserted == 1  # only row 0 (the verified prefix)
     assert result.rejected_from_seq == rows[1].monotonic_seq
     assert result.reason  # non-empty explanation
@@ -54,7 +54,7 @@ def test_ingest_replicated_inserts_verified_prefix_on_break(initialized):
 
 
 def test_ingest_replicated_poison_pill_five_rows(initialized):
-    """Fix #4 poison-pill: 5-row batch, row 3 tampered -> rows 1-2 inserted,
+    """5-row batch with row 3 tampered: rows 1-2 inserted,
     rejected_from_seq = row 3's seq, rows 3-5 not stored, no raise."""
     rows = _emit_rows(5)
     tampered = dataclasses.replace(rows[2], target="evil-target")  # row 3 broken
@@ -72,7 +72,7 @@ def test_ingest_replicated_poison_pill_five_rows(initialized):
 
 
 def test_ingest_replicated_atomic_clean_batch_commits(initialized):
-    """Fix #3 happy path: a clean batch commits atomically as one transaction."""
+    """A clean batch commits as one transaction."""
     rows = _emit_rows(4)
     dest = SQLiteStore(":memory:")
     result = dest.ingest_replicated(rows)
@@ -83,8 +83,7 @@ def test_ingest_replicated_atomic_clean_batch_commits(initialized):
 
 
 def test_ingest_replicated_atomicity_rollback_on_insert_error(initialized):
-    """Fix #3 rollback: when an insert fails mid-batch, the whole transaction
-    rolls back and NOTHING from the batch is committed."""
+    """An insert failing mid-batch rolls back the whole batch."""
     rows = _emit_rows(4)
     dest = SQLiteStore(":memory:")
     real_core = dest._insert_row_core
@@ -108,7 +107,7 @@ def test_ingest_replicated_is_idempotent(initialized):
     rows = _emit_rows(2)
     dest = SQLiteStore(":memory:")
     dest.ingest_replicated(rows)
-    # Re-deliver the same batch — INSERT OR IGNORE makes it a no-op.
+    # Re-delivering the same batch is a no-op (INSERT OR IGNORE).
     result = dest.ingest_replicated(rows)
     assert result.inserted == 2  # offered both rows again
     assert dest.count() == 2     # but no duplicates stored
@@ -124,7 +123,7 @@ def test_ingest_replicated_preserves_origin_id(initialized):
     assert stored[0].hash == rows[0].hash
 
 
-# ── module-level exposure (default engine's store) ─────────────────────────────
+# module-level exposure (default engine's store)
 
 def test_module_level_functions_exist():
     assert callable(fasten.list_unshipped)

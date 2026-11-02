@@ -1,4 +1,4 @@
-"""§8.1 background-work correlation — fasten.background / fasten.go.
+"""Background-work correlation: fasten.background and fasten.go.
 
 Work outside a request must still be correlatable: a bg- sentinel is minted when
 no request_id is active, otherwise the active id is inherited.
