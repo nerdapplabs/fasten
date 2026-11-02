@@ -103,8 +103,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   the seq a concurrent seq-0 insert has just picked.
 - **Breaking:** fresh tables get `UNIQUE (source_node_id, monotonic_seq)`.
   A row that reuses a node's seq there now fails with the new
-  `Error::SeqClash`, and the drainer dead-letters it at once instead of
-  retrying; before, the row was stored with the duplicate seq. A repeated
+  `Error::SeqClash`, and the drainer dead-letters a row with an explicit
+  seq at once instead of retrying (a seq-0 row is retried, as it gets a
+  fresh seq); before, the row was stored with the duplicate seq. A repeated
   `id` is still a no-op (`ON CONFLICT (id) DO NOTHING`).
 - Opening a table created before this release adds a non-unique
   `idx_<table>_node_seq` index, so seq allocation does not scan the table.

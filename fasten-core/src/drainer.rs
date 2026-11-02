@@ -343,9 +343,10 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                 Err(e) => {
                     let msg = e.to_string();
                     attempt += 1;
-                    // A seq clash is the same on every retry.
+                    // An explicit seq clashes the same on every retry; a
+                    // seq-0 row gets a fresh seq on the next attempt.
                     if attempt >= inner.cfg.max_attempts || in_shutdown
-                        || matches!(e, Error::SeqClash(_))
+                        || (matches!(e, Error::SeqClash(_)) && row.monotonic_seq != 0)
                     {
                         on_dead_letter(&inner, &row, attempt, &msg);
                         break;
