@@ -19,15 +19,18 @@ from __future__ import annotations
 import atexit
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import math
 import os
+import signal
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, NoReturn, Optional
 
 from .attrs import AuditRow
 from .canonical_ts import canonical_now
@@ -188,6 +191,59 @@ def _rejects_row(exc: BaseException) -> bool:
     return any(c.__name__ in ("DataError", "IntegrityError") for c in type(exc).__mro__)
 
 
+# The status of the last sys.exit() on the main thread. CPython clears the
+# SystemExit before atexit hooks run, so this is the only way the exit hook
+# can learn it.
+_exit_code: Any = None
+
+
+def _record_exit_codes() -> None:
+    real_exit = sys.exit
+    if getattr(real_exit, "_fasten_records", False):
+        return
+
+    @functools.wraps(real_exit)
+    def recording_exit(status: Any = None) -> NoReturn:
+        global _exit_code
+        if threading.current_thread() is threading.main_thread():
+            _exit_code = status
+        real_exit(status)
+
+    recording_exit._fasten_records = True    # type: ignore[attr-defined]
+    sys.exit = recording_exit
+
+
+def _exit_without_finalizing() -> None:
+    """End the process from an atexit hook with the status the interpreter
+    was exiting with, skipping finalization and the atexit hooks not yet
+    run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    logging.shutdown()
+    # PyErr_Print sets these for an uncaught exception; the REPL also sets
+    # them for each error it prints.
+    exc = None if hasattr(sys, "ps1") else getattr(sys, "last_exc", None) or getattr(sys, "last_value", None)
+    if isinstance(exc, KeyboardInterrupt):
+        # As CPython ends a process on an unhandled Ctrl-C.
+        if os.name == "posix":
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
+        status = 128 + signal.SIGINT
+    elif exc is not None and not isinstance(exc, SystemExit):
+        status = 1
+    elif _exit_code is None:
+        status = 0
+    elif isinstance(_exit_code, int):
+        status = _exit_code
+    else:
+        status = 1  # CPython printed the message already
+    os._exit(status)
+
+
 class Engine:
     """
     A single fasten runtime instance.
@@ -224,6 +280,7 @@ class Engine:
         self._fork_lock: Optional[threading.Lock] = None   # the one held across fork()
         self._closed = False    # close() has run and init has not since
         self._atexit_registered = False
+        self._retire_threads: list[threading.Thread] = []   # started by close()
         self._last_init_at: Optional[datetime] = None
 
         # Engine-side "at least one audit-store insert was swallowed" flag.
@@ -728,7 +785,16 @@ class Engine:
         (audit_drain_lost_at_stop), and a store call still running is left
         behind (audit_drain_recovered_at_stop if it later stores its row).
         Emits after close are stored inline. Returns False if a row was
-        lost."""
+        lost.
+
+        The exit hook calls ``close(5.0)``. If a store call is still running
+        after that, the hook ends the process with ``os._exit``: a thread
+        waking during interpreter finalization can abort the process on
+        CPython before 3.14. It flushes stdout, stderr and the logging
+        handlers first and keeps the exit status (that of the last
+        ``sys.exit()`` on the main thread, 1 after an uncaught exception, 0
+        otherwise), but atexit hooks registered before fasten's first
+        ``init`` do not run."""
         deadline = time.monotonic() + timeout
         with self._drainer_lock:
             self._closed = True
@@ -744,6 +810,7 @@ class Engine:
             t = threading.Thread(target=self._retire_drainer, args=(old, 0),
                                  name="fasten-retire", daemon=True)
             t.start()
+            self._retire_threads = [x for x in self._retire_threads if x.is_alive()] + [t]
             t.join(max(0.0, deadline - time.monotonic()))
             if t.is_alive():
                 self._report_unstored(old)
@@ -1096,6 +1163,7 @@ class Engine:
         with self._drainer_lock:
             old, self._drainer = self._drainer, d
         if not self._atexit_registered:
+            _record_exit_codes()
             atexit.register(self._atexit_close)
             if hasattr(os, "register_at_fork"):
                 os.register_at_fork(before=self._insert_lock_before_fork,
@@ -1163,9 +1231,12 @@ class Engine:
                 self._allocate_and_store(row, d.store, d.stdout)
             except Exception as e:  # noqa: BLE001
                 with d.lock:
-                    if not d.reported:
+                    lost = not d.reported
+                    if lost:
                         d.pending.pop(row.id, None)
-                        self._lose_at_stop(d, row, type(e).__name__)
+                        d.lost += 1
+                if lost:
+                    self._lose_at_stop(d, [row.id], type(e).__name__)
             else:
                 with d.lock:
                     if not d.reported:
@@ -1181,23 +1252,30 @@ class Engine:
             if d.reported:
                 return
             d.reported = True
-            for row, _ in list(d.pending.values()):
-                self._lose_at_stop(d, row, "TimeoutError")
+            row_ids = list(d.pending)
             d.pending.clear()
+            d.lost += len(row_ids)
+        self._lose_at_stop(d, row_ids, "TimeoutError")
 
-    def _lose_at_stop(self, d: _QueueDrainer, row: AuditRow, error_type: str) -> None:
-        d.lost += 1
+    def _lose_at_stop(self, d: _QueueDrainer, row_ids: list[str], error_type: str) -> None:
+        """Report rows already counted in ``d.lost``. Called without
+        ``d.lock``: the syslog store may be stalled too."""
+        if not row_ids:
+            return
         self._mark_write_lost(d.store, d.gen)
-        # Past the deadline the syslog store may be as stuck as the audit
-        # store, and close() must still return.
-        self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
-            "error_type": error_type,
-            "row_id": row.id,
-        }, via=d, persist=not d.past_deadline())
+        for row_id in row_ids:
+            # Past the deadline the syslog store may be as stuck as the audit
+            # store, and close() must still return.
+            self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
+                "error_type": error_type,
+                "row_id": row_id,
+            }, via=d, persist=not d.past_deadline())
 
     def _atexit_close(self) -> None:
         self.close(5.0)
         self._stop_retention_threads()
+        if any(t.is_alive() for t in self._retire_threads):
+            _exit_without_finalizing()
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────

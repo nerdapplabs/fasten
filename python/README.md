@@ -124,6 +124,9 @@ calls it): it flushes for half of `timeout`, then stores the rows still
 held. It returns within about `timeout`, reports rows not stored by then
 as `audit_drain_lost_at_stop`, and returns False if any row was lost. A
 store call still running at that point is left behind, not interrupted.
+If one is still running after the exit hook's `close`, the hook ends the
+process with `os._exit` and the same exit status, after flushing stdout,
+stderr and logging; atexit hooks registered before fasten's do not run.
 
 ## Tests
 

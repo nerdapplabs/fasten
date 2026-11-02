@@ -860,6 +860,30 @@ def test_close_does_not_wait_on_a_hung_syslog_store(tmp_path, capsys):
     assert sorted(lost) == sorted(r.id for r in rows)
 
 
+def test_close_does_not_wait_on_a_hung_syslog_store_after_a_fast_failure(tmp_path, capsys):
+    # The retire thread's own try fails at once, before the deadline, and
+    # its lost_at_stop event hangs in the syslog store.
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    syslog = BlockingSyslogStore()
+    _init(store, syslog_store=syslog, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    try:
+        rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(2)]
+        _wait_in_backoff()
+        syslog.armed.set()
+        start = time.monotonic()
+        assert not fasten.close(timeout=0.5)
+        assert time.monotonic() - start < 1.0
+    finally:
+        syslog.release.set()
+        for t in threading.enumerate():
+            if t.name == "fasten-retire":
+                t.join(timeout=5)
+    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+           if line.startswith("{")]
+    lost = [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"]
+    assert sorted(lost) == sorted(r.id for r in rows)
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_fork_does_not_wait_on_a_hung_insert(tmp_path):
     store = HangingStore(str(tmp_path / "a.db"))
@@ -914,35 +938,66 @@ def test_emit_after_close_is_stored_without_an_abandoned_event(tmp_path):
     assert not fasten.emit(code="USER_CREATED", target="u-2").hash
 
 
-@pytest.mark.xfail(sys.platform.startswith("linux") and sys.version_info < (3, 14), strict=False,
-                   reason="CPython <= 3.13 ends a thread that wakes during finalization with "
-                          "pthread_exit, which on Linux unwinds through the drain thread's "
-                          "Rust frames and aborts; needs a store-side timeout")
-def test_exit_is_not_held_by_a_hanging_store(tmp_path):
-    import subprocess
-    script = f"""
-import time, fasten
+_EXIT_SCRIPT = """
+import atexit, sys, time, fasten
 from fasten.codes import Meta, RetentionClass, Severity, register
 from fasten.store.sqlite import SQLiteStore
 
+atexit.register(print, "earlier hook ran")
+
 class Hanging(SQLiteStore):
     def allocate_and_insert_originated(self, row):
-        while True:
+        while {stuck}:
             time.sleep(0.01)
+        return super().allocate_and_insert_originated(row)
 
 register("t", {{"USER_CREATED": Meta(domain="t", category="auth", action="create",
     severity=Severity.INFO, description="x", emitter="t",
     retention_class=RetentionClass.LONG)}})
-fasten.init(service_id="svc", node_id="node", audit_store=Hanging({str(tmp_path / "a.db")!r}))
+fasten.init(service_id="svc", node_id="node", audit_store=Hanging({db!r}))
 for i in range(3):
     fasten.emit(code="USER_CREATED", target=f"u-{{i}}")
 time.sleep(0.2)
-assert not fasten.close(timeout=0.3)
+print("buffered output")
+{ending}
 """
-    start = time.monotonic()
-    proc = subprocess.run([sys.executable, "-c", script], capture_output=True,
+
+
+def _run_exit_script(tmp_path, stuck, ending):
+    import subprocess
+    script = _EXIT_SCRIPT.format(stuck=stuck, db=str(tmp_path / "a.db"), ending=ending)
+    return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=30, env={**os.environ, "PYTHONPATH": os.getcwd()})
-    assert proc.returncode == 0, proc.stderr
-    assert time.monotonic() - start < 10
+
+
+def _printed(proc):
+    """stdout without the audit rows."""
+    return [line for line in proc.stdout.splitlines() if not line.startswith("{")]
+
+
+@pytest.mark.parametrize("ending,status", [
+    ("assert not fasten.close(timeout=0.3)", 0),
+    ("fasten.close(timeout=0.3); sys.exit(3)", 3),
+    ("fasten.close(timeout=0.3); raise RuntimeError('boom')", 1),
+    pytest.param("fasten.close(timeout=0.3); raise KeyboardInterrupt", -2,
+                 marks=pytest.mark.skipif(os.name != "posix", reason="POSIX signal status")),
+    ("pass", 0),    # the exit hook's own close gives up
+])
+def test_exit_is_not_held_by_a_hanging_store(tmp_path, ending, status):
+    start = time.monotonic()
+    proc = _run_exit_script(tmp_path, True, ending)
+    assert proc.returncode == status, proc.stderr
+    assert time.monotonic() - start < 15
     lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
     assert len(lost) == 3
+    # Finalization was skipped, after stdout was flushed.
+    assert _printed(proc) == ["buffered output"]
+
+
+@pytest.mark.parametrize("ending,status", [("pass", 0), ("sys.exit(3)", 3),
+                                           ("raise RuntimeError('boom')", 1)])
+def test_exit_with_a_working_store_finalizes_as_usual(tmp_path, ending, status):
+    proc = _run_exit_script(tmp_path, False, ending)
+    assert proc.returncode == status, proc.stderr
+    assert _printed(proc) == ["buffered output", "earlier hook ran"]
+    assert len(SQLiteStore(str(tmp_path / "a.db")).query(limit=10)) == 3
