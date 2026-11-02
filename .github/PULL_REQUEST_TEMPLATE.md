@@ -1,18 +1,17 @@
 <!--
-Thanks for the PR. A few prompts to make review fast — answer briefly,
-delete sections that don't apply.
+Thanks for the PR. Answer briefly and delete sections that don't apply.
 -->
 
 ### What
 
-<!-- One or two lines: the change in adopter-visible terms. The diff
-covers the implementation; this is the line a future reader will see
-in `git log --oneline`. -->
+<!-- One or two lines describing the change as an adopter sees it. The
+diff covers the implementation; this is what a future reader sees in
+`git log --oneline`. -->
 
 ### Why
 
-<!-- The motivation. Bug fix? Feature? Cleanup that unblocks something
-else? Link the issue / spec / docs line that justifies it. -->
+<!-- The motivation: bug fix, feature, or cleanup that unblocks something
+else. Link the issue, spec or docs line that justifies it. -->
 
 ### Affected SDK / surface
 
@@ -27,24 +26,23 @@ else? Link the issue / spec / docs line that justifies it. -->
 
 ### Cross-language impact
 
-<!-- If you touched the wire shape, the public API, or the catalog
-contract, note which other SDKs need a follow-up. fasten's promise is
-"wire it once, read it anywhere"; gratuitous divergence is the thing
-we try hardest to avoid. Skip this section for docs / CI / single-SDK
-internals. -->
+<!-- If you changed the wire shape, the public API or the catalog
+contract, list the other SDKs that need a follow-up. fasten's promise is
+"wire it once, read it anywhere", so we work hard to keep the SDKs from
+drifting apart. Skip this section for docs, CI, or internals of a single
+SDK. -->
 
-### Tests + verification
+### Tests and verification
 
-<!-- How did you check this works? "verified in <docker image> →
-N passed" is the convention used elsewhere in the codebase. -->
+<!-- How did you check that this works? The convention elsewhere in the
+codebase is "verified in <docker image>: N passed". -->
 
 ### Breaking change?
 
-- [ ] No — additive / backwards-compatible.
-- [ ] Yes — note the migration path here. Pre-1.0 GA we still take
-      breaking changes, but every adopter pulls on a Friday risking
-      their Monday morning, so tight scope + a CHANGELOG entry is
-      mandatory.
+- [ ] No, additive and backwards-compatible.
+- [ ] Yes, migration path noted here. We still take breaking changes
+      before 1.0 GA, but adopters upgrade on a Friday and live with it on
+      Monday, so keep the scope tight and add a CHANGELOG entry.
 
 ### Checklist
 

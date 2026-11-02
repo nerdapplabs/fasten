@@ -1,7 +1,7 @@
 import XCTest
 @testable import FastenStore
 
-// Helper — builds a minimal valid Row as a plain dictionary.
+// A minimal valid row as a plain dictionary.
 func makeRow(_ id: String, code: String = "TEST") -> [String: Any] {
     return [
         "wire_version":   "1",
@@ -27,7 +27,7 @@ func makeRow(_ id: String, code: String = "TEST") -> [String: Any] {
     ]
 }
 
-// ── Version ───────────────────────────────────────────────────────────────────
+// MARK: - Version
 
 final class VersionTests: XCTestCase {
     func testVersionIsNonEmpty() {
@@ -36,7 +36,7 @@ final class VersionTests: XCTestCase {
     }
 }
 
-// ── SQLite ────────────────────────────────────────────────────────────────────
+// MARK: - SQLite
 
 final class SQLiteTests: XCTestCase {
 
@@ -94,7 +94,7 @@ final class SQLiteTests: XCTestCase {
     }
 }
 
-// ── PostgreSQL ────────────────────────────────────────────────────────────────
+// MARK: - PostgreSQL
 
 final class PostgreSQLTests: XCTestCase {
 
