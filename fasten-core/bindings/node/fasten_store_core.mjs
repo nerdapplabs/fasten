@@ -1,11 +1,11 @@
 /**
- * fasten_store_core — Node.js binding for libfasten_store_core.
+ * Node.js binding for libfasten_store_core.
  *
- * Uses ffi-napi (maintained fork of node-ffi, supports Node 16+).
+ * Uses ffi-napi.
  *
  *   npm install ffi-napi ref-napi
  *
- * Build lib:  cd fasten/store-core && cargo build --release --features all
+ * Build lib:  cd fasten/fasten-core && cargo build --release --features all
  *
  * Usage:
  *   import { FastenStore } from './fasten_store_core.mjs';
@@ -25,7 +25,7 @@ const require = createRequire(import.meta.url);
 const ffi     = require('ffi-napi');
 const ref     = require('ref-napi');
 
-// ── Library location ─────────────────────────────────────────────────────────
+// Library location
 
 function libName() {
   switch (os.platform()) {
@@ -54,7 +54,7 @@ function findLib() {
   );
 }
 
-// ── FFI bindings ─────────────────────────────────────────────────────────────
+// FFI bindings
 
 const VoidPtr   = ref.refType(ref.types.void);
 const StringPtr = ref.refType('string');
@@ -68,7 +68,7 @@ const lib = ffi.Library(findLib(), {
   fasten_store_version:  ['string',  []],
 });
 
-// ── Helper ───────────────────────────────────────────────────────────────────
+// Helper
 
 function takeError(outErrBuf) {
   const ptr = outErrBuf.deref();
@@ -78,7 +78,7 @@ function takeError(outErrBuf) {
   return msg;
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// Public API
 
 export class FastenStoreError extends Error {
   constructor(msg) { super(msg); this.name = 'FastenStoreError'; }

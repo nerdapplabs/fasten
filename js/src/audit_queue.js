@@ -1,20 +1,11 @@
 /**
- * P1-15: bounded audit queue + background drainer for Node.
+ * In queue mode (the default) emit() puts rows on an in-memory queue and
+ * this drainer writes them to the store, retrying with exponential backoff
+ * (100 ms to 60 s, 20% jitter), so store failures don't reach the caller.
  *
- * When `init({ auditStoreFailureStrategy: 'queue' })` is set (the v1.0
- * default), `emit()` pushes audit rows onto an in-memory queue and a
- * setImmediate-driven drainer writes them to the store with
- * exponential backoff (100 ms → 60 s, ±20 % jitter). Store failures
- * stay off the request path.
- *
- * **Cross-language deviation.** Node is single-threaded; emit() cannot
- * synchronously block on a counting semaphore the way Python / Go can.
- * `queueCapacity` is therefore the *high-water signal* threshold, not
- * a hard cap — emit() stays synchronous. The drainer issues
- * `audit_queue_high_water` (≥ 50 %) and `audit_queue_near_full`
- * (≥ 80 %) sys lines so adopters see the saturation through the same
- * channel they already monitor. `audit_drain_*` events match Python
- * exactly.
+ * Unlike Python and Go, emit() can't block when the queue is full, so
+ * `queueCapacity` only sets the warning thresholds: `audit_queue_high_water`
+ * at 50% and `audit_queue_near_full` at 80%.
  */
 
 const HW_WARN_PCT = 0.5;
@@ -71,11 +62,8 @@ class AuditQueueDrainer {
 	}
 
 	put(row) {
-		// Reject early if the drainer has been stopped (re-init swap or
-		// uninstall). Without this the row would land in a queue whose
-		// tick loop has already exited, get GC'd later, no signal —
-		// a silent data-loss bug. emit() callers see the row as
-		// abandoned via the sys stream instead.
+		// After stop() nothing drains the queue, so log the row as abandoned
+		// instead of queueing it.
 		if (this._stopped) {
 			this._sysLog("error", "audit_drain_abandoned", {
 				reason: "drainer_stopped",
@@ -124,9 +112,8 @@ class AuditQueueDrainer {
 	}
 
 	async flush(timeoutMs = 5000) {
-		// Snapshot semantics (spec §6): capture the target drain count at call
-		// time so a steady incoming rate cannot keep flush() blocked indefinitely.
-		// target = rows already drained + rows currently in the pipeline.
+		// Wait only for rows queued before this call (spec §6), so new rows
+		// can't keep flush() waiting forever.
 		const target = this._drainedTotal + this._q.length + this._inFlight;
 		if (this._drainedTotal >= target) return true;
 		const deadline = Date.now() + timeoutMs;
@@ -243,7 +230,7 @@ class AuditQueueDrainer {
 			if (delay < 0) delay = 0;
 		}
 		this._inBackoffUntilMs = Date.now() + delay;
-		// Sleep, but check _stopped frequently so shutdown is prompt.
+		// Sleep in short steps so stop() takes effect quickly.
 		const stepMs = Math.min(delay, 50);
 		const end = Date.now() + delay;
 		while (Date.now() < end) {
@@ -256,11 +243,7 @@ class AuditQueueDrainer {
 	}
 }
 
-// ── Backward-compat shims ─────────────────────────────────────────────────
-//
-// Module-level singleton replaced by Engine (see index.js). These shims
-// delegate to the default Engine so existing call sites (tests, etc.)
-// continue to work. Call _setDefaultEngine(engine) at module init time.
+// Module-level helpers that act on the default Engine (set by index.js).
 
 export { AuditQueueDrainer };
 

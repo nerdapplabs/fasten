@@ -1,8 +1,5 @@
-// FASTEN_REDACT_KEYS env parity — an extra key pattern supplied via the
-// environment (not just Config.extra_redact_keys) must be redacted, alongside
-// the built-in patterns. Matches the Python/Go/Rust/JS SDKs.
-//
-// Build via CMake (-DFASTEN_BUILD_TESTS=ON) like the other *_smoke.cpp tests.
+// Keys listed in FASTEN_REDACT_KEYS are redacted along with the built-in
+// patterns when Config.extra_redact_keys is empty.
 
 #include "fasten.hpp"
 

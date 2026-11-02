@@ -1,16 +1,5 @@
-"""
-Module-level free functions — thin wrappers around the default Engine.
-
-For multi-tenant or fully-isolated usage, construct Engine instances directly:
-
-    from fasten import Engine
-    eng = Engine()
-    eng.init(tenant_id="t-42", audit_store=my_store)
-    eng.emit(code="ORDER_PLACED", ...)
-
-The free functions (``fasten.init``, ``fasten.emit``, …) delegate to a
-single default Engine so existing single-tenant adopter code is unchanged.
-"""
+"""Module-level functions that call a default Engine. Construct an Engine
+directly when a process needs more than one configuration."""
 from __future__ import annotations
 
 import threading
@@ -20,12 +9,11 @@ from typing import Any, Callable, Iterator, Optional
 from .attrs import AuditRow
 from .chain import verify_chain as _verify_chain
 from .context import current_request_id, mint_sentinel, with_request_id
-from .engine import AuditStoreError  # noqa: F401 — re-exported
+from .engine import AuditStoreError  # noqa: F401  re-exported
 from .engine import Engine
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
 
-# Module-level default instance — all free functions delegate here.
 _default: Engine = Engine()
 
 # ``fasten.log`` is the default engine's logger.
@@ -33,14 +21,11 @@ log = _default.log
 
 
 def init(*args: Any, **kwargs: Any) -> None:
-    """
-    Initialise fasten. Any argument omitted falls back to the corresponding
-    env var. See Engine.init() for the full parameter reference.
+    """Initialise the default Engine. Omitted arguments fall back to env vars;
+    see Engine.init_config().
 
-    Required (env or arg):
-      - FASTEN_SERVICE_ID
-      - FASTEN_NODE_ID
-      - FASTEN_AUDIT_DSN  (or ``audit_store=`` kwarg)
+    service_id and node_id (FASTEN_SERVICE_ID, FASTEN_NODE_ID) are required.
+    Without audit_store or FASTEN_AUDIT_DSN, audit rows only go to stdout.
     """
     _default.init(*args, **kwargs)
 
@@ -67,12 +52,12 @@ def emit(
 
 
 def flush(timeout: float = 5.0) -> bool:
-    """Block until pending rows drain. Delegates to the default Engine."""
+    """Wait for queued audit rows to be stored. Returns False on timeout."""
     return _default.flush(timeout=timeout)
 
 
 def queue_stats() -> Optional[dict[str, Any]]:
-    """Drainer health snapshot. Delegates to the default Engine."""
+    """Drainer stats, or None in raise mode."""
     return _default.queue_stats()
 
 
@@ -92,23 +77,22 @@ def audit_store() -> Any:
 
 
 def persisted_streams() -> frozenset[str]:
-    """Streams of the default Engine backed by the durable store vs a ring."""
+    """Streams of the default Engine that have a store attached."""
     return _default.persisted_streams()
 
 
 def search_enabled() -> bool:
-    """Whether FR3 free-text search is enabled on the default Engine."""
+    """Whether free-text search is enabled on the default Engine."""
     return _default.search_enabled()
 
 
 @contextmanager
 def background(kind: str = "bg") -> Iterator[str]:
-    """Context for work that runs outside a request — a background task, worker,
-    or scheduled tick. If no request_id is active, mint a sentinel (``bg-`` by
-    default; ``kind`` may be ``sched``/``lib``) so the block's sys logs stay
-    correlatable; if one is already active, inherit it. Returns the request_id in
-    effect. §5.1/§8.1: keeps the every-row-correlatable invariant for
-    context-less work instead of leaving orphans."""
+    """Context for work outside a request, such as a worker or scheduled tick.
+
+    Keeps the active request_id if there is one, otherwise sets a sentinel of
+    the given ``kind`` (``bg``, ``sched`` or ``lib``). Yields the request_id.
+    """
     active = current_request_id()
     if active:
         yield active
@@ -118,11 +102,9 @@ def background(kind: str = "bg") -> Iterator[str]:
 
 
 def go(fn: Callable[..., Any], *args: Any, _kind: str = "bg", **kwargs: Any) -> threading.Thread:
-    """Run ``fn`` in a daemon thread under a background context — the mirror of
-    Go's ``fasten.Go``. contextvars do not cross threads, so the request_id is
-    established inside the thread: it inherits the caller's active id if there is
-    one, else a fresh ``bg-`` sentinel, so the thread's sys logs remain
-    correlatable. Returns the started thread."""
+    """Run ``fn`` in a daemon thread with the caller's request_id, or a new
+    sentinel if there is none. contextvars do not cross threads on their own.
+    Returns the started thread."""
     parent = current_request_id()
 
     def _run() -> None:
@@ -141,7 +123,7 @@ def init_config(*args: Any, **kwargs: Any) -> Any:
 
 
 def start(cfg: Any) -> None:
-    """Wire runtime from a FastenConfig. Delegates to the default Engine."""
+    """Apply a FastenConfig to the default Engine."""
     _default.start(cfg)
 
 
@@ -172,12 +154,10 @@ def mark_shipped(ids: "list[str]") -> None:
 
 
 def ingest_replicated(rows: "list[AuditRow]") -> Any:
-    """Verify + insert the verified prefix of a replicated batch, via the
-    default Engine's store.
+    """Verify a replicated batch and insert its verified prefix in one
+    transaction, via the default Engine's store.
 
-    Verifies the per-row hash chain first, then inserts the longest verified
-    prefix in a single transaction. Does NOT raise on a chain break — the
-    returned IngestResult carries ``rejected_from_seq`` (the monotonic_seq of the
-    first broken row) so the sender resyncs from there.
+    Does not raise on a chain break. The returned IngestResult carries
+    ``rejected_from_seq``, the monotonic_seq to resend from.
     """
     return _default.ingest_replicated(rows)

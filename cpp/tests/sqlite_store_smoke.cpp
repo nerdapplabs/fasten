@@ -1,5 +1,5 @@
 // Smoke tests for fasten_store_sqlite.hpp.
-// All tests use ":memory:" — no filesystem side effects.
+// All tests use ":memory:", so nothing touches the filesystem.
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
@@ -35,17 +35,17 @@ fasten::Row make_row(const std::string& id, const std::string& code) {
     return r;
 }
 
-// ── #1 basic insert + idempotency ──────────────────────────────────────────
+// basic insert + idempotency
 
 void test_insert_idempotent() {
     fasten::SqliteStore store(":memory:");
     auto row = make_row("evt-sqlite-001", "TEST_INSERT");
     store.insert(row);
-    store.insert(row); // INSERT OR IGNORE — must not throw
+    store.insert(row); // INSERT OR IGNORE: must not throw
     std::cout << "  test_insert_idempotent: PASS\n";
 }
 
-// ── #2 sink() returns a callable AuditSink ────────────────────────────────
+// sink() returns a callable AuditSink
 
 void test_sink_callable() {
     fasten::SqliteStore store(":memory:");
@@ -54,7 +54,7 @@ void test_sink_callable() {
     std::cout << "  test_sink_callable: PASS\n";
 }
 
-// ── #3 nullable columns (tenant_id, shipped_at) ───────────────────────────
+// nullable columns (tenant_id, shipped_at)
 
 void test_null_columns() {
     fasten::SqliteStore store(":memory:");
@@ -65,7 +65,7 @@ void test_null_columns() {
     std::cout << "  test_null_columns: PASS\n";
 }
 
-// ── #4 populated nullable columns ─────────────────────────────────────────
+// populated nullable columns
 
 void test_populated_nullable_columns() {
     fasten::SqliteStore store(":memory:");
@@ -76,7 +76,7 @@ void test_populated_nullable_columns() {
     std::cout << "  test_populated_nullable_columns: PASS\n";
 }
 
-// ── #5 pii_in_detail flag ─────────────────────────────────────────────────
+// pii_in_detail flag
 
 void test_pii_in_detail() {
     fasten::SqliteStore store(":memory:");
@@ -86,7 +86,7 @@ void test_pii_in_detail() {
     std::cout << "  test_pii_in_detail: PASS\n";
 }
 
-// ── #6 detail JSON round-trip (multiple keys) ─────────────────────────────
+// detail JSON round-trip (multiple keys)
 
 void test_detail_multi_key() {
     fasten::SqliteStore store(":memory:");
@@ -97,7 +97,7 @@ void test_detail_multi_key() {
     std::cout << "  test_detail_multi_key: PASS\n";
 }
 
-// ── #7 invalid table name is rejected before open ─────────────────────────
+// invalid table name is rejected before open
 
 void test_invalid_table_name() {
     bool threw = false;
@@ -110,7 +110,7 @@ void test_invalid_table_name() {
     std::cout << "  test_invalid_table_name: PASS\n";
 }
 
-// ── #8 custom table name ──────────────────────────────────────────────────
+// custom table name
 
 void test_custom_table_name() {
     fasten::SqliteStore store(":memory:", "fasten_audit");

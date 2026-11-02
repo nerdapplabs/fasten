@@ -1,4 +1,4 @@
-//! C ABI — code catalog functions.
+//! C ABI: code catalog functions.
 
 use std::collections::HashMap;
 use std::os::raw::c_char;
@@ -12,8 +12,8 @@ use crate::{
 
 /// Register a batch of audit codes for a domain.
 ///
-/// `domain`     — UTF-8 domain string, e.g. `"user"` or `"billing"`.
-/// `codes_json` — UTF-8 JSON object mapping code keys to Meta objects:
+/// `domain`:      UTF-8 domain string, e.g. `"user"` or `"billing"`.
+/// `codes_json`:  UTF-8 JSON object mapping code keys to Meta objects:
 ///   ```json
 ///   {
 ///     "USER_CREATED": {
@@ -24,7 +24,7 @@ use crate::{
 ///   ```
 ///   All fields except `id`, `retention_class`, `high_volume`, `pii_in_detail`,
 ///   `declared_unused`, and `detail_passthrough_keys` are required.
-/// `out_err`    — set on error; may be NULL.
+/// `out_err`:     set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -54,11 +54,11 @@ pub unsafe extern "C" fn fasten_register_codes(
 
 /// Look up a single code in the global registry.
 ///
-/// `code`      — UTF-8 code key, e.g. `"USER_CREATED"`.
-/// `out_json`  — set to a heap-allocated UTF-8 JSON object (Meta) on success.
+/// `code`:       UTF-8 code key, e.g. `"USER_CREATED"`.
+/// `out_json`:   set to a heap-allocated UTF-8 JSON object (Meta) on success.
 ///               Returns an empty JSON object `{}` when the code is not found.
 ///               Free with `fasten_store_free_str`. May be NULL.
-/// `out_err`   — set on error; may be NULL.
+/// `out_err`:    set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -90,9 +90,9 @@ pub unsafe extern "C" fn fasten_meta_of(
 
 /// Dump the registry as `id,domain,severity` CSV (sorted, one code per line).
 ///
-/// `out_csv` — set to a heap-allocated UTF-8 string.
+/// `out_csv`:  set to a heap-allocated UTF-8 string.
 ///             Free with `fasten_store_free_str`. May be NULL.
-/// `out_err` — set on error; may be NULL.
+/// `out_err`:  set on error; may be NULL.
 ///
 /// Returns `FASTEN_OK` (0) on success, an error code otherwise.
 #[no_mangle]
@@ -115,8 +115,6 @@ pub unsafe extern "C" fn fasten_registry_dump(
         }
     }
 }
-
-// ── Buffer-based variants (no heap allocation) ────────────────────────────────
 
 /// Buffer-based variant of `fasten_register_codes`.
 ///
@@ -141,8 +139,8 @@ pub unsafe extern "C" fn fasten_register_codes_buf(
     });
     match r {
         Ok(())        => 0,
-        // Return positive error code (same convention as fasten_register_codes).
-        // write_err_to_buf returns negative; negate to get positive.
+        // write_err_to_buf returns the code negated; flip it so this returns
+        // a positive code, like fasten_register_codes.
         Err((c, msg)) => -write_err_to_buf(out_err_buf, err_buf_len as usize, &msg, c),
     }
 }

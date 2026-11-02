@@ -1,8 +1,6 @@
-"""Per-stream retention pruning (FR1).
+"""StreamStore.purge removes rows by age.
 
-StreamStore.purge trims history by age so a persisted api/sys stream does not
-grow without bound. A timestamp-less row has unknown age and is kept, not
-silently dropped.
+A row without a timestamp has unknown age and is kept.
 """
 from fasten.store.stream import StreamStore
 
@@ -30,14 +28,12 @@ def test_purge_none_when_all_newer():
 def test_purge_keeps_null_timestamp_row():
     store = StreamStore(":memory:", table="ret3")
     store.insert({"request_id": "nots", "event": "c"})  # timestamp key absent
-    assert store.purge(before="2099-01-01T00:00:00Z") == 0  # NULL age unknown → kept
+    assert store.purge(before="2099-01-01T00:00:00Z") == 0  # unknown age, kept
     assert len(store.query()) == 1
 
 
 def test_retention_prunes_persisted_reads_end_to_end():
-    """Functional: rows written through the transport persist to the stream
-    store; purging old history removes them from subsequent reads served from
-    that store (the reader path, not just the store in isolation)."""
+    """Purged rows are gone from reads served through the transport."""
     import fasten
     from fasten.store.sqlite import SQLiteStore
 
@@ -59,4 +55,4 @@ def test_retention_prunes_persisted_reads_end_to_end():
     assert removed == 1
 
     events = {r["event"] for r in t.query_syslog()}
-    assert events == {"new"}  # the read now reflects the pruned history
+    assert events == {"new"}

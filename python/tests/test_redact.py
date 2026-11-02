@@ -61,13 +61,7 @@ def test_apikey_no_separator(r):
 
 
 def test_init_honours_env_replacement(monkeypatch, mem_store):
-    """FASTEN_REDACT_REPLACEMENT applied when init() is called env-only.
-
-    Regression: the prior signature defaulted ``redact_replacement="***"``
-    so the truthy default short-circuited the env-var read. Adopters
-    setting only the env var saw "***" with no signal that the override
-    was ignored.
-    """
+    """FASTEN_REDACT_REPLACEMENT applies when init() gets no redact_replacement."""
     monkeypatch.setenv("FASTEN_SERVICE_ID", "svc")
     monkeypatch.setenv("FASTEN_NODE_ID", "node")
     monkeypatch.setenv("FASTEN_REDACT_REPLACEMENT", "<HIDDEN>")
@@ -77,7 +71,7 @@ def test_init_honours_env_replacement(monkeypatch, mem_store):
 
 
 def test_init_explicit_replacement_overrides_env(monkeypatch, mem_store):
-    """Explicit kwarg wins over env var (standard precedence)."""
+    """An explicit kwarg wins over the env var."""
     monkeypatch.setenv("FASTEN_SERVICE_ID", "svc")
     monkeypatch.setenv("FASTEN_NODE_ID", "node")
     monkeypatch.setenv("FASTEN_REDACT_REPLACEMENT", "<env>")
@@ -91,12 +85,7 @@ def test_init_explicit_replacement_overrides_env(monkeypatch, mem_store):
 
 
 def test_redact_tolerates_non_string_keys(r):
-    """REVIEW #17: int / tuple keys must not crash re.search.
-
-    Adopters occasionally pass dicts whose keys aren't strings (e.g.
-    int-keyed lookup tables placed under detail). Earlier the redactor
-    would TypeError on the first non-str key and abort the whole emit.
-    """
+    """int and tuple keys (e.g. a lookup table under detail) are kept as is."""
     detail = {
         1: "first",
         (2, 3): "tuple-keyed",
@@ -122,7 +111,7 @@ def test_structlog_processor_tolerates_non_string_keys():
     assert out["nested"]["password"] == "***"
 
 
-# ── P1-24: value-shape redaction ─────────────────────────────────────────────
+# Value-shape redaction
 
 def test_jwt_in_value_redacted(r):
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"
@@ -155,17 +144,17 @@ def test_aws_asia_key_redacted(r):
 
 def test_gh_token_redacted(r):
     tok = "ghp_" + "A" * 36
-    # "token_data" contains "token" → key-pattern fires; use neutral key for value-shape test
+    # A key containing "token" would match a key pattern, so use a neutral key.
     assert r.redact({"raw_value": tok}) == {"raw_value": "***GH_TOKEN***"}
 
 
 def test_cc_luhn_valid_redacted(r):
-    # Visa test card — passes Luhn
+    # Visa test card, passes Luhn
     assert r.redact({"notes": "4111111111111111"}) == {"notes": "***CC***"}
 
 
 def test_cc_luhn_invalid_not_redacted(r):
-    # Same length but fails Luhn — must NOT be treated as a CC
+    # Same length but fails Luhn
     assert r.redact({"notes": "4111111111111112"}) == {"notes": "4111111111111112"}
 
 
@@ -175,8 +164,7 @@ def test_random_order_number_not_redacted(r):
 
 
 def test_key_pattern_still_wins(r):
-    # A field named `api_key` whose VALUE is a JWT — key redactor fires first,
-    # value is replaced with *** (not ***JWT***).
+    # The key match runs first, so the value becomes *** rather than ***JWT***.
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.sig"
     assert r.redact({"api_key": jwt}) == {"api_key": "***"}
 
@@ -197,13 +185,13 @@ def test_structlog_processor_redacts_jwt_value():
 
 def test_value_redact_list_of_strings(r):
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc"
-    # "tokens" contains "token" → key-pattern fires on the whole list; use a neutral key
+    # A key containing "token" would redact the whole list, so use a neutral key.
     out = r.redact({"messages": [jwt, "safe-string"]})
     assert out["messages"][0] == "***JWT***"
     assert out["messages"][1] == "safe-string"
 
 
-# ── P1-3: adversarial key-name + value-shape tests ───────────────────────────
+# Key-name and value-shape edge cases
 
 def test_three_level_deep_nesting_redacted(r):
     detail = {"l1": {"l2": {"l3": {"token": "deep-secret", "ok": "visible"}}}}
@@ -229,7 +217,7 @@ def test_mixed_case_api_key_variants(r):
 def test_secret_key_substring_in_stacktrace_not_matched(r):
     trace = "RuntimeError: timeout at module.py:42\n  File 'web.py' line 7"
     out = r.redact({"stacktrace": trace})
-    assert out["stacktrace"] == trace  # safe key → not redacted by key-pattern
+    assert out["stacktrace"] == trace
 
 
 def test_stripe_live_key_redacted(r):
@@ -249,7 +237,7 @@ def test_openai_org_key_redacted(r):
 
 def test_stripe_key_pattern_wins_if_key_also_matches(r):
     key = "sk_live_" + "B" * 24
-    # "secret" is in _REDACT_PATTERNS so "sk_live..." key would match; use neutral key
+    # A key such as "secret" would match a key pattern first, so use a neutral key.
     assert r.redact({"payment": key}) == {"payment": "***STRIPE_KEY***"}
 
 
