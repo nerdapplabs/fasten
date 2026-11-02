@@ -204,7 +204,7 @@ ring is full, the oldest entry is dropped.
 `flush(timeout)` MUST use **snapshot semantics**:
 
 1. Under the stats lock, take `target = drained_total + depth`.
-2. Poll (at most every 10 ms) until `drained_total >= target` or the
+2. Poll (every 10 ms or less) until `drained_total >= target` or the
    timeout elapses.
 3. Return `true` if and only if the target was reached.
 
