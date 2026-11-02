@@ -13,8 +13,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// FR2 — unified correlation read: GET /correlate?request_id=X fans out to the
-// audit store + sys/api rings-or-stores and assembles
+// GET /correlate?request_id=X reads the audit store and the sys/api rings or
+// stores and assembles
 // {request_id, audit, api, sys, counts, completeness} in one call.
 
 func getJSON(t *testing.T, h http.Handler, path string) (map[string]any, int) {
@@ -134,9 +134,8 @@ func TestCorrelate_ReportsStoreWhenPersisted(t *testing.T) {
 }
 
 func TestCorrelate_TotalsExposeTruncationRingOnly(t *testing.T) {
-	// counts reflects the capped response; totals reflects what the backing
-	// source holds — counts < totals is the truncation signal (100-of-100 vs
-	// 100-of-5000 was previously indistinguishable).
+	// counts is the capped response; totals is what the backing source holds.
+	// counts < totals means the response was truncated.
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -167,9 +166,8 @@ func TestCorrelate_TotalsExposeTruncationRingOnly(t *testing.T) {
 }
 
 func TestCorrelate_TotalsCountStoreHistoryAndAudit(t *testing.T) {
-	// With persistence on, totals counts durable history for the streams AND
-	// the audit store (via CountFiltered) — every stream reports total vs
-	// returned.
+	// With persistence on, totals counts durable history for the streams and
+	// the audit store (via CountFiltered).
 	resetGlobals(t)
 	registerTestCodes(t)
 	adb, _ := sql.Open("sqlite", ":memory:")
@@ -209,11 +207,9 @@ func TestCorrelate_TotalsCountStoreHistoryAndAudit(t *testing.T) {
 	}
 }
 
-// TestCorrelate_AuditTotalNullOnCountUnavailable (PR #59 finding 9): an audit
-// store without filterCounter capability must report totals.audit=null and
-// truncated.audit=null — NOT auditTotal=len(rows) which is capped at limit.
-// Reporting totals.audit == counts.audit == limit lies "not truncated" when
-// the caller has limit rows out of many more.
+// TestCorrelate_AuditTotalNullOnCountUnavailable: an audit store without
+// filterCounter reports totals.audit=null and truncated.audit=null. len(rows)
+// is capped at limit, so using it would wrongly say "not truncated".
 func TestCorrelate_AuditTotalNullOnCountUnavailable(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
@@ -234,11 +230,10 @@ func TestCorrelate_AuditTotalNullOnCountUnavailable(t *testing.T) {
 	}
 }
 
-// noCountFilteredAuditStore satisfies AuditRepository but not filterCounter —
-// the adopter case that used to trip finding 9 into falsely reporting truncated=false.
+// noCountFilteredAuditStore satisfies AuditRepository but not filterCounter.
 type noCountFilteredAuditStore struct{}
 
-func (*noCountFilteredAuditStore) Insert(context.Context, Row) error         { return nil }
+func (*noCountFilteredAuditStore) Insert(context.Context, Row) error            { return nil }
 func (*noCountFilteredAuditStore) Query(context.Context, Filter) ([]Row, error) { return nil, nil }
 func (*noCountFilteredAuditStore) ListUnshipped(context.Context, int) ([]Row, error) {
 	return nil, nil

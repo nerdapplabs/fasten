@@ -3,7 +3,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install fasten from local source + structlog for shim test
+# fasten from local source, plus structlog for the shim test.
 COPY python/ /app/sdk/
 RUN pip install --no-cache-dir /app/sdk "structlog>=21.5"
 

@@ -8,9 +8,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// #58 PersistStreams — explicit allowlist that must exactly match the set of
-// stream stores attached. Bidirectional error surfaces both directions of a
-// mismatch. Preserves the "store means store" honesty when unset.
+// PersistStreams is an explicit allowlist that must exactly match the set of
+// stream stores attached. A mismatch in either direction is an error.
 
 func newStreamTable(t *testing.T, table string) *StreamStore {
 	t.Helper()
@@ -81,7 +80,7 @@ func TestPersistStreams_BothMismatchesReported(t *testing.T) {
 	resetGlobals(t)
 	err := Init(Config{ServiceID: "svc", NodeID: "node",
 		APIStore:       newStreamTable(t, "api_x"), // attached, not named
-		PersistStreams: []string{"sys"},             // named, no store
+		PersistStreams: []string{"sys"},            // named, no store
 	})
 	if err == nil {
 		t.Fatal("both-direction mismatch must fail")
