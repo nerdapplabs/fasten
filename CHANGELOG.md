@@ -57,7 +57,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   Sys events past the deadline go to stderr and the ring but not the
   syslog store, which is then marked degraded. A row reported lost and
   stored later, by a left-behind call, retire or an inline emit, gets
-  `audit_drain_recovered_at_stop`. A left-behind call that later stores its row emits
   `audit_drain_recovered_at_stop`. The exit hook calls `close(5.0)`, so a
   hanging store no longer holds interpreter exit, and the process exits
   normally: exit status and other atexit hooks are unaffected. Emits after
