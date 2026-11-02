@@ -1,16 +1,9 @@
-"""Regression: a PostgresStore read must not leave its connection in an open
-transaction (holding ``ACCESS SHARE``) — neither on success nor on error.
+"""PostgresStore reads end their transaction, on success and on error.
 
-Root cause of the audit-store-init deadlock (continuum issue 014): the engine's
-startup seed reads — ``max_monotonic_seq()`` then ``query(..., limit=1)`` —
-executed a ``SELECT`` but never ``commit()``/``rollback()``, so the thread-local
-connection stayed *idle in transaction* holding an ``ACCESS SHARE`` lock on the
-audit table. A concurrent store-init ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``
-(which needs ``ACCESS EXCLUSIVE``, even as a no-op) then queued behind that lock
-forever, hanging the worker. A read that *errors* leaves the connection INERROR
-with the same lock held (and poisoned for reuse). These tests pin the fix:
-reads release their transaction on both paths, so they neither sit
-idle-in-transaction nor block DDL.
+A read left idle in transaction holds ``ACCESS SHARE`` on the audit table.
+Another process's store init runs ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``,
+which needs ``ACCESS EXCLUSIVE`` even as a no-op, and would wait on that lock
+indefinitely. A failed read left INERROR holds the same lock and can't be reused.
 
 The Postgres cases are skipped unless FASTEN_TEST_POSTGRES_DSN is set:
 
@@ -28,7 +21,7 @@ import pytest
 
 DSN = os.getenv("FASTEN_TEST_POSTGRES_DSN")
 requires_pg = pytest.mark.skipif(
-    not DSN, reason="FASTEN_TEST_POSTGRES_DSN not set — skipping Postgres tests"
+    not DSN, reason="FASTEN_TEST_POSTGRES_DSN not set"
 )
 
 
@@ -79,21 +72,20 @@ def test_seed_reads_do_not_leave_connection_idle_in_transaction():
 
 @requires_pg
 def test_read_does_not_block_concurrent_ddl():
-    """The real deadlock repro: after a store read, a separate connection's
-    ``ALTER TABLE ... ADD COLUMN`` must not block on an ACCESS SHARE lock."""
+    """After a store read, ``ALTER TABLE ... ADD COLUMN`` on another
+    connection does not wait on an ACCESS SHARE lock."""
     import psycopg
 
     table = f"audit_idletx_{uuid.uuid4().hex}"
     store = _store_on(table)
     try:
-        store.max_monotonic_seq()  # seed read — must not hold ACCESS SHARE
+        store.max_monotonic_seq()  # the startup seed read
 
         with psycopg.connect(_base_dsn()) as probe:
             with probe.cursor() as cur:
                 cur.execute("SET lock_timeout = '3s'")
-                # Mirrors Fasten store-init's no-op migration. If the reader still
-                # holds ACCESS SHARE, this queues for ACCESS EXCLUSIVE and raises
-                # LockNotAvailable after 3s. With the fix it succeeds immediately.
+                # Same no-op migration as store init. If the reader still held
+                # ACCESS SHARE this would raise LockNotAvailable after 3s.
                 cur.execute(
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS probe_col text"
                 )
@@ -105,9 +97,8 @@ def test_read_does_not_block_concurrent_ddl():
 
 @requires_pg
 def test_failed_read_leaves_connection_idle_not_inerror():
-    """A read that *errors* (e.g. a bad column during the concurrent-ALTER
-    window) must leave the connection IDLE — not INERROR, which keeps the
-    transaction open (holding any lock) and poisons the connection for reuse."""
+    """A failed read leaves the connection IDLE rather than INERROR, which
+    would keep the transaction and its locks open and block reuse."""
     import psycopg
 
     table = f"audit_idletx_{uuid.uuid4().hex}"
@@ -124,7 +115,7 @@ def test_failed_read_leaves_connection_idle_not_inerror():
             store._tls.conn.info.transaction_status
             == psycopg.pq.TransactionStatus.IDLE
         ), "failed read left the connection INERROR (txn open, holding locks)"
-        # ...and the connection is reusable, not poisoned.
+        # The connection is still usable.
         assert store.max_monotonic_seq() == 0
     finally:
         store.close()
@@ -132,10 +123,9 @@ def test_failed_read_leaves_connection_idle_not_inerror():
 
 
 def test_execute_with_retry_reconnects_and_releases_on_stale_connection():
-    """No database: a stale-connection error reconnects and retries once, the
-    cleanup rollback runs on both the dead and the fresh connection, and a
-    failing cleanup rollback on the dead connection does not mask the in-flight
-    error the retry depends on."""
+    """No database needed. A stale connection reconnects and retries once,
+    rollback runs on both connections, and a failing rollback on the dead
+    connection doesn't hide the original error."""
     import psycopg
 
     from fasten.store.postgres import PostgresStore

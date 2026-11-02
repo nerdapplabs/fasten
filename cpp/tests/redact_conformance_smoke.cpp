@@ -1,10 +1,6 @@
-// Redact conformance smoke — mirrors every case in spec/redact-conformance.json.
-//
-// Calls fasten_redact() (C ABI → Rust canonical impl) directly so the test is
-// independent of any C++ wrapper layer.  Cases are hardcoded to avoid a JSON-parse
-// dependency; they are kept manually in sync with the spec file.
-//
-// Build: wired via CMakeLists -DFASTEN_BUILD_TESTS=ON (see redact_conformance_smoke target).
+// Every case in spec/redact-conformance.json, run through the fasten_redact()
+// C ABI directly. The cases are copied by hand to avoid a JSON parser; keep
+// them in sync with the spec file.
 
 #include "fasten.hpp"
 
@@ -39,9 +35,8 @@ void ok_or_die(const std::string& name,
     std::cout << "ok  " << name << "\n";
 }
 
-// All cases mirror spec/redact-conformance.json exactly.
 void run_all() {
-    // ── key_pattern ──────────────────────────────────────────────────────────
+    // key_pattern
     ok_or_die("key_password",
         R"({"password":"hunter2"})",
         R"({"password":"***"})");
@@ -103,7 +98,7 @@ void run_all() {
         R"({"Password":"x"})",
         R"({"Password":"***"})");
 
-    // ── safe ─────────────────────────────────────────────────────────────────
+    // safe
     ok_or_die("safe_user_id",
         R"({"user_id":"u-42"})",
         R"({"user_id":"u-42"})");
@@ -114,7 +109,7 @@ void run_all() {
         R"({"count":42})",
         R"({"count":42})");
 
-    // ── value_shape ───────────────────────────────────────────────────────────
+    // value_shape
     ok_or_die("value_jwt",
         R"({"note":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"})",
         R"({"note":"***JWT***"})");
@@ -148,8 +143,7 @@ void run_all() {
     ok_or_die("value_gh_gho",
         R"({"note":"gho_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"})",
         R"({"note":"***GH_TOKEN***"})");
-    // Stripe: key constructed at runtime — the literal sk_live_<24+ chars> triggers
-    // GitHub push-protection false-positive even in test files.
+    // Built at runtime: a literal sk_live_ key trips GitHub push protection.
     {
         std::string key = std::string("sk") + "_live_" + std::string(24, 'A');
         ok_or_die("value_stripe_live",
@@ -175,7 +169,7 @@ void run_all() {
         R"({"note":"1234567890123456"})",
         R"({"note":"1234567890123456"})");
 
-    // ── priority ──────────────────────────────────────────────────────────────
+    // priority
     ok_or_die("priority_key_wins_over_jwt",
         R"({"api_key":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.sig"})",
         R"({"api_key":"***"})");
@@ -183,7 +177,7 @@ void run_all() {
         R"({"access_key":"AKIAIOSFODNN7EXAMPLE"})",
         R"({"access_key":"***"})");
 
-    // ── nested ────────────────────────────────────────────────────────────────
+    // nested
     ok_or_die("nested_2level_key_pattern",
         R"({"user":{"password":"abc","name":"Alice"}})",
         R"({"user":{"name":"Alice","password":"***"}})");

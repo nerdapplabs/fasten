@@ -1,8 +1,6 @@
-"""P0-9 / #12 — Postgres allocation against a REAL server.
+"""Postgres sequence allocation against a real server.
 
-This path was written, reviewed and shipped twice without ever executing.
-It is the one place a bug of the same shape as the SQLite unsealed-row defect
-would not have been caught. Requires FASTEN_TEST_POSTGRES_DSN (the name CI sets).
+Requires FASTEN_TEST_POSTGRES_DSN (CI sets it).
 """
 import os
 from datetime import datetime, timezone
@@ -51,9 +49,8 @@ def test_two_services_share_one_node_sequence(store):
 
 
 def test_advisory_lock_serialises_concurrent_writers(store):
-    """pg_advisory_xact_lock, NOT SELECT ... FOR UPDATE: on an empty table
-    there is no tip row to lock, so FOR UPDATE would let every writer through
-    to allocate seq 1."""
+    """Uses pg_advisory_xact_lock rather than SELECT ... FOR UPDATE: on an
+    empty table there is no row to lock, so every writer would get seq 1."""
     import threading
     n, errors = 12, []
     barrier = threading.Barrier(n)
@@ -80,8 +77,8 @@ def test_advisory_lock_serialises_concurrent_writers(store):
 
 
 def test_unsealed_rows_still_occupy_their_sequence(store):
-    """Same defect the SQLite backend had: filtering MAX(seq) on hash != ''
-    restarts the counter against pre-upgrade rows."""
+    """MAX(seq) must include rows with an empty hash, or the counter restarts
+    below existing unsealed rows."""
     import dataclasses
     store._insert_row(dataclasses.replace(_row(99), monotonic_seq=42))
     nxt = store.allocate_and_insert_originated(_row(1))
@@ -89,8 +86,8 @@ def test_unsealed_rows_still_occupy_their_sequence(store):
 
 
 def test_retry_is_idempotent(store):
-    """#12: re-running a committed allocation must return the PERSISTED row,
-    not a freshly-sealed one with a burned sequence number."""
+    """A retried allocation returns the stored row, not a newly sealed one
+    with another sequence number (GitHub #12)."""
     first = store.allocate_and_insert_originated(_row(7))
     again = store.allocate_and_insert_originated(_row(7))
     assert again.monotonic_seq == first.monotonic_seq
@@ -111,7 +108,7 @@ def test_form_2_commitment_round_trips(store):
 
 
 def test_redact_expired_destroys_pii_keeps_ops_and_chain(store):
-    """#90 on Postgres: PII on a short horizon, ops history on its own."""
+    """PII detail expires on its own horizon; other rows and the chain stay (GitHub #90)."""
     import dataclasses
     from datetime import timedelta
     old = datetime.now(timezone.utc) - timedelta(days=40)

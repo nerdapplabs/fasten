@@ -1,11 +1,8 @@
-"""
-P1-45 reader auth footgun reduction — pins the two contract shifts:
+"""Reader auth defaults.
 
-  1) router() with no `dependencies=` raises RuntimeError at wire time
-     (no more silent public /audit on a mis-configured proxy).
-  2) require_bearer() is a working, opinionated default any caller can
-     hand `dependencies=[Depends(...)]` when they don't yet have an
-     auth stack — 401 on missing/malformed/wrong token, 200 on match.
+1) router() without ``dependencies=`` raises RuntimeError when it is built.
+2) require_bearer() is a ready-made dependency for apps without their own
+   auth: 401 on a missing, malformed or wrong token, 200 on a match.
 """
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ def _init_engine():
     )
 
 
-# ── 1) router() defaults to a hard error, not silent public /audit ────────
+# router() requires dependencies=
 
 def test_router_without_dependencies_raises():
     pytest.importorskip("fastapi")
@@ -40,7 +37,7 @@ def test_router_with_explicit_empty_deps_is_the_opt_in_no_auth():
     assert r is not None
 
 
-# ── 2) require_bearer() end-to-end ────────────────────────────────────────
+# require_bearer()
 
 def test_require_bearer_unset_env_raises_at_wire_time(monkeypatch):
     pytest.importorskip("fastapi")

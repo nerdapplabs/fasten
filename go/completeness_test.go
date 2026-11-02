@@ -11,7 +11,7 @@ import (
 )
 
 // Every /logs read reports, per stream, whether that stream is backed by the
-// durable store or a bounded ring. With persistence still off (the default),
+// durable store or a bounded ring. With persistence off (the default),
 // audit is classified as store-backed and api/sys as ring-backed.
 
 // getCompleteness drives one reader route and returns its completeness map.
@@ -66,7 +66,7 @@ func TestCompleteness_DefaultStoreVsRing(t *testing.T) {
 		if comp[c.stream] != c.want {
 			t.Errorf("%s: completeness[%q] = %q, want %q", c.path, c.stream, comp[c.stream], c.want)
 		}
-		// Additive only: pre-existing keys must survive.
+		// The other keys are still present.
 		if _, ok := body["rows"]; !ok {
 			t.Errorf("%s: response lost 'rows' key: %v", c.path, body)
 		}
@@ -77,8 +77,8 @@ func TestCompleteness_DefaultStoreVsRing(t *testing.T) {
 	}
 }
 
-// TestCompleteness_FollowsPersistedStreams pins the resolver seam Phase 1
-// flips: once a stream is marked persisted, its reads report "store".
+// TestCompleteness_FollowsPersistedStreams: once a stream is marked persisted,
+// its reads report "store".
 func TestCompleteness_FollowsPersistedStreams(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
@@ -93,10 +93,8 @@ func TestCompleteness_FollowsPersistedStreams(t *testing.T) {
 	}
 }
 
-// TestCompleteness_StdoutOnlyAuditIsRing mirrors Python's
-// test_stdout_only_audit_reports_ring: Init'd without an audit store
-// (stdout-only mode), audit is not durable, so its completeness is "ring". The
-// reader must not advertise a store that was never configured.
+// TestCompleteness_StdoutOnlyAuditIsRing: without an audit store (stdout-only
+// mode) audit is not durable, so its completeness is "ring".
 func TestCompleteness_StdoutOnlyAuditIsRing(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil { // no AuditStore
@@ -111,13 +109,9 @@ func TestCompleteness_StdoutOnlyAuditIsRing(t *testing.T) {
 	}
 }
 
-// TestCompleteness_ErrorPathsCarryFlag is the parity for Python's
-// test_completeness_present_on_uninitialised_reads: a never-Init'd engine
-// still emits the flag (plus an error) on every endpoint, so consumers parse
-// one uniform shape. With no audit store configured, audit is honestly "ring" —
-// it must not claim a durable "store" while erroring that nothing is stored.
-// This also exercises the nil-map path through the HTTP layer — a fresh engine
-// has persistedStreams == nil.
+// TestCompleteness_ErrorPathsCarryFlag: a never-Init'd engine still emits the
+// flag (plus an error) on every endpoint, so consumers parse one shape. With
+// no audit store, audit is "ring". Also covers persistedStreams == nil.
 func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
 	h := (&Engine{}).NewReader() // never Init'd: xport, auditStore, persistedStreams all nil
 
@@ -139,10 +133,8 @@ func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
 	}
 }
 
-// TestCompleteness_NilMap pins the streamSource path that fires when the engine
-// was never Init'd (persistedStreams == nil): with no store configured, every
-// stream — audit included — resolves to "ring". Indexing a nil map yields false,
-// so no stream is claimed durable.
+// TestCompleteness_NilMap: on a never-Init'd engine (persistedStreams == nil)
+// every stream, audit included, resolves to "ring".
 func TestCompleteness_NilMap(t *testing.T) {
 	e := &Engine{} // persistedStreams == nil
 	if got := e.streamSource("audit"); got != "ring" {
@@ -153,9 +145,8 @@ func TestCompleteness_NilMap(t *testing.T) {
 	}
 }
 
-// TestCompleteness_RequestIDFilterCoexists proves the added completeness field
-// did not shadow the pre-existing request_id query param: filtering the api
-// ring still narrows rows, and the flag is still present on the filtered read.
+// TestCompleteness_RequestIDFilterCoexists: filtering the api ring by
+// request_id still narrows rows, and the flag is present on the filtered read.
 func TestCompleteness_RequestIDFilterCoexists(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {

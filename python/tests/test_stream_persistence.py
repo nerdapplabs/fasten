@@ -1,9 +1,8 @@
-"""FR1 — opt-in persistence for the api / sys streams.
+"""Optional persistence for the api and sys streams.
 
-When a StreamStore is configured, the ring stays the hot write path and the
-store is a write-through sink; reads for that stream come from the store so
-they reach durable history instead of a bounded window, and the completeness
-flag flips ring -> store. With no store, behaviour is unchanged (ring-only).
+With a StreamStore attached, writes go to the ring and through to the store,
+reads come from the store, and completeness is "store". Without one, the
+stream is ring-only.
 """
 import pytest
 
@@ -24,9 +23,7 @@ def _client():
 
 
 def _init_with_streams(**stores):
-# service_id / node_id are passed explicitly to fasten.init below; the
-    # earlier os.environ writes were dead code that leaked env across tests.
-        fasten.init(
+    fasten.init(
         service_id="test-svc", node_id="test-node",
         audit_store=SQLiteStore(":memory:"),
         audit_store_failure_strategy="raise",
@@ -34,19 +31,18 @@ def _init_with_streams(**stores):
     )
 
 
-# ── StreamStore unit behaviour ────────────────────────────────────────────
+# StreamStore
 
 def test_streamstore_roundtrip_and_filter():
     s = StreamStore(":memory:", table="api_log")
     s.insert({"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": "r-A"})
     s.insert({"method": "GET", "path": "/v1/health", "status": 200, "request_id": "r-B"})
 
-    # newest-first, byte-identical rows
+    # newest first
     allrows = s.query()
     assert [r["request_id"] for r in allrows] == ["r-B", "r-A"]
-    # request_id filter
     assert [r["path"] for r in s.query(request_id="r-A")] == ["/v1/checkout"]
-    # method/path are exact-match (parity with the ring and the Go SDK)
+    # method and path are exact match, same as the ring
     assert len(s.query(method="POST")) == 1
     assert len(s.query(method="post")) == 0          # not case-folded
     assert len(s.query(path="/v1/checkout")) == 1
@@ -54,16 +50,16 @@ def test_streamstore_roundtrip_and_filter():
 
 
 def test_streamstore_survives_beyond_ring_capacity():
-    """The ring drops old rows; the store keeps them — the core FR1 win."""
+    """The ring drops old rows; the store keeps them."""
     s = StreamStore(":memory:", table="syslog")
     for i in range(5000):
         s.insert({"level": "info", "event": f"e{i}", "request_id": f"r-{i}"})
     assert s.count() == 5000
-    # a request_id from long before a 2000-row ring would still hold
+    # r-0 would have left a 2000-row ring long ago
     assert len(s.query(request_id="r-0")) == 1
 
 
-# ── End-to-end through init + reader ──────────────────────────────────────
+# Through init and the reader
 
 def test_api_persisted_reports_store_and_serves_from_store():
     _init_with_streams(api_store=StreamStore(":memory:", table="api_log"))
@@ -73,7 +69,7 @@ def test_api_persisted_reports_store_and_serves_from_store():
     t.push_api({"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": "r-1"})
 
     body = _client().get("/api/v1/logs/api?request_id=r-1").json()
-    assert body["completeness"] == {"api": "store"}          # flipped ring -> store
+    assert body["completeness"] == {"api": "store"}
     assert [r["path"] for r in body["rows"]] == ["/v1/checkout"]
 
 
@@ -90,7 +86,7 @@ def test_sys_persisted_depth_beyond_ring():
 
 
 def test_unpersisted_streams_stay_ring():
-    """No stream store → ring-only, completeness 'ring' (backward compatible)."""
+    """With no stream store, reads come from the ring and completeness is 'ring'."""
     _init_with_streams()  # audit only
     assert fasten.persisted_streams() == frozenset({"audit"})
 
@@ -102,27 +98,26 @@ def test_unpersisted_streams_stay_ring():
 
 
 def test_write_through_keeps_ring_and_store_in_sync():
-    """A persisted push lands in BOTH the ring (hot path) and the store."""
+    """A push lands in both the ring and the store."""
     store = StreamStore(":memory:", table="api_log")
     _init_with_streams(api_store=store)
     t = fasten.transport()
     t.push_api({"method": "GET", "path": "/y", "request_id": "r-7"})
 
-    assert store.count() == 1               # write-through sink got it
-    assert len(t._api) == 1                 # ring (hot path) also got it
+    assert store.count() == 1
+    assert len(t._api) == 1
 
 
 def test_drainer_self_reports_persist_like_any_syslog_push(capsys):
-    """write_drainer_syslog is a syslog push path like any other: with a
-    syslog store attached, reads come only from the store, so an unpersisted
-    drainer event would vanish from the reader API (Go persists them via
-    PushSyslog — parity)."""
+    """Drainer events are persisted like any syslog push. With a syslog store
+    attached, reads come only from the store, so they would otherwise be
+    missing from the reader API."""
     _init_with_streams(syslog_store=StreamStore(":memory:", table="syslog"))
     t = fasten.transport()
 
     t.write_drainer_syslog({"level": "error", "event": "audit_enqueue_failed"})
-    capsys.readouterr()  # drainer path intentionally writes the row to stderr
+    capsys.readouterr()  # the drainer path also writes the row to stderr
 
     rows = t.query_syslog(event="audit_enqueue_failed")  # served from the store
     assert len(rows) == 1
-    assert rows[0]["request_id"]  # sentinel invariant holds on this path too
+    assert rows[0]["request_id"]  # gets a sentinel id

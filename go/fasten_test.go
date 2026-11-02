@@ -41,8 +41,6 @@ func registerTestCodes(t *testing.T) {
 	})
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────
-
 func TestInit_RequiresServiceID(t *testing.T) {
 	resetGlobals(t)
 	if err := Init(Config{NodeID: "node-1"}); err == nil {
@@ -67,8 +65,6 @@ func TestInit_Success(t *testing.T) {
 	}
 }
 
-// ── Register ─────────────────────────────────────────────────────────────
-
 func TestRegister_Duplicate(t *testing.T) {
 	registerTestCodes(t)
 	err := Register("user", map[Code]Meta{
@@ -91,36 +87,36 @@ func TestRegister_DomainMismatch(t *testing.T) {
 	}
 }
 
-// P1-10: ID is filled from the map key when omitted.
+// ID is filled from the map key when omitted.
 func TestRegister_FillsIDFromKey(t *testing.T) {
 	clearBothRegistries()
 	t.Cleanup(clearBothRegistries)
 
 	if err := Register("svc", map[Code]Meta{
-		"P1_10_FILLED": {Domain: "svc", Category: "x", Action: "x", Severity: SevInfo},
+		"KEY_FILLED": {Domain: "svc", Category: "x", Action: "x", Severity: SevInfo},
 	}); err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
-	m, ok := metaOf("P1_10_FILLED")
-	if !ok || m.ID != "P1_10_FILLED" {
+	m, ok := metaOf("KEY_FILLED")
+	if !ok || m.ID != "KEY_FILLED" {
 		t.Fatalf("Meta.ID not filled from key: ok=%v id=%q", ok, m.ID)
 	}
 }
 
-// P1-10: explicit ID that disagrees with map key raises.
+// An explicit ID that disagrees with the map key is an error.
 func TestRegister_IDMismatchRaises(t *testing.T) {
 	clearBothRegistries()
 	t.Cleanup(clearBothRegistries)
 
 	err := Register("svc", map[Code]Meta{
-		"P1_10_MISMATCH": {ID: "WRONG_ID", Domain: "svc", Severity: SevInfo},
+		"KEY_MISMATCH": {ID: "WRONG_ID", Domain: "svc", Severity: SevInfo},
 	})
 	if err == nil || !strings.Contains(err.Error(), "disagrees") {
 		t.Fatalf("expected ID-mismatch error, got %v", err)
 	}
 }
 
-// P1-10: lowercase / invalid key is rejected.
+// A lowercase or otherwise invalid key is rejected.
 func TestRegister_InvalidKeyShape(t *testing.T) {
 	clearBothRegistries()
 
@@ -131,8 +127,6 @@ func TestRegister_InvalidKeyShape(t *testing.T) {
 		t.Fatalf("expected key-shape error, got %v", err)
 	}
 }
-
-// ── Emit ──────────────────────────────────────────────────────────────────
 
 func TestEmit_RequiresInit(t *testing.T) {
 	resetGlobals(t)
@@ -146,11 +140,10 @@ func TestEmit_RequiresInit(t *testing.T) {
 func TestEmit_UnknownCode(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-store, cleanup := newMemStore(t, "fasten_audit")
+	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
-	// spec §8.1: with no audit store there is nothing to allocate against, so
-	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
-	// about seq/hash must attach one — as real deployments do.
+	// spec §8.1: without an audit store rows go out unsealed, since sealing
+	// is the store's job (§2.1). So attach one.
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,11 +156,10 @@ store, cleanup := newMemStore(t, "fasten_audit")
 func TestEmit_Roundtrip(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-store, cleanup := newMemStore(t, "fasten_audit")
+	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
-	// spec §8.1: with no audit store there is nothing to allocate against, so
-	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
-	// about seq/hash must attach one — as real deployments do.
+	// spec §8.1: without an audit store rows go out unsealed, since sealing
+	// is the store's job (§2.1). So attach one.
 	if err := Init(Config{ServiceID: "svc", NodeID: "node-1", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,11 +199,10 @@ store, cleanup := newMemStore(t, "fasten_audit")
 func TestEmit_MonotonicSeqIncreases(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-store, cleanup := newMemStore(t, "fasten_audit")
+	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
-	// spec §8.1: with no audit store there is nothing to allocate against, so
-	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
-	// about seq/hash must attach one — as real deployments do.
+	// spec §8.1: without an audit store rows go out unsealed, since sealing
+	// is the store's job (§2.1). So attach one.
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +212,6 @@ store, cleanup := newMemStore(t, "fasten_audit")
 		t.Errorf("seq did not increase: %d <= %d", r2.MonotonicSeq, r1.MonotonicSeq)
 	}
 }
-
-// ── Correlation context ───────────────────────────────────────────────────
 
 func TestWithRequestID_Roundtrip(t *testing.T) {
 	ctx := WithRequestID(context.Background(), "aabbccddeeff")
@@ -240,11 +229,10 @@ func TestRequestIDFromContext_Empty(t *testing.T) {
 func TestEmit_UsesContextRequestID(t *testing.T) {
 	resetGlobals(t)
 	registerTestCodes(t)
-store, cleanup := newMemStore(t, "fasten_audit")
+	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
-	// spec §8.1: with no audit store there is nothing to allocate against, so
-	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
-	// about seq/hash must attach one — as real deployments do.
+	// spec §8.1: without an audit store rows go out unsealed, since sealing
+	// is the store's job (§2.1). So attach one.
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatal(err)
 	}
@@ -257,8 +245,6 @@ store, cleanup := newMemStore(t, "fasten_audit")
 		t.Errorf("request_id = %q, want deadbeef1234", row.RequestID)
 	}
 }
-
-// ── RedactDetail ──────────────────────────────────────────────────────────
 
 func TestRedactDetail_APIKey(t *testing.T) {
 	out := RedactDetail(map[string]any{"api_key": "secret"})
@@ -309,8 +295,6 @@ func TestRedactDetail_CaseInsensitive(t *testing.T) {
 		t.Errorf("Password not redacted")
 	}
 }
-
-// ── RingBuffer ────────────────────────────────────────────────────────────
 
 func TestRingBuffer_Eviction(t *testing.T) {
 	rb := newRingBuffer[int](3)

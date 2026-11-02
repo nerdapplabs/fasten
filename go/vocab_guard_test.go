@@ -9,13 +9,9 @@ import (
 	"testing"
 )
 
-// TestNoAppSpecificVocabulary guards fasten's app-agnosticism: no consumer-specific
-// product name may appear anywhere in the repo. fasten is a general-purpose audit
-// library — downstream applications reference fasten, never the reverse. A leak in
-// code/tests/docs/reference-YAMLs couples the library to one consumer.
-//
-// This test scans the whole repo (all SDKs), so it fails CI regardless of which
-// language job runs it.
+// TestNoAppSpecificVocabulary checks that no consumer-specific product name
+// appears anywhere in the repo: applications reference fasten, not the other
+// way round. It scans every SDK, so any language job catches it.
 func TestNoAppSpecificVocabulary(t *testing.T) {
 	forbidden := regexp.MustCompile(`(?i)edge-manager|edge_manager|edgebits`)
 	const self = "vocab_guard_test.go"
