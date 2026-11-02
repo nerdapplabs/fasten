@@ -10,7 +10,7 @@
  *   await store.init();          // run DDL once
  *   fasten.init({ auditStore: store });
  */
-// pg is an optional peer dep — lazy import so the module loads without it installed.
+// pg is an optional peer dependency, so import it only when first needed.
 let _Pool = null;
 async function _getPool(connectionString) {
 	if (!_Pool) {
@@ -155,14 +155,12 @@ export class PostgresStore {
 		}
 		this._connectionString = connectionString;
 		this._table = table;
-		// Bare name for index identifiers — dots not allowed there.
+		// Index names can't contain the schema prefix.
 		this._idx = table.includes(".") ? table.split(".").pop() : table;
-		// Optional schema prefix.
 		this._schema = table.includes(".")
 			? table.split(".").slice(0, -1).join(".")
 			: null;
 		this._pool = null;
-		// Lazy DDL: resolved on first operation.
 		this._ready = null;
 	}
 

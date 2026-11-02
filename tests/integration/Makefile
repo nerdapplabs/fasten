@@ -1,10 +1,8 @@
-# Integration tests — per-language Docker smokes.
+# Per-language Docker smoke tests.
 #
-# Each smoke:
-#   1. Registers USER_CREATED.
-#   2. init() with FASTEN_SERVICE_ID, FASTEN_NODE_ID set.
-#   3. log.info("startup_ok", ...) — produces sys row.
-#   4. emit(USER_CREATED, ...) with PII detail — produces audit row.
+# Each smoke registers USER_CREATED, calls init(), writes a sys row with
+# log.info("startup_ok", ...) and an audit row with emit(USER_CREATED, ...)
+# whose detail includes fields that must be redacted.
 #
 # verify.py reads container stdout and asserts the wire contract.
 #
@@ -37,9 +35,8 @@ $(addprefix test-,$(LANGS)): test-%: build-%
 	@echo "==> Running fasten-itest-$*"
 	docker run --rm fasten-itest-$* | $(VERIFY)
 
-# Python is the only SDK that currently emits api rows; gate the api-stream
-# assertion via FASTEN_VERIFY_REQUIRE_API=1 (P1-20). This explicit target
-# overrides the pattern rule above for python only.
+# Only the Python smoke writes api rows, so only it sets
+# FASTEN_VERIFY_REQUIRE_API=1. This rule overrides the pattern rule above.
 test-python: build-python
 	@echo ""
 	@echo "==> Running fasten-itest-python"

@@ -1,11 +1,11 @@
-//! Bounded audit queue + background drainer (shared Rust engine).
+//! Bounded audit queue and background drainer.
 //!
-//! Implements the 12-state machine from `spec/drainer-conformance.md`:
-//! HEALTHY → FAILING → DEGRADED → STOPPED, with dead-letter after
-//! `max_attempts` insert failures.
+//! Implements the state machine in `spec/drainer-conformance.md` §3
+//! (HEALTHY, FAILING, DEGRADED, STOPPED), dead-lettering a row after
+//! `max_attempts` failed inserts.
 //!
-//! Sys-stream events are written to **stderr** as NDJSON per the spec.
-//! Each event is a JSON line: `{"shape":"sys","level":"...","event":"...", ...}`.
+//! Sys events go to stderr, one JSON object per line:
+//! `{"shape":"sys","level":"...","event":"...", ...}`.
 //!
 //! # Thread safety
 //!
@@ -23,14 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::{row::Row, store::Store};
 
-// ── Conformance constants ──────────────────────────────────────────────────
-
 const HW_WARN_PCT: f64 = 0.50;
 const HW_ERR_PCT: f64 = 0.80;
 const DEGRADED_AFTER: usize = 5;
 const DLQ_RING_SIZE: usize = 10;
-
-// ── DrainerConfig ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct DrainerConfig {
@@ -53,8 +49,6 @@ impl Default for DrainerConfig {
     }
 }
 
-// ── QueueStats ──────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueueStats {
     pub depth: usize,
@@ -68,8 +62,6 @@ pub struct QueueStats {
     pub dead_letter_depth: usize,
     pub capacity_semantics: &'static str,
 }
-
-// ── Counting semaphore ─────────────────────────────────────────────────────
 
 struct Sem {
     capacity: usize,
@@ -113,8 +105,6 @@ fn cv_wait_or_recover<'a, T>(cv: &Condvar, g: MutexGuard<'a, T>) -> MutexGuard<'
     cv.wait(g).unwrap_or_else(|e| e.into_inner())
 }
 
-// ── Internal stats ─────────────────────────────────────────────────────────
-
 #[derive(Default)]
 struct InternalStats {
     high_water: usize,
@@ -129,8 +119,6 @@ struct InternalStats {
     dead_lettered_total: usize,
     dlq: VecDeque<Row>,
 }
-
-// ── DrainerInner ──────────────────────────────────────────────────────────
 
 struct DrainerInner {
     store: Box<dyn Store>,
@@ -147,8 +135,6 @@ struct DrainerInner {
 // The inner mutex protects all shared state.
 unsafe impl Send for DrainerInner {}
 unsafe impl Sync for DrainerInner {}
-
-// ── Drainer ────────────────────────────────────────────────────────────────
 
 pub struct Drainer {
     inner: Arc<DrainerInner>,
@@ -186,7 +172,7 @@ impl Drainer {
             }));
             return false;
         }
-        // Acquire a slot — blocks under back-pressure.
+        // Blocks while the queue is full.
         self.inner.slots.acquire();
         if self.inner.stop.load(Ordering::SeqCst) {
             // Shutdown raced us; release and abandon.
@@ -197,7 +183,7 @@ impl Drainer {
             }));
             return false;
         }
-        // Update high-water + threshold events.
+        // High-water mark and threshold events.
         {
             let mut st = lock_or_recover(&self.inner.stats);
             let capacity = self.inner.cfg.capacity;
@@ -230,7 +216,8 @@ impl Drainer {
     /// Block until all rows currently queued have been drained (or timeout).
     /// Returns `true` if fully drained within the deadline.
     pub fn flush(&self, timeout: Duration) -> bool {
-        // Snapshot the target: drained_total + current depth.
+        // Wait only for rows queued before this call: rows already finished
+        // plus rows in flight now.
         let target = {
             let st = lock_or_recover(&self.inner.stats);
             st.drained_total + st.dead_lettered_total + self.inner.slots.used()
@@ -290,7 +277,7 @@ impl Drainer {
         let deadline = Instant::now() + timeout;
         if let Some(h) = lock_or_recover(&self.handle).take() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = h.join(); // join ignores timeout — thread exits quickly on stop
+            let _ = h.join(); // join has no timeout; the thread exits promptly once stop is set
             let _ = remaining;
         }
     }
@@ -302,8 +289,6 @@ impl Drop for Drainer {
     }
 }
 
-// ── Drain loop (background thread) ────────────────────────────────────────
-
 fn drain_loop(inner: Arc<DrainerInner>) {
     loop {
         let row = {
@@ -313,7 +298,7 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                     break r;
                 }
                 if inner.stop.load(Ordering::Acquire) {
-                    return; // exit cleanly
+                    return;
                 }
                 q = cv_wait_or_recover(&inner.queue_cv, q);
                 if inner.stop.load(Ordering::Acquire) && q.is_empty() {
@@ -326,7 +311,7 @@ fn drain_loop(inner: Arc<DrainerInner>) {
         let in_shutdown = inner.stop.load(Ordering::Relaxed);
 
         loop {
-            // catch_unwind guards against a panicking Store impl killing the thread.
+            // Don't let a panicking Store impl kill the thread.
             let call = panic::catch_unwind(panic::AssertUnwindSafe(|| inner.store.insert(&row)));
             let result = match call {
                 Ok(r) => r,
@@ -348,7 +333,7 @@ fn drain_loop(inner: Arc<DrainerInner>) {
                         break;
                     }
                     on_failure(&inner, &msg, attempt);
-                    // Wait out the backoff
+                    // Sleep in short steps so stop() takes effect quickly.
                     let backoff = compute_backoff(&inner, attempt);
                     let deadline = Instant::now() + backoff;
                     loop {
@@ -464,10 +449,9 @@ fn compute_backoff_val(
     if !jitter {
         return capped;
     }
-    // ±20% uniform jitter
+    // +/-20% jitter, seeded from the clock's subsecond nanos (no rand dependency).
     let ms = capped.as_millis() as u64;
-    let jitter_range = ms / 5; // 20%
-    // Simple LCG for no-std jitter (no rand dep)
+    let jitter_range = ms / 5;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -476,8 +460,6 @@ fn compute_backoff_val(
     let jittered = ms.saturating_add(j).saturating_sub(jitter_range);
     Duration::from_millis(jittered)
 }
-
-// ── Sys-stream emission ────────────────────────────────────────────────────
 
 fn sys_event(level: &str, event: &str, fields: &serde_json::Value) {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

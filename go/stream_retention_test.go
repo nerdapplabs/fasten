@@ -7,8 +7,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Per-stream retention pruning (FR1): StreamStore.Purge trims history by age.
-// A timestamp-less row has unknown age and is kept, not silently dropped.
+// StreamStore.Purge trims history by age. A row without a timestamp has an
+// unknown age and is kept.
 
 func TestStreamStore_PurgeRemovesOldRows(t *testing.T) {
 	s := newStreamStore(t, "ret")
@@ -49,9 +49,9 @@ func TestStreamStore_PurgeNoneWhenAllNewer(t *testing.T) {
 	}
 }
 
-// TestStreamStore_PurgeReflectedInReads is the functional path: rows written
-// through the transport persist to the stream store, and purging old history
-// removes them from a subsequent reader read served from that store.
+// TestStreamStore_PurgeReflectedInReads: rows written through the transport
+// persist to the stream store, and purging old history removes them from
+// later reads.
 func TestStreamStore_PurgeReflectedInReads(t *testing.T) {
 	resetGlobals(t)
 	db, err := sql.Open("sqlite", ":memory:")

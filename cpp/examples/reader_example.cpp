@@ -1,36 +1,28 @@
 /**
- * reader_example.cpp — shows two ways to expose the fasten reader:
+ * reader_example.cpp: serving the /logs endpoints.
  *
- *   1. Simple-Web-Server adapter (fasten_reader_simplehttp.hpp)
- *   2. Custom / other-framework adapter (fasten_reader.hpp directly)
+ * Patterns A to D (commented out) show Simple-Web-Server, Crow, Pistache
+ * and a hand-written server. main() calls the handlers directly and prints
+ * the responses.
  *
- * Build with Simple-Web-Server (must clone alongside this repo):
- *   g++ -std=c++14 -I../include -I/path/to/Simple-Web-Server \
- *       reader_example.cpp -o reader -lpthread
- *
- * Run:
- *   FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=node-01 ./reader
- *   curl http://localhost:9000/api/v1/logs/sys
- *   curl http://localhost:9000/api/v1/logs/audit
+ * Build:
+ *   g++ -std=c++14 -I../include reader_example.cpp \
+ *       -L../../fasten-core/target/release -lfasten_core -lpthread -o reader
  */
 
-// ── 1. Core reader (no framework dep) ────────────────────────────────────
 #include "fasten_reader.hpp"
-
-// ── 2. Simple-Web-Server adapter (comment out if not available) ───────────
-// #include "fasten_reader_simplehttp.hpp"
 
 #include <iostream>
 #include <thread>
 #include <chrono>
 
 // ---------------------------------------------------------------------------
-// Pattern A — Simple-Web-Server (one-liner start)
+// Pattern A: Simple-Web-Server
 // ---------------------------------------------------------------------------
 // #include "fasten_reader_simplehttp.hpp"
 //
 // void start_simplehttp() {
-//     // No auth — trusted network only.
+//     // No auth: trusted network only.
 //     auto t = fasten::reader::simplehttp::start(9000);
 //     t.detach();
 //
@@ -44,7 +36,7 @@
 // }
 
 // ---------------------------------------------------------------------------
-// Pattern B — Crow (https://crowcpp.org)
+// Pattern B: Crow (https://crowcpp.org)
 // ---------------------------------------------------------------------------
 // #include "crow.h"
 // #include "fasten_reader.hpp"
@@ -77,7 +69,7 @@
 // }
 
 // ---------------------------------------------------------------------------
-// Pattern C — Pistache (https://pistacheio.github.io/pistache)
+// Pattern C: Pistache (https://pistacheio.github.io/pistache)
 // ---------------------------------------------------------------------------
 // #include <pistache/endpoint.h>
 // #include "fasten_reader.hpp"
@@ -105,20 +97,16 @@
 // };
 
 // ---------------------------------------------------------------------------
-// Pattern D — custom / minimal raw server
-// The general contract: parse URL query string → Params, call handle_*,
-// write status + "Content-Type: application/json" + body.
+// Pattern D: any other server (boost::beast, POCO, raw sockets, ...)
 // ---------------------------------------------------------------------------
 //
-// Any server (boost::beast, POCO, raw POSIX sockets, etc.) follows the same
-// three steps:
 //
 //   1. Parse query string into fasten::reader::Params
 //      (unordered_map<string, string>)
 //   2. Call handle_sys / handle_api / handle_audit
 //   3. Return response.status, "Content-Type: application/json", response.body
 //
-// Example with a hypothetical parse_qs() utility:
+// With some parse_qs() helper:
 //
 //   fasten::reader::Params p = parse_qs(request.query_string);
 //   auto r = fasten::reader::handle_sys(p);
@@ -135,16 +123,15 @@ int main() {
     });
     fasten::init("demo-svc", "node-01");
 
-    // Register a fake audit query (normally this hits your SQLite/Postgres).
+    // Stand-in for a query against the audit store.
     fasten::reader::set_audit_query(
         [](const std::string& /*rid*/, const std::string& /*code*/,
            const std::string& /*domain*/, int limit) {
-            // Return an empty list — replace with real store query.
             (void)limit;
             return std::vector<fasten::Row>{};
         });
 
-    // Emit something so the ring buffers have data.
+    // Emit something so the log buffers have data.
     {
         fasten::RequestScope scope;
         fasten::log::info("demo_started", {{"version", "0.1"}});
@@ -153,14 +140,14 @@ int main() {
             fasten::detail({{"host", "10.0.0.1"}}));
     }
 
-    // Call handlers directly — same functions the HTTP adapters use.
+    // The same handlers the HTTP adapters call.
     auto r_sys   = fasten::reader::handle_sys({{"limit", "10"}});
     auto r_api   = fasten::reader::handle_api({});
     auto r_audit = fasten::reader::handle_audit({{"limit", "5"}});
 
-    std::cout << "GET /sys   → " << r_sys.status   << " " << r_sys.body   << "\n";
-    std::cout << "GET /api   → " << r_api.status   << " " << r_api.body   << "\n";
-    std::cout << "GET /audit → " << r_audit.status << " " << r_audit.body << "\n";
+    std::cout << "GET /sys   -> " << r_sys.status   << " " << r_sys.body   << "\n";
+    std::cout << "GET /api   -> " << r_api.status   << " " << r_api.body   << "\n";
+    std::cout << "GET /audit -> " << r_audit.status << " " << r_audit.body << "\n";
 
     return 0;
 }

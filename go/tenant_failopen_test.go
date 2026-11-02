@@ -168,7 +168,7 @@ func TestEngine_StoreAllocatesSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r1.MonotonicSeq == r2.MonotonicSeq {
-		t.Fatalf("two engines minted the same seq %d — the P0-9 defect", r1.MonotonicSeq)
+		t.Fatalf("two engines minted the same seq %d", r1.MonotonicSeq)
 	}
 	if r2.PrevHash != r1.Hash {
 		t.Fatalf("second engine did not chain to the first: prev=%q want %q",

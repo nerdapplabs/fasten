@@ -1,7 +1,6 @@
-"""Redact conformance — loads spec/redact-conformance.json, runs every case.
+"""Runs every case in spec/redact-conformance.json.
 
-The spec is the single source of truth (fasten-core/src/redact.rs is canonical).
-All SDKs must pass every case; failures indicate a divergence from the Rust impl.
+The same cases run against fasten-core and every SDK.
 """
 import json
 from pathlib import Path
