@@ -1275,28 +1275,30 @@ class Engine:
         # gave them one try at shutdown, and may have reported them lost.
         # Past close's deadline they are reported lost without a try.
         recovered = []
-        for row, _ in list(d.pending.values()):
-            if d.past_deadline():
-                break
-            try:
-                self._allocate_and_store(row, d.store, d.stdout)
-            except Exception as e:  # noqa: BLE001
-                with d.lock:
-                    lost = row.id not in d.reported
+        try:
+            for row, _ in list(d.pending.values()):
+                if d.past_deadline():
+                    break
+                try:
+                    self._allocate_and_store(row, d.store, d.stdout)
+                except Exception as e:  # noqa: BLE001
+                    with d.lock:
+                        lost = row.id not in d.reported
+                        if lost:
+                            d.pending.pop(row.id, None)
+                            d.reported.add(row.id)
+                            d.lost += 1
                     if lost:
+                        self._lose_at_stop(d, [row.id], type(e).__name__)
+                else:
+                    # Stored, whether or not close has reported it lost meanwhile.
+                    with d.lock:
                         d.pending.pop(row.id, None)
-                        d.reported.add(row.id)
-                        d.lost += 1
-                if lost:
-                    self._lose_at_stop(d, [row.id], type(e).__name__)
-            else:
-                # Stored, whether or not close has reported it lost meanwhile.
-                with d.lock:
-                    d.pending.pop(row.id, None)
-                recovered.append(row.id)
-        if recovered:
-            self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
-        self._report_unstored(d)
+                    recovered.append(row.id)
+            if recovered:
+                self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
+        finally:
+            self._report_unstored(d)
 
     def _give_up(self, d: _QueueDrainer) -> None:
         """Past the deadline: report the rows ``d`` still holds as lost and
@@ -1321,14 +1323,21 @@ class Engine:
         ``d.lock``: the syslog store may be stalled too."""
         if not row_ids:
             return
-        self._mark_write_lost(d.store, d.gen)
+        log = logging.getLogger("fasten")
+        try:
+            self._mark_write_lost(d.store, d.gen)
+        except Exception:  # noqa: BLE001 — still report the rows
+            log.exception("marking the audit store degraded failed")
         for row_id in row_ids:
-            # Past the deadline the syslog store may be as stuck as the audit
-            # store, and close() must still return.
-            self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
-                "error_type": error_type,
-                "row_id": row_id,
-            }, via=d, persist=not d.past_deadline())
+            try:
+                # Past the deadline the syslog store may be as stuck as the
+                # audit store, and close() must still return.
+                self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
+                    "error_type": error_type,
+                    "row_id": row_id,
+                }, via=d, persist=not d.past_deadline())
+            except Exception:  # noqa: BLE001 — report the rest
+                log.exception("lost_at_stop event failed for %s", row_id)
 
     def _atexit_close(self) -> None:
         deadline = time.monotonic() + 5.0

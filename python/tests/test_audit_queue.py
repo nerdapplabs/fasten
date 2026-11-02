@@ -1034,6 +1034,43 @@ def test_lost_at_stop_left_out_of_the_syslog_store_degrades_it(tmp_path):
         _release_hung_store(store)
 
 
+def _fail_first_lost_event(monkeypatch):
+    """Make the first lost_at_stop event raise; return the ids reported."""
+    log, reported = _default._drainer_sys_log, []
+
+    def flaky(level, event, fields, via=None, persist=True):
+        if event == "audit_drain_lost_at_stop":
+            reported.append(fields["row_id"])
+            if len(reported) == 1:
+                raise OSError("stderr closed")
+        return log(level, event, fields, via=via, persist=persist)
+    monkeypatch.setattr(_default, "_drainer_sys_log", flaky)
+    return reported
+
+
+def test_a_failed_lost_event_does_not_stop_the_others_at_close(tmp_path, monkeypatch):
+    store = HangingStore(str(tmp_path / "a.db"))
+    _init(store)
+    try:
+        rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(3)]
+        _wait_for_attempts(store, 1)
+        reported = _fail_first_lost_event(monkeypatch)
+        assert not fasten.close(timeout=0.3)
+    finally:
+        _release_hung_store(store)
+    assert sorted(reported) == sorted(r.id for r in rows)
+
+
+def test_a_failed_lost_event_does_not_stop_retire(tmp_path, monkeypatch):
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
+    rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(3)]
+    _wait_in_backoff()
+    reported = _fail_first_lost_event(monkeypatch)
+    _default._uninstall_drainer()
+    assert sorted(reported) == sorted(r.id for r in rows)
+
+
 def test_close_returns_true_when_retire_stores_the_row(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"), fail=1)
     _init(store, queue_retry_initial_ms=10_000, queue_retry_max_ms=10_000)
