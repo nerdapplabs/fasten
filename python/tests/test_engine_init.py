@@ -195,7 +195,7 @@ def test_atexit_close_drains_pending(mem_store):
     )
     fasten.emit(code="USER_CREATED", target="u-1")
     _default._atexit_close()
-    assert len(store.rows) >= 1
+    assert len(store.rows) == 1
 
 
 # ── stdlib logger fallback ────────────────────────────────────────────────

@@ -402,10 +402,11 @@ def test_rows_stored_at_stop_are_reported(tmp_path, capsys):
     assert len(_rows(store)) == 1
     err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
            if line.startswith("{")]
-    assert any(e.get("event") == "audit_drain_recovered_at_stop" and e.get("row_ids") == [row.id]
-               for e in err)
-    # Stored after all, so not also reported as dead-lettered.
-    assert not any(e.get("event") == "audit_drain_dead_letter" for e in err)
+    assert [e["row_ids"] for e in err if e.get("event") == "audit_drain_recovered_at_stop"] == [
+        [row.id]]
+    # Stored after all, so not also reported as dead-lettered or lost.
+    assert not [e for e in err if e.get("event") in ("audit_drain_dead_letter",
+                                                     "audit_drain_lost_at_stop")]
 
 
 
@@ -467,8 +468,9 @@ def test_row_failing_at_stop_is_reported(tmp_path, capsys):
     _default._uninstall_drainer()
     err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
            if line.startswith("{")]
-    assert any(e.get("event") == "audit_drain_lost_at_stop" and e.get("row_id") == row.id
-               for e in err)
+    assert [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"] == [row.id]
+    assert not [e for e in err if e.get("event") in ("audit_drain_dead_letter",
+                                                     "audit_drain_recovered_at_stop")]
     assert _default.audit_write_swallowed()
 
 
@@ -893,8 +895,9 @@ def test_fork_never_lands_mid_insert(tmp_path):
             time.sleep(0.02)
     assert not failed, f"{len(failed)} of {len(pids)} forked children did not store: {failed}"
     assert fasten.flush(timeout=10.0)
-    targets = {r.target for r in store.query(limit=10000)}
-    assert all(f"child-{r}-{k}" in targets for r in range(3) for k in range(8))
+    targets = sorted(r.target for r in store.query(limit=10000))
+    assert targets == sorted([f"parent-{r}-{i}" for r in range(3) for i in range(300)]
+                             + [f"child-{r}-{k}" for r in range(3) for k in range(8)])
 
 
 
@@ -1447,6 +1450,26 @@ def _printed(proc):
     return [line for line in proc.stdout.splitlines() if not line.startswith("{")]
 
 
+def _assert_each_row_once(tmp_path, proc):
+    """Every emitted row is either stored or reported lost (and not
+    recovered), never both. Returns the rows reported lost."""
+    emitted = {e["id"] for e in (json.loads(line) for line in proc.stdout.splitlines()
+                                 if line.startswith("{"))
+               if e.get("shape") == "audit"}
+    events = [json.loads(line) for line in proc.stderr.splitlines() if line.startswith("{")]
+    lost = [e["row_id"] for e in events if e.get("event") == "audit_drain_lost_at_stop"]
+    recovered = [i for e in events if e.get("event") == "audit_drain_recovered_at_stop"
+                 for i in e["row_ids"]]
+    stored = [r.id for r in SQLiteStore(str(tmp_path / "a.db")).query(limit=100)]
+    assert len(emitted) == 3
+    assert len(set(lost)) == len(lost) and len(set(stored)) == len(stored)
+    assert set(recovered) <= set(stored)
+    unstored = set(lost) - set(recovered)
+    assert set(stored).isdisjoint(unstored)
+    assert set(stored) | unstored == emitted
+    return lost
+
+
 @pytest.mark.parametrize("ending,status", [
     ("assert not fasten.close(timeout=0.3)", 0),
     ("fasten.close(timeout=0.3); sys.exit(3)", 3),
@@ -1465,6 +1488,7 @@ def test_exit_is_not_held_by_a_hanging_store(tmp_path, ending, status):
     assert time.monotonic() - start < 15
     lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
     assert len(lost) == 3
+    assert len(_assert_each_row_once(tmp_path, proc)) == 3
     assert _printed(proc) == ["buffered output", "earlier hook ran"]
 
 
@@ -1476,6 +1500,7 @@ def test_exit_is_not_held_by_a_hanging_syslog_store(tmp_path):
     assert time.monotonic() - start < 15
     lost = [line for line in proc.stderr.splitlines() if "audit_drain_lost_at_stop" in line]
     assert len(lost) == 3
+    assert len(_assert_each_row_once(tmp_path, proc)) == 3
     assert _printed(proc) == ["buffered output", "earlier hook ran"]
 
 
@@ -1485,6 +1510,7 @@ def test_exit_as_a_left_behind_store_call_returns(tmp_path, hang):
     # interpreter finalizes.
     proc = _run_exit_script(tmp_path, hang, "fasten.close(timeout=0.3)")
     assert proc.returncode == 0, proc.stderr
+    _assert_each_row_once(tmp_path, proc)
     assert _printed(proc) == ["buffered output", "earlier hook ran"]
 
 
@@ -1495,4 +1521,4 @@ def test_exit_with_a_working_store_finalizes_as_usual(tmp_path, ending, status):
     proc = _run_exit_script(tmp_path, 0, ending)
     assert proc.returncode == status, proc.stderr
     assert _printed(proc) == ["buffered output", "earlier hook ran"]
-    assert len(SQLiteStore(str(tmp_path / "a.db")).query(limit=10)) == 3
+    assert _assert_each_row_once(tmp_path, proc) == []
