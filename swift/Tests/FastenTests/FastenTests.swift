@@ -447,6 +447,23 @@ final class ChainTests: XCTestCase {
         try store.insert(testRow("kept"))
         XCTAssertEqual(query(path, "SELECT id, monotonic_seq FROM audit_log"), [["kept", "1"]])
     }
+
+    func testFailedRollbackIsReported() throws {
+        let path = tempDBPath(self)
+        let store = try SQLiteStore(path: path, busyTimeoutMs: 0)
+        sqlite3_set_authorizer(store.db, { _, action, arg1, _, _, _ in
+            action == SQLITE_TRANSACTION && arg1.map { String(cString: $0) } == "ROLLBACK"
+                ? SQLITE_DENY : SQLITE_OK
+        }, nil)
+        var reader: OpaquePointer?
+        sqlite3_open(path, &reader)
+        defer { sqlite3_close(reader) }
+        sqlite3_exec(reader, "BEGIN; SELECT COUNT(*) FROM audit_log;", nil, nil, nil)
+        XCTAssertThrowsError(try store.insert(testRow("lost"))) { error in
+            XCTAssertTrue("\(error)".contains("ROLLBACK failed"), "\(error)")
+            XCTAssertTrue("\(error)".contains("not authorized"), "\(error)")
+        }
+    }
 }
 
 // MARK: - PII redaction (spec 7)

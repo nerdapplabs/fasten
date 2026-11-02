@@ -14,7 +14,7 @@ import CSQLite3
 ///   let store = try SQLiteStore(path: ":memory:")
 public final class SQLiteStore: AuditStore, @unchecked Sendable {
 
-    private var db: OpaquePointer?
+    private(set) var db: OpaquePointer?   // internal for tests
     private let lock = Lock()
     private let table: String
 
@@ -112,7 +112,13 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
                 try execInsert("COMMIT")
             } catch {
                 // Also after a failed COMMIT, which leaves the transaction open.
-                sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+                // Some errors roll back on their own, so ROLLBACK failing only
+                // matters while a transaction is still open.
+                if sqlite3_exec(db, "ROLLBACK", nil, nil, nil) != SQLITE_OK,
+                   sqlite3_get_autocommit(db) == 0 {
+                    throw FastenError("\(error.localizedDescription); ROLLBACK failed, "
+                        + "the connection is still in a transaction: \(lastError())")
+                }
                 throw error
             }
         }
