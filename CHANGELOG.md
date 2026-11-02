@@ -124,7 +124,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   redacts nothing. Rows are never deleted, and sealed form-"1" rows are not
   touched; their count is logged as `pii_redaction_skipped_legacy_form`. The
   SDK runs no retention loop, so call it on a schedule. `Meta` gains
-  `piiInDetail`.
+  `piiInDetail`. A custom `AuditStore` that supports redaction implements
+  `listRedactionCandidates`, `redactRows` and `countRefusedLegacyRows`; the
+  default implementations throw.
 - Rows written by the previous Swift release are form "1" with a hash that
   never covered `detail`, so `redactExpired` refuses them. If only Swift has
   written to the table, call `SQLiteStore.clearLegacySwiftHashes()` once to

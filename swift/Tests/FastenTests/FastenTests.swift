@@ -650,6 +650,11 @@ final class RedactionTests: XCTestCase {
         XCTAssertThrowsError(try Fasten.redactExpired(before: Date()))
     }
 
+    func testStoreWithoutRedactionSupportThrowsOnRefusedCount() {
+        XCTAssertThrowsError(try CapturingStore().countRefusedLegacyRows(
+            before: Date(), codes: ["USER_EMAIL_SEEN"]))
+    }
+
     private func isoString40DaysAgo() -> String {
         ISO8601DateFormatter().string(from: Date().addingTimeInterval(-40 * day))
     }

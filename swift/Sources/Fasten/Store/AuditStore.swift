@@ -35,7 +35,7 @@ public protocol AuditStore: Sendable {
 
     /// Rows of `codes` older than `before` that still hold detail but are
     /// sealed under form "1", so they are refused (spec 7.1 says to report
-    /// them). Defaults to 0.
+    /// them).
     func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int
 }
 
@@ -48,7 +48,9 @@ extension AuditStore {
         throw FastenError("\(type(of: self)) does not support redaction (spec 7.1)")
     }
 
-    public func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int { 0 }
+    public func countRefusedLegacyRows(before: Date, codes: [Code]) throws -> Int {
+        throw FastenError("\(type(of: self)) does not support redaction (spec 7.1)")
+    }
 }
 
 /// In-memory store — tests + stdout-only deployments.
