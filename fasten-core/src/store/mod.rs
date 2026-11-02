@@ -28,9 +28,60 @@ pub struct Filter {
 pub struct RedactionCandidates {
     /// `(id, monotonic_seq)` ordered by `monotonic_seq`.
     pub rows: Vec<(String, u64)>,
-    /// Matching rows left out because they are sealed (`hash <> ''`).
+    /// Matching rows left out because they are sealed under form "1".
     /// Always 0 on a table without a `hash` column.
     pub skipped: u64,
+}
+
+/// Which rows redaction may touch, from the chain columns the table has
+/// (spec §7.1). Tables created here have none, so every row is unsealed; a
+/// table shared with an SDK that seals may hold sealed rows. A sealed form-"2"
+/// row hashes without its detail and is redacted; a sealed form-"1" row is
+/// refused.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct RedactGate {
+    hash: bool,
+    form: bool,
+    salt: bool,
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+impl RedactGate {
+    /// From the table's column names, in any case.
+    fn from_columns<S: AsRef<str>>(cols: &[S]) -> Self {
+        let has = |name: &str| cols.iter().any(|c| c.as_ref().eq_ignore_ascii_case(name));
+        RedactGate { hash: has("hash"), form: has("canonical_form_id"), salt: has("detail_salt") }
+    }
+
+    /// Appended to a WHERE clause: the rows redaction may touch.
+    fn allowed(self) -> &'static str {
+        match (self.hash, self.form) {
+            (false, _) => "",
+            (true, false) => " AND hash = ''",
+            (true, true) => " AND (canonical_form_id = '2' OR hash = '')",
+        }
+    }
+
+    /// Appended to a WHERE clause: the rows redaction refuses, or `None` when
+    /// the table can hold none.
+    fn refused(self) -> Option<&'static str> {
+        match (self.hash, self.form) {
+            (false, _) => None,
+            (true, false) => Some(" AND hash <> ''"),
+            (true, true) => Some(" AND canonical_form_id <> '2' AND hash <> ''"),
+        }
+    }
+
+    /// The SET list of the redacting UPDATE. 'null' is the JSON literal:
+    /// detail is NOT NULL, and it reads back as a null detail.
+    fn set(self) -> &'static str {
+        if self.salt {
+            "detail = 'null', detail_salt = ''"
+        } else {
+            "detail = 'null'"
+        }
+    }
 }
 
 /// Shared contract for all audit-store backends.
@@ -88,8 +139,8 @@ pub trait Store: Send + Sync {
     // ── Redaction (spec §7.1) ────────────────────────────────────────────────
 
     /// Rows with `timestamp < before`, `code` in `codes` and a `detail` not
-    /// yet redacted. Sealed rows are never listed; they are counted in
-    /// `skipped`.
+    /// yet redacted. Sealed form-"1" rows are never listed; they are counted
+    /// in `skipped`.
     fn list_redaction_candidates(
         &self,
         _before: &str,
@@ -98,8 +149,9 @@ pub trait Store: Send + Sync {
         Err(Error::Unsupported("list_redaction_candidates"))
     }
 
-    /// Set `detail` to the JSON literal `null` on the unsealed rows in `ids`.
-    /// Idempotent. Returns `ids`.
+    /// Set `detail` to the JSON literal `null` (and `detail_salt`, when the
+    /// table has one, to `''`) on the rows in `ids` that are not sealed
+    /// form-"1" rows. Idempotent. Returns `ids`.
     fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported("redact_rows"))
     }

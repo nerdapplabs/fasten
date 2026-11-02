@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{RedactionCandidates, Store};
+use super::{RedactGate, RedactionCandidates, Store};
 
 // ── SqliteStore ───────────────────────────────────────────────────────────────
 
@@ -138,19 +138,15 @@ impl SqliteStore {
         })
     }
 
-    /// Whether the table has a `hash` column.
-    ///
-    /// Tables created here have no chain columns, so every row is unsealed.
-    /// A table shared with an SDK that seals (Go adds `hash` on open) may hold
-    /// sealed rows, which redaction leaves alone.
-    fn has_hash_column(conn: &Connection, table: &str) -> Result<bool, Error> {
+    fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
         let (schema, bare) = split_table(table);
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1, ?2) WHERE name = 'hash'",
-            rusqlite::params![bare, schema.unwrap_or("main")],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
+        let cols = stmt
+            .query_map(rusqlite::params![bare, schema.unwrap_or("main")], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RedactGate::from_columns(&cols))
     }
 }
 
@@ -341,7 +337,7 @@ impl Store for SqliteStore {
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // One read transaction so every chunk sees the same rows.
         let tx = guard.transaction()?;
-        let has_hash = Self::has_hash_column(&tx, &self.table)?;
+        let gate = Self::redact_gate(&tx, &self.table)?;
         for chunk in codes.chunks(BIND_CHUNK) {
             let base = format!(
                 "FROM {} WHERE timestamp < ?1 AND code IN ({}) AND detail <> 'null'",
@@ -353,17 +349,17 @@ impl Store for SqliteStore {
             for c in chunk {
                 params.push(*c);
             }
-            let gate = if has_hash { " AND hash = ''" } else { "" };
-            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{gate}"))?;
+            let allowed = gate.allowed();
+            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{allowed}"))?;
             let rows = stmt.query_map(params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
             })?;
             for r in rows {
                 out.rows.push(r?);
             }
-            if has_hash {
+            if let Some(refused) = gate.refused() {
                 let n: i64 = tx.query_row(
-                    &format!("SELECT COUNT(*) {base} AND hash <> ''"),
+                    &format!("SELECT COUNT(*) {base}{refused}"),
                     params.as_slice(),
                     |r| r.get(0),
                 )?;
@@ -381,14 +377,14 @@ impl Store for SqliteStore {
         }
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let gate = if Self::has_hash_column(&tx, &self.table)? { " AND hash = ''" } else { "" };
+        let gate = Self::redact_gate(&tx, &self.table)?;
         for chunk in ids.chunks(BIND_CHUNK) {
-            // 'null' is the JSON literal: detail is NOT NULL, and it reads
-            // back as a null detail.
             let sql = format!(
-                "UPDATE {} SET detail = 'null' WHERE id IN ({}){gate}",
+                "UPDATE {} SET {} WHERE id IN ({}){}",
                 self.table,
-                placeholders(1, chunk.len())
+                gate.set(),
+                placeholders(1, chunk.len()),
+                gate.allowed()
             );
             let params: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
@@ -913,6 +909,57 @@ mod tests {
         store.redact_rows(&all).unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"key": "value"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// A sealed form-"2" row hashes without its detail, so it is redacted
+    /// like an unsealed one; only sealed form-"1" rows are refused.
+    #[test]
+    fn redaction_covers_sealed_form_2_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        {
+            let c = store.conn.lock().unwrap();
+            c.execute_batch(
+                "ALTER TABLE audit_log ADD COLUMN Hash TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE audit_log ADD COLUMN Canonical_Form_Id TEXT NOT NULL DEFAULT '1';
+                 ALTER TABLE audit_log ADD COLUMN Detail_Salt TEXT NOT NULL DEFAULT '';",
+            )
+            .unwrap();
+        }
+        for id in ["evt-form1", "evt-form2", "evt-unsealed"] {
+            let mut r = make_row(id, "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-form1';
+                 UPDATE audit_log SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
+                 WHERE id = 'evt-form2';",
+            )
+            .unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![("evt-form2".to_string(), 2), ("evt-unsealed".to_string(), 3)]
+        );
+        assert_eq!(found.skipped, 1);
+        let all = vec!["evt-form1".to_string(), "evt-form2".to_string(), "evt-unsealed".to_string()];
+        store.redact_rows(&all).unwrap();
+        assert_eq!(detail_of(&store, "evt-form1"), serde_json::json!({"key": "value"}));
+        assert_eq!(detail_of(&store, "evt-form2"), serde_json::Value::Null);
+        assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+        let salt: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT detail_salt FROM audit_log WHERE id = 'evt-form2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(salt, "");
     }
 
     /// More ids and codes than SQLite binds in one statement.

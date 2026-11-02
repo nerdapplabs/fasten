@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{RedactionCandidates, Store};
+use super::{RedactGate, RedactionCandidates, Store};
 
 // ── Connection holder ─────────────────────────────────────────────────────────
 //
@@ -289,19 +289,20 @@ impl PostgresStore {
         })
     }
 
-    /// Whether the table has a `hash` column. See the SQLite store.
-    fn has_hash_column(&self, client: &mut pg::Client) -> Result<bool, Error> {
+    fn redact_gate(&self, client: &mut pg::Client) -> Result<RedactGate, Error> {
         // Unquoted identifiers fold to lower case.
         let bare = self.bare.to_lowercase();
         let schema = self.schema.as_deref().map(str::to_lowercase);
-        let row = client.query_one(
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = COALESCE($1, current_schema()) \
-             AND table_name = $2 AND column_name = 'hash'",
-            &[&schema, &bare],
-        )?;
-        let n: i64 = row.get(0);
-        Ok(n > 0)
+        let cols: Vec<String> = client
+            .query(
+                "SELECT column_name::text FROM information_schema.columns \
+                 WHERE table_schema = COALESCE($1, current_schema()) AND table_name = $2",
+                &[&schema, &bare],
+            )?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        Ok(RedactGate::from_columns(&cols))
     }
 }
 
@@ -463,12 +464,12 @@ impl Store for PostgresStore {
             return Ok(RedactionCandidates::default());
         }
         self.with_reconnect(|inner| {
-            let has_hash = self.has_hash_column(&mut inner.client)?;
+            let gate = self.redact_gate(&mut inner.client)?;
             let base = format!(
                 "FROM {} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null'",
                 self.table
             );
-            let gate = if has_hash { " AND hash = ''" } else { "" };
+            let allowed = gate.allowed();
             // REPEATABLE READ so the list and the count see the same rows.
             let mut tx = inner
                 .client
@@ -477,12 +478,12 @@ impl Store for PostgresStore {
                 .read_only(true)
                 .start()?;
             let rows = tx.query(
-                format!("SELECT id, monotonic_seq {base}{gate} ORDER BY monotonic_seq").as_str(),
+                format!("SELECT id, monotonic_seq {base}{allowed} ORDER BY monotonic_seq").as_str(),
                 &[&before, &codes],
             )?;
-            let skipped: i64 = if has_hash {
+            let skipped: i64 = if let Some(refused) = gate.refused() {
                 tx.query_one(
-                    format!("SELECT COUNT(*) {base} AND hash <> ''").as_str(),
+                    format!("SELECT COUNT(*) {base}{refused}").as_str(),
                     &[&before, &codes],
                 )?
                 .get(0)
@@ -505,12 +506,14 @@ impl Store for PostgresStore {
             return Ok(vec![]);
         }
         self.with_reconnect(|inner| {
-            let gate = if self.has_hash_column(&mut inner.client)? { " AND hash = ''" } else { "" };
-            // 'null' is the JSON literal; see the SQLite store. ids go in one
-            // array parameter, so there is no per-id bind limit here.
+            let gate = self.redact_gate(&mut inner.client)?;
+            // ids go in one array parameter, so there is no per-id bind limit
+            // here.
             let sql = format!(
-                "UPDATE {} SET detail = 'null' WHERE id = ANY($1){gate}",
-                self.table
+                "UPDATE {} SET {} WHERE id = ANY($1){}",
+                self.table,
+                gate.set(),
+                gate.allowed()
             );
             inner.client.execute(sql.as_str(), &[&ids])?;
             Ok(ids.to_vec())
@@ -1134,5 +1137,50 @@ mod tests {
         assert_eq!(found.skipped, 1);
         store.redact_rows(&["evt-mixed-sealed".to_string()]).unwrap();
         assert_eq!(detail_of(&store, "evt-mixed-sealed"), serde_json::json!({"k": "v"}));
+    }
+
+    /// A sealed form-"2" row hashes without its detail, so it is redacted
+    /// like an unsealed one; only sealed form-"1" rows are refused.
+    #[test]
+    fn redaction_covers_sealed_form_2_rows() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_redact_form2";
+        let store = fresh(&dsn, table);
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!(
+            "ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT '';
+             ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1';
+             ALTER TABLE {table} ADD COLUMN detail_salt TEXT NOT NULL DEFAULT '';"
+        ))
+        .unwrap();
+        for id in ["evt-form1", "evt-form2", "evt-unsealed"] {
+            let mut r = make_row(id, "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        c.batch_execute(&format!(
+            "UPDATE {table} SET hash = 'abc' WHERE id = 'evt-form1';
+             UPDATE {table} SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
+             WHERE id = 'evt-form2';"
+        ))
+        .unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![("evt-form2".to_string(), 2), ("evt-unsealed".to_string(), 3)]
+        );
+        assert_eq!(found.skipped, 1);
+        let all = vec!["evt-form1".to_string(), "evt-form2".to_string(), "evt-unsealed".to_string()];
+        store.redact_rows(&all).unwrap();
+        assert_eq!(detail_of(&store, "evt-form1"), serde_json::json!({"k": "v"}));
+        assert_eq!(detail_of(&store, "evt-form2"), serde_json::Value::Null);
+        assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+        let salt: String = c
+            .query_one(&format!("SELECT detail_salt FROM {table} WHERE id = 'evt-form2'"), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(salt, "");
     }
 }
