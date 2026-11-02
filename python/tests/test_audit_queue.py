@@ -1035,6 +1035,34 @@ def test_core_event_past_the_deadline_skips_the_syslog_store(tmp_path):
         _release_hung_store(store)
 
 
+def test_core_stop_event_does_not_wait_on_a_hung_syslog_store(tmp_path, monkeypatch, capsys):
+    # fasten-core emits audit_drain_stop_slow from inside drainer_close, on
+    # the retire thread; stuck in the syslog store there, it would still be
+    # in Python above fasten-core's frames at interpreter exit.
+    from fasten import core_ffi
+    syslog = BlockingSyslogStore()
+    _init(FlakyStore(str(tmp_path / "a.db")), syslog_store=syslog)
+    d, close = _default._drainer, core_ffi.drainer_close
+
+    def slow_stop(handle):
+        close(handle)
+        _core_event(d, "audit_drain_stop_slow", None)
+
+    monkeypatch.setattr(core_ffi, "drainer_close", slow_stop)
+    syslog.armed.set()
+    try:
+        start = time.monotonic()
+        assert fasten.close(timeout=2.0)
+        assert time.monotonic() - start < 1
+        err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+               if line.startswith("{")]
+        assert [e["event"] for e in err if e.get("event") == "audit_drain_stop_slow"] == [
+            "audit_drain_stop_slow"]
+        assert fasten.transport().stream_degraded("sys")
+    finally:
+        syslog.release.set()
+
+
 def test_row_reported_lost_then_stored_inline_is_reported_recovered(tmp_path, monkeypatch):
     # close gives up on the drainer while an emit is between queueing the
     # row and fasten-core refusing it.

@@ -75,7 +75,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   left behind at exit can no longer abort the process during interpreter
   finalization (CPython before 3.14 on Linux).
 - Drainer sys events are written to stderr before the syslog store, so a
-  hung syslog store can't hold them back.
+  hung syslog store can't hold them back. The events fasten-core sends
+  while a drainer stops (`audit_drain_stop_slow`, `audit_drain_abandoned`)
+  go to stderr and the ring only, and the syslog store is marked degraded.
 - A flush that fails in fasten-core is reported as
   `audit_drain_flush_failed` (and `flush()` returns False) instead of
   looking like a timeout.

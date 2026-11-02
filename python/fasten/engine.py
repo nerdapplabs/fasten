@@ -199,6 +199,7 @@ class _QueueDrainer:
     abandoned: bool = False             # close gave up: no more waiting on the store
     worker: Optional[threading.Thread] = None
     drain_ident: Optional[int] = None   # fasten-core's drain thread
+    retire_ident: Optional[int] = None  # the thread stopping it
     drain_stopped: threading.Event = dataclasses.field(default_factory=threading.Event)
 
     def past_deadline(self) -> bool:
@@ -1193,11 +1194,14 @@ class Engine:
                 if (threading.get_ident() == d.drain_ident and not d.past_deadline()
                         and d.call_on_worker(_sys_event, event_json) is not None):
                     return
-                _sys_event(event_json)
+                # Stop-time events come on the retire thread, inside
+                # drainer_close: a hung syslog store would keep it in
+                # Python above fasten-core's frames into exit.
+                _sys_event(event_json, persist=threading.get_ident() != d.retire_ident)
             except BaseException:  # noqa: BLE001 — a sys event must not fail the drainer
                 cb_logger.exception("drainer sys event failed: %r", event_json)
 
-        def _sys_event(event_json: bytes) -> int:
+        def _sys_event(event_json: bytes, persist: bool = True) -> int:
             fields = json.loads(event_json.decode("utf-8"))
             # A row still pending failed its one try at stop; retire then
             # stores it or reports it lost, so this would count it twice.
@@ -1208,7 +1212,7 @@ class Engine:
             fields.pop("shape", None)
             fields.pop("timestamp", None)
             self._drainer_sys_log(fields.pop("level", "info"), fields.pop("event", ""), fields,
-                                  via=d, persist=not d.past_deadline())
+                                  via=d, persist=persist and not d.past_deadline())
             return 0
 
         cb = _ffi.InsertCallbackFn(_insert_cb)
@@ -1314,6 +1318,7 @@ class Engine:
 
     def _retire_drainer(self, d: _QueueDrainer) -> None:
         """Stop a drainer that is no longer installed and store what it didn't."""
+        d.retire_ident = threading.get_ident()
         try:
             self._stop_drainer(d)
         finally:
