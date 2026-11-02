@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// P1-45: RequireBearer contract — pinned so a future refactor can't
+// RequireBearer contract, pinned so a future refactor can't
 // silently regress the "unset env => panic" or "wrong token => 401"
 // invariants that make this a real footgun-reduction default.
 

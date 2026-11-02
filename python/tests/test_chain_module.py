@@ -1,5 +1,5 @@
-"""Items 6, 7, 10: chain module + public seal(), canonical_form_id dispatch,
-and Engine-decoupled replication.ingest."""
+"""Public seal(), canonical_form_id dispatch, and replication.ingest without
+an Engine."""
 import dataclasses
 
 import fasten
@@ -22,7 +22,7 @@ def _bare_row(seq: int = 1) -> AuditRow:
     )
 
 
-# ── item 7: public seal() round-trip ───────────────────────────────────────────
+# seal()
 
 def test_seal_round_trip_verifies():
     """A seal()-sealed row verifies under verify_chain."""
@@ -44,22 +44,22 @@ def test_seal_is_public_surface():
     assert fasten.seal is seal
 
 
-# ── item 6: canonical_form_id dispatch ─────────────────────────────────────────
+# canonical_form_id
 
 def test_emit_stamps_canonical_form_id(initialized):
     row = fasten.emit(code="USER_CREATED", target="u/9")
-    # Form "2" is current (spec §1.4): detail is committed to, not hashed
-    # directly, so a PII purge can destroy it without moving the hash.
+    # Form "2" (spec §1.4) hashes a commitment to detail, so detail can be
+    # purged without moving the hash.
     assert row.canonical_form_id == "2"
     assert row.detail_commitment and row.detail_salt
     assert verify_chain([row]).ok is True
 
 
 def test_unknown_canonical_form_id_is_rejected():
-    """A row carrying an unknown canonical_form_id must REJECT, naming the id."""
+    """An unknown canonical_form_id is rejected, and the reason names it."""
     row = seal("genesis", _bare_row())
-    # Forge an unknown form id WITHOUT recomputing the hash — verify_chain must
-    # reject on the unknown id, not merely on a hash mismatch.
+    # Change the form id without recomputing the hash. The reason must name
+    # the unknown id, not just report a hash mismatch.
     forged = dataclasses.replace(row, canonical_form_id="99")
     result = verify_chain([forged])
     assert result.ok is False
@@ -78,11 +78,10 @@ def test_canonical_form_id_round_trips_through_store(initialized, mem_store):
     assert all(r.detail_commitment and r.detail_salt for r in rows)
 
 
-# ── item 10: replication.ingest decoupled from the Engine ──────────────────────
+# replication.ingest without an Engine
 
 def test_replication_ingest_without_init():
-    """fasten.replication.ingest works on a fresh store with NO fasten.init()."""
-    # Hand-seal a standalone chain — no Engine, no init().
+    """fasten.replication.ingest works on a fresh store without fasten.init()."""
     rows = []
     prev = "genesis"
     for i in range(3):
@@ -110,7 +109,7 @@ def test_replication_ingest_rejects_on_break_without_init():
     chain = [rows[0], tampered, rows[2]]
 
     dest = SQLiteStore(":memory:")
-    result = fasten.replication.ingest(dest, chain)  # must NOT raise
+    result = fasten.replication.ingest(dest, chain)  # does not raise
     assert result.inserted == 1
     assert result.rejected_from_seq == rows[1].monotonic_seq
     assert dest.count() == 1

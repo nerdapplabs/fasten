@@ -1,10 +1,4 @@
-"""
-Scheduler shim — mints `scheduler-<run_id>` at autonomous job start.
-
-No external caller exists for scheduled jobs; without this, audit rows
-emitted by jobs would carry synthetic / null request_ids. Instead, every
-job run mints a deterministic-shape id so downstream audit stitches.
-"""
+"""Give each scheduled job run its own ``scheduler-<run_id>`` request_id."""
 from __future__ import annotations
 
 import inspect
@@ -24,17 +18,14 @@ def mint_run_id() -> str:
 
 @contextmanager
 def job_run(run_id: str | None = None) -> Iterator[str]:
-    """Wrap a scheduled job body — all logs inside inherit the minted id."""
+    """Run the block with ``run_id`` (or a new one) as the request_id."""
     rid = run_id or mint_run_id()
     with with_request_id(rid) as ctx_id:
         yield ctx_id
 
 
 def instrument(fn: Callable[..., T]) -> Callable[..., T]:
-    """Decorator — wraps a scheduled callable so each invocation mints a run id.
-
-    Works for both sync and async callables.
-    """
+    """Decorator giving each call of a sync or async job a new run id."""
     if inspect.iscoroutinefunction(fn):
         async def async_wrapper(*args: object, **kwargs: object) -> T:
             with job_run():

@@ -13,7 +13,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-// ── Library availability guard ────────────────────────────────────────────────
+// Library availability guard
 
 let FastenStore, FastenStoreError, libAvailable;
 
@@ -32,7 +32,7 @@ function skip(name, fn) {
   }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Helpers
 
 function makeRow(id, code = 'TEST') {
   return {
@@ -50,14 +50,14 @@ function makeRow(id, code = 'TEST') {
 
 const PG_DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
 
-// ── Version ───────────────────────────────────────────────────────────────────
+// Version
 
 skip('version() returns a non-empty string', () => {
   const v = FastenStore.version();
   assert.ok(typeof v === 'string' && v.length > 0, `bad version: ${v}`);
 });
 
-// ── SQLite ────────────────────────────────────────────────────────────────────
+// SQLite
 
 skip('sqlite: open :memory: and ping', () => {
   const store = FastenStore.open('sqlite', ':memory:', 'audit_log');
@@ -76,7 +76,7 @@ skip('sqlite: insert is idempotent', () => {
   const row = makeRow('evt-node-idem-001');
   try {
     store.insert(row);
-    store.insert(row); // INSERT OR IGNORE — no throw
+    store.insert(row); // duplicate id is ignored
   } finally { store.close(); }
 });
 
@@ -121,7 +121,7 @@ skip('unknown backend throws FastenStoreError', () => {
   );
 });
 
-// ── PostgreSQL (skipped without DSN) ──────────────────────────────────────────
+// PostgreSQL (skipped without DSN)
 
 if (PG_DSN) {
   skip('postgres: open and ping', () => {

@@ -19,9 +19,8 @@ pub(crate) unsafe fn read_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 
 /// Write an error message into the caller-provided `*out_err` slot.
 ///
-/// The resulting string is heap-allocated.  The C caller must free it with
-/// `fasten_store_free_str`.  If `out_err` is null the message is silently
-/// discarded — callers that don't care about error text may pass NULL.
+/// The C caller must free the string with `fasten_store_free_str`. If
+/// `out_err` is null the message is dropped.
 ///
 /// # Safety
 /// `out_err`, if non-null, must point to a writable `*mut c_char` slot.
@@ -42,7 +41,7 @@ pub(crate) unsafe fn set_error(out_err: *mut *mut c_char, msg: &str) {
     }
 }
 
-// ── Buffer-based output helpers (no heap allocation, for FFI callers like Node.js) ──
+// Helpers for the `_buf` variants, which write into caller-owned buffers.
 
 /// Write `s` into a caller-provided `[u8; buf_len]` buffer (NUL-terminated).
 ///
@@ -58,7 +57,7 @@ pub(crate) unsafe fn write_to_buf(buf: *mut u8, buf_len: usize, s: &str) -> i32 
     }
     let bytes = s.as_bytes();
     if bytes.len() + 1 > buf_len {
-        // Truncate to fit — caller can detect via return value vs buf_len.
+        // Truncate; the negative return tells the caller.
         let n = buf_len - 1;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
         *buf.add(n) = 0;

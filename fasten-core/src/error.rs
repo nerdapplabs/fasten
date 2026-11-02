@@ -35,7 +35,7 @@ pub enum Error {
     #[error("postgres: {0}")]
     Postgres(#[from] pg::Error),
 
-    // ── Catalog errors ───────────────────────────────────────────────────────
+    // Catalog errors
 
     /// Code key does not match UPPER_SNAKE_CASE (`^[A-Z][A-Z0-9_]*$`).
     #[error(
@@ -67,37 +67,32 @@ pub enum Error {
     DrainerNotInstalled,
 
     /// The DSN requested TLS (`sslmode=require|verify-*`) but this binary
-    /// was built without the `postgres-tls` feature — fail loud rather
-    /// than silently downgrade to plaintext (P1-43).
+    /// was built without the `postgres-tls` feature, so we refuse rather
+    /// than connect in plaintext.
     #[error("{0}")]
     TlsUnavailable(String),
 
-    /// Building the TLS connector itself failed (system CA store missing,
-    /// bad protocol setting, etc.). Rare, distinct from
-    /// `TlsUnavailable` so it doesn't get misread as a config error.
+    /// Building the TLS connector failed (missing system CA store, bad
+    /// protocol setting). Kept separate from `TlsUnavailable`, which is a
+    /// config error.
     #[error("tls connector build failed: {0}")]
     TlsConnector(String),
 
     /// A host-language insert callback (installed via
-    /// `fasten_store_open_callback`) returned a non-zero rc. The actual
-    /// exception lives on the host side; this variant carries only the
-    /// rc so log lines aren't misattributed (issue #36 — previously
-    /// reported as `InvalidTableName("insert callback rc=1")`).
+    /// `fasten_store_from_callback`) returned a non-zero rc. The details
+    /// are on the host side; this only carries the rc.
     #[error("insert callback returned non-zero rc={0}")]
     CallbackFailed(i32),
 }
 
-// When neither sqlite nor postgres feature is active, the #[from] impls above
-// are absent but Error still compiles; callers get UnknownBackend at runtime.
+// Without the sqlite or postgres feature the backend variants are absent and
+// opening that backend returns UnknownBackend.
 
 /// Typed error codes returned by all `fasten_*` C ABI functions.
 ///
-/// C callers compare the return value to `FASTEN_OK` (== 0) for success.
-/// Non-zero values indicate the error category; the `out_err` string provides
-/// the human-readable detail.
-///
-/// The discriminant values are stable across library versions; new variants
-/// will only ever be added with new values (never renumbering existing ones).
+/// `FASTEN_OK` (0) is success; other values give the error category and
+/// `out_err` the message. Values are stable: new variants get new numbers
+/// and existing ones are never renumbered.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastenErrorCode {

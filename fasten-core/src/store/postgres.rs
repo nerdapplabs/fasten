@@ -11,16 +11,9 @@ use crate::{
 
 use super::Store;
 
-// ── Connection holder ─────────────────────────────────────────────────────────
-//
-// Holds the live connection + the pre-prepared INSERT statement.  When the
-// connection is lost, the entire Inner is replaced via `reconnect`.
-//
-// Why prepared statements at all?  On PG 15+ with pg_stat_statements enabled,
-// named prepared statements appear in pg_prepared_statements and their query
-// text is fingerprinted, giving free per-query stats without any tracing.  For
-// high-frequency audit logging (~1 k rows/s per service) the repeated parse +
-// plan step is worth eliminating.
+// The live connection and its prepared INSERT. When the connection is lost,
+// `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
+// connection so hot audit paths skip the parse and plan step.
 
 struct Inner {
     client: pg::Client,
@@ -29,20 +22,15 @@ struct Inner {
 
 impl Inner {
     fn connect(dsn: &str, insert_sql: &str) -> Result<Self, Error> {
-        // Pure-Rust wire protocol; no libpq, no C dependency.
         let mut client = connect_client(dsn)?;
         let stmt = client.prepare(insert_sql)?;
         Ok(Self { client, stmt })
     }
 }
 
-// ── Connector selection ─────────────────────────────────────────────────────
-//
-// `postgres-tls` feature ON  → native-tls connector, honours sslmode=require.
-// `postgres-tls` feature OFF → NoTls; a DSN with sslmode=require|verify-* is
-// refused up-front rather than being silently downgraded to plaintext (the
-// exact fault P1-43 documents — the DSN said TLS, the client type was NoTls,
-// negotiation completed in clear and no error was raised).
+// With `postgres-tls`, connect through native-tls so sslmode=require is
+// honoured. Without it, connect with NoTls and refuse a DSN that asks for
+// TLS (sslmode=require|verify-*) instead of connecting in plaintext.
 
 #[cfg(feature = "postgres-tls")]
 fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
@@ -61,7 +49,7 @@ fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
              fasten-core was built without the `postgres-tls` feature. \
              Rebuild with `--features postgres-tls` (on by default), or \
              remove the sslmode param to accept plaintext explicitly. \
-             NOTE: use `sslmode=require` — the driver accepts only \
+             NOTE: use `sslmode=require`: the driver accepts only \
              disable|prefer|require, and `require` with native-tls already \
              verifies the certificate chain AND the hostname."
                 .to_string(),
@@ -70,24 +58,19 @@ fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
     Ok(pg::Client::connect(dsn, pg::NoTls)?)
 }
 
-// requires_tls: crude DSN scan for sslmode requesting encryption. Matches
-// libpq's rule set — the three sslmode values that MUST fail if TLS isn't
-// available are `require`, `verify-ca`, `verify-full` (`prefer` allows
-// fallback, `allow` allows fallback, `disable` is explicit plaintext).
+// True if the DSN's sslmode requires encryption. As in libpq, those are
+// `require`, `verify-ca` and `verify-full`; `prefer` and `allow` may fall back
+// and `disable` is plaintext.
 //
-// IMPORTANT, and the reason this list differs from what you should WRITE in a
-// DSN: tokio-postgres's Config parser accepts only `disable | prefer |
-// require`. `verify-ca` / `verify-full` are REJECTED at connect time. We still
-// match them here so a DSN carrying one fails closed rather than silently
-// connecting in plaintext — but the value to document and use is `require`,
-// which with native-tls already verifies both the certificate chain and the
-// hostname. Recommending verify-* leads users to a connect error they then
-// "fix" by dropping to `prefer`, which is exactly the plaintext fallback
-// P1-43 closed.
-// #[allow(dead_code)]: only the `#[cfg(not(feature = "postgres-tls"))]`
-// arm of connect_client calls this at runtime; the test module below
-// exercises it under every feature set so the sslmode semantics don't
-// silently drift.
+// The driver's config parser accepts only `disable | prefer | require` and
+// rejects `verify-*` at connect time. We still match `verify-*` here so such
+// a DSN fails closed, but `require` is the value to document: with native-tls
+// it already verifies the certificate chain and the hostname. Pointing users
+// at `verify-*` gets them a connect error they tend to "fix" with `prefer`,
+// which allows plaintext.
+//
+// Only the non-TLS connect_client calls this; tests cover it under every
+// feature set, hence allow(dead_code).
 #[allow(dead_code)]
 fn requires_tls(dsn: &str) -> bool {
     // Cover both URL form (?sslmode=require) and keyword form (sslmode=require).
@@ -105,10 +88,9 @@ fn requires_tls(dsn: &str) -> bool {
 #[cfg(test)]
 mod tls_tests {
     use super::requires_tls;
-    /// The driver accepts only disable|prefer|require. verify-ca/verify-full
-    /// are rejected at connect time, so they must never be RECOMMENDED even
-    /// though requires_tls() matches them (fail-closed). Pins the documented
-    /// value so the guidance can't drift back.
+    /// The driver accepts only disable|prefer|require and rejects
+    /// verify-ca/verify-full at connect time, so `require` is the documented
+    /// value; requires_tls() still matches verify-* so they fail closed.
     #[test]
     fn documented_strict_sslmode_is_require() {
         assert!(requires_tls("host=db user=x sslmode=require"));
@@ -140,8 +122,6 @@ mod tls_tests {
     }
 }
 
-// ── PostgresStore ─────────────────────────────────────────────────────────────
-
 pub struct PostgresStore {
     inner: Mutex<Inner>,
     table: String,
@@ -162,21 +142,18 @@ impl PostgresStore {
     /// qualified), create the audit table + indexes, and prepare the INSERT
     /// statement.
     ///
-    /// `dsn`   — libpq-style connection string or `postgresql://` URI.
-    ///           TLS: use `sslmode=require` in the DSN. The driver rejects
-    ///           `verify-ca`/`verify-full`; `require` + native-tls already
-    ///           verifies the chain and the hostname.
-    ///           actually negotiates TLS when the crate is built with the
-    ///           `postgres-tls` feature (ON by default). Without that
-    ///           feature the connect **fails loudly** rather than silently
-    ///           downgrading to plaintext — the P1-43 fault, where the docs
-    ///           described a protection the code did not deliver.
-    ///           For read-only replicas, add `target_session_attrs=read-write`
-    ///           so the driver rejects replica endpoints automatically.
+    /// `dsn`:   libpq-style connection string or `postgresql://` URI.
+    ///           For TLS use `sslmode=require`; the driver rejects
+    ///           `verify-ca`/`verify-full`, and `require` with native-tls
+    ///           already verifies the chain and the hostname. TLS needs the
+    ///           `postgres-tls` feature (on by default); without it a DSN
+    ///           that asks for TLS fails to connect.
+    ///           Add `target_session_attrs=read-write` to have the driver
+    ///           reject read-only replica endpoints.
     ///           Example: `"host=db.prod.example.com user=audit dbname=audit
     ///                      sslmode=require application_name=fasten_core"`
     ///
-    /// `table` — plain name (`"audit_log"`) or schema-qualified
+    /// `table`: plain name (`"audit_log"`) or schema-qualified
     ///           (`"audit.audit_log"`).  Both parts must match
     ///           `[A-Za-z_][A-Za-z0-9_]*`.
     pub fn connect(dsn: &str, table: &str) -> Result<Self, Error> {
@@ -201,8 +178,8 @@ impl PostgresStore {
         })
     }
 
-    /// Run `f` against the live connection; reconnect once on a closed
-    /// connection and retry.  Removes the per-method reconnect boilerplate.
+    /// Run `f` against the live connection; if the connection is closed,
+    /// reconnect once and retry.
     fn with_reconnect<F, R>(&self, f: F) -> Result<R, Error>
     where
         F: Fn(&mut Inner) -> Result<R, Error>,
@@ -408,8 +385,6 @@ impl Store for PostgresStore {
     }
 }
 
-// ── Schema bootstrap ──────────────────────────────────────────────────────────
-
 fn pg_exec(client: &mut pg::Client, sql: &str) -> Result<(), Error> {
     client.execute(sql, &[]).map(|_| ()).map_err(Error::Postgres)
 }
@@ -465,8 +440,6 @@ fn migrate(
 
     Ok(())
 }
-
-// ── SQL builders ──────────────────────────────────────────────────────────────
 
 fn build_insert_sql(table: &str) -> String {
     format!(
@@ -528,8 +501,6 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<(dyn ToSql + Sync)>>) {
     (clause, params)
 }
 
-// ── Row mapper ────────────────────────────────────────────────────────────────
-
 fn row_from_pg(r: &pg::Row) -> Row {
     let detail_str: String = r.get(18);
     let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
@@ -560,8 +531,6 @@ fn row_from_pg(r: &pg::Row) -> Row {
         ..Default::default()
     }
 }
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

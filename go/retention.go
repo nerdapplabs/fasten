@@ -9,28 +9,18 @@ import (
 	"time"
 )
 
-// FR1 retention (spec §1) — background age-based purge for stream stores.
-//
-// The stream stores already expose Purge(before string) (age-based delete
-// backed by idx_{table}_ts). This file is the driver: a goroutine per
-// configured stream that wakes on a ticker, computes cutoff = now - retention,
-// and calls Purge. Errors are logged via drainerSysLog and the loop keeps
-// running so a transient database blip doesn't stop future purges.
-//
-// Shutdown is cooperative: the caller-owned context.CancelFunc must fire
-// on Engine reset / atexit.
+// Retention (spec §1): one goroutine per configured stream wakes on a ticker
+// and purges rows older than the retention window. Errors are reported and
+// the loop keeps going. Cancel the context to stop it.
 
-// parseRetentionDuration accepts a single positive integer + one unit
-// suffix from {s, m, h, d} — matching the Python parser in
-// python/fasten/retention.py verbatim so FASTEN_RETENTION_API=<value>
-// means the same thing on both SDKs. Empty = disabled. Compound
-// forms ("2h30m", "1d12h") and fractional forms ("1.5h") are rejected
-// deliberately; pass a single-unit value ("150m", "36h").
 var _retentionUnits = map[byte]time.Duration{
 	's': time.Second, 'm': time.Minute,
 	'h': time.Hour, 'd': 24 * time.Hour,
 }
 
+// parseRetentionDuration accepts a positive integer and one unit from
+// s, m, h, d (e.g. "7d", "36h"), the same as the Python SDK. Empty means
+// disabled. Compound ("2h30m") and fractional ("1.5h") values are rejected.
 func parseRetentionDuration(s string) (time.Duration, error) {
 	token := strings.TrimSpace(s)
 	if token == "" {
@@ -53,36 +43,30 @@ func parseRetentionDuration(s string) (time.Duration, error) {
 	return time.Duration(n) * unit, nil
 }
 
-// retentionParams is what the engine hands to startPurger: the wired stream,
-// its store, the retention window, and the tick interval. checkInterval is
-// injected so tests don't have to wait an hour to see the second tick.
+// retentionParams configures startPurger for one stream. checkInterval is
+// settable so tests don't wait an hour.
 type retentionParams struct {
 	stream string
-	// store/retention drive the age purge. Both zero/nil for the audit
-	// stream, which is redaction-only: deleting a row from a hash-chained
-	// stream is what VerifyChain reports as tampering (spec §7.1).
+	// store and retention drive the age purge. Both are unset for the audit
+	// stream: deleting from a hash chain shows up as tampering (spec §7.1),
+	// so audit rows are only redacted.
 	store     StreamRepository
 	retention time.Duration
-	// piiRetention/redactFn drive the PII horizon. redactFn is
-	// Engine.RedactExpired, so the spec §7.2 event is written — the store
-	// methods alone destroy the data and record nothing.
+	// redactFn is Engine.RedactExpired, which also writes the spec §7.2
+	// event that the store methods alone don't.
 	piiRetention  time.Duration
 	redactFn      func(ctx context.Context, before time.Time) error
 	checkInterval time.Duration
-	// nowFn injects a fixed clock for tests. Nil defaults to time.Now.
+	// nowFn defaults to time.Now.
 	nowFn func() time.Time
-	// onError is called after every failed Purge so the engine can pipe the
-	// miss through drainerSysLog. Nil is fine (drop).
+	// onError, if set, is called after each failed purge or redaction.
 	onError func(stream string, err error)
 }
 
-// startPurger spawns a goroutine that runs an age-based purge on p.store
-// every p.checkInterval. Returns immediately; the caller cancels via ctx.
-// The first purge runs on entry (no waiting a full interval), so operators
-// see the effect on Init rather than an hour later. wg (nil-safe) lets the
-// caller Wait for the goroutine to actually exit after cancel — required
-// because Engine fields the onError callback reads (via drainerSysLog) are
-// swapped by the next Init, and cancel alone doesn't bound exit timing.
+// startPurger runs the purge once right away and then every checkInterval
+// until ctx is cancelled. If wg is non-nil the caller can Wait for the
+// goroutine to exit; the next Init needs that because onError reads Engine
+// fields that Init replaces.
 func startPurger(ctx context.Context, wg *sync.WaitGroup, p retentionParams) {
 	if p.checkInterval <= 0 {
 		p.checkInterval = time.Hour
@@ -97,9 +81,8 @@ func startPurger(ctx context.Context, wg *sync.WaitGroup, p retentionParams) {
 		if wg != nil {
 			defer wg.Done()
 		}
-		// tick immediately, then every checkInterval
-		// Two horizons, two labels. One shared path would let a redaction
-		// failure skip the age purge, and report both the same way.
+		// Redaction and age purge run and report separately, so a redaction
+		// failure doesn't skip the purge.
 		fire := func() {
 			now := p.nowFn()
 			if p.piiRetention > 0 && p.redactFn != nil {
