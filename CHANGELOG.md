@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed — Python stores on a table the Go SDK created
+
+- Rows without a salt (unsealed, or form "1") now store an empty
+  `detail_salt` and `detail_commitment` instead of SQL NULL. Go creates both
+  columns `NOT NULL`, so on Postgres these inserts failed, and on SQLite
+  `INSERT OR IGNORE` dropped the row without an error. Both stores read an
+  empty value back as `None`, so rows read the same as before.
+- The Postgres store selects its columns by name instead of `SELECT *`. Go's
+  table orders them differently, so reads on it read the wrong column for
+  most fields.
+- The Postgres store reads Go's `TIMESTAMPTZ` timestamp and `shipped_at`
+  columns, and `sources()` returns them in the canonical form.
+
 ### Changed — Python and Go redact unsealed rows (spec §7.1)
 
 - PII redaction now covers unsealed rows (an empty `hash`) as well as form
