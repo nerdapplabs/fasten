@@ -1,7 +1,8 @@
 #pragma once
 /**
- * fasten.hpp — C++14 audit + correlation SDK.
- * Single-header, zero external dependencies.
+ * fasten.hpp: C++14 audit and correlation SDK.
+ * Header-only; redaction, the code catalog and the audit queue live in
+ * libfasten_core, so link with -lfasten_core.
  *
  * Usage:
  *   fasten::register_codes("node", {
@@ -12,7 +13,7 @@
  *   });
  *   fasten::init({"my-service", "edge-01"});
  *
- *   // RAII scope — all emit/log inside inherit this request_id.
+ *   // emit() and log calls inside this scope use this request_id.
  *   fasten::RequestScope scope("req-a1b2c3");
  *
  *   fasten::emit("CONN_UP",
@@ -47,11 +48,9 @@
 #include <unordered_map>
 #include <vector>
 
-// ── libfasten_core C ABI ─────────────────────────────────────────────
-// Forward-declare the Rust shared library functions so fasten.hpp stays
-// self-contained. Link with -lfasten_core at build time.
+// libfasten_core C ABI, declared here so no extra header is needed.
 extern "C" {
-    // All catalog + redaction functions return int32_t (0 = OK).
+    // Functions returning int32_t return 0 on success.
     int32_t fasten_redact(
         const char* in_json, char** out_json, char** out_err);
     int32_t fasten_redact_full(
@@ -67,7 +66,7 @@ extern "C" {
     void fasten_registry_clear(void);
     void fasten_store_free_str(char* s);
 
-    // Opaque store + drainer handle (shared fasten-core C ABI)
+    // Opaque store and queue drainer handle.
     typedef int32_t (*FastenInsertCallbackFn)(const char* row_json, void* userdata);
     struct FastenStore;
     struct FastenStore* fasten_store_from_callback(
@@ -89,10 +88,7 @@ extern "C" {
 
 namespace fasten {
 
-// ── Types ──────────────────────────────────────────────────────────────────
-
-// Domain is a plain string — adopters define their own vocabulary.
-// Examples: "node", "user", "billing", "device" — fasten has no opinions.
+// Domain is any string the application chooses, e.g. "node" or "billing".
 using Domain = std::string;
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
@@ -143,9 +139,8 @@ constexpr const char* kRedactReplacement = "***";
 using Fields = std::unordered_map<std::string, std::string>;
 
 struct Meta {
-    // `id` is optional in adopter code — `register_codes()` fills it from
-    // the registry key. Setting `id` explicitly is allowed but must match
-    // the key (mismatch is a typo, never a feature).
+    // Optional; register_codes() fills it from the key. If set, it must
+    // match the key.
     std::string id;
     Domain      domain;
     std::string category;
@@ -156,12 +151,10 @@ struct Meta {
     Retention   retention_class = Retention::Medium;
     bool        high_volume     = false;
     bool        pii_in_detail   = false;
-    // P1-5: detail keys that survive force-redact when pii_in_detail=true.
-    // Each surviving value still passes through the secret-key redactor.
+    // With pii_in_detail, only these detail keys are kept; their values
+    // still go through the normal redactor.
     std::vector<std::string> detail_passthrough_keys;
 };
-
-// ── Row ────────────────────────────────────────────────────────────────────
 
 struct Row {
     std::string wire_version     = "1";  // wire schema version; readers tolerate higher values
@@ -186,12 +179,9 @@ struct Row {
     bool        pii_in_detail   = false;
     std::string shipped_at;          // empty = not shipped
 
-    // Declared here, defined after detail_ helpers below.
     std::string to_json() const;
     std::string to_cloud_event_json() const;
 };
-
-// ── Exceptions ─────────────────────────────────────────────────────────────
 
 struct AuditCatalogError : std::runtime_error {
     explicit AuditCatalogError(const std::string& msg)
@@ -202,8 +192,6 @@ struct InitError : std::runtime_error {
     explicit InitError(const std::string& msg)
         : std::runtime_error("fasten: " + msg) {}
 };
-
-// ── Internal helpers ───────────────────────────────────────────────────────
 
 namespace detail_ {
 
@@ -242,11 +230,8 @@ inline std::string json_str(const std::string& s) {
     return out;
 }
 
-// Serialize Fields to a JSON object — keys sorted for deterministic output.
-//
-// `_pii_in_detail` is the one cross-language P1-5 marker: Fields can only
-// hold strings, but Python/Go/JS/Rust emit it as a JSON boolean. We
-// special-case the wire format here so the NDJSON shape matches.
+// Fields as a JSON object with sorted keys. Fields holds only strings, but
+// `_pii_in_detail` is a boolean on the wire, so it is written as one.
 inline std::string fields_to_json(const Fields& f) {
     std::vector<std::pair<std::string, std::string>> pairs(f.begin(), f.end());
     std::sort(pairs.begin(), pairs.end());
@@ -266,7 +251,7 @@ inline std::string fields_to_json(const Fields& f) {
     return out;
 }
 
-// UTC ISO-8601 with milliseconds — thread-safe (gmtime_r / gmtime_s).
+// UTC ISO-8601 with milliseconds.
 inline std::string now_iso8601() {
     using namespace std::chrono;
     auto now = system_clock::now();
@@ -287,7 +272,7 @@ inline std::string now_iso8601() {
     return buf;
 }
 
-// Hex-random id — `bytes` random bytes → 2*bytes lowercase hex chars.
+// `bytes` random bytes as lowercase hex.
 inline std::string mint_id_bytes(size_t bytes) {
     static std::mutex mu;
     static std::mt19937_64 rng(std::random_device{}());
@@ -303,17 +288,46 @@ inline std::string mint_id_bytes(size_t bytes) {
     return out;
 }
 
-// Per-process redactor config — stored in Globals, configured by init().
-// Redaction logic lives in libfasten_core; we only cache config here.
+// Redaction settings from init(). The redaction itself runs in libfasten_core.
 struct RedactConfig {
     std::vector<std::string> extra_keys;
     std::string              replacement { fasten::kRedactReplacement };
 };
 
-// ── Flat-JSON helpers (used by redact / register_codes) ────────────────────
+// Minimal JSON readers for the flat objects libfasten_core returns. They
+// look keys up by text search and are not general JSON parsers.
 
-// Parse a flat JSON object with string or boolean values back to Fields.
-// Used to round-trip fasten_redact output: {"key":"val","_pii_in_detail":true}
+// Read a string body starting just after its opening quote, unescaping
+// \" \\ \n \r \t. Leaves `i` on the closing quote.
+inline std::string read_json_str(const std::string& j, size_t& i) {
+    std::string val;
+    while (i < j.size() && j[i] != '"') {
+        if (j[i] == '\\' && i + 1 < j.size()) {
+            ++i;
+            switch (j[i]) {
+                case '"':  val += '"';  break;
+                case '\\': val += '\\'; break;
+                case 'n':  val += '\n'; break;
+                case 'r':  val += '\r'; break;
+                case 't':  val += '\t'; break;
+                default:   val += j[i]; break;
+            }
+        } else { val += j[i]; }
+        ++i;
+    }
+    return val;
+}
+
+inline std::string json_extract_str_(const std::string& j, const std::string& k) {
+    std::string needle = "\"" + k + "\":\"";
+    auto pos = j.find(needle);
+    if (pos == std::string::npos) return "";
+    pos += needle.size();
+    return read_json_str(j, pos);
+}
+
+// Parse a flat JSON object with string or boolean values into Fields,
+// e.g. fasten_redact output {"key":"val","_pii_in_detail":true}.
 inline Fields parse_flat_json_fields(const std::string& json) {
     Fields out;
     if (json.size() < 2) return out;
@@ -328,40 +342,13 @@ inline Fields parse_flat_json_fields(const std::string& json) {
         if (i >= json.size() || json[i] == '}') break;
         if (json[i] != '"') break;
         ++i;
-        std::string key;
-        while (i < json.size() && json[i] != '"') {
-            if (json[i] == '\\' && i + 1 < json.size()) {
-                ++i;
-                switch (json[i]) {
-                    case '"':  key += '"';  break;
-                    case '\\': key += '\\'; break;
-                    case 'n':  key += '\n'; break;
-                    case 'r':  key += '\r'; break;
-                    case 't':  key += '\t'; break;
-                    default:   key += json[i]; break;
-                }
-            } else { key += json[i]; }
-            ++i;
-        }
+        std::string key = read_json_str(json, i);
         if (i < json.size()) ++i; // skip closing '"'
         while (i < json.size() && (json[i] == ' ' || json[i] == ':')) ++i;
         std::string val;
         if (i < json.size() && json[i] == '"') {
             ++i;
-            while (i < json.size() && json[i] != '"') {
-                if (json[i] == '\\' && i + 1 < json.size()) {
-                    ++i;
-                    switch (json[i]) {
-                        case '"':  val += '"';  break;
-                        case '\\': val += '\\'; break;
-                        case 'n':  val += '\n'; break;
-                        case 'r':  val += '\r'; break;
-                        case 't':  val += '\t'; break;
-                        default:   val += json[i]; break;
-                    }
-                } else { val += json[i]; }
-                ++i;
-            }
+            val = read_json_str(json, i);
             if (i < json.size()) ++i; // skip closing '"'
         } else if (i + 4 <= json.size() && json.substr(i, 4) == "true") {
             val = "true"; i += 4;
@@ -411,28 +398,7 @@ inline std::string meta_to_codes_json_entry(
 // Parse a Meta JSON object returned by fasten_meta_of.
 inline Meta parse_meta_json(const std::string& json) {
     Meta m;
-    auto extract_str = [&](const std::string& k) -> std::string {
-        std::string search = "\"" + k + "\":\"";
-        auto pos = json.find(search);
-        if (pos == std::string::npos) return "";
-        pos += search.size();
-        std::string val;
-        while (pos < json.size() && json[pos] != '"') {
-            if (json[pos] == '\\' && pos + 1 < json.size()) {
-                ++pos;
-                switch (json[pos]) {
-                    case '"':  val += '"';  break;
-                    case '\\': val += '\\'; break;
-                    case 'n':  val += '\n'; break;
-                    case 'r':  val += '\r'; break;
-                    case 't':  val += '\t'; break;
-                    default:   val += json[pos]; break;
-                }
-            } else { val += json[pos]; }
-            ++pos;
-        }
-        return val;
-    };
+    auto extract_str = [&](const std::string& k) { return json_extract_str_(json, k); };
     auto extract_bool = [&](const std::string& k) -> bool {
         return json.find("\"" + k + "\":true") != std::string::npos;
     };
@@ -454,7 +420,6 @@ inline Meta parse_meta_json(const std::string& json) {
     else                        m.retention_class = Retention::Medium;
     m.high_volume   = extract_bool("high_volume");
     m.pii_in_detail = extract_bool("pii_in_detail");
-    // Parse detail_passthrough_keys array.
     const std::string ak = "\"detail_passthrough_keys\":[";
     auto pos = json.find(ak);
     if (pos != std::string::npos) {
@@ -472,7 +437,7 @@ inline Meta parse_meta_json(const std::string& json) {
     return m;
 }
 
-// Thread-safe ring buffer (syslog + api streams).
+// Bounded, newest-first buffer behind query_syslog() and query_api().
 struct RingBuffer {
     size_t             max_;
     std::deque<Fields> buf_;
@@ -480,7 +445,6 @@ struct RingBuffer {
 
     explicit RingBuffer(size_t max = 2000) : max_(max) {}
 
-    // Non-copyable — mutex can't be copied.
     RingBuffer(const RingBuffer&) = delete;
     RingBuffer& operator=(const RingBuffer&) = delete;
 
@@ -535,17 +499,14 @@ struct RingBuffer {
 
 }  // namespace detail_
 
-// ── P1-15: audit-store failure handling ───────────────────────────────────
-
-// AuditStoreError is thrown by emit() in raise mode when the audit
-// sink throws. Carries the original message so adopters don't depend
-// on sqlite3 / pqxx types directly.
+// Thrown by emit() in "raise" mode when the audit sink throws. Carries
+// only the original message.
 struct AuditStoreError : std::runtime_error {
     explicit AuditStoreError(const std::string& msg)
         : std::runtime_error("fasten audit store: " + msg) {}
 };
 
-// Snapshot returned by queue_stats(). depth = queued + in-flight.
+// Returned by queue_stats(). depth counts queued and in-flight rows.
 struct QueueStats {
     std::size_t depth                = 0;
     std::size_t capacity             = 0;
@@ -564,31 +525,6 @@ namespace detail_ {
 using SysLog = std::function<void(const std::string&,
                                   const std::string&,
                                   const std::vector<std::pair<std::string, std::string>>&)>;
-
-// ── JSON extraction helpers (used by CFastenDrainer::bridge_) ─────────────
-
-inline std::string json_extract_str_(const std::string& j, const std::string& k) {
-    std::string needle = "\"" + k + "\":\"";
-    auto pos = j.find(needle);
-    if (pos == std::string::npos) return "";
-    pos += needle.size();
-    std::string val;
-    while (pos < j.size() && j[pos] != '"') {
-        if (j[pos] == '\\' && pos + 1 < j.size()) {
-            ++pos;
-            switch (j[pos]) {
-                case '"':  val += '"';  break;
-                case '\\': val += '\\'; break;
-                case 'n':  val += '\n'; break;
-                case 'r':  val += '\r'; break;
-                case 't':  val += '\t'; break;
-                default:   val += j[pos]; break;
-            }
-        } else { val += j[pos]; }
-        ++pos;
-    }
-    return val;
-}
 
 inline int64_t json_extract_int_(const std::string& j, const std::string& k) {
     std::string needle = "\"" + k + "\":";
@@ -671,17 +607,13 @@ inline Row row_from_json_(const std::string& j) {
     return r;
 }
 
-// ── SinkRef: keeps the AuditSink alive while the drainer thread runs ──────
-
+// Keeps the audit sink alive while the drainer thread can call it.
 struct SinkRef {
     std::function<void(const Row&)> sink;
 };
 
-// ── CFastenDrainer: wraps the shared fasten-core C ABI drainer ────────────
-//
-// Same public surface as the retired AuditQueueDrainer so all call sites
-// outside this class require no changes.
-
+// Queue mode: rows go to the libfasten_core drainer, whose background
+// thread calls the sink with retry and backoff.
 class CFastenDrainer {
   public:
     CFastenDrainer(std::function<void(const Row&)> sink,
@@ -785,9 +717,8 @@ class CFastenDrainer {
     std::atomic<bool>    stopped_{false};
 };
 
-// All mutable global state lives in one Meyers-singleton struct.
-// This is the correct pattern for a single-header library — one instance
-// per process regardless of how many translation units include the header.
+// All mutable state. globals() returns one instance per process, however
+// many translation units include this header.
 struct Globals {
     std::mutex                            reg_mu;
     std::unordered_map<std::string, Meta> registry;
@@ -802,26 +733,17 @@ struct Globals {
     RingBuffer syslog_ring;
     RingBuffer api_ring;
 
-    // Adopter-supplied audit sink — called for every emitted Row.
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
 
-    // P1-15: failure-strategy + drainer ownership.
-    std::string                                 failure_strategy{"queue"};
-    std::shared_ptr<CFastenDrainer>          drainer;
-    std::mutex                                  drainer_mu;
+    std::string                     failure_strategy{"queue"};  // "queue" or "raise"
+    std::shared_ptr<CFastenDrainer> drainer;  // null in raise mode or with no sink
+    std::mutex                      drainer_mu;
 
-    // Redactor config — built by init(), defaults to built-in pattern + "***".
     RedactConfig redact_cfg;
 
-    /// Reset all runtime state for test isolation.
-    ///
-    /// Stops the active drainer (best-effort), clears service config, resets
-    /// seq, clears the audit sink and in-process log rings. Does NOT clear the
-    /// code registry — codes are registered once at startup.
-    ///
-    /// Mirrors `reset_for_tests()` / `ResetForTests()` / `resetForTests()` in
-    /// Python / Go / JS / Rust.
+    // Reset runtime state between tests: stops the drainer and clears config,
+    // seq, the audit sink and the log rings. The code registry is kept.
     void reset_for_tests() {
         {
             std::lock_guard<std::mutex> lk(drainer_mu);
@@ -847,14 +769,13 @@ inline Globals& globals() {
     return g;
 }
 
-// Thread-local request_id — function-local thread_local is ODR-safe in C++14.
+// Function-local so every translation unit shares the same thread_local.
 inline std::string& tl_request_id() {
     thread_local std::string rid;
     return rid;
 }
 
-// ── Redaction via libfasten_core ────────────────────────────────────
-// Delegates all key-pattern + value-shape logic to the shared Rust engine.
+// Redact detail fields through libfasten_core.
 inline Fields redact(const Fields& f) {
     if (f.empty()) return f;
     const auto& cfg = globals().redact_cfg;
@@ -866,7 +787,6 @@ inline Fields redact(const Fields& f) {
         (cfg.replacement.empty() || cfg.replacement == fasten::kRedactReplacement)) {
         rc = fasten_redact(in_json.c_str(), &out_json, &out_err);
     } else {
-        // Build extra_keys JSON array.
         std::string ek = "[";
         bool first = true;
         for (const auto& k : cfg.extra_keys) {
@@ -892,8 +812,6 @@ inline Fields redact(const Fields& f) {
 }
 
 } // namespace detail_
-
-// ── Row serialisation (needs detail_ helpers) ──────────────────────────────
 
 inline std::string Row::to_json() const {
     std::string js = "{";
@@ -926,7 +844,8 @@ inline std::string Row::to_json() const {
 }
 
 inline std::string Row::to_cloud_event_json() const {
-    // CloudEvent 1.0 — id / source / type / time / data.
+    // CloudEvents 1.0 envelope. `data` holds detail plus actor, target,
+    // method, request_id and pii_in_detail.
     std::string data = "{";
     bool first = true;
     for (auto& kv : detail) {
@@ -945,8 +864,7 @@ inline std::string Row::to_cloud_event_json() const {
     data += ",\"target\":"        + detail_::json_str(target);
     data += ",\"method\":"        + detail_::json_str(method);
     data += ",\"request_id\":"    + detail_::json_str(request_id);
-    // Row-level PII flag — downstream consumers route on this for
-    // retention + access-control before opening `data`.
+    // Lets consumers apply retention and access rules without reading detail.
     data += ",\"pii_in_detail\":";
     data += (pii_in_detail ? "true" : "false");
     data += "}";
@@ -962,17 +880,13 @@ inline std::string Row::to_cloud_event_json() const {
     return js;
 }
 
-// ── Registry ───────────────────────────────────────────────────────────────
-
 namespace detail_ {
 
-// Shared core of register_codes: build JSON, call Rust, populate C++ cache.
+// Validate and register in libfasten_core, then cache the stored Meta here.
 template<typename CodesRange>
 inline void register_codes_impl(
     const Domain& domain, const CodesRange& codes)
 {
-    // Emit pii_in_detail warning before delegating to Rust (test expects
-    // the warning to appear on stderr during the register_codes() call).
     for (const auto& kv : codes) {
         if (kv.second.pii_in_detail &&
             kv.second.retention_class != Retention::Short) {
@@ -982,7 +896,6 @@ inline void register_codes_impl(
         }
     }
 
-    // Serialize codes to JSON for Rust validation + registration.
     std::string codes_json = "{";
     bool first = true;
     for (const auto& kv : codes) {
@@ -1003,8 +916,8 @@ inline void register_codes_impl(
     }
     if (rc != 0) throw AuditCatalogError(err_msg.empty() ? "register_codes failed" : err_msg);
 
-    // Populate C++ registry cache from canonical Rust meta (includes forced
-    // retention_class=short, filled id, etc.).
+    // Read back what the core stored (id filled in, retention forced to
+    // short for pii_in_detail codes).
     auto& g = globals();
     std::lock_guard<std::mutex> lk(g.reg_mu);
     for (const auto& kv : codes) {
@@ -1029,7 +942,7 @@ inline void register_codes(
     detail_::register_codes_impl(domain, codes);
 }
 
-// Overload for std::vector — allows runtime-built code tables.
+// For code tables built at runtime.
 inline void register_codes(
     const Domain& domain,
     const std::vector<std::pair<std::string, Meta>>& codes)
@@ -1044,7 +957,7 @@ inline std::unordered_map<std::string, Meta> registry() {
     return g.registry;
 }
 
-// "id,domain,severity\n..." sorted — feeds cross-language consistency gate.
+// The catalog as sorted "id,domain,severity" lines, for comparing catalogs.
 inline std::string dump() {
     auto reg = registry();
     std::vector<std::tuple<std::string, std::string, std::string>> rows;
@@ -1062,52 +975,32 @@ inline std::string dump() {
     return out;
 }
 
-// ── Engine ─────────────────────────────────────────────────────────────────
-//
-// Engine holds all mutable runtime state for one fasten deployment context.
-// The free-function API (init, emit, ...) delegates to the default_engine()
-// singleton. Applications needing multiple isolated fasten contexts in one
-// process can create additional Engine instances.
-//
-// For test isolation, call:
-//   fasten::default_engine().reset_for_tests();
-//
-// The code registry (register_codes) is global and is NOT reset by
-// reset_for_tests() — mirrors Python / Go / JS / Rust behaviour.
-
+// The process-wide state that init(), emit() and the other free functions
+// use. Tests call fasten::default_engine().reset_for_tests() between cases.
 using Engine = detail_::Globals;
 
 inline Engine& default_engine() { return detail_::globals(); }
-
-// ── Init ───────────────────────────────────────────────────────────────────
 
 struct Config {
     std::string              service_id;
     std::string              node_id;
     std::string              tenant_id;           // optional
 
-    // Redaction — both are additive to / override the built-in defaults.
-    std::vector<std::string> extra_redact_keys;   // appended to built-in pattern
+    std::vector<std::string> extra_redact_keys;   // added to the built-in patterns; env FASTEN_REDACT_KEYS
     std::string              redact_replacement;  // default "***"; env FASTEN_REDACT_REPLACEMENT
 
-    // P1-15: audit-store failure handling.
-    //
-    // "queue" (default) — emit() pushes rows onto a bounded in-memory
-    //   queue and returns immediately. A background thread invokes the
-    //   audit sink with exponential backoff on exception.
-    // "raise" — emit() invokes the sink synchronously and rethrows as
-    //   AuditStoreError on exception. Useful for tests / dev mode.
-    //
-    // Empty falls back to env FASTEN_AUDIT_STORE_FAILURE_STRATEGY.
-    std::string              audit_store_failure_strategy;  // "queue" | "raise"
+    // "queue" (default): emit() queues the row and a background thread calls
+    //   the audit sink, retrying with exponential backoff if it throws.
+    // "raise": emit() calls the sink directly and throws AuditStoreError if
+    //   it fails.
+    // Empty means env FASTEN_AUDIT_STORE_FAILURE_STRATEGY, then "queue".
+    std::string              audit_store_failure_strategy;
     std::size_t              queue_capacity        = 100;   // queued + in-flight
     int                      queue_retry_initial_ms = 100;
     int                      queue_retry_max_ms     = 60000;
     bool                     disable_queue_jitter   = false; // false = jitter ON
 };
 
-// Forward declaration — defined below set_audit_sink so it can read
-// the active sink. P1-15.
 inline void install_drainer_(const Config& cfg);
 
 inline void init(Config cfg = {}) {
@@ -1124,7 +1017,7 @@ inline void init(Config cfg = {}) {
     if (!cfg.extra_redact_keys.empty()) {
         g.redact_cfg.extra_keys = cfg.extra_redact_keys;
     } else {
-        // env FASTEN_REDACT_KEYS (comma-separated), parity with the other SDKs.
+        // Comma-separated, whitespace trimmed.
         std::string env_keys = env_or("FASTEN_REDACT_KEYS", "");
         if (!env_keys.empty()) {
             std::stringstream ss(env_keys);
@@ -1140,7 +1033,6 @@ inline void init(Config cfg = {}) {
         ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
 
-    // P1-15: failure-strategy + drainer wiring.
     std::string strategy = cfg.audit_store_failure_strategy;
     if (strategy.empty()) strategy = env_or("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", "queue");
     if (strategy != "queue" && strategy != "raise") {
@@ -1150,8 +1042,7 @@ inline void init(Config cfg = {}) {
     install_drainer_(cfg);
 }
 
-// Convenience overload — positional args for the common case.
-// Extra redact config can still be set via init(Config{...}).
+// Shorthand for init(Config{...}) with only the ids set.
 inline void init(std::string service_id,
                  std::string node_id,
                  std::string tenant_id = "") {
@@ -1162,11 +1053,10 @@ inline void init(std::string service_id,
     init(std::move(cfg));
 }
 
-// ── Audit sink ─────────────────────────────────────────────────────────────
-
-// Register a callback invoked for every emitted Row.
-// Use this to persist rows to SQLite, PostgreSQL, or any durable store.
-// The callback is called on the emitting thread — keep it fast or dispatch.
+// Called with every emitted Row, e.g. to write it to SQLite or PostgreSQL.
+// In queue mode the drainer thread calls the sink that was set when init()
+// ran; if none was, emit() calls the current sink directly and
+// reports its failures as sys events instead of throwing.
 using AuditSink = std::function<void(const Row&)>;
 
 inline void set_audit_sink(AuditSink sink) {
@@ -1175,17 +1065,15 @@ inline void set_audit_sink(AuditSink sink) {
     g.audit_sink = std::move(sink);
 }
 
-// ── P1-15: drainer install + public surface ────────────────────────────────
-
 namespace detail_ {
 
-inline void drainer_sys_log(const std::string& level,
-                            const std::string& event,
-                            const std::vector<std::pair<std::string, std::string>>& fields) {
-    // Non-recursive: writes a {shape:"sys"} NDJSON line to stderr +
-    // pushes to the sys ring. Never recurses through the sink.
-    // stderr is mandatory: a slow stdout consumer stalls the drainer thread
-    // if self-reports share the wire stream (stdout backpressure deadlock).
+// Write a {"shape":"sys"} NDJSON line to `out` and add it to the sys ring.
+// `fields` is written as given; callers redact first if needed.
+template <typename KeyValues>
+inline void write_sys_line(std::ostream& out,
+                           const std::string& level,
+                           const std::string& event,
+                           const KeyValues& fields) {
     auto& g = globals();
     Fields ring_row;
     std::string js = "{\"shape\":\"sys\"";
@@ -1203,22 +1091,23 @@ inline void drainer_sys_log(const std::string& level,
     ring_row["event"]      = event;
     ring_row["request_id"] = tl_request_id();
     g.syslog_ring.push(std::move(ring_row));
-    std::cerr << js << std::flush;
+    out << js << std::flush;
+}
+
+// SDK self-reports go to stderr so a slow stdout reader can't stall them.
+inline void drainer_sys_log(const std::string& level,
+                            const std::string& event,
+                            const std::vector<std::pair<std::string, std::string>>& fields) {
+    write_sys_line(std::cerr, level, event, fields);
 }
 
 }  // namespace detail_
 
 inline void install_drainer_(const Config& cfg) {
     auto& g = detail_::globals();
-    // Race-safe re-init: build the new drainer first, swap the global
-    // under lock, then flush + shutdown the old OUTSIDE the lock.
-    // Holding drainer_mu through a 5 s flush + 2 s shutdown would
-    // block every concurrent emit() on the request path.
-    //
-    // Concurrent emit() that snapshotted the old drainer before the
-    // swap and lands a put() after we shutdown self-aborts via the
-    // put() stop check (audit_drain_abandoned sys event) — no silent
-    // loss into a dead queue.
+    // Swap in the new drainer under the lock, then flush and stop the old
+    // one outside it so emit() isn't blocked for up to 7 s. A put() that
+    // reaches the old drainer after shutdown is dropped.
     std::shared_ptr<detail_::CFastenDrainer> next;
     if (g.failure_strategy == "queue") {
         std::function<void(const Row&)> sink_copy;
@@ -1247,9 +1136,8 @@ inline void install_drainer_(const Config& cfg) {
     }
 }
 
-// Snapshot of the active drainer, or nullptr in raise mode (no
-// drainer running). Mirrors Python's queue_stats() / Go's
-// GetQueueStats().
+// Drainer stats, or nullptr when no drainer is running (raise mode, or no
+// sink at init()).
 inline std::unique_ptr<QueueStats> queue_stats() {
     auto& g = detail_::globals();
     std::lock_guard<std::mutex> lk(g.drainer_mu);
@@ -1257,8 +1145,8 @@ inline std::unique_ptr<QueueStats> queue_stats() {
     return std::unique_ptr<QueueStats>(new QueueStats(g.drainer->stats()));
 }
 
-// Block until pending audit rows drain or the timeout elapses.
-// Returns true iff drained. No-op + true in raise mode.
+// Wait until queued audit rows are written or the timeout passes. Returns
+// true if everything drained, and true at once when no drainer is running.
 inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     auto& g = detail_::globals();
     std::shared_ptr<detail_::CFastenDrainer> d;
@@ -1270,14 +1158,10 @@ inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(
     return d->flush(timeout);
 }
 
-// Stop and drop the active drainer. Adopter shutdown paths call this
-// before exiting; init() also calls this internally to swap drainers.
+// Stop the drainer; rows still queued get one last attempt without retries.
+// Afterwards emit() calls the sink directly.
 inline void uninstall_drainer() {
     auto& g = detail_::globals();
-    // Symmetric with install_drainer_: clear the global FIRST under
-    // the mutex so any new emit() sees no drainer and falls through
-    // to its sync path, instead of racing against a half-shutdown
-    // drainer. Then shut down the old one outside the lock.
     std::shared_ptr<detail_::CFastenDrainer> old;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
@@ -1289,15 +1173,13 @@ inline void uninstall_drainer() {
     }
 }
 
-// ── Correlation ────────────────────────────────────────────────────────────
-
-// Mint a new 12-char hex request id.
+// New 12-char hex request id.
 inline std::string mint_id() {
     return detail_::mint_id_bytes(6);
 }
 
-// Set the ambient request id for the current thread.
-// Prefer RequestScope for automatic cleanup.
+// Set the request id for the current thread. RequestScope also restores
+// the previous one.
 inline void set_request_id(const std::string& id) {
     detail_::tl_request_id() = id;
 }
@@ -1306,8 +1188,7 @@ inline std::string current_request_id() {
     return detail_::tl_request_id();
 }
 
-// RAII scope — sets request_id on construction, restores previous on exit.
-// Equivalent to Python's `with with_request_id(rid) as ctx`.
+// Sets the thread's request_id and restores the previous one on exit.
 //
 //   fasten::RequestScope scope;           // mints a new id
 //   fasten::RequestScope scope("req-42"); // uses provided id
@@ -1334,8 +1215,7 @@ struct RequestScope {
         : prev_(std::move(o.prev_)), owns_(o.owns_) { o.owns_ = false; }
 };
 
-// ── Emit option builders ───────────────────────────────────────────────────
-
+// Options for emit(), set with target(), actor(), detail() and method().
 struct EmitOpts {
     std::string target;
     std::string actor      = "system";
@@ -1358,8 +1238,6 @@ inline std::function<void(EmitOpts&)> method(const std::string& m) {
     return [m](EmitOpts& o) { o.method_val = m; };
 }
 
-// ── Emit ───────────────────────────────────────────────────────────────────
-
 template<typename... Opts>
 inline Row emit(const std::string& code, Opts&&... opts) {
     auto& g = detail_::globals();
@@ -1378,7 +1256,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     }
 
     EmitOpts o;
-    // C++14 parameter-pack expansion into dummy array.
+    // Apply each option in order (C++14 has no fold expressions).
     int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
     (void)dummy;
 
@@ -1411,9 +1289,8 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     row.request_id     = rid;
     row.pii_in_detail  = meta.pii_in_detail;
 
-    // P1-5 #2: PII codes force-redact the whole detail. Detail keys listed
-    // in meta.detail_passthrough_keys survive but still pass through the
-    // secret-key redactor. Adopters opt-in by listing keys explicitly.
+    // For pii_in_detail codes only detail_passthrough_keys are kept, and
+    // those still go through the redactor.
     if (meta.pii_in_detail) {
         Fields kept;
         for (const auto& k : meta.detail_passthrough_keys) {
@@ -1427,32 +1304,10 @@ inline Row emit(const std::string& code, Opts&&... opts) {
         row.detail = detail_::redact(o.fields);
     }
 
-    // NDJSON to stdout — Docker log driver captures and rotates.
-    std::cout << "{\"shape\":\"audit\""
-              << ",\"wire_version\":"   << detail_::json_str(row.wire_version)
-              << ",\"id\":"             << detail_::json_str(row.id)
-              << ",\"origin_id\":"      << detail_::json_str(row.origin_id)
-              << ",\"monotonic_seq\":"  << row.monotonic_seq
-              << ",\"timestamp\":"      << detail_::json_str(row.timestamp)
-              << ",\"code\":"           << detail_::json_str(row.code)
-              << ",\"action\":"         << detail_::json_str(row.action)
-              << ",\"severity\":"       << detail_::json_str(row.severity)
-              << ",\"service_id\":"     << detail_::json_str(row.service_id)
-              << ",\"source_node_id\":" << detail_::json_str(row.source_node_id)
-              << ",\"tenant_id\":"      << (row.tenant_id.empty() ? "null" : detail_::json_str(row.tenant_id))
-              << ",\"actor\":"          << detail_::json_str(row.actor)
-              << ",\"actor_kind\":"     << detail_::json_str(row.actor_kind)
-              << ",\"target\":"         << detail_::json_str(row.target)
-              << ",\"category\":"       << detail_::json_str(row.category)
-              << ",\"domain\":"         << detail_::json_str(row.domain)
-              << ",\"method\":"         << detail_::json_str(row.method)
-              << ",\"request_id\":"     << detail_::json_str(row.request_id)
-              << ",\"detail\":"         << detail_::fields_to_json(row.detail)
-              << ",\"pii_in_detail\":"  << (row.pii_in_detail ? "true" : "false")
-              << "}\n" << std::flush;
+    // NDJSON audit line on stdout: the row's JSON with "shape" first.
+    std::cout << "{\"shape\":\"audit\"," << row.to_json().substr(1) << "\n"
+              << std::flush;
 
-    // P1-15: route through the drainer (queue mode) or invoke the
-    // sink synchronously and wrap exceptions (raise mode).
     {
         std::shared_ptr<detail_::CFastenDrainer> drainer_copy;
         {
@@ -1477,12 +1332,8 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                         throw AuditStoreError("unknown exception");
                     }
                 } else {
-                    // Queue strategy but no drainer (sink registered
-                    // after init()) — fall back to sync to avoid
-                    // silently dropping rows. Surface any sink error
-                    // on the sys stream instead of swallowing it; an
-                    // adopter watching `/logs/sys` (or queue_stats())
-                    // sees the failure instead of it vanishing.
+                    // Queue mode with no drainer (no sink at init()): call
+                    // the sink here and report failures as sys events.
                     try {
                         sink_copy(row);
                     } catch (const std::exception& e) {
@@ -1504,8 +1355,7 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     return row;
 }
 
-// ── Ring buffer accessors ──────────────────────────────────────────────────
-
+// Newest-first reads of the in-process log buffers.
 inline std::vector<Fields> query_syslog(
     size_t             limit      = 100,
     const std::string& level      = "",
@@ -1523,36 +1373,14 @@ inline std::vector<Fields> query_api(
     return detail_::globals().api_ring.query(limit, "", request_id, method_str, path);
 }
 
-// ── Structured log ─────────────────────────────────────────────────────────
-
+// Structured logs: redacted {"shape":"sys"} lines on stdout, also kept
+// for query_syslog().
 namespace log {
 
 inline void _write(const std::string& level, const std::string& event,
                    const Fields& fields)
 {
-    auto& g = detail_::globals();
-    auto clean = detail_::redact(fields);
-
-    // Build NDJSON line.
-    std::string js = "{\"shape\":\"sys\"";
-    js += ",\"level\":"      + detail_::json_str(level);
-    js += ",\"event\":"      + detail_::json_str(event);
-    js += ",\"request_id\":" + detail_::json_str(detail_::tl_request_id());
-    js += ",\"service_id\":" + detail_::json_str(g.service_id);
-    js += ",\"timestamp\":"  + detail_::json_str(detail_::now_iso8601());
-    for (auto& kv : clean) {
-        js += ',' + detail_::json_str(kv.first) + ':' + detail_::json_str(kv.second);
-    }
-    js += "}\n";
-
-    // Buffer in ring for /logs/sys.
-    auto row = clean;
-    row["level"]      = level;
-    row["event"]      = event;
-    row["request_id"] = detail_::tl_request_id();
-    g.syslog_ring.push(std::move(row));
-
-    std::cout << js << std::flush;
+    detail_::write_sys_line(std::cout, level, event, detail_::redact(fields));
 }
 
 inline void debug(const std::string& event, const Fields& f = {}) { _write("debug",    event, f); }
@@ -1562,16 +1390,13 @@ inline void error(const std::string& event, const Fields& f = {}) { _write("erro
 
 } // namespace log
 
-// ── Scheduler shim ─────────────────────────────────────────────────────────
-
 namespace scheduler {
 
-// Begin a scheduled-job scope — mints a "scheduler-<hex>" request id.
-// Returns a RequestScope; all emit/log calls in scope inherit the id.
+// Scope for one scheduled job run, with request id run_id or a new
+// "scheduler-<hex>" id.
 //
 //   auto scope = fasten::scheduler::job_run();
 //   fasten::emit("JOB_STARTED", ...);
-//   // scope destructs → previous request_id restored
 inline RequestScope job_run(const std::string& run_id = "") {
     std::string rid = run_id.empty()
         ? "scheduler-" + detail_::mint_id_bytes(4)

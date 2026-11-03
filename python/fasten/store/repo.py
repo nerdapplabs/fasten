@@ -1,8 +1,5 @@
-"""
-AuditRepository + AuditOutboxRepository — the pluggable storage contracts.
-
-Every bundled or adopter-built store implements one of these.
-"""
+"""Storage protocols (AuditRepository, AuditOutboxRepository) and the shared
+replication ingest helpers."""
 from __future__ import annotations
 
 import dataclasses
@@ -15,7 +12,7 @@ from ..chain import verify_chain
 
 @dataclasses.dataclass
 class IngestResult:
-    """Result of ingest_replicated() — how many rows were inserted.
+    """Result of ingest_replicated().
 
     ingest_replicated inserts the longest VERIFIED prefix of the batch (from the
     chain start up to, but not including, the first break) and never raises on a
@@ -34,10 +31,10 @@ class IngestResult:
 
 @runtime_checkable
 class AuditRepository(Protocol):
-    """Long-term audit store — edge (config.db), EM (Postgres), adopter's choice."""
+    """Audit store protocol, implemented by SQLiteStore and PostgresStore."""
 
     def insert(self, row: AuditRow) -> None:
-        """Thin alias for insert_originated — the engine emit/drainer path."""
+        """Same as insert_originated(). Used by the drainer."""
         ...
 
     def insert_originated(self, row: AuditRow) -> None:
@@ -47,7 +44,7 @@ class AuditRepository(Protocol):
     def allocate_and_insert_originated(self, row: AuditRow) -> AuditRow:
         """Allocate monotonic_seq + prev_hash and insert atomically (spec §2.1).
 
-        Returns the SEALED row. Implementations MUST serialise concurrent
+        Returns the sealed row. Implementations must serialise concurrent
         allocations for the same source_node_id, so that N writers on one node
         produce ONE verifiable chain rather than N rows claiming seq 1.
         """
@@ -71,9 +68,7 @@ class AuditRepository(Protocol):
         until: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
-        # Declared because the reader passes it UNCONDITIONALLY (router.py
-        # /logs/audit, /correlate, /search). A third-party store implementing
-        # this Protocol without it raises TypeError on every scoped request.
+        # The reader always passes tenant_id.
         tenant_id: str | None = None,
     ) -> list[AuditRow]: ...
 
@@ -86,9 +81,7 @@ class AuditRepository(Protocol):
         limit: int = 100,
         tenant_id: str | None = None,
     ) -> list[AuditRow]:
-        """Free-text search. Declared because the reader calls it when
-        search is enabled; an undeclared method meant every third-party store
-        either 500'd or silently degraded to "no Search method"."""
+        """Free-text search, used by /search."""
         ...
 
     def count(
@@ -107,7 +100,7 @@ class AuditRepository(Protocol):
         # to this Protocol without it raises TypeError per request.
         tenant_id: str | None = None,
     ) -> int:
-        """Total rows matching the same filter as query() — for pagination."""
+        """Number of rows matching the same filters as query()."""
         ...
 
     def sources(
@@ -116,12 +109,9 @@ class AuditRepository(Protocol):
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> list[dict[str, object]]:
-        """Fleet topology aggregated from stored rows.
-
-        One entry per distinct ``(source_node_id, service_id, tenant_id)``
-        with ``rows``/``first_seen``/``last_seen``. Optional — the reader's
-        /topology route hasattr-guards this, so adopter stores may omit it.
-        """
+        """One entry per ``(source_node_id, service_id, tenant_id)`` with
+        ``rows``, ``first_seen`` and ``last_seen``. Optional; /topology
+        reports an error without it."""
         ...
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]: ...
@@ -145,11 +135,9 @@ class AuditRepository(Protocol):
 
 
 class AuditChainError(RuntimeError):
-    """Raised by ingest_replicated() when the incoming chain fails verification.
-
-    Carries the monotonic_seq of the first broken row so the caller can log /
-    surface exactly where the replicated batch diverged.
-    """
+    """A replicated chain that failed verification, with the monotonic_seq of
+    the first broken row. ingest_replicated() does not raise it; it reports
+    the break in IngestResult."""
 
     def __init__(self, message: str, first_break_at: int | None) -> None:
         super().__init__(message)
@@ -222,7 +210,7 @@ def ingest_replicated_into(store: "AuditRepository", rows: list[AuditRow]) -> In
 
 @runtime_checkable
 class AuditOutboxRepository(Protocol):
-    """Drain-to-remote outbox — edge-sync and similar relay patterns."""
+    """Queue of rows waiting to be sent to another store."""
 
     def enqueue(self, row: AuditRow) -> None: ...
     def next_batch(self, n: int = 100) -> list[AuditRow]: ...

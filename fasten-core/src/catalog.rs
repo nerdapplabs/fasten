@@ -1,7 +1,7 @@
-//! Audit code catalog — typed metadata + per-domain registration.
+//! Audit code catalog: per-code metadata and per-domain registration.
 //!
-//! Mirrors Python `fasten.codes` and Go catalog exactly.
-//! `GLOBAL_REGISTRY` is the singleton used by the C ABI.
+//! Same validation rules as Python `fasten.codes` and the Go catalog.
+//! `GLOBAL_REGISTRY` is the instance the C ABI uses.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -11,13 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 
-// ── UPPER_SNAKE_CASE key validator ────────────────────────────────────────────
-
 #[allow(clippy::expect_used)]
 static CODE_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9_]*$").expect("code key regex is valid"));
-
-// ── Meta ──────────────────────────────────────────────────────────────────────
 
 /// Per-code metadata (wire-schema compatible with the Python SDK).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,8 +48,6 @@ fn default_retention() -> String {
     "medium".to_owned()
 }
 
-// ── CodeRegistry ──────────────────────────────────────────────────────────────
-
 pub struct CodeRegistry {
     store: HashMap<String, Meta>,
 }
@@ -65,12 +59,14 @@ impl CodeRegistry {
 
     /// Register a batch of codes for `domain`.
     ///
-    /// `codes` is a `HashMap<code_key, Meta>`.  Validation mirrors Python:
-    ///   - key must match `UPPER_SNAKE_CASE` (`^[A-Z][A-Z0-9_]*$`)
-    ///   - `Meta.id` empty → filled from key; set → must match key
-    ///   - `Meta.domain` must match `domain`
-    ///   - duplicate key across all prior registrations → error
-    ///   - `pii_in_detail=true` forces `retention_class="short"`
+    /// - key must match `UPPER_SNAKE_CASE` (`^[A-Z][A-Z0-9_]*$`)
+    /// - an empty `Meta.id` is filled from the key; a set one must match it
+    /// - `Meta.domain` must match `domain`
+    /// - a key that is already registered is an error
+    /// - `pii_in_detail=true` forces `retention_class="short"`
+    ///
+    /// Codes are inserted one at a time in HashMap order, so a failure can
+    /// leave an arbitrary part of the batch registered.
     pub fn register(&mut self, domain: &str, codes: HashMap<String, Meta>) -> Result<(), Error> {
         for (name, mut meta) in codes {
             if !CODE_KEY_RE.is_match(&name) {
@@ -108,7 +104,8 @@ impl CodeRegistry {
         self.store.get(code)
     }
 
-    /// `id,domain,severity` sorted one-per-line — feeds cross-language consistency gate.
+    /// `id,domain,severity`, sorted, one per line. Used by the cross-language
+    /// consistency check.
     pub fn dump(&self) -> String {
         let mut rows: Vec<(String, String, String)> = self
             .store
@@ -137,12 +134,8 @@ impl Default for CodeRegistry {
     }
 }
 
-// ── Global singleton ──────────────────────────────────────────────────────────
-
 pub static GLOBAL_REGISTRY: LazyLock<Mutex<CodeRegistry>> =
     LazyLock::new(|| Mutex::new(CodeRegistry::new()));
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

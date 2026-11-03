@@ -1,31 +1,15 @@
-"""
-SQLite-backed per-stream store for the ``api`` and ``sys`` streams (FR1).
+"""SQLite store for the api or sys stream, one table per stream.
 
-Unlike the audit store (typed ``AuditRow`` + tamper-evident hash chain),
-stream rows are schemaless dicts produced by the logging/HTTP shims. We
-persist the full row as a JSON ``payload`` and duplicate the queryable
-fields into indexed columns, so the reader can filter by ``request_id`` /
-time / structured fields against durable history instead of a bounded ring.
+Each row is stored whole as JSON in ``payload``, with the filterable fields
+copied into indexed columns. Reads return the decoded payloads newest first,
+like the ring. Values that are not JSON types come back as their ``str()``.
 
-Table per stream — ``api`` and ``sys`` never share rows. Rows are returned
-newest-first, reconstructed from the stored JSON payload, so a store read is
-equivalent to a ring read in content and ordering. The payload is a JSON
-round-trip (``json.dumps(..., default=str)`` on the way in), so JSON-native
-scalars are preserved but non-JSON values (e.g. ``datetime``) are coerced to
-their ``str()`` form — not type-identical to the original object.
+Every insert commits on the caller's thread. With WAL and
+``synchronous=NORMAL`` that is an append without an fsync, but it is still a
+disk write per row.
 
-Write cost: persistence is write-through — every pushed row is one
-synchronous INSERT + commit on the caller's thread. With WAL +
-``synchronous=NORMAL`` (set on every connection) a commit is a WAL append
-without a per-commit fsync, which keeps a hot api/sys stream viable. Even so
-this is a per-row disk write: for very hot streams prefer ring-only mode, or
-expect stream persistence to grow an async drainer in a later phase (the
-audit path already has one).
-
-Connection handling mirrors ``SQLiteStore``: one connection per thread for
-file-backed stores (WAL — many readers + one writer), and a single
-lock-guarded connection for ``:memory:`` (which cannot be shared across
-connections).
+File databases use one connection per thread; ``:memory:`` uses one shared
+connection behind a lock.
 """
 from __future__ import annotations
 
@@ -39,9 +23,8 @@ from typing import Any
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Columns lifted out of the row for indexed filtering. The rest of the row
-# survives in `payload`. `api` populates method/path/status; `sys` populates
-# level/service_id/event; request_id/timestamp are common to both.
+# Copied out of the row for filtering. api rows set method/path/status, sys
+# rows level/service_id/event.
 _INDEXED_FIELDS = ("request_id", "timestamp", "level", "service_id",
                    "event", "method", "path", "status")
 
@@ -70,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_{table}_sts ON {table}(status);
 
 
 class StreamStore:
-    """Durable, queryable backing for one ring-buffered stream."""
+    """SQLite table backing one stream."""
 
     def __init__(self, path: str, table: str, wal: bool = True) -> None:
         if not _SAFE_IDENTIFIER.match(table):
@@ -85,12 +68,9 @@ class StreamStore:
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
-        # Persist attempts swallowed by the transport. Non-zero means durable
-        # history has holes, so the reader degrades the stream's completeness
-        # flag from "store" to "store-degraded". Sticky for the store's
-        # lifetime: a hole in history doesn't heal when the disk recovers.
-        # Plain int under the GIL — a lost increment can only undercount, and
-        # ``degraded`` only needs "at least one".
+        # Inserts that failed and were dropped by the transport. Any at all
+        # makes the reader report "store-degraded". No lock: a lost increment
+        # only undercounts.
         self._write_failures = 0
         bootstrap = self._connect()
         for stmt in _DDL.format(table=table).split(";"):
@@ -110,13 +90,9 @@ class StreamStore:
             conn.row_factory = sqlite3.Row
             if self._wal:
                 conn.execute("PRAGMA journal_mode=WAL")
-                # The standard WAL pairing, and per-connection (unlike
-                # journal_mode, which persists in the file): commits append to
-                # the WAL without a per-commit fsync. That matters because
-                # insert() runs one commit per pushed row. NORMAL still
-                # guarantees database consistency after a crash; the tail of
-                # unsynced commits may be lost, acceptable for stream rows
-                # (the audit chain has its own store and drainer).
+                # Per connection, unlike journal_mode. No fsync per commit;
+                # a crash can lose the last few rows but not corrupt the
+                # database, which is fine for stream rows.
                 conn.execute("PRAGMA synchronous=NORMAL")
             self._tls.conn = conn
         return conn
@@ -125,7 +101,7 @@ class StreamStore:
         return self._mem_lock if self._is_memory else contextlib.nullcontext()
 
     def insert(self, row: dict[str, Any]) -> None:
-        """Write-through persist of a single stream row. Newest rows sort first."""
+        """Store one row."""
         cols = {f: row.get(f) for f in _INDEXED_FIELDS}
         with self._txn():
             conn = self._connect()
@@ -137,33 +113,27 @@ class StreamStore:
                     cols["request_id"], cols["timestamp"], cols["level"],
                     cols["service_id"], cols["event"], cols["method"],
                     cols["path"], cols["status"],
-                    # ensure_ascii=False keeps non-ASCII characters as UTF-8
-                    # bytes in the JSON payload instead of \uXXXX escapes.
-                    # With escapes, search(q="prüfung") returns zero matches
-                    # against a row containing "prüfung" while the ASCII half
-                    # of the same row matches fine — and Go's json.Marshal
-                    # (the sibling SDK sharing the table) never escapes, so a
-                    # mixed-writer table would return different rows per SDK.
+                    # Keep non-ASCII text unescaped so search() can match it,
+                    # and so rows match what Go's json.Marshal writes.
                     json.dumps(row, default=str, ensure_ascii=False),
                 ),
             )
             conn.commit()
 
     def note_write_failure(self) -> None:
-        """Record that a persist attempt for this store was swallowed. Called
-        by the transport at the swallow point, so callers that handle an
-        insert() error themselves don't mark the store degraded."""
+        """Count a failed insert that was dropped. Called by the transport,
+        not by insert(), so callers handling the error themselves don't mark
+        the store degraded."""
         self._write_failures += 1
 
     @property
     def write_failures(self) -> int:
-        """How many persist attempts were swallowed."""
+        """Number of failed inserts that were dropped."""
         return self._write_failures
 
     @property
     def degraded(self) -> bool:
-        """True when durable history has known holes (at least one swallowed
-        persist failure). Drives the ``store-degraded`` completeness flag."""
+        """True if any insert has failed and been dropped."""
         return self._write_failures > 0
 
     def _build_where(
@@ -179,8 +149,8 @@ class StreamStore:
         since: str | None = None,
         until: str | None = None,
     ) -> tuple[str, list[Any]]:
-        """Shared WHERE for query()/count_matching(): exact-match equality on
-        the indexed columns plus an optional [since, until] timestamp window."""
+        """WHERE clause for query() and count_matching(): exact matches plus an
+        optional [since, until] window."""
         conds: list[str] = []
         params: list[Any] = []
         if level:
@@ -204,11 +174,8 @@ class StreamStore:
         if status is not None:
             conds.append("status = ?")
             params.append(status)
-        # COALESCE so a NULL (timestamp-less) row sorts as "" — matching the
-        # ring, which treats a missing timestamp as empty string. Without this
-        # a NULL row is excluded by `<= until` in SQL but included in the ring.
-        # The window compares lexicographically (as does the ring): correct for
-        # fasten's own canonical UTC timestamps, but mixed formats mis-compare.
+        # A missing timestamp compares as "", as in the ring. Timestamps are
+        # compared as strings, which works for the canonical form only.
         if since:
             conds.append("COALESCE(timestamp, '') >= ?")
             params.append(since)
@@ -232,10 +199,8 @@ class StreamStore:
         since: str | None = None,
         until: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return up to ``limit`` rows newest-first, applying the same
-        exact-match filter semantics as the in-memory ring so store and ring
-        reads agree (and match the Go SDK; every filter — including ``level``
-        — is exact, not case-folded or substring)."""
+        """Up to ``limit`` rows, newest first. Every filter, ``level``
+        included, is an exact match, as in the ring and the Go SDK."""
         where, params = self._build_where(
             level=level, request_id=request_id, service_id=service_id,
             method=method, path=path, event=event, status=status,
@@ -261,9 +226,7 @@ class StreamStore:
         since: str | None = None,
         until: str | None = None,
     ) -> int:
-        """Total rows matching the same filters as query(), without a limit —
-        so a capped read can report how much history it truncated (the
-        /correlate totals)."""
+        """Number of rows matching the same filters as query(), with no limit."""
         where, params = self._build_where(
             level=level, request_id=request_id, service_id=service_id,
             method=method, path=path, event=event, status=status,
@@ -282,27 +245,11 @@ class StreamStore:
             return int(conn.execute(f"SELECT COUNT(*) FROM {self._table}").fetchone()[0])
 
     def purge(self, *, before: "datetime | str") -> int:
-        """Delete rows older than ``before``, returning the number removed.
-        Per-stream retention pruning (FR1): api/sys run 10–100× audit volume, so
-        their history is trimmed by age. Unlike audit, stream rows have no
-        ship/replication lifecycle, so this is an unconditional age-based
-        delete, backed by ``idx_{table}_ts``.
+        """Delete rows older than ``before`` and return how many were deleted.
 
-        Accepts a ``datetime`` or an already-canonical string. ``purge`` is one
-        method name over two store families — the audit stores
-        (``SQLiteStore`` / ``PostgresStore``) declare ``before: datetime``,
-        these stream stores historically declared ``before: str`` — and
-        ``start_purger`` has one call site for both. Taking either here means
-        the caller passes a ``datetime`` uniformly and cannot silently hand the
-        wrong type to the wrong family: that failure surfaced inside the tick,
-        where it was caught and reported, so an age purge that never once
-        succeeded looked like a quiet, healthy loop.
-
-        Rows with a NULL/absent timestamp are never purged (``timestamp < ?`` is
-        never true for NULL) — the age of a timestamp-less row is unknown, so it
-        is kept rather than silently dropped. The comparison is lexicographic,
-        so the cutoff is rendered in the same canonical UTC form as the stored
-        timestamps (spec §4.3)."""
+        ``before`` may be a datetime (as the audit stores take) or a canonical
+        timestamp string. Rows without a timestamp are kept.
+        """
         if not isinstance(before, str):
             from ..canonical_ts import canonical_ts
             before = canonical_ts(before)
@@ -322,18 +269,11 @@ class StreamStore:
         until: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """Case-insensitive substring search over the persisted row text, inside
-        a mandatory ``[since, until]`` window, newest-first, hard-capped.
+        """Case-insensitive substring search of the stored JSON within
+        ``[since, until]``, newest first, at most ``limit`` rows.
 
-        The FR3 escape hatch for "I only have an error string" — deliberately
-        constrained (§4.1): it is a linear ``LIKE`` scan bounded by the ``since``
-        floor and the ``limit`` cap, with **no relevance ranking**. Callers reach
-        it only when structured discovery (indexed fields) can't. ``q`` is
-        matched against the full serialized row (``payload``), which for a sys
-        row is the event name plus its fields — small, unlike a typed audit row.
-
-        ``%`` / ``_`` / ``\\`` in ``q`` are escaped so they match literally
-        rather than acting as LIKE wildcards."""
+        This is a linear ``LIKE`` scan. ``%``, ``_`` and ``\\`` in ``q`` match
+        literally."""
         esc = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         conds = ["COALESCE(timestamp, '') >= ?", "lower(payload) LIKE ? ESCAPE '\\'"]
         params: list[Any] = [since, f"%{esc}%"]
@@ -352,6 +292,6 @@ class StreamStore:
 
     @staticmethod
     def _utc_iso(dt: datetime) -> str:
-        """Canonical UTC form for lex-safe cross-SDK compares (spec §4.3)."""
+        """``dt`` as a canonical timestamp string."""
         from ..canonical_ts import canonical_ts
         return canonical_ts(dt)

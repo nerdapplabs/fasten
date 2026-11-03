@@ -7,14 +7,12 @@ package fasten
 #include <stdlib.h>
 #include <stdint.h>
 
-// Forward declaration so CGo can resolve C.goInsertCallback below.
-// Note: CGo generates char* (not const char*) for *C.char parameters.
+// cgo generates char* (not const char*) for *C.char parameters.
 extern int32_t goInsertCallback(char* row_json, void* userdata);
 extern void goSysLogCallback(char* event_json, void* userdata);
 
-// Pass a cgo.Handle (a uintptr) as the void* userdata. The uintptr->void*
-// cast happens here in C, so the Go side never does unsafe.Pointer(uintptr(...))
-// — which `go vet` flags as a possible misuse of unsafe.Pointer.
+// Passes a cgo.Handle as the void* userdata. Doing the cast in C avoids the
+// unsafe.Pointer(uintptr(...)) conversion that go vet warns about.
 static inline FastenStore* fasten_store_from_handle(
     FastenInsertCallbackFn fn, uintptr_t h, char** out_err) {
     return fasten_store_from_callback(fn, (void*)h, out_err);
@@ -45,13 +43,9 @@ import (
 	"unsafe"
 )
 
-// goInsertCallback is the C-callable insert callback that bridges the shared
-// fasten-core drainer to a Go AuditRepository. userdata is a cgo.Handle for
-// the *cFastenDrainer.
-//
-// Each insert crosses the CGo boundary twice (Go → Rust drainer → C callback → Go store).
-// The ~100 ns/call CGo overhead is acceptable at audit volumes but rules out
-// high-frequency non-audit use of this path.
+// goInsertCallback is called by the fasten-core drainer to insert one row
+// through the *cFastenDrainer passed as a cgo.Handle in userdata. Each row
+// crosses cgo twice, which is fine at audit volumes.
 //
 //export goInsertCallback
 func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) (rc C.int32_t) {
@@ -110,8 +104,8 @@ type pendingRow struct {
 	attempts int
 }
 
-// cFastenDrainer wraps a FastenStore* + Drainer (C ABI) together with the
-// cgo.Handle the callback uses to reach it.
+// cFastenDrainer holds the C store and drainer, plus the cgo.Handle the
+// callbacks use to reach it.
 type cFastenDrainer struct {
 	handle      unsafe.Pointer // *FastenStoreHandle
 	goHandle    cgo.Handle
@@ -396,8 +390,7 @@ func (d *cFastenDrainer) flush(timeout time.Duration) bool {
 	return drained != 0
 }
 
-// statsJSON returns the drainer health snapshot as a JSON string,
-// or "null" when no drainer is active.
+// statsJSON returns the drainer stats as JSON, or "null" if there are none.
 func (d *cFastenDrainer) statsJSON() string {
 	d.use.RLock()
 	defer d.use.RUnlock()

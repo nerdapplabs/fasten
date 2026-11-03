@@ -1,7 +1,7 @@
-"""Run all P1-16 Postgres fleet-scale scenarios and emit a results JSON.
+"""Run the Postgres load scenarios and write a results JSON.
 
 Usage:
-    cd fasten/tests/postgres
+    cd tests/postgres
     docker compose up -d --wait
     python run_all.py [--dsn postgresql://fasten:fasten@localhost:5432/fasten_test]
     # Results written to results/run_<timestamp>.json

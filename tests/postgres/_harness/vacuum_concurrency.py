@@ -1,7 +1,8 @@
-"""Scenario 6: VACUUM ANALYZE during writes — verify no deadlocks.
+"""Scenario 6: VACUUM ANALYZE during writes.
 
-Runs VACUUM ANALYZE on the audit table while concurrent writers emit rows.
-Pass criteria: no deadlock exceptions, p99 emit latency unchanged vs baseline.
+Runs VACUUM ANALYZE on the audit table while writer threads emit rows.
+Passes when no emit hits a deadlock; run_all.py also compares p99 latency
+against baseline.json.
 """
 import argparse
 import json
