@@ -139,7 +139,8 @@ LD_LIBRARY_PATH=$PWD/../fasten-core/target/release \
 ```
 
 CI also sets `FASTEN_TEST_POSTGRES_DSN` and runs with `-tags=integration
--race` to include the Postgres tests.
+-race` to include the Postgres tests. On macOS use `DYLD_LIBRARY_PATH`
+instead of `LD_LIBRARY_PATH`.
 
 ## Docs and design
 

@@ -30,6 +30,7 @@ Each smoke emits, in any order:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Any

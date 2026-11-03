@@ -10,9 +10,9 @@ wire contract against the canonical
 | Language | Base image           | Streams tested       | Path                  |
 |----------|----------------------|----------------------|-----------------------|
 | Python   | `python:3.10-slim`   | audit, sys, **api**  | [`python/`](python/) |
-| Go       | `golang:1.26-alpine` | audit, sys           | [`go/`](go/)         |
+| Go       | `golang:1.26-bookworm` | audit, sys         | [`go/`](go/)         |
 | Node.js  | `node:24-alpine`     | audit, sys           | [`node/`](node/)     |
-| Rust     | `rust:1.85-slim`     | audit, sys           | [`rust/`](rust/)     |
+| Rust     | `rust:1.90-slim-bookworm` | audit, sys      | [`rust/`](rust/)     |
 | C++14    | `gcc:13-bookworm`    | audit, sys           | [`cpp/`](cpp/)       |
 | Java     | _coming soon_        | none                 | _placeholder SDK; emit() throws today._ |
 
@@ -99,16 +99,15 @@ For every smoke, `verify.py` checks:
 | Lang   | Pick    | Why |
 |--------|---------|-----|
 | Python | 3.10    | Lowest maintained interpreter; `pyproject.toml` requires `>=3.10` |
-| Go     | 1.26    | Module's `go 1.26.0` directive; alpine for image size |
+| Go     | 1.26    | Module's `go 1.26.0` directive; Debian for the cgo build against fasten-core |
 | Node   | 24      | Matches `js/package.json` engines `>=24` |
-| Rust   | 1.85    | Older than fasten-core's `rust-version = "1.90"`, so this image can't build it yet |
+| Rust   | 1.90    | fasten-core's `rust-version` (the SDK builds it as a path dependency) |
 | C++    | gcc 13  | Clean C++14 support; bookworm-stable toolchain |
 
 ## CI
 
-No GitHub Actions workflow runs these smokes yet. They don't run as-is
-either: the Go, Python and Rust images don't build `fasten-core`, and
-`verify.py` is missing an `import os` (#141).
+[`integration.yml`](../../.github/workflows/integration.yml) runs
+`make test-<lang>` for each language as a parallel job.
 
 ## Adding a new language
 
