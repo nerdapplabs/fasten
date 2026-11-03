@@ -56,7 +56,8 @@ register("user", {
 })
 
 # Reads FASTEN_SERVICE_ID / FASTEN_NODE_ID / FASTEN_AUDIT_DSN. "email" isn't
-# in the default redact keys, so name it here.
+# in the default redact keys, so name it here. Passing extra_redact_keys
+# means FASTEN_REDACT_KEYS is not read.
 fasten.init(extra_redact_keys=["email"])
 
 # Auth on the reader router.
