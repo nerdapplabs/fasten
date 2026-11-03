@@ -636,6 +636,44 @@ mod tests {
         }
     }
 
+    /// #139: what the SDKs see. A sealed row inserted through the C interface
+    /// comes back from query with every chain field.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sealed_row_round_trips_through_the_c_interface() {
+        let cs = |s: &str| CString::new(s).unwrap();
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = fasten_store_open(
+                cs("sqlite").as_ptr(), cs(":memory:").as_ptr(), cs("audit_log").as_ptr(), &mut err,
+            );
+            assert!(!h.is_null());
+            let chain = serde_json::json!({
+                "prev_hash": "genesis", "hash": "h1", "canonical_form_id": "2",
+                "detail_salt": "salt", "detail_commitment": "commit",
+            });
+            let mut row = serde_json::json!({
+                "wire_version": "1", "id": "evt-1", "origin_id": "evt-1", "monotonic_seq": 1,
+                "timestamp": "2026-01-01T00:00:00.000000Z", "code": "C", "action": "a",
+                "severity": "info", "service_id": "s", "source_node_id": "n", "actor": "u",
+                "actor_kind": "user", "target": "t", "category": "c", "domain": "d",
+                "method": "sdk", "request_id": "r", "detail": {},
+            });
+            row.as_object_mut().unwrap().extend(chain.as_object().unwrap().clone());
+            let rc = fasten_store_insert(h, cs(&row.to_string()).as_ptr(), &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = fasten_store_query(h, std::ptr::null(), &mut out, &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+            let rows: serde_json::Value = serde_json::from_str(&take(out)).unwrap();
+            for (k, v) in chain.as_object().unwrap() {
+                assert_eq!(&rows[0][k], v, "{k}");
+            }
+            fasten_store_close(h);
+        }
+    }
+
     #[test]
     fn callback_store_has_no_redaction() {
         extern "C" fn ok_cb(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 0 }

@@ -29,7 +29,6 @@ pub struct RedactionCandidates {
     /// `(id, monotonic_seq)` ordered by `monotonic_seq`.
     pub rows: Vec<(String, u64)>,
     /// Matching rows left out because they are sealed under form "1".
-    /// Always 0 on a table without a `hash` column.
     pub skipped: u64,
 }
 
@@ -149,6 +148,48 @@ pub trait Store: Send + Sync {
     fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported("redact_rows"))
     }
+}
+
+/// `row` without its chain fields, as an allocating insert stores it: the
+/// store picks the seq, so a hash the caller sealed over another seq could
+/// never verify.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn unsealed(row: &Row) -> Row {
+    Row {
+        prev_hash: None,
+        hash: None,
+        canonical_form_id: None,
+        detail_salt: None,
+        detail_commitment: None,
+        ..row.clone()
+    }
+}
+
+/// Chain columns (spec §1, §2), in table order. A table an older
+/// fasten-core created lacks them; `migrate` adds them. `detail_salt` and
+/// `detail_commitment` are written as `''` when absent, since a table the Go
+/// store created declares them NOT NULL.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) const CHAIN_COLUMNS: [(&str, &str); 5] = [
+    ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("hash", "TEXT NOT NULL DEFAULT ''"),
+    ("canonical_form_id", "TEXT NOT NULL DEFAULT '1'"),
+    ("detail_salt", "TEXT"),
+    ("detail_commitment", "TEXT"),
+];
+
+/// Every column a store reads back, in the order the row mappers expect.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq,timestamp,\
+     code,action,severity,service_id,source_node_id,tenant_id,\
+     actor,actor_kind,target,category,domain,method,\
+     request_id,detail,pii_in_detail,shipped_at,\
+     prev_hash,hash,canonical_form_id,detail_salt,detail_commitment";
+
+/// `''` and NULL both mean "no salt / commitment" (form "1").
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.is_empty())
 }
 
 #[cfg(feature = "sqlite")]

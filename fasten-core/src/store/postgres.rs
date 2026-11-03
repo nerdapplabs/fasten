@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{RedactGate, RedactionCandidates, Store};
+use super::{non_empty, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -126,7 +126,6 @@ pub struct PostgresStore {
     inner: Mutex<Inner>,
     table: String,
     bare: String,          // bare name used for index identifiers
-    schema: Option<String>,
     dsn: String,           // retained for reconnect
     insert_sql: String,    // retained for re-prepare after reconnect
 }
@@ -159,20 +158,17 @@ impl PostgresStore {
     pub fn connect(dsn: &str, table: &str) -> Result<Self, Error> {
         validate_table_name(table)?;
 
-        let (schema_opt, bare) = split_table(table);
-        let schema = schema_opt.map(str::to_owned);
-        let bare = bare.to_owned();
+        let (schema, bare) = split_table(table);
         let insert_sql = build_insert_sql(table);
 
         let mut client = connect_client(dsn)?;
-        migrate(&mut client, table, &bare, schema.as_deref())?;
+        migrate(&mut client, table, bare, schema)?;
         let stmt = client.prepare(&insert_sql)?;
 
         Ok(Self {
             inner: Mutex::new(Inner { client, stmt }),
             table: table.to_owned(),
-            bare,
-            schema,
+            bare: bare.to_owned(),
             dsn: dsn.to_owned(),
             insert_sql,
         })
@@ -195,11 +191,23 @@ impl PostgresStore {
     }
 
     fn insert_with_reconnect(&self, row: &Row) -> Result<(), Error> {
+        let cleared;
+        let row = if row.monotonic_seq == 0 {
+            cleared = unsealed(row);
+            &cleared
+        } else {
+            row
+        };
         let detail_str = serde_json::to_string(&row.detail)?;
         let seq: i64 = row.monotonic_seq as i64;
         let pii: i16 = row.pii_in_detail as i16;
         let tenant: Option<&str> = row.tenant_id.as_deref();
         let shipped: Option<&str> = row.shipped_at.as_deref();
+        let prev_hash = row.prev_hash.as_deref().unwrap_or("");
+        let hash = row.hash.as_deref().unwrap_or("");
+        let form = row.canonical_form_id.as_deref().unwrap_or("1");
+        let salt = row.detail_salt.as_deref().unwrap_or("");
+        let commitment = row.detail_commitment.as_deref().unwrap_or("");
 
         let params: &[&(dyn ToSql + Sync)] = &[
             &row.id,             // $1  id
@@ -223,6 +231,11 @@ impl PostgresStore {
             &detail_str,         // $19 detail
             &pii,                // $20 pii_in_detail (SMALLINT)
             &shipped,            // $21 shipped_at    (NULL when None)
+            &prev_hash,          // $22 prev_hash
+            &hash,               // $23 hash
+            &form,               // $24 canonical_form_id
+            &salt,               // $25 detail_salt
+            &commitment,         // $26 detail_commitment
         ];
 
         let bare = self.bare.as_str();
@@ -268,8 +281,9 @@ impl PostgresStore {
 
     fn redact_gate(&self, client: &mut pg::Client) -> Result<RedactGate, Error> {
         // Unquoted identifiers fold to lower case.
-        let bare = self.bare.to_lowercase();
-        let schema = self.schema.as_deref().map(str::to_lowercase);
+        let (schema, bare) = split_table(&self.table);
+        let bare = bare.to_lowercase();
+        let schema = schema.map(str::to_lowercase);
         let cols: Vec<String> = client
             .query(
                 "SELECT column_name::text FROM information_schema.columns \
@@ -301,11 +315,7 @@ impl Store for PostgresStore {
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
         let (where_clause, mut all_params) = build_filter_where(filter);
         let mut sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {}{} ORDER BY monotonic_seq ASC",
+            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY monotonic_seq ASC",
             self.table, where_clause
         );
         if filter.limit > 0 {
@@ -349,11 +359,8 @@ impl Store for PostgresStore {
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
         let effective: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
         let sql = format!(
-            "SELECT id,wire_version,origin_id,monotonic_seq,timestamp,\
-             code,action,severity,service_id,source_node_id,tenant_id,\
-             actor,actor_kind,target,category,domain,method,\
-             request_id,detail,pii_in_detail,shipped_at \
-             FROM {} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1",
+            "SELECT {SELECT_COLUMNS} FROM {} \
+             WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1",
             self.table
         );
         self.with_reconnect(|inner| {
@@ -524,7 +531,7 @@ fn migrate(
 ) -> Result<(), Error> {
     // Probe first, so opening an up-to-date table runs no DDL and waits on
     // no lock.
-    if index_missing(client, bare, schema)?.is_none() {
+    if schema_missing(client, bare, schema)?.is_nothing() {
         return Ok(());
     }
 
@@ -542,6 +549,10 @@ fn migrate(
         pg_exec(client, &format!("CREATE SCHEMA IF NOT EXISTS {s}"))?;
     }
 
+    let chain: String = CHAIN_COLUMNS
+        .iter()
+        .map(|(name, def)| format!("{name} {def},\n                "))
+        .collect();
     pg_exec(
         client,
         &format!(
@@ -567,12 +578,20 @@ fn migrate(
                 detail          TEXT        NOT NULL DEFAULT '{{}}',
                 pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,
                 shipped_at      TEXT,
-                PRIMARY KEY (id),
+                {chain}PRIMARY KEY (id),
                 -- Same name as the Go store's index, so Go skips creating it.
                 CONSTRAINT uq_{bare}_node_seq UNIQUE (source_node_id, monotonic_seq)
             )"
         ),
     )?;
+
+    let missing = schema_missing(client, bare, schema)?;
+    // A table an older fasten-core created has no chain columns. IF NOT
+    // EXISTS: an opener that names the table differently (`t`, `public.t`)
+    // takes a different bootstrap lock and may have just added them.
+    for (name, def) in missing.columns {
+        pg_exec(client, &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {def}"))?;
+    }
 
     for sql in &[
         format!("CREATE INDEX IF NOT EXISTS idx_{bare}_req  ON {table} (request_id)"),
@@ -585,7 +604,7 @@ fn migrate(
 
     // A table created before the UNIQUE constraint has no node-seq index and
     // may already repeat seqs on a node, so this one is not unique.
-    if index_missing(client, bare, schema)? == Some(NODE_SEQ) {
+    if missing.node_seq_index {
         pg_exec(
             client,
             &format!(
@@ -599,16 +618,25 @@ fn migrate(
     Ok(())
 }
 
-const NODE_SEQ: &str = "node_seq";
+struct Missing {
+    indexes: bool,
+    node_seq_index: bool,
+    columns: Vec<(&'static str, &'static str)>,
+}
 
-/// The first index `migrate` creates that the table lacks (`req`, `code`,
-/// `ts`, `svc` or [`NODE_SEQ`]), or `None` when it is up to date. A missing
-/// table lacks them all.
-fn index_missing(
+impl Missing {
+    fn is_nothing(&self) -> bool {
+        !self.indexes && !self.node_seq_index && self.columns.is_empty()
+    }
+}
+
+/// What `migrate` still has to create on the table. A missing table lacks
+/// everything.
+fn schema_missing(
     client: &mut impl pg::GenericClient,
     bare: &str,
     schema: Option<&str>,
-) -> Result<Option<&'static str>, Error> {
+) -> Result<Missing, Error> {
     // Unquoted identifiers fold to lower case.
     let bare = bare.to_lowercase();
     let schema = schema.map(str::to_lowercase);
@@ -621,16 +649,24 @@ fn index_missing(
         .iter()
         .map(|r| r.get(0))
         .collect();
+    let have: Vec<String> = client
+        .query(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = COALESCE($1, current_schema()) AND table_name = $2",
+            &[&schema, &bare],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     let has = |n: String| names.contains(&n);
-    for s in ["req", "code", "ts", "svc"] {
-        if !has(format!("idx_{bare}_{s}")) {
-            return Ok(Some(s));
-        }
-    }
-    if !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")) {
-        return Ok(Some(NODE_SEQ));
-    }
-    Ok(None)
+    Ok(Missing {
+        indexes: !["req", "code", "ts", "svc"].iter().all(|s| has(format!("idx_{bare}_{s}"))),
+        node_seq_index: !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")),
+        columns: CHAIN_COLUMNS
+            .into_iter()
+            .filter(|(name, _)| !have.iter().any(|h| h == name))
+            .collect(),
+    })
 }
 
 fn build_insert_sql(table: &str) -> String {
@@ -639,9 +675,11 @@ fn build_insert_sql(table: &str) -> String {
          (id, wire_version, origin_id, monotonic_seq, timestamp, \
           code, action, severity, service_id, source_node_id, tenant_id, \
           actor, actor_kind, target, category, domain, method, \
-          request_id, detail, pii_in_detail, shipped_at) \
+          request_id, detail, pii_in_detail, shipped_at, \
+          prev_hash, hash, canonical_form_id, detail_salt, detail_commitment) \
          VALUES \
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,\
+          $22,$23,$24,$25,$26) \
          ON CONFLICT (id) DO NOTHING"
     )
 }
@@ -720,6 +758,11 @@ fn row_from_pg(r: &pg::Row) -> Row {
         detail,
         pii_in_detail:  pii != 0,
         shipped_at:     r.get(20),
+        prev_hash:         r.get(21),
+        hash:              r.get(22),
+        canonical_form_id: r.get(23),
+        detail_salt:       non_empty(r.get(24)),
+        detail_commitment: non_empty(r.get(25)),
         ..Default::default()
     }
 }
@@ -937,7 +980,7 @@ mod tests {
             .unwrap()
             .get(0);
         assert!(!def.contains("UNIQUE"), "{def}");
-        assert_eq!(index_missing(&mut c, table, None).unwrap(), None);
+        assert!(schema_missing(&mut c, table, None).unwrap().is_nothing());
     }
 
     /// Opening an up-to-date table runs no DDL, so it does not wait for the
@@ -1078,18 +1121,15 @@ mod tests {
     fn redaction_skips_sealed_rows() {
         let Some(dsn) = dsn() else { return };
         let store = fresh(&dsn, "fasten_sc_pg_redact_sealed");
-        let mut c = connect_client(&dsn).unwrap();
-        c.batch_execute(
-            "ALTER TABLE fasten_sc_pg_redact_sealed ADD COLUMN hash TEXT NOT NULL DEFAULT ''",
-        )
-        .unwrap();
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            if id == "evt-sealed" {
+                r.monotonic_seq = 1;
+                r.hash = Some("abc".into());
+            }
             store.insert(&r).unwrap();
         }
-        c.batch_execute("UPDATE fasten_sc_pg_redact_sealed SET hash = 'abc' WHERE id = 'evt-sealed'")
-            .unwrap();
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
@@ -1102,6 +1142,159 @@ mod tests {
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
     }
 
+    /// The store picks the seq, so a hash sealed over another one is dropped.
+    #[test]
+    fn allocating_insert_drops_chain_fields() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_alloc_chain");
+        let mut row = make_row("evt-alloc", "TEST");
+        row.prev_hash = Some("genesis".into());
+        row.hash = Some("h1".into());
+        row.canonical_form_id = Some("2".into());
+        row.detail_salt = Some("salt".into());
+        row.detail_commitment = Some("commit".into());
+        store.insert(&row).unwrap();
+        let got = &store.query(&Filter::default()).unwrap()[0];
+        assert_eq!(got.monotonic_seq, 1);
+        assert_eq!(
+            [got.prev_hash.as_deref(), got.hash.as_deref(), got.canonical_form_id.as_deref()],
+            [Some(""), Some(""), Some("1")]
+        );
+        assert_eq!((got.detail_salt.as_deref(), got.detail_commitment.as_deref()), (None, None));
+    }
+
+    /// #139: a sealed row came back without its hash.
+    #[test]
+    fn chain_fields_round_trip() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_chain");
+        let mut row = make_row("evt-sealed", "TEST");
+        row.monotonic_seq = 1;
+        row.prev_hash = Some("genesis".into());
+        row.hash = Some("h1".into());
+        row.canonical_form_id = Some("2".into());
+        row.detail_salt = Some("salt".into());
+        row.detail_commitment = Some("commit".into());
+        store.insert(&row).unwrap();
+        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        let chain = |r: &Row| {
+            [
+                r.prev_hash.clone(),
+                r.hash.clone(),
+                r.canonical_form_id.clone(),
+                r.detail_salt.clone(),
+                r.detail_commitment.clone(),
+            ]
+        };
+        assert_eq!(chain(&got[0]), chain(&row));
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(chain(&got[1]), [s(""), s(""), s("1"), None, None]);
+    }
+
+    /// A table the Go store created declares salt and commitment NOT NULL.
+    #[test]
+    fn writes_into_a_go_shaped_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_goshape";
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL,
+                timestamp TEXT NOT NULL, code TEXT NOT NULL, action TEXT NOT NULL,
+                severity TEXT NOT NULL, service_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL, tenant_id TEXT, actor TEXT NOT NULL,
+                actor_kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL,
+                domain TEXT NOT NULL, method TEXT NOT NULL, request_id TEXT NOT NULL,
+                detail TEXT NOT NULL, pii_in_detail SMALLINT NOT NULL DEFAULT 0,
+                shipped_at TEXT, hash TEXT NOT NULL DEFAULT '',
+                prev_hash TEXT NOT NULL DEFAULT '',
+                canonical_form_id TEXT NOT NULL DEFAULT '1',
+                detail_salt TEXT NOT NULL DEFAULT '',
+                detail_commitment TEXT NOT NULL DEFAULT '')"
+        ))
+        .unwrap();
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        store.insert(&make_row("evt-go", "TEST")).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(got[0].detail_salt, None);
+        assert_eq!(got[0].hash.as_deref(), Some(""));
+    }
+
+    /// A table an older fasten-core created gets the chain columns on connect.
+    #[test]
+    fn connect_adds_chain_columns_to_an_old_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_oldshape";
+        let mut c = connect_client(&dsn).unwrap();
+        create_pre_chain_table(&mut c, table);
+        c.execute(
+            &format!(
+                "INSERT INTO {table} (id, origin_id, timestamp, code, monotonic_seq) \
+                 VALUES ('evt-old', 'evt-old', '2026-05-07T00:00:00.000000Z', 'TEST', 1)"
+            ),
+            &[],
+        )
+        .unwrap();
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        let mut row = make_row("evt-new", "TEST");
+        row.monotonic_seq = 2;
+        row.hash = Some("h2".into());
+        store.insert(&row).unwrap();
+        let got = store.query(&Filter::default()).unwrap();
+        assert_eq!(got[0].hash.as_deref(), Some(""));
+        assert_eq!(got[0].canonical_form_id.as_deref(), Some("1"));
+        assert_eq!(got[1].hash.as_deref(), Some("h2"));
+    }
+
+    /// Two stores upgrading one old table, one naming it `t` and the other
+    /// `public.t`, take different bootstrap locks.
+    #[test]
+    fn old_table_upgraded_under_two_names_at_once() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_sc_pg_twonames";
+        let mut c = connect_client(&dsn).unwrap();
+        for _ in 0..10 {
+            create_pre_chain_table(&mut c, table);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let openers: Vec<_> = [table.to_string(), format!("public.{table}")]
+                .into_iter()
+                .map(|name| {
+                    let (dsn, start) = (dsn.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        PostgresStore::connect(&dsn, &name).map(drop)
+                    })
+                })
+                .collect();
+            for h in openers {
+                h.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    /// The table shape from before the chain columns and the node-seq index.
+    fn create_pre_chain_table(c: &mut pg::Client, table: &str) {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, wire_version TEXT NOT NULL DEFAULT '1',
+                origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL, code TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'info',
+                service_id TEXT NOT NULL DEFAULT '', source_node_id TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT, actor TEXT NOT NULL DEFAULT '',
+                actor_kind TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+                method TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '{{}}', pii_in_detail SMALLINT NOT NULL DEFAULT 0,
+                shipped_at TEXT);"
+        ))
+        .unwrap();
+    }
+
     /// Postgres folds unquoted names to lower case, so the column probe must
     /// too, or a mixed-case table looks hash-less and its sealed rows get
     /// redacted.
@@ -1111,7 +1304,7 @@ mod tests {
         let table = "FastenScMixed.AuditLog";
         let store = fresh(&dsn, table);
         let mut c = connect_client(&dsn).unwrap();
-        c.batch_execute(&format!("ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT ''"))
+        c.batch_execute(&format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''"))
             .unwrap();
         let mut r = make_row("evt-mixed-sealed", "USER_LOGIN");
         r.timestamp = days_ago(40);
@@ -1135,9 +1328,9 @@ mod tests {
         let store = fresh(&dsn, table);
         let mut c = connect_client(&dsn).unwrap();
         c.batch_execute(&format!(
-            "ALTER TABLE {table} ADD COLUMN hash TEXT NOT NULL DEFAULT '';
-             ALTER TABLE {table} ADD COLUMN canonical_form_id TEXT NOT NULL DEFAULT '1';
-             ALTER TABLE {table} ADD COLUMN detail_salt TEXT NOT NULL DEFAULT '';"
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+             ALTER TABLE {table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1';
+             ALTER TABLE {table} ADD COLUMN IF NOT EXISTS detail_salt TEXT NOT NULL DEFAULT '';"
         ))
         .unwrap();
         for id in ["evt-form1", "evt-form2", "evt-unsealed"] {
