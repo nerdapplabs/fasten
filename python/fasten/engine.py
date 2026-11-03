@@ -175,6 +175,7 @@ class _QueueDrainer:
     deadline: Optional[float] = None    # time.monotonic(); close starts no insert after it
     lost: int = 0                       # rows dead-lettered or lost at stop
     reported: set[str] = dataclasses.field(default_factory=set)   # rows reported lost at stop
+    reporting: int = 0                  # rows counted lost whose report isn't written yet
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     # Held around the store call and across fork(), so a child never
     # inherits a store (or SQLite's global mutex) mid-insert.
@@ -188,6 +189,10 @@ class _QueueDrainer:
     retire_ident: Optional[int] = None  # the thread stopping it
     drain_stopped: threading.Event = dataclasses.field(default_factory=threading.Event)
     retired: threading.Event = dataclasses.field(default_factory=threading.Event)  # or given up
+    reported_out: threading.Condition = dataclasses.field(init=False)   # reporting hit 0
+
+    def __post_init__(self) -> None:
+        self.reported_out = threading.Condition(self.lock)
 
     def past_deadline(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
@@ -774,9 +779,11 @@ class Engine:
         (audit_drain_lost_at_stop), and a store call still running is left
         behind (audit_drain_recovered_at_stop if it later stores its row
         before the process exits, so a lost report can be a false alarm).
-        Emits after close are stored inline. A drainer a concurrent re-init
-        is still retiring is waited for in the same way. Returns False if a
-        row was lost. The exit hook calls ``close(5.0)``."""
+        Every row counted lost is reported before close returns, which can
+        take up to 1 s past ``timeout`` if another thread is writing a
+        report. Emits after close are stored inline. A drainer a concurrent
+        re-init is still retiring is waited for in the same way. Returns
+        False if a row was lost. The exit hook calls ``close(5.0)``."""
         deadline = time.monotonic() + timeout
         with self._drainer_lock:
             self._closed = True
@@ -796,6 +803,7 @@ class Engine:
         for r in drainers:
             if r is not old and not r.retired.wait(max(0.0, deadline - time.monotonic())):
                 self._give_up(r)
+        self._wait_reported(drainers, deadline + 1.0)
         return sum(x.lost for x in drainers) == lost
 
     def queue_stats(self) -> Optional[dict[str, Any]]:
@@ -1297,6 +1305,7 @@ class Engine:
                             d.pending.pop(row.id, None)
                             d.reported.add(row.id)
                             d.lost += 1
+                            d.reporting += 1
                     if lost:
                         self._lose_at_stop(d, [row.id], type(e).__name__)
                 else:
@@ -1323,28 +1332,44 @@ class Engine:
             d.reported.update(row_ids)
             d.pending.clear()
             d.lost += len(row_ids)
+            d.reporting += len(row_ids)
         self._lose_at_stop(d, row_ids, "TimeoutError")
 
     def _lose_at_stop(self, d: _QueueDrainer, row_ids: list[str], error_type: str) -> None:
-        """Report rows already counted in ``d.lost``. Called without
-        ``d.lock``: the syslog store may be stalled too."""
+        """Report rows already counted in ``d.lost`` and ``d.reporting``.
+        Called without ``d.lock``: the syslog store may be stalled too."""
         if not row_ids:
             return
         log = logging.getLogger("fasten")
         try:
-            self._mark_write_lost(d.store, d.gen)
-        except Exception:  # noqa: BLE001 — still report the rows
-            log.exception("marking the audit store degraded failed")
-        for row_id in row_ids:
             try:
-                # Past the deadline the syslog store may be as stuck as the
-                # audit store, and close() must still return.
-                self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
-                    "error_type": error_type,
-                    "row_id": row_id,
-                }, via=d, persist=not d.past_deadline())
-            except Exception:  # noqa: BLE001 — report the rest
-                log.exception("lost_at_stop event failed for %s", row_id)
+                self._mark_write_lost(d.store, d.gen)
+            except Exception:  # noqa: BLE001 — still report the rows
+                log.exception("marking the audit store degraded failed")
+            for row_id in row_ids:
+                try:
+                    # close() waits for these, so the syslog store, which
+                    # may be as stuck as the audit store, is written from
+                    # another thread.
+                    self._drainer_sys_log("error", "audit_drain_lost_at_stop", {
+                        "error_type": error_type,
+                        "row_id": row_id,
+                    }, via=d, persist=not d.past_deadline(), background=True)
+                except Exception:  # noqa: BLE001 — report the rest
+                    log.exception("lost_at_stop event failed for %s", row_id)
+        finally:
+            with d.lock:
+                d.reporting -= len(row_ids)
+                d.reported_out.notify_all()
+
+    def _wait_reported(self, drainers: list[_QueueDrainer], deadline: float) -> None:
+        """Wait for the loss reports another thread is still writing, so an
+        exit right after close() does not drop them. Writing one never
+        waits on a store, so this is short."""
+        for d in drainers:
+            with d.lock:
+                d.reported_out.wait_for(lambda: d.reporting == 0,
+                                        max(0.0, deadline - time.monotonic()))
 
     def _atexit_close(self) -> None:
         deadline = time.monotonic() + 5.0

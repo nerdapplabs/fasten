@@ -1193,6 +1193,30 @@ def test_core_stop_event_does_not_wait_on_a_hung_syslog_store(tmp_path, monkeypa
         syslog.release.set()
 
 
+
+def test_close_waits_for_a_lost_report_still_being_written(tmp_path, monkeypatch, capsys):
+    # The retire thread counts a row lost and is still writing its report
+    # when close's deadline passes. close must not return before the report
+    # is out: an exit right after it would drop the report.
+    store = FlakyStore(str(tmp_path / "a.db"), fail=10**6)
+    _init(store, queue_retry_initial_ms=1000, queue_retry_max_ms=1000)
+    rows = [fasten.emit(code="USER_CREATED", target=f"u-{i}") for i in range(3)]
+    _wait_for_attempts(store, 3)
+    log = _default._drainer_sys_log
+
+    def slow_on_retire(level, event, fields, **kw):
+        if event == "audit_drain_lost_at_stop" and threading.current_thread().name == "fasten-retire":
+            time.sleep(0.5)
+        return log(level, event, fields, **kw)
+
+    monkeypatch.setattr(_default, "_drainer_sys_log", slow_on_retire)
+    capsys.readouterr()
+    assert not fasten.close(timeout=0.3)
+    err = [json.loads(line) for line in capsys.readouterr().err.splitlines()
+           if line.startswith("{")]
+    lost = [e["row_id"] for e in err if e.get("event") == "audit_drain_lost_at_stop"]
+    assert sorted(lost) == sorted(r.id for r in rows)
+
 def test_row_reported_lost_then_stored_inline_is_reported_recovered(tmp_path, monkeypatch):
     # close gives up on the drainer while an emit is between queueing the
     # row and fasten-core refusing it.
@@ -1262,12 +1286,12 @@ def _fail_first_lost_event(monkeypatch):
     """Make the first lost_at_stop event raise; return the ids reported."""
     log, reported = _default._drainer_sys_log, []
 
-    def flaky(level, event, fields, via=None, persist=True):
+    def flaky(level, event, fields, **kw):
         if event == "audit_drain_lost_at_stop":
             reported.append(fields["row_id"])
             if len(reported) == 1:
                 raise OSError("stderr closed")
-        return log(level, event, fields, via=via, persist=persist)
+        return log(level, event, fields, **kw)
     monkeypatch.setattr(_default, "_drainer_sys_log", flaky)
     return reported
 

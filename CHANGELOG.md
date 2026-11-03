@@ -55,7 +55,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   It returns within about `timeout`: no store call starts after that, one
   still running is left behind, and rows not stored are reported as
   `audit_drain_lost_at_stop`. It returns False only if a row was lost,
-  including one an emit racing `close` failed to store inline.
+  including one an emit racing `close` failed to store inline, and every
+  row counted lost is reported before it returns.
   Sys events past the deadline go to stderr and the ring but not the
   syslog store, which is then marked degraded. A row reported lost and
   stored later, by a left-behind call, retire or an inline emit, gets
