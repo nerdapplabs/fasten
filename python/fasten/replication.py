@@ -5,7 +5,8 @@ An aggregator receiving rows from nodes only needs a store:
     from fasten.replication import ingest
     result = ingest(my_store, rows)
 
-``fasten.ingest_replicated(rows)`` does the same with the default Engine's store.
+``fasten.ingest_replicated(rows)`` does the same with the default Engine's
+store, passing that Engine's node_id as ``local_node_id``.
 """
 from __future__ import annotations
 
@@ -30,8 +31,9 @@ def ingest(
     on a chain break; :class:`IngestResult` carries ``rejected_from_seq``, the
     seq to resend from.
 
-    Pass the receiving node's id as ``local_node_id``: rows claiming that node
-    are refused, the first of them reported as the break.
+    Pass the receiving node's id as ``local_node_id``: ingest then stops at the
+    first row from that node and reports it as the break (see
+    ``repo.ingest_without_local_node``). Without it, no such check is made.
     """
     store_ingest = getattr(store, "ingest_replicated", None)
     if not callable(store_ingest):

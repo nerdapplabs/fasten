@@ -326,6 +326,8 @@ class SQLiteStore:
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Rows are inserted with INSERT OR IGNORE, so
         retries are safe.
+        With ``local_node_id``, ingest stops at the first row from that node
+        (see ``repo.ingest_without_local_node``).
         """
         from .repo import (IngestResult, check_inserted, cut_at_conflict,
                            ingest_without_local_node, stored_conflict, verified_prefix)

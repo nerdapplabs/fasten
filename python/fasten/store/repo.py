@@ -21,7 +21,8 @@ class IngestResult:
     When the chain breaks partway, ``rejected_from_seq`` carries the
     ``monotonic_seq`` of the first broken row (the rows at/after it are NOT
     inserted) and ``reason`` explains where it diverged, so the sender can resync
-    from that point instead of re-shipping the poison-pilled batch forever. On a
+    from that point instead of re-shipping the poison-pilled batch forever. A row
+    from the local node (``local_node_id``) is reported the same way. On a
     fully-verified batch ``rejected_from_seq`` is None and ``reason`` is None.
     """
     inserted: int
@@ -131,7 +132,8 @@ class AuditRepository(Protocol):
         IngestResult carries ``rejected_from_seq`` so the sender resyncs from the
         break instead of re-shipping a poison-pilled batch forever. Used by
         replication sinks — an upstream aggregator receiving rows reverse-synced
-        from a node.
+        from a node. With ``local_node_id``, a row from that node is a break
+        (spec §4); without it, no such check is made.
         """
         ...
 
@@ -220,9 +222,12 @@ def ingest_without_local_node(
     rows: list[AuditRow],
     local_node_id: str | None,
 ) -> IngestResult:
-    """Run ``ingest`` on the rows before the first one whose source_node_id is
-    ``local_node_id``, and report that row as the break. A node's own rows
-    come from its emit path, never from replication."""
+    """Run ``ingest`` on the rows before the lowest-seq one whose
+    source_node_id is ``local_node_id``, and report that row as the break
+    unless ``ingest`` finds an earlier one. A node's own rows come from its
+    emit path, never from replication. As with a stored conflict, other
+    nodes' rows from that seq on are left for the sender to resend. An empty
+    ``local_node_id`` skips the check."""
     own = [r for r in rows if local_node_id and r.source_node_id == local_node_id]
     if not own:
         return ingest(rows)
@@ -286,7 +291,8 @@ def ingest_replicated_into(
     for adopter stores that don't expose a transaction. It cannot look up what
     the store already holds, so it does not check for stored conflicts (spec
     §4); SQLiteStore and PostgresStore do. Never raises on a chain break —
-    rejected rows surface via ``rejected_from_seq``.
+    rejected rows surface via ``rejected_from_seq``. ``local_node_id`` is as
+    in ingest_without_local_node.
     """
     if local_node_id:
         return ingest_without_local_node(

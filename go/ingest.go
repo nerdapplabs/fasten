@@ -17,8 +17,9 @@ import (
 // committed. When the chain breaks partway, RejectedFromSeq carries the
 // MonotonicSeq of the first broken row (rows at/after it are not inserted) and
 // Reason explains where it diverged, so the sender resyncs from that point
-// instead of re-shipping a poison-pilled batch forever. On a fully-verified
-// batch RejectedFromSeq is 0 and Reason is "".
+// instead of re-shipping a poison-pilled batch forever. IngestReplicatedFor
+// also reports a row from the local node this way. On a fully-verified batch
+// RejectedFromSeq is 0 and Reason is "".
 type IngestResult struct {
 	Inserted        int    `json:"inserted"`
 	RejectedFromSeq int64  `json:"rejected_from_seq"`
@@ -352,21 +353,23 @@ type LocalIngester interface {
 	IngestReplicatedFor(ctx context.Context, localNode string, rows []Row) (IngestResult, error)
 }
 
-// IngestReplicatedFor is IngestReplicated on the node localNode: rows whose
-// SourceNodeID is localNode are refused, the first of them reported as the
-// break. A node's own rows come from its emit path, never from replication.
+// IngestReplicatedFor is IngestReplicated run on node localNode. A node's own
+// rows come from its emit path, so ingest stops at the lowest-seq row whose
+// SourceNodeID is localNode and reports it as the break, unless an earlier
+// break is found. As with a stored conflict, other nodes' rows from that seq
+// on are left for the sender to resend. An empty localNode skips the check.
 func (s *SQLiteStore) IngestReplicatedFor(ctx context.Context, localNode string, rows []Row) (IngestResult, error) {
 	return ingestWithoutLocalNode(ctx, localNode, rows, s.IngestReplicated)
 }
 
-// IngestReplicatedFor is IngestReplicated on the node localNode; see
+// IngestReplicatedFor is IngestReplicated run on node localNode; see
 // SQLiteStore.IngestReplicatedFor.
 func (s *PostgresStore) IngestReplicatedFor(ctx context.Context, localNode string, rows []Row) (IngestResult, error) {
 	return ingestWithoutLocalNode(ctx, localNode, rows, s.IngestReplicated)
 }
 
-// ingestWithoutLocalNode runs ingest on the rows before the first one from
-// localNode and reports that row as the break.
+// ingestWithoutLocalNode runs ingest on the rows before the lowest-seq row
+// from localNode and reports that row as the break.
 func ingestWithoutLocalNode(
 	ctx context.Context,
 	localNode string,
@@ -383,6 +386,11 @@ func ingestWithoutLocalNode(
 	if first == nil {
 		return ingest(ctx, rows)
 	}
+	// RejectedFromSeq 0 means no break, so it can't report this row.
+	if first.MonotonicSeq < 1 {
+		return IngestResult{}, fmt.Errorf("fasten IngestReplicated: row %s: source_node_id '%s' is this node and monotonic_seq is %d",
+			first.ID, localNode, first.MonotonicSeq)
+	}
 	kept := make([]Row, 0, len(rows))
 	for _, r := range rows {
 		if r.MonotonicSeq < first.MonotonicSeq {
@@ -398,18 +406,27 @@ func ingestWithoutLocalNode(
 	return res, nil
 }
 
-// IngestReplicated ingests a replicated batch into this Engine's audit store.
-// Rows whose SourceNodeID is this Engine's NodeID are refused.
+// IngestReplicated ingests a replicated batch into this Engine's audit store,
+// stopping at the first row from this Engine's NodeID (see
+// SQLiteStore.IngestReplicatedFor). A store with only IngestReplicated gets
+// the same check.
 func (e *Engine) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	s, ok := e.auditStore.(LocalIngester)
-	if !ok {
-		return IngestResult{}, errors.New("fasten.IngestReplicated: requires an audit store with an IngestReplicatedFor method")
+	switch s := e.auditStore.(type) {
+	case nil:
+		return IngestResult{}, errors.New("fasten IngestReplicated: requires an audit store: call Init with AuditStore first")
+	case LocalIngester:
+		return s.IngestReplicatedFor(ctx, e.nodeID, rows)
+	case interface {
+		IngestReplicated(context.Context, []Row) (IngestResult, error)
+	}:
+		return ingestWithoutLocalNode(ctx, e.nodeID, rows, s.IngestReplicated)
+	default:
+		return IngestResult{}, errors.New("fasten IngestReplicated: the audit store has no IngestReplicated method")
 	}
-	return s.IngestReplicatedFor(ctx, e.nodeID, rows)
 }
 
 // IngestReplicated ingests a replicated batch into the default Engine's audit
-// store. Rows whose SourceNodeID is its NodeID are refused.
+// store; see Engine.IngestReplicated.
 func IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
 	return Default.IngestReplicated(ctx, rows)
 }

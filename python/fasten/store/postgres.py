@@ -393,6 +393,8 @@ class PostgresStore:
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Inserts use ON CONFLICT DO NOTHING, so retries
         are safe.
+        With ``local_node_id``, ingest stops at the first row from that node
+        (see ``repo.ingest_without_local_node``).
         """
         from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
                            ingest_without_local_node, stored_conflict, verified_prefix)

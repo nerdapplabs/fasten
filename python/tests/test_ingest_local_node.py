@@ -63,8 +63,32 @@ def test_an_earlier_break_is_still_reported():
     broken = _chain([1, 2], "node-1")
     broken[1] = dataclasses.replace(broken[1], target="u/edited")
     result = ingest(store, broken + _chain([3], "agg"), local_node_id="agg")
+    plain = ingest(SQLiteStore(":memory:"), broken)
     assert result.rejected_from_seq == 2 and result.inserted == 1
-    assert "is this node" not in result.reason
+    assert result.reason == plain.reason
+
+
+def test_resent_local_rows_are_still_a_break():
+    # Already stored, but still not something replication may deliver.
+    store, own = SQLiteStore(":memory:"), _chain([1, 2], "agg")
+    ingest(store, own)
+    result = ingest(store, own, local_node_id="agg")
+    assert result.rejected_from_seq == 1 and result.inserted == 0
+
+
+def test_the_cut_is_at_the_lowest_local_seq_not_the_first_in_the_batch():
+    store, own = SQLiteStore(":memory:"), _chain([1, 2, 3], "agg")
+    result = ingest(store, _chain([1, 2, 3], "node-1") + [own[2], own[1]],
+                    local_node_id="agg")
+    assert result.rejected_from_seq == 2 and result.inserted == 1
+    assert "agg-2" in result.reason
+
+
+@pytest.mark.parametrize("local", [None, ""])
+def test_no_local_node_means_no_check(local):
+    store = SQLiteStore(":memory:")
+    result = ingest(store, _chain([1, 2], "agg"), local_node_id=local)
+    assert result.rejected_from_seq is None and result.inserted == 2
 
 
 def test_other_nodes_are_unaffected():
@@ -115,10 +139,24 @@ def test_the_row_by_row_fallback_is_checked():
 
 
 def test_the_engine_refuses_its_own_node(initialized):
+    # `initialized` is the fasten module on an engine with node_id "test-node".
+    own = _chain([1, 2], "test-node")
+    result = initialized.ingest_replicated(_chain([1], "node-1") + [own[1]])
+    assert isinstance(result, IngestResult)
+    assert result.rejected_from_seq == 2 and result.inserted == 1
+
+
+def test_a_local_row_at_the_same_seq_cuts_other_nodes_too(initialized):
     result = initialized.ingest_replicated(
         _chain([1], "node-1") + _chain([1], "test-node"))
-    assert isinstance(result, IngestResult)
     assert result.rejected_from_seq == 1 and result.inserted == 0
+
+
+def test_the_engine_needs_a_node_id(initialized, monkeypatch):
+    from fasten import emitter
+    monkeypatch.setattr(emitter._default, "_node_id", "")
+    with pytest.raises(RuntimeError, match="requires a node_id"):
+        initialized.ingest_replicated(_chain([1], "node-1"))
 
 
 def test_the_engine_ingests_other_nodes(initialized):

@@ -158,7 +158,7 @@ def ingest_replicated(rows: "list[AuditRow]") -> Any:
     transaction, via the default Engine's store.
 
     Does not raise on a chain break. The returned IngestResult carries
-    ``rejected_from_seq``, the monotonic_seq to resend from. Rows claiming
-    the engine's node_id are refused.
+    ``rejected_from_seq``, the monotonic_seq to resend from. Ingest stops at
+    the first row from the engine's node_id and reports it as the break.
     """
     return _default.ingest_replicated(rows)
