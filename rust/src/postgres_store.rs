@@ -1,21 +1,16 @@
 //! PostgreSQL-backed AuditStore (sync, `postgres` crate).
 //! Enable with: fasten = { features = ["store-postgres"] }
 //!
-//! Uses the synchronous `postgres` crate (aliased as `pg`) so the impl
-//! satisfies the sync `AuditStore` trait without requiring a Tokio runtime.
-//! The inner `postgres::Client` is wrapped in a `Mutex` to satisfy `Send +
-//! Sync` and allow shared use across the drainer thread.
+//! Uses the synchronous `postgres` crate (as `pg`), since `AuditStore` is a
+//! sync trait. The client sits behind a `Mutex` so the drainer thread can
+//! share the store.
 
 use std::sync::Mutex;
 
 use pg::types::ToSql;
 
-// ── Table name validation ─────────────────────────────────────────────────
-//
-// Accept: identifier  OR  schema.table
-// Pattern: ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$
-//
-// We hand-roll the check to avoid pulling in the `regex` crate.
+// Table names must match ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$
+// (a name or schema.table).
 
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
@@ -42,8 +37,6 @@ fn validate_table_name(table: &str) -> Result<(), crate::Error> {
         )))
     }
 }
-
-// ── Schema + table bootstrap ──────────────────────────────────────────────
 
 fn pg_err(e: pg::Error) -> crate::Error {
     let msg = match e.as_db_error() {
@@ -181,8 +174,6 @@ fn inspect_columns(
     Ok(cols)
 }
 
-// ── PostgresStore ─────────────────────────────────────────────────────────
-
 /// Synchronous PostgreSQL audit store backed by the `postgres` crate.
 ///
 /// Obtain one via [`PostgresStore::new`] and wrap it in an `Arc` before
@@ -212,8 +203,7 @@ fn inspect_columns(
 pub struct PostgresStore {
     client: Mutex<pg::Client>,
     table: String,
-    /// Bare table name (without schema prefix), used to name indexes.
-    /// Exposed for reader implementations that need to reference index names.
+    /// Table name without the schema prefix; the index names are built from it.
     #[allow(dead_code)]
     idx: String,
     cols: Columns,
@@ -424,8 +414,6 @@ impl crate::AuditStore for PostgresStore {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,8 +423,6 @@ mod tests {
         std::env::var("FASTEN_TEST_POSTGRES_DSN").ok()
     }
 
-    /// Build a minimal Row for testing; fields not exercised here are set
-    /// to sensible defaults.
     fn make_row(id: &str, code: &str) -> crate::Row {
         use chrono::Utc;
         crate::Row {
@@ -480,8 +466,6 @@ mod tests {
         format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
     }
 
-    // ── insert + idempotency ──────────────────────────────────────────────
-
     #[test]
     fn test_insert_and_query() {
         let Some(dsn) = dsn() else { return };
@@ -491,13 +475,11 @@ mod tests {
 
         let row = make_row("evt-insert-test-00001", "TEST_INSERT");
 
-        // First insert must succeed.
         crate::AuditStore::insert(&store, &row).expect("first insert");
 
-        // Second insert of the same id must be idempotent (ON CONFLICT DO NOTHING).
+        // Same id again: ON CONFLICT DO NOTHING.
         crate::AuditStore::insert(&store, &row).expect("idempotent insert");
 
-        // Verify the row landed by querying directly through the Mutex'd client.
         let mut guard = store.client.lock().unwrap();
         let rows = guard
             .query(
@@ -511,8 +493,6 @@ mod tests {
         assert_eq!(returned_id, row.id);
         assert_eq!(returned_code, row.code);
     }
-
-    // ── schema-qualified table name ───────────────────────────────────────
 
     #[test]
     fn test_schema_qualified_table() {
@@ -533,8 +513,6 @@ mod tests {
             .expect("query schema table");
         assert_eq!(rows.len(), 1);
     }
-
-    // ── tenant_id + shipped_at (nullable columns) ─────────────────────────
 
     #[test]
     fn test_nullable_columns() {
@@ -563,8 +541,6 @@ mod tests {
         assert!(sat.is_some(), "shipped_at should be present");
     }
 
-    // ── pii_in_detail stored as SMALLINT 1 ───────────────────────────────
-
     #[test]
     fn test_pii_in_detail_flag() {
         let Some(dsn) = dsn() else { return };
@@ -588,8 +564,6 @@ mod tests {
         let flag: i16 = rows[0].get(0);
         assert_eq!(flag, 1i16);
     }
-
-    // ── seq allocation (spec §2.1, #92) ──────────────────────────────────
 
     // Two stores on one table, one node, writing at the same time: seqs must
     // be exactly 1..N, with no duplicates or gaps.
@@ -805,8 +779,6 @@ mod tests {
         assert_eq!(defs.len(), 6, "{defs:?}");
     }
 
-    // ── PII redaction (spec §7) ───────────────────────────────────────────
-
     #[test]
     fn test_redact_expired() {
         let Some(dsn) = dsn() else { return };
@@ -976,11 +948,9 @@ mod tests {
         engine.reset_for_tests();
     }
 
-    // ── error mapping ─────────────────────────────────────────────────────
-
     #[test]
     fn test_invalid_table_name_returns_error() {
-        // No DSN needed — validation happens before connecting.
+        // Validation runs before connecting, so no DSN is needed.
         let result = PostgresStore::new("host=localhost user=test", "bad-name!");
         assert!(
             result.is_err(),

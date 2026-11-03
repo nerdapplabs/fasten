@@ -13,11 +13,8 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver used by OpenStreamStore
 )
 
-// StreamRepository is the durable backing for one ring-buffered stream
-// (api or sys). *StreamStore (SQLite) and *PostgresStreamStore both implement
-// it, so Config/Transport can hold either backend behind one type — mirroring
-// how AuditRepository abstracts the audit store. WriteFailures() is
-// intentionally not in the interface (only tests reach for the concrete count).
+// StreamRepository is the store behind one ring-buffered stream (api or sys).
+// *StreamStore (SQLite) and *PostgresStreamStore implement it.
 type StreamRepository interface {
 	Insert(row map[string]any) error
 	Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error)
@@ -29,64 +26,36 @@ type StreamRepository interface {
 	Degraded() bool
 }
 
-// StreamStore is a durable, queryable SQLite backing for one ring-buffered
-// stream (api or sys). Unlike the audit store (typed Row + tamper-evident
-// hash chain), stream rows are schemaless maps produced by the logging/HTTP
-// shims. The full row is persisted as a JSON payload and the queryable
-// fields are duplicated into indexed columns, so the reader can filter by
-// request_id / time / structured fields against durable history instead of a
-// bounded ring.
+// StreamStore is a SQLite store for one stream (api or sys), one table per
+// stream. Each row is stored whole as JSON, with the filterable fields
+// copied into indexed columns. Rows come back newest-first, decoded from the
+// JSON, so numbers come back as float64 where a ring read has the original int.
 //
-// Table per stream — api and sys never share rows. Rows return newest-first,
-// reconstructed from the stored JSON payload, so a store read is equivalent
-// to a ring read in content and ordering. Note JSON decoding normalises
-// number types: all numbers decode to float64 (a ring read returns the
-// original int), so the value is JSON-equivalent, not type-identical.
-//
-// Write cost: persistence is write-through — every pushed row is one
-// synchronous INSERT in its own transaction, on the caller's thread. With
-// WAL + synchronous=NORMAL (set as DSN pragmas by OpenStreamStore) a commit
-// is a WAL append without a per-commit fsync, which keeps a hot api/sys
-// stream viable. Even so this is a per-row disk write: for very hot streams
-// prefer ring-only mode. An async drainer may land later as a follow-up if
-// benchmarks show write-through cost is the bottleneck (the audit path
-// already has one).
-//
-// The caller imports the SQLite driver and opens the *sql.DB, exactly as
-// for NewSQLiteStore. See *PostgresStreamStore for the Postgres backend.
+// Every pushed row is one INSERT on the caller's goroutine. With WAL and
+// synchronous=NORMAL that avoids an fsync per row, but for very hot streams
+// ring-only mode is cheaper.
 type StreamStore struct {
 	db    *sql.DB
 	table string
 
-	// writeFailures counts Insert errors swallowed by the transport (the hot
-	// path never blocks on the sink). Non-zero means durable history has holes,
-	// so the reader degrades the stream's completeness flag from "store" to
-	// "store-degraded" — otherwise the flag would assert durability for rows
-	// that were silently lost. Sticky for the store's lifetime: a hole in
-	// history doesn't heal when the disk recovers.
+	// writeFailures counts Insert errors the transport swallowed. Non-zero
+	// marks the stream "store-degraded" for the life of the store, since the
+	// missing rows don't come back.
 	writeFailures atomic.Int64
 }
 
-// streamIndexedFields are lifted out of the row into indexed columns for
-// filtering; the rest of the row survives in `payload`.
+// streamIndexedFields are copied into indexed columns for filtering.
 var streamIndexedFields = []string{
 	"request_id", "timestamp", "level", "service_id",
 	"event", "method", "path", "status",
 }
 
-// OpenStreamStore opens a SQLite-backed stream store from a DSN and migrates
-// it, setting WAL + synchronous=NORMAL as DSN pragmas so *every* pooled
-// connection gets them. This is the fix for NewStreamStore's caveat below: a
-// PRAGMA issued during migrate lands on a single pooled connection, and the
-// other connections database/sql opens keep the default synchronous=FULL (an
-// fsync per commit). Setting the pragma in the DSN makes modernc.org/sqlite
-// apply it on every connection open — mirroring the Python StreamStore, which
-// sets the pragma on each connection it opens.
+// OpenStreamStore opens a SQLite stream store from a DSN using the
+// modernc.org/sqlite driver. WAL and synchronous=NORMAL go in the DSN so
+// every pooled connection gets them, not just the one migrate runs on.
 //
-// It uses the modernc.org/sqlite driver (pure Go, already the SDK's sqlite
-// dependency). Callers who need a different driver (e.g. mattn/go-sqlite3), or
-// who already own a *sql.DB, should use NewStreamStore(db, tableName) and set
-// the per-connection pragma in their own DSN.
+// For another driver, or an existing *sql.DB, use NewStreamStore and set the
+// pragmas in your own DSN.
 func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 	path, table, err := parseStreamDSN(dsn, tableName)
 	if err != nil {
@@ -104,9 +73,8 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 	return s, nil
 }
 
-// streamPragmaDSN appends the WAL + synchronous=NORMAL pragmas to a modernc
-// sqlite DSN so they apply on every connection open, preserving any existing
-// query parameters.
+// streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc
+// sqlite DSN, keeping any existing query parameters.
 func streamPragmaDSN(dsn string) string {
 	pragmas := "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 	if strings.Contains(dsn, "?") {
@@ -115,17 +83,11 @@ func streamPragmaDSN(dsn string) string {
 	return dsn + "?" + pragmas
 }
 
-// parseStreamDSN normalises a caller-provided DSN into (fs path for modernc
-// sqlite, table override, err). Accepts:
-//   - bare filesystem path: "./streams.db"
-//   - sqlite URL: "sqlite:///./rel.db" (three slashes = relative),
+// parseStreamDSN returns the file path and table name for a DSN. Accepts:
+//   - a bare path: "./streams.db"
+//   - a sqlite URL: "sqlite:///./rel.db" (three slashes = relative),
 //     "sqlite:////abs/path.db" (four = absolute)
-//   - "?table=X" query param to override the default table on either form
-//
-// Fixes PR #59 finding 11: earlier code passed the raw DSN through to
-// sql.Open("sqlite", ...) which fails to open sqlite:/// URLs and silently
-// ignored ?table= — Python's own error message recommends sqlite:///, so
-// the two SDKs disagreed on the same DSN.
+//   - "?table=X" on a sqlite URL to override the default table
 func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 	table := defaultTable
 	path := dsn
@@ -135,9 +97,8 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 			return "", "", fmt.Errorf("fasten StreamStore: invalid sqlite DSN %q: %w", dsn, err)
 		}
 		path = u.Path
-		// URL-encoded path strips only the single URL-separator slash:
-		// sqlite:///rel.db → "/rel.db" → "rel.db" (relative);
-		// sqlite:////abs.db → "//abs.db" → "/abs.db" (absolute).
+		// Strip the one separator slash: sqlite:///rel.db gives "rel.db",
+		// sqlite:////abs.db gives "/abs.db".
 		if strings.HasPrefix(path, "/") {
 			path = path[1:]
 		}
@@ -145,9 +106,8 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 			table = t
 		}
 	} else if strings.Contains(dsn, "://") {
-		// A URL-shaped DSN that isn't sqlite:// — likely a Postgres/MySQL DSN
-		// that shouldn't have reached here. Reject rather than treating as a
-		// filesystem path (the SQLite driver would fail confusingly).
+		// Probably a Postgres or MySQL DSN; reject it rather than treat it as
+		// a file path.
 		return "", "", fmt.Errorf(
 			"fasten StreamStore: DSN scheme not supported for SQLite backend "+
 				"(dsn=%q). Use sqlite:///./path.db or a bare filesystem path.", dsn)
@@ -158,16 +118,13 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 	return path, table, nil
 }
 
-// NewStreamStore creates and migrates a per-stream table on an
-// already-opened *sql.DB, then returns the store. tableName must be a plain
-// SQL identifier (see validIdentifierRe).
+// NewStreamStore creates the stream table on db if needed and returns the
+// store. tableName must be a plain SQL identifier (see validIdentifierRe).
 //
-// Caveat: migrate sets PRAGMA synchronous=NORMAL, but that pragma is
-// per-connection and database/sql pools connections — set it in the DSN so
-// every pooled connection gets it (e.g. mattn/go-sqlite3:
-// "file:app.db?_synchronous=NORMAL"; modernc.org/sqlite:
-// "file:app.db?_pragma=synchronous(NORMAL)"). OpenStreamStore does this
-// automatically for the modernc driver.
+// migrate sets synchronous=NORMAL on only one pooled connection, so set it
+// in the DSN as well (mattn/go-sqlite3: "file:app.db?_synchronous=NORMAL";
+// modernc.org/sqlite: "file:app.db?_pragma=synchronous(NORMAL)").
+// OpenStreamStore does this for you.
 func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten StreamStore: tableName is required")
@@ -185,12 +142,8 @@ func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 }
 
 func (s *StreamStore) migrate() error {
-	// synchronous=NORMAL is the standard WAL pairing: commits append to the
-	// WAL without a per-commit fsync (the WAL is synced at checkpoints), which
-	// matters because Insert runs one commit per pushed row. In WAL mode
-	// NORMAL still guarantees database consistency after a crash; the tail of
-	// unsynced commits may be lost, which is acceptable for stream rows (the
-	// tamper-evident audit chain has its own store and drainer).
+	// With WAL, synchronous=NORMAL skips the fsync per commit. A crash can
+	// lose the last few stream rows but leaves the database consistent.
 	ddl := fmt.Sprintf(`
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -222,7 +175,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_sts ON %s(status);
 	return err
 }
 
-// Insert write-through persists a single stream row. Newest rows sort first.
+// Insert stores one stream row.
 func (s *StreamStore) Insert(row map[string]any) error {
 	payload, err := marshalStreamPayload(row)
 	if err != nil {
@@ -239,25 +192,23 @@ func (s *StreamStore) Insert(row map[string]any) error {
 	return err
 }
 
-// NoteWriteFailure records that a persist attempt for this store was
-// swallowed. Called by the transport at the swallow point, so callers that
-// handle an Insert error themselves don't mark the store degraded.
+// NoteWriteFailure records a swallowed Insert error. The transport calls it,
+// so callers that handle Insert errors themselves don't mark the store
+// degraded.
 func (s *StreamStore) NoteWriteFailure() { s.writeFailures.Add(1) }
 
 // WriteFailures returns how many persist attempts were swallowed.
 func (s *StreamStore) WriteFailures() int64 { return s.writeFailures.Load() }
 
-// Degraded reports whether durable history has known holes (at least one
-// swallowed persist failure). Drives the "store-degraded" completeness flag.
+// Degraded reports whether any Insert error was swallowed, which makes the
+// stream "store-degraded".
 func (s *StreamStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 
-// whereClause builds the shared WHERE for Query/CountMatching: equality on
-// indexed columns (only streamIndexedFields are honoured) plus an optional
-// [since, until] window on timestamp.
+// whereClause builds the WHERE for Query and CountMatching: equality on
+// streamIndexedFields plus an optional [since, until] window.
 func (s *StreamStore) whereClause(eq map[string]string, since, until string) (string, []any) {
 	var conds []string
 	var args []any
-	// Deterministic clause order for stable, testable SQL.
 	keys := make([]string, 0, len(eq))
 	for k := range eq {
 		keys = append(keys, k)
@@ -270,9 +221,7 @@ func (s *StreamStore) whereClause(eq map[string]string, since, until string) (st
 		conds = append(conds, fmt.Sprintf("%s = ?", k))
 		args = append(args, eq[k])
 	}
-	// COALESCE so a NULL (timestamp-less) row sorts as "" — matching the ring,
-	// which treats a missing timestamp as empty string. Without this a NULL row
-	// is excluded by `<= until` in SQL but included in the ring.
+	// The ring treats a missing timestamp as "", so do the same here.
 	if since != "" {
 		conds = append(conds, "COALESCE(timestamp, '') >= ?")
 		args = append(args, since)
@@ -287,9 +236,7 @@ func (s *StreamStore) whereClause(eq map[string]string, since, until string) (st
 	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
-// Query returns up to limit rows newest-first, filtered by equality on the
-// given indexed columns plus an optional [since, until] window on timestamp.
-// Mirrors the ring's exact-match filter semantics so store and ring agree.
+// Query returns up to limit rows newest-first, filtered as in whereClause.
 func (s *StreamStore) Query(limit int, eq map[string]string, since, until string) ([]map[string]any, error) {
 	where, args := s.whereClause(eq, since, until)
 	args = append(args, limit)
@@ -316,9 +263,8 @@ func (s *StreamStore) Query(limit int, eq map[string]string, since, until string
 	return out, rows.Err()
 }
 
-// CountMatching returns the total number of rows matching the same filters
-// as Query, without a limit — so a capped read can report how much history
-// it truncated (the /correlate totals).
+// CountMatching counts rows matching the same filters as Query, without a
+// limit, so a capped read can report truncation.
 func (s *StreamStore) CountMatching(eq map[string]string, since, until string) (int, error) {
 	where, args := s.whereClause(eq, since, until)
 	var n int
@@ -335,16 +281,9 @@ func (s *StreamStore) Count() (int, error) {
 	return n, err
 }
 
-// Purge deletes rows older than before (a canonical UTC ISO-8601 string) and
-// returns how many were removed. Per-stream retention pruning (FR1): api/sys
-// run 10-100x audit volume, so their history is trimmed by age. Unlike audit,
-// stream rows have no ship/replication lifecycle, so this is an unconditional
-// age-based delete backed by idx_<table>_ts.
-//
-// Rows with a NULL/absent timestamp are never purged (timestamp < ? is never
-// true for NULL) — the age of a timestamp-less row is unknown, so it is kept
-// rather than silently dropped. The comparison is lexicographic, matching the
-// read window; keep before in the same canonical UTC form as stored timestamps.
+// Purge deletes rows with a timestamp before `before` (canonical form) and
+// returns how many were removed. Rows without a timestamp are kept, since
+// their age is unknown.
 func (s *StreamStore) Purge(before string) (int64, error) {
 	res, err := s.db.Exec(
 		fmt.Sprintf("DELETE FROM %s WHERE timestamp < ?", s.table), before,
@@ -355,12 +294,9 @@ func (s *StreamStore) Purge(before string) (int64, error) {
 	return res.RowsAffected()
 }
 
-// Search is the FR3 escape hatch: a case-insensitive substring scan over the
-// persisted row text inside a mandatory [since, until] window, newest-first,
-// hard-capped, with NO relevance ranking. For "I only have an error string"
-// when structured field discovery can't help. q is matched against the full
-// serialized row (payload); LIKE wildcards (% _ \) are escaped so they match
-// literally. Mirrors the Python StreamStore.search contract.
+// Search does a case-insensitive substring match of q against the stored
+// JSON of each row since `since` (and up to `until` if set), newest-first,
+// with no ranking. LIKE wildcards in q match literally.
 func (s *StreamStore) Search(q, since, until string, limit int) ([]map[string]any, error) {
 	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(q))
 	conds := []string{"COALESCE(timestamp,'') >= ?", "lower(payload) LIKE ? ESCAPE '\\'"}
@@ -394,13 +330,9 @@ func (s *StreamStore) Search(q, since, until string, limit int) ([]map[string]an
 	return out, rows.Err()
 }
 
-// marshalStreamPayload serialises a stream row without HTML-escaping. Go's
-// default json.Marshal escapes '<', '>', '&' to < etc; Python's
-// stream store writes UTF-8 literals via ensure_ascii=False. Without this
-// parity Insert-writing "<foo>" would land as `"<foo>"` in
-// Go-backed tables and `"<foo>"` in Python-backed ones, and
-// search(q="<foo>") would return different rows depending on which SDK
-// wrote them. Sibling of Python's json.dumps(..., ensure_ascii=False).
+// marshalStreamPayload encodes a row as JSON without escaping '<', '>' and
+// '&', the way the Python SDK writes it, so a search for "<foo>" matches
+// rows from either SDK.
 func marshalStreamPayload(row map[string]any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -408,8 +340,7 @@ func marshalStreamPayload(row map[string]any) ([]byte, error) {
 	if err := enc.Encode(row); err != nil {
 		return nil, err
 	}
-	// Encode() appends a trailing newline; strip it so the stored payload
-	// matches json.Marshal's output byte-for-byte apart from the escaping.
+	// Drop the newline Encode adds.
 	b := buf.Bytes()
 	if n := len(b); n > 0 && b[n-1] == '\n' {
 		b = b[:n-1]
@@ -426,8 +357,7 @@ func isStreamIndexed(col string) bool {
 	return false
 }
 
-// strOrNil returns the string value at key, or nil so the column stores NULL
-// rather than an empty string when the field is absent.
+// strOrNil returns row[key], or nil if absent so the column stores NULL.
 func strOrNil(row map[string]any, key string) any {
 	if v, ok := row[key]; ok {
 		if s, ok := v.(string); ok {

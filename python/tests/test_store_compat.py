@@ -1,5 +1,4 @@
-"""
-Backend-compatibility suite: same tests run against SQLite and PostgreSQL.
+"""Runs the same store tests against SQLite and PostgreSQL.
 
 The ``store`` fixture is parametrized over ``["sqlite", "postgres"]``.
 Postgres is skipped at collection time unless FASTEN_TEST_POSTGRES_DSN is set:
@@ -25,9 +24,8 @@ def _unique_id() -> str:
 
 
 def make_row(**overrides):
-    # origin_id defaults to id (originated semantics) so store.insert — a thin
-    # alias for insert_originated — accepts these rows. Tests that need a
-    # replicated row (origin_id != id) override origin_id explicitly.
+    # origin_id defaults to id because store.insert (insert_originated)
+    # only accepts originated rows.
     row_id = overrides.get("id", _unique_id())
     defaults = dict(
         id=row_id,
@@ -57,7 +55,7 @@ def store(request):
     if request.param == "postgres":
         dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
         if not dsn:
-            pytest.skip("FASTEN_TEST_POSTGRES_DSN not set — skipping Postgres tests")
+            pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
         from fasten.store.postgres import PostgresStore
         import psycopg
 
@@ -71,9 +69,7 @@ def store(request):
         yield SQLiteStore(":memory:")
 
 
-# ---------------------------------------------------------------------------
-# INSERT / QUERY
-# ---------------------------------------------------------------------------
+# Insert and query
 
 def test_insert_and_query_by_request_id(store):
     rid = mint_id()
@@ -123,9 +119,7 @@ def test_round_trip_detail_json(store):
     assert back.detail == detail
 
 
-# ---------------------------------------------------------------------------
-# COUNT
-# ---------------------------------------------------------------------------
+# Count
 
 def test_count_empty(store):
     assert store.count() == 0
@@ -140,9 +134,7 @@ def test_count_filtered(store):
     assert store.count(code="USER_DELETED") == 1
 
 
-# ---------------------------------------------------------------------------
-# OUTBOX (list_unshipped / mark_shipped)
-# ---------------------------------------------------------------------------
+# Outbox (list_unshipped / mark_shipped)
 
 def test_list_unshipped(store):
     row = make_row()
@@ -167,9 +159,7 @@ def test_mark_shipped_sets_timestamp(store):
     assert back.shipped_at is not None
 
 
-# ---------------------------------------------------------------------------
-# PURGE
-# ---------------------------------------------------------------------------
+# Purge
 
 def test_purge_respects_unshipped(store):
     old = make_row(timestamp=datetime.now(timezone.utc) - timedelta(days=31))
@@ -195,9 +185,7 @@ def test_purge_force(store):
     assert deleted == 1
 
 
-# ---------------------------------------------------------------------------
 # max_monotonic_seq
-# ---------------------------------------------------------------------------
 
 def test_max_monotonic_seq_empty(store):
     assert store.max_monotonic_seq() == 0
@@ -209,12 +197,10 @@ def test_max_monotonic_seq_returns_max(store):
     assert store.max_monotonic_seq() == 7
 
 
-# ---------------------------------------------------------------------------
-# Table naming flexibility (Postgres-only)
-# ---------------------------------------------------------------------------
+# Table naming (Postgres only)
 
 def test_postgres_schema_qualified_table():
-    """fasten.audit_log — table lives in a dedicated 'fasten' schema."""
+    """Table in a dedicated 'fasten' schema, e.g. fasten.audit_log."""
     dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
@@ -234,7 +220,7 @@ def test_postgres_schema_qualified_table():
 
 
 def test_postgres_fasten_prefix_table():
-    """fasten_audit_log — user's DB, no new schema, fasten_ prefix avoids clashes."""
+    """Table in the default schema with a fasten_ prefix, e.g. fasten_audit_log."""
     dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
@@ -251,29 +237,26 @@ def test_postgres_fasten_prefix_table():
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
-# ---------------------------------------------------------------------------
-# QUERY ORDERING ACROSS SUB-CHAINS (#68)
-# ---------------------------------------------------------------------------
+# Query ordering across sub-chains (GitHub #68)
 
 def test_query_orders_by_time_across_sub_chains(store):
-    """monotonic_seq is a per-(service_id, source_node_id) counter — comparing
-    it across sub-chains is meaningless. Global query() must order by
-    wall-clock first, so a chatty old chain's high counters cannot bury a
-    quieter chain's newer rows below the page limit (#68)."""
+    """monotonic_seq is per (service_id, source_node_id), so it can't be
+    compared across sub-chains. query() orders by timestamp first, so one
+    chain's high counters don't push another chain's newer rows off the page."""
     now = datetime.now(timezone.utc)
-    # Chain A: an older, chattier writer — high seq, day-old timestamps.
+    # Chain A: high seq, day-old timestamps.
     for i in range(5):
         store.insert(make_row(service_id="svc-a", source_node_id="node-a",
                               monotonic_seq=100 + i,
                               timestamp=now - timedelta(days=1, minutes=5 - i)))
-    # Chain B: a fresh writer — counter restarted at 1, current timestamps.
+    # Chain B: seq from 1, current timestamps.
     for i in range(3):
         store.insert(make_row(service_id="svc-b", source_node_id="node-b",
                               monotonic_seq=1 + i,
                               timestamp=now - timedelta(minutes=3 - i)))
 
     page = store.query(limit=4)
-    # Newest wall-clock rows come first: all of chain B precedes any of chain A.
+    # All of chain B comes before any of chain A.
     assert [r.source_node_id for r in page[:3]] == ["node-b"] * 3
     stamps = [r.timestamp for r in page]
     assert stamps == sorted(stamps, reverse=True)

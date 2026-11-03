@@ -1,8 +1,4 @@
-"""Coverage for Engine.init() error paths and accessor methods.
-
-Tests in this file target the lines that fall outside the happy-path
-fixture in conftest.py.
-"""
+"""Engine.init() error paths and accessors not covered by the conftest fixture."""
 from __future__ import annotations
 
 import logging
@@ -13,7 +9,7 @@ import fasten
 from fasten.emitter import _default
 
 
-# ── init() error paths ────────────────────────────────────────────────────
+# init() error paths
 
 
 def test_init_raises_when_service_id_missing(mem_store):
@@ -27,8 +23,7 @@ def test_init_raises_when_node_id_missing(mem_store):
 
 
 def test_init_stdout_only_when_no_audit_store_and_no_dsn(monkeypatch):
-    """No store and no DSN → stdout-only mode: init() succeeds without persisting.
-    AuditStore is optional here, matching Go/JS/Rust."""
+    """No store and no DSN: stdout-only mode, init() succeeds without persisting."""
     monkeypatch.delenv("FASTEN_AUDIT_DSN", raising=False)
     fasten.init(service_id="svc", node_id="n")
     assert _default._audit_store is None
@@ -44,7 +39,7 @@ def test_init_raises_on_invalid_strategy(mem_store):
         )
 
 
-# ── init() with env-based DSN ─────────────────────────────────────────────
+# init() with env-based DSN
 
 
 def test_init_reads_dsn_from_env(monkeypatch):
@@ -53,17 +48,13 @@ def test_init_reads_dsn_from_env(monkeypatch):
     assert _default._audit_store is not None
 
 
-# ── init() seq seeding from store ─────────────────────────────────────────
+# init() seq seeding from store
 
 
 def test_post_restart_rows_continue_the_node_sequence(mem_store):
-    """Post-restart rows must never reuse a pre-restart monotonic_seq.
+    """Post-restart rows never reuse a pre-restart monotonic_seq.
 
-    Previously the Engine seeded a private `_seq` from max_monotonic_seq() at
-    init. It no longer holds chain state at all — the store allocates inside
-    the insert transaction (spec §2.1). The guarantee is unchanged, so this
-    asserts the guarantee rather than the mechanism: it would catch a
-    regression in either implementation.
+    The store allocates seq inside the insert transaction (spec §2.1).
     """
     from datetime import datetime, timezone
     from fasten.attrs import AuditRow
@@ -107,7 +98,7 @@ def test_post_restart_rows_continue_the_node_sequence(mem_store):
     assert verify_chain(sealed).ok
 
 
-# ── accessors ─────────────────────────────────────────────────────────────
+# accessors
 
 
 def test_audit_store_accessor_returns_store(initialized, mem_store):
@@ -125,12 +116,12 @@ def test_last_init_at_is_set_after_init(initialized):
     assert ts is not None
 
 
-# ── re-init flushes old drainer ───────────────────────────────────────────
+# re-init flushes old drainer
 
 
 def test_reinit_flushes_old_drainer_before_replacing(mem_store):
-    """Calling init() twice in queue mode must flush + stop the first drainer
-    before installing the second one — no rows dropped."""
+    """A second init() in queue mode flushes and stops the first drainer
+    before installing the new one, so no rows are dropped."""
     import threading
     received = []
     lock = threading.Lock()
@@ -162,7 +153,7 @@ def test_reinit_flushes_old_drainer_before_replacing(mem_store):
     assert len(received) >= 1
 
 
-# ── atexit flush ──────────────────────────────────────────────────────────
+# atexit flush
 
 
 def test_atexit_flush_noop_when_no_drainer():
@@ -198,7 +189,7 @@ def test_atexit_flush_drains_pending(mem_store):
     assert len(store.rows) >= 1
 
 
-# ── stdlib logger fallback ────────────────────────────────────────────────
+# stdlib logger fallback
 
 
 def test_log_falls_back_to_stdlib_before_init(caplog):
@@ -208,25 +199,14 @@ def test_log_falls_back_to_stdlib_before_init(caplog):
     assert any("startup_probe" in r.message for r in caplog.records)
 
 
-# ── issue #36: datetime round-trip through the drainer ───────────────────
+# Datetime round-trip through the drainer (#36)
 
 
 def test_issue_36_drainer_reconstructs_datetime_from_json_roundtrip():
-    """Regression for #36.
-
-    fasten.emit -> JSON -> Rust queue -> Python _insert_cb is the
-    audit row's round-trip through the drainer. After json.loads(),
-    ``timestamp`` arrives as an ISO string, not a ``datetime``. Any
-    store implementation that calls ``_utc_iso(row.timestamp)`` (both
-    PostgresStore and SQLiteStore do) then crashes on
-    ``AttributeError: 'str' has no attribute 'tzinfo'`` — and because
-    ``_insert_cb`` swallows exceptions and returns 1, the row is
-    silently dead-lettered after retry-exhaustion.
-
-    The fix reconstructs the two datetime fields in ``_insert_cb``
-    before constructing ``AuditRow``. This test exercises the
-    queue-mode path end-to-end and asserts the store receives the
-    row with a real datetime instance (not a str).
+    """In queue mode a row goes emit -> JSON -> fasten-core queue ->
+    ``_insert_cb``, so ``timestamp`` arrives as a string. ``_insert_cb`` must
+    turn it back into a datetime before building the AuditRow, or the store's
+    ``_utc_iso(row.timestamp)`` fails and the row is dead-lettered.
     """
     from datetime import datetime as _datetime
 
@@ -250,7 +230,7 @@ def test_issue_36_drainer_reconstructs_datetime_from_json_roundtrip():
 
     assert len(received) == 1, (
         "row should land via the drainer's _insert_cb; if zero, the "
-        "drainer dead-lettered the row after exception (the #36 bug)"
+        "drainer dead-lettered the row after an exception"
     )
     row = received[0]
     assert isinstance(row.timestamp, _datetime), (
@@ -264,12 +244,12 @@ def test_issue_36_drainer_reconstructs_datetime_from_json_roundtrip():
     )
 
 
-# ── sync fallback with no drainer ─────────────────────────────────────────
+# sync fallback with no drainer
 
 
 def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
-    """Queue mode + drainer uninstalled → emit() falls back to sync insert.
-    A sink failure must emit audit_sync_fallback_failed via drainer syslog."""
+    """Queue mode with no drainer: emit() falls back to a sync insert, and a
+    store failure writes audit_sync_fallback_failed to the drainer syslog."""
     from fasten.emitter import _default as eng
 
     class _BrokenStore:
@@ -302,9 +282,9 @@ def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
 
 
 def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_notifier():
-    """PR #59 finding 3: an adopter AuditRepository doesn't have to implement
-    note_write_failure — the swallow must still land on the engine flag, or
-    completeness reports 'store' over a store that just lost a row."""
+    """An adopter AuditRepository need not implement note_write_failure. A
+    swallowed write still sets the engine flag, so completeness reports
+    'store-degraded'."""
     pytest.importorskip("fastapi")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -312,8 +292,7 @@ def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_noti
     from fasten.emitter import _default as eng
 
     class _AdopterStore:
-        """AuditRepository shape but no note_write_failure / degraded — the
-        documented extension point (adopter-supplied audit store)."""
+        """AuditRepository shape without note_write_failure / degraded."""
         def insert(self, row) -> None:
             raise RuntimeError("adopter store down")
         def count(self, **_) -> int:
@@ -338,6 +317,5 @@ def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_noti
     app.include_router(build_router(dependencies=[]), prefix="/api/v1/logs")
     resp = TestClient(app).get("/api/v1/logs/audit?limit=1")
     assert resp.status_code == 200
-    # Was reporting 'store' before the fix — 'store-degraded' proves the
-    # engine-side flag flows into the reader.
+    # The engine-side flag reaches the reader.
     assert resp.json()["completeness"] == {"audit": "store-degraded"}

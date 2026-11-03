@@ -1,19 +1,12 @@
-/**
- * core.js — the pure-JS fasten-core surface. No native dependencies,
- * no Rust toolchain, no FASTEN_CORE_LIB env var.
- *
- * Implements:
- *   - Key-pattern redaction (mirrors spec/row-schema.json x-fasten-redact)
- *   - Code catalog validation (UPPER_SNAKE_CASE, id-mismatch, domain-mismatch,
- *     duplicate) with the same error codes as the Rust ABI
- */
+// Redaction and code-catalog validation in plain JS (no native library).
+// Error codes match fasten-core's C ABI.
 
-// ── Redaction ─────────────────────────────────────────────────────────────
+// --- Redaction -------------------------------------------------------------
 
 const REDACT_REPLACEMENT = "***";
 
-// Patterns from spec/row-schema.json x-fasten-redact.patterns — case-insensitive
-// match on object keys (not values). Keep in sync with the spec.
+// Matched against object keys, case-insensitive. Keep in sync with
+// x-fasten-redact.patterns in spec/row-schema.json.
 const _DEFAULT_PATTERNS = [
 	/api[_-]?key/i,
 	/password/i,
@@ -31,9 +24,8 @@ const _DEFAULT_PATTERNS = [
 	/credential/i,
 ];
 
-// Value-shape patterns (P1-24) — applied to string values after key-pattern pass.
-// Order and patterns mirror the canonical Rust implementation in fasten-core/src/redact.rs.
-// All patterns are substring-matching (no anchors): a secret embedded in a log string is detected.
+// Matched against string values, anywhere in the string. Same order as
+// fasten-core/src/redact.rs.
 const _VALUE_SHAPE_RULES = [
 	// JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)
 	[/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "***JWT***"],
@@ -44,7 +36,7 @@ const _VALUE_SHAPE_RULES = [
 	],
 	// AWS access key: permanent AKIA or short-lived ASIA
 	[/(?:AKIA|ASIA)[A-Z0-9]{16}/, "***AWS_KEY***"],
-	// GitHub token: ghp (personal) / gho (OAuth) / ghu (user-to-server) / ghs (server-to-server) / ghr (refresh)
+	// GitHub tokens
 	[/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/, "***GH_TOKEN***"],
 	// Stripe live secret key
 	[/sk_live_[A-Za-z0-9]{24,}/, "***STRIPE_KEY***"],
@@ -52,7 +44,7 @@ const _VALUE_SHAPE_RULES = [
 	[/sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
 ];
 
-// CC: 13–19 digit groups with optional space/dash separators — Luhn-guarded.
+// Card numbers: 13 to 19 digits, optional spaces or dashes, Luhn-checked.
 const _CC_DIGIT_RE = /\b\d[\d\s-]{11,17}\d\b/;
 
 function _luhn(digits) {
@@ -70,7 +62,7 @@ function _luhn(digits) {
 }
 
 function _checkValueShape(s) {
-	// CC check first — Luhn guard prevents order-number false positives.
+	// The Luhn check keeps order numbers and similar ids from matching.
 	const ccMatch = _CC_DIGIT_RE.exec(s);
 	if (ccMatch) {
 		const digits = ccMatch[0].replace(/[\s-]/g, "");
@@ -118,7 +110,7 @@ export function coreRedact(inJson) {
 /**
  * Redact with optional extra key patterns and a custom replacement string.
  * extraKeysJson: JSON array of regex strings (e.g. '["my_secret","ssn"]')
- * replacement:   string to substitute (null → "***")
+ * replacement:   string to substitute (null means "***")
  */
 export function coreRedactFull(inJson, extraKeysJson, replacement) {
 	const rep = replacement ?? REDACT_REPLACEMENT;
@@ -135,11 +127,11 @@ export function coreRedactFull(inJson, extraKeysJson, replacement) {
 	return JSON.stringify(_redactObj(obj, patterns, rep));
 }
 
-// ── Catalog registry + validation ─────────────────────────────────────────
+// --- Catalog ---------------------------------------------------------------
 
 const UPPER_SNAKE_RE = /^[A-Z][A-Z0-9_]*$/;
 
-// Error codes mirror the Rust ABI constants (fasten_store_core.h FASTEN_ERR_*).
+// FASTEN_ERR_* in fasten-core/include/fasten_core.h.
 const ERR = {
 	INVALID_KEY: 6,
 	ID_MISMATCH: 7,
@@ -147,25 +139,21 @@ const ERR = {
 	DUPLICATE_CODE: 9,
 };
 
-// In-process canonical registry used by coreMetaOf / coreRegistryClear.
-// index.js maintains its own _registry populated from this via coreMetaOf.
+// index.js keeps its own copy, filled from here through coreMetaOf.
 const _coreRegistry = new Map();
 
 function _err(msg, code) {
 	const e = new Error(msg);
-	e.rustCode = code;
+	e.catalogCode = code;
 	return e;
 }
 
 /**
- * Validate and register a batch of codes for a domain.
- * Throws with .rustCode set on violation — same error contract as the Rust ABI.
- * Normalization applied: id filled from key; retention_class forced to "short"
- * when pii_in_detail=true.
+ * Validate and register codes for a domain. Nothing is registered if any
+ * code fails. Errors carry .catalogCode. pii codes get retention "short".
  */
 export function coreRegisterCodes(domain, codesJson) {
 	const codes = JSON.parse(codesJson);
-	// Full validation pass before any mutation.
 	for (const [id, meta] of Object.entries(codes)) {
 		if (!UPPER_SNAKE_RE.test(id))
 			throw _err(`code key "${id}" must be UPPER_SNAKE_CASE`, ERR.INVALID_KEY);
@@ -182,7 +170,6 @@ export function coreRegisterCodes(domain, codesJson) {
 		if (_coreRegistry.has(id))
 			throw _err(`duplicate code: "${id}"`, ERR.DUPLICATE_CODE);
 	}
-	// Commit with normalization (all validation passed).
 	for (const [id, meta] of Object.entries(codes)) {
 		const pii = !!meta.pii_in_detail;
 		_coreRegistry.set(id, {
@@ -201,7 +188,7 @@ export function coreMetaOf(code) {
 	return m ? JSON.stringify(m) : null;
 }
 
-/** Wipe the registry — for test teardown only. */
+/** Test teardown only. */
 export function coreRegistryClear() {
 	_coreRegistry.clear();
 }

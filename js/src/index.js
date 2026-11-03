@@ -1,11 +1,4 @@
-/**
- * fasten — audit + correlation SDK for Node.js.
- *
- * Same shape as the Python + Go references: 6 anchors (5 Ws + H) +
- * correlation, opt-in shims, pluggable store, mountable reader.
- *
- * See ../README.md for the full design.
- */
+// fasten audit and correlation SDK for Node.js. See ../README.md.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
@@ -25,10 +18,8 @@ export function mintID() {
 }
 
 export function currentRequestID() {
-	// Only a non-empty string counts as a caller-supplied id. A non-string (e.g.
-	// a number passed to withRequestID) is treated as missing, so the emit path
-	// mints a real id instead of stamping the wrong type onto the row — parity
-	// with the Python (isinstance) and Go (.(string)) guards.
+	// A non-string id (e.g. a number passed to withRequestID) counts as
+	// missing, so emit mints a new one instead of writing the wrong type.
 	const rid = als.getStore()?.requestId;
 	return typeof rid === "string" && rid ? rid : null;
 }
@@ -40,20 +31,15 @@ export function withRequestID(requestId, fn) {
 // --- Code catalog ---------------------------------------------------------
 
 const _registry = new Map();
-// Codes whose source-of-truth is a yaml file (vs. programmatic register()).
-// Tracked so reload() can drop yaml-removed codes while preserving
-// programmatic registrations. Exported for ./codes_yaml.js.
+// Codes loaded from yaml, so reload() can drop removed ones without
+// touching codes added with register(). Used by codes_yaml.js.
 export const _yamlCodes = new Set();
 
 export function registry() {
 	return _registry;
 }
 
-/**
- * Internal helper for the yaml loader's atomic swap on reload. Replaces
- * every entry of the registry and the yaml-codes set. Not part of the
- * public API; codes_yaml.js uses it under the hood.
- */
+// Used by codes_yaml.js reload() to swap in the new registry.
 export function _resetRegistryForReload(newRegistry, newYamlCodes) {
 	_registry.clear();
 	for (const [k, v] of newRegistry) _registry.set(k, v);
@@ -61,8 +47,9 @@ export function _resetRegistryForReload(newRegistry, newYamlCodes) {
 	for (const k of newYamlCodes) _yamlCodes.add(k);
 }
 
-// Domain is a plain string — adopters define their own vocabulary.
-export const Domain = {}; // kept for import compatibility; intentionally empty
+// Domain is a plain string chosen by the adopter. Kept so existing
+// imports don't break.
+export const Domain = {};
 
 // ── FASTEN GENERATED ─ source: spec/row-schema.json ─ run: python spec/codegen.py ──
 export const Severity = Object.freeze({
@@ -96,8 +83,7 @@ export const Method = Object.freeze({
 
 export const REDACT_REPLACEMENT = "***";
 
-// Catalog error codes — numeric like HTTP status codes.
-// Values mirror fasten_store_core.h FASTEN_ERR_* constants.
+// Same values as FASTEN_ERR_* in fasten-core/include/fasten_core.h.
 export const CATALOG_ERR = Object.freeze({
 	BACKEND: 1,
 	BAD_JSON: 3,
@@ -115,8 +101,7 @@ export class AuditCatalogError extends Error {
 	}
 }
 
-// Convert Rust snake_case meta JSON → JS camelCase meta object.
-function _rustMetaToJs(rm) {
+function _metaFromCore(rm) {
 	return {
 		id: rm.id,
 		domain: rm.domain,
@@ -134,36 +119,29 @@ function _rustMetaToJs(rm) {
 }
 
 /**
- * Register a batch of codes for a domain.
- *
- * Adopters write the code id once — as the dict key. The SDK fills
- * `meta.id` from the key at register time. Setting `meta.id` explicitly
- * is allowed but must match the key (mismatch is a typo, never a feature).
+ * Register codes for a domain. The object key is the code id; `meta.id`
+ * may be set but must match it.
  *
  *     register('user', {
- *         USER_CREATED: { domain: 'user', action: 'create',
- *                         severity: 'info', ... },
+ *         USER_CREATED: { domain: 'user', action: 'create', severity: 'info' },
  *     });
  *
- * Validation (UPPER_SNAKE_CASE, id-mismatch, domain-mismatch, duplicate)
- * is delegated to fasten-core (Rust) so the logic is canonical across all
- * SDKs. Throws AuditCatalogError with a numeric .code on violation.
+ * Throws AuditCatalogError (with a numeric .code) on a bad key, id or
+ * domain mismatch, or a duplicate.
  */
 export function register(domain, codes) {
 	const codesObj = {};
 	for (const [id, meta] of Object.entries(codes)) {
-		// Normalize retention class — accept both camelCase and snake_case input.
 		const rc =
 			meta.retentionClass ?? meta.retention_class ?? RetentionClass.MEDIUM;
 		const pii = !!(meta.piiInDetail ?? meta.pii_in_detail);
-		// Emit pii_in_detail warning in JS before Rust silently forces SHORT.
+		// core.js forces SHORT for pii codes; say so instead of doing it silently.
 		if (pii && rc !== RetentionClass.SHORT) {
 			console.warn(
 				`fasten: code ${id} has piiInDetail=true; ` +
 					`retentionClass forced to SHORT (was ${String(rc).toUpperCase()}).`,
 			);
 		}
-		// Fast-path JS duplicate check before calling Rust.
 		if (_registry.has(id)) {
 			throw new AuditCatalogError(
 				`register: duplicate code '${id}'`,
@@ -186,17 +164,15 @@ export function register(domain, codes) {
 				meta.detailPassthroughKeys ?? meta.detail_passthrough_keys ?? [],
 		};
 	}
-	// Delegate UPPER_SNAKE_CASE, id-mismatch, domain-mismatch, duplicate to Rust.
 	try {
 		coreRegisterCodes(domain, JSON.stringify(codesObj));
 	} catch (e) {
-		throw new AuditCatalogError(e.message, e.rustCode ?? 0);
+		throw new AuditCatalogError(e.message, e.catalogCode ?? 0);
 	}
-	// Populate JS registry from Rust-validated canonical state.
 	for (const id of Object.keys(codes)) {
 		const metaJson = coreMetaOf(id);
 		if (metaJson && metaJson !== "{}") {
-			_registry.set(id, _rustMetaToJs(JSON.parse(metaJson)));
+			_registry.set(id, _metaFromCore(JSON.parse(metaJson)));
 		}
 	}
 }
@@ -213,8 +189,8 @@ export function dump() {
 		.join("\n");
 }
 
-// Clear both registries — for test teardown only.
-export function _clearRustRegistry() {
+// Test teardown only. Clears the core.js registry.
+export function _clearCoreRegistry() {
 	coreRegistryClear();
 }
 
@@ -240,7 +216,7 @@ export class Engine {
 		failureStrategy: "queue",
 	};
 	#seq = 0;
-	_drainer = null; // accessible by audit_queue.js shims via _setDefaultEngine
+	_drainer = null; // also read by the audit_queue.js helpers
 
 	init(opts = {}) {
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
@@ -310,7 +286,15 @@ export class Engine {
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 		const extraKeys = cfg.extraRedactKeys;
-		const redactRepl = cfg.redactReplacement; // null → core default "***"
+		const redactRepl = cfg.redactReplacement; // null means "***"
+		const redact = (obj) => {
+			const json = JSON.stringify(obj);
+			return JSON.parse(
+				extraKeys.length || redactRepl
+					? coreRedactFull(json, JSON.stringify(extraKeys), redactRepl)
+					: coreRedact(json),
+			);
+		};
 		let outDetail;
 		if (meta.piiInDetail) {
 			const passthrough = new Set(meta.detailPassthroughKeys ?? []);
@@ -318,23 +302,13 @@ export class Engine {
 			for (const [k, v] of Object.entries(detail)) {
 				if (passthrough.has(k)) kept[k] = v;
 			}
-			const keptJson = JSON.stringify(kept);
-			const redactedJson =
-				extraKeys.length || redactRepl
-					? coreRedactFull(keptJson, JSON.stringify(extraKeys), redactRepl)
-					: coreRedact(keptJson);
 			outDetail = {
 				_redacted: REDACT_REPLACEMENT,
 				_pii_in_detail: true,
-				...JSON.parse(redactedJson),
+				...redact(kept),
 			};
 		} else {
-			const detailJson = JSON.stringify(detail);
-			const redactedJson =
-				extraKeys.length || redactRepl
-					? coreRedactFull(detailJson, JSON.stringify(extraKeys), redactRepl)
-					: coreRedact(detailJson);
-			outDetail = JSON.parse(redactedJson);
+			outDetail = redact(detail);
 		}
 
 		const row = {
@@ -405,12 +379,11 @@ export class Engine {
 			auditStore: null,
 			apiStore: null,
 			extraRedactKeys: [],
+			redactReplacement: null,
 			failureStrategy: "queue",
 		};
 		this.#seq = 0;
 	}
-
-	// ── Internal ────────────────────────────────────────────────────────────
 
 	_installDrainer(opts) {
 		const next = new AuditQueueDrainer(opts);
@@ -427,7 +400,7 @@ export class Engine {
 		if (old) old.stop();
 	}
 
-	_drainerSysLog(level, event, fields) {
+	_sysLine(stream, level, event, fields = {}) {
 		const line = {
 			shape: "sys",
 			level,
@@ -437,23 +410,18 @@ export class Engine {
 			timestamp: new Date().toISOString(),
 			...fields,
 		};
-		process.stderr.write(`${JSON.stringify(line)}\n`);
+		stream.write(`${JSON.stringify(line)}\n`);
+	}
+
+	_drainerSysLog(level, event, fields) {
+		this._sysLine(process.stderr, level, event, fields);
 	}
 
 	get log() {
 		const self = this;
 		return {
-			_emit(level, event, fields = {}) {
-				const line = {
-					shape: "sys",
-					level,
-					event,
-					request_id: currentRequestID(),
-					service_id: self.#config.serviceId || undefined,
-					timestamp: new Date().toISOString(),
-					...fields,
-				};
-				process.stdout.write(`${JSON.stringify(line)}\n`);
+			_emit(level, event, fields) {
+				self._sysLine(process.stdout, level, event, fields);
 			},
 			info(event, fields) {
 				this._emit("info", event, fields);
@@ -471,10 +439,10 @@ export class Engine {
 	}
 }
 
-// ── Default Engine + free-function API ────────────────────────────────────
+// --- Default engine -------------------------------------------------------
 
 export const defaultEngine = new Engine();
-_setDefaultEngine(defaultEngine); // wire up audit_queue.js shims
+_setDefaultEngine(defaultEngine);
 
 export function init(opts) {
 	return defaultEngine.init(opts);
@@ -491,7 +459,8 @@ export async function flush(timeoutMs = 5000) {
 
 export const log = defaultEngine.log;
 
-// ── Catalog yaml (P1-11) ──────────────────────────────────────────────────
+// --- Catalog yaml ---------------------------------------------------------
+
 export const codes = {
 	register,
 	async load(path) {
@@ -517,7 +486,6 @@ export default {
 	codes,
 	Engine,
 	defaultEngine,
-	// P1-15
 	AuditStoreError,
 	queueStats,
 	flush,
@@ -526,7 +494,6 @@ export default {
 	RetentionClass,
 	ActorKind,
 	Method,
-	// P0-7: catalog error codes
 	AuditCatalogError,
 	CATALOG_ERR,
 };

@@ -1,19 +1,16 @@
 import Foundation
 
-/// PII / secret redactor — pure Swift, no native dependencies.
-///
-/// Applies two redaction passes in order:
-///   1. Key-pattern: keys matching spec/row-schema.json x-fasten-redact patterns → replace with `replacement`
-///   2. Value-shape: string values matching known secret shapes (P1-24) → replace with type token
-///
-/// Recursively walks nested `[String: Any]` dictionaries and arrays.
+/// Redacts `detail` values, walking nested dictionaries and arrays:
+///   1. A key matching a key pattern gets `replacement` as its value.
+///   2. Otherwise a string value that looks like a known secret (JWT, AWS key,
+///      card number, ...) is replaced with a token such as "***JWT***".
 public final class Redactor: @unchecked Sendable {
 
     private let keyPatterns:       [NSRegularExpression]
     private let replacement:       String
     private let extraValueRules:   [(NSRegularExpression, String)]
 
-    // Patterns from spec/row-schema.json x-fasten-redact.patterns — case-insensitive substring match on keys.
+    // spec/row-schema.json x-fasten-redact.patterns; case-insensitive, matched anywhere in the key.
     private static let defaultKeyPatterns: [NSRegularExpression] = {
         let specs = [
             "api[_-]?key", "password", "passwd", "token", "secret",
@@ -23,9 +20,8 @@ public final class Redactor: @unchecked Sendable {
         return specs.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
     }()
 
-    // Built-in value-shape rules (P1-24); applied to string values regardless of key.
-    // Patterns mirror the canonical Rust implementation in fasten-core/src/redact.rs.
-    // No anchors — a secret embedded anywhere in a string value is detected.
+    // Applied to string values whatever the key. Same patterns as
+    // fasten-core/src/redact.rs. Unanchored, so they match inside longer strings.
     private static let valueShapeRules: [(NSRegularExpression, String)] = {
         let defs: [(String, String)] = [
             // JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)

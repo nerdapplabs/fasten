@@ -1,10 +1,7 @@
-"""
-Engine — encapsulates all fasten runtime state.
+"""Engine holds all fasten runtime state.
 
-The module-level free functions (``fasten.init``, ``fasten.emit``, …)
-delegate to a module-level default Engine instance.  Applications that
-need multiple isolated fasten configurations in one process (multi-tenant
-services, test isolation) construct Engine instances directly:
+``fasten.init``, ``fasten.emit`` and the other module functions use a default
+Engine. Construct more when one process needs separate configurations:
 
     tenant_a = fasten.Engine()
     tenant_a.init(tenant_id="tenant-a", audit_store=store_a, ...)
@@ -35,8 +32,7 @@ from . import core_ffi as _ffi
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
 
-# Re-exported for backwards compatibility: tests and downstream code historically
-# imported these from fasten.engine. The canonical home is now fasten.chain.
+# The chain helpers live in fasten.chain; re-exported here for existing imports.
 __all__ = [
     "AuditStoreError",
     "ChainVerifyResult",
@@ -72,22 +68,17 @@ class FastenConfig:
     queue_retry_jitter: bool
     queue_drain_max_attempts: int
     search_enabled: bool
-    # FR1 retention (spec §1): background age-based purge on api/sys stream
-    # stores. None disables. Strings are duration tokens ("7d", "24h").
+    # Age-based purge of the api/sys stream stores, as duration strings
+    # ("7d", "24h"). None disables.
     retention_api: Optional[str]
     retention_syslog: Optional[str]
-    # #90 PII horizon on the audit store: rows in codes.pii_codes() older than
-    # this have detail + detail_salt destroyed. Redaction-only by design — an
-    # audit age-purge would delete chain rows, which reads as tampering (§7.1).
+    # Audit rows of pii codes older than this have detail and detail_salt
+    # destroyed. Audit rows are never deleted, since that would break the
+    # chain (spec 7.1).
     retention_pii: Optional[str]
-    # #58 persist_streams: explicit allowlist of streams the operator has
-    # opted into persisting. When set, start() asserts that the set matches
-    # the streams with stores attached (bidirectional — a named stream
-    # without a store or an attached store without the name both fail
-    # loudly). When None, persistence is derived from store attachment —
-    # a stream reports "store" only when it actually has one. Never
-    # includes "audit" (audit persistence is driven by audit_store, not
-    # this knob).
+    # Streams ("api", "sys") expected to have a store. If set, start() fails
+    # unless it matches the attached stores exactly. None means "whatever has
+    # a store". Audit persistence is controlled by audit_store alone.
     persist_streams: Optional[frozenset[str]]
 
 
@@ -111,16 +102,13 @@ _STREAM_DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
 
 
 def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
-    """Build a per-stream store (api/sys) from a DSN. Explicit scheme whitelist:
+    """Build an api/sys stream store from a DSN.
 
-    - ``postgres://`` / ``postgresql://`` → PostgresStreamStore
-    - ``sqlite:///path`` or bare path → SQLite-backed StreamStore
-
-    Any other scheme (e.g. ``postgresql+psycopg://``, ``mysql://``) is rejected
-    with a clear error. The earlier fall-through accepted every scheme and
-    silently created a local SQLite file named after the DSN's path component
-    (``postgresql+psycopg://host/db`` → SQLite file ``db``), asserting
-    durability over an ephemeral container file — PR #59 finding 11."""
+    ``postgres://`` and ``postgresql://`` give a PostgresStreamStore;
+    ``sqlite:///path`` or a bare path gives a SQLite StreamStore. Any other
+    scheme (e.g. ``postgresql+psycopg://``) raises ValueError rather than
+    quietly becoming a local SQLite file.
+    """
     from urllib.parse import parse_qs, urlparse
 
     u = urlparse(dsn)
@@ -137,10 +125,8 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     from .store.stream import StreamStore
 
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
-    # SQLAlchemy-style sqlite paths: strip only the single URL-separator slash,
-    # not every leading slash. sqlite:///rel.db -> rel.db (relative);
-    # sqlite:////abs/path.db -> /abs/path.db (absolute). The old lstrip("/")
-    # collapsed the four-slash absolute form into a relative path.
+    # SQLAlchemy-style paths: strip only the one separator slash, so
+    # sqlite:///rel.db is relative and sqlite:////abs/path.db is absolute.
     path = u.path
     if u.scheme and path.startswith("/"):
         path = path[1:]
@@ -153,16 +139,12 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
 
 
 class Engine:
-    """
-    A single fasten runtime instance.
-
-    Holds service identity, redactor, audit store, stdout transport, and
-    drainer state for one deployment context.  Thread-safe.
-    """
+    """One fasten runtime: service identity, redactor, stores, transport and
+    the audit queue drainer."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._boot_request_id: Optional[str] = None  # sentinel boot-window id
+        self._boot_request_id: Optional[str] = None
 
         self._service_id: str = ""
         self._node_id: str = ""
@@ -176,35 +158,28 @@ class Engine:
         self._search_enabled: bool = False
         self._stdlib_logger = logging.getLogger("fasten")
 
-        # spec §2.1: fasten-core does not yet allocate monotonic_seq/prev_hash
-        # in the store transaction, so audit rows bypass the FFI drainer. Flip
-        # to True when core lands §2.1.
         self._unchained_store_logged: bool = False
         self._audit_chain_unavailable: bool = False
+        # The fasten-core drainer does not allocate monotonic_seq/prev_hash
+        # (spec 2.1), so emit() stores audit rows directly while this is False.
         self._drainer_allocates: bool = False
         self._drainer_bypass_logged: bool = False
         self._drainer_handle: Any = None          # FastenStore* (ctypes void ptr)
-        self._drainer_callback: Any = None        # keep ctypes callback alive (GC guard)
+        self._drainer_callback: Any = None        # must outlive the handle
         self._drainer_lock = threading.Lock()
         self._atexit_registered = False
         self._last_init_at: Optional[datetime] = None
 
-        # Engine-side "at least one audit-store insert was swallowed" flag.
-        # Tracked here (not only on the store) because AuditRepository does
-        # not require ``note_write_failure``: an adopter-supplied store fails
-        # the getattr check below and the swallow would otherwise be
-        # invisible, leaving completeness reporting "store" over durable
-        # history that has holes. Sticky — a hole doesn't heal.
+        # Set when an audit insert failed and was dropped. Kept here as well
+        # as on the store because AuditRepository does not require
+        # note_write_failure(). Stays set until the next start().
         self._audit_write_swallowed: bool = False
 
-        # FR1 retention (spec §1). One shutdown event + one thread per
-        # configured stream. See fasten.retention.start_purger.
+        # One purger thread per configured stream; see retention.start_purger.
         self._retention_stop: threading.Event = threading.Event()
         self._retention_threads: list[threading.Thread] = []
 
         self.log: _Logger = _Logger(self)
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def init_config(
         self,
@@ -229,10 +204,11 @@ class Engine:
         retention_pii: Optional[str] = None,
         persist_streams: Optional[list[str] | set[str] | frozenset[str]] = None,
     ) -> FastenConfig:
-        """Resolve all parameters and environment variables into a FastenConfig.
+        """Resolve arguments and environment variables into a FastenConfig.
 
-        Does NOT start any runtime (no thread, no store connection). Safe to
-        call from config-loading code that runs before the event loop starts.
+        Starts no threads, so it is safe to call before the event loop
+        exists. If a DSN comes from the environment, the store is built here,
+        which opens a connection and creates the table.
         """
         svc = _pick(service_id, "FASTEN_SERVICE_ID")
         node = _pick(node_id, "FASTEN_NODE_ID")
@@ -247,13 +223,9 @@ class Engine:
             dsn = os.environ.get("FASTEN_AUDIT_DSN")
             if dsn:
                 resolved_store = _store_from_dsn(dsn)
-            # No store and no DSN → stdout-only mode. Rows are written to stdout
-            # but not persisted. Matches Go/JS/Rust behaviour where AuditStore is
-            # optional. Adopters who need persistence must supply audit_store= or
-            # set FASTEN_AUDIT_DSN.
+            # With neither, rows only go to stdout.
 
-        # api/sys persistence (FR1) — opt-in, SQLite-backed StreamStore. When
-        # unset the stream falls back to ring-only (today's behaviour).
+        # Without a store the api/sys streams are kept in memory only.
         resolved_api_store = api_store
         if resolved_api_store is None:
             dsn = os.environ.get("FASTEN_API_DSN")
@@ -280,22 +252,18 @@ class Engine:
                 f"(got {strategy!r})"
             )
 
-        # FR3 free-text search is opt-in (§4.1): off unless explicitly enabled,
-        # via arg or FASTEN_SEARCH_ENABLED. Enabling it without a syslog store
-        # still yields "search requires sys persistence" at read time.
+        # Search also needs a syslog store; without one, reads report
+        # "search requires sys persistence".
         env_search = os.environ.get("FASTEN_SEARCH_ENABLED")
         search_on = search_enabled or (env_search or "").lower() in ("1", "true", "yes")
 
-        # FR1 retention (§1). Env overrides the arg if arg is None; env
-        # empty-string counts as unset.
+        # The environment is used only when the argument is None; an empty
+        # value counts as unset.
         ret_api = retention_api if retention_api is not None else (os.environ.get("FASTEN_RETENTION_API") or None)
         ret_sys = retention_syslog if retention_syslog is not None else (os.environ.get("FASTEN_RETENTION_SYSLOG") or None)
         ret_pii = retention_pii if retention_pii is not None else (os.environ.get("FASTEN_RETENTION_PII") or None)
 
-        # #58 persist_streams: explicit stream allowlist. Env supports a
-        # comma-separated list; empty-string counts as unset. Validated
-        # against the set of stores in start(), not here — init_config
-        # never touches runtime state.
+        # Checked against the attached stores in start(), not here.
         env_ps = os.environ.get("FASTEN_PERSIST_STREAMS")
         if persist_streams is not None:
             ps: Optional[frozenset[str]] = frozenset(persist_streams)
@@ -308,7 +276,7 @@ class Engine:
             unknown = ps - allowed
             if unknown:
                 raise RuntimeError(
-                    f"fasten.init_config: persist_streams={sorted(ps)} — "
+                    f"fasten.init_config: persist_streams={sorted(ps)}: "
                     f"unknown stream(s) {sorted(unknown)}. "
                     f"Only {sorted(allowed)} are valid (audit persistence is "
                     "driven by audit_store, not persist_streams)."
@@ -338,19 +306,13 @@ class Engine:
         )
 
     def start(self, cfg: FastenConfig) -> None:
-        """Wire runtime from a resolved FastenConfig. Idempotent — safe to call
-        on re-configuration; flushes and stops the previous drainer first."""
-        # Stop any previous retention threads before re-wiring — otherwise a
-        # re-Init on the same Engine leaves orphan purgers hammering the old
-        # store (which may already be closed).
+        """Apply a FastenConfig. Can be called again to reconfigure; the
+        previous drainer and purger threads are stopped first."""
+        # Old purgers would otherwise keep running against the old store.
         self._stop_retention_threads()
 
-        # #58 persist_streams assertion — every named stream needs a store,
-        # every attached store needs to be named. Both directions so an
-        # operator can't declare persistence without wiring it (silent
-        # ring-only under a "store" flag) or wire a store the config didn't
-        # opt into (surprise IO on a stream the operator thought was
-        # ring-only). Skipped when persist_streams is None.
+        # Every named stream needs a store and every attached store must be
+        # named.
         if cfg.persist_streams is not None:
             have = {name for name, store in
                     (("api", cfg.api_store), ("sys", cfg.syslog_store))
@@ -371,7 +333,7 @@ class Engine:
                         f"{sorted(unlisted_store)}"
                     )
                 raise RuntimeError(
-                    "fasten.init: persist_streams / stores mismatch — " + "; ".join(bits)
+                    "fasten.init: persist_streams / stores mismatch: " + "; ".join(bits)
                 )
 
         self._service_id = cfg.service_id
@@ -380,23 +342,18 @@ class Engine:
         self._audit_store = cfg.audit_store
         self._api_store   = cfg.api_store
         self._syslog_store = cfg.syslog_store
-        # Re-init on a fresh store clears the sticky degrade — a hole in the
-        # previous store's history doesn't apply to this one.
+        # A gap in the previous store's history says nothing about this one.
         self._audit_write_swallowed = False
 
-        # NOTE: no seq / prev_hash seeding here. Allocation is the store's job
-        # (spec §2.1) and happens inside the insert transaction, so an engine
-        # holds no chain state at all. Seeding here previously cost two store
-        # round trips per init() and — worse — implied the engine owned the
-        # counter, which is the bug P0-9 fixed.
+        # No chain state lives in the engine: the store allocates seq and
+        # prev_hash inside the insert transaction (spec 2.1).
 
         self._redactor = Redactor(
             extra_keys=cfg.extra_redact_keys,
             replacement=cfg.redact_replacement,
             extra_value_patterns=cfg.extra_value_redact_patterns,
         )
-        # Sentinel invariant: one stable boot-window id per process, in effect
-        # for context-less stream rows until the first real request arrives.
+        # Stamped on context-less stream rows until the first real request.
         from .context import mint_sentinel
         self._boot_request_id = mint_sentinel("boot", cfg.service_id)
         self._stdout = StdoutTransport(
@@ -421,9 +378,6 @@ class Engine:
         else:
             self._uninstall_drainer()
 
-        # FR1 retention (§1). Only when a store is attached AND a retention
-        # is set; running a background purger over a nil store is a no-op
-        # that would still hit disk on a bare ring-only engine.
         self._start_retention_threads(
             api_ret=cfg.retention_api, sys_ret=cfg.retention_syslog,
             pii_ret=cfg.retention_pii,
@@ -434,12 +388,12 @@ class Engine:
         self, *, api_ret: Optional[str], sys_ret: Optional[str],
         pii_ret: Optional[str] = None,
     ) -> None:
-        """Spawn one purger thread per configured (store, retention) pair.
-        Called from start(); the previous set has already been stopped."""
+        """Start one purger thread per stream that has both a store and a
+        retention. The previous threads must already be stopped."""
         from .retention import parse_duration, start_purger
 
-        # Fresh event for this generation of threads so old wait() calls on
-        # a re-Init don't return prematurely on the new event.
+        # New event per generation. Old threads may outlive the 2s join, and
+        # clearing a shared event would let them keep running.
         self._retention_stop = threading.Event()
 
         def _log_err(stream: str, e: Exception) -> None:
@@ -456,19 +410,17 @@ class Engine:
         ):
             if store is None or not dur_s:
                 continue
-            retention = parse_duration(dur_s)   # raises early on malformed input
+            retention = parse_duration(dur_s)
             t = start_purger(
                 store=store, stream=stream, retention=retention,
                 stop_event=self._retention_stop, on_error=_log_err,
             )
             self._retention_threads.append(t)
 
-        # #90 audit PII horizon. Separate from the loop above because both
-        # arguments differ: retention=None (redaction only, never delete), and
-        # redact_fn=self.redact_expired rather than the store method, so the
-        # §7.2 AUDIT_ROW_REDACTED row actually gets written.
+        # Audit rows are only redacted, never deleted. redact_fn goes through
+        # redact_expired() so the AUDIT_ROW_REDACTED row is written (spec 7.2).
         if pii_ret and self._audit_store is not None:
-            pii_retention = parse_duration(pii_ret)   # raises early
+            pii_retention = parse_duration(pii_ret)
             self._retention_threads.append(start_purger(
                 store=self._audit_store, stream="audit",
                 retention=None, pii_retention=pii_retention,
@@ -477,7 +429,7 @@ class Engine:
             ))
 
     def _stop_retention_threads(self) -> None:
-        """Wake and join every purger thread. Idempotent."""
+        """Stop and join the purger threads."""
         if not self._retention_threads:
             return
         self._retention_stop.set()
@@ -524,8 +476,6 @@ class Engine:
             persist_streams=persist_streams,
         ))
 
-    # ── Emit ──────────────────────────────────────────────────────────────
-
     def emit(
         self,
         code: str,
@@ -537,11 +487,12 @@ class Engine:
         method: Optional[str] = None,
         _durable: bool = False,
     ) -> AuditRow:
-        """
-        Emit an audit row. Anchors auto-filled where possible.
+        """Emit an audit row for a registered ``code``.
 
-        Raises RuntimeError if init() has not been called.
-        Raises ValueError for an unregistered code.
+        ``_durable=True`` stores the row synchronously and raises if that
+        fails, even in queue mode.
+
+        Raises RuntimeError before init() and ValueError for an unknown code.
         """
         if not self._service_id:
             raise RuntimeError("fasten.init() must be called before emit()")
@@ -564,13 +515,10 @@ class Engine:
         else:
             detail = self._redactor.redact(detail)
 
-        # Build the row with a placeholder seq; hash chain fields are assigned
-        # atomically under _lock below so concurrent emit() calls can't
-        # interleave their prev_hash references.
         row = AuditRow(
             id=f"evt-{uuid.uuid4().hex[:20]}",
             origin_id="",
-            monotonic_seq=0,  # placeholder — the store allocates (spec §2.1)
+            monotonic_seq=0,  # allocated by the store
             timestamp=datetime.now(timezone.utc),
             code=code,
             action=meta.action,
@@ -589,29 +537,23 @@ class Engine:
         )
         row = dataclasses.replace(row, origin_id=row.id)
 
-        # monotonic_seq / prev_hash / hash are NOT assigned here. They are
-        # allocated by the store inside the insert transaction (spec §2.1), so
-        # that N engine instances on one node produce ONE chain instead of N
-        # rows all claiming seq 1. Sealing therefore happens at insert time.
+        # monotonic_seq, prev_hash and hash are set by the store inside the
+        # insert transaction (spec 2.1), so several engines on one node share
+        # one chain.
         #
-        # Phase 1 of the two-phase stdout contract (spec §8): write the unsealed
-        # row before store routing, so it reaches the log stream even if the
-        # store path blocks or raises. Phase 2 re-emits it sealed below.
+        # Write the unsealed row to stdout first so it is logged even if the
+        # store blocks or fails; the sealed row follows (spec 8).
         if self._stdout is not None:
             self._stdout.write_audit(row.to_dict())
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":
-                # The FFI drainer allocates in fasten-core, which does not yet
-                # implement spec §2.1. Routing audit rows through it would leave
-                # them unsealed and unsequenced — silently disabling the chain.
-                # Correctness beats throughput: take the Python allocating path
-                # and say so once. Remove this guard when core lands §2.1.
+                # Rows queued through the fasten-core drainer would not be
+                # sealed (see _drainer_allocates), so store them directly and
+                # log that once.
                 handle = self._drainer_handle
                 if handle is not None and _durable:
-                    # Enqueueing is fire-and-forget: it reports success before
-                    # the row is persisted. A caller that must not proceed
-                    # unless the row is durable takes the synchronous path.
+                    # Enqueueing returns before the row is stored.
                     handle = None
                 if handle is not None and not self._drainer_allocates:
                     if not self._drainer_bypass_logged:
@@ -629,16 +571,9 @@ class Engine:
                         row = self._allocate_and_store(row)
                     except Exception as e:  # noqa: BLE001
                         if _durable:
-                            # Not hot-path telemetry. The caller is relying on
-                            # this row existing before it does something
-                            # irreversible, so the failure has to reach it.
                             raise
-                        # Swallowed on the hot path → durable history now has a
-                        # hole; degrade the audit completeness flag. Set the
-                        # engine flag unconditionally (adopter stores may not
-                        # implement note_write_failure); also call the store's
-                        # notifier when present so store-side reporting is
-                        # accurate too.
+                        # The stored history now has a gap; record it so
+                        # completeness is reported as degraded.
                         self._audit_write_swallowed = True
                         note = getattr(self._audit_store, "note_write_failure", None)
                         if callable(note):
@@ -655,10 +590,8 @@ class Engine:
                     raise AuditStoreError(f"{type(e).__name__}: {e}") from e
         return row
 
-    # ── Queue / drainer ───────────────────────────────────────────────────
-
     def flush(self, timeout: float = 5.0) -> bool:
-        """Block until pending audit rows drain (or timeout). Returns True iff drained."""
+        """Wait for queued audit rows to be stored. Returns False on timeout."""
         handle = self._drainer_handle
         if handle is None:
             return True
@@ -674,8 +607,6 @@ class Engine:
             return None
         return json.loads(raw)
 
-    # ── Public accessors ──────────────────────────────────────────────────
-
     def transport(self) -> Optional[StdoutTransport]:
         """Active StdoutTransport, or None if init() has not been called."""
         return self._stdout
@@ -689,19 +620,13 @@ class Engine:
         return self._audit_store
 
     def audit_write_swallowed(self) -> bool:
-        """True iff at least one audit-store insert was swallowed on the sync
-        fallback path since Engine construction. Sticky — durable history has
-        a hole that doesn't heal. See ``_audit_write_swallowed`` on the
-        engine and the /correlate + /logs completeness readers."""
+        """True if an audit insert failed and was dropped since the last
+        start(). Used by the reader's completeness reporting."""
         return self._audit_write_swallowed
 
     def persisted_streams(self) -> frozenset[str]:
-        """Streams backed by the durable store rather than a bounded ring
-        (FR4 completeness). A stream joins the set only when it actually has a
-        store: ``audit`` when an audit store is configured, ``api``/``sys``
-        when a stream store is (FR1). In stdout-only mode (no audit store)
-        ``audit`` is absent, so its reads report ``ring`` instead of asserting
-        a durable ``store`` that does not exist."""
+        """Streams that have a store attached ("audit", "api", "sys"). The
+        others are read from the in-memory ring."""
         streams: set[str] = set()
         if self._audit_store is not None:
             streams.add("audit")
@@ -712,25 +637,24 @@ class Engine:
         return frozenset(streams)
 
     def search_enabled(self) -> bool:
-        """Whether FR3 free-text search (``/logs/search`` and ``q=``) is enabled.
-        Off by default (§4.1) — an explicit opt-in, since it is a linear scan."""
+        """Whether free-text search (``/logs/search`` and ``q=``) is enabled.
+        Off by default because it is a linear scan."""
         return self._search_enabled
 
     def _require_store(self, op: str) -> Any:
         store = self._audit_store
         if store is None:
             raise RuntimeError(
-                f"fasten.{op}() requires an audit store — call init() with "
+                f"fasten.{op}() requires an audit store: call init() with "
                 "audit_store= or FASTEN_AUDIT_DSN first (stdout-only mode has "
                 "no store to read/write)."
             )
         return store
 
     def list_unshipped(self, limit: int = 100) -> "list[AuditRow]":
-        """Rows this engine ORIGINATED that are not yet shipped upstream, oldest
-        first. Scoped to the engine's own (service_id, source_node_id) so rows
-        ingested from another origin are never re-shipped (that would duplicate
-        a foreign sub-chain). Delegates to the store."""
+        """Rows this engine originated that are not yet shipped, oldest first.
+        Rows ingested from another node are excluded so they are not shipped
+        twice."""
         return self._require_store("list_unshipped").list_unshipped(
             limit=limit,
             service_id=self._service_id,
@@ -742,8 +666,8 @@ class Engine:
         self._require_store("mark_shipped").mark_shipped(ids)
 
     def ingest_replicated(self, rows: "list[AuditRow]") -> Any:
-        """Verify + insert the verified prefix of a replicated batch (single
-        transaction). Delegates to the store; does not raise on a chain break."""
+        """Verify a replicated batch and insert its verified prefix in one
+        transaction. Does not raise on a chain break."""
         return self._require_store("ingest_replicated").ingest_replicated(rows)
 
     def last_init_at(self) -> Optional[datetime]:
@@ -751,17 +675,9 @@ class Engine:
         return self._last_init_at
 
     def reset_for_tests(self) -> None:
-        """Reset all runtime state to pre-init defaults.
-
-        Intended for test fixtures that need a clean Engine without
-        constructing a new one. Do not call in production code.
-        """
+        """Reset to the pre-init state. For test fixtures only."""
         self._uninstall_drainer()
-        # Retention threads outlive the reset otherwise. Harmless while the
-        # only purgers were age-based on api/sys, but an audit PII purger
-        # holds a reference to the old store and keeps redacting into it
-        # after the fixture has moved on — a leaked thread mutating a
-        # previous test's data.
+        # A PII purger would otherwise keep redacting the previous test's store.
         self._stop_retention_threads()
         self._service_id    = ""
         self._node_id       = ""
@@ -775,18 +691,13 @@ class Engine:
         self._search_enabled = False
         self._last_init_at  = None
 
-    # ── Internal ──────────────────────────────────────────────────────────
-
-    # spec §7.2: fasten's own code for the redaction event. Registered lazily on
-    # first use so adopters who never redact don't carry it in their catalog.
+    # Code for the redaction record (spec 7.2). Registered on first use so it
+    # only appears in catalogs that need it.
     _REDACTION_DOMAIN = "fasten"
     _REDACTION_CODE = "AUDIT_ROW_REDACTED"
 
     def _ensure_redaction_code(self) -> None:
         from .codes import Meta, RetentionClass, Severity, meta_of, register
-        # Check the RETURN VALUE. meta_of() yields None for an unknown code
-        # rather than raising, so `try: meta_of(); return` skipped registration
-        # every time and emit() then failed with "unknown audit code".
         if meta_of(self._REDACTION_CODE) is not None:
             return
         register(self._REDACTION_DOMAIN, {self._REDACTION_CODE: Meta(
@@ -804,13 +715,8 @@ class Engine:
         codes: "list[str]",
         reason: str = "retention",
     ) -> list[str]:
-        """Destroy ``detail`` on expired rows AND record that it happened.
-
-        The store redaction alone leaves an honest erasure and a quiet
-        redaction indistinguishable — both yield a row whose detail is null.
-        Spec §7.2 requires the destruction itself be an originated, chained
-        row, so a verifier can see the suffix was altered *because of a
-        recorded policy action*.
+        """Destroy ``detail`` on expired rows, writing an AUDIT_ROW_REDACTED
+        row for each first (spec 7.2).
 
         Returns the ids of the rows redacted.
         """
@@ -820,31 +726,22 @@ class Engine:
                 "fasten.redact_expired: the audit store does not implement "
                 "list_redaction_candidates / redact_rows (spec §7.1)"
             )
-        # Record BEFORE destroying. Destroy-then-emit leaves destroyed rows
-        # with no record if the emit fails, and the retry can't find them.
-        # This way an emit failure destroys nothing, and a destroy failure
-        # leaves the data intact under a record the next tick converges on.
+        # Record before destroying: if the record fails nothing is destroyed,
+        # and if the destroy fails the next run retries it.
         self._ensure_redaction_code()
         candidates = list(store.list_redaction_candidates(
             before=before, codes=codes))
         if not candidates:
             return []
-        # One row at a time, record then destroy. Emitting the whole batch
-        # and then destroying it in one call meant a failed destroy left every
-        # row still a candidate, so the next tick re-emitted a record for all
-        # of them — duplicate events scaling with the batch. Per row, only the
-        # row that failed between its own record and its destroy can repeat.
+        # One row at a time, so a failure can duplicate at most one record.
         redacted: list[str] = []
         for row_id, seq in candidates:
             self.emit(
                 code=self._REDACTION_CODE,
                 target=row_id,
-                # Must persist before the destroy. In queue mode (the default)
-                # a plain emit swallows the store failure and returns normally,
-                # so rows were destroyed with no record.
+                # The record must be stored before the destroy.
                 _durable=True,
-                # spec §7.2 shape; redacted_id too, since seq is only unique
-                # per source node.
+                # redacted_id as well, since seq is only unique per node.
                 detail={"redacted_seq": seq, "reason": reason,
                         "redacted_id": row_id},
             )
@@ -852,12 +749,9 @@ class Engine:
         return redacted
 
     def _allocate_and_store(self, row: AuditRow) -> AuditRow:
-        """Store-allocated seal (spec §2.1) + phase-2 stdout write (spec §8).
-
-        Falls back to the legacy unallocated insert for adopter repositories that
-        predate the protocol method, so a custom store keeps working (unchained)
-        rather than raising on the hot path.
-        """
+        """Insert through the store's allocating method and write the sealed
+        row to stdout. Stores without allocate_and_insert_originated get a
+        plain insert, unsealed."""
         allocate = getattr(self._audit_store, "allocate_and_insert_originated", None)
         if not callable(allocate):
             # This store predates spec §2.1, so rows go in UNSEALED: no seq, no
@@ -880,7 +774,8 @@ class Engine:
         return sealed
 
     def _drainer_sys_log(self, level: str, event: str, fields: dict[str, Any]) -> None:
-        """Route drainer events to stderr (not stdout) to avoid backpressure deadlock."""
+        """Write an internal sys event to stderr, so stdout backpressure
+        cannot block the drainer."""
         if self._stdout is None:
             return
         payload: dict[str, Any] = {
@@ -903,11 +798,8 @@ class Engine:
         retry_jitter: bool,
         max_attempts: int,
     ) -> None:
-        # Build an insert callback that delegates to the Python store.
-        # The row crosses Python → JSON → Rust queue → Python here, so
-        # `timestamp` / `shipped_at` arrive as ISO strings and have to
-        # be parsed back to `datetime` before the store's `_utc_iso`
-        # tries to read `.tzinfo` (issue #36).
+        # Rows come back from the Rust queue as JSON, so timestamps are
+        # strings and must be parsed back to datetime for the store.
         cb_logger = logging.getLogger("fasten")
 
         def _insert_cb(row_json: bytes, _userdata: int) -> int:
@@ -921,7 +813,7 @@ class Engine:
                 row = AuditRow(**{k: row_dict[k] for k in AuditRow.__dataclass_fields__ if k in row_dict})
                 store.insert(row)
                 return 0
-            except Exception:  # noqa: BLE001 — store / drainer reports the dead-letter outcome
+            except Exception:  # noqa: BLE001  the drainer reports the dead-letter outcome
                 cb_logger.exception(
                     "insert_cb failed for row %s", row_dict.get("id", "<unparsed>"),
                 )
@@ -941,12 +833,12 @@ class Engine:
             old_handle    = self._drainer_handle
             old_callback  = self._drainer_callback
             self._drainer_handle   = new_handle
-            self._drainer_callback = cb   # keep callback alive
+            self._drainer_callback = cb
         if old_handle is not None:
             _ffi.drainer_flush(old_handle, 5_000)
             _ffi.drainer_close(old_handle)
             _ffi.store_close(old_handle)
-        _ = old_callback  # referenced to prevent premature GC
+        _ = old_callback  # released only after the old drainer is closed
         if not self._atexit_registered:
             atexit.register(self._atexit_flush)
             self._atexit_registered = True
@@ -958,16 +850,13 @@ class Engine:
             self._drainer_handle   = None
             self._drainer_callback = None
         if old_handle is not None:
-            # Keep old_callback alive until after drainer_close() returns.
-            # The drainer's background thread may still call the Python
-            # callback (CInsertFn) while we wait for it to stop; releasing
-            # the ctypes closure before the thread exits would be a
-            # use-after-free and causes a SIGSEGV.
+            # The drainer thread may call the callback until drainer_close()
+            # returns; freeing the ctypes closure earlier crashes the process.
             try:
                 _ffi.drainer_close(old_handle)
                 _ffi.store_close(old_handle)
             finally:
-                del old_callback  # safe to release once thread has stopped
+                del old_callback
 
     def _atexit_flush(self) -> None:
         handle = self._drainer_handle
@@ -977,13 +866,10 @@ class Engine:
         self._stop_retention_threads()
 
 
-# ── Logger ────────────────────────────────────────────────────────────────────
-
-
 class _Logger:
-    """Structured syslog writer bound to an Engine instance.
+    """Structured sys log writer for an Engine.
 
-    Per-module loggers via :meth:`bound`:
+    ``bound()`` returns a logger with a name and extra fields attached:
 
         log = fasten.log.bound("buffer-manager")
         log.info("flush_complete", batch=42)
