@@ -1,33 +1,19 @@
-"""
-Hash chain — the single canonical home for fasten's tamper-evidence chain.
+"""Row hashing, sealing and chain verification.
 
-This module owns the row-hash canonical form, the per-row ``seal()`` operation,
-and ``verify_chain()``. ``engine.py`` (emit path) and ``store/repo.py``
-(verified-prefix / ingest path) both import from here, so there is exactly ONE
-implementation of the hash and ONE place the canonical form is documented.
-
-Canonical forms
----------------
-The hashed canonical form is itself versioned via ``AuditRow.canonical_form_id``
-so the choice of bytes is tamper-evident and future forms are additive.
-
-Form "1" (the only form today): SHA-256 of the canonical JSON of the row dict
-with the ``hash`` field excluded, where canonical JSON is
+Each row records the hash form it was sealed with in ``canonical_form_id``;
+``_HASH_FN_BY_FORM`` maps each id to its hash function. Both forms hash
 
     json.dumps(d, sort_keys=True, separators=(',', ':'), default=str)
 
-over ``AuditRow.to_dict()``. This means:
-  - the exact Python AuditRow field set (NOTE: no ``pii_in_detail`` — the Go
-    wire Row carries it but the Python AuditRow does not; both SDKs exclude it
-    from the hash so a Go aggregator can verify a Python-sealed chain),
-  - ``canonical_form_id`` IS included in the hashed bytes,
-  - sorted keys (top level and nested), compact separators,
-  - ``None`` -> ``null`` for tenant_id / shipped_at,
-  - timestamps as ``datetime.isoformat()`` strings.
+over ``AuditRow.to_dict()`` minus some fields, ``canonical_form_id`` included.
 
-A new form is added by registering a new id in ``_HASH_FN_BY_FORM`` with its own
-hash function; ``verify_chain`` dispatches per row on ``canonical_form_id`` and
-REJECTS rows that carry an unknown id.
+- Form "1" hashes ``detail`` directly, with timestamps in
+  ``datetime.isoformat()`` form (``+00:00``).
+- Form "2" (current) hashes ``detail_commitment`` instead of ``detail``, and
+  timestamps as written on the wire.
+
+``pii_in_detail`` is not an AuditRow field, so it is never hashed; the Go SDK
+leaves it out too. The full rules are in spec/chain-replication.md.
 """
 from __future__ import annotations
 
@@ -40,16 +26,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     from .attrs import AuditRow
 
-# The canonical_form_id stamped on every row sealed by this SDK version.
-#
-# Form "2" (spec §1.4) is now stamped on new rows: the stores carry
-# detail_salt / detail_commitment and migrate existing tables. detail is
-# COMMITTED to rather than hashed, so it can be destroyed for retention without
-# moving the row hash — which is what makes a PII purge possible without
-# breaking the chain (P1-47).
-#
-# Form "1" stays registered forever so every pre-existing row verifies
-# unchanged; verify_chain dispatches per row.
+# Form stamped by seal(). Form "2" commits to detail rather than hashing it,
+# so detail can be destroyed for retention without changing the row hash
+# (spec 1.4). Form "1" stays registered so older rows still verify.
 CURRENT_CANONICAL_FORM_ID = "2"
 
 
@@ -58,9 +37,8 @@ def _canonical_json(d: dict[str, Any]) -> bytes:
     return json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
 
 
-# Fields that exist on AuditRow but are NOT part of form "1"'s hashed bytes.
-# detail_salt / detail_commitment were added for form "2" (spec §1.4); excluding
-# them here is what keeps every pre-existing form-"1" hash bit-identical.
+# detail_salt and detail_commitment belong to form "2" and are not hashed
+# by form "1".
 _FORM_1_EXCLUDED = frozenset({"hash", "detail_salt", "detail_commitment"})
 
 # Form "2" commits to detail instead of hashing it, so `detail` and its salt
@@ -69,12 +47,10 @@ _FORM_2_EXCLUDED = frozenset({"hash", "detail", "detail_salt"})
 
 
 def detail_commitment(salt: str, detail: Any) -> str:
-    """Salted commitment to ``detail`` (spec §1.4): sha256(salt || canonical).
+    """sha256(salt + canonical JSON of detail) (spec 1.4).
 
-    The salt is what makes the commitment hiding. An unsalted digest of a
-    low-entropy value (an email address, an account id) is a dictionary attack
-    away from the original, so destroying ``detail`` alone would not destroy the
-    information. Redaction therefore drops the salt too.
+    Without the salt a short value such as an email address could be
+    recovered by guessing, so redaction clears the salt along with detail.
     """
     return hashlib.sha256(salt.encode() + _canonical_json(detail)).hexdigest()
 
@@ -83,16 +59,10 @@ _TS_HASHED_FIELDS = ("timestamp", "shipped_at")
 
 
 def _hashed_ts(value: Any) -> Any:
-    """Render a timestamp in the HASHED form (spec §1.2): ``+00:00``, and
-    six-digit microseconds only when nonzero.
-
-    ``AuditRow.to_dict()`` stamps timestamps with ``canonical_ts`` (spec §4.3),
-    which is always-``Z`` with fixed six-digit microseconds so stamps sort
-    lexicographically. That is the right WIRE form and the wrong HASHED form:
-    §1.2 pins ``datetime.isoformat()``, and Go's ``pyISOFormat`` implements it.
-    Hashing the ``Z`` form made every Python-sealed row unverifiable by a Go
-    aggregator. The two forms are deliberately different; this converts back.
-    """
+    """Convert a wire timestamp (``Z``, always six-digit microseconds, spec
+    4.3) to the form "1" hashed form (``datetime.isoformat()``, spec 1.2):
+    ``+00:00``, with microseconds only when nonzero. Go's pyISOFormat does
+    the same."""
     if not isinstance(value, str) or not value.endswith("Z"):
         return value
     body = value[:-1]
@@ -110,11 +80,7 @@ def _to_hashed_form(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _row_hash_form_1(row_dict: dict[str, Any]) -> str:
-    """Form "1": SHA256 of canonical JSON of the row, excluding the 'hash' field.
-
-    ``canonical_form_id`` is part of ``row_dict`` (via AuditRow.to_dict) and is
-    therefore covered by the hash.
-    """
+    """Form "1": hash of the row with timestamps in isoformat form."""
     d = {k: v for k, v in row_dict.items() if k not in _FORM_1_EXCLUDED}
     return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
 
@@ -136,23 +102,15 @@ def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
 
 
 def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
-    """Form "2" (spec §1.4): ``detail`` replaced by ``detail_commitment``.
-
-    Because ``detail`` is not hashed, it can be set to NULL for retention
-    without changing this row's hash — and therefore without invalidating the
-    successor's ``prev_hash``, which would otherwise cascade a re-seal down the
-    whole chain and be indistinguishable from tampering.
-    """
-    # NO _to_hashed_form here: form "2" hashes the timestamp exactly as the row
-    # carries it on the wire (§4.3 / §1.4). One renderer, one spelling. Form "1"
-    # needs the conversion because it hashed a different spelling than it wrote.
+    """Form "2" (spec 1.4): ``detail_commitment`` is hashed instead of
+    ``detail``, so detail can be cleared without changing the hash."""
+    # Timestamps are hashed as written on the wire; no _to_hashed_form.
     d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
     return hashlib.sha256(_canonical_json(d)).hexdigest()
 
 
-# Form-id -> hash function registry. Adding a v2 is purely additive: register a
-# new id here and stamp it in seal(); verify_chain dispatches automatically and
-# rejects any id not present in this map.
+# A new form is added here and stamped in seal(). verify_chain rejects ids
+# not in this map.
 _HASH_FN_BY_FORM: dict[str, Callable[[dict[str, Any]], str]] = {
     "1": _row_hash_form_1,
     "2": _row_hash_form_2,
@@ -160,25 +118,15 @@ _HASH_FN_BY_FORM: dict[str, Callable[[dict[str, Any]], str]] = {
 
 
 def _row_hash(row_dict: dict[str, Any]) -> str:
-    """Compute the row hash using the row's declared canonical_form_id.
-
-    Defaults to form "1" when the dict carries no canonical_form_id (rows built
-    before the field existed serialise without it). Raises KeyError on an
-    unknown id — callers that must tolerate unknown ids use verify_chain, which
-    rejects them gracefully instead.
-    """
+    """Hash a row dict with its canonical_form_id's function, or the current
+    form if it has none. Raises KeyError on an unknown id."""
     form_id = str(row_dict.get("canonical_form_id", CURRENT_CANONICAL_FORM_ID))
     return _HASH_FN_BY_FORM[form_id](row_dict)
 
 
 def seal(prev_hash: str, row: "AuditRow") -> "AuditRow":
-    """Return a copy of ``row`` sealed into the chain.
-
-    Stamps the current ``canonical_form_id``, sets ``prev_hash``, computes the
-    self ``hash`` over the canonical form, and returns the new row. This is the
-    ONE canonical way to seal a row — both the engine emit path and any
-    re-sealing helper go through it.
-    """
+    """Return a copy of ``row`` with the current canonical_form_id,
+    ``prev_hash``, a detail salt and commitment, and its ``hash`` set."""
     salt = row.detail_salt or secrets.token_hex(32)
     sealed = dataclasses.replace(
         row,
@@ -191,14 +139,10 @@ def seal(prev_hash: str, row: "AuditRow") -> "AuditRow":
 
 
 def redact(row: "AuditRow") -> "AuditRow":
-    """Destroy ``detail`` while leaving the chain intact (spec §7.1).
+    """Return a copy with ``detail`` and ``detail_salt`` cleared (spec 7.1).
+    The hash is unchanged, so the chain still verifies.
 
-    Returns a copy with ``detail`` and ``detail_salt`` cleared. ``hash``,
-    ``prev_hash``, ``monotonic_seq`` and ``canonical_form_id`` are untouched, so
-    verification passes before and after and no other row is affected.
-
-    Raises on a form-"1" row: its ``detail`` is hashed directly, so redacting it
-    would change its hash and force a re-seal of every following row.
+    Raises ValueError for a form "1" row, whose hash covers ``detail``.
     """
     if str(row.canonical_form_id) != "2":
         raise ValueError(
@@ -226,8 +170,8 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     replication contract are normative in ``spec/chain-replication.md``.
 
     Detects field tampering, row insertion, deletion, and reorder. Does NOT
-    detect tail truncation — that requires an external tip-anchor (see P1-23 for
-    the documented limitation).
+    detect tail truncation; that needs an external anchor for the latest
+    hash.
 
     Rows with an empty ``hash`` field (written before hash-chain support was
     enabled) are skipped silently — the chain is verified only for the portion

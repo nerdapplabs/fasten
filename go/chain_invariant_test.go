@@ -10,16 +10,15 @@ import (
 )
 
 // The tamper chain is per (service_id, source_node_id) and monotonic_seq is a
-// per-node counter (see README + python/fasten/attrs.py). Replication must
-// preserve each origin's sub-chain. These tests pin the three invariants a
-// reviewer found broken:
+// per-node counter (see README and python/fasten/attrs.py). Replication must
+// preserve each origin's sub-chain. These tests check that:
 //
-//   - Fix 1: MaxMonotonicSeq scoped to the engine's own identity, so a restart
+//   - MaxMonotonicSeq is scoped to the engine's own identity, so a restart
 //     after ingesting a foreign origin's rows does not seed seq from that
 //     foreign sub-chain.
-//   - Fix 2: ListUnshippedOriginated returns only rows this node ORIGINATED.
-//   - Fix 3: a Go-Emit-sealed row is accepted by Go VerifyChain (the seal and
-//     the verifier agree on one canonical hash form).
+//   - ListUnshippedOriginated returns only rows this node originated.
+//   - a row sealed by Emit is accepted by VerifyChain (the seal and the
+//     verifier agree on one canonical hash form).
 
 func newMemStore(t *testing.T, table string) (*SQLiteStore, func()) {
 	t.Helper()
@@ -76,16 +75,13 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
-// ── Fix 3: Go-Emit-sealed row round-trips through Go VerifyChain ──────────────
-
-func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
+func TestChain_GoEmitSealedRowVerifies(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
 	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
-	// spec §8.1: with no audit store there is nothing to allocate against, so
-	// rows go out unsealed. Sealing is the store's job now (§2.1), so a test
-	// about seq/hash must attach one — as real deployments do.
+	// spec §8.1: without an audit store rows go out unsealed, since sealing
+	// is the store's job (§2.1). So attach one.
 	if err := Init(Config{ServiceID: "svc-1", NodeID: "node-1", AuditStore: store}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -99,12 +95,8 @@ func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 
-	// A Go-Emit-sealed row must self-verify: recomputing its canonical hash
-	// must reproduce the stored Hash. Before Fix 3 the seal used a different
-	// JSON form than the verifier, so this failed.
-	// Dispatch on the row's OWN form. Hardcoding rowHashPyCompat asserted
-	// form "1" and broke the moment the SDK started sealing "2", even though
-	// VerifyChain (which dispatches) was fine.
+	// Recomputing the hash with the row's own canonical form must reproduce
+	// the sealed Hash.
 	if got := hashFnByForm[r1.CanonicalFormID](r1); got != r1.Hash {
 		t.Fatalf("Go-sealed row hash not reproducible by verifier:\n  sealed = %s\n  verify = %s", r1.Hash, got)
 	}
@@ -115,17 +107,15 @@ func TestFix3_GoEmitSealedRowVerifies(t *testing.T) {
 	}
 }
 
-// TestFix3_CrossLanguageVectorStillPasses guards that the canonical form used
-// by Emit (now rowHashPyCompat) still matches the frozen Python vector.
-func TestFix3_CrossLanguageVectorStillPasses(t *testing.T) {
+// TestChain_EmitFormMatchesPythonVector checks that rowHashPyCompat still
+// matches the frozen Python vector.
+func TestChain_EmitFormMatchesPythonVector(t *testing.T) {
 	if got := rowHashPyCompat(pyVectorRow()); got != pyVectorHash {
 		t.Fatalf("cross-language vector regressed:\n  go     = %s\n  python = %s", got, pyVectorHash)
 	}
 }
 
-// ── Fix 1: restart seeds seq scoped to the engine's own identity ──────────────
-
-func TestFix1_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
+func TestChain_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 	store, cleanup := newMemStore(t, "audit_fix1")
 	defer cleanup()
 	ctx := context.Background()
@@ -164,7 +154,7 @@ func TestFix1_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 		t.Fatalf("hub-scoped MaxMonotonicSeq = %d, want 1", mx)
 	}
 
-	// Session 2: restart — fresh Engine re-seeds seq from the store.
+	// Session 2: restart. A fresh Engine re-seeds seq from the store.
 	hub2 := &Engine{}
 	if err := hub2.Init(Config{
 		ServiceID: hubSvc, NodeID: hubNode,
@@ -177,9 +167,8 @@ func TestFix1_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 		t.Fatalf("hub2.Emit: %v", err)
 	}
 
-	// Load-bearing: hub's next row is seq=2, not seq=101. This is the Fix 1
-	// invariant — seq seeds from the hub's OWN sub-chain max (1), not the
-	// global max (100, dominated by node A's ingested rows).
+	// The hub's next row is seq=2, not 101: seq seeds from the hub's own
+	// sub-chain max (1), not the global max (100, from node A's rows).
 	if r2.MonotonicSeq != 2 {
 		t.Fatalf("hub seq after restart = %d, want 2 (unscoped seed leaked node A's sub-chain)", r2.MonotonicSeq)
 	}
@@ -203,9 +192,7 @@ func TestFix1_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 	}
 }
 
-// ── Fix 2: ListUnshippedOriginated returns only originated rows ───────────────
-
-func TestFix2_ListUnshippedOriginatedExcludesReplicated(t *testing.T) {
+func TestChain_ListUnshippedOriginatedExcludesReplicated(t *testing.T) {
 	store, cleanup := newMemStore(t, "audit_fix2")
 	defer cleanup()
 	ctx := context.Background()
@@ -229,7 +216,7 @@ func TestFix2_ListUnshippedOriginatedExcludesReplicated(t *testing.T) {
 		t.Fatalf("IngestReplicated: %v", err)
 	}
 
-	// Plain ListUnshipped bleeds all 5 rows (legacy behaviour).
+	// Plain ListUnshipped returns all 5 rows.
 	all, err := store.ListUnshipped(ctx, 100)
 	if err != nil {
 		t.Fatalf("ListUnshipped: %v", err)

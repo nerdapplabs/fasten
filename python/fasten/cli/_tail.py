@@ -1,12 +1,6 @@
-"""
-`fasten tail` — polling client for /api/v1/logs/{audit,sys,api}.
+"""`fasten tail`: poll /api/v1/logs/{audit,sys,api} and print new rows.
 
-Polls the reader every `--interval` seconds, dedupes by timestamp,
-prints only new rows. Honours FASTEN_READER_KEY (sends as X-Fasten-Key
-once P0-4 ships; harmless to send today). `--json` emits NDJSON.
-
-SSE / long-poll path lands once the reader exposes /stream — out of
-scope here.
+Sends FASTEN_READER_KEY (or --key) as X-Fasten-Key. --json prints NDJSON.
 """
 from __future__ import annotations
 
@@ -103,9 +97,9 @@ def run(
 
     api_key = api_key or os.environ.get("FASTEN_READER_KEY")
 
-    # Start window: 5 min back, so first poll picks up recent context.
+    # The first poll shows the last five minutes.
     last_seen = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    # Ordered deque for bounded, deterministic dedup (oldest fall off the left).
+    # Keys of rows already printed; the deque bounds the set.
     seen_deque: collections.deque[str] = collections.deque(maxlen=5000)
     seen_ids: set[str] = set()
 
@@ -115,13 +109,13 @@ def run(
         while True:
             rows = _fetch(url, stream, request_id, last_seen, limit=100, api_key=api_key)
 
-            # Dedupe by id when present, else by (timestamp, code) tuple.
+            # Dedupe by id, or by timestamp, code and event for rows without one.
             new_rows = []
             for r in rows:
                 key = r.get("id") or f"{_row_ts(r)}|{r.get('code', '')}|{r.get('event', '')}"
                 if key in seen_ids:
                     continue
-                # deque(maxlen=5000) evicts oldest key; mirror eviction in set.
+                # The deque is about to drop its oldest key; drop it from the set too.
                 if len(seen_deque) == seen_deque.maxlen:
                     evicted = seen_deque[0]
                     seen_ids.discard(evicted)

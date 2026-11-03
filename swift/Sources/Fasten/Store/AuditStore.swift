@@ -1,13 +1,13 @@
 import Foundation
 
-/// Minimal persistence contract — same shape as every other SDK's AuditRepository.
+/// Persistence interface for audit rows. Mirrors AuditRepository in the other SDKs.
 public protocol AuditStore: Sendable {
     func insert(_ row: AuditRow) throws
     func ping() throws
     func maxMonotonicSeq() -> Int
 }
 
-/// In-memory store — tests + stdout-only deployments.
+/// In-memory store, for tests.
 public final class MemoryStore: AuditStore, @unchecked Sendable {
     private var rows: [AuditRow] = []
     private let lock = Lock()

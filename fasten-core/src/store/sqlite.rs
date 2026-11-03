@@ -10,9 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, unsealed, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
-
-// ── SqliteStore ───────────────────────────────────────────────────────────────
+use super::{non_empty, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -31,7 +29,8 @@ impl SqliteStore {
     /// audit table + indexes.
     ///
     /// `path` may be a filesystem path or `":memory:"`.
-    /// `table` must match `[A-Za-z_][A-Za-z0-9_]*` — no schema prefix.
+    /// `table` must match `[A-Za-z_][A-Za-z0-9_]*`; a schema prefix is not
+    /// supported here.
     /// `wal`  enables WAL journal mode (ignored for `:memory:` databases).
     pub fn open(path: &str, table: &str, wal: bool) -> Result<Self, Error> {
         validate_table_name(table)?;
@@ -152,6 +151,17 @@ impl SqliteStore {
             .collect();
         Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
     }
+
+    fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
+        let (schema, bare) = split_table(table);
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
+        let cols = stmt
+            .query_map(rusqlite::params![bare, schema.unwrap_or("main")], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RedactGate::from_columns(&cols))
+    }
 }
 
 struct Missing {
@@ -214,7 +224,7 @@ impl Store for SqliteStore {
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
         let (where_clause, params_owned) = build_filter_where(filter);
-        // LIMIT / OFFSET are integers, interpolated directly — no injection risk.
+        // LIMIT and OFFSET are integers, so interpolating them is safe.
         let mut sql = format!(
             "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
             self.table, where_clause
@@ -250,7 +260,7 @@ impl Store for SqliteStore {
     }
 
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> {
-        // Always emit LIMIT; use i64::MAX when the caller passes 0.
+        // limit 0 means all rows; i64::MAX keeps the statement cacheable.
         let effective: i64 = if limit == 0 {
             i64::MAX
         } else {
@@ -340,6 +350,7 @@ impl Store for SqliteStore {
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // One read transaction so every chunk sees the same rows.
         let tx = guard.transaction()?;
+        let gate = Self::redact_gate(&tx, &self.table)?;
         for chunk in codes.chunks(BIND_CHUNK) {
             let base = format!(
                 "FROM {} WHERE timestamp < ?1 AND code IN ({}) AND detail <> 'null'",
@@ -351,19 +362,22 @@ impl Store for SqliteStore {
             for c in chunk {
                 params.push(*c);
             }
-            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base} AND hash = ''"))?;
+            let allowed = gate.allowed();
+            let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{allowed}"))?;
             let rows = stmt.query_map(params.as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
             })?;
             for r in rows {
                 out.rows.push(r?);
             }
-            let n: i64 = tx.query_row(
-                &format!("SELECT COUNT(*) {base} AND hash <> ''"),
-                params.as_slice(),
-                |r| r.get(0),
-            )?;
-            out.skipped += n.unsigned_abs();
+            if let Some(refused) = gate.refused() {
+                let n: i64 = tx.query_row(
+                    &format!("SELECT COUNT(*) {base}{refused}"),
+                    params.as_slice(),
+                    |r| r.get(0),
+                )?;
+                out.skipped += n.unsigned_abs();
+            }
         }
         tx.commit()?;
         out.rows.sort_by_key(|(_, seq)| *seq);
@@ -376,13 +390,14 @@ impl Store for SqliteStore {
         }
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let gate = Self::redact_gate(&tx, &self.table)?;
         for chunk in ids.chunks(BIND_CHUNK) {
-            // 'null' is the JSON literal: detail is NOT NULL, and it reads
-            // back as a null detail.
             let sql = format!(
-                "UPDATE {} SET detail = 'null' WHERE id IN ({}) AND hash = ''",
+                "UPDATE {} SET {} WHERE id IN ({}){}",
                 self.table,
-                placeholders(1, chunk.len())
+                gate.set(),
+                placeholders(1, chunk.len()),
+                gate.allowed()
             );
             let params: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
@@ -392,8 +407,6 @@ impl Store for SqliteStore {
         Ok(ids.to_vec())
     }
 }
-
-// ── SQL helpers ───────────────────────────────────────────────────────────────
 
 fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Result<(), Error> {
     let detail_str = serde_json::to_string(&row.detail)?;
@@ -410,7 +423,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         row.severity,
         row.service_id,
         row.source_node_id,
-        row.tenant_id,      // Option<String> → NULL when None
+        row.tenant_id,      // None is stored as NULL
         row.actor,
         row.actor_kind,
         row.target,
@@ -420,7 +433,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         row.request_id,
         detail_str,
         pii,
-        row.shipped_at,     // Option<String> → NULL when None
+        row.shipped_at,     // None is stored as NULL
         row.prev_hash.as_deref().unwrap_or(""),
         row.hash.as_deref().unwrap_or(""),
         row.canonical_form_id.as_deref().unwrap_or("1"),
@@ -501,8 +514,6 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     (clause, params)
 }
 
-// ── Row mapper ────────────────────────────────────────────────────────────────
-
 /// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.
 fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let detail_str: String = r.get(18)?;
@@ -539,8 +550,6 @@ fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
         ..Default::default()
     })
 }
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -586,7 +595,7 @@ mod tests {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let row = make_row("evt-idem-001", "TEST");
         store.insert(&row).unwrap();
-        store.insert(&row).unwrap(); // ON CONFLICT (id) DO NOTHING — no error
+        store.insert(&row).unwrap(); // ON CONFLICT (id) DO NOTHING, no error
     }
 
     #[test]
@@ -743,6 +752,23 @@ mod tests {
         store.insert(&a).unwrap();
         assert!(matches!(store.insert(&b), Err(Error::SeqClash(_))));
         assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    /// A replayed row keeps its id and seq, so storing it again is a no-op;
+    /// another row on that node and seq is a clash.
+    #[test]
+    fn replayed_explicit_seq_row_is_stored_once() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        let mut r = row_on("evt-replay-1", "node-a");
+        r.monotonic_seq = 7;
+        store.insert(&r).unwrap();
+        store.insert(&r).unwrap();
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+        let mut other = row_on("evt-replay-2", "node-a");
+        other.monotonic_seq = 7;
+        assert!(matches!(store.insert(&other), Err(Error::SeqClash(_))));
+        assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+        assert_eq!(seqs(&store, "node-a"), vec![7]);
     }
 
     /// A table from before the UNIQUE constraint already repeats seqs, so
@@ -909,6 +935,48 @@ mod tests {
         store.redact_rows(&all).unwrap();
         assert_eq!(detail_of(&store, "evt-sealed"), serde_json::json!({"key": "value"}));
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+    }
+
+    /// A sealed form-"2" row hashes without its detail, so it is redacted
+    /// like an unsealed one; only sealed form-"1" rows are refused.
+    #[test]
+    fn redaction_covers_sealed_form_2_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        for id in ["evt-form1", "evt-form2", "evt-unsealed"] {
+            let mut r = make_row(id, "USER_LOGIN");
+            r.timestamp = days_ago(40);
+            store.insert(&r).unwrap();
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-form1';
+                 UPDATE audit_log SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
+                 WHERE id = 'evt-form2';",
+            )
+            .unwrap();
+
+        let codes = vec!["USER_LOGIN".to_string()];
+        let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![("evt-form2".to_string(), 2), ("evt-unsealed".to_string(), 3)]
+        );
+        assert_eq!(found.skipped, 1);
+        let all = vec!["evt-form1".to_string(), "evt-form2".to_string(), "evt-unsealed".to_string()];
+        store.redact_rows(&all).unwrap();
+        assert_eq!(detail_of(&store, "evt-form1"), serde_json::json!({"key": "value"}));
+        assert_eq!(detail_of(&store, "evt-form2"), serde_json::Value::Null);
+        assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
+        let salt: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT detail_salt FROM audit_log WHERE id = 'evt-form2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(salt, "");
     }
 
     /// More ids and codes than SQLite binds in one statement.
