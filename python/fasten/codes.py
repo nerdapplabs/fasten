@@ -1,16 +1,7 @@
-"""
-Audit code catalog — typed constants + per-code metadata.
+"""Audit code catalog: enums and per-code metadata.
 
-Public API (unchanged from pre-FFI):
-  register(domain, codes)  — validate + store via fasten-core Rust engine
-  registry()               — return a copy of the current catalog (Python-side cache)
-  dump()                   — sorted `id,domain,severity` CSV via Rust
-  meta_of(code)            — single-code lookup
-  load(path)               — load a catalog yaml file
-  reload()                 — re-read previously-loaded yaml paths
-
-All validation logic (UPPER_SNAKE_CASE, duplicate detection, domain checks,
-pii_in_detail → retention SHORT enforcement) lives in fasten-core.
+Codes are validated by fasten-core in register(); this module keeps a Python
+copy of the validated metadata for lookups.
 """
 from __future__ import annotations
 
@@ -109,13 +100,12 @@ class AuditCatalogError(Exception):
     """Raised at registration time for duplicate codes or bad metadata."""
 
 
-# ── Python-side cache (populated through Rust validation) ────────────────────
-
+# Filled from fasten-core after validation.
 _registry: dict[str, Meta] = {}
 
 
 def _meta_to_dict(name: str, meta: Meta) -> dict:
-    """Convert a Meta object to a JSON-serialisable dict for fasten_register_codes."""
+    """Meta as the JSON dict fasten_register_codes expects."""
     return {
         "domain":                 meta.domain,
         "category":               meta.category,
@@ -133,7 +123,7 @@ def _meta_to_dict(name: str, meta: Meta) -> dict:
 
 
 def _dict_to_meta(d: dict) -> Meta:
-    """Reconstruct a Python Meta from a Rust JSON dict."""
+    """Meta from fasten-core's JSON dict."""
     return Meta(
         domain=d["domain"],
         category=d["category"],
@@ -151,18 +141,15 @@ def _dict_to_meta(d: dict) -> Meta:
 
 
 def register(domain: Domain, codes: Mapping[str, Meta]) -> None:
-    """Register a batch of codes for a domain.
+    """Register codes for a domain.
 
-    Validation is delegated to fasten-core (Rust):
-      - key shape: UPPER_SNAKE_CASE
-      - Meta.id empty → filled from key; set → must match key
-      - Meta.domain must match domain
-      - duplicate code across registrations
-      - pii_in_detail=True forces retention_class=SHORT
+    Keys must be UPPER_SNAKE_CASE and not already registered. ``Meta.id`` is
+    filled from the key if empty and must match it otherwise; ``Meta.domain``
+    must equal ``domain``. pii_in_detail codes get retention_class SHORT.
 
     Raises AuditCatalogError on any violation.
     """
-    # Emit the pii_in_detail warning in Python before Rust silently forces SHORT.
+    # fasten-core forces SHORT without saying so; warn here.
     for name, meta in codes.items():
         if meta.pii_in_detail and meta.retention_class is not RetentionClass.SHORT:
             _logger.warning(
@@ -171,9 +158,7 @@ def register(domain: Domain, codes: Mapping[str, Meta]) -> None:
                 name, meta.retention_class.value.upper(),
             )
     codes_dict = {name: _meta_to_dict(name, meta) for name, meta in codes.items()}
-    # Raises AuditCatalogError on validation failure (mapped from Rust error codes).
     core_ffi.register_codes(domain, json.dumps(codes_dict))
-    # Populate Python cache from the Rust-validated state.
     for name in codes:
         meta_json = core_ffi.meta_of_json(name)
         if meta_json and meta_json != "{}":
@@ -191,18 +176,9 @@ def registry() -> dict[str, Meta]:
 
 
 def pii_codes() -> list[str]:
-    """Codes whose rows may carry personal data in ``detail``.
-
-    This is what makes ``pii_in_detail=True`` mean something at runtime. The
-    flag forces ``retention_class`` to SHORT at registration, but nothing acted
-    on that: ``purge()`` filters on age alone, so an operator had to hand-pass
-    a list of codes to ``redact_expired`` and the flag was effectively a
-    comment.
-
-    Includes a code if EITHER it declares ``pii_in_detail`` or it is classified
-    SHORT — the forcing makes the first imply the second, and an adopter who
-    sets SHORT directly has said the same thing about retention.
-    """
+    """Codes whose rows may carry personal data in ``detail``: those with
+    ``pii_in_detail`` or retention_class SHORT. Used by the PII retention
+    purger."""
     return sorted(
         name for name, meta in registry().items()
         if meta.pii_in_detail or str(meta.retention_class) == "short"
@@ -210,23 +186,22 @@ def pii_codes() -> list[str]:
 
 
 def dump() -> str:
-    """`id,domain,severity` sorted one-per-line — feeds cross-language consistency gate."""
+    """Sorted ``id,domain,severity`` lines, compared across the SDKs."""
     rows = sorted(
         (m.id, m.domain, str(m.severity)) for m in _registry.values()
     )
     return "\n".join(f"{i},{d},{s}" for (i, d, s) in rows)
 
 
-# ── Optional yaml catalog (P1-11) ─────────────────────────────────────────
-# Re-export lazy: pyyaml is only imported when load() / reload() runs.
+# yaml catalogs. Imported lazily so pyyaml is only needed when used.
 
 def load(path: str) -> None:
-    """Load a catalog yaml file (see ``fasten/codes_yaml.py`` for full docs)."""
+    """Load a catalog yaml file. See fasten.codes_yaml."""
     from .codes_yaml import load as _load
     _load(path)
 
 
 def reload() -> None:
-    """Re-read all previously-loaded yaml paths and atomically swap the registry."""
+    """Re-read the loaded yaml files and swap the registry in one step."""
     from .codes_yaml import reload as _reload
     _reload()

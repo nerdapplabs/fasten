@@ -1,6 +1,6 @@
 import Foundation
 
-/// Cross-platform lock wrapper — works identically on Apple and Linux.
+/// NSLock wrapper with a closure-based withLock, available on Apple and Linux.
 final class Lock: @unchecked Sendable {
     private let _lock = NSLock()
 

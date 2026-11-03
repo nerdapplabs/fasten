@@ -1,6 +1,6 @@
 # Security Policy
 
-See [docs/security.md](docs/security.md) for the full threat model — trust boundaries, attack surfaces, mitigations in place, and what is explicitly out of scope.
+See [docs/security.md](docs/security.md) for the full threat model: trust boundaries, attack surfaces, mitigations in place, and what is explicitly out of scope.
 
 ## Supported versions
 
@@ -41,37 +41,37 @@ GitHub acts as a CNA; advisories are published to the NVD automatically on relea
 
 ## Supply-chain attestation
 
-**No releases have been published to PyPI / npm / crates.io yet.**
-v1.0.0-beta is source-only — clone the repo and build from a pinned
-commit SHA. The first published release will land at the v1.0.0 GA tag.
+**No releases have been published to PyPI, npm or crates.io yet.**
+v1.0.0-beta is source-only: clone the repo and build from a pinned
+commit SHA. The first published release will be the v1.0.0 GA tag.
 
-**Configured, ready to take effect on the first published release:**
+**Configured, and active from the first published release:**
 
-- PyPI Trusted Publishing (OIDC, no long-lived tokens) — wired in
+- PyPI Trusted Publishing (OIDC, no long-lived tokens), in
   [`release-python.yml`](.github/workflows/release-python.yml).
-- npm `--provenance` (linked back to source commit) — wired in
+- npm `--provenance` (linked back to the source commit), in
   [`release-js.yml`](.github/workflows/release-js.yml).
 
-**Still planned for the v1.0.0 GA tag:**
+**Planned for the v1.0.0 GA tag:**
 
-- Release artifacts signed with [Sigstore](https://www.sigstore.dev/) cosign;
-  verification instructions on each
+- Release artifacts signed with [Sigstore](https://www.sigstore.dev/) cosign,
+  with verification instructions on each
   [release](https://github.com/nerdapplabs/fasten/releases).
-- SBOM published per-language alongside each release.
+- A per-language SBOM published with each release.
 
 ## Current scan posture
 
-CI runs three vulnerability scanners on every push against the
-minimum supported language version (Python 3.10-slim, Go 1.22-alpine,
-Node 24-alpine). All three are CLEAN as of the latest commit:
+Each SDK's dependencies are scanned against the minimum supported
+language version (Python 3.10-slim, Go 1.22-alpine, Node 24-alpine). All
+three are clean as of the latest scan:
 
 | Language | Scanner          | Status | Notes |
 |----------|------------------|--------|-------|
-| Python   | `pip-audit`      | CLEAN  | Zero runtime deps (`dependencies = []` in `pyproject.toml`). CI uses `uv venv` + `uv pip install`; the resulting venv contains only project + dev deps — no `pip` / `wheel` to flag. |
-| Go       | `govulncheck`    | CLEAN  | Two direct deps: `gopkg.in/yaml.v3` (catalog parsing) and `modernc.org/sqlite` (CGO-free SQLite driver, pulls 11 indirect deps from the modernc toolchain). `govulncheck` reports no advisories against the resolved set. Re-run after any `go.mod` change. |
-| JS       | `npm audit`      | CLEAN  | Zero production deps (`package.json` has no `dependencies` block). Uses `node:async_hooks` + `node:crypto` builtins. `js-yaml` is an optional peer dep (catalog parsing only). |
+| Python   | `pip-audit`      | Clean  | Zero runtime deps (`dependencies = []` in `pyproject.toml`). Runs in CI on every push and pull request that touches `python/` or `fasten-core/`. CI installs the project and dev deps into a `uv venv`, which has no `pip` / `wheel` to flag, then runs `uvx pip-audit@2.10.1 --path <venv site-packages>` from its own environment, so the audit covers the project venv and not pip-audit's own dependencies. The job fails if site-packages is not found. |
+| Go       | `govulncheck`    | Clean  | Three direct deps: `gopkg.in/yaml.v3` (catalog parsing), `modernc.org/sqlite` (CGO-free SQLite driver, which pulls the 13 indirect deps in `go.mod`) and `github.com/lib/pq` (Postgres driver). `govulncheck` reports no advisories against the resolved set. Re-run after any `go.mod` change. |
+| JS       | `npm audit`      | Clean  | Zero production deps (`package.json` has an empty `dependencies` block). Uses the `node:async_hooks` and `node:crypto` builtins. `pg` (Postgres store) and `js-yaml` (catalog parsing only) are optional and not installed by default. |
 
-Re-run after adding any dependency: `pip-audit` · `govulncheck ./...` · `npm audit`.
+Re-run after adding any dependency: `pip-audit`, `govulncheck ./...`, `npm audit`.
 
 ## Scope
 

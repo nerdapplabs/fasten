@@ -8,12 +8,9 @@ What this file guarantees, one class per guarantee:
   RedactionSemantics  what redaction destroys, what it preserves, and that the
                       chain still verifies afterwards
   RecordBeforeDestroy no row loses its payload without a durable spec §7.2
-                      record — in every failure mode, including the default
+                      record, in every failure mode including the default
   FormCompatibility   form-"1" rows cannot be redacted, and are reported
   AgePurgeContract    the age purge and the PII horizon are independent
-
-Organised by what breaks if it regresses, not by the order the bugs were found.
-Provenance appears only where a guard looks arbitrary without it.
 
 Companion files: test_retention.py (purger loop mechanics and duration
 parsing), test_canonical_form_2.py (the hashed form itself).
@@ -91,8 +88,8 @@ def rows_by_id(db: str) -> dict[str, AuditRow]:
 def wait_for(pred: Callable[[], Any], timeout: float = 10.0) -> Any:
     """Poll until pred() is truthy. Returns None on timeout.
 
-    The purger's first tick runs immediately, so seeding the store BEFORE
-    init() needs no check_interval knob — but the tick is on another thread.
+    The purger's first tick runs immediately, so seeding the store before
+    init() needs no check_interval, but the tick runs on another thread.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -114,8 +111,6 @@ def engine_with(db: str, *, store: Optional[Any] = None, **init_kw: Any) -> Engi
 def redactions(rows: Any) -> list[AuditRow]:
     return [r for r in rows if r.code == REDACTION]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPIICodeSet:
     """Which codes the horizon acts on."""
@@ -189,7 +184,7 @@ class TestRedactionSemantics:
     """What redaction destroys, preserves, and leaves verifiable."""
 
     def test_pii_expires_while_operational_history_survives(self) -> None:
-        """The policy that was previously inexpressible: two horizons."""
+        """PII and operational rows have separate horizons."""
         store = SQLiteStore(new_db())
         pii = aged(store, PII, {"email": "a@b.c"}, 40)
         ops = aged(store, OPS, {"n": 1}, 40)
@@ -254,12 +249,10 @@ class TestRedactionSemantics:
             e.reset_for_tests()
 
     def test_retry_destroys_the_same_rows_and_reports_them(self) -> None:
-        """Idempotent by targeting ids rather than a time window.
+        """Idempotent because it targets ids rather than a time window.
 
-        Deriving the return value from RETURNING on a window query guarded by
-        `detail <> 'null'` meant a retry after a lost commit ack matched
-        nothing and returned [], so the caller wrote no events for rows it had
-        just destroyed.
+        A retry after a lost commit ack still returns the ids, so the caller
+        can write events for them.
         """
         store = SQLiteStore(new_db())
         pii = aged(store, PII, {"email": "a@b.c"}, 40)
@@ -306,10 +299,7 @@ class TestRecordBeforeDestroy:
             e.reset_for_tests()
 
     def test_event_carries_the_spec_detail_shape(self) -> None:
-        """spec/chain-replication.md §7.2: {"redacted_seq": n, "reason": ...}.
-
-        The implementation wrote redacted_id and no seq.
-        """
+        """spec/chain-replication.md §7.2: {"redacted_seq": n, "reason": ...}."""
         db = new_db()
         store = SQLiteStore(db)
         pii = aged(store, PII, {"email": "a@b.c"}, 40)
@@ -523,13 +513,10 @@ class TestAgePurgeContract:
     """The age purge and the PII horizon are independent policies."""
 
     def test_age_purge_accepts_a_datetime_on_an_audit_store(self) -> None:
-        """It used to raise on every tick, invisibly.
+        """Audit stores declare `before: datetime`.
 
-        start_purger passed a canonical string while the audit stores declare
-        `before: datetime`. The raise landed in the tick's except and went out
-        through on_error, so a purge that never once succeeded looked healthy:
-        the fake store in test_retention.py agreed with the caller, the real
-        stores did not, and every fixture row was younger than its retention.
+        A tick that raises is only reported through on_error, and the fake
+        store in test_retention.py does not check the type, so this uses a real store.
         """
         db = new_db()
         store = SQLiteStore(db)
@@ -551,8 +538,8 @@ class TestAgePurgeContract:
         assert not errors, f"a retention tick raised: {errors}"
 
     def test_a_redaction_failure_does_not_skip_the_age_purge(self) -> None:
-        """Separate try blocks, separate labels. One shared try let a
-        redaction failure suppress the age purge for the rest of the tick."""
+        """Redaction and the age purge run in separate try blocks, with
+        separate error labels."""
         purged: list[Any] = []
 
         class RedactionFails:

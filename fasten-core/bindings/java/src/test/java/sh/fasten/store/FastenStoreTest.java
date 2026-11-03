@@ -43,7 +43,7 @@ class FastenStoreTest {
 
     void requireLib() {
         assumeTrue(libAvailable,
-            "libfasten_store_core not found — build with `cargo build --release --features all`");
+            "libfasten_store_core not found; build with `cargo build --release --features all`");
     }
 
     String pgDsn() {
@@ -75,7 +75,7 @@ class FastenStoreTest {
         );
     }
 
-    // ── Version ───────────────────────────────────────────────────────────────
+    // Version
 
     @Test
     void version_returnsNonEmpty() {
@@ -85,7 +85,7 @@ class FastenStoreTest {
         assertFalse(v.isBlank());
     }
 
-    // ── SQLite ────────────────────────────────────────────────────────────────
+    // SQLite
 
     @Test
     void sqlite_openMemoryAndPing() {
@@ -165,10 +165,10 @@ class FastenStoreTest {
         try (var store = FastenStore.open("sqlite", ":memory:", "audit_log")) {
             store.insert(makeRow("evt-java-twr-001", "TEST"));
         }
-        // close() must be idempotent — no crash after try block exits
+        // close() must be idempotent
     }
 
-    // ── PostgreSQL ────────────────────────────────────────────────────────────
+    // PostgreSQL
 
     @Test
     void postgres_openAndPing() {

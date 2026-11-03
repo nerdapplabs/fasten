@@ -12,7 +12,7 @@ public struct RedactionCandidate: Sendable, Equatable {
     }
 }
 
-/// Minimal persistence contract — same shape as every other SDK's AuditRepository.
+/// Persistence interface for audit rows. Mirrors AuditRepository in the other SDKs.
 ///
 /// `insert` with `monotonicSeq == 0` must assign the next seq for the row's
 /// `source_node_id` inside the insert transaction (spec 2.1). A non-zero seq
@@ -53,12 +53,12 @@ extension AuditStore {
     }
 }
 
-/// In-memory store — tests + stdout-only deployments.
 public extension AuditStore {
     /// The highest `monotonic_seq` across every node.
     func maxMonotonicSeq() -> Int { maxMonotonicSeq(sourceNodeID: nil) }
 }
 
+/// In-memory store, for tests.
 public final class MemoryStore: AuditStore, @unchecked Sendable {
     private var rows: [AuditRow] = []
     private var redacted: Set<String> = []

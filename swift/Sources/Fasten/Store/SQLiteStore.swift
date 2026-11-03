@@ -5,13 +5,8 @@ import SQLite3
 import CSQLite3
 #endif
 
-/// SQLite-backed AuditStore.  Uses the system SQLite3 library (always available on
-/// Apple platforms; install libsqlite3-dev on Linux).
-///
-/// Usage:
-///   let store = try SQLiteStore(path: "./fasten-audit.db")
-///   // or in-memory for tests:
-///   let store = try SQLiteStore(path: ":memory:")
+/// AuditStore backed by the system SQLite3 library (install libsqlite3-dev on
+/// Linux). Pass ":memory:" as the path for an in-memory database.
 public final class SQLiteStore: AuditStore, @unchecked Sendable {
 
     private(set) var db: OpaquePointer?   // internal for tests
@@ -42,8 +37,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     deinit { sqlite3_close(db) }
-
-    // ── Schema ─────────────────────────────────────────────────────────────
 
     private func bootstrap() throws {
         let ddl = """
@@ -96,8 +89,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             } catch let e as FastenError where e.message.hasPrefix("duplicate column name") {}
         }
     }
-
-    // ── AuditStore protocol ─────────────────────────────────────────────────
 
     /// A row with `monotonicSeq == 0` gets the next seq for its
     /// `source_node_id`, allocated under `BEGIN IMMEDIATE` so two connections
@@ -322,8 +313,6 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             return Int(sqlite3_column_int64(stmt, 0))
         }
     }
-
-    // ── Helpers ────────────────────────────────────────────────────────────
 
     private func lastError() -> String {
         sqlite3_errmsg(db).map { String(cString: $0) } ?? "unknown error"

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Thread-safe fasten engine — all SDK state lives here.
+/// Holds all SDK state. The Fasten enum forwards to a shared instance.
 final class Engine: @unchecked Sendable {
 
     var serviceID:  String = ""
@@ -25,7 +25,7 @@ final class Engine: @unchecked Sendable {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
-        // Flush + stop old drainer before reconfiguring so in-flight rows are not dropped.
+        // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
         if let old = drainer {
             old.flush(timeout: 5.0)
             old.close()
@@ -195,11 +195,12 @@ final class Engine: @unchecked Sendable {
     }
 }
 
-/// Shared default engine — module-level functions delegate here.
+/// The engine behind the static Fasten API.
 let _defaultEngine = Engine()
 
-/// FastenError wraps any fasten-specific failure. Its localizedDescription is
-/// the message, which the drainer keeps as last_error.
+/// Error thrown by fasten itself (unknown code, bad table name, SQLite errors).
+/// Its localizedDescription is the message, which the drainer keeps as
+/// last_error.
 public struct FastenError: Error, LocalizedError, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }
