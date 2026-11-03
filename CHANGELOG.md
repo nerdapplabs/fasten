@@ -45,6 +45,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `pg_advisory_xact_lock` the required Postgres lock, and §7.1 makes
   redacting unsealed rows the rule for every SDK.
 
+### Fixed: C++ queue mode reads columns from the row, not from `detail` (#147)
+
+- The drainer hands each row to the sink as JSON, and every column was found
+  by a substring search over it. A `detail` key named like a column that is
+  null or left out (`tenant_id` with no engine tenant, `shipped_at`) set that
+  column on the stored row, and a `detail` key `pii_in_detail` could clear
+  that flag. Columns are now read from the row's own members.
+- `detail` is bounded by the same scan, so a value containing `}` no longer
+  cuts it short (#138, point 1).
+
 ### Changed: reworded messages (all SDKs)
 
 - Reader error bodies (Python and Go): `search requires sys persistence:
