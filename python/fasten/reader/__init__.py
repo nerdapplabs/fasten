@@ -1,7 +1,5 @@
-"""
-Reader — mountable /logs/{api,sys,audit} handler, framework-agnostic.
+"""FastAPI router serving /logs/{api,sys,audit} and related reads.
 
-Usage (FastAPI/Starlette):
     from fastapi import Depends
     from fasten.reader import router, require_bearer
 
@@ -9,9 +7,6 @@ Usage (FastAPI/Starlette):
         router(dependencies=[Depends(require_bearer())]),
         prefix="/api/v1/logs",
     )
-
-Returns canonical rows filterable by request_id, code, domain, since/until,
-level, service_id, etc.
 """
 from __future__ import annotations
 

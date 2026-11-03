@@ -7,11 +7,9 @@ import (
 	"time"
 )
 
-// TestStoreDegradedStickyThroughSuccessfulWrite covers FR4-2: a store that has
-// gone store-degraded must STAY degraded after a later successful write — the
-// hole in durable history does not heal. The existing degrade test closes the
-// sink and asserts once; it never drives a successful write afterwards, so a
-// regression that reset the flag on a healthy insert would pass unnoticed.
+// TestStoreDegradedStickyThroughSuccessfulWrite: once a stream is
+// store-degraded it stays degraded after a later successful write, because the
+// hole in durable history does not heal.
 func TestStoreDegradedStickyThroughSuccessfulWrite(t *testing.T) {
 	registerTestCodes(t)
 	apiDB, err := sql.Open("sqlite", ":memory:")
@@ -45,7 +43,7 @@ func TestStoreDegradedStickyThroughSuccessfulWrite(t *testing.T) {
 	if got := Default.streamSource("api"); got != "store-degraded" {
 		t.Fatalf("after failure api=%q, want store-degraded", got)
 	}
-	// Sink recovers: a subsequent SUCCESSFUL write must NOT clear the flag.
+	// The sink recovers; a later successful write must not clear the flag.
 	tr.PushAPI(APIRow{"method": "GET", "path": "/kept", "request_id": "r2"})
 	if n := apiStore.WriteFailures(); n != 1 {
 		t.Fatalf("a successful write must not add a failure; WriteFailures=%d, want 1", n)
@@ -56,16 +54,15 @@ func TestStoreDegradedStickyThroughSuccessfulWrite(t *testing.T) {
 	if got := Default.streamSource("api"); got != "store-degraded" {
 		t.Fatalf("after recovery api=%q, want store-degraded (sticky)", got)
 	}
-	// The recovered row is present — history keeps growing, the earlier hole stays.
+	// The recovered row is present: history keeps growing, the hole stays.
 	body, _ := getJSON(t, NewReader(), "/api")
 	if rows, _ := body["rows"].([]any); len(rows) != 1 {
 		t.Fatalf("want 1 persisted row after recovery, got %d", len(rows))
 	}
 }
 
-// TestCorrelateMixedDurabilityClasses covers FR4-3: /correlate must report each
-// stream's own durability class when they differ. Every other test uses a
-// uniform class; nothing pinned the mixed composition.
+// TestCorrelateMixedDurabilityClasses: /correlate reports each stream's own
+// durability class when they differ.
 func TestCorrelateMixedDurabilityClasses(t *testing.T) {
 	registerTestCodes(t)
 	auditDB, err := sql.Open("sqlite", ":memory:")
@@ -99,8 +96,8 @@ func TestCorrelateMixedDurabilityClasses(t *testing.T) {
 	}
 }
 
-// TestCorrelateTruncatedFlag covers FR4-4: /correlate exposes a per-stream
-// truncated boolean (counts < totals) so callers don't re-derive it.
+// TestCorrelateTruncatedFlag: /correlate exposes a per-stream truncated
+// boolean (counts < totals) so callers don't re-derive it.
 func TestCorrelateTruncatedFlag(t *testing.T) {
 	registerTestCodes(t)
 	auditDB, err := sql.Open("sqlite", ":memory:")
@@ -133,11 +130,9 @@ func TestCorrelateTruncatedFlag(t *testing.T) {
 	}
 }
 
-// TestAdopterAuditStoreDegradeThroughEngine (PR #59 finding 3):
-// AuditRepository does not require NoteWriteFailure — the sync-fallback
-// swallow used to be a no-op for adopter stores, so completeness kept
-// reporting "store" over durable history that had holes. The engine-side
-// auditWriteSwallowed flag must catch this case.
+// TestAdopterAuditStoreDegradeThroughEngine: AuditRepository does not require
+// NoteWriteFailure, so the engine's auditWriteSwallowed flag is what marks an
+// adopter store degraded after a swallowed write.
 func TestAdopterAuditStoreDegradeThroughEngine(t *testing.T) {
 	registerTestCodes(t)
 	resetGlobals(t)
@@ -168,8 +163,8 @@ func TestAdopterAuditStoreDegradeThroughEngine(t *testing.T) {
 	}
 }
 
-// brokenAdopterAuditStore is an AuditRepository with no NoteWriteFailure
-// / Degraded — the documented adopter shape. Insert always fails.
+// brokenAdopterAuditStore is an AuditRepository without NoteWriteFailure or
+// Degraded, the documented adopter shape. Insert always fails.
 type brokenAdopterAuditStore struct{}
 
 func (*brokenAdopterAuditStore) Insert(context.Context, Row) error {

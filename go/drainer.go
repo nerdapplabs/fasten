@@ -7,13 +7,11 @@ package fasten
 #include <stdlib.h>
 #include <stdint.h>
 
-// Forward declaration so CGo can resolve C.goInsertCallback below.
-// Note: CGo generates char* (not const char*) for *C.char parameters.
+// cgo generates char* (not const char*) for *C.char parameters.
 extern int32_t goInsertCallback(char* row_json, void* userdata);
 
-// Pass a cgo.Handle (a uintptr) as the void* userdata. The uintptr->void*
-// cast happens here in C, so the Go side never does unsafe.Pointer(uintptr(...))
-// — which `go vet` flags as a possible misuse of unsafe.Pointer.
+// Passes a cgo.Handle as the void* userdata. Doing the cast in C avoids the
+// unsafe.Pointer(uintptr(...)) conversion that go vet warns about.
 static inline FastenStore* fasten_store_from_handle(
     FastenInsertCallbackFn fn, uintptr_t h, char** out_err) {
     return fasten_store_from_callback(fn, (void*)h, out_err);
@@ -29,13 +27,9 @@ import (
 	"unsafe"
 )
 
-// goInsertCallback is the C-callable insert callback that bridges
-// the shared fasten-core drainer to a Go AuditRepository.
-// The store is passed via userdata as a cgo.Handle (uintptr).
-//
-// Each insert crosses the CGo boundary twice (Go → Rust drainer → C callback → Go store).
-// The ~100 ns/call CGo overhead is acceptable at audit volumes but rules out
-// high-frequency non-audit use of this path.
+// goInsertCallback is called by the fasten-core drainer to insert one row
+// into the Go AuditRepository passed as a cgo.Handle in userdata. Each row
+// crosses cgo twice, which is fine at audit volumes.
 //
 //export goInsertCallback
 func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) C.int32_t {
@@ -55,12 +49,11 @@ func goInsertCallback(rowJSON *C.char, userdata unsafe.Pointer) C.int32_t {
 	return 0
 }
 
-// cFastenDrainer wraps a FastenStore* + Drainer (C ABI) together
-// with the cgo.Handle that keeps the Go AuditRepository alive for
-// the drainer's background thread.
+// cFastenDrainer holds the C store and drainer, plus the cgo.Handle that
+// keeps the Go AuditRepository reachable from the drainer thread.
 type cFastenDrainer struct {
-	handle   unsafe.Pointer // *FastenStoreHandle
-	goHandle cgo.Handle     // holds the Go AuditRepository alive
+	handle   unsafe.Pointer // *C.FastenStore
+	goHandle cgo.Handle
 }
 
 func newCFastenDrainer(
@@ -70,7 +63,6 @@ func newCFastenDrainer(
 	retryJitter bool,
 	maxAttempts uint32,
 ) (*cFastenDrainer, error) {
-	// Create a cgo.Handle so the C callback can reach the Go store.
 	h := cgo.NewHandle(store)
 
 	var errStr *C.char
@@ -116,7 +108,7 @@ func newCFastenDrainer(
 	return &cFastenDrainer{handle: unsafe.Pointer(storePtr), goHandle: h}, nil
 }
 
-// enqueue serialises a Row to JSON and hands it to the shared drainer.
+// enqueue hands a row to the drainer as JSON.
 func (d *cFastenDrainer) enqueue(row Row) {
 	b, err := json.Marshal(row)
 	if err != nil {
@@ -139,8 +131,7 @@ func (d *cFastenDrainer) flush(timeout time.Duration) bool {
 	return drained != 0
 }
 
-// statsJSON returns the drainer health snapshot as a JSON string,
-// or "null" when no drainer is active.
+// statsJSON returns the drainer stats as JSON, or "null" if there are none.
 func (d *cFastenDrainer) statsJSON() string {
 	var outJSON, errStr *C.char
 	C.fasten_drainer_stats_json((*C.FastenStore)(d.handle), &outJSON, &errStr)
@@ -155,9 +146,8 @@ func (d *cFastenDrainer) statsJSON() string {
 	return result
 }
 
-// close stops the drainer thread and releases all C resources.
-// The cgo.Handle is deleted AFTER drainer_close() so the background
-// thread cannot call into a freed Go store.
+// close stops the drainer and frees the C store. The handle is deleted only
+// after the drainer thread has stopped, so it can't reach a deleted handle.
 func (d *cFastenDrainer) close() {
 	C.fasten_drainer_close((*C.FastenStore)(d.handle))
 	d.goHandle.Delete()
