@@ -1,10 +1,10 @@
-"""
-CLI helpers (debug utilities, not a product):
-  - fasten dump    — print registered codes + meta (feeds CI consistency gate)
-  - fasten tail    — stream /logs/* from a local/remote fasten-mounted service
-  - fasten doctor  — verify init config + store + correlation wiring
-  - fasten tui     — multi-pane live feed (requires fasten[tui])
-  - fasten codes typegen — emit IDE / type-checker stubs from a yaml catalog
+"""Debugging CLI.
+
+  fasten dump            print registered codes as id,domain,severity
+  fasten tail            poll /logs/* from a service with the reader mounted
+  fasten doctor          check config, stores and correlation
+  fasten tui             multi-pane live view (needs fasten[tui])
+  fasten codes typegen   write type stubs for a yaml catalog
 """
 from __future__ import annotations
 

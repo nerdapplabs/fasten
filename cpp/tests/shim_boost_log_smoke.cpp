@@ -1,11 +1,7 @@
-// P1-12 — Boost.Log → fasten syslog shim integration test.
-//
-// Requires Boost.Log headers (boost >= 1.54). Guarded in CMakeLists.txt
-// via find_package(Boost COMPONENTS log) — skipped when Boost is absent.
-//
-// Tests:
+// fasten/shim/boost_log.hpp. Needs Boost.Log 1.54+; CMake skips it when
+// Boost.Log is not found. Covers:
 //   1. consume() pushes a row with correct level and event fields
-//   2. Level mapping (trivial severity → fasten level strings)
+//   2. Level mapping (trivial severity to fasten levels)
 //   3. Recursion guard (no infinite re-entry)
 
 #include "fasten.hpp"
@@ -29,8 +25,7 @@ void reset() {
     g.syslog_ring.clear();
 }
 
-// Build a trivial Boost.Log record and open a record_view from it.
-// We drive the fasten backend via core::open_record + record_view.
+// Feed the backend record_views opened with core::open_record.
 void fire_via_core(boost::log::trivial::severity_level sev,
                    const std::string& msg)
 {
@@ -124,6 +119,6 @@ int main() {
     test_ring_receives_row();
     test_level_mapping();
     test_recursion_guard();
-    std::cout << "\nALL P1-12 boost_log SHIM TESTS PASSED\n";
+    std::cout << "\nALL BOOST_LOG SHIM TESTS PASSED\n";
     return 0;
 }
