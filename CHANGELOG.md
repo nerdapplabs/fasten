@@ -31,6 +31,65 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - The queue is no longer allocated up front, so a large `capacity` costs
   nothing until rows arrive.
 
+### Changed: Python queue mode goes through the shared drainer
+
+- In queue mode (the default), `emit()` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `monotonic_seq` is 0 and
+  `hash` is empty, and the store seals the row when it lands. Use
+  `audit_store_failure_strategy="raise"` to get the
+  sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `queue_drain_max_attempts`, instead of being dropped after one try. A row
+  the store rejects outright (DB-API `DataError` / `IntegrityError`) is
+  dead-lettered at once.
+- `emit()` blocks while the queue is full.
+- A forked child (gunicorn `--preload`, Celery prefork) installs its own
+  drainer. `fork()` waits up to 1 s for an in-flight store insert, so a
+  child no longer stops storing after inheriting SQLite mid-insert, and an
+  insert stuck on a database lock does not hold up `fork()`; the parent then
+  emits `audit_drain_fork_during_insert`, stored from another thread so a
+  stalled syslog store does not hold up `fork()` either. A failed reinstall
+  in the child emits `audit_drain_reinstall_failed`.
+- `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
+  of `timeout`, then stops the drainer and stores the rows it still holds.
+  It returns within about `timeout`: no store call starts after that, one
+  still running is left behind, and rows not stored are reported as
+  `audit_drain_lost_at_stop`. It returns False only if a row was lost,
+  including one an emit racing `close` failed to store inline, and every
+  row counted lost is reported before it returns.
+  Sys events past the deadline go to stderr and the ring but not the
+  syslog store, which is then marked degraded. A row reported lost and
+  stored later, by a left-behind call, retire or an inline emit, gets
+  `audit_drain_recovered_at_stop`, unless the process exits first, so a
+  row reported lost may still have been stored. The exit hook calls
+  `close(5.0)`, so a hanging store no longer holds interpreter exit, and
+  the process exits normally: exit status and other atexit hooks are
+  unaffected. Emits after `close` are stored inline without an
+  `audit_drain_abandoned` event.
+- Re-`init` waits at most 10 s for the drainer it replaces (flushing it
+  for up to 5 s, as before), and reports rows still held then as
+  `audit_drain_lost_at_stop`, so a hanging store no longer blocks
+  `fasten.init()`, and a store call stuck in the old store no longer holds
+  up the new drainer's inserts. If the old drainer's flush timed out or a
+  row it held was not stored, re-init emits `audit_drain_install_incomplete`
+  (`flushed`, `unstored`). While it retires, `flush()` also waits for its
+  rows, and `close()` waits for it within its own timeout and reports the
+  rows it still holds then as lost. Rows the old drainer loses keep the engine's
+  `audit_write_swallowed()` flag set when re-init builds a new store over
+  the same database (the same SQLite file or Postgres DSN and table, as
+  `FASTEN_AUDIT_DSN` does); only a different store clears it.
+- The drainer's store calls run on a Python thread (`fasten-store`, one
+  per drainer); fasten-core's drain thread waits for each. A store call
+  left behind at exit can no longer abort the process during interpreter
+  finalization (CPython before 3.14 on Linux).
+- Drainer sys events are written to stderr before the syslog store, so a
+  hung syslog store can't hold them back. The events fasten-core sends
+  while a drainer stops (`audit_drain_stop_slow`, `audit_drain_abandoned`)
+  go to stderr and the ring only, and the syslog store is marked degraded.
+- A flush that fails in fasten-core is reported as
+  `audit_drain_flush_failed` (and `flush()` returns False) instead of
+  looking like a timeout.
+
 ### Changed: Go queue mode goes through the shared drainer
 
 - In queue mode (the default), `Emit` now hands the row to the fasten-core

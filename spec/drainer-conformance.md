@@ -475,6 +475,12 @@ shutdown timeout passes, is reported with `audit_drain_lost_at_stop`, not
 false. An SDK that stores rows its drainer still held after stopping it
 reports them with `audit_drain_recovered_at_stop`.
 
+A lost report can be a false alarm, but a loss is never missed. A store
+call left behind at the deadline may still store its row, and if the
+process exits before the SDK can report that, no
+`audit_drain_recovered_at_stop` follows. A row not reported lost was
+stored.
+
 `install_drainer()` / `init()` on a running engine MUST:
 
 1. Build the new drainer first.
