@@ -118,7 +118,9 @@ class AuditRepository(Protocol):
     def mark_shipped(self, ids: list[str]) -> None: ...
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int: ...
 
-    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+    def ingest_replicated(
+        self, rows: list[AuditRow], local_node_id: str | None = None,
+    ) -> "IngestResult":
         """Verify the chain of replicated rows, then insert the verified prefix.
 
         Verifies the per-row hash chain first. If it is intact, every row is
@@ -213,6 +215,28 @@ def stored_conflict(
     return None
 
 
+def ingest_without_local_node(
+    ingest: Callable[[list[AuditRow]], IngestResult],
+    rows: list[AuditRow],
+    local_node_id: str | None,
+) -> IngestResult:
+    """Run ``ingest`` on the rows before the first one whose source_node_id is
+    ``local_node_id``, and report that row as the break. A node's own rows
+    come from its emit path, never from replication."""
+    own = [r for r in rows if local_node_id and r.source_node_id == local_node_id]
+    if not own:
+        return ingest(rows)
+    first = min(own, key=lambda r: r.monotonic_seq)
+    result = ingest([r for r in rows if r.monotonic_seq < first.monotonic_seq])
+    if result.rejected_from_seq is not None:
+        return result
+    return dataclasses.replace(
+        result,
+        rejected_from_seq=first.monotonic_seq,
+        reason=f"row {first.id}: source_node_id {local_node_id!r} is this node",
+    )
+
+
 class StoredMeanwhile(Exception):
     """Another writer stored a row with this id after the stored-row checks
     ran, so the insert was skipped. The caller rolls back and checks again."""
@@ -251,7 +275,9 @@ def _insert_one_replicated(store: "AuditRepository", row: AuditRow) -> None:
         store.insert(row)
 
 
-def ingest_replicated_into(store: "AuditRepository", rows: list[AuditRow]) -> IngestResult:
+def ingest_replicated_into(
+    store: "AuditRepository", rows: list[AuditRow], local_node_id: str | None = None,
+) -> IngestResult:
     """Shared ingest_replicated fallback for stores without a transactional path.
 
     Computes the verified prefix and inserts it row-by-row via the idempotent
@@ -262,6 +288,9 @@ def ingest_replicated_into(store: "AuditRepository", rows: list[AuditRow]) -> In
     §4); SQLiteStore and PostgresStore do. Never raises on a chain break —
     rejected rows surface via ``rejected_from_seq``.
     """
+    if local_node_id:
+        return ingest_without_local_node(
+            lambda rs: ingest_replicated_into(store, rs), rows, local_node_id)
     prefix, rejected_from_seq, reason = verified_prefix(rows)
     inserted = 0
     for row in prefix:

@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: replication ingest refuses the receiving node's own rows (Python + Go)
+
+- A node's own rows come from its emit path, so ingest now refuses rows
+  whose `source_node_id` is the receiving node and reports the first of
+  them as the break.
+- Python: `Engine.ingest_replicated` and `fasten.ingest_replicated` check
+  against the engine's `node_id`. `replication.ingest`, `SQLiteStore` and
+  `PostgresStore.ingest_replicated` take an optional `local_node_id`.
+- Go: new `Engine.IngestReplicated` and `fasten.IngestReplicated` check
+  against the engine's `NodeID`. `SQLiteStore` and `PostgresStore` get
+  `IngestReplicatedFor(ctx, localNode, rows)`; `IngestReplicated` on a
+  store is unchanged.
+
 ### Changed: replication ingest checks the stored rows (Python + Go)
 
 - `ingest` / `IngestReplicated` now check a batch against the rows the store

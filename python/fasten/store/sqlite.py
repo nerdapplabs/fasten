@@ -319,14 +319,19 @@ class SQLiteStore:
             )
             conn.commit()
 
-    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+    def ingest_replicated(
+        self, rows: list[AuditRow], local_node_id: str | None = None,
+    ) -> "IngestResult":
         """Verify a replicated batch and insert its verified prefix in one
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Rows are inserted with INSERT OR IGNORE, so
         retries are safe.
         """
-        from .repo import (IngestResult, check_inserted, cut_at_conflict, stored_conflict,
-                           verified_prefix)
+        from .repo import (IngestResult, check_inserted, cut_at_conflict,
+                           ingest_without_local_node, stored_conflict, verified_prefix)
+
+        if local_node_id:
+            return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
         for row in prefix:

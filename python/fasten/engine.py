@@ -667,8 +667,10 @@ class Engine:
 
     def ingest_replicated(self, rows: "list[AuditRow]") -> Any:
         """Verify a replicated batch and insert its verified prefix in one
-        transaction. Does not raise on a chain break."""
-        return self._require_store("ingest_replicated").ingest_replicated(rows)
+        transaction. Does not raise on a chain break. Rows claiming this
+        engine's node_id are refused."""
+        from .replication import ingest
+        return ingest(self._require_store("ingest_replicated"), rows, self._node_id)
 
     def last_init_at(self) -> Optional[datetime]:
         """Timestamp of the most recent init() call, or None."""
