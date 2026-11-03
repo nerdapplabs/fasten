@@ -16,9 +16,14 @@
 #define FASTEN_STORE_SQLITE_HPP
 
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <sqlite3.h>
 
@@ -74,7 +79,7 @@ public:
     /// A row with monotonic_seq 0 (what emit() returns) gets the node's next
     /// seq in the insert's transaction (spec §2.1). The row is not sealed.
     void insert(const Row& row) {
-        std::string detail_json = detail_::fields_to_json(row.detail);
+        std::string detail_json = detail_::fields_to_json(row.detail, row.code);
         int         pii_int     = row.pii_in_detail ? 1 : 0;
 
         std::lock_guard<std::mutex> lk(mu_);
@@ -147,10 +152,101 @@ public:
         return [this](const Row& row) { insert(row); };
     }
 
+    /// (id, monotonic_seq) of rows with a code in `codes`, older than
+    /// `before`, that redact_rows() would redact (spec §7.1). A sealed row
+    /// under form "1" is never one: its detail is in the hash. Their number
+    /// goes to `skipped`.
+    std::vector<std::pair<std::string, int64_t>> list_redaction_candidates(
+        std::chrono::system_clock::time_point before,
+        const std::vector<std::string>& codes,
+        int64_t* skipped = nullptr)
+    {
+        std::vector<std::pair<std::string, int64_t>> out;
+        if (skipped) *skipped = 0;
+        if (codes.empty()) return out;
+        const std::string cutoff = detail_::iso8601(before);
+        const std::string where =
+            " FROM " + table_ + " WHERE timestamp < ? AND code IN (" +
+            placeholders(codes.size()) + ") AND detail <> 'null' AND ";
+
+        std::lock_guard<std::mutex> lk(mu_);
+        if (skipped) {
+            Stmt q(db_, "SELECT COUNT(*)" + where + "NOT " + redactable());
+            bind_window(q.s, cutoff, codes);
+            if (sqlite3_step(q.s) == SQLITE_ROW) *skipped = sqlite3_column_int64(q.s, 0);
+        }
+        Stmt q(db_, "SELECT id, monotonic_seq" + where + redactable() +
+                    " ORDER BY monotonic_seq");
+        bind_window(q.s, cutoff, codes);
+        int rc;
+        while ((rc = sqlite3_step(q.s)) == SQLITE_ROW) {
+            out.emplace_back(
+                reinterpret_cast<const char*>(sqlite3_column_text(q.s, 0)),
+                sqlite3_column_int64(q.s, 1));
+        }
+        if (rc != SQLITE_DONE)
+            throw std::runtime_error(
+                std::string("fasten SqliteStore list_redaction_candidates: ") +
+                sqlite3_errmsg(db_));
+        return out;
+    }
+
+    /// Sets detail to the JSON literal null and clears detail_salt on these
+    /// ids (spec §7.1). Hash, prev_hash and seq are kept. A sealed form-"1"
+    /// row is left alone. Safe to repeat; returns `ids`.
+    std::vector<std::string> redact_rows(const std::vector<std::string>& ids) {
+        if (ids.empty()) return ids;
+        std::lock_guard<std::mutex> lk(mu_);
+        Stmt q(db_, "UPDATE " + table_ +
+                    " SET detail = 'null', detail_salt = '' WHERE id IN (" +
+                    placeholders(ids.size()) + ") AND " + redactable());
+        int i = 1;
+        for (const auto& id : ids)
+            sqlite3_bind_text(q.s, i++, id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(q.s) != SQLITE_DONE)
+            throw std::runtime_error(
+                std::string("fasten SqliteStore redact_rows: ") + sqlite3_errmsg(db_));
+        return ids;
+    }
+
 private:
-    void exec(const char* sql) {
+    // Unsealed, or sealed under form "2" where the hash covers the detail
+    // commitment and not the detail.
+    static const char* redactable() {
+        return "(hash = '' OR canonical_form_id = '2')";
+    }
+
+    struct Stmt {
+        sqlite3_stmt* s = nullptr;
+        Stmt(sqlite3* db, const std::string& sql) {
+            if (sqlite3_prepare_v2(db, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+                throw std::runtime_error(
+                    std::string("fasten SqliteStore prepare: ") + sqlite3_errmsg(db));
+        }
+        ~Stmt() { sqlite3_finalize(s); }
+        Stmt(const Stmt&)            = delete;
+        Stmt& operator=(const Stmt&) = delete;
+    };
+
+    static std::string placeholders(size_t n) {
+        std::string out;
+        for (size_t i = 0; i < n; ++i) out += i ? ",?" : "?";
+        return out;
+    }
+
+    static void bind_window(sqlite3_stmt* q, const std::string& cutoff,
+                            const std::vector<std::string>& codes) {
+        sqlite3_bind_text(q, 1, cutoff.c_str(), -1, SQLITE_TRANSIENT);
+        int i = 2;
+        for (const auto& c : codes)
+            sqlite3_bind_text(q, i++, c.c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    void exec(const char* sql) { exec_sql(sql); }
+
+    void exec_sql(const std::string& sql) {
         char* errmsg = nullptr;
-        if (sqlite3_exec(db_, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
             std::string msg = errmsg ? errmsg : sqlite3_errmsg(db_);
             sqlite3_free(errmsg);
             throw std::runtime_error(std::string("fasten SqliteStore ") + sql + ": " + msg);
@@ -195,6 +291,27 @@ private:
                 "fasten SqliteStore: invalid table name '" + table + "'");
     }
 
+    std::vector<const char* const*> missing_columns() {
+        static const char* const cols[][2] = {
+            {"pii_in_detail",     "INTEGER NOT NULL DEFAULT 0"},
+            {"prev_hash",         "TEXT NOT NULL DEFAULT ''"},
+            {"hash",              "TEXT NOT NULL DEFAULT ''"},
+            {"canonical_form_id", "TEXT NOT NULL DEFAULT '1'"},
+            {"detail_salt",       "TEXT NOT NULL DEFAULT ''"},
+            {"detail_commitment", "TEXT NOT NULL DEFAULT ''"},
+        };
+        std::set<std::string> have;
+        {
+            Stmt q(db_, "PRAGMA table_info(" + table_ + ")");
+            while (sqlite3_step(q.s) == SQLITE_ROW)
+                have.insert(reinterpret_cast<const char*>(sqlite3_column_text(q.s, 1)));
+        }
+        std::vector<const char* const*> out;
+        for (const auto& col : cols)
+            if (!have.count(col[0])) out.push_back(col);
+        return out;
+    }
+
     void migrate() {
         const std::string ddl =
             "CREATE TABLE IF NOT EXISTS " + table_ + " ("
@@ -217,7 +334,12 @@ private:
             "  request_id      TEXT    NOT NULL DEFAULT '',"
             "  detail          TEXT    NOT NULL DEFAULT '{}',"
             "  pii_in_detail   INTEGER NOT NULL DEFAULT 0,"
-            "  shipped_at      TEXT"
+            "  shipped_at      TEXT,"
+            "  prev_hash       TEXT    NOT NULL DEFAULT '',"
+            "  hash            TEXT    NOT NULL DEFAULT '',"
+            "  canonical_form_id TEXT  NOT NULL DEFAULT '1',"
+            "  detail_salt     TEXT    NOT NULL DEFAULT '',"
+            "  detail_commitment TEXT  NOT NULL DEFAULT ''"
             ")";
 
         char* errmsg = nullptr;
@@ -226,6 +348,23 @@ private:
             std::string msg = errmsg ? errmsg : "DDL error";
             sqlite3_free(errmsg);
             throw std::runtime_error("fasten SqliteStore migrate: " + msg);
+        }
+
+        // Columns a table created before them (or by the Python store, which
+        // has no pii_in_detail) lacks, with the Go store's definitions so the
+        // table can be shared. Checked again under the write lock, so
+        // concurrent openers of an old file wait instead of adding a column
+        // twice.
+        if (!missing_columns().empty()) {
+            exec("BEGIN IMMEDIATE");
+            try {
+                for (const auto* col : missing_columns())
+                    exec_sql("ALTER TABLE " + table_ + " ADD COLUMN " + col[0] + " " + col[1]);
+                exec("COMMIT");
+            } catch (...) {
+                rollback();
+                throw;
+            }
         }
 
         const std::string idx_sql =
@@ -252,8 +391,9 @@ private:
             " (id, origin_id, monotonic_seq, timestamp,"
             "  code, action, severity, service_id, source_node_id, tenant_id,"
             "  actor, actor_kind, target, category, domain, method,"
-            "  request_id, detail, pii_in_detail, shipped_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            "  request_id, detail, pii_in_detail, shipped_at,"
+            "  prev_hash, hash, canonical_form_id, detail_salt, detail_commitment)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','1','','')";
 
         int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt_, nullptr);
         if (rc != SQLITE_OK)

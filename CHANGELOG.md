@@ -6,6 +6,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ PII redaction (#124)
+
+- `fasten::redact_expired(store, before, reason)` redacts rows of the codes in
+  `pii_codes()` (`pii_in_detail`, or retention class short) older than
+  `before`, as Python and Go do (spec §7). `detail` becomes the JSON literal
+  `null`; rows are never deleted. An `AUDIT_ROW_REDACTED` row is inserted
+  into the store before each row is redacted. There is no background loop:
+  the adopter calls it on a schedule.
+- `SqliteStore` and `PostgresStore` gain `list_redaction_candidates()` and
+  `redact_rows()`, and the `prev_hash`, `hash`, `canonical_form_id`,
+  `detail_salt` and `detail_commitment` columns. They are added to existing
+  tables, with `pii_in_detail` for a table the Python store made; `SqliteStore`
+  adds them under one write lock, so stores opening an old file at once don't
+  fail. C++ rows are unsealed; a sealed form-"1" row is never redacted.
+- `redacted_seq` is a JSON number only in an `AUDIT_ROW_REDACTED` row's
+  `detail`. In any other code's `detail` it stays a string, so the redactor's
+  value checks still see it.
+- Test for #92: two `SqliteStore`s on one file and one node get seqs 1..N.
+
 ### Changed: C++ seq, request ids, tenant_id on sys rows, `/audit` errors (#138)
 
 - **Breaking for existing callers** who read these values:
