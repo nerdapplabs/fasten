@@ -1481,8 +1481,9 @@ def _printed(proc):
 
 
 def _assert_each_row_once(tmp_path, proc):
-    """Every emitted row is either stored or reported lost (and not
-    recovered), never both. Returns the rows reported lost."""
+    """Every emitted row is stored or reported lost. A lost report can be a
+    false alarm: a call left behind may store the row as the interpreter
+    exits, too late to report it recovered. Returns the rows reported lost."""
     emitted = {e["id"] for e in (json.loads(line) for line in proc.stdout.splitlines()
                                  if line.startswith("{"))
                if e.get("shape") == "audit"}
@@ -1494,9 +1495,7 @@ def _assert_each_row_once(tmp_path, proc):
     assert len(emitted) == 3
     assert len(set(lost)) == len(lost) and len(set(stored)) == len(stored)
     assert set(recovered) <= set(stored)
-    unstored = set(lost) - set(recovered)
-    assert set(stored).isdisjoint(unstored)
-    assert set(stored) | unstored == emitted
+    assert set(stored) | set(lost) == emitted
     return lost
 
 

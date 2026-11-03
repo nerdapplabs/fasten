@@ -772,7 +772,8 @@ class Engine:
         the drainer and store any row it still holds. Returns within about
         ``timeout``: a row not stored by then is reported lost
         (audit_drain_lost_at_stop), and a store call still running is left
-        behind (audit_drain_recovered_at_stop if it later stores its row).
+        behind (audit_drain_recovered_at_stop if it later stores its row
+        before the process exits, so a lost report can be a false alarm).
         Emits after close are stored inline. A drainer a concurrent re-init
         is still retiring is waited for in the same way. Returns False if a
         row was lost. The exit hook calls ``close(5.0)``."""

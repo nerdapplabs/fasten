@@ -141,7 +141,10 @@ retried. `emit()` returns the row before it is stored, so its
 `fasten.close(timeout=5.0)` stops the drainer on shutdown (the exit hook
 calls it): it flushes for half of `timeout`, then stores the rows still
 held. It returns within about `timeout`, reports rows not stored by then
-as `audit_drain_lost_at_stop`, and returns False if any row was lost. A
+as `audit_drain_lost_at_stop`, and returns False if any row was lost.
+A row reported lost may still be stored by a call left running; that is
+reported as `audit_drain_recovered_at_stop` unless the process has exited
+by then. A
 store call still running at that point is left behind on its thread
 (`fasten-store`), not interrupted, and does not hold up or affect
 interpreter exit: the exit status and other atexit hooks are unchanged.
