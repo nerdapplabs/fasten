@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlsplit, urlunsplit
 
+from ..store.sqlite import sqlite_dsn_path
+
 
 @dataclass
 class CheckResult:
@@ -139,7 +141,7 @@ def _check_audit_dsn() -> CheckResult:
         )
     # Same scheme test and SQLite path as the engine's audit store.
     try:
-        path = urlsplit(dsn).path.lstrip("/")
+        path = sqlite_dsn_path(dsn)
     except ValueError:
         path = ""
     return _check_store("audit_dsn", dsn, dsn.startswith(("postgres://", "postgresql://")),

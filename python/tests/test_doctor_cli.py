@@ -63,6 +63,16 @@ def test_sqlite_dsn_shows_its_path(doctor_env, monkeypatch, capsys):
     assert "sqlite /./audit.db (connected" in out
 
 
+
+@pytest.mark.parametrize("form", ["sqlite:///{}", "{}", "sqlite:///./{}"])
+def test_absolute_and_relative_sqlite_dsns_are_opened(doctor_env, monkeypatch, capsys, tmp_path, form):
+    path = tmp_path / "abs.db" if form != "sqlite:///./{}" else "abs.db"
+    sqlite3.connect(tmp_path / "abs.db").execute("CREATE TABLE audit_log (id TEXT)")
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", form.format(path))
+    out = _run(capsys)
+    assert "SQLite file not found" not in out
+    assert "(connected, sample query returned 0 row[s])" in out
+
 def test_a_missing_sqlite_file_fails_and_is_not_created(doctor_env, monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
     monkeypatch.setenv("FASTEN_API_DSN", "./api.db")
