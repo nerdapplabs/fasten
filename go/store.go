@@ -554,6 +554,20 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// ChainTips returns each node's sealed row with the highest monotonic_seq,
+// by node id.
+func (s *SQLiteStore) ChainTips(ctx context.Context) ([]Row, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT %s FROM %s WHERE hash != '' AND (source_node_id, monotonic_seq) IN `+
+			`(SELECT source_node_id, MAX(monotonic_seq) FROM %s WHERE hash != '' GROUP BY source_node_id) `+
+			`ORDER BY source_node_id, id`, auditCols, s.table, s.table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
 // ChainTail returns the node's newest limit rows by monotonic_seq, oldest
 // first. It is the doctor's chain sample: Query orders by timestamp, so after
 // a clock step back its newest rows can skip a seq and read as a break.

@@ -98,8 +98,18 @@ type VerifyResult struct {
 //   - On the first mismatch the walk stops and returns OK=false with
 //     FirstBreakAt set to that row's MonotonicSeq.
 //
-// It does NOT detect tail truncation — that needs an external tip anchor.
+// Tail truncation and a re-seal from genesis are detected only against
+// checkpoints; see VerifyChainWithCheckpoints.
 func VerifyChain(rows []Row) VerifyResult {
+	return VerifyChainWithCheckpoints(rows, nil)
+}
+
+// VerifyChainWithCheckpoints is VerifyChain, with rows also checked against
+// checkpoints published earlier outside the store (spec §9). Each checkpoint
+// for a node in rows must match the row at its seq; one older than the
+// node's oldest row is skipped, as is one for a node with no rows here.
+// FirstBreakAt is the lowest seq of any break.
+func VerifyChainWithCheckpoints(rows []Row, checkpoints []Checkpoint) VerifyResult {
 	total := len(rows)
 	if total == 0 {
 		return VerifyResult{OK: true, TotalRows: 0}
@@ -136,7 +146,10 @@ func VerifyChain(rows []Row) VerifyResult {
 	}
 	res := walkChains(sorted, total)
 	if dup != nil && (res.OK || dup.FirstBreakAt < res.FirstBreakAt) {
-		return *dup
+		res = *dup
+	}
+	if cp := checkpointBreak(sorted, checkpoints); cp != nil && (res.OK || cp.FirstBreakAt < res.FirstBreakAt) {
+		res = VerifyResult{OK: false, TotalRows: total, FirstBreakAt: cp.FirstBreakAt, Reason: cp.Reason}
 	}
 	return res
 }

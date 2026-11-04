@@ -366,6 +366,20 @@ func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	return s.InsertOriginated(ctx, row)
 }
 
+// ChainTips returns each node's sealed row with the highest monotonic_seq,
+// by node id.
+func (s *PostgresStore) ChainTips(ctx context.Context) ([]Row, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT %s FROM %s WHERE hash <> '' AND (source_node_id, monotonic_seq) IN `+
+			`(SELECT source_node_id, MAX(monotonic_seq) FROM %s WHERE hash <> '' GROUP BY source_node_id) `+
+			`ORDER BY source_node_id, id`, pgAuditCols, s.table, s.table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsPg(rows)
+}
+
 // ChainTail returns the node's newest limit rows by monotonic_seq, oldest
 // first. See SQLiteStore.ChainTail.
 func (s *PostgresStore) ChainTail(ctx context.Context, sourceNodeID string, limit int) ([]Row, error) {

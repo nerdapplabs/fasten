@@ -137,6 +137,26 @@ returns within about `timeout`, reports rows not stored by then as
 call still running then, such as a lib/pq query to a server that stopped
 answering, is left to finish in the background.
 
+## Chain checkpoints
+
+`VerifyChain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later
+([spec §9](../spec/chain-replication.md#9-checkpoints)):
+
+```go
+sink := fasten.FileCheckpointSink{Path: "/mnt/worm/checkpoints.jsonl"}
+// fasten.HTTPCheckpointSink{URL: url} POSTs them instead.
+if _, err := fasten.PublishCheckpoints(ctx, store, sink); err != nil {
+    return err
+}
+
+cps, err := fasten.LoadCheckpoints("/mnt/worm/checkpoints.jsonl")
+rows, err := store.ChainTail(ctx, "node-1", 10000)
+res := fasten.VerifyChainWithCheckpoints(rows, cps)
+```
+
 ## Tests
 
 The same steps CI runs (see
