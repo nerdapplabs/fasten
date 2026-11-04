@@ -175,7 +175,23 @@ By default the rows are taken as the whole chain: every checkpointed node
 must have rows, and its newest checkpoint must fall within them. To check
 a page or one node, pass `partial=True`; checkpoints below its rows, or for
 nodes not in them, are then skipped. If the file's last line was cut short
-by a crash, `load_checkpoints` skips it and logs a warning.
+by a crash, `load_checkpoints` skips it and logs a warning, and the next
+publish drops it. Use one publisher per file.
+
+With retention, a node whose rows have all been purged still has
+checkpoints, and they fail a whole-chain verify. Pass only the checkpoints
+taken since the latest purge finished, and publish again after each purge:
+
+```python
+from fasten.checkpoints import checkpoints_since
+
+cps = checkpoints_since(load_checkpoints("/mnt/worm/checkpoints.jsonl"), purged_at)
+result = verify_chain(all_rows, checkpoints=cps)
+```
+
+A whole-chain verify does not show rows deleted from the start of a chain
+as long as the newest checkpointed row and the rows after it remain; that
+looks the same as a purge.
 
 ## Tests
 

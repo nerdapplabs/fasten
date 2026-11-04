@@ -31,7 +31,10 @@ type CheckpointSink interface {
 }
 
 // FileCheckpointSink appends one JSON line per checkpoint to Path and
-// fsyncs it.
+// fsyncs it. If the file ends in an unfinished line, as a crash mid-append
+// leaves it, that line is dropped before the append; a complete last line
+// without a newline gets one. One publisher per file: concurrent publishes
+// to the same file are not supported.
 type FileCheckpointSink struct {
 	Path string
 }
@@ -48,19 +51,57 @@ func (s FileCheckpointSink) Publish(_ context.Context, checkpoints []Checkpoint)
 			return err
 		}
 	}
-	f, err := os.OpenFile(s.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.Path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(buf.Bytes()); err != nil {
-		f.Close()
-		return err
+	prefix, err := endLastLine(f)
+	if err == nil {
+		_, err = f.Write(append(prefix, buf.Bytes()...))
 	}
-	if err := f.Sync(); err != nil {
+	if err == nil {
+		err = f.Sync()
+	}
+	if err != nil {
 		f.Close()
 		return err
 	}
 	return f.Close()
+}
+
+// endLastLine makes f end at a line break, as LoadCheckpoints reads it: it
+// truncates an unfinished last line (not valid JSON), or returns the
+// newline that a complete one lacks.
+func endLastLine(f *os.File) ([]byte, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	end := info.Size()
+	start := end
+	chunk := make([]byte, 4096)
+	for start > 0 {
+		n := min(int64(len(chunk)), start)
+		if _, err := f.ReadAt(chunk[:n], start-n); err != nil {
+			return nil, err
+		}
+		if i := bytes.LastIndexByte(chunk[:n], '\n'); i >= 0 {
+			start = start - n + int64(i) + 1
+			break
+		}
+		start -= n
+	}
+	if start == end {
+		return nil, nil
+	}
+	last := make([]byte, end-start)
+	if _, err := f.ReadAt(last, start); err != nil {
+		return nil, err
+	}
+	if json.Valid(last) {
+		return []byte("\n"), nil
+	}
+	return nil, f.Truncate(start)
 }
 
 // HTTPCheckpointSink POSTs the checkpoints as one JSON array to URL. Client
@@ -201,6 +242,32 @@ func LoadCheckpoints(path string) ([]Checkpoint, error) {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		out = append(out, cp)
+	}
+	return out, nil
+}
+
+// CheckpointsSince returns the checkpoints anchored at or after cutoff, in
+// their order. An AnchoredAt not in the canonical form is an error.
+//
+// For a whole-chain verify of a store with retention, pass the time the
+// latest purge finished: a node whose rows that purge removed was last
+// checkpointed before it, while every node still in the store has a
+// checkpoint from the next publish. The retention period alone is not a
+// safe cutoff, since a node's last checkpoint can be taken just before its
+// rows are purged:
+//
+//	kept, err := fasten.CheckpointsSince(cps, purgedAt)
+//	res := fasten.VerifyChainWithCheckpoints(rows, kept, fasten.CheckpointOptions{})
+func CheckpointsSince(checkpoints []Checkpoint, cutoff time.Time) ([]Checkpoint, error) {
+	var out []Checkpoint
+	for _, cp := range checkpoints {
+		at, err := parseCanonicalTS(cp.AnchoredAt)
+		if err != nil {
+			return nil, fmt.Errorf("checkpoint of node '%s' at seq %d: %w", cp.SourceNodeID, cp.MonotonicSeq, err)
+		}
+		if !at.Before(cutoff) {
+			out = append(out, cp)
+		}
 	}
 	return out, nil
 }

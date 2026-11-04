@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -240,6 +241,87 @@ func TestLoadCheckpointsUnfinishedLastLine(t *testing.T) {
 	got, err := LoadCheckpoints(path)
 	if !errors.Is(err, ErrPartialLastLine) || !reflect.DeepEqual(got, cps) {
 		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestFileCheckpointSinkDropsAnUnfinishedLastLine(t *testing.T) {
+	ctx := context.Background()
+	first := []Checkpoint{cpOf(cpChain(1, "node-1", "u1")[0]), cpOf(cpChain(2, "node-1", "u1")[1])}
+	second := []Checkpoint{cpOf(cpChain(1, "node-2", "u1")[0])}
+	torn := `{"source_node_id":"node-1","monot`
+	var whole bytes.Buffer
+	enc := json.NewEncoder(&whole)
+	for _, cp := range first {
+		if err := enc.Encode(cp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name, body string
+		want       []Checkpoint
+	}{
+		{"after complete lines", whole.String() + torn, append(slices.Clone(first), second...)},
+		{"only an unfinished line", torn, second},
+		{"complete last line without a newline", strings.TrimSuffix(whole.String(), "\n"), append(slices.Clone(first), second...)},
+		{"empty file", "", second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cp.jsonl")
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := (FileCheckpointSink{Path: path}).Publish(ctx, second); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := LoadCheckpoints(path); err != nil || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+func cpAt(r Row, at string) Checkpoint {
+	cp := cpOf(r)
+	cp.AnchoredAt = at
+	return cp
+}
+
+func TestCheckpointsSinceDropsAFullyPurgedNodesCheckpoints(t *testing.T) {
+	// node-2's rows were all purged at 12:00; node-1 was checkpointed again after.
+	one, two := cpChain(5, "node-1", "u1"), cpChain(3, "node-2", "u1")
+	cps := []Checkpoint{
+		cpAt(one[2], "2026-06-15T11:00:00.000000Z"),
+		cpAt(two[2], "2026-06-15T11:59:00.000000Z"),
+		cpAt(one[4], "2026-06-15T12:00:00.000000Z"),
+	}
+	if VerifyChainWithCheckpoints(one, cps, CheckpointOptions{}).OK {
+		t.Fatal("a purged node's checkpoint passed")
+	}
+	kept, err := CheckpointsSince(cps, time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil || !reflect.DeepEqual(kept, cps[2:]) {
+		t.Fatalf("got %+v, %v", kept, err)
+	}
+	if res := VerifyChainWithCheckpoints(one, kept, CheckpointOptions{}); !res.OK {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestCheckpointsSinceKeepsARecentCheckpointOfANodeWithNoRows(t *testing.T) {
+	one, two := cpChain(5, "node-1", "u1"), cpChain(3, "node-2", "u1")
+	cps := []Checkpoint{cpAt(two[2], "2026-06-15T12:30:00.000000Z"), cpAt(one[4], "2026-06-15T12:30:00.000000Z")}
+	cutoff := time.Date(2026, 6, 15, 14, 0, 0, 0, time.FixedZone("", 2*3600))
+	kept, err := CheckpointsSince(cps, cutoff)
+	if err != nil || !reflect.DeepEqual(kept, cps) {
+		t.Fatalf("got %+v, %v", kept, err)
+	}
+	wantBreak(t, VerifyChainWithCheckpoints(one, kept, CheckpointOptions{}), 3,
+		"node 'node-2': no rows, but checkpointed at seq 3")
+}
+
+func TestCheckpointsSinceRejectsANonCanonicalAnchoredAt(t *testing.T) {
+	cps := []Checkpoint{cpAt(cpChain(1, "node-1", "u1")[0], "2026-06-15T12:30:00Z")}
+	if _, err := CheckpointsSince(cps, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatal("accepted a non-canonical anchored_at")
 	}
 }
 

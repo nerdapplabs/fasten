@@ -318,6 +318,8 @@ def verify_chain(
     For a page, one node or a sample, pass ``partial=True``: then a
     checkpoint below a node's oldest row, or for a node with no rows here, is
     skipped. Rows after a node's newest checkpoint are not covered by it.
+    Under retention, pass only the checkpoints taken since the latest purge
+    (``checkpoints_since``): a node whose rows were all purged would fail.
 
     Rows with an empty ``hash`` field (written before hash-chain support, or in
     stdout-only mode) are skipped below their node's first sealed seq; they are

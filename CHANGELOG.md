@@ -14,17 +14,22 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   the end of a chain and a chain re-sealed from genesis (spec §9).
 - Python: `fasten.checkpoints` with `Checkpoint`, `FileCheckpointSink`,
   `HttpCheckpointSink`, `CheckpointStore`, `take_checkpoints`,
-  `publish_checkpoints` and `load_checkpoints`, and
+  `publish_checkpoints`, `load_checkpoints` and `checkpoints_since`, and
   `verify_chain(rows, checkpoints=..., partial=False)`. `SQLiteStore` and
   `PostgresStore` gain `chain_tips()`.
 - Go: `Checkpoint`, `FileCheckpointSink`, `HTTPCheckpointSink`,
   `TakeCheckpoints`, `PublishCheckpoints`, `LoadCheckpoints`,
-  `ErrPartialLastLine`, `CheckpointOptions` and
+  `CheckpointsSince`, `ErrPartialLastLine`, `CheckpointOptions` and
   `VerifyChainWithCheckpoints`; `VerifyChain` is unchanged. `SQLiteStore`
   and `PostgresStore` gain `ChainTips`.
 - A verify with checkpoints covers the whole chain by default: a
   checkpointed node with no rows, or whose rows start after its newest
-  checkpoint, fails. A partial verify (a page, one node) opts out.
+  checkpoint, fails. A partial verify (a page, one node) opts out. With
+  retention, pass only the checkpoints taken since the latest purge
+  (`checkpoints_since` / `CheckpointsSince`), so a node whose rows were all
+  purged does not fail.
+- The file sinks drop an unfinished last line, left by a crash mid-append,
+  before the next append, so the file keeps loading.
 - The HTTP sinks treat a redirect as a failed publish, time out after 10 s
   by default, and leave userinfo and query out of error messages.
 - `spec/checkpoint-vectors.json` holds cases both SDKs must agree on.

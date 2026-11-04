@@ -19,6 +19,7 @@ from fasten.checkpoints import (
     Checkpoint,
     FileCheckpointSink,
     HttpCheckpointSink,
+    checkpoints_since,
     load_checkpoints,
     publish_checkpoints,
     take_checkpoints,
@@ -153,6 +154,38 @@ def test_a_chain_break_below_a_checkpoint_break_wins():
     assert result.first_break_at == 2 and "hash mismatch" in result.reason
 
 
+def _cp_at(row: AuditRow, at: str) -> Checkpoint:
+    return dataclasses.replace(_cp(row), anchored_at=at)
+
+
+def test_checkpoints_since_drops_a_fully_purged_nodes_checkpoints():
+    # node-2's rows were all purged at 12:00; node-1 was checkpointed again after.
+    one, two = _chain(range(1, 6)), _chain(range(1, 4), node="node-2")
+    cps = [_cp_at(one[2], "2026-06-15T11:00:00.000000Z"),
+           _cp_at(two[-1], "2026-06-15T11:59:00.000000Z"),
+           _cp_at(one[-1], "2026-06-15T12:00:00.000000Z")]
+    assert not verify_chain(one, checkpoints=cps).ok
+    kept = checkpoints_since(cps, datetime(2026, 6, 15, 12, tzinfo=timezone.utc))
+    assert kept == [cps[2]]
+    assert verify_chain(one, checkpoints=kept).ok
+
+
+def test_checkpoints_since_keeps_a_recent_checkpoint_of_a_node_with_no_rows():
+    one, two = _chain(range(1, 6)), _chain(range(1, 4), node="node-2")
+    cps = [_cp_at(two[-1], "2026-06-15T12:30:00.000000Z"),
+           _cp_at(one[-1], "2026-06-15T12:30:00.000000Z")]
+    kept = checkpoints_since(cps, datetime(2026, 6, 15, 12))
+    assert kept == cps
+    result = verify_chain(one, checkpoints=kept)
+    assert not result.ok and result.reason == "node 'node-2': no rows, but checkpointed at seq 3"
+
+
+def test_checkpoints_since_rejects_a_non_canonical_anchored_at():
+    with pytest.raises(ValueError):
+        checkpoints_since([_cp_at(_chain([1])[0], "2026-06-15T12:30:00Z")],
+                          datetime(2026, 6, 15, tzinfo=timezone.utc))
+
+
 # sinks
 
 def test_file_sink_round_trip(tmp_path):
@@ -213,6 +246,38 @@ def test_load_rejects_an_unfinished_line_before_the_last(tmp_path):
     path.write_text('{"source_node_id": "node-1", "monot\n' + cp + "\n")
     with pytest.raises(ValueError):
         load_checkpoints(path)
+
+
+def test_publish_drops_an_unfinished_last_line_first(tmp_path, caplog):
+    first = [_cp(r) for r in _chain(range(1, 3))]
+    second = [_cp(_chain([1], node="node-2")[0])]
+    path = tmp_path / "cp.jsonl"
+    sink = FileCheckpointSink(path)
+    sink.publish(first)
+    with open(path, "a") as f:
+        f.write('{"source_node_id": "node-1", "monot')
+    sink.publish(second)
+    with caplog.at_level(logging.WARNING, logger="fasten.checkpoints"):
+        assert load_checkpoints(path) == first + second
+    assert caplog.text == ""
+
+
+def test_publish_over_a_file_with_only_an_unfinished_line(tmp_path):
+    cps = [_cp(_chain([1])[0])]
+    path = tmp_path / "cp.jsonl"
+    path.write_text('{"source_node_id": "node-1", "monot')
+    FileCheckpointSink(path).publish(cps)
+    assert load_checkpoints(path) == cps
+    assert path.read_text().count("\n") == 1
+
+
+def test_publish_keeps_a_complete_last_line_without_a_newline(tmp_path):
+    first = [_cp(r) for r in _chain(range(1, 3))]
+    second = [_cp(_chain([1], node="node-2")[0])]
+    path = tmp_path / "cp.jsonl"
+    path.write_text("\n".join(json.dumps(c.to_dict()) for c in first))
+    FileCheckpointSink(path).publish(second)
+    assert load_checkpoints(path) == first + second
 
 
 class _Server:

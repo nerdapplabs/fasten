@@ -10,7 +10,9 @@ a chain cut short at the end, or re-sealed from genesis:
     verify_chain(rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
 
 ``rows`` there must be the whole chain; pass ``partial=True`` to verify a page
-or one node.
+or one node. With retention, a node whose rows have all been purged still has
+checkpoints, which fail a whole-chain verify; pass only the checkpoints taken
+since the latest purge finished (see checkpoints_since).
 """
 from __future__ import annotations
 
@@ -21,11 +23,14 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import TYPE_CHECKING, Any, Protocol
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 
-from .canonical_ts import canonical_now
+from .canonical_ts import canonical_now, canonical_ts, parse_canonical
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .attrs import AuditRow
 
 _log = logging.getLogger(__name__)
@@ -37,6 +42,7 @@ __all__ = [
     "CheckpointStore",
     "FileCheckpointSink",
     "HttpCheckpointSink",
+    "checkpoints_since",
     "load_checkpoints",
     "publish_checkpoints",
     "take_checkpoints",
@@ -73,7 +79,12 @@ class CheckpointSink(Protocol):
 
 
 class FileCheckpointSink:
-    """Appends one JSON line per checkpoint to ``path`` and fsyncs it."""
+    """Appends one JSON line per checkpoint to ``path`` and fsyncs it.
+
+    If the file ends in an unfinished line, as a crash mid-append leaves it,
+    that line is dropped before the append; a complete last line without a
+    newline gets one. One publisher per file: concurrent publishes to the
+    same file are not supported."""
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = path
@@ -82,10 +93,35 @@ class FileCheckpointSink:
         if not checkpoints:
             return
         lines = "".join(json.dumps(cp.to_dict(), sort_keys=True) + "\n" for cp in checkpoints)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(lines)
+        with open(self.path, "a+b") as f:
+            f.write(_end_last_line(f) + lines.encode())
             f.flush()
             os.fsync(f.fileno())
+
+
+def _end_last_line(f: BinaryIO) -> bytes:
+    """Make ``f`` end at a line break, as load_checkpoints reads it: truncate
+    an unfinished last line (not valid JSON), or return the newline that a
+    complete one lacks."""
+    end = f.seek(0, os.SEEK_END)
+    start = end
+    while start > 0:
+        n = min(4096, start)
+        f.seek(start - n)
+        i = f.read(n).rfind(b"\n")
+        if i >= 0:
+            start = start - n + i + 1
+            break
+        start -= n
+    if start == end:
+        return b""
+    f.seek(start)
+    try:
+        json.loads(f.read())
+    except ValueError:
+        f.truncate(start)
+        return b""
+    return b"\n"
 
 
 def _redact_url(url: str) -> str:
@@ -182,4 +218,27 @@ def load_checkpoints(path: str | os.PathLike[str]) -> list[Checkpoint]:
             _log.warning("%s: skipped an unfinished last line", path)
             return out
         out.append(Checkpoint.from_dict(d))
+    return out
+
+
+def checkpoints_since(checkpoints: "Sequence[Checkpoint]", cutoff: datetime) -> list[Checkpoint]:
+    """The checkpoints anchored at or after ``cutoff`` (naive is taken as UTC),
+    in their order. Raises ValueError for an ``anchored_at`` not in the
+    canonical form.
+
+    For a whole-chain verify of a store with retention, pass the time the
+    latest purge finished: a node whose rows that purge removed was last
+    checkpointed before it, while every node still in the store has a
+    checkpoint from the next publish. The retention period alone is not a
+    safe cutoff, since a node's last checkpoint can be taken just before its
+    rows are purged::
+
+        verify_chain(rows, checkpoints=checkpoints_since(load_checkpoints(path), purged_at))
+    """
+    at = canonical_ts(cutoff)
+    out = []
+    for cp in checkpoints:
+        parse_canonical(cp.anchored_at)
+        if cp.anchored_at >= at:
+            out.append(cp)
     return out
