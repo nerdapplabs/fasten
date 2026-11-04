@@ -95,6 +95,45 @@ When you register an audit sink and call `fasten::init()` with the default
 path. Set `audit_store_failure_strategy = "raise"` for synchronous writes
 that throw `fasten::AuditStoreError`. `fasten::queue_stats()` and
 `fasten::flush(timeout)` complete the public surface.
+`queue_drain_max_attempts` (default 50) sets how many inserts a row gets
+before it is dead-lettered.
+
+`emit()` returns the row with `monotonic_seq` 0. The bundled
+`SqliteStore` and `PostgresStore` give it the node's next seq in the
+insert's transaction; rows are not sealed. A row put on a drainer that
+`init()` has just replaced is reported as `audit_drain_abandoned`.
+
+## PII retention
+
+Rows of a code with `pii_in_detail` (or retention class short) can be
+redacted once they are older than your PII period:
+
+```cpp
+fasten::SqliteStore store("audit.db");
+auto ids = fasten::redact_expired(store,
+    std::chrono::system_clock::now() - std::chrono::hours(24 * 30));
+```
+
+Each row keeps its place, and its `detail` becomes `null`. An
+`AUDIT_ROW_REDACTED` row naming it is written to the store first. fasten
+runs no background job for this, so call it on a schedule. C++ rows are
+unsealed, so all of them can be redacted. A row sealed under canonical form
+`"1"` by another SDK is left alone and counted on the sys stream.
+
+## Reader tenant isolation
+
+On a store shared by several tenants, resolve the caller's tenant from
+your own auth and call the reader handlers that take it:
+
+```cpp
+auto r = fasten::reader::handle_audit(params, tenant_from_my_auth(req));
+fasten::reader::enforce_tenant_isolation();  // handlers without a tenant answer 401
+```
+
+Rows are limited to that tenant and `?tenant_id=` is ignored. Register
+`set_scoped_audit_query()` to pass the tenant to your store query. Sys
+rows carry the engine's `tenant_id`. The Simple-Web-Server adapter takes
+a tenant resolver as the fourth argument of `mount()` / `start()`.
 
 ## Tests
 
@@ -115,7 +154,8 @@ LD_LIBRARY_PATH=$PWD/../fasten-core/target/release \
 
 ctest suites: `pii_in_detail_smoke`, `redact_substring_smoke`,
 `redact_env_keys_smoke`, `redact_conformance_smoke`, `shim_spdlog_smoke`,
-`shim_glog_smoke`, and, when their dependencies are found,
+`shim_glog_smoke`, `drainer_conformance_smoke`, `row_fields_smoke`,
+`reader_scope_smoke`, and, when their dependencies are found,
 `sqlite_store_smoke`, `postgres_store_smoke`, `codes_yaml_smoke` and
 `shim_boost_log_smoke`.
 
