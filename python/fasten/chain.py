@@ -173,13 +173,15 @@ def redact(row: "AuditRow") -> "AuditRow":
     """Return a copy with ``detail`` and ``detail_salt`` cleared (spec 7.1).
     The hash is unchanged, so the chain still verifies.
 
-    Raises ValueError for a form "1" row, whose hash covers ``detail``.
+    Unsealed rows (empty ``hash``) are redacted too, since no hash covers
+    their detail. Raises ValueError for a sealed form "1" row, whose hash
+    covers ``detail``.
     """
-    if str(row.canonical_form_id) != "2":
+    if str(row.canonical_form_id) != "2" and row.hash:
         raise ValueError(
             f"row {row.id!r} is canonical form {row.canonical_form_id!r}; only "
-            'form "2" rows can be redacted without re-sealing the chain suffix '
-            "(spec §7.1). This row predates committed detail."
+            'form "2" and unsealed rows can be redacted without re-sealing the '
+            "chain suffix (spec §7.1). This row predates committed detail."
         )
     return dataclasses.replace(row, detail=None, detail_salt=None)
 

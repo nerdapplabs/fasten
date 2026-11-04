@@ -28,6 +28,41 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `allocate_and_insert_originated` reports `verified: false` from the start,
   not only after its first emit.
 
+### Fixed: Python stores on a table the Go SDK created
+
+- Rows without a salt (unsealed, or form "1") now store an empty
+  `detail_salt` and `detail_commitment` instead of SQL NULL. Go creates both
+  columns `NOT NULL`, so on Postgres these inserts failed, and on SQLite
+  `INSERT OR IGNORE` dropped the row without an error. Both stores read an
+  empty value back as `None`, so rows read the same as before.
+- The Postgres store selects its columns by name instead of `SELECT *`. Go's
+  table orders them differently, so reads on it read the wrong column for
+  most fields.
+- The Postgres store reads Go's `TIMESTAMPTZ` timestamp and `shipped_at`
+  columns, and `sources()` returns them in the canonical form.
+
+### Changed: Python and Go redact unsealed rows (spec §7.1)
+
+- PII redaction now covers unsealed rows (an empty `hash`) as well as form
+  "2" rows: no hash covers their `detail`, so destroying it breaks nothing.
+  These are the rows the core, Rust, JS, C++ and Swift SDKs write to a shared
+  table. Python and Go used to skip them and count them as legacy rows on
+  every pass, so their personal data outlived the horizon.
+- Sealed form "1" rows are still skipped, and are now the only rows counted in
+  the `pii_redaction_skipped_legacy_form` event and the Python warning.
+- Adopters relying on unsealed rows keeping their `detail` past the PII
+  horizon: it is now set to null after an `AUDIT_ROW_REDACTED` record, as for
+  form "2" rows.
+- Python's `fasten.chain.redact()` accepts unsealed rows too, matching the
+  stores; it still raises on a sealed form "1" row.
+- Python redaction now writes an empty `detail_salt` instead of SQL NULL, as
+  Go does. On a table the Go store created the column is `NOT NULL`, so the
+  update failed after the redaction record was written: on Postgres every pass
+  added another record and the row was never blanked, and on SQLite the
+  connection stayed in its transaction and other writers got "database is
+  locked". The SQLite store now rolls back when the update fails, and both
+  stores read an empty salt back as `None`.
+
 ### Changed: chain verification (Python + Go)
 
 - A row with no hash is skipped only below its node's first sealed row; one

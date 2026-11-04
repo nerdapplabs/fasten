@@ -3,6 +3,7 @@ package fasten
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -300,6 +301,76 @@ func TestRetention_QueueModeDoesNotDestroyWithoutARecord(t *testing.T) {
 		}
 		if r.Code == CodeAuditRowRedacted {
 			t.Fatal("a redaction event persisted though the store rejected it")
+		}
+	}
+}
+
+// Spec §7.1: no hash covers an unsealed row's detail, so it is redacted like a
+// form-"2" row. A sealed form-"1" row's detail is inside its hash, so it is
+// left alone and counted.
+func TestRetention_RedactsUnsealedRowsAndSkipsSealedForm1(t *testing.T) {
+	db, _ := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	defer db.Close()
+	store, err := NewSQLiteStore(db, "fasten_audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkRedactsUnsealedAndSkipsSealedForm1(t, store)
+}
+
+func checkRedactsUnsealedAndSkipsSealedForm1(t *testing.T, store interface {
+	AuditRepository
+	RedactionRepository
+}) {
+	t.Helper()
+	registerPIICodes(t)
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-40 * 24 * time.Hour).Truncate(time.Microsecond)
+	row := func(id string, seq int64, hash, form string) Row {
+		return Row{
+			WireVersion: "1", ID: id, OriginID: id, MonotonicSeq: seq,
+			Timestamp: old, Code: piiCode, Action: "x", Severity: SevInfo,
+			ServiceID: "svc", SourceNodeID: "node-1",
+			Actor: "system", ActorKind: "service", Target: "t",
+			Category: "c", Domain: "gopiidemo", Method: "sdk", RequestID: "req-1",
+			Detail:   map[string]any{"email": id + "@x.y"},
+			PrevHash: "genesis", Hash: hash, CanonicalFormID: form,
+		}
+	}
+	unsealed := row("evt-unsealed", 7, "", "1")
+	unsealed.PrevHash = ""
+	legacy := row("evt-legacy", 8, strings.Repeat("f", 64), "1")
+	for _, r := range []Row{unsealed, legacy} {
+		if err := store.Insert(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, skipped, err := store.ListRedactionCandidates(ctx, time.Now().Add(-30*24*time.Hour), []Code{piiCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != unsealed.ID || skipped != 1 {
+		t.Fatalf("candidates = %+v, skipped = %d; want only %s and 1 skipped", got, skipped, unsealed.ID)
+	}
+	// RedactRows refuses the sealed form-"1" row even when named directly.
+	if _, err := store.RedactRows(ctx, []string{unsealed.ID, legacy.ID}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.Query(ctx, Filter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		switch r.ID {
+		case unsealed.ID:
+			if r.Detail != nil {
+				t.Errorf("unsealed row kept its detail: %v", r.Detail)
+			}
+		case legacy.ID:
+			if r.Detail == nil {
+				t.Error("sealed form-1 row was redacted")
+			}
 		}
 	}
 }

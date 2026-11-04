@@ -181,3 +181,7 @@ func TestPGAlloc_RetryIsIdempotent(t *testing.T) {
 
 func idFor(i int) string  { return "pa-c" + string(rune('a'+i%26)) + string(rune('0'+i/26)) }
 func svcFor(i int) string { return "svc-" + string(rune('a'+i%3)) }
+
+func TestPGRetention_RedactsUnsealedRowsAndSkipsSealedForm1(t *testing.T) {
+	checkRedactsUnsealedAndSkipsSealedForm1(t, pgAllocStore(t, "fasten_audit_redact_unsealed"))
+}

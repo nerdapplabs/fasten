@@ -700,8 +700,9 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 
 // ListRedactionCandidates implements RedactionRepository (spec §7.1).
 //
-// Skips form-"1" rows: their detail IS hashed, so redacting one changes its
-// hash and cascades a re-seal down the chain. Counted and logged rather than
+// Lists form-"2" rows and unsealed rows (empty hash): no hash covers their
+// detail. Skips sealed form-"1" rows: their detail IS hashed, so redacting one
+// changes its hash and cascades a re-seal down the chain. Counted and logged rather than
 // skipped quietly — on a pre-form-"2" store, silence lets an operator watch
 // redaction "succeed" while the personal data survives.
 func (s *SQLiteStore) ListRedactionCandidates(
@@ -724,14 +725,14 @@ func (s *SQLiteStore) ListRedactionCandidates(
 	var skipped int64
 	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
 		"SELECT COUNT(*) FROM %s WHERE timestamp < ? AND code IN (%s) "+
-			"AND canonical_form_id <> '2' AND detail <> 'null'", s.table, ph),
+			"AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'", s.table, ph),
 		args...).Scan(&skipped); err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
 		"SELECT id, monotonic_seq FROM %s WHERE timestamp < ? AND code IN (%s) "+
-			"AND canonical_form_id = '2' AND detail <> 'null' "+
+			"AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "+
 			"ORDER BY monotonic_seq", s.table, ph),
 		args...)
 	if err != nil {
@@ -770,7 +771,7 @@ func (s *SQLiteStore) RedactRows(ctx context.Context, ids []string) ([]string, e
 	// that on SQLite needs a full table rebuild. Reads back as nil either way.
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 		"UPDATE %s SET detail = 'null', detail_salt = '' "+
-			"WHERE id IN (%s) AND canonical_form_id = '2'", s.table, ph),
+			"WHERE id IN (%s) AND (canonical_form_id = '2' OR hash = '')", s.table, ph),
 		args...); err != nil {
 		return nil, err
 	}
