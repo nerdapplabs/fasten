@@ -14,6 +14,54 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   module map links `fasten_core`, and the build points at
   `fasten-core/target/release`.
 
+### Fixed: Swift store-assigned monotonic_seq, no non-spec hash, PII redaction (#124)
+
+- **Breaking:** the store assigns `monotonic_seq` inside the insert
+  transaction (`BEGIN IMMEDIATE` on SQLite, spec §2.1), so two engines on one
+  file and node no longer write duplicate seqs. `emit` hands the store a row
+  with `monotonic_seq` 0, so a custom `AuditStore` must assign it, and the
+  stdout line carries 0 too. `hash` and `prev_hash` are now empty. The old
+  Swift hash did not follow spec §1, so `verify_chain` in Python and Go
+  reported those rows as tampered. Rows are written unsealed, and `configure`
+  logs `audit_chain_unavailable` once. A store given a non-zero seq writes it
+  as given.
+- `SQLiteStore` sets a 5 s busy timeout (`busyTimeoutMs`), adds the
+  `pii_in_detail`, `canonical_form_id`, `detail_salt` and `detail_commitment`
+  columns, and indexes `(source_node_id, monotonic_seq)` so the seq lookup on
+  insert does not scan the table. `pii_in_detail` is set from the code's
+  `Meta`. `init` throws if adding a column fails for any reason other than
+  the column already existing.
+- `Fasten.redactExpired(before:codes:reason:)` sets `detail` to null on rows
+  of `codes` older than `before`, after writing an `AUDIT_ROW_REDACTED` row
+  for each one (spec §7). `codes` defaults to `Fasten.piiCodes()`, which only
+  holds codes registered in this process; a retention job that never calls
+  `register` passes them. With no codes it logs `pii_redaction_no_codes` and
+  redacts nothing. Rows are never deleted, and sealed form-"1" rows are not
+  touched; their count is logged as `pii_redaction_skipped_legacy_form`. The
+  SDK runs no retention loop, so call it on a schedule. `Meta` gains
+  `piiInDetail`. A custom `AuditStore` that supports redaction implements
+  `listRedactionCandidates`, `redactRows` and `countRefusedLegacyRows`; the
+  default implementations throw.
+- Rows written by the previous Swift release are form "1" with a hash that
+  never covered `detail`, so `redactExpired` refuses them. If only Swift has
+  written to the table, call `SQLiteStore.clearLegacySwiftHashes()` once to
+  unseal them and let `redactExpired` reach them. Do not call it on a table Go
+  or Python also write: their form "1" hashes do cover `detail`.
+- The swift-crypto dependency is gone. `SQLiteStore.ping` and
+  `maxMonotonicSeq` take the store lock, so calling them while the drainer
+  inserts no longer crashes. The connection is opened with
+  `SQLITE_OPEN_NOMUTEX`, so that lock is what serializes it on every platform.
+- `AuditStore.maxMonotonicSeq(sourceNodeID:)` returns one node's highest seq,
+  or the table's with nil; `maxMonotonicSeq()` is the table-wide shorthand.
+  A custom `AuditStore` implements the new requirement.
+
+### Fixed: Swift `SQLiteStore.insert` reports SQLite errors
+
+- `insert` throws when prepare or step fails. Raise mode reports the error and
+  the queue drainer retries the row; before, the row was dropped silently.
+- `FastenError` conforms to `LocalizedError`, so `localizedDescription` carries
+  the store's message.
+
 ### Fixed: C++ PII redaction (#124)
 
 - `fasten::redact_expired(store, before, reason)` redacts rows of the codes in
