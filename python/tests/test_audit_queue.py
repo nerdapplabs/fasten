@@ -858,29 +858,34 @@ def test_fork_never_lands_mid_insert(tmp_path):
     # inherited its global mutex or file lock state and never stored a row.
     store = SQLiteStore(str(tmp_path / "a.db"))
     _init(store)
-    # A child still running at the deadline gets SIGABRT, so its stack
-    # shows where it hung.
-    if not faulthandler.is_enabled():
-        faulthandler.enable()
-    pids = []
-    for rnd in range(3):
-        for i in range(300):
-            fasten.emit(code="USER_CREATED", target=f"parent-{rnd}-{i}")
-        for k in range(8):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
-                pid = os.fork()
-            if pid == 0:
-                code = 1
-                try:
-                    fasten.emit(code="USER_CREATED", target=f"child-{rnd}-{k}")
-                    code = 0 if fasten.flush(timeout=5.0) else 2
-                finally:
-                    os._exit(code)
-            pids.append(pid)
+    # A child still running at the deadline gets SIGABRT, and faulthandler
+    # writes its stack to that child's file, set before the fork so a hang
+    # in the fork hooks is caught too.
+    pids, stacks = [], []
+    try:
+        for rnd in range(3):
+            for i in range(300):
+                fasten.emit(code="USER_CREATED", target=f"parent-{rnd}-{i}")
+            for k in range(8):
+                stack = open(tmp_path / f"stack-{rnd}-{k}.txt", "w+")
+                stacks.append(stack)
+                faulthandler.enable(file=stack)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)  # fork with threads
+                    pid = os.fork()
+                if pid == 0:
+                    code = 1
+                    try:
+                        fasten.emit(code="USER_CREATED", target=f"child-{rnd}-{k}")
+                        code = 0 if fasten.flush(timeout=5.0) else 2
+                    finally:
+                        os._exit(code)
+                pids.append(pid)
+    finally:
+        faulthandler.enable(file=sys.__stderr__)
     deadline = time.monotonic() + 20
     failed = []
-    for pid in pids:
+    for pid, stack in zip(pids, stacks):
         while True:
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
@@ -890,9 +895,12 @@ def test_fork_never_lands_mid_insert(tmp_path):
             if time.monotonic() > deadline:
                 os.kill(pid, signal.SIGABRT)
                 os.waitpid(pid, 0)
-                failed.append("hung")
+                stack.seek(0)
+                failed.append(f"hung:\n{stack.read()}")
                 break
             time.sleep(0.02)
+    for stack in stacks:
+        stack.close()
     assert not failed, f"{len(failed)} of {len(pids)} forked children did not store: {failed}"
     assert fasten.flush(timeout=10.0)
     targets = sorted(r.target for r in store.query(limit=10000))
