@@ -122,8 +122,11 @@ final class SQLiteTests: XCTestCase {
                 return
             }
             for i in 0..<200 {
+                // Seq 0: the store assigns each row its own seq.
+                var row = makeRow("evt-close-\(worker)-\(i)")
+                row["monotonic_seq"] = 0
                 do {
-                    try store.insert(makeRow("evt-close-\(worker)-\(i)"))
+                    try store.insert(row)
                 } catch let e as FastenStoreError where e.message == "store is closed" {
                     lock.lock()
                     closedHits += 1
