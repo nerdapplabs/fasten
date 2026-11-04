@@ -795,6 +795,21 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
+    def chain_tips(self) -> list[AuditRow]:
+        """Each node's sealed row with the highest monotonic_seq, by node id."""
+
+        def _run(conn: Any) -> list[AuditRow]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_COLUMNS} FROM {self._table} WHERE hash <> '' AND "
+                    "(source_node_id, monotonic_seq) IN (SELECT source_node_id, "
+                    f"MAX(monotonic_seq) FROM {self._table} WHERE hash <> '' "
+                    "GROUP BY source_node_id) ORDER BY source_node_id, id"
+                )
+                return [self._row(r) for r in cur.fetchall()]
+
+        return self._execute_with_retry(_run)
+
     def _row(self, r: tuple) -> AuditRow:
         """A row selected as ``_COLUMNS``."""
         return AuditRow(

@@ -153,6 +153,25 @@ in the same way, and emits `audit_drain_install_incomplete` if that
 drainer's flush timed out or a row it held was not stored. Until it is
 retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
+## Chain checkpoints
+
+`verify_chain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later
+([spec §9](../spec/chain-replication.md#9-checkpoints)):
+
+```python
+from fasten import verify_chain
+from fasten.checkpoints import FileCheckpointSink, load_checkpoints, publish_checkpoints
+
+publish_checkpoints(store, FileCheckpointSink("/mnt/worm/checkpoints.jsonl"))
+# HttpCheckpointSink(url) POSTs them instead.
+
+rows = store.chain_tail("node-1", 10_000)
+result = verify_chain(rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
+```
+
 ## Tests
 
 The same steps CI runs (see

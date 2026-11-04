@@ -23,10 +23,11 @@ import dataclasses
 import hashlib
 import json
 import secrets
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 if TYPE_CHECKING:
     from .attrs import AuditRow
+    from .checkpoints import Checkpoint
 
 # Form stamped by seal(). Form "2" commits to detail rather than hashing it,
 # so detail can be destroyed for retention without changing the row hash
@@ -272,16 +273,43 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
     return None
 
 
-def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
+def _checkpoint_break(
+    rows: "list[AuditRow]", cp: "Checkpoint",
+) -> "tuple[int, str] | None":
+    """Check one node's rows against a checkpoint of that node (spec §9), as
+    (monotonic_seq, reason); None if they agree or the checkpoint is older
+    than the oldest row."""
+    seq = cp.monotonic_seq
+    at = sorted((r for r in rows if r.monotonic_seq == seq), key=lambda r: r.id)
+    if at:
+        if any(r.hash == cp.hash for r in at):
+            return None
+        return seq, f"row {at[0].id}: hash differs from checkpoint at seq {seq}"
+    lowest = min(r.monotonic_seq for r in rows)
+    highest = max(r.monotonic_seq for r in rows)
+    if seq > highest:
+        return highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
+                             f"{highest} before checkpoint at seq {seq}")
+    if seq < lowest:
+        return None  # purged by retention
+    return seq, f"node '{cp.source_node_id}': no row at checkpointed seq {seq}"
+
+
+def verify_chain(
+    rows: "list[AuditRow]", checkpoints: "Sequence[Checkpoint] | None" = None,
+) -> ChainVerifyResult:
     """Walk the per-row hash chain and return a verification result.
 
     The canonical hashed form, the cross-language rendering rules (including the
     whole-number-float hazard), the canonical_form_id registry, and the
     replication contract are normative in ``spec/chain-replication.md``.
 
-    Detects field tampering, row insertion, deletion, and reorder. Does NOT
-    detect tail truncation; that needs an external anchor for the latest
-    hash.
+    Detects field tampering, row insertion, deletion, and reorder. Tail
+    truncation and a full re-seal from genesis are detected only against
+    ``checkpoints`` published earlier outside the store (spec §9): each
+    checkpoint for a node in ``rows`` must match the row at its seq. One
+    older than the node's oldest row is skipped, as is one for a node with
+    no rows here.
 
     Rows with an empty ``hash`` field (written before hash-chain support, or in
     stdout-only mode) are skipped below their node's first sealed seq; they are
@@ -331,6 +359,13 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
             first = found
     if dup is not None and (first is None or dup[0] < first[0]):
         first = dup
+    for cp in sorted(checkpoints or (), key=lambda c: (c.source_node_id, c.monotonic_seq)):
+        node_rows = by_node.get(cp.source_node_id)
+        if not node_rows:
+            continue
+        found = _checkpoint_break(list(node_rows.values()), cp)
+        if found is not None and (first is None or found[0] < first[0]):
+            first = found
     if first is not None:
         return ChainVerifyResult(ok=False, total_rows=len(rows), first_break_at=first[0], reason=first[1])
 
