@@ -101,8 +101,10 @@ struct SdkStoreAdapter(Arc<dyn AuditStore>);
 impl fasten_core::store::Store for SdkStoreAdapter {
     fn insert(&self, row: &fasten_core::Row) -> Result<(), fasten_core::Error> {
         let sdk_row = core_to_sdk_row(row);
-        // A positive rc: the drainer retries the row.
-        self.0.insert(&sdk_row).map_err(|_| fasten_core::Error::CallbackFailed(1))
+        // Type only: a store error message can quote row values. The
+        // drainer retries the row.
+        self.0.insert(&sdk_row)
+            .map_err(|e| fasten_core::Error::Store(crate::retention::error_type(&e).into()))
     }
     fn ping(&self) -> Result<(), fasten_core::Error> { Ok(()) }
     fn query(&self, _: &fasten_core::store::Filter)
@@ -274,15 +276,18 @@ impl Engine {
                 }));
                 Ok(())
             }
-            Err(e) => {
-                // Type only: a store error message can quote row values.
-                self.sys_event("error", "audit_sync_fallback_failed", serde_json::json!({
-                    "error_type": crate::retention::error_type(&e),
-                    "row_id": row.id,
-                }));
-                Err(crate::AuditStoreError { source: e })
-            }
+            Err(e) => Err(self.fallback_failed(row, e)),
         }
+    }
+
+    /// Report a row submit could not store after the drainer refused it.
+    pub(crate) fn fallback_failed(&self, row: &crate::Row, e: Error) -> crate::AuditStoreError {
+        // Type only: a store error message can quote row values.
+        self.sys_event("error", "audit_sync_fallback_failed", serde_json::json!({
+            "error_type": crate::retention::error_type(&e),
+            "row_id": row.id,
+        }));
+        crate::AuditStoreError { source: e }
     }
 }
 
@@ -355,7 +360,7 @@ mod tests {
         }
     }
 
-    // A failed insert is retried, not reported as a bad table name.
+    // A failed insert is retried and reported by its type.
     #[test]
     fn adapter_maps_store_errors_to_retryable() {
         crate::register("adapter".into(), [("ADAPTER_EVENT".into(), crate::Meta {
@@ -367,6 +372,6 @@ mod tests {
         let row = crate::EmitBuilder::new("ADAPTER_EVENT", "t").build_row(&cfg).unwrap();
         let row = sdk_row_to_core(&row);
         let err = SdkStoreAdapter(Arc::new(FailStore)).insert(&row).unwrap_err();
-        assert!(matches!(err, fasten_core::Error::CallbackFailed(1)), "{err:?}");
+        assert!(matches!(&err, fasten_core::Error::Store(t) if t == "AuditStoreInsert"), "{err:?}");
     }
 }

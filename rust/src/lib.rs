@@ -656,8 +656,13 @@ impl EmitBuilder {
                 if !d.enqueue(core_row) {
                     // The drainer is stopping (a re-init or shutdown), so
                     // store the row here.
-                    if let Some(s) = cfg.audit_store.as_ref() {
-                        engine.store_inline(&**s, &row)?;
+                    match cfg.audit_store.as_ref() {
+                        Some(s) => engine.store_inline(&**s, &row)?,
+                        // A concurrent re-init dropped the store.
+                        None => return Err(engine.fallback_failed(
+                            &row,
+                            Error::AuditStoreInsert("no audit store".into()),
+                        )),
                     }
                 }
             } else if let Some(s) = cfg.audit_store.as_ref() {
@@ -1517,6 +1522,109 @@ mod tests {
         e.init(queue_config("svc-reinit-ok", store.clone())).unwrap();
         e.init(queue_config("svc-reinit-ok", store)).unwrap();
         assert!(sys_lines("svc-reinit-ok", "audit_drain_install_incomplete").is_empty());
+        e.reset_for_tests();
+    }
+
+    // A failed drainer insert is retried and shows the store error's type.
+    #[test]
+    fn drainer_reports_store_error_type() {
+        register("drain_type".into(), [("DRAIN_TYPE".into(), plain_meta("drain_type"))]).unwrap();
+        let store: Arc<dyn AuditStore> = Arc::new(IdStore { fail: true, ..Default::default() });
+        let cfg = Config {
+            queue_retry_initial: Some(Duration::from_millis(10)),
+            queue_retry_max: Some(Duration::from_millis(10)),
+            disable_queue_jitter: true,
+            ..queue_config("svc-drain-type", store)
+        };
+        let e = Engine::new();
+        e.init(cfg).unwrap();
+        EmitBuilder::new("DRAIN_TYPE", "t").submit_to(&e).expect("submit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while e.queue_stats().unwrap().retry_count_active < 2 {
+            assert!(std::time::Instant::now() < deadline, "row was not retried");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stats = e.queue_stats().unwrap();
+        assert_eq!(stats.last_error.as_deref(), Some("AuditStoreInsert"));
+        assert_eq!(stats.dead_lettered_total, 0);
+        e.reset_for_tests();
+    }
+
+    // A refused row is an error when a re-init has dropped the store.
+    #[test]
+    fn submit_errors_when_drainer_stopped_and_store_gone() {
+        register("store_gone".into(), [("STORE_GONE".into(), plain_meta("store_gone"))]).unwrap();
+        let e = Engine::new();
+        e.init(queue_config("svc-store-gone", Arc::new(IdStore::default()))).unwrap();
+        e.active_drainer().unwrap().stop(Duration::from_secs(2));
+        e.config.lock().unwrap().as_mut().unwrap().audit_store = None;
+
+        let err = EmitBuilder::new("STORE_GONE", "t").submit_to(&e).unwrap_err();
+        assert!(matches!(err.source, Error::AuditStoreInsert(_)));
+        let lines = sys_lines("svc-store-gone", "audit_sync_fallback_failed");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["error_type"], "AuditStoreInsert");
+        e.reset_for_tests();
+    }
+
+    // Holds the first insert until opened, then stores every row.
+    #[derive(Default)]
+    struct GateStore {
+        open: std::sync::Mutex<bool>,
+        open_cv: std::sync::Condvar,
+        started: std::sync::atomic::AtomicBool,
+        ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl GateStore {
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.open_cv.notify_all();
+        }
+    }
+
+    impl AuditStore for GateStore {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut open = self.open.lock().unwrap();
+                while !*open {
+                    open = self.open_cv.wait(open).unwrap();
+                }
+            }
+            self.ids.lock().unwrap().push(row.id.clone());
+            Ok(())
+        }
+    }
+
+    // A submit blocked on a full queue that a re-init's stop wakes stores
+    // its row inline.
+    #[test]
+    fn blocked_submit_woken_by_reinit_is_stored() {
+        register("reinit_blocked".into(), [("REINIT_BLOCKED".into(), plain_meta("reinit_blocked"))])
+            .unwrap();
+        let store = Arc::new(GateStore::default());
+        let cfg = Config {
+            queue_capacity: Some(1),
+            ..queue_config("svc-reinit-blocked", store.clone())
+        };
+        let e = Engine::new();
+        e.init(cfg.clone()).unwrap();
+        // Holds the only slot while its insert waits on the gate.
+        let first = EmitBuilder::new("REINIT_BLOCKED", "t").submit_to(&e).expect("submit");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|sc| {
+            sc.spawn(|| tx.send(EmitBuilder::new("REINIT_BLOCKED", "t").submit_to(&e)).unwrap());
+            // Let the second submit block on the full queue.
+            std::thread::sleep(Duration::from_millis(200));
+            sc.spawn(|| e.init(cfg.clone()).unwrap());
+            // The re-init's flush times out after 5s; its stop wakes the submit.
+            let blocked = rx.recv_timeout(Duration::from_secs(20));
+            store.release();
+            let row = blocked.expect("blocked submit returned").expect("submit");
+            assert!(store.ids.lock().unwrap().contains(&row.id), "row was dropped");
+        });
+        assert!(store.ids.lock().unwrap().contains(&first.id));
         e.reset_for_tests();
     }
 

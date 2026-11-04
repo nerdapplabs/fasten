@@ -10,8 +10,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `submit()` stores a row inline when the drainer is stopping and refuses it,
   then emits `audit_drain_stored_inline`. If that insert fails too, it emits
-  `audit_sync_fallback_failed` and returns the error. Before, such a row was
-  dropped and `submit()` returned `Ok`.
+  `audit_sync_fallback_failed` and returns the error, as it does when a
+  concurrent re-init has dropped the store. Before, such a row was dropped
+  and `submit()` returned `Ok`.
 - Redact sys and log lines (`fasten::log::*` included) with the configured
   extra keys and replacement, as the other SDKs do.
 - SDK sys events (`audit_chain_unavailable`, `retention_purge_failed`,
@@ -19,8 +20,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   drainer-conformance §4 asks. `fasten::log::*` lines stay on stdout.
 - Re-init emits `audit_drain_install_incomplete {flushed, unstored}` when the
   old drainer's flush timed out or rows it held were not stored (spec §10).
-- A failed insert through the drainer is reported as `CallbackFailed`, not
-  `InvalidTableName`, in `audit_drain_lost_at_stop.error_type`.
+- A failed insert through the drainer is retried and reported by the store
+  error's type (e.g. `AuditStoreInsert`) in `audit_drain_failed.error`,
+  `audit_drain_dead_letter.last_error`, `audit_drain_lost_at_stop.error_type`
+  and `queue_stats().last_error`. Before, it was reported as
+  `InvalidTableName`.
+- fasten-core: `Drainer::unstored_total` is now public, and the new
+  `Error::Store(String)` is a store error that carries only its type. The
+  drainer retries it, and it maps to `ErrBackend`. The C ABI is unchanged.
 - `PostgresStore::redact_rows` returns only the ids it redacted.
 
 ### Changed: Go SDK requires Go 1.26

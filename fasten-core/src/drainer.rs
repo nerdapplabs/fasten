@@ -459,8 +459,11 @@ fn rejected(e: &Error, row: &Row) -> bool {
     }
 }
 
-/// The variant name, e.g. `CallbackFailed`.
+/// The variant name, e.g. `CallbackFailed`, or the type a `Store` error carries.
 fn error_type(e: &Error) -> String {
+    if let Error::Store(t) = e {
+        return t.clone();
+    }
     let debug = format!("{e:?}");
     debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
 }
@@ -701,5 +704,54 @@ mod stop_tests {
         let start = Instant::now();
         assert!(d.flush(Duration::from_secs(30)));
         assert!(start.elapsed() < Duration::from_secs(5), "flush waited for its timeout");
+    }
+
+    struct TypedFailStore(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Store for TypedFailStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(crate::error::Error::Store("PgError".into()))
+        }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// A `Store` error is retried and reported by the type it carries.
+    #[test]
+    fn store_error_is_retried_and_reported_by_type() {
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = events.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = Drainer::with_sys_log(Box::new(TypedFailStore(attempts.clone())), DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts: 50,
+        }, Some(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+        })));
+        assert!(d.enqueue(Row { id: "r-1".into(), ..Row::default() }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::SeqCst) < 3 {
+            assert!(Instant::now() < deadline, "row was not retried");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let stats = d.stats();
+        assert_eq!(stats.last_error.as_deref(), Some("PgError"));
+        assert_eq!(stats.dead_lettered_total, 0);
+        d.stop(Duration::from_secs(2));
+
+        let events = events.lock().unwrap();
+        let find = |name: &str| events.iter().find(|e| e["event"] == name).cloned();
+        assert_eq!(find("audit_drain_failed").unwrap()["error"], "PgError");
+        assert!(find("audit_drain_dead_letter").is_none());
+        assert_eq!(find("audit_drain_lost_at_stop").unwrap()["error_type"], "PgError");
     }
 }
