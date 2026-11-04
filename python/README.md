@@ -153,6 +153,21 @@ in the same way, and emits `audit_drain_install_incomplete` if that
 drainer's flush timed out or a row it held was not stored. Until it is
 retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
+## Verifying the chain
+
+`verify_chain` checks the hash chain over a set of rows and reports the
+first break: an edited, inserted, deleted or reordered row
+([spec §3](../spec/chain-replication.md#3-verification)). Chains sealed by
+the Python and Go SDKs verify in either.
+
+```python
+from fasten import verify_chain
+
+result = verify_chain(store.query(limit=10_000))
+if not result.ok:
+    print(result.first_break_at, result.reason)
+```
+
 ## Chain checkpoints
 
 `verify_chain` cannot tell on its own that rows were cut off the end of a

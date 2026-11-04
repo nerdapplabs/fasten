@@ -250,6 +250,10 @@ covers what the stdout stream carries until then.
 
 ## §3 Verification
 
+The SDKs that verify name it `verify_chain(rows)` (Python) and
+`VerifyChain(rows)` (Go); this spec uses the Python name. Both follow
+these steps and give the same result for the same rows.
+
 `verify_chain(rows)`:
 
 1. Keep one copy of each row `id` per node (re-delivery, §4; or a stdout

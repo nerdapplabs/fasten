@@ -137,6 +137,23 @@ returns within about `timeout`, reports rows not stored by then as
 call still running then, such as a lib/pq query to a server that stopped
 answering, is left to finish in the background.
 
+## Verifying the chain
+
+`fasten.VerifyChain` checks the hash chain over a set of rows and reports
+the first break: an edited, inserted, deleted or reordered row
+([spec §3](../spec/chain-replication.md#3-verification)). Chains sealed by
+the Go and Python SDKs verify in either.
+
+```go
+rows, err := store.Query(ctx, fasten.Filter{Limit: 10000})
+if err != nil {
+	return err
+}
+if res := fasten.VerifyChain(rows); !res.OK {
+	log.Printf("chain breaks at seq %d: %s", res.FirstBreakAt, res.Reason)
+}
+```
+
 ## Chain checkpoints
 
 `VerifyChain` cannot tell on its own that rows were cut off the end of a
