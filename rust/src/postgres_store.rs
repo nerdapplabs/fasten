@@ -26,7 +26,7 @@ fn validate_table_name(table: &str) -> Result<(), crate::Error> {
         Some((s, t)) => (Some(s), t),
         None => (None, table),
     };
-    let ok = schema.map_or(true, is_valid_identifier) && is_valid_identifier(bare);
+    let ok = schema.is_none_or(is_valid_identifier) && is_valid_identifier(bare);
     if ok {
         Ok(())
     } else {
@@ -39,7 +39,11 @@ fn validate_table_name(table: &str) -> Result<(), crate::Error> {
 }
 
 fn pg_err(e: pg::Error) -> crate::Error {
-    crate::Error::AuditStoreInsert(e.to_string())
+    let msg = match e.as_db_error() {
+        Some(db) => format!("{e}: {}", db.message()),
+        None => e.to_string(),
+    };
+    crate::Error::AuditStoreInsert(msg)
 }
 
 fn ensure_schema(client: &mut pg::Client, schema: &str) -> Result<(), crate::Error> {
@@ -48,11 +52,30 @@ fn ensure_schema(client: &mut pg::Client, schema: &str) -> Result<(), crate::Err
     Ok(())
 }
 
+/// `idx_{bare}_{suffix}`, unless that passes Postgres's 63-byte identifier
+/// limit, where long names truncate to one name and only the first index
+/// gets made. Then the table part is cut and a hash of the full name added.
+fn index_name(bare: &str, suffix: &str) -> String {
+    const MAX: usize = 63;
+    let name = format!("idx_{bare}_{suffix}");
+    if name.len() <= MAX {
+        return name;
+    }
+    // FNV-1a over the folded name: unquoted `Foo` and `foo` are one table.
+    let mut h: u32 = 0x811c_9dc5;
+    for b in bare.to_ascii_lowercase().bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    let keep = MAX - "idx___".len() - 8 - suffix.len();
+    format!("idx_{}_{h:08x}_{suffix}", &bare[..keep])
+}
+
+// Column order follows the Python store, which reads rows by position.
+// pii_in_detail and wire_version, which Python lacks, go last.
 fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), crate::Error> {
     let create = format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             id              TEXT        NOT NULL,
-            wire_version    TEXT        NOT NULL DEFAULT '1',
             origin_id       TEXT        NOT NULL,
             monotonic_seq   BIGINT      NOT NULL DEFAULT 0,
             timestamp       TEXT        NOT NULL,
@@ -70,28 +93,96 @@ fn ensure_table(client: &mut pg::Client, table: &str, bare: &str) -> Result<(), 
             method          TEXT        NOT NULL DEFAULT '',
             request_id      TEXT        NOT NULL DEFAULT '',
             detail          TEXT        NOT NULL DEFAULT '{{}}',
-            pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,
             shipped_at      TEXT,
+            prev_hash       TEXT        NOT NULL DEFAULT 'genesis',
+            hash            TEXT        NOT NULL DEFAULT '',
+            canonical_form_id TEXT      NOT NULL DEFAULT '1',
+            detail_salt       TEXT,
+            detail_commitment TEXT,
+            pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,
+            wire_version    TEXT        NOT NULL DEFAULT '1',
             PRIMARY KEY (id)
         )"
     );
     client.execute(&create, &[]).map_err(pg_err)?;
 
-    for sql in &[
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_req  ON {table} (request_id)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_code ON {table} (code)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_ts   ON {table} (timestamp)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{bare}_svc  ON {table} (service_id)"),
+    // Columns a table made by another SDK, or an older Rust store, may lack.
+    for col in [
+        "pii_in_detail SMALLINT NOT NULL DEFAULT 0",
+        "wire_version TEXT NOT NULL DEFAULT '1'",
+        "prev_hash TEXT NOT NULL DEFAULT 'genesis'",
+        "hash TEXT NOT NULL DEFAULT ''",
+        "canonical_form_id TEXT NOT NULL DEFAULT '1'",
+        "detail_salt TEXT",
+        "detail_commitment TEXT",
     ] {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col}");
+        client.execute(sql.as_str(), &[]).map_err(pg_err)?;
+    }
+
+    for (suffix, cols) in [
+        ("req", "request_id"),
+        ("code", "code"),
+        ("ts", "timestamp"),
+        ("svc", "service_id"),
+        // Not unique: older Rust tables repeat seqs per node.
+        ("node_seq", "source_node_id, monotonic_seq"),
+    ] {
+        let name = index_name(bare, suffix);
+        let sql = format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})");
         client.execute(sql.as_str(), &[]).map_err(pg_err)?;
     }
     Ok(())
+}
+
+/// What the existing table's columns allow. The Go store keeps timestamps as
+/// TIMESTAMPTZ and detail_salt as NOT NULL; Python keeps TEXT and nullable.
+struct Columns {
+    ts_cast: &'static str,
+    shipped_cast: &'static str,
+    salt_nullable: bool,
+}
+
+fn inspect_columns(
+    client: &mut pg::Client,
+    schema: Option<&str>,
+    bare: &str,
+) -> Result<Columns, crate::Error> {
+    // Unquoted identifiers fold to lowercase in Postgres.
+    let schema = schema.map(str::to_ascii_lowercase);
+    let bare = bare.to_ascii_lowercase();
+    let rows = client
+        .query(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+             WHERE table_schema = COALESCE($1::text, current_schema()) AND table_name = $2",
+            &[&schema, &bare],
+        )
+        .map_err(pg_err)?;
+    let mut cols = Columns { ts_cast: "", shipped_cast: "", salt_nullable: true };
+    for r in rows {
+        let name: &str = r.get(0);
+        let dtype: &str = r.get(1);
+        let nullable: &str = r.get(2);
+        let cast = if dtype.starts_with("timestamp") { "::timestamptz" } else { "" };
+        match name {
+            "timestamp" => cols.ts_cast = cast,
+            "shipped_at" => cols.shipped_cast = cast,
+            "detail_salt" => cols.salt_nullable = nullable == "YES",
+            _ => {}
+        }
+    }
+    Ok(cols)
 }
 
 /// Synchronous PostgreSQL audit store backed by the `postgres` crate.
 ///
 /// Obtain one via [`PostgresStore::new`] and wrap it in an `Arc` before
 /// passing to [`crate::Config::audit_store`].
+///
+/// A row with `monotonic_seq` 0 (what `emit` returns) gets the node's next
+/// seq in the insert transaction, under the same per-node advisory lock as
+/// the Python, Go and JS stores (spec §2.1). Rows are not sealed: `hash` and
+/// `prev_hash` are empty.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -115,6 +206,7 @@ pub struct PostgresStore {
     /// Table name without the schema prefix; the index names are built from it.
     #[allow(dead_code)]
     idx: String,
+    cols: Columns,
 }
 
 impl PostgresStore {
@@ -135,45 +227,98 @@ impl PostgresStore {
 
         let mut client = pg::Client::connect(dsn, pg::NoTls).map_err(pg_err)?;
 
-        if let Some(ref schema) = schema_opt {
-            ensure_schema(&mut client, schema)?;
-        }
-        ensure_table(&mut client, &table, &bare)?;
+        // Serialise bootstrap across processes and SDKs: concurrent CREATE /
+        // ALTER on one table deadlock or fail. Same key as the Python store.
+        let lock_key = format!("fasten.bootstrap.{table}");
+        client
+            .execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&lock_key])
+            .map_err(pg_err)?;
+        let ddl = (|| {
+            if let Some(ref schema) = schema_opt {
+                ensure_schema(&mut client, schema)?;
+            }
+            ensure_table(&mut client, &table, &bare)
+        })();
+        let unlock = client
+            .execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&lock_key])
+            .map_err(pg_err);
+        ddl?;
+        unlock?;
+
+        let cols = inspect_columns(&mut client, schema_opt.as_deref(), &bare)?;
 
         Ok(Self {
             client: Mutex::new(client),
             table,
             idx: bare,
+            cols,
         })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, pg::Client> {
+        self.client.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl crate::AuditStore for PostgresStore {
     fn insert(&self, row: &crate::Row) -> Result<(), crate::Error> {
         let detail_json = serde_json::to_string(&row.detail)?;
-        let timestamp = row.timestamp.to_rfc3339();
-        let shipped_at = row.shipped_at.as_ref().map(|t| t.to_rfc3339());
+        let timestamp = crate::canonical_ts(&row.timestamp);
+        let shipped_at = row.shipped_at.as_ref().map(crate::canonical_ts);
         let pii_in_detail: i16 = if row.pii_in_detail { 1 } else { 0 };
-        let monotonic_seq = row.monotonic_seq as i64;
         let severity = row.severity.to_string();
 
+        // detail_salt / detail_commitment are '' rather than NULL: the Go
+        // store reads them as strings.
         let sql = format!(
             "INSERT INTO {} \
              (id, wire_version, origin_id, monotonic_seq, timestamp, \
               code, action, severity, service_id, source_node_id, tenant_id, \
               actor, actor_kind, target, category, domain, method, \
-              request_id, detail, pii_in_detail, shipped_at) \
+              request_id, detail, pii_in_detail, shipped_at, \
+              prev_hash, hash, detail_salt, detail_commitment) \
              VALUES \
-             ($1, $2, $3, $4, $5, \
+             ($1, $2, $3, $4, $5::text{}, \
               $6, $7, $8, $9, $10, $11, \
               $12, $13, $14, $15, $16, $17, \
-              $18, $19, $20, $21) \
+              $18, $19, $20, $21::text{}, \
+              $22, $23, '', '') \
              ON CONFLICT (id) DO NOTHING",
-            self.table
+            self.table, self.cols.ts_cast, self.cols.shipped_cast
         );
 
         let tenant: Option<&str> = row.tenant_id.as_deref();
         let shipped: Option<&str> = shipped_at.as_deref();
+
+        let mut guard = self.lock();
+        let mut tx = guard.transaction().map_err(pg_err)?;
+
+        let mut monotonic_seq = row.monotonic_seq as i64;
+        if monotonic_seq == 0 {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&row.source_node_id],
+            )
+            .map_err(pg_err)?;
+            // A retry of a row that already landed must not take a new seq.
+            let exists = tx
+                .query_opt(&format!("SELECT 1 FROM {} WHERE id = $1", self.table), &[&row.id])
+                .map_err(pg_err)?;
+            if exists.is_some() {
+                return tx.commit().map_err(pg_err);
+            }
+            monotonic_seq = tx
+                .query_one(
+                    &format!(
+                        "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
+                         WHERE source_node_id = $1",
+                        self.table
+                    ),
+                    &[&row.source_node_id],
+                )
+                .map_err(pg_err)?
+                .get(0);
+        }
 
         let params: &[&(dyn ToSql + Sync)] = &[
             &row.id,
@@ -197,17 +342,75 @@ impl crate::AuditStore for PostgresStore {
             &detail_json,
             &pii_in_detail,
             &shipped,
+            &row.prev_hash,
+            &row.hash,
         ];
+        tx.execute(&sql as &str, params).map_err(pg_err)?;
+        tx.commit().map_err(pg_err)
+    }
 
-        let mut guard = self
-            .client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    // Unsealed rows (hash '') and form-"2" rows only. A sealed form-"1" row
+    // hashes its detail, so redacting it would break the chain (spec §7.1).
+    fn list_redaction_candidates(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        codes: &[String],
+    ) -> Result<Vec<crate::RedactionCandidate>, crate::Error> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, monotonic_seq FROM {} \
+             WHERE timestamp < $1::text{} AND code = ANY($2) AND detail <> 'null' \
+             AND (hash = '' OR canonical_form_id = '2') \
+             ORDER BY monotonic_seq",
+            self.table, self.cols.ts_cast
+        );
+        let before = crate::canonical_ts(&before);
+        let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
+        let rows = self.lock().query(&sql as &str, &[&before, &codes]).map_err(pg_err)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::RedactionCandidate {
+                id: r.get(0),
+                monotonic_seq: r.get::<_, i64>(1) as u64,
+            })
+            .collect())
+    }
 
-        guard
-            .execute(&sql as &str, params)
-            .map(|_| ())
-            .map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
+    fn count_skipped_legacy_form(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        codes: &[String],
+    ) -> Result<u64, crate::Error> {
+        if codes.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} \
+             WHERE timestamp < $1::text{} AND code = ANY($2) AND detail <> 'null' \
+             AND hash <> '' AND canonical_form_id <> '2'",
+            self.table, self.cols.ts_cast
+        );
+        let before = crate::canonical_ts(&before);
+        let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
+        let row = self.lock().query_one(&sql as &str, &[&before, &codes]).map_err(pg_err)?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, crate::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let salt = if self.cols.salt_nullable { "NULL" } else { "''" };
+        let sql = format!(
+            "UPDATE {} SET detail = 'null', detail_salt = {salt} \
+             WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2')",
+            self.table
+        );
+        let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.lock().execute(&sql as &str, &[&ids_ref]).map_err(pg_err)?;
+        Ok(ids.to_vec())
     }
 }
 
@@ -247,8 +450,20 @@ mod tests {
                 m
             },
             pii_in_detail: false,
+            prev_hash: String::new(),
+            hash: String::new(),
             shipped_at: None,
         }
+    }
+
+    fn fresh_store(dsn: &str, table: &str) -> PostgresStore {
+        let mut c = pg::Client::connect(dsn, pg::NoTls).expect("connect");
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {table}")).expect("drop");
+        PostgresStore::new(dsn, table).expect("PostgresStore::new")
+    }
+
+    fn uniq(prefix: &str) -> String {
+        format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
     }
 
     #[test]
@@ -348,6 +563,389 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let flag: i16 = rows[0].get(0);
         assert_eq!(flag, 1i16);
+    }
+
+    // Two stores on one table, one node, writing at the same time: seqs must
+    // be exactly 1..N, with no duplicates or gaps.
+    #[test]
+    fn test_two_stores_allocate_unique_seq() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_alloc_test";
+        let a = std::sync::Arc::new(fresh_store(&dsn, table));
+        let b = std::sync::Arc::new(PostgresStore::new(&dsn, table).expect("second store"));
+        let node = uniq("node");
+        const PER: usize = 25;
+
+        let handles: Vec<_> = [a, b]
+            .into_iter()
+            .map(|store| {
+                let node = node.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER {
+                        let mut row = make_row(&uniq("evt"), "TEST_ALLOC");
+                        row.origin_id = row.id.clone();
+                        row.monotonic_seq = 0;
+                        row.source_node_id = node.clone();
+                        crate::AuditStore::insert(&*store, &row).expect("insert");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT monotonic_seq, hash, prev_hash FROM {table}                      WHERE source_node_id = $1 ORDER BY monotonic_seq"
+                ),
+                &[&node],
+            )
+            .expect("query");
+        let seqs: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(seqs, (1..=(2 * PER) as i64).collect::<Vec<_>>());
+        for r in &rows {
+            assert_eq!(r.get::<_, &str>(1), "");
+            assert_eq!(r.get::<_, &str>(2), "");
+        }
+    }
+
+    // A retried insert of a row that already landed takes no new seq.
+    #[test]
+    fn test_retry_does_not_burn_seq() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::new(&dsn, "fasten_pg_test").expect("PostgresStore::new");
+        let node = uniq("node");
+        let mut first = make_row(&uniq("evt"), "TEST_RETRY");
+        first.monotonic_seq = 0;
+        first.source_node_id = node.clone();
+        crate::AuditStore::insert(&store, &first).expect("insert");
+        crate::AuditStore::insert(&store, &first).expect("retry");
+        let mut second = make_row(&uniq("evt"), "TEST_RETRY");
+        second.monotonic_seq = 0;
+        second.source_node_id = node.clone();
+        crate::AuditStore::insert(&store, &second).expect("insert second");
+
+        let rows = store
+            .lock()
+            .query(
+                "SELECT monotonic_seq FROM fasten_pg_test WHERE source_node_id = $1                  ORDER BY monotonic_seq",
+                &[&node],
+            )
+            .expect("query");
+        let seqs: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    // Timestamps are written in the canonical form the other SDKs write.
+    #[test]
+    fn test_canonical_timestamp() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::new(&dsn, "fasten_pg_test").expect("PostgresStore::new");
+        let mut row = make_row(&uniq("evt"), "TEST_TS");
+        row.timestamp = "2026-01-02T03:04:05Z".parse().unwrap();
+        row.shipped_at = Some("2026-01-02T03:04:06.5Z".parse().unwrap());
+        crate::AuditStore::insert(&store, &row).expect("insert");
+        let r = store
+            .lock()
+            .query_one(
+                "SELECT timestamp, shipped_at FROM fasten_pg_test WHERE id = $1",
+                &[&row.id],
+            )
+            .expect("query");
+        assert_eq!(r.get::<_, &str>(0), "2026-01-02T03:04:05.000000Z");
+        assert_eq!(r.get::<_, Option<&str>>(1), Some("2026-01-02T03:04:06.500000Z"));
+    }
+
+    fn create_go_table(c: &mut pg::Client, table: &str) {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (
+                id TEXT PRIMARY KEY, origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL, code TEXT NOT NULL, action TEXT NOT NULL,
+                severity TEXT NOT NULL, service_id TEXT NOT NULL, source_node_id TEXT NOT NULL,
+                tenant_id TEXT, actor TEXT NOT NULL, actor_kind TEXT NOT NULL,
+                target TEXT NOT NULL, category TEXT NOT NULL, domain TEXT NOT NULL,
+                method TEXT NOT NULL, request_id TEXT NOT NULL, detail TEXT NOT NULL,
+                pii_in_detail SMALLINT NOT NULL DEFAULT 0, shipped_at TIMESTAMPTZ,
+                wire_version TEXT NOT NULL DEFAULT '1', hash TEXT NOT NULL DEFAULT '',
+                prev_hash TEXT NOT NULL DEFAULT '', canonical_form_id TEXT NOT NULL DEFAULT '1',
+                detail_salt TEXT NOT NULL DEFAULT '', detail_commitment TEXT NOT NULL DEFAULT '')"
+        ))
+        .expect("create go table");
+    }
+
+    // Rows go into a Go-shaped table: TIMESTAMPTZ timestamps, NOT NULL salt.
+    #[test]
+    fn test_insert_into_go_shaped_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_go_shape";
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        create_go_table(&mut c, table);
+        let store = PostgresStore::new(&dsn, table).expect("PostgresStore::new");
+        let mut row = make_row(&uniq("evt"), "TEST_GO");
+        row.monotonic_seq = 0;
+        row.shipped_at = Some(chrono::Utc::now());
+        crate::AuditStore::insert(&store, &row).expect("insert");
+        let codes = vec!["TEST_GO".to_string()];
+        let later = chrono::Utc::now() + chrono::Duration::hours(1);
+        let found = crate::AuditStore::list_redaction_candidates(&store, later, &codes)
+            .expect("candidates");
+        assert_eq!(found.len(), 1);
+        crate::AuditStore::redact_rows(&store, &[row.id.clone()]).expect("redact");
+        let r = c
+            .query_one(
+                &format!("SELECT monotonic_seq, detail, detail_salt FROM {table} WHERE id = $1"),
+                &[&row.id],
+            )
+            .expect("query");
+        assert_eq!(r.get::<_, i64>(0), 1);
+        assert_eq!(r.get::<_, &str>(1), "null");
+        assert_eq!(r.get::<_, &str>(2), "");
+    }
+
+    // A mixed-case name folds to lowercase, so the TIMESTAMPTZ cast still applies.
+    #[test]
+    fn test_insert_into_mixed_case_go_table() {
+        let Some(dsn) = dsn() else { return };
+        let table = "Fasten_Go_Mixed";
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        create_go_table(&mut c, table);
+        let store = PostgresStore::new(&dsn, table).expect("PostgresStore::new");
+        let mut row = make_row(&uniq("evt"), "TEST_GO_MIXED");
+        row.monotonic_seq = 0;
+        row.shipped_at = Some(chrono::Utc::now());
+        crate::AuditStore::insert(&store, &row).expect("insert");
+        let n: i64 = c
+            .query_one(&format!("SELECT count(*) FROM {table} WHERE id = $1"), &[&row.id])
+            .expect("query")
+            .get(0);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_node_seq_index_created() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_seq_index";
+        let _store = fresh_store(&dsn, table);
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let r = c
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+                &[&table, &format!("idx_{table}_node_seq")],
+            )
+            .expect("index exists");
+        let def: &str = r.get(0);
+        assert!(def.contains("(source_node_id, monotonic_seq)"), "{def}");
+        assert!(!def.contains("UNIQUE"), "{def}");
+    }
+
+    #[test]
+    fn test_index_name_fits_identifier_limit() {
+        assert_eq!(index_name("audit_logs", "node_seq"), "idx_audit_logs_node_seq");
+        let long = "a".repeat(63);
+        let names: std::collections::HashSet<String> = ["req", "code", "ts", "svc", "node_seq"]
+            .iter()
+            .map(|s| index_name(&long, s))
+            .collect();
+        assert_eq!(names.len(), 5);
+        for n in &names {
+            assert!(n.len() <= 63, "{n}");
+        }
+        let other = format!("{}b", "a".repeat(62));
+        assert_ne!(index_name(&long, "node_seq"), index_name(&other, "node_seq"));
+    }
+
+    #[test]
+    fn test_node_seq_index_created_for_long_table_name() {
+        let Some(dsn) = dsn() else { return };
+        let table = format!("fasten_pg_long_{}", "x".repeat(45));
+        assert_eq!(table.len(), 60);
+        let _store = fresh_store(&dsn, &table);
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let defs: Vec<String> = c
+            .query("SELECT indexdef FROM pg_indexes WHERE tablename = $1", &[&table])
+            .expect("indexes")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert!(
+            defs.iter().any(|d| d.contains("(source_node_id, monotonic_seq)")),
+            "{defs:?}"
+        );
+        // Five indexes plus the primary key.
+        assert_eq!(defs.len(), 6, "{defs:?}");
+    }
+
+    #[test]
+    fn test_redact_expired() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_redact_test";
+        let store = std::sync::Arc::new(fresh_store(&dsn, table));
+
+        crate::register(
+            "pg_redact".into(),
+            [
+                (
+                    "PG_REDACT_PII".to_string(),
+                    crate::Meta {
+                        domain: "pg_redact".into(),
+                        severity: crate::Severity::Info,
+                        pii_in_detail: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "PG_REDACT_PLAIN".to_string(),
+                    crate::Meta {
+                        domain: "pg_redact".into(),
+                        severity: crate::Severity::Info,
+                        retention_class: crate::RetentionClass::Long,
+                        ..Default::default()
+                    },
+                ),
+            ],
+        )
+        .expect("register");
+
+        let node = uniq("node");
+        let old = chrono::Utc::now() - chrono::Duration::days(40);
+        let mut pii = make_row(&uniq("evt"), "PG_REDACT_PII");
+        let mut plain = make_row(&uniq("evt"), "PG_REDACT_PLAIN");
+        for r in [&mut pii, &mut plain] {
+            r.monotonic_seq = 0;
+            r.source_node_id = node.clone();
+            r.timestamp = old;
+            crate::AuditStore::insert(&*store, r).expect("insert");
+        }
+        // A sealed form-"1" row: its detail is in the hash, so it stays.
+        let sealed_id = uniq("evt");
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, origin_id, monotonic_seq, timestamp, code,                      source_node_id, detail, prev_hash, hash, canonical_form_id)                      VALUES ($1, $1, 99, '2020-01-01T00:00:00.000000Z', 'PG_REDACT_PII',                      'other-node', '{{\"email\":\"a@b.c\"}}', 'genesis', 'abc123', '1')"
+                ),
+                &[&sealed_id],
+            )
+            .expect("insert sealed");
+
+        let engine = crate::Engine::new();
+        engine
+            .init(crate::Config {
+                service_id: "svc-redact".into(),
+                node_id: node.clone(),
+                audit_store: Some(store.clone()),
+                audit_store_failure_strategy: Some("raise".into()),
+                ..Default::default()
+            })
+            .expect("init");
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let redacted = engine.redact_expired(cutoff, "pii-30d").expect("redact_expired");
+        assert_eq!(redacted, vec![pii.id.clone()]);
+
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let detail_of = |c: &mut pg::Client, id: &str| -> String {
+            c.query_one(&format!("SELECT detail FROM {table} WHERE id = $1"), &[&id])
+                .expect("query")
+                .get(0)
+        };
+        assert_eq!(detail_of(&mut c, &pii.id), "null");
+        assert_eq!(detail_of(&mut c, &plain.id), r#"{"key":"value"}"#);
+        assert_eq!(detail_of(&mut c, &sealed_id), r#"{"email":"a@b.c"}"#);
+
+        let events = c
+            .query(
+                &format!(
+                    "SELECT target, detail, monotonic_seq FROM {table} WHERE code = $1"
+                ),
+                &[&crate::AUDIT_ROW_REDACTED],
+            )
+            .expect("query events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].get::<_, &str>(0), pii.id);
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].get::<_, &str>(1)).expect("detail json");
+        assert_eq!(detail["redacted_id"], serde_json::json!(pii.id));
+        assert_eq!(detail["redacted_seq"], serde_json::json!(1));
+        assert_eq!(detail["reason"], serde_json::json!("pii-30d"));
+        assert_eq!(events[0].get::<_, i64>(2), 3);
+
+        // Nothing left to do on a second pass.
+        assert!(engine.redact_expired(cutoff, "pii-30d").expect("again").is_empty());
+        engine.reset_for_tests();
+    }
+
+    // A sealed form-"1" PII row past the cutoff is left alone and reported.
+    #[test]
+    fn test_redact_reports_sealed_form1() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_redact_form1";
+        let store = std::sync::Arc::new(fresh_store(&dsn, table));
+        crate::register(
+            "pg_form1".into(),
+            [(
+                "PG_FORM1_PII".to_string(),
+                crate::Meta {
+                    domain: "pg_form1".into(),
+                    severity: crate::Severity::Info,
+                    pii_in_detail: true,
+                    ..Default::default()
+                },
+            )],
+        )
+        .expect("register");
+        let sealed_id = uniq("evt");
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, origin_id, monotonic_seq, timestamp, code, \
+                     source_node_id, detail, prev_hash, hash, canonical_form_id) \
+                     VALUES ($1, $1, 1, '2020-01-01T00:00:00.000000Z', 'PG_FORM1_PII', \
+                     'node-f1', '{{\"email\":\"a@b.c\"}}', 'genesis', 'abc123', '1')"
+                ),
+                &[&sealed_id],
+            )
+            .expect("insert sealed");
+
+        let engine = crate::Engine::new();
+        engine
+            .init(crate::Config {
+                service_id: "svc-redact-form1".into(),
+                node_id: "node-f1".into(),
+                audit_store: Some(store.clone()),
+                audit_store_failure_strategy: Some("raise".into()),
+                ..Default::default()
+            })
+            .expect("init");
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let redacted = engine.redact_expired(cutoff, "pii-30d").expect("redact_expired");
+        assert!(redacted.is_empty());
+
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        let detail: String = c
+            .query_one(&format!("SELECT detail FROM {table} WHERE id = $1"), &[&sealed_id])
+            .expect("query")
+            .get(0);
+        assert_eq!(detail, r#"{"email":"a@b.c"}"#);
+
+        let lines: Vec<serde_json::Value> = crate::engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| {
+                v["service_id"] == "svc-redact-form1"
+                    && v["event"] == "pii_redaction_skipped_legacy_form"
+            })
+            .cloned()
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["level"], "warn");
+        assert_eq!(lines[0]["rows"], 1);
+        engine.reset_for_tests();
     }
 
     #[test]

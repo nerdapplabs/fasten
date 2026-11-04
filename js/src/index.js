@@ -197,9 +197,9 @@ export function _clearCoreRegistry() {
 // --- Engine ---------------------------------------------------------------
 
 import {
+	_setDefaultEngine,
 	AuditQueueDrainer,
 	AuditStoreError,
-	_setDefaultEngine,
 } from "./audit_queue.js";
 
 export { AuditStoreError };
@@ -285,16 +285,6 @@ export class Engine {
 		if (!meta) throw new Error(`unknown audit code: ${code}`);
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-		const extraKeys = cfg.extraRedactKeys;
-		const redactRepl = cfg.redactReplacement; // null means "***"
-		const redact = (obj) => {
-			const json = JSON.stringify(obj);
-			return JSON.parse(
-				extraKeys.length || redactRepl
-					? coreRedactFull(json, JSON.stringify(extraKeys), redactRepl)
-					: coreRedact(json),
-			);
-		};
 		let outDetail;
 		if (meta.piiInDetail) {
 			const passthrough = new Set(meta.detailPassthroughKeys ?? []);
@@ -305,10 +295,10 @@ export class Engine {
 			outDetail = {
 				_redacted: REDACT_REPLACEMENT,
 				_pii_in_detail: true,
-				...redact(kept),
+				...this._redact(kept),
 			};
 		} else {
-			outDetail = redact(detail);
+			outDetail = this._redact(detail);
 		}
 
 		const row = {
@@ -400,6 +390,16 @@ export class Engine {
 		if (old) old.stop();
 	}
 
+	_redact(obj) {
+		const { extraRedactKeys: extra, redactReplacement: repl } = this.#config;
+		const json = JSON.stringify(obj);
+		return JSON.parse(
+			extra.length || repl
+				? coreRedactFull(json, JSON.stringify(extra), repl)
+				: coreRedact(json),
+		);
+	}
+
 	_sysLine(stream, level, event, fields = {}) {
 		const line = {
 			shape: "sys",
@@ -408,9 +408,11 @@ export class Engine {
 			request_id: currentRequestID(),
 			service_id: this.#config.serviceId || undefined,
 			timestamp: new Date().toISOString(),
-			...fields,
+			// Fields that aren't JSON (none, or a function) log as {}.
+			...(JSON.stringify(fields) === undefined ? {} : fields),
 		};
-		stream.write(`${JSON.stringify(line)}\n`);
+		// The whole line, as Go and Python do: a secret can be in the event.
+		stream.write(`${JSON.stringify(this._redact(line))}\n`);
 	}
 
 	_drainerSysLog(level, event, fields) {

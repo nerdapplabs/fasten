@@ -20,6 +20,7 @@ from .context import (
 from .emitter import (
     audit_store,
     background,
+    close,
     emit,
     flush,
     go,
@@ -73,6 +74,7 @@ __all__ = [
     "seal",
     # audit-store failure handling
     "AuditStoreError",
+    "close",
     "flush",
     "queue_stats",
     # context

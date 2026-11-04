@@ -111,13 +111,24 @@ void fasten_store_close(FastenStore* store);
  *
  * A row whose `id` already exists is ignored, so inserts are idempotent.
  *
+ * monotonic_seq 0 means "allocate": the store assigns the next seq for the
+ * row's source_node_id inside the insert transaction (spec §2.1, §8.2). The
+ * row is stored unsealed: any chain fields it carries are dropped (stored as
+ * prev_hash "", hash "", canonical_form_id "1", no salt or commitment). A
+ * non-zero monotonic_seq is written as given, chain fields included; on a
+ * table created by this library a (source_node_id, monotonic_seq) clash is
+ * an error.
+ *
  * @param store    Non-null handle returned by fasten_store_open().
  * @param row_json UTF-8 JSON object matching the fasten wire schema.
  *                 Required fields: id, wire_version, origin_id,
  *                 monotonic_seq, timestamp, code, action, severity,
  *                 service_id, source_node_id, actor, actor_kind, target,
  *                 category, domain, method, request_id, detail.
- *                 Optional: tenant_id, pii_in_detail, shipped_at.
+ *                 Optional: tenant_id, pii_in_detail, shipped_at, and the
+ *                 chain fields prev_hash, hash, canonical_form_id,
+ *                 detail_salt, detail_commitment, stored as given when
+ *                 monotonic_seq is non-zero.
  * @param out_err  Set on error; may be NULL.
  *
  * @return  FASTEN_OK on success, error code otherwise (out_err set).
@@ -249,6 +260,7 @@ FastenErrorCode fasten_store_purge(
 
 /**
  * Return the maximum monotonic_seq across all stored rows, or 0 if empty.
+ * Table-wide, not per node; do not use it to allocate a seq.
  *
  * @param store   Non-null handle.
  * @param out_seq Set to the maximum sequence number on success; must be
@@ -260,6 +272,55 @@ FastenErrorCode fasten_store_purge(
 FastenErrorCode fasten_store_max_monotonic_seq(
     FastenStore* store,
     uint64_t*    out_seq,
+    char**       out_err
+);
+
+/* PII retention (spec §7.1) */
+
+/**
+ * List rows a PII retention horizon would redact: timestamp < before, code
+ * in codes, detail not already redacted. Sealed rows (a non-empty hash) are
+ * never listed.
+ *
+ * @param store          Non-null handle.
+ * @param before_iso8601 ISO-8601 UTC cutoff; rows strictly older qualify.
+ * @param codes_json     UTF-8 JSON array of codes: ["USER_LOGIN",...].
+ * @param out_json       On success: heap-allocated JSON array of
+ *                       {"id": "...", "monotonic_seq": n}, ordered by
+ *                       monotonic_seq. Free with fasten_store_free_str().
+ * @param out_skipped    On success: number of matching sealed rows left out
+ *                       of out_json. May be NULL.
+ * @param out_err        Set on error; may be NULL.
+ *
+ * @return  FASTEN_OK on success, error code otherwise (out_err set).
+ *          A callback store (fasten_store_from_callback) returns
+ *          FASTEN_ERR_BACKEND.
+ */
+FastenErrorCode fasten_store_list_redaction_candidates(
+    FastenStore* store,
+    const char*  before_iso8601,
+    const char*  codes_json,
+    char**       out_json,
+    uint64_t*    out_skipped,
+    char**       out_err
+);
+
+/**
+ * Redact rows by id: set detail to the JSON literal null. The row itself is
+ * kept. Idempotent; sealed rows are left alone.
+ *
+ * @param store        Non-null handle.
+ * @param ids_json     UTF-8 JSON array of ids: ["id1","id2",...].
+ * @param out_ids_json On success: the ids passed in, as a heap-allocated JSON
+ *                     array. Free with fasten_store_free_str(). May be NULL.
+ * @param out_err      Set on error; may be NULL.
+ *
+ * @return  FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_store_redact_rows(
+    FastenStore* store,
+    const char*  ids_json,
+    char**       out_ids_json,
     char**       out_err
 );
 
@@ -478,11 +539,18 @@ int32_t fasten_meta_of_buf(
 /* SDK-store callback bridge */
 
 /**
- * Callback invoked by the drainer for each row insert.
+ * Callback invoked by the drainer for each row insert, on the drain thread.
  * `row_json` is valid only for the duration of the call.
- * Return 0 = success; any other value = error (drainer will retry).
+ * Return 0 = success; FASTEN_INSERT_REJECTED (or any negative value) = the
+ * store rejected this row, so it is dead-lettered without retry; any
+ * positive value = error, retried up to max_attempts.
+ * It must not call fasten_drainer_enqueue, flush, close or install on the
+ * same handle: they wait on the row this call is still writing.
  */
 typedef int32_t (*FastenInsertCallbackFn)(const char* row_json, void* userdata);
+
+/** Insert callback result: the row itself was rejected; do not retry it. */
+#define FASTEN_INSERT_REJECTED (-1)
 
 /**
  * Create a store handle backed by a C insert callback.
@@ -506,8 +574,10 @@ FastenStore* fasten_store_from_callback(
  * Attach a background-drain queue to an existing store handle.
  *
  * Must be called before fasten_drainer_enqueue. The drainer shares the
- * store already held by `store`. Re-calling replaces any existing drainer
- * (previous pending rows are flushed with a 2-second timeout first).
+ * store already held by `store`. Re-calling replaces any existing drainer:
+ * the new one takes rows at once, and the old one is flushed (up to 5 s)
+ * and then stopped. Rows it could not write are reported in an
+ * `audit_drain_install_incomplete` sys event.
  *
  * @param store            Non-null handle returned by fasten_store_open().
  * @param capacity         Max queued + in-flight slots (0 = default 100).
@@ -530,10 +600,43 @@ FastenErrorCode fasten_drainer_install(
 );
 
 /**
+ * Receives one drainer sys event as a NUL-terminated JSON object with
+ * `shape`, `level`, `event`, `timestamp` and the event's fields. The string
+ * is valid only during the call.
+ */
+typedef void (*FastenSysLogFn)(const char* event_json, void* userdata);
+
+/**
+ * fasten_drainer_install, with the drainer's sys events (audit_drain_*,
+ * audit_queue_*) sent to `sys_log` instead of stderr. NULL = stderr.
+ *
+ * `sys_log` is called with no drainer lock held, from the drain thread or
+ * from a thread calling enqueue, install or close on this handle. It must
+ * not call fasten_drainer_enqueue, flush, close or install on the same
+ * handle. It
+ * and `userdata` must stay valid until fasten_drainer_close (or an install
+ * that replaces this drainer) returns; close waits for enqueue calls still
+ * running, so none calls `sys_log` after that.
+ */
+FastenErrorCode fasten_drainer_install_with_sys_log(
+    FastenStore*   store,
+    uint64_t       capacity,
+    uint64_t       retry_initial_ms,
+    uint64_t       retry_max_ms,
+    int            retry_jitter,
+    uint32_t       max_attempts,
+    FastenSysLogFn sys_log,
+    void*          userdata,
+    char**         out_err
+);
+
+/**
  * Enqueue a row JSON for asynchronous insertion.
  *
  * Blocks under back-pressure (queue full + store slow). Returns
- * FASTEN_ERR_NULL_ARG when no drainer is installed.
+ * FASTEN_ERR_NULL_ARG when no drainer is installed, and
+ * FASTEN_ERR_DRAINER_STOPPED when the drainer is stopping and the row was
+ * not queued; in both cases the caller should store the row itself.
  *
  * @param store    Non-null handle.
  * @param row_json UTF-8 JSON object matching the fasten wire schema.
@@ -583,9 +686,10 @@ FastenErrorCode fasten_drainer_stats_json(
 );
 
 /**
- * Shut down the drainer: signal the background thread to stop and
- * perform a best-effort drain (2-second timeout). Safe to call with NULL
- * or when no drainer is installed.
+ * Shut down the drainer. Each queued row gets one more attempt; then close
+ * waits for the drain thread, including a store callback in progress, and
+ * for a drainer an install on another thread is still retiring.
+ * Safe to call with NULL or when no drainer is installed.
  */
 void fasten_drainer_close(FastenStore* store);
 
@@ -596,6 +700,7 @@ void fasten_drainer_close(FastenStore* store);
 #define FASTEN_ERR_ID_MISMATCH     7  /**< Meta.id disagrees with dict key.         */
 #define FASTEN_ERR_DOMAIN_MISMATCH 8  /**< Meta.domain disagrees with domain arg.   */
 #define FASTEN_ERR_DUPLICATE_CODE  9  /**< Code already registered.                 */
+#define FASTEN_ERR_DRAINER_STOPPED 10 /**< Drainer stopping; row was not queued.    */
 
 #ifdef __cplusplus
 }
