@@ -267,9 +267,9 @@ const RETENTION_CHECK_MS = 3_600_000;
 // --- Engine ---------------------------------------------------------------
 
 import {
+	_setDefaultEngine,
 	AuditQueueDrainer,
 	AuditStoreError,
-	_setDefaultEngine,
 } from "./audit_queue.js";
 
 export { AuditStoreError };
