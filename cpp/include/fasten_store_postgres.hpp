@@ -16,9 +16,13 @@
 #define FASTEN_STORE_POSTGRES_HPP
 
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <libpq-fe.h>
 
@@ -68,9 +72,127 @@ public:
     PostgresStore& operator=(const PostgresStore&) = delete;
 
     /// Insert one audit row. Thread-safe.
+    ///
+    /// A row with monotonic_seq 0 (what emit() returns) gets the node's next
+    /// seq in the insert's transaction, under the same per-node advisory lock
+    /// as the Python, Go and JS stores (spec §2.1). The row is not sealed.
     void insert(const Row& row) {
-        std::string detail_json = detail_::fields_to_json(row.detail);
-        std::string mono_str    = std::to_string(row.monotonic_seq);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (row.monotonic_seq != 0) {
+            insert_row(row, row.monotonic_seq);
+            return;
+        }
+        exec("BEGIN");
+        try {
+            const char* node[1] = {row.source_node_id.c_str()};
+            query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", 1, node);
+            std::string seq = query(
+                "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM " + table_ +
+                " WHERE source_node_id = $1", 1, node);
+            insert_row(row, std::stoll(seq));
+            exec("COMMIT");
+        } catch (...) {
+            PQclear(PQexec(conn_, "ROLLBACK"));
+            throw;
+        }
+    }
+
+    /// (id, monotonic_seq) of rows with a code in `codes`, older than
+    /// `before`, that redact_rows() would redact (spec §7.1). A sealed row
+    /// under form "1" is never one: its detail is in the hash. Their number
+    /// goes to `skipped`.
+    std::vector<std::pair<std::string, int64_t>> list_redaction_candidates(
+        std::chrono::system_clock::time_point before,
+        const std::vector<std::string>& codes,
+        int64_t* skipped = nullptr)
+    {
+        std::vector<std::pair<std::string, int64_t>> out;
+        if (skipped) *skipped = 0;
+        if (codes.empty()) return out;
+        const std::string cutoff = detail_::iso8601(before);
+        std::vector<const char*> params{cutoff.c_str()};
+        for (const auto& c : codes) params.push_back(c.c_str());
+        const std::string where =
+            " FROM " + table_ + " WHERE timestamp < $1 AND code IN (" +
+            placeholders(2, codes.size()) + ") AND detail <> 'null' AND ";
+
+        std::lock_guard<std::mutex> lk(mu_);
+        if (skipped) {
+            *skipped = std::stoll(query("SELECT COUNT(*)" + where + "NOT " + redactable(),
+                                        static_cast<int>(params.size()), params.data()));
+        }
+        Result res(conn_, "SELECT id, monotonic_seq" + where + redactable() +
+                          " ORDER BY monotonic_seq",
+                   static_cast<int>(params.size()), params.data());
+        for (int i = 0; i < PQntuples(res.r); ++i)
+            out.emplace_back(PQgetvalue(res.r, i, 0), std::stoll(PQgetvalue(res.r, i, 1)));
+        return out;
+    }
+
+    /// Sets detail to the JSON literal null and clears detail_salt on these
+    /// ids (spec §7.1). Hash, prev_hash and seq are kept. A sealed form-"1"
+    /// row is left alone. Safe to repeat; returns `ids`.
+    std::vector<std::string> redact_rows(const std::vector<std::string>& ids) {
+        if (ids.empty()) return ids;
+        std::vector<const char*> params;
+        for (const auto& id : ids) params.push_back(id.c_str());
+        std::lock_guard<std::mutex> lk(mu_);
+        query("UPDATE " + table_ + " SET detail = 'null', detail_salt = ''"
+              " WHERE id IN (" + placeholders(1, ids.size()) + ") AND " + redactable(),
+              static_cast<int>(params.size()), params.data());
+        return ids;
+    }
+
+private:
+    // Unsealed, or sealed under form "2" where the hash covers the detail
+    // commitment and not the detail.
+    static const char* redactable() {
+        return "(hash = '' OR canonical_form_id = '2')";
+    }
+
+    static std::string placeholders(size_t first, size_t n) {
+        std::string out;
+        for (size_t i = 0; i < n; ++i)
+            out += (i ? ",$" : "$") + std::to_string(first + i);
+        return out;
+    }
+
+    struct Result {
+        PGresult* r;
+        Result(PGconn* c, const std::string& sql, int n, const char* const* params)
+            : r(PQexecParams(c, sql.c_str(), n, nullptr, params, nullptr, nullptr, 0)) {
+            if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+                std::string msg = PQerrorMessage(c);
+                PQclear(r);
+                throw std::runtime_error("fasten PostgresStore: " + msg);
+            }
+        }
+        ~Result() { PQclear(r); }
+        Result(const Result&)            = delete;
+        Result& operator=(const Result&) = delete;
+    };
+
+    void exec(const char* sql) { query(sql, 0, nullptr); }
+
+    // Runs sql and returns the first column of the first row, or "".
+    std::string query(const std::string& sql, int n, const char* const* params) {
+        PGresult* res = PQexecParams(conn_, sql.c_str(), n, nullptr, params,
+                                     nullptr, nullptr, 0);
+        ExecStatusType status = PQresultStatus(res);
+        if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            std::string msg = PQerrorMessage(conn_);
+            PQclear(res);
+            throw std::runtime_error("fasten PostgresStore: " + msg);
+        }
+        std::string out = (status == PGRES_TUPLES_OK && PQntuples(res) > 0)
+            ? PQgetvalue(res, 0, 0) : "";
+        PQclear(res);
+        return out;
+    }
+
+    void insert_row(const Row& row, int64_t seq) {
+        std::string detail_json = detail_::fields_to_json(row.detail, row.code);
+        std::string mono_str    = std::to_string(seq);
         const char* pii_str     = row.pii_in_detail ? "1" : "0";
 
         // nullptr is sent as SQL NULL.
@@ -105,12 +227,12 @@ public:
             " (id, origin_id, monotonic_seq, timestamp,"
             "  code, action, severity, service_id, source_node_id, tenant_id,"
             "  actor, actor_kind, target, category, domain, method,"
-            "  request_id, detail, pii_in_detail, shipped_at)"
+            "  request_id, detail, pii_in_detail, shipped_at,"
+            "  prev_hash, hash, canonical_form_id, detail_salt, detail_commitment)"
             " VALUES"
-            " ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"
+            " ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,"
+            "  '','','1','','')"
             " ON CONFLICT (id) DO NOTHING";
-
-        std::lock_guard<std::mutex> lk(mu_);
 
         PGresult* res = PQexecParams(
             conn_,
@@ -132,6 +254,7 @@ public:
         PQclear(res);
     }
 
+public:
     /// Returns an AuditSink that calls insert(). The PostgresStore must
     /// outlive the returned sink.
     AuditSink sink() {
@@ -176,7 +299,22 @@ private:
         PQclear(res);
     }
 
+    // Concurrent openers serialise on the Python store's bootstrap lock:
+    // CREATE ... IF NOT EXISTS does not stop two sessions racing on the
+    // catalog. table_ is a validated identifier, so it is safe in the literal.
     void migrate() {
+        const std::string key = "hashtextextended('fasten.bootstrap." + table_ + "', 0)";
+        pg_exec("SELECT pg_advisory_lock(" + key + ")");
+        try {
+            migrate_locked();
+        } catch (...) {
+            PQclear(PQexec(conn_, ("SELECT pg_advisory_unlock(" + key + ")").c_str()));
+            throw;
+        }
+        pg_exec("SELECT pg_advisory_unlock(" + key + ")");
+    }
+
+    void migrate_locked() {
         if (!schema_.empty())
             pg_exec("CREATE SCHEMA IF NOT EXISTS " + schema_);
 
@@ -202,14 +340,36 @@ private:
             "  detail          TEXT        NOT NULL DEFAULT '{}',"
             "  pii_in_detail   SMALLINT    NOT NULL DEFAULT 0,"
             "  shipped_at      TEXT,"
+            "  prev_hash       TEXT        NOT NULL DEFAULT '',"
+            "  hash            TEXT        NOT NULL DEFAULT '',"
+            "  canonical_form_id TEXT      NOT NULL DEFAULT '1',"
+            "  detail_salt     TEXT        NOT NULL DEFAULT '',"
+            "  detail_commitment TEXT      NOT NULL DEFAULT '',"
             "  PRIMARY KEY (id)"
             ")"
         );
+
+        // Columns a table created before them (or by the Python store, which
+        // has no pii_in_detail) lacks, with the Go store's definitions so the
+        // table can be shared.
+        for (const char* col : {
+                 "pii_in_detail SMALLINT NOT NULL DEFAULT 0",
+                 "prev_hash TEXT NOT NULL DEFAULT ''",
+                 "hash TEXT NOT NULL DEFAULT ''",
+                 "canonical_form_id TEXT NOT NULL DEFAULT '1'",
+                 "detail_salt TEXT NOT NULL DEFAULT ''",
+                 "detail_commitment TEXT NOT NULL DEFAULT ''"}) {
+            pg_exec("ALTER TABLE " + table_ + " ADD COLUMN IF NOT EXISTS " + col);
+        }
 
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_req  ON " + table_ + " (request_id)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_code ON " + table_ + " (code)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_ts   ON " + table_ + " (timestamp)");
         pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_svc  ON " + table_ + " (service_id)");
+        // For the seq allocation in insert(). Not unique: rows from the old
+        // per-process counter repeat seqs.
+        pg_exec("CREATE INDEX IF NOT EXISTS idx_" + bare_ + "_node_seq ON " + table_ +
+                " (source_node_id, monotonic_seq)");
     }
 
     PGconn*     conn_   = nullptr;

@@ -136,6 +136,8 @@ struct Method {
 constexpr const char* kRedactReplacement = "***";
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 
+constexpr const char* kAuditRowRedacted = "AUDIT_ROW_REDACTED";
+
 using Fields = std::unordered_map<std::string, std::string>;
 
 struct Meta {
@@ -231,46 +233,61 @@ inline std::string json_str(const std::string& s) {
 }
 
 // Fields as a JSON object with sorted keys. Fields holds only strings, but
-// `_pii_in_detail` is a boolean on the wire, so it is written as one.
-inline std::string fields_to_json(const Fields& f) {
+// two keys other SDKs write as JSON scalars are written the same way:
+// `_pii_in_detail` (a boolean) and, in the detail of an AUDIT_ROW_REDACTED
+// row (`code`), `redacted_seq` (a number, spec §7.2) when it is a canonical
+// JSON integer (no leading zero, fits int64). Anything else stays a string,
+// so the line is always valid JSON, and the redactor's value-shape checks,
+// which only look at strings, see every other value.
+inline std::string field_json_value_(const std::string& key, const std::string& val,
+                                     const std::string& code = "") {
+    if (key == "_pii_in_detail") return val == "true" ? "true" : "false";
+    if (key == "redacted_seq" && code == kAuditRowRedacted &&
+        !val.empty() && val.size() <= 18 &&
+        (val == "0" || val[0] != '0') &&
+        std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return val;
+    }
+    return json_str(val);
+}
+
+inline std::string fields_to_json(const Fields& f, const std::string& code = "") {
     std::vector<std::pair<std::string, std::string>> pairs(f.begin(), f.end());
     std::sort(pairs.begin(), pairs.end());
     std::string out = "{";
     bool first = true;
     for (auto& kv : pairs) {
         if (!first) out += ',';
-        out += json_str(kv.first) + ':';
-        if (kv.first == "_pii_in_detail") {
-            out += (kv.second == "true" ? "true" : "false");
-        } else {
-            out += json_str(kv.second);
-        }
+        out += json_str(kv.first) + ':' + field_json_value_(kv.first, kv.second, code);
         first = false;
     }
     out += '}';
     return out;
 }
 
-// UTC ISO-8601 with milliseconds.
-inline std::string now_iso8601() {
+// Canonical UTC timestamp (spec §4.3): six fractional digits and Z, e.g.
+// 2026-08-21T10:00:00.500000Z. Thread-safe (gmtime_r / gmtime_s).
+inline std::string iso8601(std::chrono::system_clock::time_point tp) {
     using namespace std::chrono;
-    auto now = system_clock::now();
-    auto ms  = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-    auto t   = system_clock::to_time_t(now);
+    auto us  = duration_cast<microseconds>(tp.time_since_epoch()) % 1000000;
+    if (us.count() < 0) us += seconds(1);
+    auto t   = system_clock::to_time_t(time_point_cast<seconds>(tp - us));
     struct tm tmb {};
 #ifdef _WIN32
     gmtime_s(&tmb, &t);
 #else
     gmtime_r(&t, &tmb);
 #endif
-    char buf[32];
+    char buf[64];
     std::snprintf(buf, sizeof(buf),
-        "%04d-%02d-%02dT%02d:%02d:%02d.%03lldZ",
+        "%04d-%02d-%02dT%02d:%02d:%02d.%06lldZ",
         tmb.tm_year + 1900, tmb.tm_mon + 1, tmb.tm_mday,
         tmb.tm_hour, tmb.tm_min, tmb.tm_sec,
-        static_cast<long long>(ms.count()));
+        static_cast<long long>(us.count()));
     return buf;
 }
+
+inline std::string now_iso8601() { return iso8601(std::chrono::system_clock::now()); }
 
 // `bytes` random bytes as lowercase hex.
 inline std::string mint_id_bytes(size_t bytes) {
@@ -297,21 +314,67 @@ struct RedactConfig {
 // Minimal JSON readers for the flat objects libfasten_core returns. They
 // look keys up by text search and are not general JSON parsers.
 
-// Read a string body starting just after its opening quote, unescaping
-// \" \\ \n \r \t. Leaves `i` on the closing quote.
+// Appends the character a JSON escape stands for. pos is on the character
+// after the backslash and is left on the escape's last character. A "u"
+// escape with four hex digits, or a surrogate pair of them, is written as UTF-8.
+inline void json_unescape_(const std::string& j, size_t& pos, std::string& out) {
+    auto hex4 = [&j](size_t at, unsigned& cp) {
+        if (at + 4 > j.size()) return false;
+        cp = 0;
+        for (size_t k = at; k < at + 4; ++k) {
+            char c = j[k];
+            cp <<= 4;
+            if      (c >= '0' && c <= '9') cp |= static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f') cp |= static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') cp |= static_cast<unsigned>(c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+    switch (j[pos]) {
+        case 'n': out += '\n'; return;
+        case 'r': out += '\r'; return;
+        case 't': out += '\t'; return;
+        case 'b': out += '\b'; return;
+        case 'f': out += '\f'; return;
+        case 'u': break;
+        default:  out += j[pos]; return;  // " \\ / and anything else
+    }
+    unsigned cp = 0;
+    if (!hex4(pos + 1, cp)) { out += 'u'; return; }
+    pos += 4;
+    unsigned lo = 0;
+    if (cp >= 0xD800 && cp < 0xDC00 && pos + 6 < j.size() &&
+        j[pos + 1] == '\\' && j[pos + 2] == 'u' && hex4(pos + 3, lo) &&
+        lo >= 0xDC00 && lo < 0xE000) {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        pos += 6;
+    }
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+// Read a string body starting just after its opening quote, unescaping it
+// with json_unescape_. Leaves `i` on the closing quote.
 inline std::string read_json_str(const std::string& j, size_t& i) {
     std::string val;
     while (i < j.size() && j[i] != '"') {
         if (j[i] == '\\' && i + 1 < j.size()) {
             ++i;
-            switch (j[i]) {
-                case '"':  val += '"';  break;
-                case '\\': val += '\\'; break;
-                case 'n':  val += '\n'; break;
-                case 'r':  val += '\r'; break;
-                case 't':  val += '\t'; break;
-                default:   val += j[i]; break;
-            }
+            json_unescape_(j, i, val);
         } else { val += j[i]; }
         ++i;
     }
@@ -354,6 +417,10 @@ inline Fields parse_flat_json_fields(const std::string& json) {
             val = "true"; i += 4;
         } else if (i + 5 <= json.size() && json.substr(i, 5) == "false") {
             val = "false"; i += 5;
+        } else if (i < json.size() && (json[i] == '-' || (json[i] >= '0' && json[i] <= '9'))) {
+            // A number keeps its text, so redacted_seq survives a redact pass.
+            while (i < json.size() && json[i] != ',' && json[i] != '}' &&
+                   json[i] != ' ' && json[i] != '\n') val += json[i++];
         } else {
             while (i < json.size() && json[i] != ',' && json[i] != '}') ++i;
             continue;
@@ -660,8 +727,20 @@ struct SinkRef {
     std::function<void(const Row&)> sink;
 };
 
+inline void drainer_sys_log(const std::string& level,
+                            const std::string& event,
+                            const std::vector<std::pair<std::string, std::string>>& fields);
+
 // Queue mode: rows go to the libfasten_core drainer, whose background
 // thread calls the sink with retry and backoff.
+//
+// Every call that uses store_ is counted in busy_ (see Use). shutdown() first
+// closes the core drainer, which wakes a put() blocked on a full queue and
+// drains with one attempt per row, then waits for busy_ to reach 0 before it
+// frees store_. A put() that starts after stopped_ is set, including one made
+// by the sink while the drain finishes, never touches store_. Closing while a
+// call is still inside the core needs a core where calls in progress keep
+// their drainer (fasten-core #161).
 class CFastenDrainer {
   public:
     CFastenDrainer(std::function<void(const Row&)> sink,
@@ -705,20 +784,35 @@ class CFastenDrainer {
     CFastenDrainer(const CFastenDrainer&)            = delete;
     CFastenDrainer& operator=(const CFastenDrainer&) = delete;
 
-    void put(const Row& row) {
-        if (stopped_.load()) return;
+    // Returns false if the row was not queued, so the caller can store it
+    // itself (spec §10). Each refusal is reported once: the core reports the
+    // rows it refuses at stop, and this reports the rest.
+    bool put(const Row& row) {
+        Use use(*this);
+        if (!use.ok) {
+            drainer_sys_log("error", "audit_drain_abandoned",
+                {{"reason", "drainer_stopped"}, {"row_id", row.id}});
+            return false;
+        }
         std::string json = row.to_json();
         char* err = nullptr;
-        fasten_drainer_enqueue(store_, json.c_str(), &err);
+        int32_t rc = fasten_drainer_enqueue(store_, json.c_str(), &err);
+        if (rc != 0 && rc != kErrDrainerStopped) {
+            drainer_sys_log("error", "audit_drain_abandoned",
+                {{"reason", err ? err : "enqueue failed"}, {"row_id", row.id}});
+        }
         if (err) fasten_store_free_str(err);
+        return rc == 0;
     }
 
     QueueStats stats() const {
+        Use use(*this);
+        QueueStats s;
+        if (!use.ok) return s;
         char* out_json = nullptr;
         char* err      = nullptr;
         fasten_drainer_stats_json(store_, &out_json, &err);
         if (err) fasten_store_free_str(err);
-        QueueStats s;
         if (out_json) {
             std::string j(out_json);
             fasten_store_free_str(out_json);
@@ -737,6 +831,8 @@ class CFastenDrainer {
     }
 
     bool flush(std::chrono::milliseconds timeout) {
+        Use use(*this);
+        if (!use.ok) return true;
         int drained = 0;
         fasten_drainer_flush(store_,
             static_cast<uint64_t>(timeout.count()), &drained, nullptr);
@@ -746,11 +842,19 @@ class CFastenDrainer {
     void shutdown(std::chrono::milliseconds /*timeout*/) {
         if (stopped_.exchange(true)) return;
         fasten_drainer_close(store_);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            idle_.wait(lk, [this] { return busy_.load() == 0; });
+        }
         delete sink_ref_; sink_ref_ = nullptr;
         fasten_store_close(store_); store_ = nullptr;
     }
 
   private:
+    // fasten_drainer_enqueue's FASTEN_ERR_DRAINER_STOPPED: the drainer is
+    // stopping, the row was not queued, and the core has reported it.
+    static constexpr int32_t kErrDrainerStopped = 10;
+
     static int32_t bridge_(const char* row_json, void* userdata) {
         auto* ref = static_cast<SinkRef*>(userdata);
         if (!ref || !row_json) return 1;
@@ -763,6 +867,25 @@ class CFastenDrainer {
     struct FastenStore*  store_    = nullptr;
     SinkRef*             sink_ref_ = nullptr;
     std::atomic<bool>    stopped_{false};
+
+    // Counts a call in busy_ for its lifetime; ok is false once stopped_ is
+    // set. Incrementing before reading stopped_ (both seq_cst) means
+    // shutdown() either sees this call in busy_ or this call sees stopped_.
+    struct Use {
+        const CFastenDrainer& d;
+        bool ok;
+        explicit Use(const CFastenDrainer& owner) : d(owner) {
+            ++d.busy_;
+            ok = !d.stopped_.load();
+        }
+        ~Use() {
+            std::lock_guard<std::mutex> lk(d.mu_);
+            if (--d.busy_ == 0) d.idle_.notify_all();
+        }
+    };
+    mutable std::atomic<int>        busy_{0};
+    mutable std::mutex              mu_;
+    mutable std::condition_variable idle_;
 };
 
 // All mutable state. globals() returns one instance per process, however
@@ -771,15 +894,22 @@ struct Globals {
     std::mutex                            reg_mu;
     std::unordered_map<std::string, Meta> registry;
 
+    // init() replaces the strings guarded by cfg_mu while other threads may
+    // be emitting or logging, so readers copy them under it (identity(),
+    // strategy(), redaction()) and a re-init can't free one mid-copy.
+    mutable std::mutex cfg_mu;
     std::string service_id;
     std::string node_id;
     std::string tenant_id;
 
-    int64_t    seq{0};
-    std::mutex seq_mu;
-
     RingBuffer syslog_ring;
     RingBuffer api_ring;
+
+    // Sys rows with no request in scope carry this until the first real
+    // request_id is seen (spec persistent-streams §7). Set by init(), guarded
+    // by cfg_mu.
+    std::string       boot_request_id;
+    std::atomic<bool> boot_over{false};
 
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
@@ -790,25 +920,51 @@ struct Globals {
 
     RedactConfig redact_cfg;
 
+    struct Identity {
+        std::string service_id;
+        std::string node_id;
+        std::string tenant_id;
+    };
+
+    Identity identity() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return Identity{service_id, node_id, tenant_id};
+    }
+
+    std::string strategy() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return failure_strategy;
+    }
+
+    RedactConfig redaction() const {
+        std::lock_guard<std::mutex> lk(cfg_mu);
+        return redact_cfg;
+    }
+
     // Reset runtime state between tests: stops the drainer and clears config,
     // seq, the audit sink and the log rings. The code registry is kept.
     void reset_for_tests() {
+        // Shut down outside drainer_mu, as uninstall_drainer() does: a sink
+        // that emits during the final drain needs it.
+        std::shared_ptr<CFastenDrainer> old;
         {
             std::lock_guard<std::mutex> lk(drainer_mu);
-            if (drainer) {
-                drainer->shutdown(std::chrono::seconds(2));
-                drainer.reset();
-            }
+            old.swap(drainer);
         }
-        service_id.clear();
-        node_id.clear();
-        tenant_id.clear();
-        { std::lock_guard<std::mutex> lk(seq_mu); seq = 0; }
-        failure_strategy = "queue";
+        if (old) old->shutdown(std::chrono::seconds(2));
+        {
+            std::lock_guard<std::mutex> lk(cfg_mu);
+            service_id.clear();
+            node_id.clear();
+            tenant_id.clear();
+            failure_strategy = "queue";
+            redact_cfg = RedactConfig{};
+            boot_request_id.clear();
+        }
         { std::lock_guard<std::mutex> lk(sink_mu); audit_sink = nullptr; }
-        redact_cfg = RedactConfig{};
         syslog_ring.clear();
         api_ring.clear();
+        boot_over = false;
     }
 };
 
@@ -823,10 +979,49 @@ inline std::string& tl_request_id() {
     return rid;
 }
 
+// Sentinel request_ids (spec persistent-streams §7), recognised by prefix.
+inline bool is_sentinel(const std::string& rid) {
+    for (const char* p : {"boot-", "sched-", "bg-", "lib-", "orphan-"}) {
+        if (rid.compare(0, std::char_traits<char>::length(p), p) == 0) return true;
+    }
+    return false;
+}
+
+inline std::string mint_sentinel(const std::string& kind, const std::string& svc) {
+    return kind + "-" + (svc.empty() ? "svc" : svc) + "-" + mint_id_bytes(6);
+}
+
+// The request_id for a sys row: the one in scope, else the boot sentinel until
+// a real id has been seen, else a fresh orphan sentinel. Never empty.
+inline std::string sys_request_id() {
+    auto& g = globals();
+    const std::string& rid = tl_request_id();
+    if (!rid.empty()) {
+        if (!is_sentinel(rid)) g.boot_over = true;
+        return rid;
+    }
+    if (!g.boot_over) {
+        std::lock_guard<std::mutex> lk(g.cfg_mu);
+        if (!g.boot_request_id.empty()) return g.boot_request_id;
+    }
+    return mint_sentinel("orphan", g.identity().service_id);
+}
+
+// Adds a sys row to the ring with its request_id and the engine's tenant_id,
+// so a tenant-scoped reader can return it.
+inline void push_sys_row(Fields row) {
+    auto& g = globals();
+    auto rid = row.find("request_id");
+    if (rid == row.end() || rid->second.empty()) row["request_id"] = sys_request_id();
+    const std::string tenant = g.identity().tenant_id;
+    if (!tenant.empty() && !row.count("tenant_id")) row["tenant_id"] = tenant;
+    g.syslog_ring.push(std::move(row));
+}
+
 // Redact detail fields through libfasten_core.
 inline Fields redact(const Fields& f) {
     if (f.empty()) return f;
-    const auto& cfg = globals().redact_cfg;
+    const RedactConfig cfg = globals().redaction();
     const std::string in_json = fields_to_json(f);
     char* out_json = nullptr;
     char* out_err  = nullptr;
@@ -881,7 +1076,7 @@ inline std::string Row::to_json() const {
     js += ",\"domain\":"         + detail_::json_str(domain);
     js += ",\"method\":"         + detail_::json_str(method);
     js += ",\"request_id\":"     + detail_::json_str(request_id);
-    js += ",\"detail\":"         + detail_::fields_to_json(detail);
+    js += ",\"detail\":"         + detail_::fields_to_json(detail, code);
     js += ",\"pii_in_detail\":";
     js += (pii_in_detail ? "true" : "false");
     if (!shipped_at.empty()) {
@@ -898,12 +1093,8 @@ inline std::string Row::to_cloud_event_json() const {
     bool first = true;
     for (auto& kv : detail) {
         if (!first) data += ',';
-        data += detail_::json_str(kv.first) + ':';
-        if (kv.first == "_pii_in_detail") {
-            data += (kv.second == "true" ? "true" : "false");
-        } else {
-            data += detail_::json_str(kv.second);
-        }
+        data += detail_::json_str(kv.first) + ':' +
+                detail_::field_json_value_(kv.first, kv.second, code);
         first = false;
     }
     if (!first) data += ',';
@@ -1047,6 +1238,7 @@ struct Config {
     int                      queue_retry_initial_ms = 100;
     int                      queue_retry_max_ms     = 60000;
     bool                     disable_queue_jitter   = false; // false = jitter ON
+    std::size_t              queue_drain_max_attempts = 50;  // then dead-letter
 };
 
 inline void install_drainer_(const Config& cfg);
@@ -1054,16 +1246,17 @@ inline void install_drainer_(const Config& cfg);
 inline void init(Config cfg = {}) {
     using detail_::env_or;
     auto& g = detail_::globals();
-    g.service_id = cfg.service_id.empty() ? env_or("FASTEN_SERVICE_ID") : cfg.service_id;
-    g.node_id    = cfg.node_id.empty()    ? env_or("FASTEN_NODE_ID")    : cfg.node_id;
-    g.tenant_id  = cfg.tenant_id.empty()  ? env_or("FASTEN_TENANT_ID")  : cfg.tenant_id;
+    std::string service_id = cfg.service_id.empty() ? env_or("FASTEN_SERVICE_ID") : cfg.service_id;
+    std::string node_id    = cfg.node_id.empty()    ? env_or("FASTEN_NODE_ID")    : cfg.node_id;
+    std::string tenant_id  = cfg.tenant_id.empty()  ? env_or("FASTEN_TENANT_ID")  : cfg.tenant_id;
 
-    if (g.service_id.empty() || g.node_id.empty()) {
+    if (service_id.empty() || node_id.empty()) {
         throw InitError("init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required");
     }
 
+    detail_::RedactConfig redact_cfg = g.redaction();
     if (!cfg.extra_redact_keys.empty()) {
-        g.redact_cfg.extra_keys = cfg.extra_redact_keys;
+        redact_cfg.extra_keys = cfg.extra_redact_keys;
     } else {
         // Comma-separated, whitespace trimmed.
         std::string env_keys = env_or("FASTEN_REDACT_KEYS", "");
@@ -1073,12 +1266,12 @@ inline void init(Config cfg = {}) {
             while (std::getline(ss, tok, ',')) {
                 size_t a = tok.find_first_not_of(" \t");
                 size_t b = tok.find_last_not_of(" \t");
-                if (a != std::string::npos) g.redact_cfg.extra_keys.push_back(tok.substr(a, b - a + 1));
+                if (a != std::string::npos) redact_cfg.extra_keys.push_back(tok.substr(a, b - a + 1));
             }
         }
     }
-    g.redact_cfg.replacement = cfg.redact_replacement.empty()
-        ? env_or("FASTEN_REDACT_REPLACEMENT", g.redact_cfg.replacement.c_str())
+    redact_cfg.replacement = cfg.redact_replacement.empty()
+        ? env_or("FASTEN_REDACT_REPLACEMENT", redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
 
     std::string strategy = cfg.audit_store_failure_strategy;
@@ -1086,7 +1279,18 @@ inline void init(Config cfg = {}) {
     if (strategy != "queue" && strategy != "raise") {
         throw InitError("init: audit_store_failure_strategy must be \"queue\" or \"raise\"");
     }
-    g.failure_strategy = strategy;
+
+    std::string boot_id = detail_::mint_sentinel("boot", service_id);
+    {
+        std::lock_guard<std::mutex> lk(g.cfg_mu);
+        g.service_id       = std::move(service_id);
+        g.node_id          = std::move(node_id);
+        g.tenant_id        = std::move(tenant_id);
+        g.redact_cfg       = std::move(redact_cfg);
+        g.failure_strategy = std::move(strategy);
+        g.boot_request_id  = std::move(boot_id);
+    }
+    g.boot_over = false;
     install_drainer_(cfg);
 }
 
@@ -1122,13 +1326,15 @@ inline void write_sys_line(std::ostream& out,
                            const std::string& level,
                            const std::string& event,
                            const KeyValues& fields) {
-    auto& g = globals();
+    const auto id = globals().identity();
+    const std::string rid = sys_request_id();
     Fields ring_row;
     std::string js = "{\"shape\":\"sys\"";
     js += ",\"level\":"      + json_str(level);
     js += ",\"event\":"      + json_str(event);
-    js += ",\"request_id\":" + json_str(tl_request_id());
-    js += ",\"service_id\":" + json_str(g.service_id);
+    js += ",\"request_id\":" + json_str(rid);
+    js += ",\"service_id\":" + json_str(id.service_id);
+    if (!id.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(id.tenant_id);
     js += ",\"timestamp\":"  + json_str(now_iso8601());
     for (const auto& kv : fields) {
         js += ',' + json_str(kv.first) + ':' + json_str(kv.second);
@@ -1137,8 +1343,8 @@ inline void write_sys_line(std::ostream& out,
     js += "}\n";
     ring_row["level"]      = level;
     ring_row["event"]      = event;
-    ring_row["request_id"] = tl_request_id();
-    g.syslog_ring.push(std::move(ring_row));
+    ring_row["request_id"] = rid;
+    push_sys_row(std::move(ring_row));
     out << js << std::flush;
 }
 
@@ -1155,9 +1361,10 @@ inline void install_drainer_(const Config& cfg) {
     auto& g = detail_::globals();
     // Swap in the new drainer under the lock, then flush and stop the old
     // one outside it so emit() isn't blocked for up to 7 s. A put() that
-    // reaches the old drainer after shutdown is dropped.
+    // reaches the old drainer after shutdown is refused (an
+    // audit_drain_abandoned sys event) and the row is stored synchronously.
     std::shared_ptr<detail_::CFastenDrainer> next;
-    if (g.failure_strategy == "queue") {
+    if (g.strategy() == "queue") {
         std::function<void(const Row&)> sink_copy;
         {
             std::lock_guard<std::mutex> sk(g.sink_mu);
@@ -1169,7 +1376,8 @@ inline void install_drainer_(const Config& cfg) {
                 cfg.queue_capacity,
                 std::chrono::milliseconds(cfg.queue_retry_initial_ms),
                 std::chrono::milliseconds(cfg.queue_retry_max_ms),
-                !cfg.disable_queue_jitter);
+                !cfg.disable_queue_jitter,
+                cfg.queue_drain_max_attempts);
         }
     }
     std::shared_ptr<detail_::CFastenDrainer> old;
@@ -1286,10 +1494,13 @@ inline std::function<void(EmitOpts&)> method(const std::string& m) {
     return [m](EmitOpts& o) { o.method_val = m; };
 }
 
-template<typename... Opts>
-inline Row emit(const std::string& code, Opts&&... opts) {
-    auto& g = detail_::globals();
-    if (g.service_id.empty()) {
+namespace detail_ {
+
+// Builds the row for `code` and writes its NDJSON line to stdout.
+inline Row make_row_(const std::string& code, const EmitOpts& o) {
+    auto& g = globals();
+    const auto id = g.identity();
+    if (id.service_id.empty()) {
         throw InitError("emit: fasten::init() must be called first");
     }
 
@@ -1303,31 +1514,22 @@ inline Row emit(const std::string& code, Opts&&... opts) {
         meta = it->second;
     }
 
-    EmitOpts o;
-    // Apply each option in order (C++14 has no fold expressions).
-    int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
-    (void)dummy;
-
-    int64_t seq;
-    {
-        std::lock_guard<std::mutex> lk(g.seq_mu);
-        seq = ++g.seq;
-    }
-
     std::string rid = detail_::tl_request_id();
     if (rid.empty()) rid = mint_id();
+    else if (!detail_::is_sentinel(rid)) g.boot_over = true;
 
     Row row;
     row.id             = "evt-" + detail_::mint_id_bytes(10);
     row.origin_id      = row.id;
-    row.monotonic_seq  = seq;
+    // Spec §2.1 / §8: the store allocates seq; emit() never makes one up.
+    row.monotonic_seq  = 0;
     row.timestamp      = detail_::now_iso8601();
     row.code           = code;
     row.action         = meta.action;
     row.severity       = detail_::sev_str(meta.severity);
-    row.service_id     = g.service_id;
-    row.source_node_id = g.node_id;
-    row.tenant_id      = g.tenant_id;
+    row.service_id     = id.service_id;
+    row.source_node_id = id.node_id;
+    row.tenant_id      = id.tenant_id;
     row.actor          = o.actor;
     row.actor_kind     = o.actor_kind;
     row.target         = o.target;
@@ -1355,6 +1557,20 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     // NDJSON audit line on stdout: the row's JSON with "shape" first.
     std::cout << "{\"shape\":\"audit\"," << row.to_json().substr(1) << "\n"
               << std::flush;
+    return row;
+}
+
+}  // namespace detail_
+
+template<typename... Opts>
+inline Row emit(const std::string& code, Opts&&... opts) {
+    auto& g = detail_::globals();
+    EmitOpts o;
+    // Apply each option in order (C++14 has no fold expressions).
+    int dummy[] = {0, (std::forward<Opts>(opts)(o), 0)...};
+    (void)dummy;
+    Row row = detail_::make_row_(code, o);
+    const std::string strategy = g.strategy();
 
     {
         std::shared_ptr<detail_::CFastenDrainer> drainer_copy;
@@ -1362,16 +1578,17 @@ inline Row emit(const std::string& code, Opts&&... opts) {
             std::lock_guard<std::mutex> lk(g.drainer_mu);
             drainer_copy = g.drainer;
         }
-        if (drainer_copy && g.failure_strategy == "queue") {
-            drainer_copy->put(row);
-        } else {
+        // A row the drainer refuses (a re-init stopped it) is stored below.
+        const bool offered = drainer_copy && strategy == "queue";
+        const bool queued  = offered && drainer_copy->put(row);
+        if (!queued) {
             std::function<void(const Row&)> sink_copy;
             {
                 std::lock_guard<std::mutex> lk(g.sink_mu);
                 sink_copy = g.audit_sink;
             }
             if (sink_copy) {
-                if (g.failure_strategy == "raise") {
+                if (strategy == "raise") {
                     try {
                         sink_copy(row);
                     } catch (const std::exception& e) {
@@ -1380,10 +1597,17 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                         throw AuditStoreError("unknown exception");
                     }
                 } else {
-                    // Queue mode with no drainer (no sink at init()): call
-                    // the sink here and report failures as sys events.
+                    // Queue mode with no drainer (sink registered after
+                    // init()), or the drainer refused the row: call the
+                    // sink here and report failures as sys events.
                     try {
                         sink_copy(row);
+                        if (offered) {
+                            // Follows the abandoned event.
+                            detail_::drainer_sys_log("info",
+                                "audit_drain_stored_inline",
+                                {{"row_id", row.id}});
+                        }
                     } catch (const std::exception& e) {
                         detail_::drainer_sys_log("error",
                             "audit_sync_fallback_failed",
@@ -1401,6 +1625,87 @@ inline Row emit(const std::string& code, Opts&&... opts) {
     }
 
     return row;
+}
+
+// Codes whose rows may carry personal data in detail (spec §7):
+// pii_in_detail, or retention class short. Sorted.
+inline std::vector<std::string> pii_codes() {
+    std::vector<std::string> out;
+    for (const auto& kv : registry()) {
+        if (kv.second.pii_in_detail || kv.second.retention_class == Retention::Short)
+            out.push_back(kv.first);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+namespace detail_ {
+
+inline void ensure_redaction_code_() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    {
+        auto& g = globals();
+        std::lock_guard<std::mutex> rk(g.reg_mu);
+        if (g.registry.count(kAuditRowRedacted)) return;
+    }
+    Meta m;
+    m.domain          = "fasten";
+    m.category        = "retention";
+    m.action          = "redact";
+    m.severity        = Sev::Warn;
+    m.description     = "Audit row detail destroyed under a retention policy";
+    m.emitter         = "fasten";
+    m.retention_class = Retention::Long;
+    register_codes("fasten", {{kAuditRowRedacted, m}});
+}
+
+}  // namespace detail_
+
+// Redacts the detail of rows with a PII code (pii_codes()) older than
+// `before`, and returns their ids. Rows are never deleted: detail becomes the
+// JSON literal null and the row keeps its id, seq and place in the table.
+//
+// For each row an AUDIT_ROW_REDACTED row (target = the row's id) is inserted
+// with store.insert() first, then the row is redacted. The insert goes to the
+// store directly, not through the queue, so the record exists before the data
+// is gone; if it throws, that row is left as it was.
+//
+// `store` is SqliteStore, PostgresStore, or any type with insert(Row),
+// list_redaction_candidates() and redact_rows() of the same shape. fasten has
+// no background loop here: call this on a schedule, e.g. daily with
+// before = now - 30 days. Needs init(). A sealed form-"1" row is not redacted
+// (its detail is in the hash); those are counted on the sys stream as
+// pii_redaction_skipped_legacy_form.
+template<typename Store>
+inline std::vector<std::string> redact_expired(
+    Store& store,
+    std::chrono::system_clock::time_point before,
+    std::string reason = "retention")
+{
+    std::vector<std::string> redacted;
+    const auto codes = pii_codes();
+    if (codes.empty()) return redacted;
+    detail_::ensure_redaction_code_();
+    int64_t skipped = 0;
+    const auto candidates = store.list_redaction_candidates(before, codes, &skipped);
+    if (skipped > 0) {
+        detail_::drainer_sys_log("warn", "pii_redaction_skipped_legacy_form",
+            {{"rows", std::to_string(skipped)},
+             {"reason", "sealed under canonical form 1, detail is in the hash; "
+                        "the personal data in these rows still exists"}});
+    }
+    if (reason.empty()) reason = "retention";
+    for (const auto& c : candidates) {
+        EmitOpts o;
+        o.target = c.first;
+        o.fields = {{"redacted_seq", std::to_string(c.second)},
+                    {"reason", reason},
+                    {"redacted_id", c.first}};
+        store.insert(detail_::make_row_(kAuditRowRedacted, o));
+        for (auto& id : store.redact_rows({c.first})) redacted.push_back(std::move(id));
+    }
+    return redacted;
 }
 
 // Newest-first reads of the in-process log buffers.
@@ -1441,13 +1746,13 @@ inline void error(const std::string& event, const Fields& f = {}) { _write("erro
 namespace scheduler {
 
 // Scope for one scheduled job run, with request id run_id or a new
-// "scheduler-<hex>" id.
+// "sched-<hex>" id (spec §7).
 //
 //   auto scope = fasten::scheduler::job_run();
 //   fasten::emit("JOB_STARTED", ...);
 inline RequestScope job_run(const std::string& run_id = "") {
     std::string rid = run_id.empty()
-        ? "scheduler-" + detail_::mint_id_bytes(4)
+        ? "sched-" + detail_::mint_id_bytes(6)
         : run_id;
     return RequestScope(std::move(rid));
 }

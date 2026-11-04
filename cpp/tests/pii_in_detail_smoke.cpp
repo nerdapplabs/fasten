@@ -16,7 +16,6 @@ void reset_state() {
     fasten_registry_clear();
     auto& g = fasten::detail_::globals();
     g.registry.clear();
-    g.seq = 0;
 }
 
 // Capture stderr while running fn().
