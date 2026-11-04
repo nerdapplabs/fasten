@@ -553,3 +553,63 @@ def test_row_sealed_with_shipped_at_set_binds_that_value(raw):
     assert not verify_chain([moved]).ok
     assert not verify_chain([dataclasses.replace(row, shipped_at=None)]).ok
     assert not verify_chain([dataclasses.replace(row, actor="bob")]).ok
+
+
+# Rows the Go SDK sealed before it escaped DEL (0x7f) as \u007f. The hashes
+# come from the Go SDK at origin/main, which wrote DEL raw; go/row_map_form2_test.go
+# pins the same row.
+
+RAW_DEL_COMMITMENT = "9f56c9d55c78a68e3438acd78c9184602d48f7f5c7c8102c008c57dcc2aed54f"
+RAW_DEL_FORM_2_HASH = "a81613148862cd4447110c6da9e8ad7c12465a159dd9ee83261d550c92f42e95"
+RAW_DEL_FORM_1_HASH = "0223c0d666cea08f2b0ebdac0ceda0ed41ac88aaec2e8ef2f0148df39d2f14c9"
+
+
+def _del_row(**kw) -> AuditRow:
+    fields = dict(
+        id="evt-del", origin_id="evt-del", monotonic_seq=1,
+        timestamp=datetime(2026, 6, 15, 10, 30, 45, 123456, tzinfo=timezone.utc),
+        code="ORDER_PLACED", action="create", severity="info",
+        service_id="gateway", source_node_id="node-1",
+        actor="alice", actor_kind="user", target="order/\x7f42",
+        category="order", domain="sales", method="http", request_id="req-xyz",
+        detail={"note": "a\x7fb"}, prev_hash="genesis",
+    )
+    fields.update(kw)
+    return AuditRow(**fields)
+
+
+def _raw_del_form_2(**kw) -> AuditRow:
+    return _del_row(canonical_form_id="2", detail_salt="b" * 64,
+                    detail_commitment=RAW_DEL_COMMITMENT, hash=RAW_DEL_FORM_2_HASH, **kw)
+
+
+def _raw_del_form_1(**kw) -> AuditRow:
+    return _del_row(canonical_form_id="1", hash=RAW_DEL_FORM_1_HASH, **kw)
+
+
+def test_rows_go_sealed_with_raw_del_verify():
+    for row in (_raw_del_form_1(), _raw_del_form_2()):
+        res = verify_chain([row])
+        assert res.ok, (row.canonical_form_id, res.reason)
+
+
+def test_row_sealed_with_del_escaped_verifies():
+    sealed = _seal2("genesis", _del_row(), salt="b" * 64)
+    # Same hashes go/row_map_form2_test.go pins for Python.
+    assert sealed.detail_commitment == "9a837ae6d78f634f2731b76037f50cf3dbc1ac5f13bde1f0f26a1745f4853251"
+    assert sealed.hash == "55404a784f6fe52f181b7e880e4bb25667e7800fc17890bf6c13b67073a00f13"
+    assert verify_chain([sealed]).ok
+
+
+@pytest.mark.parametrize("make, edit, reason", [
+    (_raw_del_form_2, {"target": "order/\x7f43"}, "hash mismatch"),
+    (_raw_del_form_2, {"target": "order/\\u007f42"}, "hash mismatch"),
+    (_raw_del_form_2, {"target": "order/42"}, "hash mismatch"),
+    (_raw_del_form_2, {"detail": {"note": "a\x7fc"}}, "detail does not match its commitment"),
+    (_raw_del_form_1, {"target": "order/\x7f43"}, "hash mismatch"),
+    (_raw_del_form_1, {"detail": {"note": "a\x7fc"}}, "hash mismatch"),
+])
+def test_raw_del_fallback_still_catches_tampering(make, edit, reason):
+    res = verify_chain([make(**edit)])
+    assert not res.ok
+    assert reason in res.reason

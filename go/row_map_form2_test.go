@@ -77,10 +77,22 @@ func TestEmit_SealedStdoutLineVerifies(t *testing.T) {
 	}
 }
 
-// Python's json.dumps(ensure_ascii=True) writes DEL (0x7f) as \u007f. The
-// hashes below come from python/fasten/chain.py for this row.
-func TestCanonicalJSON_EscapesDELLikePython(t *testing.T) {
-	row := Row{
+func TestRowToMap_RedactedForm2RowVerifiesAfterJSON(t *testing.T) {
+	sealed := Seal("genesis", bareRow(1, "evt-1"))
+	sealed.Detail = nil
+	sealed.DetailSalt = ""
+	m := rowToMap(sealed)
+	if _, ok := m["detail_salt"]; ok {
+		t.Error("redacted row should have no detail_salt key")
+	}
+	if res := VerifyChain([]Row{rowFromMap(t, m)}); !res.OK {
+		t.Fatalf("redacted form-2 row read back from rowToMap does not verify: %s", res.Reason)
+	}
+}
+
+// delRow holds DEL (0x7f) in target and in detail.
+func delRow() Row {
+	return Row{
 		WireVersion:  "1",
 		ID:           "evt-del",
 		OriginID:     "evt-del",
@@ -101,6 +113,12 @@ func TestCanonicalJSON_EscapesDELLikePython(t *testing.T) {
 		Detail:       map[string]any{"note": "a\x7fb"},
 		DetailSalt:   strings.Repeat("b", 64),
 	}
+}
+
+// Python's json.dumps(ensure_ascii=True) writes DEL (0x7f) as \u007f. The
+// hashes below come from python/fasten/chain.py for this row.
+func TestCanonicalJSON_EscapesDELLikePython(t *testing.T) {
+	row := delRow()
 	if got := string(canonicalJSON(map[string]any{"s": "\x7f"})); got != `{"s":"\u007f"}` {
 		t.Errorf("canonicalJSON = %s, want {\"s\":\"\\u007f\"}", got)
 	}
@@ -120,5 +138,69 @@ func TestCanonicalJSON_EscapesDELLikePython(t *testing.T) {
 	const pyForm1Hash = "a7816f9fec4ca3c7f56a28493bc522601cda73848304d3e6b3f1c0b1c8312807"
 	if got := rowHashPyCompat(row); got != pyForm1Hash {
 		t.Errorf("form 1 hash = %s, want %s", got, pyForm1Hash)
+	}
+}
+
+// Hashes Go sealed delRow with before it escaped DEL, from the Go SDK at
+// origin/main (DEL left raw in the canonical JSON).
+const (
+	rawDELCommitment = "9f56c9d55c78a68e3438acd78c9184602d48f7f5c7c8102c008c57dcc2aed54f"
+	rawDELForm2Hash  = "a81613148862cd4447110c6da9e8ad7c12465a159dd9ee83261d550c92f42e95"
+	rawDELForm1Hash  = "0223c0d666cea08f2b0ebdac0ceda0ed41ac88aaec2e8ef2f0148df39d2f14c9"
+)
+
+func rawDELRows() (form1, form2 Row) {
+	form2 = delRow()
+	form2.CanonicalFormID = "2"
+	form2.PrevHash = "genesis"
+	form2.DetailCommitment = rawDELCommitment
+	form2.Hash = rawDELForm2Hash
+	form1 = delRow()
+	form1.CanonicalFormID = "1"
+	form1.PrevHash = "genesis"
+	form1.DetailSalt = ""
+	form1.Hash = rawDELForm1Hash
+	return form1, form2
+}
+
+func TestVerifyChain_AcceptsRowsSealedWithRawDEL(t *testing.T) {
+	form1, form2 := rawDELRows()
+	for _, row := range []Row{form1, form2} {
+		if res := VerifyChain([]Row{row}); !res.OK {
+			t.Errorf("form %s row sealed with raw DEL: %s", row.CanonicalFormID, res.Reason)
+		}
+		if res := VerifyChain([]Row{rowFromMap(t, rowToMap(row))}); !res.OK {
+			t.Errorf("form %s row sealed with raw DEL, after JSON: %s", row.CanonicalFormID, res.Reason)
+		}
+	}
+	if res := VerifyChain([]Row{Seal("genesis", delRow())}); !res.OK {
+		t.Errorf("row sealed with DEL escaped: %s", res.Reason)
+	}
+}
+
+func TestVerifyChain_RawDELFallbackStillCatchesTampering(t *testing.T) {
+	form1, form2 := rawDELRows()
+	cases := []struct {
+		name   string
+		row    Row
+		edit   func(*Row)
+		reason string
+	}{
+		{"form 2 target", form2, func(r *Row) { r.Target = "order/\x7f43" }, "hash mismatch"},
+		{"form 2 target spelled as an escape", form2, func(r *Row) { r.Target = `order/\u007f42` }, "hash mismatch"},
+		{"form 2 target without DEL", form2, func(r *Row) { r.Target = "order/42" }, "hash mismatch"},
+		{"form 2 detail", form2, func(r *Row) { r.Detail = map[string]any{"note": "a\x7fc"} }, "detail does not match its commitment"},
+		{"form 1 target", form1, func(r *Row) { r.Target = "order/\x7f43" }, "hash mismatch"},
+		{"form 1 detail", form1, func(r *Row) { r.Detail = map[string]any{"note": "a\x7fc"} }, "hash mismatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := tc.row
+			tc.edit(&row)
+			res := VerifyChain([]Row{row})
+			if res.OK || !strings.Contains(res.Reason, tc.reason) {
+				t.Fatalf("got OK=%v reason %q, want %q", res.OK, res.Reason, tc.reason)
+			}
+		})
 	}
 }

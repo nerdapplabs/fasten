@@ -14,6 +14,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   Python and could not be ingested again.
 - Canonical JSON writes DEL (0x7f) as `\u007f`, as Python's `json.dumps`
   does, so a row holding that byte hashes the same in Go and Python.
+- Rows Go sealed earlier with DEL left raw still verify, in Go and Python:
+  when the commitment or hash misses, the check is retried with DEL raw
+  (spec §1.2).
 - The Go workflow also runs when `spec/` changes, since Go tests read it.
 
 ### Changed: Go SDK requires Go 1.26

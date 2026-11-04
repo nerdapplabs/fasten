@@ -99,7 +99,7 @@ func TestChain_GoEmitSealedRowVerifies(t *testing.T) {
 
 	// Recomputing the hash with the row's own canonical form must reproduce
 	// the sealed Hash.
-	if got := hashFnByForm[r1.CanonicalFormID](r1); got != r1.Hash {
+	if got := hashFnByForm[r1.CanonicalFormID](r1, canonicalJSON); got != r1.Hash {
 		t.Fatalf("Go-sealed row hash not reproducible by verifier:\n  sealed = %s\n  verify = %s", r1.Hash, got)
 	}
 
@@ -188,7 +188,7 @@ func TestChain_RestartSeedsSeqScopedToOwnIdentity(t *testing.T) {
 		t.Fatalf("expected 2 hub rows, got %d", len(hubRows))
 	}
 	for _, row := range hubRows {
-		if got := hashFnByForm[row.CanonicalFormID](row); got != row.Hash {
+		if got := hashFnByForm[row.CanonicalFormID](row, canonicalJSON); got != row.Hash {
 			t.Fatalf("hub row seq=%d hash not reproducible: sealed=%s verify=%s", row.MonotonicSeq, row.Hash, got)
 		}
 	}

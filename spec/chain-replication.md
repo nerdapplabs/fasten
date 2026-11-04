@@ -75,9 +75,16 @@ Every SDK MUST produce the same bytes:
 | Key order | Sorted ascending, **recursively** (top level and every nested object). |
 | Whitespace | None: `,` and `:` separators, no spaces. |
 | Non-ASCII | Escaped as `\uXXXX` (UTF-16 surrogate pairs for astral characters), as with CPython `ensure_ascii=True`. |
+| DEL (0x7f) | Escaped as `\u007f`, as CPython does. |
 | `<` `>` `&` | Left **literal**. CPython does NOT HTML-escape; a Go encoder MUST turn HTML escaping off. |
 | Null | `None` renders as `null` for `tenant_id` when absent; `shipped_at` is always `null` (§1.1). |
 | Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp`. |
+
+Rows the Go SDK sealed before it escaped DEL hold it raw in the hashed bytes.
+When a row's detail commitment or hash does not match and a hashed string holds
+DEL, verifiers MUST retry that check with DEL written raw, every other rule
+unchanged, and accept the row if it then matches. This applies to every form
+and alongside the `shipped_at` rule in §1.1.
 
 ### §1.3 Number rendering (cross-language hazard)
 

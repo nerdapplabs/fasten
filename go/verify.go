@@ -33,11 +33,12 @@ const currentCanonicalFormID = "2"
 // predates the field, so it is form "1".
 const legacyCanonicalFormID = "1"
 
-// hashFnByForm maps a canonical_form_id to its row hash function. A new form
-// is added here and stamped in Seal; VerifyChain picks it up from this map.
-var hashFnByForm = map[string]func(Row) string{
-	"1": rowHashPyCompat,
-	"2": rowHashForm2,
+// hashFnByForm maps a canonical_form_id to its row hash function, which takes
+// the canonical JSON encoder (canonicalJSON, or canonicalJSONRawDEL when
+// rowBreak retries). A new form is added here and stamped in Seal.
+var hashFnByForm = map[string]func(Row, func(any) []byte) string{
+	"1": rowHashForm1With,
+	"2": rowHashForm2With,
 }
 
 // Seal returns a copy of row sealed into the chain: it stamps the current
@@ -51,7 +52,7 @@ func Seal(prevHash string, row Row) Row {
 		row.DetailSalt = newDetailSalt()
 	}
 	row.DetailCommitment = detailCommitment(row.DetailSalt, row.Detail)
-	row.Hash = hashFnByForm[currentCanonicalFormID](row)
+	row.Hash = hashFnByForm[currentCanonicalFormID](row, canonicalJSON)
 	return row
 }
 
@@ -209,9 +210,15 @@ func rowBreak(row Row) string {
 		// A row without the field predates it, so it is form "1".
 		formID = legacyCanonicalFormID
 	}
-	hashFn, ok := hashFnByForm[formID]
-	if !ok {
+	if _, ok := hashFnByForm[formID]; !ok {
 		return fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID)
+	}
+	// Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
+	// sealed with DEL in a hashed string matches only that way. Each check
+	// below is retried with DEL raw; nothing else about the encoding changes.
+	canons := []func(any) []byte{canonicalJSON}
+	if hasDEL(row) {
+		canons = append(canons, canonicalJSONRawDEL)
 	}
 	// Form "2" hashes detail_commitment, NOT detail. The hash therefore
 	// does not protect detail on its own: a rewritten detail with the
@@ -226,32 +233,38 @@ func rowBreak(row Row) string {
 				"row %s: detail present but detail_salt is missing — commitment cannot be verified",
 				row.ID)
 		}
-		if detailCommitment(row.DetailSalt, row.Detail) != row.DetailCommitment {
+		if !slices.ContainsFunc(canons, func(canon func(any) []byte) bool {
+			return detailCommitmentWith(row.DetailSalt, row.Detail, canon) == row.DetailCommitment
+		}) {
 			return fmt.Sprintf("row %s: detail does not match its commitment", row.ID)
 		}
 	}
-
-	expected := hashFn(row)
-	if expected != row.Hash && formID == "1" {
-		// Pre-conformance Python hashed the wire timestamp verbatim
-		// (always-"Z") while the spec and Go use "+00:00" — the
-		// divergence in #91. Those rows exist in deployments and are not
-		// tampered; without this they verify in Python (which has the
-		// same fallback) and fail here, which reads as tampering.
-		// Delete with form "1".
-		expected = rowHashForm1LegacyZ(row)
-	}
-	if expected != row.Hash && row.ShippedAt != nil {
-		// Sealed with shipped_at already set, before §1.1 hashed it as
-		// null. Such a row matches only over its exact stored value.
-		if slices.Contains(rowHashesOverShippedAt(row, formID), row.Hash) {
-			expected = row.Hash
-		}
-	}
-	if expected != row.Hash {
+	if !slices.ContainsFunc(canons, func(canon func(any) []byte) bool {
+		return hashMatches(row, formID, canon)
+	}) {
 		return fmt.Sprintf("row %s: hash mismatch", row.ID)
 	}
 	return ""
+}
+
+// hashMatches reports whether row.Hash is the row's hash under canon, its
+// form's own or one of the fallbacks below.
+func hashMatches(row Row, formID string, canon func(any) []byte) bool {
+	if hashFnByForm[formID](row, canon) == row.Hash {
+		return true
+	}
+	// Pre-conformance Python hashed the wire timestamp verbatim
+	// (always-"Z") while the spec and Go use "+00:00" — the
+	// divergence in #91. Those rows exist in deployments and are not
+	// tampered; without this they verify in Python (which has the
+	// same fallback) and fail here, which reads as tampering.
+	// Delete with form "1".
+	if formID == "1" && rowHashForm1LegacyZ(row, canon) == row.Hash {
+		return true
+	}
+	// Sealed with shipped_at already set, before §1.1 hashed it as
+	// null. Such a row matches only over its exact stored value.
+	return row.ShippedAt != nil && slices.Contains(rowHashesOverShippedAt(row, formID, canon), row.Hash)
 }
 
 // rowHashPyCompat reproduces Python fasten.chain._row_hash byte-for-byte:
@@ -270,9 +283,11 @@ func rowBreak(row Row) string {
 //   - non-ASCII escaped as \uXXXX (Python json.dumps ensure_ascii=True),
 //   - <, >, & left literal (Python does not HTML-escape).
 func rowHashPyCompat(row Row) string {
-	d := pyCanonicalRowMap(row)
-	b := canonicalJSON(d)
-	sum := sha256.Sum256(b)
+	return rowHashForm1With(row, canonicalJSON)
+}
+
+func rowHashForm1With(row Row, canon func(any) []byte) string {
+	sum := sha256.Sum256(canon(pyCanonicalRowMap(row)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -284,10 +299,14 @@ func rowHashPyCompat(row Row) string {
 // low-entropy value is a dictionary attack away from the original, so
 // redaction drops the salt along with the payload.
 func detailCommitment(salt string, detail map[string]any) string {
+	return detailCommitmentWith(salt, detail, canonicalJSON)
+}
+
+func detailCommitmentWith(salt string, detail map[string]any, canon func(any) []byte) string {
 	if detail == nil {
 		detail = map[string]any{}
 	}
-	sum := sha256.Sum256(append([]byte(salt), canonicalJSON(detail)...))
+	sum := sha256.Sum256(append([]byte(salt), canon(detail)...))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -295,11 +314,11 @@ func detailCommitment(salt string, detail map[string]any) string {
 // it: the always-"Z" wire timestamp hashed verbatim, instead of the spec §1.2
 // "+00:00" variable-width rendering. Mirrors Python's
 // _row_hash_form_1_legacy_z. Verification fallback only — never used to seal.
-func rowHashForm1LegacyZ(row Row) string {
+func rowHashForm1LegacyZ(row Row, canon func(any) []byte) string {
 	d := pyCanonicalRowMap(row)
 	delete(d, "hash")
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	sum := sha256.Sum256(canonicalJSON(d))
+	sum := sha256.Sum256(canon(d))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -307,11 +326,15 @@ func rowHashForm1LegacyZ(row Row) string {
 // replaced by detail_commitment, and timestamps in the same canonical form
 // as on the wire (form "1" used a separate "+00:00" rendering).
 func rowHashForm2(row Row) string {
+	return rowHashForm2With(row, canonicalJSON)
+}
+
+func rowHashForm2With(row Row, canon func(any) []byte) string {
 	d := pyCanonicalRowMap(row)
 	delete(d, "detail")
 	d["detail_commitment"] = row.DetailCommitment
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	sum := sha256.Sum256(canonicalJSON(d))
+	sum := sha256.Sum256(canon(d))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -320,9 +343,9 @@ func rowHashForm2(row Row) string {
 // §1.1 nulled it, the stored value rendered like the timestamp next to it.
 // Emit never sealed such rows; a caller passing ShippedAt to Seal or
 // AllocateAndInsertOriginated did. Verification fallback only.
-func rowHashesOverShippedAt(row Row, formID string) []string {
+func rowHashesOverShippedAt(row Row, formID string, canon func(any) []byte) []string {
 	hash := func(d map[string]any) string {
-		sum := sha256.Sum256(canonicalJSON(d))
+		sum := sha256.Sum256(canon(d))
 		return hex.EncodeToString(sum[:])
 	}
 	switch formID {
@@ -413,28 +436,43 @@ func pyISOFormat(t time.Time) string {
 // would: sorted keys, compact separators, HTML left literal, non-ASCII escaped.
 //
 // encoding/json already sorts map keys and is compact, so this only turns off
-// HTML escaping and escapes non-ASCII runes as \uXXXX. Bytes >= 0x80 only
-// appear inside strings, so that is safe.
+// HTML escaping and escapes DEL (0x7f) and non-ASCII runes as \uXXXX.
+// encoding/json writes those bytes only inside strings, so that is safe.
 func canonicalJSON(v any) []byte {
+	return asciiEscape(encodeJSON(v), true)
+}
+
+// canonicalJSONRawDEL is canonicalJSON with DEL left raw, as Go wrote it
+// before it escaped DEL. Verification fallback only, never used to seal.
+func canonicalJSONRawDEL(v any) []byte {
+	return asciiEscape(encodeJSON(v), false)
+}
+
+func encodeJSON(v any) []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	// The maps built here always encode, so the error is ignored.
 	_ = enc.Encode(v)
-	out := bytes.TrimRight(buf.Bytes(), "\n")
-	return asciiEscape(out)
+	return bytes.TrimRight(buf.Bytes(), "\n")
 }
 
-// asciiEscape replaces DEL and every non-ASCII rune in the JSON bytes with its
-// \uXXXX (or surrogate-pair) escape, matching Python json.dumps ensure_ascii=True.
-func asciiEscape(b []byte) []byte {
-	if plainASCII(b) {
+// hasDEL reports whether any string the row hashes holds DEL.
+func hasDEL(row Row) bool {
+	return bytes.IndexByte(encodeJSON(pyCanonicalRowMap(row)), 0x7f) >= 0
+}
+
+// asciiEscape replaces every non-ASCII rune in the JSON bytes with its \uXXXX
+// (or surrogate-pair) escape, and DEL too when escapeDEL is set, matching
+// Python json.dumps ensure_ascii=True.
+func asciiEscape(b []byte, escapeDEL bool) []byte {
+	if plainASCII(b, escapeDEL) {
 		return b
 	}
 	var sb strings.Builder
 	for i := 0; i < len(b); {
 		c := b[i]
-		if c == 0x7f {
+		if c == 0x7f && escapeDEL {
 			sb.WriteString(`\u007f`)
 			i++
 			continue
@@ -467,9 +505,9 @@ func asciiEscape(b []byte) []byte {
 }
 
 // plainASCII reports whether b has no byte that asciiEscape rewrites.
-func plainASCII(b []byte) bool {
+func plainASCII(b []byte, escapeDEL bool) bool {
 	for _, c := range b {
-		if c >= 0x7f {
+		if c >= utf8.RuneSelf || (c == 0x7f && escapeDEL) {
 			return false
 		}
 	}
