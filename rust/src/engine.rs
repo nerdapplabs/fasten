@@ -24,9 +24,6 @@ impl<T: ?Sized> LockOrRecover<T> for Mutex<T> {
 }
 
 pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
-    let mut extra = HashMap::new();
-    extra.insert("prev_hash".to_string(), serde_json::Value::String(r.prev_hash.clone()));
-    extra.insert("hash".to_string(), serde_json::Value::String(r.hash.clone()));
     fasten_core::Row {
         wire_version:   r.wire_version.clone(),
         id:             r.id.clone(),
@@ -49,7 +46,12 @@ pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
         detail:         serde_json::Value::Object(r.detail.clone().into_iter().collect()),
         pii_in_detail:  r.pii_in_detail,
         shipped_at:     r.shipped_at.as_ref().map(crate::canonical_ts),
-        extra,
+        prev_hash:      Some(r.prev_hash.clone()),
+        hash:           Some(r.hash.clone()),
+        canonical_form_id: None,
+        detail_salt:    None,
+        detail_commitment: None,
+        extra:          HashMap::new(),
     }
 }
 
@@ -60,9 +62,6 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
         "error"    => crate::Severity::Error,
         "critical" => crate::Severity::Critical,
         _          => crate::Severity::Info,
-    };
-    let extra_str = |k: &str| {
-        r.extra.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string()
     };
     let detail: HashMap<String, serde_json::Value> = match &r.detail {
         serde_json::Value::Object(m) => m.clone().into_iter().collect(),
@@ -89,8 +88,8 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
         request_id:     r.request_id.clone(),
         detail,
         pii_in_detail:  r.pii_in_detail,
-        prev_hash:      extra_str("prev_hash"),
-        hash:           extra_str("hash"),
+        prev_hash:      r.prev_hash.clone().unwrap_or_default(),
+        hash:           r.hash.clone().unwrap_or_default(),
         shipped_at:     r.shipped_at.as_deref().and_then(|s| s.parse().ok()),
     }
 }
