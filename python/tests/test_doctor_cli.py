@@ -60,7 +60,7 @@ def test_sqlite_dsn_shows_its_path(doctor_env, monkeypatch, capsys):
     SQLiteStore.from_dsn("sqlite:///./audit.db")
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
     out = _run(capsys)
-    assert "sqlite /./audit.db (connected" in out
+    assert "sqlite ./audit.db (connected" in out
 
 
 

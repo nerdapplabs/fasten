@@ -44,7 +44,7 @@ def _describe(dsn: str, is_postgres: bool) -> str:
     if "://" not in dsn and _KEYWORD_RE.search(dsn):
         return _KEYWORD_DSN
     try:
-        path = urlsplit(dsn).path
+        path = sqlite_dsn_path(dsn)
     except ValueError:
         return "unparseable DSN"
     return f"sqlite {path or '(no path)'}"

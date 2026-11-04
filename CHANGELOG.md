@@ -10,7 +10,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `fasten doctor` reads the audit DSN path as the SQLite store does, so
   `sqlite:////abs/audit.db` and a bare `/abs/audit.db` are checked at that
-  path instead of being reported as not found.
+  path instead of being reported as not found. The path it prints is the
+  path it checks.
 - `fasten.shim.structlog.configure()` uses the engine's current redactor for
   each event, so redaction settings from an `init()` that runs after
   `configure()` apply to structlog output and the stdlib bridge.
