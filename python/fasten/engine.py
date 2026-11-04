@@ -729,7 +729,7 @@ class Engine:
                                 "reason": "no_drainer", "row_id": row.id,
                             })
                         elif d.gen != gen:
-                            pass    # init is switching stores: store it inline in the new one
+                            pass    # init is switching stores: store it inline in the one read above
                         else:
                             store = d.store
                             with d.lock:
