@@ -7,11 +7,25 @@ on:
       - 'scripts/release/**'
       - '.github/workflows/release-provenance.yml'
       - '.github/workflows/release-check.yml'
+      - 'swift/**'
+      - 'cpp/include/**'
+      - 'rust/**'
+      - 'fasten-core/**'
+      - 'go/**'
+      - 'rust-toolchain.toml'
+      - 'LICENSE'
   pull_request:
     paths:
       - 'scripts/release/**'
       - '.github/workflows/release-provenance.yml'
       - '.github/workflows/release-check.yml'
+      - 'swift/**'
+      - 'cpp/include/**'
+      - 'rust/**'
+      - 'fasten-core/**'
+      - 'go/**'
+      - 'rust-toolchain.toml'
+      - 'LICENSE'
 
 permissions:
   contents: read
@@ -24,3 +38,6 @@ jobs:
 
       - name: Build twice and compare
         run: scripts/release/check-reproducible.sh
+
+      - name: Latest release choice
+        run: scripts/release/test-latest-flag.sh

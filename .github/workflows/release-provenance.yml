@@ -96,6 +96,11 @@ jobs:
     permissions:
       contents: write   # create the release and upload its files
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # all tags, to pick the latest release
+          persist-credentials: false
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-files
@@ -109,8 +114,10 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             pre=()
             case $TAG in *-*) pre=(--prerelease) ;; esac
+            # Only the highest vX.Y.Z tag becomes the repo's latest release.
+            latest=$(git tag -l 'v*' | scripts/release/latest-flag.sh "$TAG")
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "$TAG" "${pre[@]}" \
+              --title "$TAG" "${pre[@]}" --latest="$latest" \
               --notes "Verify these files with the steps in SECURITY.md (Verifying a release)."
           fi
           gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

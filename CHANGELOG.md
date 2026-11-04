@@ -13,11 +13,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   x86_64 (or the Go module zip for `go/` tags) with
   `scripts/release/build-artifacts.sh`, writes `SHA256SUMS`, attests every
   file with GitHub artifact attestations, runs `gh attestation verify` on each
-  one and then uploads them to the tag's GitHub release.
-- The source archives are reproducible. `release-check.yml` builds them twice
-  from separate clones and fails if the bytes differ.
+  one and then uploads them to the tag's GitHub release. Only the highest
+  `vX.Y.Z` tag is marked as the repo's latest release; `go/` tags,
+  prereleases and backports are not.
+- The source archives are reproducible with GNU tar, GNU gzip and the stock
+  Python zlib. `release-check.yml` builds them twice from separate clones and
+  fails if the bytes differ. It runs on changes to any file the archives hold.
 - The PyPI release sets `attestations: true` (PEP 740) explicitly.
-- SECURITY.md lists the commands to verify a release for each SDK.
+- SECURITY.md lists the commands to verify a release for each SDK, including
+  how to match the Go zip's `h1:` hash with `go.sum`.
 
 ### Changed: Go SDK requires Go 1.26
 

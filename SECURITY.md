@@ -57,8 +57,11 @@ commit SHA. The first published release will be the v1.0.0 GA tag.
   A `vX.Y.Z` release carries Swift, C++ and Rust source archives and the
   fasten-core library for linux x86_64. A `go/vX.Y.Z` release carries the Go
   module zip. Each release also has a `SHA256SUMS` file. The source archives
-  are reproducible: `scripts/release/build-artifacts.sh <tag> <dir>` run on
-  the tagged commit gives the same bytes.
+  and the Go module zip are reproducible: `scripts/release/build-artifacts.sh
+  <tag> <dir>` run on the tagged commit gives the same bytes when built with
+  GNU tar, GNU gzip and the stock Python zlib, as CI does on Ubuntu. Other
+  compressor builds (zlib-ng, for one) can give different bytes for the same
+  content.
 
 **Planned for the v1.0.0 GA tag:**
 
@@ -89,14 +92,26 @@ gh release download v1.0.0 --repo nerdapplabs/fasten --dir fasten-v1.0.0
 cd fasten-v1.0.0
 sha256sum -c SHA256SUMS
 for f in *; do
-  gh attestation verify "$f" --repo nerdapplabs/fasten --source-ref refs/tags/v1.0.0
+  gh attestation verify "$f" --repo nerdapplabs/fasten --source-ref refs/tags/v1.0.0 \
+    --signer-workflow nerdapplabs/fasten/.github/workflows/release-provenance.yml
 done
 ```
 
 Go: the same commands with the `go/v1.0.0` tag and
-`--source-ref refs/tags/go/v1.0.0`. The zip has the module proxy layout, so
-its `h1:` hash is the one the `go` command checks against `go.sum` and
-sum.golang.org.
+`--source-ref refs/tags/go/v1.0.0`. The `go` command does not download this
+zip; the module proxy builds its own from the tag. To tie the two, compute
+the zip's `h1:` hash and compare it with the one `go` records:
+
+```bash
+python3 -c 'import sys, zipfile, hashlib, base64
+z = zipfile.ZipFile(sys.argv[1])
+s = "".join(hashlib.sha256(z.read(n)).hexdigest() + "  " + n + "\n" for n in sorted(z.namelist()))
+print("h1:" + base64.b64encode(hashlib.sha256(s.encode()).digest()).decode())' fasten-go-v1.0.0.zip
+go mod download -json github.com/nerdapplabs/fasten/go@v1.0.0 | grep '"Sum"'
+```
+
+The two `h1:` values must match. The second is also the hash in `go.sum` and
+on sum.golang.org for `github.com/nerdapplabs/fasten/go v1.0.0`.
 
 ## Current scan posture
 
