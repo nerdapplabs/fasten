@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Swift `FastenStore` binding (#149)
+
+- `close()` can be called more than once, and `deinit` goes through it. Calls
+  after `close()` throw `FastenStoreError` instead of using a stale handle.
+- The binding builds again: the status check compares with `FASTEN_OK`, the
+  module map links `fasten_core`, and the build points at
+  `fasten-core/target/release`.
+
 ### Fixed: Swift store-assigned monotonic_seq, no non-spec hash, PII redaction (#124)
 
 - **Breaking:** the store assigns `monotonic_seq` inside the insert
