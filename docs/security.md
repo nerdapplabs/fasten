@@ -88,7 +88,7 @@ The runtime layout:
 **Not mitigated:**
 
 - fasten does not enforce authentication. A router mounted with `dependencies=[]` on a public interface has no access control. This is a deployment concern rather than a library concern, but treat the `/logs/*` routes like any internal admin endpoint.
-- The `/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated.
+- The `/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
 
 ---
 
@@ -117,7 +117,9 @@ The runtime layout:
 
 - The spdlog, glog and Boost.Log C++ shims apply the same two-pass redaction to log message strings before pushing to the sys ring.
 - `fasten.shim.stdlib.LoggingHandler` redacts the whole row it builds from a stdlib `LogRecord`: the `extra` fields get key-pattern and value-shape redaction, and the formatted message is checked against the value-shape rules.
-- `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields.
+- `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields and the value-shape pass to `event` itself. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
+- JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
+- `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
 
 **Not mitigated:**
 

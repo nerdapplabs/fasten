@@ -25,6 +25,20 @@ jobs:
     container:
       image: rust:1.90
 
+    # The job runs in a container, so the service is reached by name.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fasten
+          POSTGRES_PASSWORD: fasten
+          POSTGRES_DB: fasten_test
+        options: >-
+          --health-cmd "pg_isready -U fasten -d fasten_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: rust
@@ -48,10 +62,12 @@ jobs:
       - name: Lint (clippy)
         # --locked builds with the committed Cargo.lock instead of resolving
         # newer transitive versions.
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --features store-postgres -- -D warnings
 
       - name: Unit tests
-        run: cargo test --locked --quiet
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
+        run: cargo test --locked --quiet --features store-postgres
 
       # rust/ depends on fasten-core with default-features = false, so its
       # tests never compile store/postgres.rs. Run the core's own tests here
@@ -60,6 +76,9 @@ jobs:
         working-directory: fasten-core
         # native-tls needs pkg-config and the OpenSSL headers. The rust
         # container runs as root and has no sudo.
+        # Without the DSN the Postgres store tests return early and pass.
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test?sslmode=disable
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
