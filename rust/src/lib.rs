@@ -443,26 +443,33 @@ pub mod log {
     }
 }
 
+pub(crate) fn redact_value(
+    v: &serde_json::Value,
+    extra: Option<&[String]>,
+    replacement: Option<&str>,
+) -> serde_json::Value {
+    use fasten_core::redact::{Redactor, REDACTOR};
+    // An empty replacement means the built-in "***". Build a custom Redactor
+    // only when there are extra keys or a custom replacement.
+    let repl = replacement.unwrap_or("");
+    let has_extra = extra.is_some_and(|k| !k.is_empty());
+    if has_extra || !repl.is_empty() {
+        let refs: Vec<&str> = extra
+            .map(|k| k.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        Redactor::new(&refs, repl, &[]).redact_value(v)
+    } else {
+        REDACTOR.redact_value(v)
+    }
+}
+
 fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
     replacement: Option<&str>,
 ) -> HashMap<String, serde_json::Value> {
-    use fasten_core::redact::{Redactor, REDACTOR};
     let v = serde_json::Value::Object(detail.into_iter().collect());
-    // An empty replacement means the built-in "***". Build a custom Redactor
-    // only when there are extra keys or a custom replacement.
-    let repl = replacement.unwrap_or("");
-    let has_extra = extra.is_some_and(|k| !k.is_empty());
-    let redacted = if has_extra || !repl.is_empty() {
-        let refs: Vec<&str> = extra
-            .map(|k| k.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        Redactor::new(&refs, repl, &[]).redact_value(&v)
-    } else {
-        REDACTOR.redact_value(&v)
-    };
-    match redacted {
+    match redact_value(&v, extra, replacement) {
         serde_json::Value::Object(map) => map.into_iter().collect(),
         _ => unreachable!("redact_value on Object always returns Object"),
     }
@@ -625,7 +632,11 @@ impl EmitBuilder {
     /// The row is also written to stdout (`{"shape":"audit",...}`) in
     /// either mode.
     pub fn submit(self) -> Result<Row, AuditStoreError> {
-        let cfg = DEFAULT.current_config().map_err(|e| AuditStoreError { source: e })?;
+        self.submit_to(&DEFAULT)
+    }
+
+    pub(crate) fn submit_to(self, engine: &Engine) -> Result<Row, AuditStoreError> {
+        let cfg = engine.current_config().map_err(|e| AuditStoreError { source: e })?;
         let row = self
             .build_row(&cfg)
             .map_err(|e| AuditStoreError { source: e })?;
@@ -640,9 +651,15 @@ impl EmitBuilder {
             .as_deref()
             .unwrap_or("queue");
         if strategy == "queue" {
-            if let Some(d) = DEFAULT.active_drainer() {
+            if let Some(d) = engine.active_drainer() {
                 let core_row = crate::engine::sdk_row_to_core(&row);
-                d.enqueue(core_row);
+                if !d.enqueue(core_row) {
+                    // The drainer is stopping (a re-init or shutdown), so
+                    // store the row here.
+                    if let Some(s) = cfg.audit_store.as_ref() {
+                        engine.store_inline(&**s, &row)?;
+                    }
+                }
             } else if let Some(s) = cfg.audit_store.as_ref() {
                 // No drainer installed; insert synchronously rather than
                 // drop the row.
@@ -1381,7 +1398,8 @@ mod tests {
 
     #[test]
     fn sys_line_uses_canonical_timestamp() {
-        engine::sys_line("svc-sys-ts", "info", "sys_ts_probe", serde_json::json!({}));
+        let cfg = Config { service_id: "svc-sys-ts".into(), ..Default::default() };
+        engine::sys_line(Some(&cfg), "info", "sys_ts_probe", serde_json::json!({}));
         let line = engine::SYS_CAPTURE
             .lock()
             .unwrap()
@@ -1393,6 +1411,159 @@ mod tests {
         assert_eq!(ts.len(), "2026-01-02T03:04:05.000000Z".len(), "{ts}");
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[19..20], ".");
+    }
+
+    // Records inserted row ids, or fails every insert.
+    #[derive(Default)]
+    struct IdStore {
+        fail: bool,
+        ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AuditStore for IdStore {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            if self.fail {
+                return Err(Error::AuditStoreInsert("down".into()));
+            }
+            self.ids.lock().unwrap().push(row.id.clone());
+            Ok(())
+        }
+    }
+
+    fn sys_lines(service_id: &str, event: &str) -> Vec<serde_json::Value> {
+        engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["service_id"] == service_id && v["event"] == event)
+            .cloned()
+            .collect()
+    }
+
+    fn queue_config(service_id: &str, store: Arc<dyn AuditStore>) -> Config {
+        Config {
+            service_id: service_id.into(),
+            node_id: "n".into(),
+            audit_store: Some(store),
+            ..Default::default()
+        }
+    }
+
+    // A row the stopped drainer refuses is stored inline.
+    #[test]
+    fn submit_stores_inline_when_drainer_stopped() {
+        register("inline".into(), [("INLINE_EVENT".into(), plain_meta("inline"))]).unwrap();
+        let store = Arc::new(IdStore::default());
+        let e = Engine::new();
+        e.init(queue_config("svc-inline", store.clone())).unwrap();
+        e.active_drainer().unwrap().stop(Duration::from_secs(2));
+
+        let row = EmitBuilder::new("INLINE_EVENT", "t").submit_to(&e).expect("submit");
+        assert_eq!(*store.ids.lock().unwrap(), vec![row.id.clone()]);
+        let lines = sys_lines("svc-inline", "audit_drain_stored_inline");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["row_id"], serde_json::json!(row.id));
+        e.reset_for_tests();
+    }
+
+    // If the inline insert fails too, submit returns the error.
+    #[test]
+    fn submit_errors_when_drainer_stopped_and_insert_fails() {
+        register("inline_fail".into(), [("INLINE_FAIL".into(), plain_meta("inline_fail"))])
+            .unwrap();
+        let store = Arc::new(IdStore { fail: true, ..Default::default() });
+        let e = Engine::new();
+        e.init(queue_config("svc-inline-fail", store)).unwrap();
+        e.active_drainer().unwrap().stop(Duration::from_secs(2));
+
+        let err = EmitBuilder::new("INLINE_FAIL", "t").submit_to(&e).unwrap_err();
+        assert!(matches!(err.source, Error::AuditStoreInsert(_)));
+        let lines = sys_lines("svc-inline-fail", "audit_sync_fallback_failed");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["error_type"], "AuditStoreInsert");
+        assert!(lines[0].get("error").is_none());
+        e.reset_for_tests();
+    }
+
+    // Re-init reports a row the old drainer dead-lettered during its flush.
+    #[test]
+    fn reinit_reports_unstored_rows() {
+        register("reinit".into(), [("REINIT_EVENT".into(), plain_meta("reinit"))]).unwrap();
+        let store: Arc<dyn AuditStore> = Arc::new(IdStore { fail: true, ..Default::default() });
+        let cfg = Config {
+            queue_retry_initial: Some(Duration::from_millis(200)),
+            queue_drain_max_attempts: Some(3),
+            disable_queue_jitter: true,
+            ..queue_config("svc-reinit", store)
+        };
+        let e = Engine::new();
+        e.init(cfg.clone()).unwrap();
+        EmitBuilder::new("REINIT_EVENT", "t").submit_to(&e).expect("submit");
+        e.init(cfg).unwrap();
+
+        let lines = sys_lines("svc-reinit", "audit_drain_install_incomplete");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["level"], "warn");
+        assert_eq!(lines[0]["flushed"], true);
+        assert_eq!(lines[0]["unstored"], 1);
+        e.reset_for_tests();
+    }
+
+    // A clean re-init reports nothing.
+    #[test]
+    fn reinit_after_clean_flush_is_quiet() {
+        let store: Arc<dyn AuditStore> = Arc::new(IdStore::default());
+        let e = Engine::new();
+        e.init(queue_config("svc-reinit-ok", store.clone())).unwrap();
+        e.init(queue_config("svc-reinit-ok", store)).unwrap();
+        assert!(sys_lines("svc-reinit-ok", "audit_drain_install_incomplete").is_empty());
+        e.reset_for_tests();
+    }
+
+    #[test]
+    fn log_lines_are_redacted() {
+        let e = Engine::new();
+        e.init(Config {
+            service_id: "svc-log-redact".into(),
+            node_id: "n".into(),
+            extra_redact_keys: Some(vec!["badge".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        e.log_sys("info", "x", serde_json::json!({
+            "password": "p",
+            "nested": {"token": "t", "ok": "v"},
+            "badge": "b",
+        }));
+        let line = sys_lines("svc-log-redact", "x").pop().expect("log line");
+        assert_eq!(line["password"], "***");
+        assert_eq!(line["nested"]["token"], "***");
+        assert_eq!(line["nested"]["ok"], "v");
+        assert_eq!(line["badge"], "***");
+        e.reset_for_tests();
+    }
+
+    // Log lines go to stdout; SDK sys events go to stderr.
+    #[test]
+    fn sys_events_skip_stdout() {
+        let e = Engine::new();
+        e.init(Config {
+            service_id: "svc-streams".into(),
+            node_id: "n".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        e.log_sys("info", "app_event", serde_json::json!({}));
+        let events: Vec<serde_json::Value> = engine::SYS_STDOUT
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["service_id"] == "svc-streams")
+            .map(|v| v["event"].clone())
+            .collect();
+        assert_eq!(events, vec![serde_json::json!("app_event")]);
+        assert_eq!(sys_events("svc-streams", "audit_chain_unavailable"), 1);
+        e.reset_for_tests();
     }
 }
 

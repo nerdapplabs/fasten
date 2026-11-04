@@ -314,7 +314,7 @@ impl Drainer {
     }
 
     /// Rows dead-lettered or lost at stop so far.
-    pub(crate) fn unstored_total(&self) -> usize {
+    pub fn unstored_total(&self) -> usize {
         let st = lock_or_recover(&self.inner.stats);
         st.dead_lettered_total + st.lost_at_stop_total
     }
