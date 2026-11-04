@@ -13,8 +13,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   false if it lost rows, and re-init emits `audit_drain_install_incomplete`
   when the old drainer's flush timed out or rows were not stored.
 - A re-`init()` to raise mode, or with no store, flushes the old drainer for
-  up to 5 s too, instead of giving a row in backoff one try. A later
-  `close()` resolves false if that drainer lost rows.
+  up to 5 s too, instead of giving a row in backoff one try. Rows it loses
+  are reported with `audit_drain_lost_at_stop` and
+  `audit_drain_install_incomplete`; a later `close()` reports only rows lost
+  during that close, as in Python and Go.
 - `resetForTests()` also stops the drainers a re-init is retiring, and
   resolves once they have stopped.
 - An idle drainer waits for the next row instead of polling, so it no longer

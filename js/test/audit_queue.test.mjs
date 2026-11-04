@@ -523,7 +523,7 @@ for (const [name, reinit] of [
         serviceId: 'svc', nodeId: 'node', auditStoreFailureStrategy: 'raise',
     })],
 ]) {
-    test(`re-init to ${name} flushes the old drainer and close reports its loss`, async () => {
+    test(`re-init to ${name} flushes the old drainer and reports its loss`, async () => {
         const store = new BrokenStore();
         let closed;
         const captured = await captureSys(async (seen) => {
@@ -548,8 +548,9 @@ for (const [name, reinit] of [
         assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
         assert.equal(inc[0].flushed, false);
         assert.equal(inc[0].unstored, 1);
-        assert.equal(closed, false);
-        assert.equal(await close(1000), true);
+        // The loss is reported by the re-init's events; a close() with
+        // nothing pending afterwards loses nothing, as in Python and Go.
+        assert.equal(closed, true);
     });
 }
 

@@ -287,7 +287,6 @@ export class Engine {
 	};
 	_drainer = null; // also read by the audit_queue.js helpers
 	_retiring = new Set(); // drainers taken out of the slot, still stopping
-	_retireLost = false; // a re-init's retired drainer lost rows; close() reports it
 	#closing = null;
 	_retentionTimer = null;
 	_retentionFirst = null;
@@ -559,7 +558,7 @@ export class Engine {
 	}
 
 	async #close(timeoutMs) {
-		if (!this._drainer && this._retiring.size === 0) return this._takeLost();
+		if (!this._drainer && this._retiring.size === 0) return true;
 		const deadline = Date.now() + timeoutMs;
 		const left = () => Math.max(0, deadline - Date.now());
 		await this.flush(timeoutMs / 2);
@@ -570,14 +569,7 @@ export class Engine {
 			...retiring.map((e) => e.stop(left())),
 		]);
 		await Promise.all(retiring.map((e) => e.done));
-		return this._takeLost() && ok.every(Boolean);
-	}
-
-	// True unless a retired drainer lost rows since the last close().
-	_takeLost() {
-		const lost = this._retireLost;
-		this._retireLost = false;
-		return !lost;
+		return ok.every(Boolean);
 	}
 
 	// Stops the drainer and any a re-init is retiring.
@@ -597,7 +589,6 @@ export class Engine {
 		};
 		await Promise.all([stopped, ...retiring.map((e) => e.stop())]);
 		await Promise.all(retiring.map((e) => e.done));
-		this._retireLost = false;
 	}
 
 	// The in-flight pass lives on the engine, so a re-init can't start a second
@@ -676,7 +667,6 @@ export class Engine {
 			const flushed = flush ? await drainer.flush(5000) : true;
 			const ok = await (entry.stopped ?? drainer.stop(timeoutMs));
 			const unstored = drainer.unstoredTotal() - before;
-			if (flush && !ok) this._retireLost = true;
 			if (flush && (!flushed || unstored > 0)) {
 				this._drainerSysLog("warn", "audit_drain_install_incomplete", {
 					flushed,
