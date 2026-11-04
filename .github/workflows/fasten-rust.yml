@@ -76,6 +76,9 @@ jobs:
         working-directory: fasten-core
         # native-tls needs pkg-config and the OpenSSL headers. The rust
         # container runs as root and has no sudo.
+        # Without the DSN the Postgres store tests return early and pass.
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test?sslmode=disable
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
