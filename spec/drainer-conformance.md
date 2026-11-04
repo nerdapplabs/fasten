@@ -92,6 +92,16 @@ The degraded flag (`_degraded_emitted`) resets to `false` on every
 successful insert, so the next failure burst can emit
 `audit_drain_degraded` again.
 
+**Rejected rows.** When the store rejects the row itself (bad content,
+a constraint it can never meet), retrying cannot help, and the row would
+hold up every row behind it for the whole retry budget. Such a failure
+SHOULD dead-letter the row on that attempt. Over the shared C ABI, an insert
+callback signals it by returning a negative code (`FASTEN_INSERT_REJECTED`);
+any positive code is retried as usual. Only insert callbacks can signal
+this for now: the native stores, the Rust SDK's store adapter and the JS
+and Swift drainers cannot tell a rejected row from a failed write yet, so
+they retry it.
+
 ---
 
 ## §4 Sys-stream events
@@ -132,8 +142,12 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 | `audit_drain_failed` | `warn` | First failure in a new burst (`retry_count` goes from 0 to 1) |
 | `audit_drain_degraded` | `error` | `retry_count` reaches 5 within the burst |
 | `audit_drain_recovered` | `info` | An insert succeeds after one or more failures |
-| `audit_drain_dead_letter` | `error` | A row uses up `max_attempts` |
+| `audit_drain_dead_letter` | `error` | A row uses up `max_attempts`, or the store rejects it (§3) |
 | `audit_drain_abandoned` | `error` | `put()` is called after the drainer has stopped |
+| `audit_drain_stop_slow` | `warn` | Joining the drainer thread at stop took longer than the stop timeout (§10) |
+| `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or rows it held were not stored (§10) |
+| `audit_drain_lost_at_stop` | `error` | Row not stored at shutdown (§10) |
+| `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
 
 **`audit_drain_failed` fields:**
 
@@ -171,6 +185,32 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 
 ```json
 { "reason": "drainer_stopped", "row_id": "<string|null>" }
+```
+
+**`audit_drain_stop_slow` fields:**
+
+```json
+{ "waited_seconds": <float> }
+```
+
+**`audit_drain_install_incomplete` fields:**
+
+```json
+{ "flushed": <bool>, "unstored": <int> }
+```
+
+`unstored` counts rows dead-lettered or lost at stop.
+
+**`audit_drain_lost_at_stop` fields** (one event per row):
+
+```json
+{ "error_type": "<ExceptionType>", "row_id": "<string|null>" }
+```
+
+**`audit_drain_recovered_at_stop` fields** (one event per stop):
+
+```json
+{ "row_ids": ["<string>", ...] }
 ```
 
 ---
@@ -423,12 +463,34 @@ first five delays are 100 ms, 200 ms, 400 ms, 800 ms and 1600 ms.
 2. Interrupt any backoff sleep in progress immediately.
 3. Drain the remaining queue entries with at most one attempt each. There
    is no retry on the shutdown path.
-4. Join the drainer thread with a short timeout.
+4. Join the drainer thread. Where the thread may be inside a host store
+   callback (the shared C ABI), the join has no timeout, since the host
+   may release that callback once stop returns; if it takes longer than
+   the stop timeout, emit `audit_drain_stop_slow`. Other implementations
+   MAY join with a short timeout.
+
+A row that fails its shutdown attempt, or is still unstored when the
+shutdown timeout passes, is reported with `audit_drain_lost_at_stop`, not
+`audit_drain_dead_letter`, and the SDK's `close()` / `Close()` returns
+false. An SDK that stores rows its drainer still held after stopping it
+reports them with `audit_drain_recovered_at_stop`.
+
+A lost report can be a false alarm, but a loss is never missed. A store
+call left behind at the deadline may still store its row, and if the
+process exits before the SDK can report that, no
+`audit_drain_recovered_at_stop` follows. A row not reported lost was
+stored.
 
 `install_drainer()` / `init()` on a running engine MUST:
 
 1. Build the new drainer first.
-2. Swap it into the slot atomically, under a mutex.
-3. Flush the old drainer, outside the mutex, then stop it.
+2. Swap it into the slot atomically, under a mutex. The old drainer must stay
+   visible to `flush()` throughout, so a flush during the swap waits for
+   its rows too.
+3. Flush the old drainer, outside the mutex and for up to 5 s, then stop it. If
+   the flush timed out or rows were not stored, emit
+   `audit_drain_install_incomplete`.
 
 This order means no in-flight rows are dropped during re-init.
+Closing the drainer also waits for an old drainer that a concurrent
+re-install is still stopping.
