@@ -29,6 +29,8 @@ public struct Meta: Sendable {
     public let description:    String
     public let emitter:        String
     public let retentionClass: RetentionClass
+    /// The row's detail may hold personal data; `Fasten.redactExpired` redacts it.
+    public let piiInDetail:    Bool
 
     public init(
         id:             Code,
@@ -38,7 +40,8 @@ public struct Meta: Sendable {
         severity:       Severity       = .info,
         description:    String,
         emitter:        String,
-        retentionClass: RetentionClass = .medium
+        retentionClass: RetentionClass = .medium,
+        piiInDetail:    Bool           = false
     ) {
         self.id             = id
         self.domain         = domain
@@ -48,6 +51,7 @@ public struct Meta: Sendable {
         self.description    = description
         self.emitter        = emitter
         self.retentionClass = retentionClass
+        self.piiInDetail    = piiInDetail
     }
 }
 
@@ -83,6 +87,15 @@ final class CodeRegistry: @unchecked Sendable {
 
     func lookup(_ code: Code) -> Meta? {
         lock.withLock { cache[code] }
+    }
+
+    /// Codes that declare `piiInDetail` or use retention class short, as in
+    /// the Python SDK's `pii_codes()`.
+    func piiCodes() -> [Code] {
+        lock.withLock {
+            cache.values.filter { $0.piiInDetail || $0.retentionClass == .short_ }
+                .map(\.id).sorted()
+        }
     }
 
     func clear() {
