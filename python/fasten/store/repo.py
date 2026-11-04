@@ -157,7 +157,7 @@ def verified_prefix(
 
     - Chain intact → ``(sealed_rows_sorted, None, "")``.
     - Chain broken → ``(sealed rows with monotonic_seq < first_break_at,
-      first_break_at, reason)`` — the prefix stops before the first broken row,
+      first_break_at, reason)``: the prefix stops before the first broken row,
       so the verified portion can be inserted while the break and everything
       after it is rejected.
 
