@@ -986,6 +986,9 @@ class CFastenDrainer {
     // Rows dead-lettered or lost at stop so far.
     std::size_t unstored() const { return unstored_.load(); }
 
+    // True once shutdown() has started.
+    bool stopping() const { return stopped_.load(); }
+
   private:
     // fasten_drainer_enqueue's FASTEN_ERR_DRAINER_STOPPED: the drainer is
     // stopping, the row was not queued, and the core has reported it.
@@ -1673,8 +1676,8 @@ inline std::unique_ptr<QueueStats> queue_stats() {
 
 // Wait until queued audit rows are written or the timeout passes. Returns
 // true if everything drained, and true at once when no drainer is running.
-// A drainer a re-init is replacing is waited for as well. A drainer still
-// running when the timeout is used up counts as not drained.
+// A drainer a re-init is replacing is waited for as well. Each drainer gets
+// at least 1 ms, so flush(0) is true when nothing is queued.
 inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     auto& g = detail_::globals();
     std::vector<std::shared_ptr<detail_::CFastenDrainer>> ds;
@@ -1687,13 +1690,10 @@ inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(
     bool drained = true;
     for (const auto& d : ds) {
         const auto left = deadline - std::chrono::steady_clock::now();
-        if (left <= std::chrono::steady_clock::duration::zero()) {
-            drained = false;
-            continue;
-        }
-        // Rounded up, so under 1 ms left still waits 1 ms.
+        // Rounded up, and never below 1 ms.
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(left);
         if (ms < left) ++ms;
+        if (ms < std::chrono::milliseconds(1)) ms = std::chrono::milliseconds(1);
         if (!d->flush(ms)) drained = false;
     }
     return drained;

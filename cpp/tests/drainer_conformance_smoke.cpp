@@ -433,6 +433,16 @@ void short_flush_does_not_wait_for_a_stuck_row() {
     std::cout << "short flush does not wait for a stuck row: PASS\n";
 }
 
+// flush(0) with nothing queued is true: the target is reached at call time.
+void zero_flush_with_idle_drainer() {
+    reset_state();
+    fasten::set_audit_sink([](const fasten::Row&) {});
+    fasten::init(cfg("queue"));
+    assert(fasten::queue_stats());
+    assert(fasten::flush(milliseconds(0)));
+    std::cout << "zero flush with an idle drainer: PASS\n";
+}
+
 // The core's drainer events keep their JSON types on stderr.
 void core_events_keep_json_types() {
     reset_state();
@@ -506,7 +516,7 @@ void flush_during_shutdown_waits_for_close() {
     d.put(a);
     while (!in_sink) std::this_thread::sleep_for(milliseconds(5));
     std::thread stopper([&] { d.shutdown(milliseconds(1000)); });
-    std::this_thread::sleep_for(milliseconds(50));
+    while (!d.stopping()) std::this_thread::sleep_for(milliseconds(1));
     bool early = d.flush(milliseconds(100));
     bool later = d.flush(milliseconds(3000));
     stopper.join();
@@ -536,6 +546,7 @@ int main() {
     shutdown_with_a_sink_that_puts();
     reinit_under_load();
     short_flush_does_not_wait_for_a_stuck_row();
+    zero_flush_with_idle_drainer();
     core_events_keep_json_types();
     core_event_fields_are_redacted();
     reinit_reports_unstored_rows();

@@ -132,7 +132,7 @@ void core_error_replaces_every_value() {
 fasten::Config failing_redact_config() {
     fasten::Config c{"svc", "node", ""};
     c.audit_store_failure_strategy = "raise";
-    c.extra_redact_keys = {std::string(2000000, 'k')};
+    c.extra_redact_keys = {std::string(200000, 'k')};
     return c;
 }
 

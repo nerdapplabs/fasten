@@ -20,8 +20,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   through the SDK's sys log, redacted, so they reach `query_syslog()` as
   well as stderr. Their numbers and booleans stay JSON numbers and
   booleans on the stderr line.
-- `fasten::flush()` with under 1 ms left no longer waits with no timeout;
-  a drainer still running when the time is used up counts as not drained.
+- `fasten::flush()` with under 1 ms left, including `flush(0)`, no longer
+  waits with no timeout: each drainer gets at least 1 ms, so it returns
+  true at once when nothing is queued and false after 1 ms when rows are
+  still pending.
 - `fasten::flush()` while a re-init is stopping the old drainer waits for
   the stop to finish, and returns false if it does not finish in time.
 - A re-init whose old drainer did not flush in time, or held rows that
