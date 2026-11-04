@@ -6,6 +6,32 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: redact values when the core can't parse the input (C++)
+
+- Strings are now written as valid UTF-8 JSON: bytes that are not valid
+  UTF-8 become U+FFFD, so the core can redact detail and log fields that
+  contain them. Before, such fields were returned unredacted.
+- If the core still returns an error, every value is replaced with the
+  redaction token (keys are kept) and a `redact_failed` sys event with
+  `error_type` is written to stderr and the sys ring.
+- `fasten::flush()` during a re-init also waits for the drainer being
+  replaced, not only the new one.
+- The core drainer's sys events (`audit_drain_*`, `audit_queue_*`) now go
+  through the SDK's sys log, redacted, so they reach `query_syslog()` as
+  well as stderr. Their numbers and booleans stay JSON numbers and
+  booleans on the stderr line.
+- `fasten::flush()` with under 1 ms left, including `flush(0)`, no longer
+  waits with no timeout: each drainer gets at least 1 ms, so it returns
+  true at once when nothing is queued and false after 1 ms when rows are
+  still pending.
+- `fasten::flush()` while a re-init is stopping the old drainer waits for
+  the stop to finish, and returns false if it does not finish in time.
+- A re-init whose old drainer did not flush in time, or held rows that
+  were not stored, emits `audit_drain_install_incomplete` with `flushed`
+  and `unstored`.
+- When the core returns an error, an `AUDIT_ROW_REDACTED` row keeps its
+  numeric `redacted_seq`.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
