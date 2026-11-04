@@ -6,6 +6,68 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: fasten-core stores keep the chain fields (#139, item 1)
+
+- `SqliteStore` and `PostgresStore` store `prev_hash`, `hash`,
+  `canonical_form_id`, `detail_salt` and `detail_commitment` and read them
+  back. A sealed row passed to `fasten_store_insert` used to be stored without
+  its hash, so every `fasten-core/bindings/*` package lost the chain.
+  A row sent with `monotonic_seq: 0` gets a store-allocated seq and is stored
+  unsealed: its chain fields are dropped, as Python and Go overwrite them on
+  allocation, since a hash sealed over another seq could never verify.
+- `Row` has these as typed optional fields instead of leaving them in
+  `extra`. A row passed through the C interface or the drainer keeps an
+  absent field absent. A row read back from a store carries `prev_hash` and
+  `hash` (`""` when unsealed) and `canonical_form_id` (`"1"` by default), as
+  Python's rows do; salt and commitment only on a form "2" row.
+- Opening a store adds the five columns to a table an older fasten-core
+  created. It checks the table first and only alters what is missing, so
+  opening an up-to-date table takes no write lock (SQLite) and runs no
+  `ALTER TABLE` (Postgres). Salt and commitment are written as `''` when absent, so a table the
+  Go store created (NOT NULL there) accepts the row; both read back as absent.
+- Every table now has the chain columns, so redaction always applies the
+  spec §7.1 rule: unsealed and sealed form-"2" rows are redacted, sealed
+  form-"1" rows are refused.
+
+### Fixed: fasten-core stores assign monotonic_seq; PII redaction (#124)
+
+- `SqliteStore` and `PostgresStore` now allocate `monotonic_seq` when a row
+  arrives with `monotonic_seq: 0`: next seq for its `source_node_id`, in the
+  insert transaction (`BEGIN IMMEDIATE` on SQLite, the shared
+  `pg_advisory_xact_lock` on Postgres). Two handles on one store no longer
+  write duplicate seqs (#92). Rows stay unsealed (spec §8.2). A non-zero seq
+  is written as given, under the same lock on Postgres, so it cannot take
+  the seq a concurrent seq-0 insert has just picked.
+- **Breaking:** fresh tables get `UNIQUE (source_node_id, monotonic_seq)`.
+  A row that reuses a node's seq there now fails with the new
+  `Error::SeqClash`, and the drainer dead-letters a row with an explicit
+  seq at once instead of retrying (a seq-0 row is retried, as it gets a
+  fresh seq); before, the row was stored with the duplicate seq. A repeated
+  `id` is still a no-op (`ON CONFLICT (id) DO NOTHING`).
+- Opening a table created before this release adds a non-unique
+  `idx_<table>_node_seq` index, so seq allocation does not scan the table.
+  The first open builds it while holding the write lock (SQLite) or a
+  `SHARE` lock on the table (Postgres); create it beforehand on a big,
+  busy table. Opening a table that is already up to date runs no DDL and
+  takes no write lock.
+- PII retention by redaction (spec §7.1): `list_redaction_candidates` and
+  `redact_rows` on the `Store` trait, exported as
+  `fasten_store_list_redaction_candidates` / `fasten_store_redact_rows`.
+  `detail` becomes JSON `null` (and `detail_salt`, when the table has one,
+  `''`); rows are never deleted. On a table shared with a sealing SDK,
+  sealed form-`"1"` rows are left alone and `list_redaction_candidates`
+  reports how many it left out (`skipped`; the C export's `out_skipped`, may
+  be NULL); sealed form-`"2"` rows are redacted. The SQLite store binds ids and codes
+  in chunks of 500 inside one transaction, so long lists stay under SQLite's
+  bound-variable limit.
+- `PostgresStore` takes the `fasten.bootstrap.<table>` advisory lock (same key
+  as Python) around its schema bootstrap, so stores opening a fresh database
+  at once no longer fail on a duplicate `pg_type` key.
+- Spec: §8.2 (allocation without sealing), §2 and §2.1 state `prev_hash`
+  comes from the node's last sealed row, §2.1 makes the node-keyed
+  `pg_advisory_xact_lock` the required Postgres lock, and §7.1 makes
+  redacting unsealed rows the rule for every SDK.
+
 ### Changed: shared drainer stop, install and close (fasten-core C ABI)
 
 - `fasten_drainer_install` on a handle that already has a drainer now

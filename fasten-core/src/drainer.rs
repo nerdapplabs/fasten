@@ -427,7 +427,7 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                         on_lost_at_stop(inner, &row, &error_type(&e));
                         break;
                     }
-                    if attempt >= inner.cfg.max_attempts || rejected(&e) {
+                    if attempt >= inner.cfg.max_attempts || rejected(&e, &row) {
                         on_dead_letter(inner, &row, attempt, &msg);
                         break;
                     }
@@ -448,9 +448,15 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
 }
 
 /// The store refused the row itself, so retrying cannot help: an insert
-/// callback returned a negative code (`FASTEN_INSERT_REJECTED`).
-fn rejected(e: &Error) -> bool {
-    matches!(e, Error::CallbackFailed(rc) if *rc < 0)
+/// callback returned a negative code (`FASTEN_INSERT_REJECTED`), or a row
+/// with an explicit seq clashed. A seq-0 row gets a fresh seq on the next
+/// attempt, so its clash is retried.
+fn rejected(e: &Error, row: &Row) -> bool {
+    match e {
+        Error::CallbackFailed(rc) => *rc < 0,
+        Error::SeqClash(_) => row.monotonic_seq != 0,
+        _ => false,
+    }
 }
 
 /// The variant name, e.g. `CallbackFailed`.

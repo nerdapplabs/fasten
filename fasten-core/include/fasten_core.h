@@ -111,13 +111,24 @@ void fasten_store_close(FastenStore* store);
  *
  * A row whose `id` already exists is ignored, so inserts are idempotent.
  *
+ * monotonic_seq 0 means "allocate": the store assigns the next seq for the
+ * row's source_node_id inside the insert transaction (spec §2.1, §8.2). The
+ * row is stored unsealed: any chain fields it carries are dropped (stored as
+ * prev_hash "", hash "", canonical_form_id "1", no salt or commitment). A
+ * non-zero monotonic_seq is written as given, chain fields included; on a
+ * table created by this library a (source_node_id, monotonic_seq) clash is
+ * an error.
+ *
  * @param store    Non-null handle returned by fasten_store_open().
  * @param row_json UTF-8 JSON object matching the fasten wire schema.
  *                 Required fields: id, wire_version, origin_id,
  *                 monotonic_seq, timestamp, code, action, severity,
  *                 service_id, source_node_id, actor, actor_kind, target,
  *                 category, domain, method, request_id, detail.
- *                 Optional: tenant_id, pii_in_detail, shipped_at.
+ *                 Optional: tenant_id, pii_in_detail, shipped_at, and the
+ *                 chain fields prev_hash, hash, canonical_form_id,
+ *                 detail_salt, detail_commitment, stored as given when
+ *                 monotonic_seq is non-zero.
  * @param out_err  Set on error; may be NULL.
  *
  * @return  FASTEN_OK on success, error code otherwise (out_err set).
@@ -249,6 +260,7 @@ FastenErrorCode fasten_store_purge(
 
 /**
  * Return the maximum monotonic_seq across all stored rows, or 0 if empty.
+ * Table-wide, not per node; do not use it to allocate a seq.
  *
  * @param store   Non-null handle.
  * @param out_seq Set to the maximum sequence number on success; must be
@@ -260,6 +272,55 @@ FastenErrorCode fasten_store_purge(
 FastenErrorCode fasten_store_max_monotonic_seq(
     FastenStore* store,
     uint64_t*    out_seq,
+    char**       out_err
+);
+
+/* PII retention (spec §7.1) */
+
+/**
+ * List rows a PII retention horizon would redact: timestamp < before, code
+ * in codes, detail not already redacted. Sealed rows (a non-empty hash) are
+ * never listed.
+ *
+ * @param store          Non-null handle.
+ * @param before_iso8601 ISO-8601 UTC cutoff; rows strictly older qualify.
+ * @param codes_json     UTF-8 JSON array of codes: ["USER_LOGIN",...].
+ * @param out_json       On success: heap-allocated JSON array of
+ *                       {"id": "...", "monotonic_seq": n}, ordered by
+ *                       monotonic_seq. Free with fasten_store_free_str().
+ * @param out_skipped    On success: number of matching sealed rows left out
+ *                       of out_json. May be NULL.
+ * @param out_err        Set on error; may be NULL.
+ *
+ * @return  FASTEN_OK on success, error code otherwise (out_err set).
+ *          A callback store (fasten_store_from_callback) returns
+ *          FASTEN_ERR_BACKEND.
+ */
+FastenErrorCode fasten_store_list_redaction_candidates(
+    FastenStore* store,
+    const char*  before_iso8601,
+    const char*  codes_json,
+    char**       out_json,
+    uint64_t*    out_skipped,
+    char**       out_err
+);
+
+/**
+ * Redact rows by id: set detail to the JSON literal null. The row itself is
+ * kept. Idempotent; sealed rows are left alone.
+ *
+ * @param store        Non-null handle.
+ * @param ids_json     UTF-8 JSON array of ids: ["id1","id2",...].
+ * @param out_ids_json On success: the ids passed in, as a heap-allocated JSON
+ *                     array. Free with fasten_store_free_str(). May be NULL.
+ * @param out_err      Set on error; may be NULL.
+ *
+ * @return  FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_store_redact_rows(
+    FastenStore* store,
+    const char*  ids_json,
+    char**       out_ids_json,
     char**       out_err
 );
 
