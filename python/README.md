@@ -168,9 +168,14 @@ from fasten.checkpoints import FileCheckpointSink, load_checkpoints, publish_che
 publish_checkpoints(store, FileCheckpointSink("/mnt/worm/checkpoints.jsonl"))
 # HttpCheckpointSink(url) POSTs them instead.
 
-rows = store.chain_tail("node-1", 10_000)
-result = verify_chain(rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
+result = verify_chain(all_rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
 ```
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and its newest checkpoint must fall within them. To check
+a page or one node, pass `partial=True`; checkpoints below its rows, or for
+nodes not in them, are then skipped. If the file's last line was cut short
+by a crash, `load_checkpoints` skips it and logs a warning.
 
 ## Tests
 

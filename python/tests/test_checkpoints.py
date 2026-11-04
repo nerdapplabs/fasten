@@ -3,6 +3,7 @@ published latest seq and hash detects a cut-off tail and a full re-seal."""
 import dataclasses
 import http.server
 import json
+import logging
 import os
 import threading
 import uuid
@@ -84,9 +85,40 @@ def test_a_resealed_chain_fails_against_the_earlier_checkpoint():
     assert result.reason == f"row {resealed[-1].id}: hash differs from checkpoint at seq 5"
 
 
-def test_a_checkpoint_older_than_the_oldest_row_is_skipped():
+def test_a_retention_purge_below_the_newest_checkpoint_verifies():
     rows = _chain(range(1, 11))
     assert verify_chain(rows[4:], checkpoints=[_cp(rows[1]), _cp(rows[-1])]).ok
+
+
+def test_a_chain_resealed_above_the_newest_checkpoint_fails():
+    rows = _chain(range(1, 11))
+    resealed = _chain(range(11, 21), target="u/2")
+    assert verify_chain(resealed).ok
+    result = verify_chain(resealed, checkpoints=[_cp(rows[4]), _cp(rows[-1])])
+    assert not result.ok and result.first_break_at == 11
+    assert result.reason == ("node 'node-1': rows start at seq 11, "
+                             "after the newest checkpoint at seq 10")
+
+
+def test_a_checkpointed_node_with_no_rows_fails():
+    one, two = _chain(range(1, 4)), _chain(range(1, 6), node="node-2")
+    result = verify_chain(one, checkpoints=[_cp(one[-1]), _cp(two[1]), _cp(two[-1])])
+    assert not result.ok and result.first_break_at == 5
+    assert result.reason == "node 'node-2': no rows, but checkpointed at seq 5"
+    result = verify_chain([], checkpoints=[_cp(two[-1])])
+    assert not result.ok and result.first_break_at == 5 and result.total_rows == 0
+
+
+def test_partial_skips_checkpoints_outside_the_rows():
+    rows = _chain(range(1, 11))
+    other = _chain(range(1, 4), node="node-2")
+    resealed = _chain(range(11, 21), target="u/2")
+    cps = [_cp(rows[-1]), _cp(other[-1])]
+    assert verify_chain(resealed, checkpoints=cps, partial=True).ok
+    assert verify_chain([], checkpoints=cps, partial=True).ok
+    assert verify_chain(rows[4:], checkpoints=cps, partial=True).ok
+    result = verify_chain(rows[:6], checkpoints=cps, partial=True)
+    assert result.first_break_at == 7 and "chain ends at seq 6" in result.reason
 
 
 def test_a_missing_checkpointed_row_inside_the_chain_breaks_there():
@@ -100,9 +132,9 @@ def test_a_missing_checkpointed_row_inside_the_chain_breaks_there():
     assert result.reason == "node 'node-1': no row at checkpointed seq 3"
 
 
-def test_a_checkpoint_for_a_node_not_in_the_rows_is_skipped():
+def test_partial_skips_a_checkpoint_for_a_node_not_in_the_rows():
     other = _chain(range(1, 4), node="node-2")
-    assert verify_chain(_chain(range(1, 4)), checkpoints=[_cp(other[-1])]).ok
+    assert verify_chain(_chain(range(1, 4)), checkpoints=[_cp(other[-1])], partial=True).ok
 
 
 def test_the_lowest_break_across_nodes_is_reported():
@@ -144,9 +176,49 @@ def test_load_rejects_a_line_that_is_not_a_checkpoint(tmp_path):
         load_checkpoints(path)
 
 
+@pytest.mark.parametrize("line", [
+    '{"source_node_id": "n", "monotonic_seq": 1, "hash": "h", "anchored_at": "t", "x": 1}',
+    '{"source_node_id": "n", "Monotonic_Seq": 1, "hash": "h", "anchored_at": "t"}',
+    '{"source_node_id": null, "monotonic_seq": 1, "hash": "h", "anchored_at": "t"}',
+    '[]',
+])
+def test_load_rejects_other_keys_and_values(tmp_path, line):
+    path = tmp_path / "bad.jsonl"
+    path.write_text(line + "\n")
+    with pytest.raises(ValueError):
+        load_checkpoints(path)
+
+
+def test_load_skips_an_unfinished_last_line(tmp_path, caplog):
+    cps = [_cp(r) for r in _chain(range(1, 3))]
+    path = tmp_path / "cp.jsonl"
+    FileCheckpointSink(path).publish(cps)
+    with open(path, "a") as f:
+        f.write('{"source_node_id": "node-1", "monot')
+    with caplog.at_level(logging.WARNING, logger="fasten.checkpoints"):
+        assert load_checkpoints(path) == cps
+    assert "unfinished last line" in caplog.text
+
+
+def test_load_reads_a_complete_last_line_without_a_newline(tmp_path):
+    cps = [_cp(r) for r in _chain(range(1, 3))]
+    path = tmp_path / "cp.jsonl"
+    path.write_text("\n".join(json.dumps(c.to_dict()) for c in cps))
+    assert load_checkpoints(path) == cps
+
+
+def test_load_rejects_an_unfinished_line_before_the_last(tmp_path):
+    cp = json.dumps(_cp(_chain([1])[0]).to_dict())
+    path = tmp_path / "cp.jsonl"
+    path.write_text('{"source_node_id": "node-1", "monot\n' + cp + "\n")
+    with pytest.raises(ValueError):
+        load_checkpoints(path)
+
+
 class _Server:
     def __init__(self, status: int):
         self.bodies: list = []
+        self.gets = 0
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -155,6 +227,14 @@ class _Server:
                 outer.bodies.append((self.headers["Content-Type"],
                                      json.loads(self.rfile.read(n))))
                 self.send_response(status)
+                if 300 <= status < 400:
+                    self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                outer.gets += 1
+                self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -174,6 +254,7 @@ class _Server:
 @pytest.fixture
 def server(request):
     s = _Server(request.param)
+    s.status = request.param
     yield s
     s.close()
 
@@ -189,6 +270,31 @@ def test_http_sink_posts_a_json_array(server):
 def test_http_sink_raises_on_an_error_status(server):
     with pytest.raises(OSError):
         HttpCheckpointSink(server.url, timeout=5).publish([_cp(_chain([1])[0])])
+
+
+@pytest.mark.parametrize("server", [301, 302, 303, 307], indirect=True)
+def test_http_sink_fails_on_a_redirect(server):
+    with pytest.raises(OSError, match=f"HTTP {server.status}"):
+        HttpCheckpointSink(server.url, timeout=5).publish([_cp(_chain([1])[0])])
+    assert len(server.bodies) == 1 and server.gets == 0
+
+
+@pytest.mark.parametrize("server", [500], indirect=True)
+def test_http_sink_errors_leave_out_userinfo_and_query(server):
+    cps = [_cp(_chain([1])[0])]
+    with pytest.raises(OSError) as err:
+        HttpCheckpointSink(f"{server.url}?token=tok-456", timeout=5).publish(cps)
+    assert str(err.value) == f"checkpoint sink {server.url}: HTTP 500"
+    # urllib takes userinfo as part of the host name, so this one fails to
+    # connect.
+    host = server.url.removeprefix("http://")
+    with pytest.raises(OSError) as err:
+        HttpCheckpointSink(f"http://user:pw-123@{host}?token=tok-456", timeout=5).publish(cps)
+    assert str(err.value).startswith(f"checkpoint sink {server.url}: ")
+    assert "pw-123" not in str(err.value) and err.value.__cause__ is None
+    with pytest.raises(ValueError) as verr:
+        HttpCheckpointSink("ftp://user:pw-123@example.com/x?token=tok-456")
+    assert str(verr.value).endswith("ftp://example.com/x")
 
 
 def test_http_sink_refuses_other_schemes():
@@ -307,7 +413,8 @@ def test_checkpoint_vectors():
     assert len(cases) >= 8
     for case in cases:
         result = verify_chain(_vector_rows(case["rows"]),
-                              checkpoints=[Checkpoint.from_dict(c) for c in case["checkpoints"]])
+                              checkpoints=[Checkpoint.from_dict(c) for c in case["checkpoints"]],
+                              partial=case["partial"])
         want = case["expected"]
         got = {"ok": result.ok, "first_break_at": result.first_break_at,
                "reason": result.reason}

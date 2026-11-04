@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate spec/checkpoint-vectors.json: rows, checkpoints and the
-verify_chain result Python gives for them (spec chain-replication.md §9).
+verify_chain result Python gives for them, whole-chain or partial (spec chain-replication.md §9).
 
 Python and Go both run every case and must give the same ok, first_break_at
 and reason. Salts are pinned so the output is the same on every run.
@@ -41,9 +41,10 @@ def _row(seq: int, node: str, target: str) -> AuditRow:
     )
 
 
-def _chain(n: int, node: str = "node-1", target: str = "order/1") -> list[AuditRow]:
+def _chain(n: int, node: str = "node-1", target: str = "order/1",
+           start: int = 1) -> list[AuditRow]:
     out, prev = [], "genesis"
-    for seq in range(1, n + 1):
+    for seq in range(start, start + n):
         row = seal(prev, _row(seq, node, target))
         prev = row.hash
         out.append(row)
@@ -58,10 +59,12 @@ def _cp(row: AuditRow) -> Checkpoint:
 def build() -> dict:
     cases = []
 
-    def add(label: str, rows: list[AuditRow], cps: list[Checkpoint]) -> None:
-        result = verify_chain(rows, checkpoints=cps)
+    def add(label: str, rows: list[AuditRow], cps: list[Checkpoint],
+            partial: bool = False) -> None:
+        result = verify_chain(rows, checkpoints=cps, partial=partial)
         cases.append({
             "label": label,
+            "partial": partial,
             "rows": [json.loads(json.dumps(r.to_dict(), default=str)) for r in rows],
             "checkpoints": [c.to_dict() for c in cps],
             "expected": {"ok": result.ok, "first_break_at": result.first_break_at,
@@ -77,7 +80,15 @@ def build() -> dict:
     unsealed = [dataclasses.replace(_row(s, "node-1", "order/0"), hash="", prev_hash="",
                                     detail_salt=None) for s in (1, 2)]
     add("missing_row_in_span", unsealed + chain[3:], [_cp(chain[2])])
-    add("node_not_in_rows_skipped", chain, [_cp(_chain(3, node="node-2")[-1])])
+    other = [_cp(_chain(3, node="node-2")[-1])]
+    add("checkpointed_node_without_rows", chain, other)
+    add("node_not_in_rows_skipped_partial", chain, other, partial=True)
+    add("no_rows", [], [_cp(chain[-1])])
+    add("no_rows_partial", [], [_cp(chain[-1])], partial=True)
+    resealed_above = _chain(6, target="order/3", start=7)
+    add("rows_start_after_newest_checkpoint", resealed_above, [_cp(chain[2]), _cp(chain[-1])])
+    add("rows_start_after_newest_checkpoint_partial", resealed_above,
+        [_cp(chain[2]), _cp(chain[-1])], partial=True)
     a, b = _chain(6, node="node-a"), _chain(6, node="node-b")
     add("two_nodes_lowest_break", a[:5] + b[:2], [_cp(a[-1]), _cp(b[-1])])
     edited = list(chain[:4])

@@ -1,15 +1,17 @@
 package fasten
 
 import (
-	"bufio"
 	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
+	"time"
 )
 
 // Checkpoint records a node's latest sealed row (spec §9). Published
@@ -62,7 +64,9 @@ func (s FileCheckpointSink) Publish(_ context.Context, checkpoints []Checkpoint)
 }
 
 // HTTPCheckpointSink POSTs the checkpoints as one JSON array to URL. Client
-// nil means http.DefaultClient; the context bounds the request.
+// nil means a client with a 10 s timeout; the context also bounds the
+// request. Redirects are not followed, whatever the client, and errors name
+// the URL without userinfo or query.
 type HTTPCheckpointSink struct {
 	URL    string
 	Client *http.Client
@@ -77,24 +81,47 @@ func (s HTTPCheckpointSink) Publish(ctx context.Context, checkpoints []Checkpoin
 	if err != nil {
 		return err
 	}
+	where := redactURL(s.URL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return fmt.Errorf("checkpoint sink %s: invalid url", where)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := s.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := s.client().Do(req)
 	if err != nil {
-		return err
+		// A *url.Error names the request URL with its query.
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			err = ue.Err
+		}
+		return fmt.Errorf("checkpoint sink %s: %w", where, err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("checkpoint sink %s: HTTP %d", s.URL, resp.StatusCode)
+		return fmt.Errorf("checkpoint sink %s: HTTP %d", where, resp.StatusCode)
 	}
 	return nil
+}
+
+// client is a copy of s.Client, or one with a 10 s timeout, that does not
+// follow redirects: a client follows a 301-303 on POST as a GET without the
+// body.
+func (s HTTPCheckpointSink) client() *http.Client {
+	c := http.Client{Timeout: 10 * time.Second}
+	if s.Client != nil {
+		c = *s.Client
+	}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
+}
+
+// redactURL is raw as scheme://host[:port]/path, for error messages: no
+// userinfo, query or fragment.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(invalid url)"
+	}
+	return u.Scheme + "://" + u.Host + u.Path
 }
 
 // CheckpointStore is what TakeCheckpoints reads: each node's sealed row
@@ -135,42 +162,79 @@ func PublishCheckpoints(ctx context.Context, store CheckpointStore, sink Checkpo
 	return checkpoints, nil
 }
 
+// ErrPartialLastLine is returned by LoadCheckpoints, with the checkpoints
+// before it, when the file's last line has no newline and is not valid
+// JSON, as a crash mid-append leaves it. Check it with errors.Is to go on
+// with those checkpoints. Python logs a warning for it instead.
+var ErrPartialLastLine = errors.New("checkpoint file ends in an unfinished line")
+
 // LoadCheckpoints reads back a file written by FileCheckpointSink. Blank
-// lines are skipped.
+// lines are skipped. A line that is not a checkpoint, with exactly the four
+// fields, fails the load, except an unfinished last line: see
+// ErrPartialLastLine.
 func LoadCheckpoints(path string) ([]Checkpoint, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	lines := bytes.Split(data, []byte("\n"))
+	// The text after the last newline; empty when the file ends with one.
+	last := lines[len(lines)-1]
+	lines = lines[:len(lines)-1]
 	var out []Checkpoint
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var raw struct {
-			SourceNodeID *string `json:"source_node_id"`
-			MonotonicSeq *int64  `json:"monotonic_seq"`
-			Hash         *string `json:"hash"`
-			AnchoredAt   *string `json:"anchored_at"`
+		cp, err := parseCheckpoint(line)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		if err := json.Unmarshal(line, &raw); err != nil {
-			return nil, fmt.Errorf("%s: not a checkpoint: %w", path, err)
-		}
-		if raw.SourceNodeID == nil || raw.MonotonicSeq == nil || raw.Hash == nil || raw.AnchoredAt == nil {
-			return nil, fmt.Errorf("%s: not a checkpoint: %s", path, line)
-		}
-		out = append(out, Checkpoint{SourceNodeID: *raw.SourceNodeID, MonotonicSeq: *raw.MonotonicSeq, Hash: *raw.Hash, AnchoredAt: *raw.AnchoredAt})
+		out = append(out, cp)
 	}
-	return out, sc.Err()
+	if len(bytes.TrimSpace(last)) > 0 {
+		if !json.Valid(last) {
+			return out, fmt.Errorf("%s: %w", path, ErrPartialLastLine)
+		}
+		cp, err := parseCheckpoint(last)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		out = append(out, cp)
+	}
+	return out, nil
+}
+
+// parseCheckpoint decodes one line. Keys must match exactly, case included,
+// and no other key may appear, as in Python.
+func parseCheckpoint(line []byte) (Checkpoint, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(line, &fields); err != nil {
+		return Checkpoint{}, fmt.Errorf("not a checkpoint: %w", err)
+	}
+	var cp Checkpoint
+	targets := map[string]any{
+		"source_node_id": &cp.SourceNodeID, "monotonic_seq": &cp.MonotonicSeq,
+		"hash": &cp.Hash, "anchored_at": &cp.AnchoredAt,
+	}
+	if len(fields) != len(targets) {
+		return Checkpoint{}, fmt.Errorf("not a checkpoint: %s", line)
+	}
+	for key, target := range targets {
+		v, ok := fields[key]
+		// Unmarshal leaves a field unset on null rather than failing.
+		if !ok || string(v) == "null" || json.Unmarshal(v, target) != nil {
+			return Checkpoint{}, fmt.Errorf("not a checkpoint: %s", line)
+		}
+	}
+	return cp, nil
 }
 
 // checkpointBreak checks rows, one copy per id, against checkpoints and
 // returns the lowest-seq break, or nil. Checkpoints are taken by node, then
-// seq, as in Python, so both report the same break.
-func checkpointBreak(rows []Row, checkpoints []Checkpoint) *VerifyResult {
+// seq, as in Python, so both report the same break. Unless partial, each
+// node's newest checkpoint must fall within its rows.
+func checkpointBreak(rows []Row, checkpoints []Checkpoint, partial bool) *VerifyResult {
 	if len(checkpoints) == 0 {
 		return nil
 	}
@@ -178,17 +242,27 @@ func checkpointBreak(rows []Row, checkpoints []Checkpoint) *VerifyResult {
 	for _, row := range rows {
 		byNode[row.SourceNodeID] = append(byNode[row.SourceNodeID], row)
 	}
+	newest := map[string]int64{}
+	for _, cp := range checkpoints {
+		if seq, ok := newest[cp.SourceNodeID]; !ok || cp.MonotonicSeq > seq {
+			newest[cp.SourceNodeID] = cp.MonotonicSeq
+		}
+	}
 	sorted := slices.Clone(checkpoints)
 	slices.SortStableFunc(sorted, func(a, b Checkpoint) int {
 		return cmp.Or(cmp.Compare(a.SourceNodeID, b.SourceNodeID), cmp.Compare(a.MonotonicSeq, b.MonotonicSeq))
 	})
 	var first *VerifyResult
 	for _, cp := range sorted {
-		nodeRows := byNode[cp.SourceNodeID]
-		if len(nodeRows) == 0 {
-			continue
+		mustCover := !partial && cp.MonotonicSeq == newest[cp.SourceNodeID]
+		var found *VerifyResult
+		if nodeRows := byNode[cp.SourceNodeID]; len(nodeRows) > 0 {
+			found = checkpointMismatch(nodeRows, cp, mustCover)
+		} else if mustCover {
+			found = &VerifyResult{FirstBreakAt: cp.MonotonicSeq, Reason: fmt.Sprintf(
+				"node '%s': no rows, but checkpointed at seq %d", cp.SourceNodeID, cp.MonotonicSeq)}
 		}
-		if found := checkpointMismatch(nodeRows, cp); found != nil && (first == nil || found.FirstBreakAt < first.FirstBreakAt) {
+		if found != nil && (first == nil || found.FirstBreakAt < first.FirstBreakAt) {
 			first = found
 		}
 	}
@@ -196,8 +270,9 @@ func checkpointBreak(rows []Row, checkpoints []Checkpoint) *VerifyResult {
 }
 
 // checkpointMismatch checks one node's rows against a checkpoint of that
-// node; nil if they agree or the checkpoint is older than the oldest row.
-func checkpointMismatch(rows []Row, cp Checkpoint) *VerifyResult {
+// node; nil if they agree. A checkpoint older than the oldest row is
+// skipped unless newest says it must be covered.
+func checkpointMismatch(rows []Row, cp Checkpoint, newest bool) *VerifyResult {
 	seq := cp.MonotonicSeq
 	lowest, highest := rows[0].MonotonicSeq, rows[0].MonotonicSeq
 	var at []Row
@@ -217,6 +292,9 @@ func checkpointMismatch(rows []Row, cp Checkpoint) *VerifyResult {
 	case seq > highest:
 		return &VerifyResult{FirstBreakAt: highest + 1, Reason: fmt.Sprintf(
 			"node '%s': chain ends at seq %d before checkpoint at seq %d", cp.SourceNodeID, highest, seq)}
+	case seq < lowest && newest:
+		return &VerifyResult{FirstBreakAt: lowest, Reason: fmt.Sprintf(
+			"node '%s': rows start at seq %d, after the newest checkpoint at seq %d", cp.SourceNodeID, lowest, seq)}
 	case seq < lowest:
 		return nil // purged by retention
 	default:

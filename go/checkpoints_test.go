@@ -1,9 +1,11 @@
 package fasten
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,7 +58,7 @@ func wantBreak(t *testing.T, res VerifyResult, seq int64, reason string) {
 
 func TestCheckpointMatchingTheTipVerifies(t *testing.T) {
 	rows := cpChain(5, "node-1", "u1")
-	if res := VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(rows[1]), cpOf(rows[4])}); !res.OK {
+	if res := VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(rows[1]), cpOf(rows[4])}, CheckpointOptions{}); !res.OK {
 		t.Fatalf("got %+v", res)
 	}
 }
@@ -66,7 +68,7 @@ func TestCheckpointCutOffTailBreaksAfterTheLastRow(t *testing.T) {
 	if !VerifyChain(rows[:6]).OK {
 		t.Fatal("a cut-off chain verifies on its own")
 	}
-	wantBreak(t, VerifyChainWithCheckpoints(rows[:6], []Checkpoint{cpOf(rows[9])}), 7,
+	wantBreak(t, VerifyChainWithCheckpoints(rows[:6], []Checkpoint{cpOf(rows[9])}, CheckpointOptions{}), 7,
 		"node 'node-1': chain ends at seq 6 before checkpoint at seq 10")
 }
 
@@ -76,13 +78,13 @@ func TestCheckpointResealedChainFails(t *testing.T) {
 	if !VerifyChain(resealed).OK {
 		t.Fatal("a re-sealed chain verifies on its own")
 	}
-	wantBreak(t, VerifyChainWithCheckpoints(resealed, []Checkpoint{cpOf(rows[4])}), 5,
+	wantBreak(t, VerifyChainWithCheckpoints(resealed, []Checkpoint{cpOf(rows[4])}, CheckpointOptions{}), 5,
 		"row "+resealed[4].ID+": hash differs from checkpoint at seq 5")
 }
 
-func TestCheckpointOlderThanTheOldestRowIsSkipped(t *testing.T) {
+func TestCheckpointRetentionPurgeBelowTheNewestVerifies(t *testing.T) {
 	rows := cpChain(10, "node-1", "u1")
-	if res := VerifyChainWithCheckpoints(rows[4:], []Checkpoint{cpOf(rows[1]), cpOf(rows[9])}); !res.OK {
+	if res := VerifyChainWithCheckpoints(rows[4:], []Checkpoint{cpOf(rows[1]), cpOf(rows[9])}, CheckpointOptions{}); !res.OK {
 		t.Fatalf("got %+v", res)
 	}
 }
@@ -98,21 +100,62 @@ func TestCheckpointMissingRowInsideTheChainBreaksThere(t *testing.T) {
 	if !VerifyChain(rows).OK {
 		t.Fatal("rows verify on their own")
 	}
-	wantBreak(t, VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(sealed[2])}), 3,
+	wantBreak(t, VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(sealed[2])}, CheckpointOptions{}), 3,
 		"node 'node-1': no row at checkpointed seq 3")
 }
 
-func TestCheckpointForANodeNotInTheRowsIsSkipped(t *testing.T) {
-	other := cpChain(3, "node-2", "u1")
-	if res := VerifyChainWithCheckpoints(cpChain(3, "node-1", "u1"), []Checkpoint{cpOf(other[2])}); !res.OK {
+// cpChainFrom is cpChain with seqs from start, sealed from genesis.
+func cpChainFrom(start, n int, node, target string) []Row {
+	rows := make([]Row, 0, n)
+	prev := "genesis"
+	for i := start; i < start+n; i++ {
+		r := Seal(prev, cpRow(i, node, target))
+		rows = append(rows, r)
+		prev = r.Hash
+	}
+	return rows
+}
+
+func TestCheckpointChainResealedAboveTheNewestFails(t *testing.T) {
+	rows := cpChain(10, "node-1", "u1")
+	resealed := cpChainFrom(11, 10, "node-1", "u2")
+	if !VerifyChain(resealed).OK {
+		t.Fatal("a re-sealed chain verifies on its own")
+	}
+	wantBreak(t, VerifyChainWithCheckpoints(resealed, []Checkpoint{cpOf(rows[4]), cpOf(rows[9])}, CheckpointOptions{}), 11,
+		"node 'node-1': rows start at seq 11, after the newest checkpoint at seq 10")
+}
+
+func TestCheckpointedNodeWithNoRowsFails(t *testing.T) {
+	one, two := cpChain(3, "node-1", "u1"), cpChain(5, "node-2", "u1")
+	wantBreak(t, VerifyChainWithCheckpoints(one, []Checkpoint{cpOf(one[2]), cpOf(two[1]), cpOf(two[4])}, CheckpointOptions{}), 5,
+		"node 'node-2': no rows, but checkpointed at seq 5")
+	res := VerifyChainWithCheckpoints(nil, []Checkpoint{cpOf(two[4])}, CheckpointOptions{})
+	wantBreak(t, res, 5, "node 'node-2': no rows, but checkpointed at seq 5")
+	if res.TotalRows != 0 {
 		t.Fatalf("got %+v", res)
 	}
+}
+
+func TestCheckpointPartialSkipsCheckpointsOutsideTheRows(t *testing.T) {
+	rows := cpChain(10, "node-1", "u1")
+	other := cpChain(3, "node-2", "u1")
+	resealed := cpChainFrom(11, 10, "node-1", "u2")
+	cps := []Checkpoint{cpOf(rows[9]), cpOf(other[2])}
+	partial := CheckpointOptions{Partial: true}
+	for _, batch := range [][]Row{resealed, nil, rows[4:], cpChain(3, "node-1", "u1")[:0]} {
+		if res := VerifyChainWithCheckpoints(batch, cps, partial); !res.OK {
+			t.Fatalf("got %+v", res)
+		}
+	}
+	wantBreak(t, VerifyChainWithCheckpoints(rows[:6], cps, partial), 7,
+		"node 'node-1': chain ends at seq 6 before checkpoint at seq 10")
 }
 
 func TestCheckpointLowestBreakAcrossNodes(t *testing.T) {
 	a, b := cpChain(10, "node-a", "u1"), cpChain(10, "node-b", "u1")
 	rows := append(append([]Row{}, a[:8]...), b[:3]...)
-	wantBreak(t, VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(a[9]), cpOf(b[9])}), 4,
+	wantBreak(t, VerifyChainWithCheckpoints(rows, []Checkpoint{cpOf(a[9]), cpOf(b[9])}, CheckpointOptions{}), 4,
 		"node 'node-b': chain ends at seq 3 before checkpoint at seq 10")
 }
 
@@ -120,7 +163,7 @@ func TestCheckpointChainBreakBelowItWins(t *testing.T) {
 	rows := cpChain(10, "node-1", "u1")
 	cut := append([]Row{}, rows[:6]...)
 	cut[1].Target = "u-edited"
-	res := VerifyChainWithCheckpoints(cut, []Checkpoint{cpOf(rows[9])})
+	res := VerifyChainWithCheckpoints(cut, []Checkpoint{cpOf(rows[9])}, CheckpointOptions{})
 	if res.FirstBreakAt != 2 || !strings.Contains(res.Reason, "hash mismatch") {
 		t.Fatalf("got %+v", res)
 	}
@@ -161,12 +204,93 @@ func TestLoadCheckpointsRejectsALineThatIsNotACheckpoint(t *testing.T) {
 	for _, body := range []string{
 		`{"source_node_id":"n","monotonic_seq":"1","hash":"h","anchored_at":"t"}`,
 		`{"source_node_id":"n","hash":"h","anchored_at":"t"}`,
+		`{"source_node_id":"n","monotonic_seq":1,"hash":"h","anchored_at":"t","x":1}`,
+		`{"source_node_id":"n","Monotonic_Seq":1,"hash":"h","anchored_at":"t"}`,
+		`{"source_node_id":null,"monotonic_seq":1,"hash":"h","anchored_at":"t"}`,
+		`[]`,
+		`{"source_node_id":"n","monot` + "\n" + `{"source_node_id":"n","monotonic_seq":1,"hash":"h","anchored_at":"t"}`,
 	} {
 		if err := os.WriteFile(path, []byte(body+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := LoadCheckpoints(path); err == nil {
 			t.Fatalf("loaded %s", body)
+		}
+	}
+}
+
+func TestLoadCheckpointsUnfinishedLastLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cp.jsonl")
+	cps := []Checkpoint{cpOf(cpChain(1, "node-1", "u1")[0]), cpOf(cpChain(2, "node-1", "u1")[1])}
+	if err := (FileCheckpointSink{Path: path}).Publish(context.Background(), cps); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	// A complete last line without a newline is read.
+	if err := os.WriteFile(path, bytes.TrimSuffix(raw, []byte("\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := LoadCheckpoints(path); err != nil || !reflect.DeepEqual(got, cps) {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	// An unfinished one is skipped and reported.
+	if err := os.WriteFile(path, append(raw, `{"source_node_id":"node-1","monot`...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadCheckpoints(path)
+	if !errors.Is(err, ErrPartialLastLine) || !reflect.DeepEqual(got, cps) {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestHTTPCheckpointSinkRedirectFails(t *testing.T) {
+	cps := []Checkpoint{cpOf(cpChain(1, "node-1", "u1")[0])}
+	for _, code := range []int{301, 302, 303, 307, 308} {
+		var posts, gets int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				posts++
+				http.Redirect(w, r, "/elsewhere", code)
+				return
+			}
+			gets++
+		}))
+		for _, sink := range []HTTPCheckpointSink{{URL: srv.URL}, {URL: srv.URL, Client: &http.Client{}}} {
+			err := sink.Publish(context.Background(), cps)
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", code)) {
+				t.Fatalf("%d: got %v", code, err)
+			}
+		}
+		srv.Close()
+		if posts != 2 || gets != 0 {
+			t.Fatalf("%d: %d posts, %d gets", code, posts, gets)
+		}
+	}
+}
+
+func TestHTTPCheckpointSinkDefaultTimeout(t *testing.T) {
+	if c := (HTTPCheckpointSink{}).client(); c.Timeout != 10*time.Second || c == http.DefaultClient {
+		t.Fatalf("got %+v", c)
+	}
+}
+
+func TestHTTPCheckpointSinkErrorsLeaveOutUserinfoAndQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	host := strings.TrimPrefix(srv.URL, "http://")
+	raw := "http://user:pw-123@" + host + "/checkpoints?token=tok-456"
+	cps := []Checkpoint{cpOf(cpChain(1, "node-1", "u1")[0])}
+	sink := HTTPCheckpointSink{URL: raw}
+	err := sink.Publish(context.Background(), cps)
+	if want := "checkpoint sink " + srv.URL + "/checkpoints: HTTP 500"; err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %s", err, want)
+	}
+	srv.Close()
+	for _, url := range []string{raw, "http://user:pw-123@" + host + "/%zz?token=tok-456"} {
+		err = HTTPCheckpointSink{URL: url}.Publish(context.Background(), cps)
+		if err == nil || strings.Contains(err.Error(), "pw-123") || strings.Contains(err.Error(), "tok-456") {
+			t.Fatalf("got %v", err)
 		}
 	}
 }
@@ -261,7 +385,7 @@ func runCheckpointStoreCases(t *testing.T, open func(t *testing.T) (cpStore, *sq
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res := VerifyChainWithCheckpoints(tail(t, s), loaded); !res.OK {
+		if res := VerifyChainWithCheckpoints(tail(t, s), loaded, CheckpointOptions{}); !res.OK {
 			t.Fatalf("got %+v", res)
 		}
 	})
@@ -275,7 +399,7 @@ func runCheckpointStoreCases(t *testing.T, open func(t *testing.T) (cpStore, *sq
 		if !VerifyChain(rows).OK {
 			t.Fatal("cut chain verifies on its own")
 		}
-		wantBreak(t, VerifyChainWithCheckpoints(rows, cps), 6,
+		wantBreak(t, VerifyChainWithCheckpoints(rows, cps, CheckpointOptions{}), 6,
 			"node 'node-1': chain ends at seq 5 before checkpoint at seq 8")
 	})
 
@@ -289,7 +413,7 @@ func runCheckpointStoreCases(t *testing.T, open func(t *testing.T) (cpStore, *sq
 		if !VerifyChain(rows).OK {
 			t.Fatal("re-sealed chain verifies on its own")
 		}
-		wantBreak(t, VerifyChainWithCheckpoints(rows, cps), 5,
+		wantBreak(t, VerifyChainWithCheckpoints(rows, cps, CheckpointOptions{}), 5,
 			"row "+rows[4].ID+": hash differs from checkpoint at seq 5")
 	})
 
@@ -335,6 +459,7 @@ func TestCheckpointVectors(t *testing.T) {
 	var file struct {
 		Cases []struct {
 			Label       string       `json:"label"`
+			Partial     bool         `json:"partial"`
 			Rows        []Row        `json:"rows"`
 			Checkpoints []Checkpoint `json:"checkpoints"`
 			Expected    struct {
@@ -352,7 +477,7 @@ func TestCheckpointVectors(t *testing.T) {
 	}
 	for _, c := range file.Cases {
 		t.Run(c.Label, func(t *testing.T) {
-			res := VerifyChainWithCheckpoints(c.Rows, c.Checkpoints)
+			res := VerifyChainWithCheckpoints(c.Rows, c.Checkpoints, CheckpointOptions{Partial: c.Partial})
 			var at int64
 			if c.Expected.FirstBreakAt != nil {
 				at = *c.Expected.FirstBreakAt

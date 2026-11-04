@@ -101,17 +101,28 @@ type VerifyResult struct {
 // Tail truncation and a re-seal from genesis are detected only against
 // checkpoints; see VerifyChainWithCheckpoints.
 func VerifyChain(rows []Row) VerifyResult {
-	return VerifyChainWithCheckpoints(rows, nil)
+	return VerifyChainWithCheckpoints(rows, nil, CheckpointOptions{})
+}
+
+// CheckpointOptions configures VerifyChainWithCheckpoints.
+type CheckpointOptions struct {
+	// Partial marks rows as a page, one node or a sample rather than the
+	// whole chain: a checkpoint below a node's oldest row, or for a node
+	// with no rows, is then skipped.
+	Partial bool
 }
 
 // VerifyChainWithCheckpoints is VerifyChain, with rows also checked against
-// checkpoints published earlier outside the store (spec §9). Each checkpoint
-// for a node in rows must match the row at its seq; one older than the
-// node's oldest row is skipped, as is one for a node with no rows here.
-// FirstBreakAt is the lowest seq of any break.
-func VerifyChainWithCheckpoints(rows []Row, checkpoints []Checkpoint) VerifyResult {
+// checkpoints published earlier outside the store (spec §9). Each
+// checkpoint within a node's rows must match the row at its seq. Unless
+// opts.Partial is set, rows are taken as the whole chain: every
+// checkpointed node must have rows, and its newest checkpoint must fall
+// within them; only older checkpoints below a node's oldest row (purged by
+// retention) are skipped. Rows after a node's newest checkpoint are not
+// covered by it. FirstBreakAt is the lowest seq of any break.
+func VerifyChainWithCheckpoints(rows []Row, checkpoints []Checkpoint, opts CheckpointOptions) VerifyResult {
 	total := len(rows)
-	if total == 0 {
+	if total == 0 && (opts.Partial || len(checkpoints) == 0) {
 		return VerifyResult{OK: true, TotalRows: 0}
 	}
 
@@ -148,7 +159,7 @@ func VerifyChainWithCheckpoints(rows []Row, checkpoints []Checkpoint) VerifyResu
 	if dup != nil && (res.OK || dup.FirstBreakAt < res.FirstBreakAt) {
 		res = *dup
 	}
-	if cp := checkpointBreak(sorted, checkpoints); cp != nil && (res.OK || cp.FirstBreakAt < res.FirstBreakAt) {
+	if cp := checkpointBreak(sorted, checkpoints, opts.Partial); cp != nil && (res.OK || cp.FirstBreakAt < res.FirstBreakAt) {
 		res = VerifyResult{OK: false, TotalRows: total, FirstBreakAt: cp.FirstBreakAt, Reason: cp.Reason}
 	}
 	return res

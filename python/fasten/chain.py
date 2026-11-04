@@ -274,11 +274,11 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
 
 
 def _checkpoint_break(
-    rows: "list[AuditRow]", cp: "Checkpoint",
+    rows: "list[AuditRow]", cp: "Checkpoint", newest: bool,
 ) -> "tuple[int, str] | None":
     """Check one node's rows against a checkpoint of that node (spec §9), as
-    (monotonic_seq, reason); None if they agree or the checkpoint is older
-    than the oldest row."""
+    (monotonic_seq, reason); None if they agree. A checkpoint older than the
+    oldest row is skipped unless ``newest`` says it must be covered."""
     seq = cp.monotonic_seq
     at = sorted((r for r in rows if r.monotonic_seq == seq), key=lambda r: r.id)
     if at:
@@ -291,12 +291,16 @@ def _checkpoint_break(
         return highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
                              f"{highest} before checkpoint at seq {seq}")
     if seq < lowest:
+        if newest:
+            return lowest, (f"node '{cp.source_node_id}': rows start at seq {lowest}, "
+                            f"after the newest checkpoint at seq {seq}")
         return None  # purged by retention
     return seq, f"node '{cp.source_node_id}': no row at checkpointed seq {seq}"
 
 
 def verify_chain(
     rows: "list[AuditRow]", checkpoints: "Sequence[Checkpoint] | None" = None,
+    *, partial: bool = False,
 ) -> ChainVerifyResult:
     """Walk the per-row hash chain and return a verification result.
 
@@ -306,10 +310,14 @@ def verify_chain(
 
     Detects field tampering, row insertion, deletion, and reorder. Tail
     truncation and a full re-seal from genesis are detected only against
-    ``checkpoints`` published earlier outside the store (spec §9): each
-    checkpoint for a node in ``rows`` must match the row at its seq. One
-    older than the node's oldest row is skipped, as is one for a node with
-    no rows here.
+    ``checkpoints`` published earlier outside the store (spec §9). Each
+    checkpoint within a node's rows must match the row at its seq. By default
+    ``rows`` are taken as the whole chain: every checkpointed node must have
+    rows, and its newest checkpoint must fall within them; only older
+    checkpoints below a node's oldest row (purged by retention) are skipped.
+    For a page, one node or a sample, pass ``partial=True``: then a
+    checkpoint below a node's oldest row, or for a node with no rows here, is
+    skipped. Rows after a node's newest checkpoint are not covered by it.
 
     Rows with an empty ``hash`` field (written before hash-chain support, or in
     stdout-only mode) are skipped below their node's first sealed seq; they are
@@ -325,7 +333,7 @@ def verify_chain(
     is not-ok and the reason names the offending id) so a node can never silently
     accept a row sealed under a form it does not understand.
     """
-    if not rows:
+    if not rows and (partial or not checkpoints):
         return ChainVerifyResult(ok=True, total_rows=0, first_break_at=None, reason=None)
 
     # Chains are per node (spec §2), so the prev_hash walk MUST be scoped by
@@ -359,11 +367,20 @@ def verify_chain(
             first = found
     if dup is not None and (first is None or dup[0] < first[0]):
         first = dup
+    newest: dict[str, int] = {}
+    for cp in checkpoints or ():
+        newest[cp.source_node_id] = max(cp.monotonic_seq, newest.get(cp.source_node_id, cp.monotonic_seq))
     for cp in sorted(checkpoints or (), key=lambda c: (c.source_node_id, c.monotonic_seq)):
+        must_cover = not partial and cp.monotonic_seq == newest[cp.source_node_id]
         node_rows = by_node.get(cp.source_node_id)
         if not node_rows:
+            if must_cover:
+                found = cp.monotonic_seq, (f"node '{cp.source_node_id}': no rows, but "
+                                           f"checkpointed at seq {cp.monotonic_seq}")
+                if first is None or found[0] < first[0]:
+                    first = found
             continue
-        found = _checkpoint_break(list(node_rows.values()), cp)
+        found = _checkpoint_break(list(node_rows.values()), cp, must_cover)
         if found is not None and (first is None or found[0] < first[0]):
             first = found
     if first is not None:

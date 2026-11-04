@@ -153,9 +153,15 @@ if _, err := fasten.PublishCheckpoints(ctx, store, sink); err != nil {
 }
 
 cps, err := fasten.LoadCheckpoints("/mnt/worm/checkpoints.jsonl")
-rows, err := store.ChainTail(ctx, "node-1", 10000)
-res := fasten.VerifyChainWithCheckpoints(rows, cps)
+res := fasten.VerifyChainWithCheckpoints(allRows, cps, fasten.CheckpointOptions{})
 ```
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and its newest checkpoint must fall within them. To check
+a page or one node, set `CheckpointOptions{Partial: true}`; checkpoints
+below its rows, or for nodes not in them, are then skipped. If the file's
+last line was cut short by a crash, `LoadCheckpoints` returns the earlier
+checkpoints with `ErrPartialLastLine`.
 
 ## Tests
 
