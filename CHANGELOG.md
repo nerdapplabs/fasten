@@ -6,6 +6,22 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: chain checkpoints (Python + Go)
+
+- A checkpoint records a node's latest sealed row (`source_node_id`,
+  `monotonic_seq`, `hash`, `anchored_at`). Checked against checkpoints
+  published earlier outside the store, verification now reports rows cut off
+  the end of a chain and a chain re-sealed from genesis (spec §9).
+- Python: `fasten.checkpoints` with `Checkpoint`, `FileCheckpointSink`,
+  `HttpCheckpointSink`, `take_checkpoints`, `publish_checkpoints` and
+  `load_checkpoints`, and `verify_chain(rows, checkpoints=...)`.
+  `SQLiteStore` and `PostgresStore` gain `chain_tips()`.
+- Go: `Checkpoint`, `FileCheckpointSink`, `HTTPCheckpointSink`,
+  `TakeCheckpoints`, `PublishCheckpoints`, `LoadCheckpoints` and
+  `VerifyChainWithCheckpoints`; `VerifyChain` is unchanged. `SQLiteStore`
+  and `PostgresStore` gain `ChainTips`.
+- `spec/checkpoint-vectors.json` holds cases both SDKs must agree on.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
