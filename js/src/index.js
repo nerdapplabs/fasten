@@ -287,6 +287,7 @@ export class Engine {
 	};
 	_drainer = null; // also read by the audit_queue.js helpers
 	_retiring = new Set(); // drainers taken out of the slot, still stopping
+	_retireLost = false; // a re-init's retired drainer lost rows; close() reports it
 	#closing = null;
 	_retentionTimer = null;
 	_retentionFirst = null;
@@ -360,7 +361,7 @@ export class Engine {
 				maxAttempts: opts.queueDrainMaxAttempts ?? 50,
 			});
 		} else {
-			this._uninstallDrainer();
+			this._uninstallDrainer(5000, true);
 		}
 		if (piiRetMs && store) this._startRetention(piiRetMs);
 	}
@@ -465,7 +466,7 @@ export class Engine {
 			detail: outDetail,
 			pii_in_detail: !!meta.piiInDetail,
 		};
-		// Spec §8: the store seals the row, so this line's hashes are empty.
+		// JS doesn't seal rows (spec §8), so this line's hashes are empty.
 		process.stdout.write(
 			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" })}\n`,
 		);
@@ -558,7 +559,7 @@ export class Engine {
 	}
 
 	async #close(timeoutMs) {
-		if (!this._drainer && this._retiring.size === 0) return true;
+		if (!this._drainer && this._retiring.size === 0) return this._takeLost();
 		const deadline = Date.now() + timeoutMs;
 		const left = () => Math.max(0, deadline - Date.now());
 		await this.flush(timeoutMs / 2);
@@ -569,11 +570,20 @@ export class Engine {
 			...retiring.map((e) => e.stop(left())),
 		]);
 		await Promise.all(retiring.map((e) => e.done));
-		return ok.every(Boolean);
+		return this._takeLost() && ok.every(Boolean);
 	}
 
-	resetForTests() {
-		this._uninstallDrainer();
+	// True unless a retired drainer lost rows since the last close().
+	_takeLost() {
+		const lost = this._retireLost;
+		this._retireLost = false;
+		return !lost;
+	}
+
+	// Stops the drainer and any a re-init is retiring.
+	async resetForTests() {
+		const retiring = [...this._retiring];
+		const stopped = this._uninstallDrainer();
 		this._stopRetention();
 		this.#config = {
 			serviceId: "",
@@ -585,6 +595,9 @@ export class Engine {
 			redactReplacement: null,
 			failureStrategy: "queue",
 		};
+		await Promise.all([stopped, ...retiring.map((e) => e.stop())]);
+		await Promise.all(retiring.map((e) => e.done));
+		this._retireLost = false;
 	}
 
 	// The in-flight pass lives on the engine, so a re-init can't start a second
@@ -638,18 +651,19 @@ export class Engine {
 		if (old) this._retire(old, true);
 	}
 
-	_uninstallDrainer(timeoutMs) {
+	_uninstallDrainer(timeoutMs, flush = false) {
 		const old = this._drainer;
 		this._drainer = null;
 		return old
-			? this._retire(old, false, timeoutMs).done
+			? this._retire(old, flush, timeoutMs).done
 			: Promise.resolve(true);
 	}
 
 	// Spec §10: stops a drainer taken out of the slot, after a re-init
 	// flushing it for up to 5 s first. Until it has stopped, flush() and
 	// close() wait for it. A re-init whose flush timed out, or whose rows
-	// were not all stored, emits audit_drain_install_incomplete.
+	// were not all stored, emits audit_drain_install_incomplete, and the
+	// next close() resolves false if rows were lost.
 	_retire(drainer, flush, timeoutMs = 5000) {
 		const entry = { drainer, stopped: null };
 		// close() stops it with what is left of its own timeout.
@@ -662,6 +676,7 @@ export class Engine {
 			const flushed = flush ? await drainer.flush(5000) : true;
 			const ok = await (entry.stopped ?? drainer.stop(timeoutMs));
 			const unstored = drainer.unstoredTotal() - before;
+			if (flush && !ok) this._retireLost = true;
 			if (flush && (!flushed || unstored > 0)) {
 				this._drainerSysLog("warn", "audit_drain_install_incomplete", {
 					flushed,

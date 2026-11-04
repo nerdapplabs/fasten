@@ -4,9 +4,9 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush, close, _clearCoreRegistry,
+    AuditStoreError, queueStats, flush, close, _clearCoreRegistry, defaultEngine,
 } from '../src/index.js';
-import { uninstallDrainer } from '../src/audit_queue.js';
+import { uninstallDrainer, activeDrainer } from '../src/audit_queue.js';
 
 // Stub stores
 
@@ -57,14 +57,14 @@ const TEST_META = {
 };
 
 beforeEach(async () => {
-    await uninstallDrainer();
+    await defaultEngine.resetForTests();
     _clearCoreRegistry();
     _reg().clear();
     register('user', TEST_META);
 });
 
 afterEach(async () => {
-    await uninstallDrainer();
+    await defaultEngine.resetForTests();
 });
 
 function _initQueue(store, opts = {}) {
@@ -515,6 +515,63 @@ test('re-init that stores every row reports nothing', async () => {
         assert.equal(await close(2000), true);
     });
     assert.ok(!captured.some(r => r.event === 'audit_drain_install_incomplete'));
+});
+
+for (const [name, reinit] of [
+    ['queue mode', () => _initQueue(new RecordingStore())],
+    ['raise mode with no store', () => init({
+        serviceId: 'svc', nodeId: 'node', auditStoreFailureStrategy: 'raise',
+    })],
+]) {
+    test(`re-init to ${name} flushes the old drainer and close reports its loss`, async () => {
+        const store = new BrokenStore();
+        let closed;
+        const captured = await captureSys(async (seen) => {
+            _initQueue(store, {
+                queueRetryInitialMs: 60_000,
+                queueRetryMaxMs: 60_000,
+                queueRetryJitter: false,
+            });
+            emit({ code: 'USER_CREATED', target: 'u-1' });
+            while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
+            reinit();
+            await new Promise(r => setTimeout(r, 50));
+            assert.equal(store.attempts, 1, 'the row waits out the flush first');
+            const deadline = Date.now() + 8000;
+            while (!seen.some(r => r.event === 'audit_drain_install_incomplete')
+                && Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+            closed = await close(1000);
+        });
+        const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
+        assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
+        assert.equal(inc[0].flushed, false);
+        assert.equal(inc[0].unstored, 1);
+        assert.equal(closed, false);
+        assert.equal(await close(1000), true);
+    });
+}
+
+test('close keeps to its timeout while a re-init is stopping the old drainer', async () => {
+    const store = { insert: () => new Promise(() => {}) };
+    let closed;
+    await captureSys(async () => {
+        _initQueue(store);
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        const old = activeDrainer();
+        _initQueue(new RecordingStore());
+        // The re-init's 5 s flush times out and it starts its own stop.
+        const deadline = Date.now() + 8000;
+        while (!old._stopped && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 20));
+        }
+        assert.ok(old._stopped);
+        const t0 = Date.now();
+        closed = await close(300);
+        assert.ok(Date.now() - t0 < 1000, `close took ${Date.now() - t0} ms`);
+    });
+    assert.equal(closed, false);
 });
 
 // Idle drainer

@@ -83,8 +83,10 @@ it flushes, then stops the drainer, giving rows still queued one more
 attempt each. A row that fails it, or is still unstored at the timeout, is
 reported as `audit_drain_lost_at_stop`, and `close()` resolves false.
 Re-`init()` flushes the old drainer for up to 5 s, then stops it the same
-way; `flush()` and `close()` also wait for it, and rows it could not store
-are reported with `audit_drain_install_incomplete`. An idle drainer does not
+way, also when the new config is raise mode or has no store. `flush()` and
+`close()` wait for it, rows it could not store are reported with
+`audit_drain_install_incomplete`, and the next `close()` resolves false if
+it lost rows. An idle drainer does not
 keep the process alive.
 
 **Chain.** The JS SDK does not seal rows. `emit()` returns the row with
