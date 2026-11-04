@@ -199,6 +199,105 @@
    }
   },
   {
+   "label": "form1_shipped",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "428e6b092ba198e6d51f044f889b8c0e31601cbb054bcc94126c1b9fbf297bee",
+    "id": "evt-form1_shipped",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_shipped",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z",
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form1_legacy_Z_shipped",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "1",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": null,
+    "detail_salt": null,
+    "domain": "sales",
+    "hash": "f7045e7190c9f291ee9a8495599101405f8d96a3be14d85a76a76dc459817425",
+    "id": "evt-form1_legacy_Z_shipped",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form1_legacy_Z_shipped",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z",
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
+   "label": "form2_shipped",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "2",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "qty": 3,
+     "sku": "WIDGET"
+    },
+    "detail_commitment": "f539a999e9d125e1097ffaf48dc5034d46eda02f8ee2620ee0b896ebf9cd3dfd",
+    "detail_salt": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "domain": "sales",
+    "hash": "fa9793b6143f84e930fd4f6c09ba27e4b59c16b3370c7e6c09c2a35f36d5fe79",
+    "id": "evt-form2_shipped",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form2_shipped",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": "2026-06-16T08:00:00.250000Z",
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
    "label": "form1_real_prefix_release",
    "row": {
     "action": "create",
