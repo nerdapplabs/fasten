@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `mark_shipped` no longer breaks a row's hash (#123, Python + Go)
+
+- Every canonical form hashes `shipped_at` as null (spec §1.1). Setting it
+  after sealing changed the hash, so `verify_chain` failed on untouched rows.
+- Emit always sealed with `shipped_at` null, so existing hashes don't change.
+  A row sealed by calling `seal()` or `allocate_and_insert_originated` with
+  `shipped_at` already set still verifies, over its stored value.
+
 ### Fixed: Rust SDK store-assigned monotonic_seq and PII redaction (#124)
 
 - **Breaking:** `emit()` returns `monotonic_seq: 0`. The per-engine counter

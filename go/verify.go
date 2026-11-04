@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -160,6 +161,13 @@ func VerifyChain(rows []Row) VerifyResult {
 			// Delete with form "1".
 			expected = rowHashForm1LegacyZ(row)
 		}
+		if expected != row.Hash && row.ShippedAt != nil {
+			// Sealed with shipped_at already set, before §1.1 hashed it as
+			// null. Such a row matches only over its exact stored value.
+			if slices.Contains(rowHashesOverShippedAt(row, formID), row.Hash) {
+				expected = row.Hash
+			}
+		}
 		if expected != row.Hash {
 			return VerifyResult{
 				OK:           false,
@@ -184,7 +192,7 @@ func VerifyChain(rows []Row) VerifyResult {
 	return VerifyResult{OK: true, TotalRows: total}
 }
 
-// rowHashPyCompat reproduces Python fasten.engine._row_hash byte-for-byte:
+// rowHashPyCompat reproduces Python fasten.chain._row_hash byte-for-byte:
 // SHA-256 of the canonical JSON of the row dict with the "hash" field excluded.
 //
 // The canonical form matches Python's
@@ -195,8 +203,8 @@ func VerifyChain(rows []Row) VerifyResult {
 //   - the exact Python field set (no pii_in_detail, which the Go Row
 //     carries but the Python AuditRow does not),
 //   - sorted keys (top level and nested), compact separators,
-//   - None -> null for tenant_id / shipped_at,
-//   - timestamp / shipped_at as Python datetime.isoformat() strings,
+//   - None -> null for tenant_id; shipped_at always null (spec §1.1),
+//   - timestamp as a Python datetime.isoformat() string,
 //   - non-ASCII escaped as \uXXXX (Python json.dumps ensure_ascii=True),
 //   - <, >, & left literal (Python does not HTML-escape).
 func rowHashPyCompat(row Row) string {
@@ -229,9 +237,6 @@ func rowHashForm1LegacyZ(row Row) string {
 	d := pyCanonicalRowMap(row)
 	delete(d, "hash")
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	if row.ShippedAt != nil {
-		d["shipped_at"] = canonicalTS(*row.ShippedAt)
-	}
 	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
 }
@@ -244,24 +249,47 @@ func rowHashForm2(row Row) string {
 	delete(d, "detail")
 	d["detail_commitment"] = row.DetailCommitment
 	d["timestamp"] = canonicalTS(row.Timestamp)
-	if row.ShippedAt != nil {
-		d["shipped_at"] = canonicalTS(*row.ShippedAt)
-	}
 	sum := sha256.Sum256(canonicalJSON(d))
 	return hex.EncodeToString(sum[:])
 }
 
+// rowHashesOverShippedAt mirrors Python _row_hashes_over_shipped_at: the hashes
+// of a row sealed with ShippedAt already set, as every form hashed it before
+// §1.1 nulled it, the stored value rendered like the timestamp next to it.
+// Emit never sealed such rows; a caller passing ShippedAt to Seal or
+// AllocateAndInsertOriginated did. Verification fallback only.
+func rowHashesOverShippedAt(row Row, formID string) []string {
+	hash := func(d map[string]any) string {
+		sum := sha256.Sum256(canonicalJSON(d))
+		return hex.EncodeToString(sum[:])
+	}
+	switch formID {
+	case "1":
+		d := pyCanonicalRowMap(row)
+		d["shipped_at"] = pyISOFormat(*row.ShippedAt)
+		form1 := hash(d)
+		// The legacy-"Z" spelling (#91): both fields verbatim.
+		d["timestamp"] = canonicalTS(row.Timestamp)
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+		return []string{form1, hash(d)}
+	case "2":
+		d := pyCanonicalRowMap(row)
+		delete(d, "detail")
+		d["detail_commitment"] = row.DetailCommitment
+		d["timestamp"] = canonicalTS(row.Timestamp)
+		d["shipped_at"] = canonicalTS(*row.ShippedAt)
+		return []string{hash(d)}
+	}
+	return nil
+}
+
 // pyCanonicalRowMap builds the map with the same keys and value encodings as
 // Python's AuditRow.to_dict(), without "hash" (and without pii_in_detail,
-// which Python's dict doesn't have).
+// which Python's dict doesn't have), and with shipped_at set to nil (spec §1.1).
 func pyCanonicalRowMap(row Row) map[string]any {
 	var tenant any
 	if row.TenantID != nil {
 		tenant = *row.TenantID
-	}
-	var shipped any
-	if row.ShippedAt != nil {
-		shipped = pyISOFormat(*row.ShippedAt)
 	}
 	wire := row.WireVersion
 	if wire == "" {
@@ -296,8 +324,9 @@ func pyCanonicalRowMap(row Row) map[string]any {
 		"request_id":        row.RequestID,
 		"detail":            detail,
 		"wire_version":      wire,
-		"shipped_at":        shipped,
-		"prev_hash":         row.PrevHash,
+		// MarkShipped sets this after sealing, so it is hashed as null (spec §1.1).
+		"shipped_at": nil,
+		"prev_hash":  row.PrevHash,
 	}
 }
 
