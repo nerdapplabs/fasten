@@ -25,6 +25,7 @@ jobs:
     container:
       image: rust:1.90
 
+    # The job runs in a container, so the service is reached by name.
     services:
       postgres:
         image: postgres:16-alpine
@@ -61,10 +62,12 @@ jobs:
       - name: Lint (clippy)
         # --locked builds with the committed Cargo.lock instead of resolving
         # newer transitive versions.
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --features store-postgres -- -D warnings
 
       - name: Unit tests
-        run: cargo test --locked --quiet
+        env:
+          FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
+        run: cargo test --locked --quiet --features store-postgres
 
       # rust/ depends on fasten-core with default-features = false, so its
       # tests never compile store/postgres.rs. Run the core's own tests here
