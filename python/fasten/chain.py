@@ -235,10 +235,17 @@ def _row_break(row: "AuditRow") -> Optional[str]:
 
     # Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
     # sealed with DEL in a hashed string matches only that way. Each check
-    # below is retried with DEL raw; nothing else about the encoding changes.
-    canons: list[_Canon] = [_canonical_json]
-    if _has_del(row_d):
-        canons.append(_canonical_json_raw_del)
+    # below is retried with DEL raw on a miss; nothing else about the
+    # encoding changes. Looking for DEL costs an encode, so only a miss pays.
+    has_del: Optional[bool] = None
+
+    def matches(check: Callable[[_Canon], bool]) -> bool:
+        nonlocal has_del
+        if check(_canonical_json):
+            return True
+        if has_del is None:
+            has_del = _has_del(row_d)
+        return has_del and check(_canonical_json_raw_del)
 
     # Form "2" hashes detail_commitment, not detail, so a changed detail
     # with the commitment left as it was still matches the hash. While
@@ -254,11 +261,11 @@ def _row_break(row: "AuditRow") -> Optional[str]:
             return (f"row {row.id}: detail present but detail_salt "
                     "is missing — commitment cannot be verified")
         salt = row.detail_salt
-        if not any(_detail_commitment(salt, row.detail, c) == (row.detail_commitment or "")
-                   for c in canons):
+        if not matches(lambda c: _detail_commitment(salt, row.detail, c)
+                       == (row.detail_commitment or "")):
             return f"row {row.id}: detail does not match its commitment"
 
-    if not any(_hash_matches(row, form_id, hash_fn, row_d, c) for c in canons):
+    if not matches(lambda c: _hash_matches(row, form_id, hash_fn, row_d, c)):
         return f"row {row.id}: hash mismatch"
     return None
 

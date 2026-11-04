@@ -215,10 +215,17 @@ func rowBreak(row Row) string {
 	}
 	// Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
 	// sealed with DEL in a hashed string matches only that way. Each check
-	// below is retried with DEL raw; nothing else about the encoding changes.
-	canons := []func(any) []byte{canonicalJSON}
-	if hasDEL(row) {
-		canons = append(canons, canonicalJSONRawDEL)
+	// below is retried with DEL raw on a miss; nothing else about the
+	// encoding changes. Looking for DEL costs an encode, so only a miss pays.
+	delChecked, del := false, false
+	matches := func(check func(canon func(any) []byte) bool) bool {
+		if check(canonicalJSON) {
+			return true
+		}
+		if !delChecked {
+			delChecked, del = true, hasDEL(row)
+		}
+		return del && check(canonicalJSONRawDEL)
 	}
 	// Form "2" hashes detail_commitment, NOT detail. The hash therefore
 	// does not protect detail on its own: a rewritten detail with the
@@ -233,13 +240,13 @@ func rowBreak(row Row) string {
 				"row %s: detail present but detail_salt is missing — commitment cannot be verified",
 				row.ID)
 		}
-		if !slices.ContainsFunc(canons, func(canon func(any) []byte) bool {
+		if !matches(func(canon func(any) []byte) bool {
 			return detailCommitmentWith(row.DetailSalt, row.Detail, canon) == row.DetailCommitment
 		}) {
 			return fmt.Sprintf("row %s: detail does not match its commitment", row.ID)
 		}
 	}
-	if !slices.ContainsFunc(canons, func(canon func(any) []byte) bool {
+	if !matches(func(canon func(any) []byte) bool {
 		return hashMatches(row, formID, canon)
 	}) {
 		return fmt.Sprintf("row %s: hash mismatch", row.ID)

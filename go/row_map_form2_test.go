@@ -204,3 +204,72 @@ func TestVerifyChain_RawDELFallbackStillCatchesTampering(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkRowBreak(b *testing.B) {
+	row := delRow()
+	row.Target = "order/42"
+	row.Detail = map[string]any{"note": "ab"}
+	row = Seal("genesis", row)
+	if reason := rowBreak(row); reason != "" {
+		b.Fatal(reason)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rowBreak(row)
+	}
+}
+
+// sealWith seals row as form "2" (or "1"), with the commitment and the hash
+// each encoded by its own canon.
+func sealWith(row Row, formID string, commitCanon, hashCanon func(any) []byte) Row {
+	row.CanonicalFormID = formID
+	row.PrevHash = "genesis"
+	if formID == "2" {
+		row.DetailCommitment = detailCommitmentWith(row.DetailSalt, row.Detail, commitCanon)
+	} else {
+		row.DetailSalt = ""
+	}
+	row.Hash = hashFnByForm[formID](row, hashCanon)
+	return row
+}
+
+func TestVerifyChain_RawDELInDetailOnly(t *testing.T) {
+	row := delRow()
+	row.Target = "order/42"
+	for _, sealed := range []Row{
+		sealWith(row, "2", canonicalJSONRawDEL, canonicalJSON),
+		sealWith(row, "1", nil, canonicalJSONRawDEL),
+	} {
+		if res := VerifyChain([]Row{sealed}); !res.OK {
+			t.Errorf("form %s, DEL raw in detail only: %s", sealed.CanonicalFormID, res.Reason)
+		}
+		sealed.Detail = map[string]any{"note": "a\x7fc"}
+		if res := VerifyChain([]Row{sealed}); res.OK {
+			t.Errorf("form %s, DEL raw in detail only: tampered detail verified", sealed.CanonicalFormID)
+		}
+	}
+}
+
+func TestVerifyChain_RawDELCommitmentAndHashCheckedApart(t *testing.T) {
+	cases := map[string]Row{
+		"commitment raw, hash escaped": sealWith(delRow(), "2", canonicalJSONRawDEL, canonicalJSON),
+		"commitment escaped, hash raw": sealWith(delRow(), "2", canonicalJSON, canonicalJSONRawDEL),
+	}
+	for name, row := range cases {
+		t.Run(name, func(t *testing.T) {
+			if res := VerifyChain([]Row{row}); !res.OK {
+				t.Fatalf("did not verify: %s", res.Reason)
+			}
+			tampered := row
+			tampered.Target = "order/\x7f43"
+			if res := VerifyChain([]Row{tampered}); res.OK || !strings.Contains(res.Reason, "hash mismatch") {
+				t.Errorf("tampered target: OK=%v reason %q", res.OK, res.Reason)
+			}
+			tampered = row
+			tampered.Detail = map[string]any{"note": "a\x7fc"}
+			if res := VerifyChain([]Row{tampered}); res.OK || !strings.Contains(res.Reason, "commitment") {
+				t.Errorf("tampered detail: OK=%v reason %q", res.OK, res.Reason)
+			}
+		})
+	}
+}

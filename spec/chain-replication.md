@@ -84,7 +84,9 @@ Rows the Go SDK sealed before it escaped DEL hold it raw in the hashed bytes.
 When a row's detail commitment or hash does not match and a hashed string holds
 DEL, verifiers MUST retry that check with DEL written raw, every other rule
 unchanged, and accept the row if it then matches. This applies to every form
-and alongside the `shipped_at` rule in §1.1.
+and combines with the other hash fallbacks: the `shipped_at` rule in §1.1, and
+for form `"1"` a hash over the wire `Z` timestamp, as Python sealed form `"1"`
+before it used `+00:00`.
 
 ### §1.3 Number rendering (cross-language hazard)
 

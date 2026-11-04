@@ -16,7 +16,11 @@ import pytest
 from fasten.attrs import AuditRow
 from fasten.canonical_ts import parse_canonical
 from fasten.chain import (
+    _canonical_json,
+    _canonical_json_raw_del,
+    _detail_commitment,
     _row_hash_form_1,
+    _row_hash_form_2,
     detail_commitment,
     redact,
     seal,
@@ -613,3 +617,39 @@ def test_raw_del_fallback_still_catches_tampering(make, edit, reason):
     res = verify_chain([make(**edit)])
     assert not res.ok
     assert reason in res.reason
+
+
+def _seal_with(row: AuditRow, form_id: str, commit_canon, hash_canon) -> AuditRow:
+    """Seal row with the commitment and the hash each encoded by its own canon."""
+    if form_id == "2":
+        salt = "b" * 64
+        row = dataclasses.replace(
+            row, canonical_form_id="2", detail_salt=salt,
+            detail_commitment=_detail_commitment(salt, row.detail, commit_canon))
+        return dataclasses.replace(row, hash=_row_hash_form_2(row.to_dict(), hash_canon))
+    row = dataclasses.replace(row, canonical_form_id="1")
+    return dataclasses.replace(row, hash=_row_hash_form_1(row.to_dict(), hash_canon))
+
+
+@pytest.mark.parametrize("form_id, commit_canon, hash_canon", [
+    ("2", _canonical_json_raw_del, _canonical_json),
+    ("1", None, _canonical_json_raw_del),
+])
+def test_raw_del_in_detail_only(form_id, commit_canon, hash_canon):
+    row = _seal_with(_del_row(target="order/42"), form_id, commit_canon, hash_canon)
+    assert verify_chain([row]).ok, verify_chain([row]).reason
+    assert not verify_chain([dataclasses.replace(row, detail={"note": "a\x7fc"})]).ok
+
+
+@pytest.mark.parametrize("commit_canon, hash_canon", [
+    (_canonical_json_raw_del, _canonical_json),
+    (_canonical_json, _canonical_json_raw_del),
+])
+def test_raw_del_commitment_and_hash_checked_apart(commit_canon, hash_canon):
+    row = _seal_with(_del_row(), "2", commit_canon, hash_canon)
+    res = verify_chain([row])
+    assert res.ok, res.reason
+    res = verify_chain([dataclasses.replace(row, target="order/\x7f43")])
+    assert not res.ok and "hash mismatch" in res.reason
+    res = verify_chain([dataclasses.replace(row, detail={"note": "a\x7fc"})])
+    assert not res.ok and "commitment" in res.reason
