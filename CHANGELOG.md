@@ -13,8 +13,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - An unsealed row below a node's first sealed row, which `verify_chain`
   skips, is left out of the insert. Ingest no longer raises (Python) or fails
   the batch (Go) on it (spec §4).
-- Python reads a sealed row with an empty `canonical_form_id` as form "1",
-  as Go does (spec §1.5), so it verifies in both SDKs.
+- Python reads a sealed row with an empty or missing `canonical_form_id` as
+  form "1" and stores it as "1", as Go does (spec §1.5), so it verifies in
+  both SDKs. SQLite no longer skips such a row and Postgres no longer rejects it.
 
 ### Changed: Go SDK requires Go 1.26
 

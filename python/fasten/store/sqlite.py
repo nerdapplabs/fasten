@@ -194,7 +194,7 @@ class SQLiteStore:
                 row.method, row.request_id,
                 json.dumps(row.detail),
                 _utc_iso(row.shipped_at) if row.shipped_at else None,
-                row.canonical_form_id,
+                row.canonical_form_id or "1",
                 row.prev_hash,
                 row.hash,
                 # '' rather than NULL: a Go-created table has them NOT NULL,

@@ -155,15 +155,15 @@ def verified_prefix(
 
     Sorts ``rows`` by ``monotonic_seq`` and verifies the per-row hash chain.
 
-    - Chain intact → ``(all_rows_sorted, None, "")``.
-    - Chain broken → ``(rows with monotonic_seq < first_break_at, first_break_at,
-      reason)`` — the prefix is everything strictly before the first broken row,
+    - Chain intact → ``(sealed_rows_sorted, None, "")``.
+    - Chain broken → ``(sealed rows with monotonic_seq < first_break_at,
+      first_break_at, reason)`` — the prefix stops before the first broken row,
       so the verified portion can be inserted while the break and everything
       after it is rejected.
 
-    The prefix leaves out unsealed rows, which verify_chain skips and
-    replication does not insert, and keeps one of identical copies of a row
-    on a node (a re-delivery, spec §4).
+    Unsealed rows, which verify_chain skips and replication does not insert,
+    are left out, and identical copies of a row on a node (a re-delivery,
+    spec §4) appear once.
 
     No I/O — callers insert the prefix and report ``first_break_at`` as
     ``rejected_from_seq`` so the sender resyncs from the break.

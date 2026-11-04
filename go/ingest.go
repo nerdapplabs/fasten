@@ -36,12 +36,12 @@ type execContext interface {
 // verifiedPrefix returns the longest verified run of rows from the chain start.
 //
 // Rows are sorted by MonotonicSeq, then the hash chain is verified:
-//   - intact -> (allSorted, rejectedFromSeq=0, reason="")
-//   - broken -> (rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
+//   - intact -> (the sealed rows, rejectedFromSeq=0, reason="")
+//   - broken -> (the sealed rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
 //
-// The prefix leaves out unsealed rows, which VerifyChain skips and
-// replication does not insert, and keeps one of identical copies of a row on a
-// node (a re-delivery, spec §4).
+// Unsealed rows, which VerifyChain skips and replication does not insert, are
+// left out, and identical copies of a row on a node (a re-delivery, spec §4)
+// appear once.
 //
 // No I/O; the caller inserts the prefix and reports firstBreakAt as
 // RejectedFromSeq.

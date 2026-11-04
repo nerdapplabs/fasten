@@ -243,7 +243,7 @@ class PostgresStore:
             _utc_iso(row.shipped_at) if row.shipped_at else None,
             row.prev_hash,
             row.hash,
-            row.canonical_form_id,
+            row.canonical_form_id or "1",
             # '' rather than NULL: a Go-created table has them NOT NULL.
             row.detail_salt or "",
             row.detail_commitment or "",

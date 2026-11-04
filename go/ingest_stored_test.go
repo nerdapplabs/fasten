@@ -316,6 +316,20 @@ func TestIngestAnUnsealedRowBeforeTheChainIsNotInserted(t *testing.T) {
 	}
 }
 
+func TestIngestAnUnsealedRowAfterTheChainStartsIsABreak(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(5, "svc", "node-1")
+	rows[0].Hash, rows[0].PrevHash = "", ""
+	rows[4].Hash, rows[4].PrevHash = "", ""
+	batch := []Row{rows[0], resealFrom("genesis", rows[1:2])[0], rows[4]}
+	res := ingestOK(t, s, batch)
+	if res.RejectedFromSeq != 5 || res.Inserted != 1 || storedCount(t, s) != 1 {
+		t.Fatalf("want row 2 stored and a break at 5, got %+v, %d rows", res, storedCount(t, s))
+	}
+	if !strings.Contains(res.Reason, "no hash after the node's chain started") {
+		t.Fatalf("reason = %q", res.Reason)
+	}
+}
+
 func TestIngestARowAfterAStoredUnsealedRowLinksToGenesis(t *testing.T) {
 	s, rows := ingestStore(t), makeRemoteChain(2, "svc", "node-1")
 	unsealed := rows[0]
