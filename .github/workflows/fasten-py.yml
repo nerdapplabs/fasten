@@ -82,7 +82,7 @@ jobs:
           uv venv
           # Without the fastapi extra the reader tests skip themselves
           # (importorskip) and the job still passes.
-          uv pip install -e ".[dev,postgres,fastapi,sqlite]"
+          uv pip install -e ".[dev,postgres,fastapi,sqlite,structlog]"
 
       - name: Activate venv for subsequent steps
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"

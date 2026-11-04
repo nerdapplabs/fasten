@@ -16,7 +16,8 @@ final class StdoutTransport: @unchecked Sendable {
     }
 
     func log(level: String, event: String, serviceID: String?, nodeID: String?,
-             requestID: String?, fields: [String: Any]) {
+             requestID: String?, fields: [String: Any],
+             redact: ([String: Any]) -> [String: Any] = { $0 }) {
         var obj: [String: Any] = [
             "timestamp": isoNow(),
             "level": level,
@@ -27,7 +28,7 @@ final class StdoutTransport: @unchecked Sendable {
         if let r = requestID  { obj["request_id"] = r }
         obj.merge(fields) { _, new in new }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: obj,
+        guard let data = try? JSONSerialization.data(withJSONObject: redact(obj),
                                                      options: [.sortedKeys]),
               let line = String(data: data, encoding: .utf8) else { return }
         lock.withLock { print(line) }
