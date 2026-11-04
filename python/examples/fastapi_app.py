@@ -55,7 +55,10 @@ register("user", {
     ),
 })
 
-fasten.init()  # reads FASTEN_SERVICE_ID / FASTEN_NODE_ID / FASTEN_AUDIT_DSN
+# Reads FASTEN_SERVICE_ID / FASTEN_NODE_ID / FASTEN_AUDIT_DSN. "email" isn't
+# in the default redact keys, so name it here. Passing extra_redact_keys
+# means FASTEN_REDACT_KEYS is not read.
+fasten.init(extra_redact_keys=["email"])
 
 # Auth on the reader router.
 # The reader endpoints return audit rows, tenant ids and queue stats, so put
@@ -88,7 +91,7 @@ async def create_user(req: Request):
         code="USER_CREATED",
         target=user_id,
         actor="admin",                              # usually from auth
-        detail={"email": email},                    # PII redacted by default rules
+        detail={"email": email},                    # redacted: see extra_redact_keys
     )
     return {"user_id": user_id}
 
