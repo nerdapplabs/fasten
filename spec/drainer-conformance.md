@@ -148,6 +148,7 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 | `audit_drain_install_incomplete` | `warn` | Re-install could not flush the old drainer in time, or rows it held were not stored (§10) |
 | `audit_drain_lost_at_stop` | `error` | Row not stored at shutdown (§10) |
 | `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
+| `audit_drain_stored_inline` | `info` | A row the drainer refused is stored synchronously by the SDK |
 
 **`audit_drain_failed` fields:**
 
@@ -211,6 +212,13 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 
 ```json
 { "row_ids": ["<string>", ...] }
+```
+
+**`audit_drain_stored_inline` fields** (follows the row's
+`audit_drain_abandoned`):
+
+```json
+{ "row_id": "<string>" }
 ```
 
 ---

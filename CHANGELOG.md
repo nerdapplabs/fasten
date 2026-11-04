@@ -72,6 +72,68 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   target `SQLite::SQLite3`, so it was always skipped. CI runs
   `postgres_store_smoke` against a Postgres service; it used to skip.
 
+### Fixed: JS async store errors, drainer stop and `PostgresStore` (#137)
+
+- Raise mode with a store whose `insert` returns a promise (such as
+  `PostgresStore`): `emit()` returns a promise for the row that rejects with
+  `AuditStoreError`. It used to return normally, and the rejection ended the
+  process as an `unhandledRejection`. A sync store still throws from `emit()`.
+  The TypeScript return type is now `Row | Promise<Row>`.
+- The queue-mode fallback with no drainer logs `audit_sync_fallback_failed`
+  for a rejected async insert too.
+- Stopping the drainer (re-`init()`, uninstall) no longer drops rows
+  silently. It cuts any backoff short and gives each row still queued one
+  more attempt (spec §10). A row that fails it, or is still unstored when the
+  timeout (5 s) passes, is reported as `audit_drain_lost_at_stop`, as in Go
+  and Python, and `stop(timeoutMs)` resolves false. `flush()` counts a
+  dead-lettered or lost row as done.
+- New `close(timeoutMs)` (and `Engine.close()`) for shutdown: it flushes for
+  up to half the timeout, then stops the drainer, and resolves false if a row
+  was lost. A second `close()` while one runs waits for the same result.
+- `audit_drain_degraded` reports the backoff about to start in
+  `in_backoff_seconds`; it was always 0.
+- `emit()` no longer makes up `monotonic_seq` from a per-process counter that
+  restarted at 1 (spec §2.1, §8). It returns `monotonic_seq: 0`, and
+  `PostgresStore` allocates the node's next seq in the insert transaction
+  under the same advisory lock as Python and Go, using a new
+  `(source_node_id, monotonic_seq)` index. Rows are still unsealed;
+  `init()` logs `audit_chain_unavailable` (error) once to say so (§8.1).
+  The first start after upgrading builds that index while the column
+  ALTERs hold the table's exclusive lock, so on a large table create it
+  beforehand (for the default table: `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+  idx_audit_log_node_seq ON audit_log (source_node_id, monotonic_seq)`).
+- Audit row timestamps and `shipped_at` use the canonical form (§4.3).
+- `PostgresStore` can share a table with the Python and Go stores: it inserts
+  with a column list, adds the chain columns (and `pii_in_detail` on a table
+  Python made), writes `shipped_at` in the canonical form instead of `NOW()`,
+  reads `TIMESTAMPTZ` columns back in that form with their microseconds, filters on `tenantId`, and
+  orders `query()` by timestamp.
+- A table the JS store creates has the Python store's column order (Python
+  reads by position) and empty, not NULL, `detail_salt` / `detail_commitment`
+  (Go reads them as strings). A table an older JS store created keeps its old
+  column order, with `pii_in_detail` before `shipped_at`; Postgres can't move
+  a column, so recreate it before pointing a Python store at it.
+- JS CI runs the `PostgresStore` tests against Postgres; they were always
+  skipped. Two purge tests that failed against a real database are fixed.
+
+### Fixed: JS PII redaction (#124)
+
+- `fasten.redactExpired({ before })` clears `detail` (to `null`) on rows of
+  the PII codes (`piiCodes()`: `piiInDetail` or SHORT) older than `before`,
+  as Python and Go do (spec §7). It writes an `AUDIT_ROW_REDACTED` row for
+  each one first, straight to the store, then clears it. Rows are never
+  deleted, and a row sealed under form "1" is left alone and counted in
+  `pii_redaction_skipped_legacy_form`.
+- `init({ retentionPii: '30d' })` or `FASTEN_RETENTION_PII` runs it on init
+  and then hourly. A re-`init()` during a pass runs the new config once that
+  pass ends.
+- `PostgresStore` retries its table setup on the next call when it fails,
+  such as when Postgres isn't up yet; it used to fail every call until a
+  restart.
+- `PostgresStore` has `listRedactionCandidates()` and `redactRows()`, and
+  takes an advisory lock while it creates its table, so two stores starting
+  on a new table no longer fail with a duplicate-key error.
+
 ### Fixed: log output goes through the redactor (JS, Swift, Python)
 
 - JS and Swift log lines, and JS drainer lines on stderr, are redacted as a
