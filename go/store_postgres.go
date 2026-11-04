@@ -199,8 +199,9 @@ const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, seve
 	` detail_salt, detail_commitment`
 
 // insertRowExec inserts a row (ON CONFLICT DO NOTHING) on a *sql.DB or
-// *sql.Tx. The originated and replicated checks are in the callers.
-func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
+// *sql.Tx and returns the rows inserted: 0 when the id was already stored.
+// The originated and replicated checks are in the callers.
+func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) (int64, error) {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -222,7 +223,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 	if formID == "" {
 		formID = "1"
 	}
-	_, err = exec.ExecContext(ctx,
+	res, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
@@ -237,12 +238,16 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		wv, row.Hash, row.PrevHash, formID,
 		row.DetailSalt, row.DetailCommitment,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // insertRow inserts one row outside a transaction.
 func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
-	return s.insertRowExec(ctx, s.db, row)
+	_, err := s.insertRowExec(ctx, s.db, row)
+	return err
 }
 
 // InsertOriginated inserts a row this node originated (origin_id == id).
@@ -328,7 +333,7 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 
 	row.MonotonicSeq = nextSeq
 	sealed := Seal(prevHash, row)
-	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+	if _, err := s.insertRowExec(ctx, tx, sealed); err != nil {
 		return Row{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -346,10 +351,11 @@ func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 }
 
 // insertReplicatedTx is InsertReplicated on the caller's transaction;
-// IngestReplicated commits once for the batch.
-func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+// IngestReplicated commits once for the batch. It returns the rows inserted:
+// 0 when the id was already stored.
+func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) (int64, error) {
 	if row.Hash == "" {
-		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+		return 0, fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRowExec(ctx, exec, row)
 }

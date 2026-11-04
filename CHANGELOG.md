@@ -6,6 +6,40 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: replication ingest refuses the receiving node's own rows (Python + Go)
+
+- A node's own rows come from its emit path, so ingest now stops at the
+  first row whose `source_node_id` is the receiving node and reports it as
+  the break, unless an earlier break is found. As with a stored conflict,
+  other nodes' rows from that seq on are left for the sender to resend.
+- Python: `Engine.ingest_replicated` and `fasten.ingest_replicated` check
+  against the engine's `node_id`, and raise if it is empty.
+  `replication.ingest`, `SQLiteStore.ingest_replicated` and
+  `PostgresStore.ingest_replicated` take an optional `local_node_id`.
+- Go: `SQLiteStore.IngestReplicated` and `PostgresStore.IngestReplicated`
+  are unchanged.
+
+### Added: engine-level replication ingest (Go)
+
+- `Engine.IngestReplicated` and `fasten.IngestReplicated` ingest into the
+  engine's audit store and check against its `NodeID`.
+- `SQLiteStore.IngestReplicatedFor(ctx, localNode, rows)` and the same on
+  `PostgresStore`, behind the new `LocalIngester` interface. A local-node
+  row with `MonotonicSeq` below 1 is an error, since `RejectedFromSeq` 0
+  means no break.
+
+### Changed: replication ingest checks the stored rows (Python + Go)
+
+- `ingest` / `IngestReplicated` now check a batch against the rows the store
+  already holds, and reject from the first row that disagrees, where they
+  used to keep the stored version and report the row as inserted: a row
+  whose id, or node and seq, is stored with other content; a row that does
+  not link to the stored row before or after it; an id repeated within the
+  batch, on one node or two. A row
+  stored with the same hash is still a re-delivery.
+- Go SQLite stores raise `busy_timeout` to 5 s only while they write, and put
+  back the pool connection's own value afterwards.
+
 ### Fixed: Python audit DSN path and `/audit/doctor` (#135, items 1–3)
 
 - `SQLiteStore.from_dsn` keeps `sqlite:////abs/path.db` absolute, as the

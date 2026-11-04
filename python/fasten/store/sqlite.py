@@ -173,10 +173,11 @@ class SQLiteStore:
             wal=q.get("wal", "true") != "false",
         )
 
-    def _insert_row_core(self, conn: Any, row: AuditRow) -> None:
+    def _insert_row_core(self, conn: Any, row: AuditRow) -> int:
         """INSERT OR IGNORE one row on ``conn`` without committing; the caller
-        owns the transaction. The public insert methods do the checks."""
-        conn.execute(
+        owns the transaction. The public insert methods do the checks.
+        Returns the rows inserted: 0 when the id was already stored."""
+        cur = conn.execute(
             f"INSERT OR IGNORE INTO {self._table} "
             "(id,origin_id,monotonic_seq,timestamp,code,action,severity,"
             "service_id,source_node_id,tenant_id,actor,actor_kind,"
@@ -202,6 +203,7 @@ class SQLiteStore:
                 row.detail_commitment or "",
             ),
         )
+        return int(cur.rowcount)
 
     def _insert_row(self, row: AuditRow) -> None:
         """Idempotent INSERT OR IGNORE of a single row, committed immediately."""
@@ -331,13 +333,21 @@ class SQLiteStore:
             )
             conn.commit()
 
-    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+    def ingest_replicated(
+        self, rows: list[AuditRow], local_node_id: str | None = None,
+    ) -> "IngestResult":
         """Verify a replicated batch and insert its verified prefix in one
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Rows are inserted with INSERT OR IGNORE, so
         retries are safe.
+        With ``local_node_id``, ingest stops at the first row from that node
+        (see ``repo.ingest_without_local_node``).
         """
-        from .repo import IngestResult, verified_prefix
+        from .repo import (IngestResult, check_inserted, cut_at_conflict,
+                           ingest_without_local_node, stored_conflict, verified_prefix)
+
+        if local_node_id:
+            return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
         for row in prefix:
@@ -350,8 +360,28 @@ class SQLiteStore:
         with self._txn():
             conn = self._connect()
             try:
+                # Check against what is already stored, in the same transaction
+                # (spec §4): a conflicting row is reported, never ignored.
+                conn.execute("BEGIN IMMEDIATE")
+
+                def by_id(row_id: str) -> str | None:
+                    r = conn.execute(f"SELECT hash FROM {self._table} WHERE id = ?",
+                                     (row_id,)).fetchone()
+                    return r[0] if r else None
+
+                def at_seq(node: str, seq: int) -> tuple[str, str, str] | None:
+                    r = conn.execute(
+                        f"SELECT id, hash, prev_hash FROM {self._table} "
+                        "WHERE source_node_id = ? AND monotonic_seq = ? LIMIT 1",
+                        (node, seq)).fetchone()
+                    return (r[0], r[1], r[2]) if r else None
+
+                prefix, rejected_from_seq, reason = cut_at_conflict(
+                    prefix, rejected_from_seq, reason, stored_conflict(prefix, by_id, at_seq))
+                # BEGIN IMMEDIATE holds off other writers, so a skipped insert
+                # here means the checks missed something: fail, don't drop it.
                 for row in prefix:
-                    self._insert_row_core(conn, row)
+                    check_inserted(self._insert_row_core(conn, row), row, by_id)
                     inserted += 1
                 conn.commit()
             except Exception:

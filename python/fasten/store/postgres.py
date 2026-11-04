@@ -249,10 +249,12 @@ class PostgresStore:
             row.detail_commitment or "",
         )
 
-    def _insert_row_core(self, cur: Any, row: AuditRow) -> None:
+    def _insert_row_core(self, cur: Any, row: AuditRow) -> int:
         """Insert one row on ``cur`` (ON CONFLICT DO NOTHING) without
-        committing; the caller owns the transaction."""
+        committing; the caller owns the transaction. Returns the rows
+        inserted: 0 when the id was already stored."""
         cur.execute(self._INSERT_SQL.format(table=self._table), self._insert_params(row))
+        return int(cur.rowcount)
 
     def _insert_row(self, row: AuditRow) -> None:
         """Insert and commit one row. The public insert methods do the checks."""
@@ -407,41 +409,77 @@ class PostgresStore:
 
         self._execute_with_retry(_run)
 
-    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+    def ingest_replicated(
+        self, rows: list[AuditRow], local_node_id: str | None = None,
+    ) -> "IngestResult":
         """Verify a replicated batch and insert its verified prefix in one
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Inserts use ON CONFLICT DO NOTHING, so retries
         are safe.
+        With ``local_node_id``, ingest stops at the first row from that node
+        (see ``repo.ingest_without_local_node``).
         """
-        from .repo import IngestResult, verified_prefix
+        from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
+                           ingest_without_local_node, stored_conflict, verified_prefix)
 
-        prefix, rejected_from_seq, reason = verified_prefix(rows)
-        for row in prefix:
+        if local_node_id:
+            return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
+
+        verified, verified_reject, verified_reason = verified_prefix(rows)
+        for row in verified:
             if not row.hash:
                 raise ValueError(
                     "ingest_replicated requires sealed rows (non-empty hash); "
                     f"row {row.id!r} has no hash"
                 )
 
-        def _run(conn: Any) -> int:
-            inserted = 0
+        def _run(conn: Any) -> "IngestResult":
             try:
                 with conn.cursor() as cur:
+                    # Serialise with allocation and other ingests on each node
+                    # (same lock as allocate_and_insert_originated), then check
+                    # against what is already stored (spec §4): a conflicting
+                    # row is reported, never ignored.
+                    for node in sorted({r.source_node_id for r in verified}):
+                        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (node,))
+
+                    def by_id(row_id: str) -> str | None:
+                        cur.execute(f"SELECT hash FROM {self._table} WHERE id = %s", (row_id,))
+                        r = cur.fetchone()
+                        return r[0] if r else None
+
+                    def at_seq(node: str, seq: int) -> tuple[str, str, str] | None:
+                        cur.execute(
+                            f"SELECT id, hash, prev_hash FROM {self._table} "
+                            "WHERE source_node_id = %s AND monotonic_seq = %s LIMIT 1",
+                            (node, seq))
+                        r = cur.fetchone()
+                        return (r[0], r[1], r[2]) if r else None
+
+                    prefix, rejected_from_seq, reason = cut_at_conflict(
+                        verified, verified_reject, verified_reason,
+                        stored_conflict(verified, by_id, at_seq))
                     for row in prefix:
-                        self._insert_row_core(cur, row)
-                        inserted += 1
+                        check_inserted(self._insert_row_core(cur, row), row, by_id)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-            return inserted
+            return IngestResult(
+                inserted=len(prefix),
+                rejected_from_seq=rejected_from_seq,
+                reason=reason or None,
+            )
 
-        inserted = self._execute_with_retry(_run)
-        return IngestResult(
-            inserted=inserted,
-            rejected_from_seq=rejected_from_seq,
-            reason=reason or None,
-        )
+        # The node locks don't cover ids, which are unique across nodes; if an
+        # ingest for another node stored one of these ids meanwhile, check again.
+        for _ in range(3):
+            try:
+                result: IngestResult = self._execute_with_retry(_run)
+                return result
+            except StoredMeanwhile:
+                continue
+        raise RuntimeError("ingest_replicated: rows kept being stored by another writer")
 
     def redact_expired(self, *, before: datetime,
                        codes: "Sequence[str]") -> "list[str]":

@@ -195,8 +195,9 @@ func (s *SQLiteStore) existingColumns() (map[string]bool, error) {
 }
 
 // insertRowExec inserts a row (INSERT OR IGNORE) on a *sql.DB, *sql.Conn or
-// *sql.Tx. The originated and replicated checks are in the callers.
-func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
+// *sql.Tx and returns the rows inserted: 0 when the id was already stored.
+// The originated and replicated checks are in the callers.
+func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row Row) (int64, error) {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -218,7 +219,7 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 	if formID == "" {
 		formID = "1"
 	}
-	_, err = exec.ExecContext(ctx,
+	res, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT OR IGNORE INTO %s (%s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.table, auditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		canonicalTS(row.Timestamp),
@@ -233,12 +234,16 @@ func (s *SQLiteStore) insertRowExec(ctx context.Context, exec execContext, row R
 		wv, row.Hash, row.PrevHash, formID,
 		row.DetailSalt, row.DetailCommitment,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // insertRow inserts one row outside a transaction.
 func (s *SQLiteStore) insertRow(ctx context.Context, row Row) error {
-	return s.insertRowExec(ctx, s.db, row)
+	_, err := s.insertRowExec(ctx, s.db, row)
+	return err
 }
 
 // InsertOriginated inserts a row this node originated (origin_id == id).
@@ -282,9 +287,11 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return Row{}, fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
+	restore, err := beginImmediate(ctx, conn)
+	if err != nil {
+		return Row{}, err
 	}
+	defer restore() // after the ROLLBACK below, before conn.Close
 	committed := false
 	defer func() {
 		if !committed {
@@ -318,7 +325,7 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 
 	row.MonotonicSeq = nextSeq
 	sealed := Seal(prevHash, row)
-	if err := s.insertRowExec(ctx, conn, sealed); err != nil {
+	if _, err := s.insertRowExec(ctx, conn, sealed); err != nil {
 		return Row{}, err
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
@@ -338,12 +345,43 @@ func (s *SQLiteStore) InsertReplicated(ctx context.Context, row Row) error {
 }
 
 // insertReplicatedTx is InsertReplicated on the caller's transaction;
-// IngestReplicated commits once for the batch.
-func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+// IngestReplicated commits once for the batch. It returns the rows inserted:
+// 0 when the id was already stored.
+func (s *SQLiteStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) (int64, error) {
 	if row.Hash == "" {
-		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+		return 0, fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRowExec(ctx, exec, row)
+}
+
+// sqliteBusyTimeoutMs is how long a writer waits for SQLite's write lock before
+// failing with SQLITE_BUSY, matching Python's sqlite3 default of 5 s.
+const sqliteBusyTimeoutMs = 5000
+
+// beginImmediate starts a write transaction on conn that holds SQLite's write
+// lock before its first read, waiting for another writer rather than failing.
+// It raises busy_timeout for the transaction, never lowering what the caller
+// set. busy_timeout belongs to the connection, which goes back to the
+// caller's pool, so call restore once the transaction has ended.
+func beginImmediate(ctx context.Context, conn *sql.Conn) (restore func(), err error) {
+	restore = func() {}
+	var current int
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&current); err != nil {
+		return restore, fmt.Errorf("fasten: busy_timeout: %w", err)
+	}
+	if current < sqliteBusyTimeoutMs {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMs)); err != nil {
+			return restore, fmt.Errorf("fasten: busy_timeout: %w", err)
+		}
+		restore = func() {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout = %d", current))
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		restore()
+		return func() {}, fmt.Errorf("fasten: BEGIN IMMEDIATE: %w", err)
+	}
+	return restore, nil
 }
 
 // Insert calls InsertOriginated. The drainer writes through it.
