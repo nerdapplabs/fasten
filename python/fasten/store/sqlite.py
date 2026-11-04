@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
     canonical_form_id TEXT NOT NULL DEFAULT '1',
-    -- Form "2" columns (spec 1.4). NULL on form "1" rows, and detail_salt is
-    -- cleared on redaction.
+    -- Form "2" columns (spec 1.4). '' on form "1" rows (NULL in older rows),
+    -- and detail_salt is cleared on redaction.
     detail_salt       TEXT,
     detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
@@ -186,8 +186,10 @@ class SQLiteStore:
                 row.canonical_form_id,
                 row.prev_hash,
                 row.hash,
-                row.detail_salt,
-                row.detail_commitment,
+                # '' rather than NULL: a Go-created table has them NOT NULL,
+                # and OR IGNORE would drop the row without a word.
+                row.detail_salt or "",
+                row.detail_commitment or "",
             ),
         )
 
@@ -368,9 +370,10 @@ class SQLiteStore:
         Separate from redact_rows() so the caller can record each redaction
         first (spec 7.2). The seq is returned for the ``redacted_seq`` field.
 
-        Skips form-"1" rows: their ``detail`` IS hashed, so redacting one would
-        change its hash and cascade a re-seal down the rest of the chain. They
-        are counted and logged at WARNING rather than skipped quietly — on a
+        Lists form-"2" rows and unsealed rows (empty ``hash``): no hash covers
+        their ``detail`` (spec §7.1). Skips sealed form-"1" rows: their
+        ``detail`` IS hashed, so redacting one would change its hash and cascade
+        a re-seal down the rest of the chain. They are counted and logged at WARNING rather than skipped quietly — on a
         store written before the form-"2" upgrade, silence here would let an
         operator watch redaction "succeed" while the personal data it was
         supposed to destroy survives untouched.
@@ -382,14 +385,14 @@ class SQLiteStore:
         skipped = conn.execute(
             f"SELECT COUNT(*) FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id <> '2' AND detail <> 'null'",
+            "AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'",
             (_utc_iso(before), *codes),
         ).fetchone()[0]
         if skipped:
             logger.warning(
                 "fasten redact_expired: %d row(s) past the PII horizon were "
-                "NOT redacted because canonical_form_id != '2' — their "
-                "detail is inside the hash, so redacting would break the "
+                "NOT redacted because they are sealed under form '1' — "
+                "their detail is inside the hash, so redacting would break the "
                 "chain. Personal data in these rows still exists. "
                 "Re-seal under form '2' or erase the chain segment.",
                 skipped,
@@ -397,7 +400,7 @@ class SQLiteStore:
         rows = conn.execute(
             f"SELECT id, monotonic_seq FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id = '2' AND detail <> 'null' "
+            "AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "
             "ORDER BY monotonic_seq",
             (_utc_iso(before), *codes),
         ).fetchall()
@@ -412,14 +415,23 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in ids)
         with self._txn():
             conn = self._connect()
-            conn.execute(
-                # The JSON literal 'null', since detail is NOT NULL and
-                # changing that needs a table rebuild. It reads back as None.
-                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
-                f"WHERE id IN ({placeholders}) AND canonical_form_id = '2'",
-                tuple(ids),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    # The JSON literal 'null', since detail is NOT NULL and
+                    # changing that needs a table rebuild. It reads back as
+                    # None. The salt gets '' because a table the Go store
+                    # created declares it NOT NULL.
+                    f"UPDATE {self._table} SET detail = 'null', detail_salt = '' "
+                    f"WHERE id IN ({placeholders}) AND (canonical_form_id = '2' OR hash = '')",
+                    tuple(ids),
+                )
+                conn.commit()
+            except BaseException:
+                # The UPDATE opened an implicit transaction; left open, it
+                # keeps the write lock and other writers get "database is
+                # locked".
+                conn.rollback()
+                raise
             return list(ids)
 
     def redact_expired(self, *, before: datetime,
@@ -658,9 +670,10 @@ class SQLiteStore:
             detail=json.loads(r["detail"]),
             shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
-            detail_salt=r["detail_salt"] if "detail_salt" in keys else None,
+            # '' (what the stores write, and what redaction leaves) is none.
+            detail_salt=(r["detail_salt"] or None) if "detail_salt" in keys else None,
             detail_commitment=(
-                r["detail_commitment"] if "detail_commitment" in keys else None),
+                (r["detail_commitment"] or None) if "detail_commitment" in keys else None),
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",
         )

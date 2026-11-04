@@ -143,3 +143,68 @@ def test_redact_expired_respects_cutoff_and_codes(store):
     assert store.redact_expired(before=datetime(2099, 1, 1, tzinfo=timezone.utc),
                                 codes=[]) == []
     assert {r.id: r for r in store.query(limit=50)}[fresh.id].detail is not None
+
+
+def test_sealed_form_1_row_is_counted_and_never_redacted(store, caplog):
+    """Spec §7.1: an unsealed row is a candidate; a sealed form "1" row is not,
+    is counted in the warning, and survives redact_rows naming it directly."""
+    import dataclasses
+    import logging
+    from datetime import timedelta
+    old = datetime.now(timezone.utc) - timedelta(days=40)
+    unsealed = dataclasses.replace(
+        _row(31), code="USER_EXPORTED", timestamp=old,
+        detail={"email": "u@v.w"}, monotonic_seq=900_001)
+    legacy = dataclasses.replace(
+        _row(32), code="USER_EXPORTED", timestamp=old,
+        detail={"email": "l@m.n"}, monotonic_seq=900_002,
+        canonical_form_id="1", prev_hash="genesis", hash="f" * 64)
+    store._insert_row(unsealed)
+    store._insert_row(legacy)
+
+    with caplog.at_level(logging.WARNING, logger="fasten.store.postgres"):
+        got = store.list_redaction_candidates(
+            before=datetime.now(timezone.utc) - timedelta(days=30),
+            codes=["USER_EXPORTED"])
+    assert [cid for cid, _ in got] == [unsealed.id]
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "fasten.store.postgres"]
+    assert len(warnings) == 1 and " 1 row(s) " in warnings[0], warnings
+
+    store.redact_rows(ids=[legacy.id])
+    assert {r.id: r for r in store.query(limit=50)}[legacy.id].detail == {"email": "l@m.n"}
+
+
+def test_redact_rows_on_a_not_null_salt_column():
+    """go/store_postgres.go declares detail_salt NOT NULL DEFAULT '', so
+    redaction writes '' like Go does, and '' reads back as no salt. One pass
+    blanks the row; a second finds nothing left to redact."""
+    import dataclasses
+
+    import psycopg
+
+    from fasten.store.postgres import PostgresStore
+    table = "fasten_not_null_salt"
+    with psycopg.connect(DSN) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    store = PostgresStore(DSN, table=table)
+    sealed = store.allocate_and_insert_originated(_row(41))
+    with psycopg.connect(DSN) as conn:
+        for col in ("detail_salt", "detail_commitment"):
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN {col} SET DEFAULT ''")
+            conn.execute(f"ALTER TABLE {table} ALTER COLUMN {col} SET NOT NULL")
+    unsealed = dataclasses.replace(
+        _row(42), monotonic_seq=sealed.monotonic_seq + 1,
+        detail_salt="", detail_commitment="")
+    store._insert_row(unsealed)
+
+    assert store.redact_rows(ids=[sealed.id, unsealed.id]) == [sealed.id, unsealed.id]
+
+    rows = {r.id: r for r in store.query(limit=10)}
+    for rid in (sealed.id, unsealed.id):
+        assert rows[rid].detail is None
+        assert rows[rid].detail_salt is None
+    assert verify_chain([rows[sealed.id]]).ok
+    assert store.list_redaction_candidates(
+        before=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        codes=["USER_CREATED"]) == []
