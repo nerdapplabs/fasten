@@ -400,6 +400,121 @@ void reinit_under_load() {
     std::cout << "re-init under load: PASS\n";
 }
 
+
+// The line on stderr for `event`, or "" if there is none.
+std::string line_of(const std::string& text, const std::string& event) {
+    const auto p = text.find("\"event\":\"" + event + "\"");
+    if (p == std::string::npos) return "";
+    const auto b = text.rfind('\n', p);
+    const auto e = text.find('\n', p);
+    return text.substr(b == std::string::npos ? 0 : b + 1,
+                       e == std::string::npos ? std::string::npos : e - (b + 1));
+}
+
+// A flush() with under 1 ms to go returns false at once instead of waiting
+// for a row the sink is still holding.
+void short_flush_does_not_wait_for_a_stuck_row() {
+    reset_state();
+    std::atomic<bool> release{false};
+    fasten::set_audit_sink([&](const fasten::Row&) {
+        while (!release) std::this_thread::sleep_for(milliseconds(5));
+    });
+    fasten::init(cfg("queue"));
+    emit_one();
+    std::this_thread::sleep_for(milliseconds(50));
+    const auto t0 = std::chrono::steady_clock::now();
+    bool drained = fasten::flush(milliseconds(1));
+    bool zero = fasten::flush(milliseconds(0));
+    const auto took = std::chrono::steady_clock::now() - t0;
+    release = true;
+    assert(!drained && !zero);
+    assert(took < milliseconds(500));
+    assert(fasten::flush(milliseconds(2000)));
+    std::cout << "short flush does not wait for a stuck row: PASS\n";
+}
+
+// The core's drainer events keep their JSON types on stderr.
+void core_events_keep_json_types() {
+    reset_state();
+    fasten::set_audit_sink([](const fasten::Row&) { throw std::runtime_error("down"); });
+    auto c = cfg("queue");
+    c.queue_drain_max_attempts = 6;
+    c.queue_retry_initial_ms = 1; c.queue_retry_max_ms = 5; c.disable_queue_jitter = true;
+    Stderr err; err.start();
+    fasten::init(c);
+    emit_one();
+    fasten::flush(milliseconds(2000));
+    auto out = err.stop();
+    const auto dead = line_of(out, "audit_drain_dead_letter");
+    const auto degraded = line_of(out, "audit_drain_degraded");
+    assert(dead.find("\"attempt_count\":6") != std::string::npos);
+    assert(degraded.find("\"retry_count\":5") != std::string::npos);
+    assert(degraded.find("\"in_backoff_seconds\":\"") == std::string::npos);
+    assert(degraded.find("\"in_backoff_seconds\":") != std::string::npos);
+    std::cout << "core events keep JSON types: PASS\n";
+}
+
+// Core event values still go through the redactor, and only strings change.
+void core_event_fields_are_redacted() {
+    reset_state();
+    fasten::init(cfg("raise"));
+    auto f = fasten::detail_::redact_json_fields_({
+        {"depth", "1"}, {"in_backoff_seconds", "0.25"}, {"flushed", "true"},
+        {"row_id", "null"}, {"password", "\"hunter2\""}, {"row_ids", "[\"a\",\"b\"]"}});
+    std::string line;
+    for (auto& x : f) line += x.key + "=" + x.json + ";";
+    assert(line.find("depth=1;") != std::string::npos);
+    assert(line.find("in_backoff_seconds=0.25;") != std::string::npos);
+    assert(line.find("flushed=true;") != std::string::npos);
+    assert(line.find("row_id=null;") != std::string::npos);
+    assert(line.find("row_ids=[\"a\",\"b\"];") != std::string::npos);
+    assert(line.find("hunter2") == std::string::npos);
+    std::cout << "core event fields are redacted: PASS\n";
+}
+
+// A re-init whose old drainer holds a row it could not store reports it (§10).
+void reinit_reports_unstored_rows() {
+    reset_state();
+    fasten::set_audit_sink([](const fasten::Row&) { throw std::runtime_error("down"); });
+    auto c = cfg("queue");
+    c.queue_drain_max_attempts = 3;
+    c.queue_retry_initial_ms = 100; c.queue_retry_max_ms = 100; c.disable_queue_jitter = true;
+    Stderr err; err.start();
+    fasten::init(c);
+    emit_one();
+    // The old drainer's flush sees the row dead-lettered.
+    fasten::init(cfg("queue"));
+    auto out = err.stop();
+    const auto line = line_of(out, "audit_drain_install_incomplete");
+    assert(line.find("\"flushed\":true") != std::string::npos);
+    assert(line.find("\"unstored\":1") != std::string::npos);
+    assert(syslog_has("audit_drain_install_incomplete"));
+    std::cout << "re-init reports unstored rows: PASS\n";
+}
+
+// A flush() while shutdown() is still making its last attempts waits for it,
+// and returns false if it does not finish in time.
+void flush_during_shutdown_waits_for_close() {
+    reset_state();
+    fasten::init(cfg("raise"));
+    std::atomic<bool> in_sink{false};
+    fasten::detail_::CFastenDrainer d([&](const fasten::Row&) {
+        in_sink = true;
+        std::this_thread::sleep_for(milliseconds(800));
+    }, 10, milliseconds(10), milliseconds(50), false);
+    fasten::Row a; a.id = "evt-a";
+    d.put(a);
+    while (!in_sink) std::this_thread::sleep_for(milliseconds(5));
+    std::thread stopper([&] { d.shutdown(milliseconds(1000)); });
+    std::this_thread::sleep_for(milliseconds(50));
+    bool early = d.flush(milliseconds(100));
+    bool later = d.flush(milliseconds(3000));
+    stopper.join();
+    assert(!early);
+    assert(later);
+    std::cout << "flush during shutdown waits for close: PASS\n";
+}
+
 }  // namespace
 
 int main() {
@@ -420,5 +535,10 @@ int main() {
     shutdown_with_a_put_blocked_on_a_full_queue();
     shutdown_with_a_sink_that_puts();
     reinit_under_load();
+    short_flush_does_not_wait_for_a_stuck_row();
+    core_events_keep_json_types();
+    core_event_fields_are_redacted();
+    reinit_reports_unstored_rows();
+    flush_during_shutdown_waits_for_close();
     return 0;
 }

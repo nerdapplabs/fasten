@@ -126,6 +126,57 @@ void core_error_replaces_every_value() {
     std::cout << "ok core_error_replaces_every_value\n";
 }
 
+
+// An extra key too long for the core's key pattern makes every redact call
+// return an error from the core.
+fasten::Config failing_redact_config() {
+    fasten::Config c{"svc", "node", ""};
+    c.audit_store_failure_strategy = "raise";
+    c.extra_redact_keys = {std::string(2000000, 'k')};
+    return c;
+}
+
+void redact_gets_core_error() {
+    reset_state();
+    fasten::set_audit_sink([](const fasten::Row&) {});
+    fasten::init(failing_redact_config());
+
+    Capture out(1); out.start();
+    Capture err(2); err.start();
+    fasten::Row row = fasten::emit("REDACT_INVALID_UTF8",
+        fasten::target("t-1"), fasten::detail({{"password", kSecret}, {"name", "alice"}}));
+    const std::string lines = err.stop();
+    const std::string line = out.stop();
+
+    if (row.detail["password"] != "***" || row.detail["name"] != "***")
+        fail("core error: values not replaced");
+    if (line.find(kSecret) != std::string::npos) fail("core error: stdout line has the password");
+    if (lines.find("\"event\":\"redact_failed\"") == std::string::npos)
+        fail("core error: no redact_failed line on stderr");
+    std::cout << "ok redact_gets_core_error\n";
+}
+
+// On the fallback path an AUDIT_ROW_REDACTED row keeps redacted_seq a number.
+void core_error_keeps_redacted_seq() {
+    reset_state();
+    fasten::init(failing_redact_config());
+    fasten::detail_::ensure_redaction_code_();
+    fasten::EmitOpts o;
+    o.target = "evt-1";
+    o.fields = {{"redacted_seq", "42"}, {"reason", "retention"}, {"redacted_id", "evt-1"}};
+
+    Capture out(1); out.start();
+    Capture err(2); err.start();
+    fasten::Row row = fasten::detail_::make_row_(fasten::kAuditRowRedacted, o);
+    err.stop();
+    out.stop();
+
+    if (row.detail["reason"] != "***") fail("redacted_seq: fallback not taken");
+    if (row.to_json().find("\"redacted_seq\":42") == std::string::npos)
+        fail("redacted_seq: not kept as a number");
+    std::cout << "ok core_error_keeps_redacted_seq\n";
+}
+
 }  // namespace
 
 int main() {
@@ -133,6 +184,8 @@ int main() {
     log_redacts_invalid_utf8();
     json_str_writes_valid_utf8();
     core_error_replaces_every_value();
+    redact_gets_core_error();
+    core_error_keeps_redacted_seq();
     std::cout << "\nALL REDACT_INVALID_UTF8 TESTS PASSED\n";
     return 0;
 }

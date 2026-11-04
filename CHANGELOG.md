@@ -18,7 +18,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   replaced, not only the new one.
 - The core drainer's sys events (`audit_drain_*`, `audit_queue_*`) now go
   through the SDK's sys log, redacted, so they reach `query_syslog()` as
-  well as stderr.
+  well as stderr. Their numbers and booleans stay JSON numbers and
+  booleans on the stderr line.
+- `fasten::flush()` with under 1 ms left no longer waits with no timeout;
+  a drainer still running when the time is used up counts as not drained.
+- `fasten::flush()` while a re-init is stopping the old drainer waits for
+  the stop to finish, and returns false if it does not finish in time.
+- A re-init whose old drainer did not flush in time, or held rows that
+  were not stored, emits `audit_drain_install_incomplete` with `flushed`
+  and `unstored`.
+- When the core returns an error, an `AUDIT_ROW_REDACTED` row keeps its
+  numeric `redacted_seq`.
 
 ### Changed: Go SDK requires Go 1.26
 
