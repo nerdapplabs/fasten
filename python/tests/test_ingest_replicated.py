@@ -141,11 +141,9 @@ def test_module_list_unshipped_and_mark_shipped(initialized):
 
 
 def test_module_ingest_replicated_uses_default_store(initialized):
-    rows = _seal_chain([
-        fasten.emit(code="USER_CREATED", target="x"),
-    ])
-    # default engine store (mem_store via `initialized`) already has the row;
-    # ingest a freshly-sealed standalone chain into it idempotently.
+    emitted = fasten.emit(code="USER_CREATED", target="x")
+    rows = _seal_chain([dataclasses.replace(
+        emitted, id="evt-other", origin_id="evt-other", source_node_id="other-node")])
     result = fasten.ingest_replicated(rows)
     assert isinstance(result, IngestResult)
     assert result.inserted == 1

@@ -156,14 +156,14 @@ def test_reinit_flushes_old_drainer_before_replacing(mem_store):
 # atexit flush
 
 
-def test_atexit_flush_noop_when_no_drainer():
-    """_atexit_flush must not raise when called with no drainer installed."""
+def test_atexit_close_noop_when_no_drainer():
+    """_atexit_close must not raise when called with no drainer installed."""
     _default.reset_for_tests()
-    _default._atexit_flush()  # must not raise
+    _default._atexit_close()  # must not raise
 
 
-def test_atexit_flush_drains_pending(mem_store):
-    """_atexit_flush must flush pending rows when a drainer is active."""
+def test_atexit_close_drains_pending(mem_store):
+    """_atexit_close must flush pending rows when a drainer is active."""
     import threading
     flushed = threading.Event()
 
@@ -185,8 +185,8 @@ def test_atexit_flush_drains_pending(mem_store):
         audit_store_failure_strategy="queue",
     )
     fasten.emit(code="USER_CREATED", target="u-1")
-    _default._atexit_flush()
-    assert len(store.rows) >= 1
+    _default._atexit_close()
+    assert len(store.rows) == 1
 
 
 # stdlib logger fallback
@@ -272,7 +272,7 @@ def test_sync_fallback_emits_sys_event_on_queue_mode_no_drainer():
     t = fasten.transport()
     assert t is not None
     orig = t.write_drainer_syslog
-    t.write_drainer_syslog = lambda r: (captured.append(r), orig(r))[-1]  # type: ignore[assignment,attr-defined]
+    t.write_drainer_syslog = lambda r, **kw: (captured.append(r), orig(r, **kw))[-1]  # type: ignore[assignment,attr-defined]
 
     # emit() must not raise even though the store is broken.
     fasten.emit(code="USER_CREATED", target="u-1")

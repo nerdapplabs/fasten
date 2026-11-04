@@ -50,7 +50,7 @@ await withRequestID('req-a1b2c3', async () => {
     fasten.log.info('signup_complete', { user_id: 'u-42' });
 });
 
-await fasten.flush();   // drain pending audit rows
+await fasten.close();   // on shutdown: store pending audit rows, stop the drainer
 ```
 
 Both lines go to stdout as NDJSON with the same `request_id`.
@@ -75,8 +75,28 @@ curl http://localhost:8080/users/u-42
 and a `setImmediate`-driven drainer writes them to the sink with exponential
 backoff (100 ms to 60 s, plus or minus 20 % jitter). Sink failures stay off
 the request path. Set `auditStoreFailureStrategy: 'raise'` for synchronous
-writes that throw `AuditStoreError`. `queueStats()` and `flush(timeoutMs)`
-complete the public surface.
+writes that throw `AuditStoreError`. With an async store such as
+`PostgresStore`, raise-mode `emit()` returns a promise for the row; `await`
+it to see the `AuditStoreError`. `queueStats()`, `flush(timeoutMs)` and
+`close(timeoutMs)` complete the public surface. Call `close()` on shutdown:
+it flushes, then stops the drainer, giving rows still queued one more
+attempt each. A row that fails it, or is still unstored at the timeout, is
+reported as `audit_drain_lost_at_stop`, and `close()` resolves false.
+Re-`init()` stops the old drainer the same way.
+
+**Chain.** The JS SDK does not seal rows. `emit()` returns the row with
+`monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the
+insert transaction, under the same per-node lock as the Python and Go
+stores; `hash` and `prev_hash` stay empty. `PostgresStore` writes into a
+table the Python or Go store created, and adds the columns it lacks.
+
+**PII retention.** `redactExpired({ before })` clears `detail` (to `null`)
+on rows of the PII codes older than `before`: codes with `piiInDetail` or
+`retentionClass: SHORT` (`piiCodes()`). Each redacted row gets an
+`AUDIT_ROW_REDACTED` row naming it, written before the row is cleared. Rows
+are never deleted. Set `retentionPii: '30d'` (or `FASTEN_RETENTION_PII`) in
+`init()` to run it on init and then hourly; the store must implement
+`listRedactionCandidates` and `redactRows`, as `PostgresStore` does.
 
 **Differs from the other SDKs:** Node is single-threaded, so `emit()` cannot
 block on a counting semaphore the way Python, Go, Rust and C++ do.

@@ -10,14 +10,42 @@
  *   await store.init();          // run DDL once
  *   fasten.init({ auditStore: store });
  */
+import { canonicalTS } from "../canonical_ts.js";
+
 // pg is an optional peer dependency, so import it only when first needed.
 let _Pool = null;
+let _types = null;
 async function _getPool(connectionString) {
 	if (!_Pool) {
 		const mod = await import("pg");
-		_Pool = mod.default.Pool ?? mod.Pool;
+		const pg = mod.default ?? mod;
+		_Pool = pg.Pool;
+		const base = pg.types;
+		// timestamptz (1184) and timestamp (1114) as text: a Date keeps only
+		// milliseconds, so a Go-written .123456 would come back as .123000.
+		// Set on this pool only, not on pg globally.
+		_types = {
+			getTypeParser: (oid, format) =>
+				oid === 1184 || oid === 1114
+					? _pgTimestamp
+					: base.getTypeParser(oid, format),
+		};
 	}
-	return new _Pool({ connectionString });
+	return new _Pool({ connectionString, types: _types });
+}
+
+// "2026-08-21 10:00:00.123456+05:30" → "2026-08-21T04:30:00.123456Z".
+// A timestamp with no offset is UTC.
+function _pgTimestamp(v) {
+	const m =
+		/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:([+-]\d{2})(?::?(\d{2}))?)?$/.exec(
+			v,
+		);
+	if (!m) return v;
+	const [, date, time, frac = "", offH, offM = "00"] = m;
+	const offset = offH ? `${offH}:${offM}` : "Z";
+	const secs = new Date(`${date}T${time}${offset}`).toISOString().slice(0, 19);
+	return `${secs}.${frac.padEnd(6, "0")}Z`;
 }
 
 // Bare name ("audit_log") or schema-qualified ("fasten.audit_log").
@@ -50,14 +78,32 @@ function _ddlStatements(table, idx) {
     method         TEXT NOT NULL,
     request_id     TEXT NOT NULL,
     detail         TEXT NOT NULL,
-    pii_in_detail  SMALLINT NOT NULL DEFAULT 0,
-    shipped_at     TEXT
+    shipped_at     TEXT,
+    prev_hash      TEXT NOT NULL DEFAULT 'genesis',
+    hash           TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT,
+    detail_commitment TEXT,
+    pii_in_detail  SMALLINT NOT NULL DEFAULT 0
 )`,
+		// The column order matches Python's table, which the Python store
+		// reads by position; pii_in_detail comes last, where the ALTER below
+		// puts it on a table Python created. The ALTERs add the columns the
+		// Python and Go stores have to a table an older JS store created.
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS pii_in_detail SMALLINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT 'genesis'`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS canonical_form_id TEXT NOT NULL DEFAULT '1'`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS detail_salt TEXT`,
+		`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS detail_commitment TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_req       ON ${table}(request_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_code      ON ${table}(code)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_ts        ON ${table}(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_unshipped ON ${table}(shipped_at) WHERE shipped_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_pii       ON ${table}(pii_in_detail) WHERE pii_in_detail = 1`,
+		// For the seq allocation in insert(). Not unique: rows from the old
+		// per-process counter repeat seqs.
+		`CREATE INDEX IF NOT EXISTS idx_${idx}_node_seq  ON ${table}(source_node_id, monotonic_seq)`,
 	];
 }
 
@@ -89,6 +135,8 @@ function _mapRow(r) {
 		detail: typeof r.detail === "string" ? JSON.parse(r.detail) : r.detail,
 		piiInDetail: Number(r.pii_in_detail) === 1,
 		shippedAt: r.shipped_at ?? null,
+		prevHash: r.prev_hash ?? "",
+		hash: r.hash ?? "",
 	};
 }
 
@@ -96,14 +144,23 @@ function _mapRow(r) {
  * Build a parameterised WHERE clause from filter options.
  * Returns { where, params } where params is already accumulated.
  *
- * @param {{ requestId?, code?, domain?, sourceNodeId?, actor?, target?, since?, until? }} filters
+ * @param {{ requestId?, code?, domain?, sourceNodeId?, tenantId?, actor?, target?, since?, until? }} filters
  * @returns {{ where: string, params: unknown[] }}
  */
 function _buildWhere(filters) {
 	const conds = [];
 	const params = [];
-	const { requestId, code, domain, sourceNodeId, actor, target, since, until } =
-		filters;
+	const {
+		requestId,
+		code,
+		domain,
+		sourceNodeId,
+		tenantId,
+		actor,
+		target,
+		since,
+		until,
+	} = filters;
 
 	if (requestId) {
 		params.push(requestId);
@@ -120,6 +177,10 @@ function _buildWhere(filters) {
 	if (sourceNodeId) {
 		params.push(sourceNodeId);
 		conds.push(`source_node_id = $${params.length}`);
+	}
+	if (tenantId) {
+		params.push(tenantId);
+		conds.push(`tenant_id = $${params.length}`);
 	}
 	if (actor) {
 		params.push(actor);
@@ -174,6 +235,12 @@ export class PostgresStore {
 		const client = await this._pool.connect();
 		try {
 			await client.query("BEGIN");
+			// Stores starting together on a new table race on CREATE TABLE.
+			// Same key as the Python store's bootstrap lock.
+			await client.query(
+				"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+				[`fasten.bootstrap.${this._table}`],
+			);
 			if (this._schema) {
 				await client.query(`CREATE SCHEMA IF NOT EXISTS ${this._schema}`);
 			}
@@ -192,7 +259,11 @@ export class PostgresStore {
 	/** Ensure DDL has run exactly once, lazily. */
 	async _ensureReady() {
 		if (!this._ready) {
-			this._ready = this.init();
+			// Drop a failed init so the next call retries once Postgres is up.
+			this._ready = this.init().catch((err) => {
+				this._ready = null;
+				throw err;
+			});
 		}
 		return this._ready;
 	}
@@ -201,12 +272,17 @@ export class PostgresStore {
 	 * Insert one audit row.  Ignores duplicate IDs (ON CONFLICT DO NOTHING).
 	 * This is the method the fasten drainer calls.
 	 *
+	 * A row with `monotonic_seq` 0 (what `emit()` returns) gets the node's next
+	 * seq, allocated in the insert's transaction under the same per-node lock
+	 * as the Python and Go stores (spec §2.1). The row is not sealed: `hash`
+	 * and `prev_hash` are empty.
+	 *
 	 * @param {Record<string,unknown>} row  Raw row object from `fasten.emit()`.
 	 * @returns {Promise<void>}
 	 */
 	async insert(row) {
 		await this._ensureReady();
-		const piiFlag = row.pii_in_detail || row.piiInDetail ? 1 : 0;
+		const node = row.source_node_id ?? row.sourceNodeId;
 		const detailStr =
 			typeof row.detail === "string"
 				? row.detail
@@ -214,15 +290,15 @@ export class PostgresStore {
 		const params = [
 			row.id,
 			row.origin_id ?? row.originId,
-			row.monotonic_seq ?? row.monotonicSeq,
+			Number(row.monotonic_seq ?? row.monotonicSeq ?? 0),
 			row.timestamp instanceof Date
-				? row.timestamp.toISOString()
+				? canonicalTS(row.timestamp)
 				: row.timestamp,
 			row.code,
 			row.action,
 			row.severity,
 			row.service_id ?? row.serviceId,
-			row.source_node_id ?? row.sourceNodeId,
+			node,
 			row.tenant_id ?? row.tenantId ?? null,
 			row.actor,
 			row.actor_kind ?? row.actorKind,
@@ -232,13 +308,34 @@ export class PostgresStore {
 			row.method,
 			row.request_id ?? row.requestId,
 			detailStr,
-			piiFlag,
+			row.pii_in_detail || row.piiInDetail ? 1 : 0,
 			row.shipped_at ?? row.shippedAt ?? null,
 		];
-		await this._pool.query(
-			`INSERT INTO ${this._table} VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT (id) DO NOTHING`,
-			params,
-		);
+		const client = await this._pool.connect();
+		try {
+			await client.query("BEGIN");
+			if (!params[2]) {
+				await client.query(
+					"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+					[node],
+				);
+				const res = await client.query(
+					`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
+					[node],
+				);
+				params[2] = Number(res.rows[0].seq);
+			}
+			await client.query(
+				`INSERT INTO ${this._table} (id, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, pii_in_detail, shipped_at, prev_hash, hash, detail_salt, detail_commitment) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'','','','') ON CONFLICT (id) DO NOTHING`,
+				params,
+			);
+			await client.query("COMMIT");
+		} catch (err) {
+			await client.query("ROLLBACK").catch(() => {});
+			throw err;
+		} finally {
+			client.release();
+		}
 	}
 
 	/**
@@ -246,7 +343,7 @@ export class PostgresStore {
 	 *
 	 * @param {{
 	 *   requestId?: string, code?: string, domain?: string,
-	 *   sourceNodeId?: string, actor?: string, target?: string,
+	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string,
 	 *   limit?: number, offset?: number
 	 * }} [opts]
@@ -257,6 +354,7 @@ export class PostgresStore {
 		code,
 		domain,
 		sourceNodeId,
+		tenantId,
 		actor,
 		target,
 		since,
@@ -270,6 +368,7 @@ export class PostgresStore {
 			code,
 			domain,
 			sourceNodeId,
+			tenantId,
 			actor,
 			target,
 			since,
@@ -277,7 +376,7 @@ export class PostgresStore {
 		});
 		const n = params.length;
 		params.push(limit, offset);
-		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
+		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
 		const res = await this._pool.query(sql, params);
 		return res.rows.map(_mapRow);
 	}
@@ -287,7 +386,7 @@ export class PostgresStore {
 	 *
 	 * @param {{
 	 *   requestId?: string, code?: string, domain?: string,
-	 *   sourceNodeId?: string, actor?: string, target?: string,
+	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string
 	 * }} [opts]
 	 * @returns {Promise<number>}
@@ -297,6 +396,7 @@ export class PostgresStore {
 		code,
 		domain,
 		sourceNodeId,
+		tenantId,
 		actor,
 		target,
 		since,
@@ -308,6 +408,7 @@ export class PostgresStore {
 			code,
 			domain,
 			sourceNodeId,
+			tenantId,
 			actor,
 			target,
 			since,
@@ -335,7 +436,8 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Mark rows as shipped by setting shipped_at to the current UTC time.
+	 * Mark rows as shipped by setting shipped_at to the current time, in the
+	 * canonical form the other SDKs parse (spec §4.3).
 	 *
 	 * @param {string[]} ids
 	 * @returns {Promise<void>}
@@ -344,8 +446,8 @@ export class PostgresStore {
 		if (!ids || ids.length === 0) return;
 		await this._ensureReady();
 		await this._pool.query(
-			`UPDATE ${this._table} SET shipped_at = NOW() WHERE id = ANY($1)`,
-			[ids],
+			`UPDATE ${this._table} SET shipped_at = $2 WHERE id = ANY($1)`,
+			[ids, canonicalTS()],
 		);
 	}
 
@@ -362,6 +464,64 @@ export class PostgresStore {
 		if (respectUnshipped) sql += " AND shipped_at IS NOT NULL";
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
+	}
+
+	/**
+	 * Rows of `codes` older than `before` that redaction would clear (spec §7.1),
+	 * oldest seq first. A row is redactable when it is unsealed (`hash` empty,
+	 * as every JS row is) or sealed under form "2". `skipped` counts sealed
+	 * form-"1" rows past the cutoff: their detail is hashed, so they stay.
+	 *
+	 * @param {{ before: Date | string, codes: string[] }} opts
+	 * @returns {Promise<{ candidates: { id: string, monotonicSeq: number }[], skipped: number }>}
+	 */
+	async listRedactionCandidates({ before, codes }) {
+		if (!codes || codes.length === 0) return { candidates: [], skipped: 0 };
+		await this._ensureReady();
+		// timestamp is compared as text, so the cutoff must be canonical too.
+		const d = before instanceof Date ? before : new Date(before);
+		if (Number.isNaN(d.getTime())) {
+			throw new Error(
+				`fasten PostgresStore: bad before ${JSON.stringify(before)}`,
+			);
+		}
+		const cutoff = canonicalTS(d);
+		const skippedRes = await this._pool.query(
+			`SELECT COUNT(*) FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND hash <> '' AND canonical_form_id <> '2'`,
+			[cutoff, codes],
+		);
+		const res = await this._pool.query(
+			`SELECT id, monotonic_seq FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND (hash = '' OR canonical_form_id = '2') ORDER BY monotonic_seq`,
+			[cutoff, codes],
+		);
+		return {
+			candidates: res.rows.map((r) => ({
+				id: r.id,
+				monotonicSeq: Number(r.monotonic_seq),
+			})),
+			skipped: Number(skippedRes.rows[0].count),
+		};
+	}
+
+	/**
+	 * Clear `detail` (to the JSON literal `null`) and `detail_salt` on the
+	 * given rows. Never deletes. Returns the ids that are redacted now,
+	 * including ones an earlier call already redacted, so a retry returns the
+	 * same list.
+	 *
+	 * @param {{ ids: string[] }} opts
+	 * @returns {Promise<string[]>}
+	 */
+	async redactRows({ ids }) {
+		if (!ids || ids.length === 0) return [];
+		await this._ensureReady();
+		// '' rather than NULL: Go's table and the Go reader need a string, and
+		// Python treats '' as no salt.
+		const res = await this._pool.query(
+			`UPDATE ${this._table} SET detail = 'null', detail_salt = '' WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2') RETURNING id`,
+			[ids],
+		);
+		return res.rows.map((r) => r.id);
 	}
 
 	/**

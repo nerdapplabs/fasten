@@ -280,6 +280,71 @@ fn dead_letter_after_max_attempts() {
 }
 
 #[test]
+fn seq_clash_dead_letters_without_retry() {
+    struct ClashStore(Arc<Mutex<usize>>);
+    impl Store for ClashStore {
+        fn insert(&self, _: &Row) -> Result<(), Error> {
+            *self.0.lock().unwrap() += 1;
+            Err(Error::SeqClash("node-a/3".into()))
+        }
+        fn ping(&self) -> Result<(), Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+    }
+    let attempts = Arc::new(Mutex::new(0));
+    let d = Drainer::new(Box::new(ClashStore(attempts.clone())), DrainerConfig {
+        retry_initial: Duration::from_secs(10),
+        retry_max: Duration::from_secs(10),
+        retry_jitter: false,
+        max_attempts: 50,
+        capacity: 100,
+    });
+    d.enqueue(make_row("r-clash"));
+    assert!(d.flush(Duration::from_secs(5)), "clash must not wait out a backoff");
+    let stats: serde_json::Value = serde_json::from_str(&d.stats_json()).unwrap();
+    assert_eq!(stats["dead_lettered_total"], 1);
+    assert_eq!(*attempts.lock().unwrap(), 1);
+}
+
+/// A seq-0 row gets a fresh seq on each attempt, so its clash (only possible
+/// next to a writer that skips the node lock) is retried.
+#[test]
+fn seq_clash_on_seq_zero_row_is_retried() {
+    struct ClashOnceStore(Arc<Mutex<usize>>);
+    impl Store for ClashOnceStore {
+        fn insert(&self, _: &Row) -> Result<(), Error> {
+            let mut n = self.0.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Err(Error::SeqClash("node/1".into()));
+            }
+            Ok(())
+        }
+        fn ping(&self) -> Result<(), Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+    }
+    let attempts = Arc::new(Mutex::new(0));
+    let d = Drainer::new(Box::new(ClashOnceStore(attempts.clone())), fast_cfg());
+    let mut row = make_row("r-clash-0");
+    row.monotonic_seq = 0;
+    d.enqueue(row);
+    assert!(d.flush(Duration::from_secs(5)));
+    let stats: serde_json::Value = serde_json::from_str(&d.stats_json()).unwrap();
+    assert_eq!(stats["dead_lettered_total"], 0);
+    assert_eq!(stats["drained_total"], 1);
+    assert_eq!(*attempts.lock().unwrap(), 2);
+}
+
+#[test]
 fn flush_targets_rows_at_call_time_not_later_emits() {
     struct SlowStore(RecordingStore);
     impl Store for SlowStore {

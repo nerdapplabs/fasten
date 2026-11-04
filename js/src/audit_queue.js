@@ -40,6 +40,7 @@ class AuditQueueDrainer {
 
 		this._q = [];
 		this._inFlight = 0; // row popped but insert not yet resolved
+		this._current = null; // that row, until stop() gives up on it
 		this._stopped = false;
 
 		// Stats
@@ -51,14 +52,17 @@ class AuditQueueDrainer {
 		this._failureBurstStartedAt = null;
 		this._deadLetteredTotal = 0;
 		this._dlq = []; // bounded ring, max 10 entries
+		this._lostTotal = 0; // rows not stored at stop (audit_drain_lost_at_stop)
 
 		// Threshold debouncing
 		this._warnHWFired = false;
 		this._errHWFired = false;
 		this._degradedFired = false;
 
-		// Kick the drainer loop.
-		setImmediate(() => this._tick());
+		// Kick the drainer loop. stop() resolves when it has finished.
+		this._done = new Promise((resolve) => {
+			setImmediate(() => this._tick().then(resolve));
+		});
 	}
 
 	put(row) {
@@ -113,33 +117,53 @@ class AuditQueueDrainer {
 
 	async flush(timeoutMs = 5000) {
 		// Wait only for rows queued before this call (spec §6), so new rows
-		// can't keep flush() waiting forever.
-		const target = this._drainedTotal + this._q.length + this._inFlight;
-		if (this._drainedTotal >= target) return true;
+		// can't keep flush() waiting forever. A dead-lettered or lost row
+		// counts as done.
+		const done = () =>
+			this._drainedTotal + this._deadLetteredTotal + this._lostTotal;
+		const target = done() + this._q.length + this._inFlight;
+		if (done() >= target) return true;
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			if (this._drainedTotal >= target) return true;
+			if (done() >= target) return true;
 			await new Promise((r) => setTimeout(r, 10));
 		}
-		return this._drainedTotal >= target;
+		return done() >= target;
 	}
 
-	stop() {
+	// Spec §10: rows still queued get one attempt each. A row that fails it,
+	// or is still unstored after timeoutMs, is reported lost
+	// (audit_drain_lost_at_stop). Resolves false if a row was lost.
+	stop(timeoutMs = 5000) {
 		this._stopped = true;
+		const lost = this._lostTotal;
+		let timer;
+		const timeout = new Promise((r) => {
+			timer = setTimeout(() => {
+				this._loseUnstored();
+				r(false);
+			}, timeoutMs);
+		});
+		return Promise.race([
+			this._done.then(() => this._lostTotal === lost),
+			timeout,
+		]).finally(() => clearTimeout(timer));
 	}
 
 	async _tick() {
-		while (!this._stopped) {
+		while (!this._stopped || this._q.length > 0) {
 			if (this._q.length === 0) {
 				await new Promise((r) => setImmediate(r));
 				continue;
 			}
 			const row = this._q.shift();
 			this._inFlight++;
+			this._current = row;
 			try {
 				await this._drainOne(row);
 			} finally {
 				this._inFlight--;
+				this._current = null;
 			}
 		}
 	}
@@ -153,14 +177,18 @@ class AuditQueueDrainer {
 				this._onSuccess();
 				return;
 			} catch (err) {
+				if (this._stopped) {
+					// stop() may have reported it already, on timeout.
+					if (this._current === row) this._onLostAtStop(row, err);
+					return;
+				}
 				if (attempt >= this._maxAttempts) {
 					this._onDeadLetter(row, attempt, err);
 					return;
 				}
 				this._onFailure(err);
-				if (this._stopped) return;
-				const cont = await this._waitBackoff();
-				if (!cont) return;
+				// A stop cuts the wait short; the next pass is the row's last.
+				await this._waitBackoff();
 			}
 		}
 	}
@@ -169,6 +197,7 @@ class AuditQueueDrainer {
 		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
 		this._deadLetteredTotal++;
 		this._retryCount = 0;
+		this._inBackoffUntilMs = 0;
 		this._lastError = msg;
 		if (this._dlq.length >= 10) this._dlq.shift();
 		this._dlq.push(row);
@@ -177,6 +206,25 @@ class AuditQueueDrainer {
 			attempt_count: attempt,
 			last_error: msg,
 		});
+	}
+
+	_onLostAtStop(row, err) {
+		this._lostTotal++;
+		this._sysLog("error", "audit_drain_lost_at_stop", {
+			error_type: err?.name ?? "Error",
+			row_id: row?.id ?? null,
+		});
+	}
+
+	// stop() timed out: what is still queued or in flight is reported lost
+	// now, since the process may exit before it is tried.
+	_loseUnstored() {
+		const timedOut = { name: "TimeoutError" };
+		if (this._current) {
+			this._onLostAtStop(this._current, timedOut);
+			this._current = null;
+		}
+		for (const row of this._q.splice(0)) this._onLostAtStop(row, timedOut);
 	}
 
 	_onFailure(err) {
@@ -188,6 +236,8 @@ class AuditQueueDrainer {
 		const crossedDegraded =
 			this._retryCount >= DEGRADED_AFTER && !this._degradedFired;
 		if (crossedDegraded) this._degradedFired = true;
+		// Set before the degraded event so it reports this retry's wait.
+		this._inBackoffUntilMs = Date.now() + this._backoffMs();
 
 		if (first) {
 			this._sysLog("warn", "audit_drain_failed", { error: msg });
@@ -220,7 +270,7 @@ class AuditQueueDrainer {
 		}
 	}
 
-	async _waitBackoff() {
+	_backoffMs() {
 		const n = this._retryCount;
 		let delay = this._retryInitialMs * 2 ** Math.max(0, n - 1);
 		if (delay > this._retryMaxMs) delay = this._retryMaxMs;
@@ -229,17 +279,15 @@ class AuditQueueDrainer {
 			delay += (Math.random() * 2 - 1) * j;
 			if (delay < 0) delay = 0;
 		}
-		this._inBackoffUntilMs = Date.now() + delay;
-		// Sleep in short steps so stop() takes effect quickly.
-		const stepMs = Math.min(delay, 50);
-		const end = Date.now() + delay;
-		while (Date.now() < end) {
-			if (this._stopped) return false;
-			await new Promise((r) =>
-				setTimeout(r, Math.min(stepMs, end - Date.now())),
-			);
+		return delay;
+	}
+
+	// Sleeps until _inBackoffUntilMs, checking _stopped so shutdown is prompt.
+	async _waitBackoff() {
+		const end = this._inBackoffUntilMs;
+		while (Date.now() < end && !this._stopped) {
+			await new Promise((r) => setTimeout(r, Math.min(50, end - Date.now())));
 		}
-		return !this._stopped;
 	}
 }
 
@@ -257,8 +305,8 @@ export function installDrainer(opts) {
 	return _defaultEngine?._drainer ?? null;
 }
 
-export function uninstallDrainer() {
-	_defaultEngine?._uninstallDrainer();
+export function uninstallDrainer(timeoutMs) {
+	return _defaultEngine?._uninstallDrainer(timeoutMs) ?? Promise.resolve(true);
 }
 
 export function activeDrainer() {

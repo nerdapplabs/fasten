@@ -1,38 +1,22 @@
 name: Release Go SDK
 
+# The module lives in go/, so its versions are go/vX.Y.Z tags.
 on:
   push:
     tags:
-      - 'v*'
+      - 'go/v*'
 
 permissions:
   contents: read
+  id-token: write   # fasten-go.yml uploads coverage through Codecov OIDC
 
 jobs:
   verify:
+    uses: ./.github/workflows/fasten-go.yml
+
+  published:
+    needs: verify
     runs-on: ubuntu-latest
-    container:
-      image: golang:1.22-alpine
-
-    defaults:
-      run:
-        working-directory: go
-
     steps:
-      - uses: actions/checkout@v6
-
-      # -race needs CGO, and the alpine image has no C compiler and
-      # CGO_ENABLED=0 by default.
-      - name: Install build toolchain (for CGO -race)
-        run: apk add --no-cache build-base
-      - name: Vet and test
-        env:
-          CGO_ENABLED: "1"
-        run: |
-          go vet ./...
-          go test -v -race ./...
-
-      - name: Tag published
-        # Go modules are fetched from the VCS tag, so there is nothing to publish.
-        # The module path is github.com/nerdapplabs/fasten/go.
-        run: echo "Tag ${{ github.ref_name }} pushed — module available via pkg.go.dev"
+      # pkg.go.dev serves Go modules from VCS tags; there is nothing to upload.
+      - run: echo "Tag ${{ github.ref_name }} pushed; module github.com/nerdapplabs/fasten/go"
