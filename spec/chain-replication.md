@@ -49,6 +49,12 @@ severity, shipped_at, source_node_id, target, tenant_id, timestamp, wire_version
 - `hash` is **excluded**. It is the output.
 - `canonical_form_id` is **included**, so the form choice is covered by the
   hash.
+- `shipped_at` is hashed as **`null`** in every form, whatever the row holds.
+  Rows are sealed with it `null` and `mark_shipped` sets it later, so it must
+  not move the hash. Rows sealed through emit keep their existing hashes.
+  A row sealed earlier with `shipped_at` already set was hashed over that
+  value; verifiers MUST accept it when the hash matches with the stored
+  `shipped_at` (rendered like `timestamp`) in place of `null`.
 - `pii_in_detail` is **excluded**. The Go wire `Row` has this field; the Python
   `AuditRow` does not. Both SDKs MUST leave it out of the hash so a Go
   aggregator can verify a chain sealed in Python. This is a fixed rule, NOT a
@@ -70,8 +76,8 @@ Every SDK MUST produce the same bytes:
 | Whitespace | None: `,` and `:` separators, no spaces. |
 | Non-ASCII | Escaped as `\uXXXX` (UTF-16 surrogate pairs for astral characters), as with CPython `ensure_ascii=True`. |
 | `<` `>` `&` | Left **literal**. CPython does NOT HTML-escape; a Go encoder MUST turn HTML escaping off. |
-| Null | `None` renders as `null` for `tenant_id` and `shipped_at` when absent. |
-| Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp` and `shipped_at`. |
+| Null | `None` renders as `null` for `tenant_id` when absent; `shipped_at` is always `null` (§1.1). |
+| Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp`. |
 
 ### §1.3 Number rendering (cross-language hazard)
 
@@ -183,8 +189,8 @@ stamp it at seal time.
 - `monotonic_seq` is strictly increasing and **unique** within a
   `source_node_id`. Two originated rows on one node MUST NOT share a
   `monotonic_seq`.
-- `prev_hash` is the hex SHA-256 of the previous row in that sequence, or the
-  literal `"genesis"` for the first row.
+- `prev_hash` is the `hash` of the preceding sealed row in that sequence, or
+  the literal `"genesis"` for the node's first sealed row (§2.1).
 - Rows with an empty `hash` (written before hash-chain support, or emitted in
   stdout-only mode, §8) are skipped by `verify_chain`, not rejected, as long
   as their `monotonic_seq` is below the node's first sealed row. They are not
@@ -212,18 +218,22 @@ A conformant allocation does the following atomically:
 ```
 BEGIN
   seq  := COALESCE(MAX(monotonic_seq), 0) + 1   -- WHERE source_node_id = ?
-  prev := hash of the row at seq-1               -- same predicate, or "genesis"
+  prev := hash of the node's last sealed row     -- or "genesis" if none
   row  := seal(prev, row WITH monotonic_seq = seq)
   INSERT row
 COMMIT
 ```
 
+`seq` counts every row on the node, sealed or not. `prev` is the `hash` of the
+node's sealed row (`hash <> ''`) with the highest `monotonic_seq`, or
+`"genesis"` when the node has no sealed row.
+
 The transaction MUST serialise against concurrent allocations for the same
-`source_node_id`. SQLite: `BEGIN IMMEDIATE`. Postgres: a node-scoped advisory
-lock, `pg_advisory_xact_lock(hashtextextended(source_node_id, 0))`, with the
-same key in every SDK. `SELECT … FOR UPDATE` on the
-node's tip row is not enough on its own: before a node's first row there is no
-tip row to lock.
+`source_node_id`. SQLite: `BEGIN IMMEDIATE`. Postgres: the transaction MUST
+first run `SELECT pg_advisory_xact_lock(hashtextextended(source_node_id, 0))`.
+Every SDK takes this same lock, so writers from different SDKs on one table
+exclude each other; `SELECT … FOR UPDATE` on the tip row does not, and locks
+nothing when the node has no rows yet.
 
 ### §2.2 Sealing
 
@@ -333,6 +343,10 @@ SDKs MUST refuse to redact a form-`"1"` row, because its `detail` is hashed
 directly and redacting it would mean re-sealing the rest of the chain. They
 MUST report that the row predates form `"2"`.
 
+An unsealed row (`hash = ""`) is not in the chain, so SDKs MUST redact it
+like any other candidate, whatever its `canonical_form_id`; the form-`"1"`
+refusal above applies only to sealed rows.
+
 ### §7.2 The redaction event
 
 Every redaction MUST itself be an originated, chained row:
@@ -384,3 +398,13 @@ an SDK MUST emit phase-1 lines only, with `hash = ""`, and MUST log once at init
 that chaining is disabled. `verify_chain` already skips rows with an empty hash
 (§2), so such a stream verifies trivially instead of failing. An SDK MUST NOT
 keep an in-memory sequence in this mode; that is exactly what §2.1 forbids.
+
+### §8.2 Allocation without sealing
+
+A store MAY allocate `monotonic_seq` (§2.1) for a writer that cannot seal, for
+example one writing through fasten-core. Such rows have an empty `hash`;
+`verify_chain` treats them as unsealed (§2). The writer MUST log
+`audit_chain_unavailable` once per init, as in §8.1.
+
+A node that writes unsealed rows MUST NOT share its `source_node_id` with a
+writer that seals; give it a distinct node id.

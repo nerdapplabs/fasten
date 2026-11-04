@@ -66,6 +66,10 @@ pub enum Error {
     #[error("no drainer installed; call fasten_drainer_install first")]
     DrainerNotInstalled,
 
+    /// The drainer is stopping, so the row was not queued.
+    #[error("drainer stopped; row not queued")]
+    DrainerStopped,
+
     /// The DSN requested TLS (`sslmode=require|verify-*`) but this binary
     /// was built without the `postgres-tls` feature, so we refuse rather
     /// than connect in plaintext.
@@ -83,6 +87,16 @@ pub enum Error {
     /// are on the host side; this only carries the rc.
     #[error("insert callback returned non-zero rc={0}")]
     CallbackFailed(i32),
+
+    /// The store does not implement this operation (e.g. redaction on a
+    /// callback-backed store).
+    #[error("{0} is not supported by this store")]
+    Unsupported(&'static str),
+
+    /// Another row already holds this `(source_node_id, monotonic_seq)`.
+    /// Retrying cannot help, so the drainer dead-letters the row at once.
+    #[error("seq clash: {0}")]
+    SeqClash(String),
 }
 
 // Without the sqlite or postgres feature the backend variants are absent and
@@ -106,6 +120,7 @@ pub enum FastenErrorCode {
     ErrIdMismatch   = 7,   // Meta.id disagrees with dict key
     ErrDomainMismatch = 8, // Meta.domain disagrees with register(domain, ...)
     ErrDuplicateCode  = 9, // duplicate code already registered
+    ErrDrainerStopped = 10, // drainer is stopping; the row was not queued
     ErrUnknown      = 99,  // internal panic or unexpected error
 }
 
@@ -122,9 +137,12 @@ impl From<&Error> for FastenErrorCode {
             Error::DomainMismatch { .. } => FastenErrorCode::ErrDomainMismatch,
             Error::DuplicateCode(_)    => FastenErrorCode::ErrDuplicateCode,
             Error::DrainerNotInstalled => FastenErrorCode::ErrNullArg,
+            Error::DrainerStopped      => FastenErrorCode::ErrDrainerStopped,
             Error::CallbackFailed(_)   => FastenErrorCode::ErrBackend,
             Error::TlsUnavailable(_)   => FastenErrorCode::ErrBackend,
             Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
+            Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
+            Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

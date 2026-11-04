@@ -19,6 +19,228 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   duplicate `monotonic_seq` on one node, and `first_break_at` is the lowest
   seq that breaks on any node.
 
+### Fixed: `mark_shipped` no longer breaks a row's hash (#123, Python + Go)
+
+- Every canonical form hashes `shipped_at` as null (spec §1.1). Setting it
+  after sealing changed the hash, so `verify_chain` failed on untouched rows.
+- Emit always sealed with `shipped_at` null, so existing hashes don't change.
+  A row sealed by calling `seal()` or `allocate_and_insert_originated` with
+  `shipped_at` already set still verifies, over its stored value.
+
+### Fixed: Rust SDK store-assigned monotonic_seq and PII redaction (#124)
+
+- **Breaking:** `emit()` returns `monotonic_seq: 0`. The per-engine counter
+  restarted at 1, so two engines on one node wrote duplicate seqs (spec §2.1).
+  `PostgresStore` now gives a seq-0 row the node's next seq in the insert
+  transaction, under the same advisory lock as the Python, Go and JS stores.
+  Rows are not sealed, and `init()` logs `audit_chain_unavailable` (error)
+  once to say so (§8.1).
+- **Breaking:** `Row` gains public fields `prev_hash` and `hash` (both empty),
+  so `Row { .. }` literals that list every field stop compiling.
+- **Breaking:** `timestamp` and `shipped_at` use the canonical form
+  `YYYY-MM-DDTHH:MM:SS.ffffffZ` (§4.3) in `PostgresStore`, in `Row`'s serde
+  output (stdout audit lines included) and in sys-line `timestamp`s, which
+  were milliseconds.
+- `PostgresStore` can share a table with the Python and Go stores: it inserts
+  with a column list, adds the chain columns, writes `''` for `detail_salt` /
+  `detail_commitment`, and writes into `TIMESTAMPTZ` columns, mixed-case
+  table names included. Store bootstrap
+  takes the same advisory lock as Python, so stores starting together no
+  longer fail on concurrent `CREATE TABLE`. Bootstrap adds a non-unique
+  `(source_node_id, monotonic_seq)` index so the next-seq lookup stays cheap.
+- Index names for tables whose `idx_{table}_{suffix}` would pass 63 bytes
+  (table names of about 50 characters or more) now cut the table part and add
+  a hash of the full name. Postgres truncated the old names to one, so only
+  the first index was made and the seq index was missing. Shorter names keep
+  their index names.
+- PII retention: set `Config::retention_pii` (or `FASTEN_RETENTION_PII`), e.g.
+  `"30d"`. A background thread redacts expired rows whose code is in
+  `pii_codes()` (`pii_in_detail` or retention class Short): `detail` becomes
+  `null` and an `AUDIT_ROW_REDACTED` row is written first (§7). Rows are never
+  deleted. `redact_expired()` runs it by hand. `AuditStore` gains
+  `list_redaction_candidates` and `redact_rows`, which default to
+  `Error::Unsupported`, and `count_skipped_legacy_form`, which defaults to 0.
+  `Config` gains `retention_pii`, so `Config { .. }` literals without
+  `..Default::default()` stop compiling.
+- `PostgresStore` redacts unsealed rows (`hash = ''`) whatever their
+  `canonical_form_id` (spec §7.1). A sealed form-`"1"` row is never redacted:
+  its detail is inside the hash. Such rows past the cutoff are counted and
+  logged as `pii_redaction_skipped_legacy_form` (warn).
+- Stopping the purger (`init()` again, `reset_for_tests()`) waits at most 2 s.
+  The purger stops after the row it is on. Dropping an `Engine` stops its
+  purger too.
+- **Breaking:** `Error` gains `Unsupported` and `InvalidRetention` and is now
+  `#[non_exhaustive]`, so `match`es on `Error` need a wildcard arm. Later
+  variants will not be breaking.
+
+### Fixed: fasten-core stores keep the chain fields (#139, item 1)
+
+- `SqliteStore` and `PostgresStore` store `prev_hash`, `hash`,
+  `canonical_form_id`, `detail_salt` and `detail_commitment` and read them
+  back. A sealed row passed to `fasten_store_insert` used to be stored without
+  its hash, so every `fasten-core/bindings/*` package lost the chain.
+  A row sent with `monotonic_seq: 0` gets a store-allocated seq and is stored
+  unsealed: its chain fields are dropped, as Python and Go overwrite them on
+  allocation, since a hash sealed over another seq could never verify.
+- `Row` has these as typed optional fields instead of leaving them in
+  `extra`. A row passed through the C interface or the drainer keeps an
+  absent field absent. A row read back from a store carries `prev_hash` and
+  `hash` (`""` when unsealed) and `canonical_form_id` (`"1"` by default), as
+  Python's rows do; salt and commitment only on a form "2" row.
+- Opening a store adds the five columns to a table an older fasten-core
+  created. It checks the table first and only alters what is missing, so
+  opening an up-to-date table takes no write lock (SQLite) and runs no
+  `ALTER TABLE` (Postgres). Salt and commitment are written as `''` when absent, so a table the
+  Go store created (NOT NULL there) accepts the row; both read back as absent.
+- Every table now has the chain columns, so redaction always applies the
+  spec §7.1 rule: unsealed and sealed form-"2" rows are redacted, sealed
+  form-"1" rows are refused.
+
+### Fixed: fasten-core stores assign monotonic_seq; PII redaction (#124)
+
+- `SqliteStore` and `PostgresStore` now allocate `monotonic_seq` when a row
+  arrives with `monotonic_seq: 0`: next seq for its `source_node_id`, in the
+  insert transaction (`BEGIN IMMEDIATE` on SQLite, the shared
+  `pg_advisory_xact_lock` on Postgres). Two handles on one store no longer
+  write duplicate seqs (#92). Rows stay unsealed (spec §8.2). A non-zero seq
+  is written as given, under the same lock on Postgres, so it cannot take
+  the seq a concurrent seq-0 insert has just picked.
+- **Breaking:** fresh tables get `UNIQUE (source_node_id, monotonic_seq)`.
+  A row that reuses a node's seq there now fails with the new
+  `Error::SeqClash`, and the drainer dead-letters a row with an explicit
+  seq at once instead of retrying (a seq-0 row is retried, as it gets a
+  fresh seq); before, the row was stored with the duplicate seq. A repeated
+  `id` is still a no-op (`ON CONFLICT (id) DO NOTHING`).
+- Opening a table created before this release adds a non-unique
+  `idx_<table>_node_seq` index, so seq allocation does not scan the table.
+  The first open builds it while holding the write lock (SQLite) or a
+  `SHARE` lock on the table (Postgres); create it beforehand on a big,
+  busy table. Opening a table that is already up to date runs no DDL and
+  takes no write lock.
+- PII retention by redaction (spec §7.1): `list_redaction_candidates` and
+  `redact_rows` on the `Store` trait, exported as
+  `fasten_store_list_redaction_candidates` / `fasten_store_redact_rows`.
+  `detail` becomes JSON `null` (and `detail_salt`, when the table has one,
+  `''`); rows are never deleted. On a table shared with a sealing SDK,
+  sealed form-`"1"` rows are left alone and `list_redaction_candidates`
+  reports how many it left out (`skipped`; the C export's `out_skipped`, may
+  be NULL); sealed form-`"2"` rows are redacted. The SQLite store binds ids and codes
+  in chunks of 500 inside one transaction, so long lists stay under SQLite's
+  bound-variable limit.
+- `PostgresStore` takes the `fasten.bootstrap.<table>` advisory lock (same key
+  as Python) around its schema bootstrap, so stores opening a fresh database
+  at once no longer fail on a duplicate `pg_type` key.
+- Spec: §8.2 (allocation without sealing), §2 and §2.1 state `prev_hash`
+  comes from the node's last sealed row, §2.1 makes the node-keyed
+  `pg_advisory_xact_lock` the required Postgres lock, and §7.1 makes
+  redacting unsealed rows the rule for every SDK.
+
+### Changed: shared drainer stop, install and close (fasten-core C ABI)
+
+- `fasten_drainer_install` on a handle that already has a drainer now
+  flushes the old one (up to 5 s) before stopping it, and reports rows it
+  could not write in an `audit_drain_install_incomplete` sys event.
+- `fasten_drainer_close` and `fasten_store_close` wait for the drain thread,
+  including a store callback in progress, and for an old drainer a
+  concurrent install is still stopping. A slow stop emits
+  `audit_drain_stop_slow` instead of returning early.
+- `fasten_drainer_enqueue` returns the new `FASTEN_ERR_DRAINER_STOPPED` (10)
+  when the drainer is stopping and the row was not queued.
+- New `fasten_drainer_install_with_sys_log` sends sys events to a host
+  callback instead of stderr.
+- An insert callback can return `FASTEN_INSERT_REJECTED` (any negative code)
+  for a row the store will never accept; it is dead-lettered at once
+  instead of being retried for the whole retry budget.
+- A row that fails its one attempt at stop is now reported with
+  `audit_drain_lost_at_stop` (`error_type`, `row_id`) instead of
+  `audit_drain_dead_letter`, and no longer counts in `dead_lettered_total`
+  or the dead-letter ring. `audit_drain_install_incomplete` reports
+  `unstored` (rows dead-lettered or lost at stop) in place of
+  `dead_lettered`.
+- The queue is no longer allocated up front, so a large `capacity` costs
+  nothing until rows arrive.
+
+### Changed: Python queue mode goes through the shared drainer
+
+- In queue mode (the default), `emit()` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `monotonic_seq` is 0 and
+  `hash` is empty, and the store seals the row when it lands. Use
+  `audit_store_failure_strategy="raise"` to get the
+  sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `queue_drain_max_attempts`, instead of being dropped after one try. A row
+  the store rejects outright (DB-API `DataError` / `IntegrityError`) is
+  dead-lettered at once.
+- `emit()` blocks while the queue is full.
+- A forked child (gunicorn `--preload`, Celery prefork) installs its own
+  drainer. `fork()` waits up to 1 s for an in-flight store insert, so a
+  child no longer stops storing after inheriting SQLite mid-insert, and an
+  insert stuck on a database lock does not hold up `fork()`; the parent then
+  emits `audit_drain_fork_during_insert`, stored from another thread so a
+  stalled syslog store does not hold up `fork()` either. A failed reinstall
+  in the child emits `audit_drain_reinstall_failed`.
+- `fasten.close(timeout=5.0)` (and `Engine.close`) flushes for up to half
+  of `timeout`, then stops the drainer and stores the rows it still holds.
+  It returns within about `timeout`: no store call starts after that, one
+  still running is left behind, and rows not stored are reported as
+  `audit_drain_lost_at_stop`. It returns False only if a row was lost,
+  including one an emit racing `close` failed to store inline, and every
+  row counted lost is reported before it returns.
+  Sys events past the deadline go to stderr and the ring but not the
+  syslog store, which is then marked degraded. A row reported lost and
+  stored later, by a left-behind call, retire or an inline emit, gets
+  `audit_drain_recovered_at_stop`, unless the process exits first, so a
+  row reported lost may still have been stored. The exit hook calls
+  `close(5.0)`, so a hanging store no longer holds interpreter exit, and
+  the process exits normally: exit status and other atexit hooks are
+  unaffected. Emits after `close` are stored inline without an
+  `audit_drain_abandoned` event.
+- Re-`init` waits at most 10 s for the drainer it replaces (flushing it
+  for up to 5 s, as before), and reports rows still held then as
+  `audit_drain_lost_at_stop`, so a hanging store no longer blocks
+  `fasten.init()`, and a store call stuck in the old store no longer holds
+  up the new drainer's inserts. If the old drainer's flush timed out or a
+  row it held was not stored, re-init emits `audit_drain_install_incomplete`
+  (`flushed`, `unstored`). While it retires, `flush()` also waits for its
+  rows, and `close()` waits for it within its own timeout and reports the
+  rows it still holds then as lost. Rows the old drainer loses keep the engine's
+  `audit_write_swallowed()` flag set when re-init builds a new store over
+  the same database (the same SQLite file or Postgres DSN and table, as
+  `FASTEN_AUDIT_DSN` does); only a different store clears it.
+- The drainer's store calls run on a Python thread (`fasten-store`, one
+  per drainer); fasten-core's drain thread waits for each. A store call
+  left behind at exit can no longer abort the process during interpreter
+  finalization (CPython before 3.14 on Linux).
+- Drainer sys events are written to stderr before the syslog store, so a
+  hung syslog store can't hold them back. The events fasten-core sends
+  while a drainer stops (`audit_drain_stop_slow`, `audit_drain_abandoned`)
+  go to stderr and the ring only, and the syslog store is marked degraded.
+- A flush that fails in fasten-core is reported as
+  `audit_drain_flush_failed` (and `flush()` returns False) instead of
+  looking like a timeout.
+
+### Changed: Go queue mode goes through the shared drainer
+
+- In queue mode (the default), `Emit` now hands the row to the fasten-core
+  drainer and returns it before it is stored: `MonotonicSeq` and `Hash`
+  are zero, and the store seals the row when it lands. Use
+  `AuditStoreFailureStrategy: "raise"` to get the sealed row back.
+- A failed insert is retried with backoff and dead-lettered after
+  `QueueDrainMaxAttempts`, instead of being dropped after one try. A row
+  the store rejects outright (Postgres SQLSTATE class 22/23, a SQLite
+  constraint) is dead-lettered at once.
+- `Emit` blocks while the queue is full, and that wait does not observe
+  `ctx`.
+- New `fasten.Close(timeout)` flushes and stops the drainer; call it on
+  shutdown instead of `Flush` so a row still being retried is stored or
+  reported. It returns within about `timeout`, even when a store call
+  ignores `ctx` (lib/pq waiting on a server that stopped answering);
+  that call finishes in the background. It reports rows not stored by
+  then as `audit_drain_lost_at_stop`, and returns false only if a row
+  was lost. A second `Close` while one runs waits for it and returns the
+  same result. Emits after `Close` are stored inline without an
+  `audit_drain_abandoned` event.
+
 ### Fixed: C++ queue mode reads columns from the row, not from `detail` (#147)
 
 - The drainer hands each row to the sink as JSON, and every column was found

@@ -410,10 +410,13 @@ type QueueStats struct {
 // AuditStoreFailureStrategy (or FASTEN_AUDIT_STORE_FAILURE_STRATEGY) sets
 // how Emit writes to the store:
 //
-//   - "queue" (default): Emit writes the row to the store directly. A
-//     store error is logged, not returned, and the audit stream is marked
-//     degraded. Rows don't go through the drainer queue until fasten-core
-//     can allocate seq (spec §2.1).
+//   - "queue" (default): Emit hands rows to the fasten-core drainer, whose
+//     background thread stores them with exponential backoff and
+//     dead-letters a row after QueueDrainMaxAttempts, or at once when the
+//     store rejects the row itself. The returned row is not sealed yet
+//     (spec §8): MonotonicSeq and Hash are zero. Emit blocks only while
+//     QueueCapacity (queued plus in-flight retry) is full, and that wait
+//     does not observe ctx.
 //   - "raise": Emit calls Insert directly and returns any error as
 //     *AuditStoreError.
 type Config struct {
@@ -475,6 +478,10 @@ func GetTransport() *Transport { return Default.GetTransport() }
 
 // Flush blocks until the Default engine's pending rows drain.
 func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
+
+// Close flushes and stops the Default engine's drainer; call it on shutdown.
+// It returns within about timeout, and false if a row was lost.
+func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.
 func GetQueueStats() *QueueStats { return Default.GetQueueStats() }
