@@ -127,10 +127,31 @@ write per row.
 
 `fasten.emit()` defaults to **queue mode**: rows go onto a bounded in-memory
 queue, drained by a background thread with exponential backoff (100 ms to
-60 s, plus or minus 20 % jitter). Store failures stay off the request path.
-Pass `audit_store_failure_strategy="raise"` for synchronous writes that raise
-`AuditStoreError`. `fasten.queue_stats()` and `fasten.flush()` complete the
-public surface.
+60 s, plus or minus 20 % jitter) and dead-lettered after
+`queue_drain_max_attempts`. A failed insert doesn't fail the request, but
+when the queue is full `emit()` blocks until a slot frees, so in a long
+outage it waits on the drainer's retries; size `queue_capacity` and the
+retry settings for that. A row the store rejects outright (a DB-API
+`DataError` or `IntegrityError`) is dead-lettered at once rather than
+retried. `emit()` returns the row before it is stored, so its
+`monotonic_seq` and `hash` are not set yet; the store seals it. Pass
+`audit_store_failure_strategy="raise"` for synchronous writes that raise
+`AuditStoreError` and return the sealed row. `fasten.queue_stats()` and
+`fasten.flush()` complete the public surface.
+`fasten.close(timeout=5.0)` stops the drainer on shutdown (the exit hook
+calls it): it flushes for half of `timeout`, then stores the rows still
+held. It returns within about `timeout`, reports rows not stored by then
+as `audit_drain_lost_at_stop`, and returns False if any row was lost.
+A row reported lost may still be stored by a call left running; that is
+reported as `audit_drain_recovered_at_stop` unless the process has exited
+by then. A
+store call still running at that point is left behind on its thread
+(`fasten-store`), not interrupted, and does not hold up or affect
+interpreter exit: the exit status and other atexit hooks are unchanged.
+Re-running `fasten.init()` waits at most 10 s for the drainer it replaces
+in the same way, and emits `audit_drain_install_incomplete` if that
+drainer's flush timed out or a row it held was not stored. Until it is
+retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
 ## Tests
 
