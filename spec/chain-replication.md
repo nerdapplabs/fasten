@@ -272,6 +272,13 @@ and `monotonic_seq`.
   NOT keep one version silently: an insert skipped because another writer
   stored that `id` in the meantime is checked again, not counted as inserted.
   A row stored with the same `hash` is a re-delivery.
+- **Local node.** A node's own rows come only from its emit path, so a row
+  whose `source_node_id` is the receiving node is a break at that row; as
+  with stored rows, the batch is cut at the lowest such `monotonic_seq`. The
+  break is permanent: resending the same row fails again, so the sender must
+  drop it (it usually means two nodes share a node id). An SDK's
+  engine-level ingest checks against its own node id; store-level ingest can
+  be given the receiving node's id, and without it makes no such check.
 - **Atomicity.** The verified prefix is inserted in one transaction. The insert
   is idempotent, so re-delivery is a no-op.
 - **`origin_id == id`** marks a row as originated on this node. A node's

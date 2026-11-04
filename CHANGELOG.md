@@ -6,6 +6,28 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: replication ingest refuses the receiving node's own rows (Python + Go)
+
+- A node's own rows come from its emit path, so ingest now stops at the
+  first row whose `source_node_id` is the receiving node and reports it as
+  the break, unless an earlier break is found. As with a stored conflict,
+  other nodes' rows from that seq on are left for the sender to resend.
+- Python: `Engine.ingest_replicated` and `fasten.ingest_replicated` check
+  against the engine's `node_id`, and raise if it is empty.
+  `replication.ingest`, `SQLiteStore.ingest_replicated` and
+  `PostgresStore.ingest_replicated` take an optional `local_node_id`.
+- Go: `SQLiteStore.IngestReplicated` and `PostgresStore.IngestReplicated`
+  are unchanged.
+
+### Added: engine-level replication ingest (Go)
+
+- `Engine.IngestReplicated` and `fasten.IngestReplicated` ingest into the
+  engine's audit store and check against its `NodeID`.
+- `SQLiteStore.IngestReplicatedFor(ctx, localNode, rows)` and the same on
+  `PostgresStore`, behind the new `LocalIngester` interface. A local-node
+  row with `MonotonicSeq` below 1 is an error, since `RejectedFromSeq` 0
+  means no break.
+
 ### Changed: replication ingest checks the stored rows (Python + Go)
 
 - `ingest` / `IngestReplicated` now check a batch against the rows the store

@@ -386,14 +386,21 @@ class PostgresStore:
 
         self._execute_with_retry(_run)
 
-    def ingest_replicated(self, rows: list[AuditRow]) -> "IngestResult":
+    def ingest_replicated(
+        self, rows: list[AuditRow], local_node_id: str | None = None,
+    ) -> "IngestResult":
         """Verify a replicated batch and insert its verified prefix in one
         transaction. A chain break does not raise; it is reported in
         ``rejected_from_seq``. Inserts use ON CONFLICT DO NOTHING, so retries
         are safe.
+        With ``local_node_id``, ingest stops at the first row from that node
+        (see ``repo.ingest_without_local_node``).
         """
         from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
-                           stored_conflict, verified_prefix)
+                           ingest_without_local_node, stored_conflict, verified_prefix)
+
+        if local_node_id:
+            return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         verified, verified_reject, verified_reason = verified_prefix(rows)
         for row in verified:
