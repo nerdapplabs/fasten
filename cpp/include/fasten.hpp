@@ -76,6 +76,12 @@ extern "C" {
         struct FastenStore* store, uint64_t capacity,
         uint64_t retry_initial_ms, uint64_t retry_max_ms,
         int retry_jitter, uint32_t max_attempts, char** out_err);
+    typedef void (*FastenSysLogFn)(const char* event_json, void* userdata);
+    int32_t fasten_drainer_install_with_sys_log(
+        struct FastenStore* store, uint64_t capacity,
+        uint64_t retry_initial_ms, uint64_t retry_max_ms,
+        int retry_jitter, uint32_t max_attempts,
+        FastenSysLogFn sys_log, void* userdata, char** out_err);
     int32_t fasten_drainer_enqueue(
         struct FastenStore* store, const char* row_json, char** out_err);
     int32_t fasten_drainer_flush(
@@ -204,12 +210,47 @@ inline std::string env_or(const char* key, const char* fallback = "") {
 
 inline std::string sev_str(Sev s) { return fasten::to_string(s); }
 
-// JSON-escape a string value (including control chars below 0x20).
+// Length of the valid UTF-8 sequence starting at s[i], or 0 if the bytes
+// there are not one (overlong forms and surrogates included).
+inline size_t utf8_seq_len_(const std::string& s, size_t i) {
+    const auto b = [&s](size_t k) { return static_cast<unsigned char>(s[k]); };
+    const unsigned char c = b(i);
+    size_t n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if      (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c == 0xE0)              { n = 3; lo = 0xA0; }
+    else if (c == 0xED)              { n = 3; hi = 0x9F; }
+    else if (c >= 0xE1 && c <= 0xEF) n = 3;
+    else if (c == 0xF0)              { n = 4; lo = 0x90; }
+    else if (c == 0xF4)              { n = 4; hi = 0x8F; }
+    else if (c >= 0xF1 && c <= 0xF3) n = 4;
+    else return 0;
+    if (i + n > s.size()) return 0;
+    if (b(i + 1) < lo || b(i + 1) > hi) return 0;
+    for (size_t k = 2; k < n; ++k) {
+        if (b(i + k) < 0x80 || b(i + k) > 0xBF) return 0;
+    }
+    return n;
+}
+
+// JSON-escape a string value (including control chars below 0x20). Bytes
+// that are not valid UTF-8 become U+FFFD, so the result is always valid JSON.
 inline std::string json_str(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
     out += '"';
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c >= 0x80) {
+            const size_t n = utf8_seq_len_(s, i);
+            if (n == 0) {
+                out += "\xEF\xBF\xBD";
+            } else {
+                out.append(s, i, n);
+                i += n - 1;
+            }
+            continue;
+        }
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -730,6 +771,7 @@ struct SinkRef {
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields);
+inline Fields redact(const Fields& f);
 
 // Queue mode: rows go to the libfasten_core drainer, whose background
 // thread calls the sink with retry and backoff.
@@ -760,13 +802,15 @@ class CFastenDrainer {
         }
         sink_ref_ = ref;
         int jitter = retry_jitter ? 1 : 0;
-        int32_t rc = fasten_drainer_install(
+        int32_t rc = fasten_drainer_install_with_sys_log(
             store_,
             static_cast<uint64_t>(capacity),
             static_cast<uint64_t>(retry_initial.count()),
             static_cast<uint64_t>(retry_max.count()),
             jitter,
             static_cast<uint32_t>(max_attempts),
+            &CFastenDrainer::sys_log_,
+            nullptr,
             &err
         );
         if (rc != 0) {
@@ -855,6 +899,25 @@ class CFastenDrainer {
     // stopping, the row was not queued, and the core has reported it.
     static constexpr int32_t kErrDrainerStopped = 10;
 
+    // The core's drainer events join the SDK's sys stream (stderr and the
+    // sys ring), redacted like other sys lines. Runs on the drain thread or
+    // a thread calling put() or shutdown(), with no drainer lock held.
+    static void sys_log_(const char* event_json, void* /*userdata*/) {
+        if (!event_json) return;
+        try {
+            Fields f = parse_flat_json_fields(event_json);
+            const std::string level = f["level"];
+            const std::string event = f["event"];
+            for (const char* k : {"shape", "level", "event", "timestamp",
+                                  "request_id", "service_id", "tenant_id"}) {
+                f.erase(k);
+            }
+            std::vector<std::pair<std::string, std::string>> kv;
+            for (const auto& e : redact(f)) kv.emplace_back(e.first, e.second);
+            drainer_sys_log(level, event, kv);
+        } catch (...) {}
+    }
+
     static int32_t bridge_(const char* row_json, void* userdata) {
         auto* ref = static_cast<SinkRef*>(userdata);
         if (!ref || !row_json) return 1;
@@ -901,6 +964,8 @@ struct Globals {
     std::string service_id;
     std::string node_id;
     std::string tenant_id;
+    // Declared before drainer: a drainer stopping at exit logs through it.
+    RedactConfig redact_cfg;
 
     RingBuffer syslog_ring;
     RingBuffer api_ring;
@@ -916,9 +981,10 @@ struct Globals {
 
     std::string                     failure_strategy{"queue"};  // "queue" or "raise"
     std::shared_ptr<CFastenDrainer> drainer;  // null in raise mode or with no sink
+    // Drainers a re-init replaced and is still flushing, so flush() waits
+    // for their rows too. Guarded by drainer_mu.
+    std::vector<std::shared_ptr<CFastenDrainer>> retiring_drainers;
     std::mutex                      drainer_mu;
-
-    RedactConfig redact_cfg;
 
     struct Identity {
         std::string service_id;
@@ -1018,6 +1084,27 @@ inline void push_sys_row(Fields row) {
     g.syslog_ring.push(std::move(row));
 }
 
+template <typename KeyValues>
+inline void write_sys_line(std::ostream& out,
+                           const std::string& level,
+                           const std::string& event,
+                           const KeyValues& fields);
+
+// Used when the core can't parse the input: every value becomes the
+// replacement and the keys are kept, so nothing passes through unredacted.
+inline Fields redact_all_values_(const Fields& f, const std::string& replacement,
+                                 int32_t rc) {
+    Fields out;
+    for (const auto& kv : f) out[kv.first] = replacement;
+    // The core's error codes; the message is not logged, it may quote input.
+    const std::string error_type = rc == 3 ? "bad_json"
+                                 : rc == 4 ? "invalid_input"
+                                 : "error_" + std::to_string(rc);
+    write_sys_line(std::cerr, "error", "redact_failed",
+        std::vector<std::pair<std::string, std::string>>{{"error_type", error_type}});
+    return out;
+}
+
 // Redact detail fields through libfasten_core.
 inline Fields redact(const Fields& f) {
     if (f.empty()) return f;
@@ -1047,7 +1134,8 @@ inline Fields redact(const Fields& f) {
     if (out_err) { fasten_store_free_str(out_err); }
     if (rc != 0 || !out_json) {
         if (out_json) fasten_store_free_str(out_json);
-        return f; // on error, return original (safe fallback)
+        return redact_all_values_(f, cfg.replacement.empty()
+            ? std::string(fasten::kRedactReplacement) : cfg.replacement, rc);
     }
     std::string result(out_json);
     fasten_store_free_str(out_json);
@@ -1385,10 +1473,14 @@ inline void install_drainer_(const Config& cfg) {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         old = g.drainer;
         g.drainer = next;
+        if (old) g.retiring_drainers.push_back(old);
     }
     if (old) {
         old->flush(std::chrono::seconds(5));
         old->shutdown(std::chrono::seconds(2));
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        auto& r = g.retiring_drainers;
+        r.erase(std::remove(r.begin(), r.end(), old), r.end());
     }
 }
 
@@ -1403,15 +1495,24 @@ inline std::unique_ptr<QueueStats> queue_stats() {
 
 // Wait until queued audit rows are written or the timeout passes. Returns
 // true if everything drained, and true at once when no drainer is running.
+// A drainer a re-init is replacing is waited for as well.
 inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     auto& g = detail_::globals();
-    std::shared_ptr<detail_::CFastenDrainer> d;
+    std::vector<std::shared_ptr<detail_::CFastenDrainer>> ds;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
-        d = g.drainer;
+        ds = g.retiring_drainers;
+        if (g.drainer) ds.push_back(g.drainer);
     }
-    if (!d) return true;
-    return d->flush(timeout);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool drained = true;
+    for (const auto& d : ds) {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (left.count() < 0) left = std::chrono::milliseconds(0);
+        if (!d->flush(left)) drained = false;
+    }
+    return drained;
 }
 
 // Stop the drainer; rows still queued get one last attempt without retries.

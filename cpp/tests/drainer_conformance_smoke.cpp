@@ -218,6 +218,8 @@ void v10_dead_letter() {
     assert(s->dead_lettered_total == 1);
     assert(s->depth == 0);
     assert(count(out, "audit_drain_dead_letter") == 1);
+    // The core's drainer events join the sys stream.
+    assert(syslog_has("audit_drain_dead_letter"));
     std::cout << "V-10: PASS\n";
 }
 
@@ -285,6 +287,36 @@ void refused_row_is_stored_synchronously() {
     assert(count(out, "audit_drain_stored_inline") == 1);
     assert(out.find("audit_drain_abandoned") < out.find("audit_drain_stored_inline"));
     std::cout << "refused row stored synchronously: PASS\n";
+}
+
+// A flush() while a re-init is flushing the old drainer waits for the old
+// drainer's rows too (§10).
+void flush_during_reinit_waits_for_old_drainer() {
+    reset_state();
+    std::atomic<int> stored{0};
+    fasten::set_audit_sink([&](const fasten::Row&) {
+        std::this_thread::sleep_for(milliseconds(1000));
+        ++stored;
+    });
+    fasten::init(cfg("queue"));
+    emit_one();
+    auto c = cfg("queue");
+    c.queue_capacity = 7;
+    std::thread reinit([&] { fasten::init(c); });
+    // The new drainer is in place once its capacity shows.
+    auto deadline = std::chrono::steady_clock::now() + milliseconds(3000);
+    for (;;) {
+        auto s = fasten::queue_stats();
+        if (s && s->capacity == 7) break;
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(milliseconds(5));
+    }
+    bool drained = fasten::flush(milliseconds(5000));
+    int seen = stored;
+    reinit.join();
+    assert(drained);
+    assert(seen == 1);
+    std::cout << "flush during re-init waits for the old drainer: PASS\n";
 }
 
 // Runs fn on a thread and fails the test if it takes longer than limit.
@@ -384,6 +416,7 @@ int main() {
     v11_events_in_order();
     v12_abandoned_after_stop();
     refused_row_is_stored_synchronously();
+    flush_during_reinit_waits_for_old_drainer();
     shutdown_with_a_put_blocked_on_a_full_queue();
     shutdown_with_a_sink_that_puts();
     reinit_under_load();

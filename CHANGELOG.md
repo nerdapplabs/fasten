@@ -6,6 +6,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: redact values when the core can't parse the input (C++)
+
+- Strings are now written as valid UTF-8 JSON: bytes that are not valid
+  UTF-8 become U+FFFD, so the core can redact detail and log fields that
+  contain them. Before, such fields were returned unredacted.
+- If the core still returns an error, every value is replaced with the
+  redaction token (keys are kept) and a `redact_failed` sys event with
+  `error_type` is written to stderr and the sys ring.
+- `fasten::flush()` during a re-init also waits for the drainer being
+  replaced, not only the new one.
+- The core drainer's sys events (`audit_drain_*`, `audit_queue_*`) now go
+  through the SDK's sys log, redacted, so they reach `query_syslog()` as
+  well as stderr.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
