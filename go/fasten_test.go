@@ -159,8 +159,10 @@ func TestEmit_Roundtrip(t *testing.T) {
 	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
 	// spec §8.1: without an audit store rows go out unsealed, since sealing
-	// is the store's job (§2.1). So attach one.
-	if err := Init(Config{ServiceID: "svc", NodeID: "node-1", AuditStore: store}); err != nil {
+	// is the store's job (§2.1). So attach one, in raise mode so Emit
+	// returns the sealed row.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node-1", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatal(err)
 	}
 	row, err := Emit(context.Background(), "USER_CREATED", Target("u-42"), Actor("alice", "user"))
@@ -202,8 +204,10 @@ func TestEmit_MonotonicSeqIncreases(t *testing.T) {
 	store, cleanup := newMemStore(t, "fasten_audit")
 	t.Cleanup(cleanup)
 	// spec §8.1: without an audit store rows go out unsealed, since sealing
-	// is the store's job (§2.1). So attach one.
-	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
+	// is the store's job (§2.1). So attach one, in raise mode so Emit
+	// returns the sealed row.
+	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store,
+		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatal(err)
 	}
 	r1, _ := Emit(context.Background(), "USER_CREATED", Target("u-1"))

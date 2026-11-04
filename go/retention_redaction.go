@@ -27,7 +27,7 @@ type RedactionCandidate struct {
 // separate so the caller can write the §7.2 record before anything is
 // destroyed; the other order can lose rows with no record and nothing to retry.
 type RedactionRepository interface {
-	// The int is the number of form-"1" rows past the horizon that were NOT
+	// The int is the number of sealed form-"1" rows past the horizon that were NOT
 	// returned because their detail is inside the hash. Reported by the
 	// caller, which has the sys stream; a store writing to stderr puts a
 	// privacy-relevant miss somewhere nothing is monitoring.
@@ -101,7 +101,7 @@ func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason str
 	if skippedForm1 > 0 {
 		e.drainerSysLog("warn", "pii_redaction_skipped_legacy_form", map[string]any{
 			"rows": skippedForm1,
-			"reason": "canonical_form_id != 2; detail is inside the hash, " +
+			"reason": "sealed under form 1; detail is inside the hash, " +
 				"so redacting would break the chain. The personal data in " +
 				"these rows still exists.",
 		})

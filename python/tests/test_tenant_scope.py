@@ -209,3 +209,39 @@ def test_topology_scoped_to_tenant():
         assert src["tenant_id"] == "tenant-a"
     # tenants count must be 1 for a scoped read.
     assert body["tenants"] <= 1
+
+
+# ── /audit/doctor ────────────────────────────────────────────────────────
+
+def test_doctor_hides_host_tenant_id_from_a_scoped_caller():
+    audit = _init_shared_store()
+    fasten.init(service_id="svc", node_id="n", tenant_id="tenant-b",
+                audit_store=audit, audit_store_failure_strategy="raise")
+    body = _client().get("/api/v1/logs/audit/doctor").json()
+    assert body["init"]["tenant_id"] == "tenant-b"
+    assert body["store"]["rows"] == 2
+
+    body = _client(tenant_scope=lambda r: "tenant-a").get(
+        "/api/v1/logs/audit/doctor").json()
+    assert body["init"]["tenant_id"] is None
+    assert body["store"]["rows"] == 1
+    assert body["chain"]["verified"] is True, body["chain"]
+    assert body["chain"]["reason"] is None
+
+
+def test_doctor_hides_the_broken_row_from_a_scoped_caller():
+    audit = _init_shared_store()
+    row_id = audit._mem_conn.execute(
+        "SELECT id FROM audit_log WHERE tenant_id = 'tenant-b'").fetchone()[0]
+    audit._mem_conn.execute("UPDATE audit_log SET hash = 'x' WHERE id = ?", (row_id,))
+    audit._mem_conn.commit()
+
+    chain = _client().get("/api/v1/logs/audit/doctor").json()["chain"]
+    assert row_id in chain["reason"]
+
+    chain = _client(tenant_scope=lambda r: "tenant-a").get(
+        "/api/v1/logs/audit/doctor").json()["chain"]
+    assert chain["verified"] is False
+    assert chain["breaks"] == 1
+    assert row_id not in chain["reason"]
+    assert chain["first_break_at"] is None

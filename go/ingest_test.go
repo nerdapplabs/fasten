@@ -106,15 +106,15 @@ func TestIngestReplicatedTx_RollsBackOnInsertError(t *testing.T) {
 	injected := errors.New("injected insert failure")
 	calls := 0
 
-	insertTx := func(ctx context.Context, exec execContext, row Row) error {
+	insertTx := func(ctx context.Context, exec execContext, row Row) (int64, error) {
 		calls++
 		if calls == 3 { // fail mid-batch, after two successful inserts on the tx
-			return injected
+			return 0, injected
 		}
 		return store.insertReplicatedTx(ctx, exec, row)
 	}
 
-	_, err := ingestReplicatedTx(ctx, store.db, rows, insertTx)
+	_, err := ingestReplicatedTx(ctx, store.db, rows, insertTx, store.lookup())
 	if !errors.Is(err, injected) {
 		t.Fatalf("expected injected insert error, got: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestIngestReplicatedTx_CleanBatchCommitsAtomically(t *testing.T) {
 	ctx := context.Background()
 
 	rows := makeRemoteChain(3, "svc-d", "node-d")
-	res, err := ingestReplicatedTx(ctx, store.db, rows, store.insertReplicatedTx)
+	res, err := ingestReplicatedTx(ctx, store.db, rows, store.insertReplicatedTx, store.lookup())
 	if err != nil {
 		t.Fatalf("clean tx batch failed: %v", err)
 	}
