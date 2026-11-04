@@ -220,6 +220,32 @@ def test_structlog_event_and_stdlib_extras_are_redacted(initialized, capsys):
         logging.getLogger().setLevel(saved_level)
 
 
+
+def test_structlog_configure_before_init_uses_init_redaction(initialized, mem_store, capsys):
+    """configure() before init() still applies init's redaction keys."""
+    pytest.importorskip("structlog")
+    import structlog
+    from fasten.shim.structlog import configure
+
+    saved_handlers = list(logging.getLogger().handlers)
+    saved_level = logging.getLogger().level
+    try:
+        configure(json=True, quiet=(), extra_redact_keys=["ssn"])
+        fasten.init(service_id="test-svc", node_id="test-node", audit_store=mem_store,
+                    audit_store_failure_strategy="raise", extra_redact_keys=["badge"])
+        structlog.get_logger().info("reinit_event", badge="B-1234", ssn="123-45-6789")
+        out = capsys.readouterr().out
+        assert "B-1234" not in out and "123-45-6789" not in out
+        assert '"badge": "***"' in out
+
+        logging.getLogger("app").info("reinit_stdlib", extra={"badge": "B-5678", "ssn": "1"})
+        rows = fasten.transport().query_syslog(limit=20)
+        row = next(r for r in rows if r.get("event") == "reinit_stdlib")
+        assert row["badge"] == "***" and row["ssn"] == "***"
+    finally:
+        logging.getLogger().handlers = saved_handlers
+        logging.getLogger().setLevel(saved_level)
+
 # Meta.id is optional; register() fills it from the dict key
 
 def test_register_dict_form_fills_id_from_key():
