@@ -1,0 +1,26 @@
+name: Release files
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'scripts/release/**'
+      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release-check.yml'
+  pull_request:
+    paths:
+      - 'scripts/release/**'
+      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build twice and compare
+        run: scripts/release/check-reproducible.sh

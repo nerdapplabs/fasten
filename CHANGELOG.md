@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: release provenance
+
+- `release-provenance.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
+  Swift, C++ and Rust source archives and the fasten-core library for linux
+  x86_64 (or the Go module zip for `go/` tags) with
+  `scripts/release/build-artifacts.sh`, writes `SHA256SUMS`, attests every
+  file with GitHub artifact attestations, runs `gh attestation verify` on each
+  one and then uploads them to the tag's GitHub release.
+- The source archives are reproducible. `release-check.yml` builds them twice
+  from separate clones and fails if the bytes differ.
+- The PyPI release sets `attestations: true` (PEP 740) explicitly.
+- SECURITY.md lists the commands to verify a release for each SDK.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
