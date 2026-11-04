@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `fasten doctor` absolute SQLite paths and structlog redaction after init (Python)
+
+- `fasten doctor` reads the audit DSN path as the SQLite store does, so
+  `sqlite:////abs/audit.db` and a bare `/abs/audit.db` are checked at that
+  path instead of being reported as not found.
+- `fasten.shim.structlog.configure()` uses the engine's current redactor for
+  each event, so redaction settings from an `init()` that runs after
+  `configure()` apply to structlog output and the stdlib bridge.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
