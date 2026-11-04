@@ -425,15 +425,20 @@ func canonicalJSON(v any) []byte {
 	return asciiEscape(out)
 }
 
-// asciiEscape replaces every non-ASCII rune in the JSON bytes with its \uXXXX
-// (or surrogate-pair) escape, matching Python json.dumps ensure_ascii=True.
+// asciiEscape replaces DEL and every non-ASCII rune in the JSON bytes with its
+// \uXXXX (or surrogate-pair) escape, matching Python json.dumps ensure_ascii=True.
 func asciiEscape(b []byte) []byte {
-	if isASCII(b) {
+	if plainASCII(b) {
 		return b
 	}
 	var sb strings.Builder
 	for i := 0; i < len(b); {
 		c := b[i]
+		if c == 0x7f {
+			sb.WriteString(`\u007f`)
+			i++
+			continue
+		}
 		if c < utf8.RuneSelf {
 			sb.WriteByte(c)
 			i++
@@ -461,9 +466,10 @@ func asciiEscape(b []byte) []byte {
 	return []byte(sb.String())
 }
 
-func isASCII(b []byte) bool {
+// plainASCII reports whether b has no byte that asciiEscape rewrites.
+func plainASCII(b []byte) bool {
 	for _, c := range b {
-		if c >= utf8.RuneSelf {
+		if c >= 0x7f {
 			return false
 		}
 	}
