@@ -749,7 +749,7 @@ class PostgresStore:
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT * FROM {self._table} WHERE source_node_id = %s "
+                    f"SELECT {_COLUMNS} FROM {self._table} WHERE source_node_id = %s "
                     "ORDER BY monotonic_seq DESC LIMIT %s",
                     (source_node_id, limit),
                 )

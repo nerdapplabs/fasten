@@ -181,6 +181,15 @@ def test_row_go_wrote_reads_back(go_table):
 
 
 
+def test_chain_tail_reads_back(go_table):
+    store, _ = go_table
+    written = [store.allocate_and_insert_originated(_row(target=f"u-{i}")) for i in range(4)]
+    tail = store.chain_tail("node-1", 3)
+    assert [(r.id, r.monotonic_seq, r.target, r.hash) for r in tail] == [
+        (w.id, w.monotonic_seq, w.target, w.hash) for w in written[1:]]
+    assert verify_chain(tail).ok
+
+
 def test_redact_ship_and_sources(go_table):
     store, _ = go_table
     old = datetime(2026, 1, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
