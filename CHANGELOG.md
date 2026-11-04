@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: chain verification (Python + Go)
+
+- A row with no hash is skipped only below its node's first sealed row; one
+  at or above it is a break. The sealed row right after an unsealed one must
+  link to `"genesis"`.
+- A row given more than once is checked once, with its sealed copy
+  preferred over an unsealed one (a stdout capture has both). Two sealed
+  copies must have the same hash, and each must verify.
+- Go now walks each node's chain separately, as Python does, so rows from
+  several nodes no longer break on interleaving. Both SDKs report a
+  duplicate `monotonic_seq` on one node, and `first_break_at` is the lowest
+  seq that breaks on any node.
+
 ### Fixed: `mark_shipped` no longer breaks a row's hash (#123, Python + Go)
 
 - Every canonical form hashes `shipped_at` as null (spec §1.1). Setting it

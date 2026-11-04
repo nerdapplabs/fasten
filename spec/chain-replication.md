@@ -192,7 +192,16 @@ stamp it at seal time.
 - `prev_hash` is the `hash` of the preceding sealed row in that sequence, or
   the literal `"genesis"` for the node's first sealed row (§2.1).
 - Rows with an empty `hash` (written before hash-chain support, or emitted in
-  stdout-only mode, §8) are skipped by `verify_chain`, not rejected.
+  stdout-only mode, §8) are skipped by `verify_chain`, not rejected, as long
+  as their `monotonic_seq` is below the node's first sealed row. They are not
+  covered by the chain. A conformant store never writes an unsealed row at or
+  above that seq (§2.1), so one there is a break. Only the node's first sealed
+  row is exempt from the `prev_hash` check against the row before it: directly
+  after an unsealed row (seq + 1) it carries `prev_hash = "genesis"`, and after
+  a gap below it, as left by a purged head, the chain is checked from that row
+  on. A gap between two sealed rows is a `prev_hash` break. Since an
+  unsealed row can carry any seq, losing the head of a chain is detectable only
+  against an external record of it, as with tail truncation.
 
 ### §2.1 Allocation (normative)
 
@@ -242,13 +251,19 @@ covers what the stdout stream carries until then.
 
 `verify_chain(rows)`:
 
-1. Sort by `monotonic_seq`.
-2. For each row that has a hash, recompute the §1 hash for its
-   `canonical_form_id` and compare it with the stored `hash`.
-3. Compare each such row's `prev_hash` with the `hash` of the previous row
-   that has a hash (`"genesis"` for the first).
-4. Stop at the first failure and report `first_break_at` = that row's
-   `monotonic_seq`.
+1. Keep one copy of each row `id` per node (re-delivery, §4; or a stdout
+   capture holding both §8 lines). A sealed copy wins over an unsealed one.
+   Two sealed copies MUST have the same `hash`, and each MUST pass step 2;
+   otherwise the chain breaks at the lower `monotonic_seq` of the two copies.
+   Sort by `monotonic_seq`.
+2. For each hash-bearing row, recompute the §1 hash for its `canonical_form_id`
+   and compare it with the stored `hash`. A row with an empty `hash` at or above
+   its node's first sealed seq is a break (§2).
+3. Compare each row's `prev_hash` with the previous row's `hash` on its node,
+   or with `"genesis"` when the previous row is unsealed and directly before it.
+   Only the node's first sealed row, after a gap, skips this check (§2).
+4. Report `first_break_at` = the lowest `monotonic_seq` at which any node's
+   chain fails.
 
 The result carries `ok`, `total_rows`, `first_break_at` and `reason`.
 
