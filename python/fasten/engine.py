@@ -493,6 +493,13 @@ class Engine:
         if _store_key(cfg.audit_store) != _store_key(prev_store):
             self._store_gen += 1
             self._audit_write_swallowed = False
+        # The unchained-store flags describe the old store. A store without
+        # allocate_and_insert_originated can't be verified, so /audit/doctor
+        # says so from init, before the first emit logs it.
+        self._unchained_store_logged = False
+        self._audit_chain_unavailable = cfg.audit_store is not None and not callable(
+            getattr(cfg.audit_store, "allocate_and_insert_originated", None)
+        )
 
         # No chain state lives in the engine: the store allocates seq and
         # prev_hash inside the insert transaction (spec 2.1).

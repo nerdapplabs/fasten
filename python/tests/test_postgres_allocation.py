@@ -145,6 +145,15 @@ def test_redact_expired_respects_cutoff_and_codes(store):
     assert {r.id: r for r in store.query(limit=50)}[fresh.id].detail is not None
 
 
+def test_chain_tail_keeps_the_newest_rows_in_seq_order(store):
+    for i in range(1, 6):
+        store.allocate_and_insert_originated(_row(i))
+    store.allocate_and_insert_originated(_row(1, service_id="svc-b", node="node-2"))
+    rows = store.chain_tail("node-1", 3)
+    assert [r.monotonic_seq for r in rows] == [3, 4, 5]
+    assert [r.source_node_id for r in store.chain_tail("node-2", 3)] == ["node-2"]
+
+
 def test_sealed_form_1_row_is_counted_and_never_redacted(store, caplog):
     """Spec §7.1: an unsealed row is a candidate; a sealed form "1" row is not,
     is counted in the warning, and survives redact_rows naming it directly."""

@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -62,6 +63,9 @@ CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
 CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
 CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
+-- Seq allocation and the doctor's chain sample. Not unique: unchained rows
+-- all sit at seq 0.
+CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monotonic_seq);
 """
 
 
@@ -80,7 +84,9 @@ class SQLiteStore:
                 f"fasten SQLiteStore: table name {table!r} is not a valid SQL identifier. "
                 "Use only letters, digits, and underscores."
             )
-        self._path = path
+        # Absolute, because each thread opens its own connection later and a
+        # relative path would follow an os.chdir() in between.
+        self._path = path if path == ":memory:" else os.path.abspath(path)
         self._table = table
         self._wal = wal
         # Failed inserts the caller dropped (see note_write_failure). Any
@@ -151,7 +157,11 @@ class SQLiteStore:
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        path = u.path.lstrip("/")
+        # Strip only the URL-separator slash, as the stream store does:
+        # sqlite:///rel.db is relative, sqlite:////abs/path.db is absolute.
+        path = u.path
+        if u.scheme and path.startswith("/"):
+            path = path[1:]
         if not path:
             raise ValueError(
                 f"fasten SQLiteStore: DSN {dsn!r} has no path. "
@@ -295,9 +305,11 @@ class SQLiteStore:
         scoped = service_id is not None and source_node_id is not None
         with self._txn():
             if scoped:
+                # Unary + keeps SQLite off idx_node_seq, which would walk the
+                # node's whole history; the unshipped partial index is smaller.
                 cur = self._connect().execute(
                     f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-                    "AND service_id = ? AND source_node_id = ? AND origin_id = id "
+                    "AND service_id = ? AND +source_node_id = ? AND origin_id = id "
                     "ORDER BY monotonic_seq ASC LIMIT ?",
                     (service_id, source_node_id, limit),
                 )
@@ -473,7 +485,9 @@ class SQLiteStore:
             conds.append("domain = ?")
             params.append(domain)
         if source_node_id:
-            conds.append("source_node_id = ?")
+            # Unary +: without statistics SQLite would pick idx_node_seq and
+            # sort the node's whole history instead of walking idx_ts.
+            conds.append("+source_node_id = ?")
             params.append(source_node_id)
         # `is not None`, not truthiness: an empty tenant_id must filter to
         # nothing, never silently widen the query to every tenant. Matches the
@@ -653,6 +667,20 @@ class SQLiteStore:
                     f"SELECT COALESCE(MAX(monotonic_seq), 0) FROM {self._table}"
                 )
             return int(cur.fetchone()[0])
+
+    def chain_tail(self, source_node_id: str, limit: int) -> list[AuditRow]:
+        """The node's newest ``limit`` rows by monotonic_seq, oldest first.
+
+        The doctor's chain sample. query() orders by timestamp, so after a
+        clock step back its newest rows can skip a seq and read as a break.
+        """
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT * FROM {self._table} WHERE source_node_id = ? "
+                "ORDER BY monotonic_seq DESC LIMIT ?",
+                (source_node_id, limit),
+            )
+            return [self._row(r) for r in reversed(cur.fetchall())]
 
     def _row(self, r: sqlite3.Row) -> AuditRow:
         from ..canonical_ts import parse_canonical
