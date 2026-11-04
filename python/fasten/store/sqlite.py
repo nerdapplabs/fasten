@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -51,8 +52,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     detail           TEXT NOT NULL,
     shipped_at       TEXT,
     canonical_form_id TEXT NOT NULL DEFAULT '1',
-    -- Form "2" columns (spec 1.4). NULL on form "1" rows, and detail_salt is
-    -- cleared on redaction.
+    -- Form "2" columns (spec 1.4). '' on form "1" rows (NULL in older rows),
+    -- and detail_salt is cleared on redaction.
     detail_salt       TEXT,
     detail_commitment TEXT,
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
@@ -62,6 +63,9 @@ CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
 CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
 CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
+-- Seq allocation and the doctor's chain sample. Not unique: unchained rows
+-- all sit at seq 0.
+CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monotonic_seq);
 """
 
 
@@ -80,7 +84,9 @@ class SQLiteStore:
                 f"fasten SQLiteStore: table name {table!r} is not a valid SQL identifier. "
                 "Use only letters, digits, and underscores."
             )
-        self._path = path
+        # Absolute, because each thread opens its own connection later and a
+        # relative path would follow an os.chdir() in between.
+        self._path = path if path == ":memory:" else os.path.abspath(path)
         self._table = table
         self._wal = wal
         # Failed inserts the caller dropped (see note_write_failure). Any
@@ -151,7 +157,11 @@ class SQLiteStore:
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        path = u.path.lstrip("/")
+        # Strip only the URL-separator slash, as the stream store does:
+        # sqlite:///rel.db is relative, sqlite:////abs/path.db is absolute.
+        path = u.path
+        if u.scheme and path.startswith("/"):
+            path = path[1:]
         if not path:
             raise ValueError(
                 f"fasten SQLiteStore: DSN {dsn!r} has no path. "
@@ -187,8 +197,10 @@ class SQLiteStore:
                 row.canonical_form_id,
                 row.prev_hash,
                 row.hash,
-                row.detail_salt,
-                row.detail_commitment,
+                # '' rather than NULL: a Go-created table has them NOT NULL,
+                # and OR IGNORE would drop the row without a word.
+                row.detail_salt or "",
+                row.detail_commitment or "",
             ),
         )
         return int(cur.rowcount)
@@ -295,9 +307,11 @@ class SQLiteStore:
         scoped = service_id is not None and source_node_id is not None
         with self._txn():
             if scoped:
+                # Unary + keeps SQLite off idx_node_seq, which would walk the
+                # node's whole history; the unshipped partial index is smaller.
                 cur = self._connect().execute(
                     f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
-                    "AND service_id = ? AND source_node_id = ? AND origin_id = id "
+                    "AND service_id = ? AND +source_node_id = ? AND origin_id = id "
                     "ORDER BY monotonic_seq ASC LIMIT ?",
                     (service_id, source_node_id, limit),
                 )
@@ -398,9 +412,10 @@ class SQLiteStore:
         Separate from redact_rows() so the caller can record each redaction
         first (spec 7.2). The seq is returned for the ``redacted_seq`` field.
 
-        Skips form-"1" rows: their ``detail`` IS hashed, so redacting one would
-        change its hash and cascade a re-seal down the rest of the chain. They
-        are counted and logged at WARNING rather than skipped quietly — on a
+        Lists form-"2" rows and unsealed rows (empty ``hash``): no hash covers
+        their ``detail`` (spec §7.1). Skips sealed form-"1" rows: their
+        ``detail`` IS hashed, so redacting one would change its hash and cascade
+        a re-seal down the rest of the chain. They are counted and logged at WARNING rather than skipped quietly — on a
         store written before the form-"2" upgrade, silence here would let an
         operator watch redaction "succeed" while the personal data it was
         supposed to destroy survives untouched.
@@ -412,14 +427,14 @@ class SQLiteStore:
         skipped = conn.execute(
             f"SELECT COUNT(*) FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id <> '2' AND detail <> 'null'",
+            "AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'",
             (_utc_iso(before), *codes),
         ).fetchone()[0]
         if skipped:
             logger.warning(
                 "fasten redact_expired: %d row(s) past the PII horizon were "
-                "NOT redacted because canonical_form_id != '2' — their "
-                "detail is inside the hash, so redacting would break the "
+                "NOT redacted because they are sealed under form '1' — "
+                "their detail is inside the hash, so redacting would break the "
                 "chain. Personal data in these rows still exists. "
                 "Re-seal under form '2' or erase the chain segment.",
                 skipped,
@@ -427,7 +442,7 @@ class SQLiteStore:
         rows = conn.execute(
             f"SELECT id, monotonic_seq FROM {self._table} "
             f"WHERE timestamp < ? AND code IN ({placeholders}) "
-            "AND canonical_form_id = '2' AND detail <> 'null' "
+            "AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "
             "ORDER BY monotonic_seq",
             (_utc_iso(before), *codes),
         ).fetchall()
@@ -442,14 +457,23 @@ class SQLiteStore:
         placeholders = ",".join("?" for _ in ids)
         with self._txn():
             conn = self._connect()
-            conn.execute(
-                # The JSON literal 'null', since detail is NOT NULL and
-                # changing that needs a table rebuild. It reads back as None.
-                f"UPDATE {self._table} SET detail = 'null', detail_salt = NULL "
-                f"WHERE id IN ({placeholders}) AND canonical_form_id = '2'",
-                tuple(ids),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    # The JSON literal 'null', since detail is NOT NULL and
+                    # changing that needs a table rebuild. It reads back as
+                    # None. The salt gets '' because a table the Go store
+                    # created declares it NOT NULL.
+                    f"UPDATE {self._table} SET detail = 'null', detail_salt = '' "
+                    f"WHERE id IN ({placeholders}) AND (canonical_form_id = '2' OR hash = '')",
+                    tuple(ids),
+                )
+                conn.commit()
+            except BaseException:
+                # The UPDATE opened an implicit transaction; left open, it
+                # keeps the write lock and other writers get "database is
+                # locked".
+                conn.rollback()
+                raise
             return list(ids)
 
     def redact_expired(self, *, before: datetime,
@@ -491,7 +515,9 @@ class SQLiteStore:
             conds.append("domain = ?")
             params.append(domain)
         if source_node_id:
-            conds.append("source_node_id = ?")
+            # Unary +: without statistics SQLite would pick idx_node_seq and
+            # sort the node's whole history instead of walking idx_ts.
+            conds.append("+source_node_id = ?")
             params.append(source_node_id)
         # `is not None`, not truthiness: an empty tenant_id must filter to
         # nothing, never silently widen the query to every tenant. Matches the
@@ -672,6 +698,20 @@ class SQLiteStore:
                 )
             return int(cur.fetchone()[0])
 
+    def chain_tail(self, source_node_id: str, limit: int) -> list[AuditRow]:
+        """The node's newest ``limit`` rows by monotonic_seq, oldest first.
+
+        The doctor's chain sample. query() orders by timestamp, so after a
+        clock step back its newest rows can skip a seq and read as a break.
+        """
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT * FROM {self._table} WHERE source_node_id = ? "
+                "ORDER BY monotonic_seq DESC LIMIT ?",
+                (source_node_id, limit),
+            )
+            return [self._row(r) for r in reversed(cur.fetchall())]
+
     def _row(self, r: sqlite3.Row) -> AuditRow:
         from ..canonical_ts import parse_canonical
         keys = r.keys()
@@ -688,9 +728,10 @@ class SQLiteStore:
             detail=json.loads(r["detail"]),
             shipped_at=parse_canonical(r["shipped_at"]) if r["shipped_at"] else None,
             canonical_form_id=r["canonical_form_id"] if "canonical_form_id" in keys else "1",
-            detail_salt=r["detail_salt"] if "detail_salt" in keys else None,
+            # '' (what the stores write, and what redaction leaves) is none.
+            detail_salt=(r["detail_salt"] or None) if "detail_salt" in keys else None,
             detail_commitment=(
-                r["detail_commitment"] if "detail_commitment" in keys else None),
+                (r["detail_commitment"] or None) if "detail_commitment" in keys else None),
             prev_hash=r["prev_hash"] if "prev_hash" in keys else "genesis",
             hash=r["hash"] if "hash" in keys else "",
         )

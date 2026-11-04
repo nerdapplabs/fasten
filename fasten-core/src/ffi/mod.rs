@@ -18,7 +18,7 @@ pub(crate) mod redact;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::panic;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{
     drainer::Drainer,
@@ -49,7 +49,13 @@ where
 /// Heap-allocated, type-erased store + optional drainer. C sees only `FastenStore*`.
 pub struct FastenStoreHandle {
     store: Arc<dyn Store>,
-    drainer: Option<Arc<Drainer>>,
+    // Callers clone the Arc under the lock, so a drainer closed by one thread
+    // stays usable for calls already in progress on others.
+    drainer: Mutex<Option<Arc<Drainer>>>,
+    // Drainers being flushed or stopped by install/close; flush waits for them.
+    retiring: Mutex<Vec<Arc<Drainer>>>,
+    // Signalled when a drainer leaves `retiring`.
+    retired: Condvar,
 }
 
 /// Write the error string and return the error code.
@@ -105,7 +111,12 @@ pub unsafe extern "C" fn fasten_store_open(
             other => return Err(Error::UnknownBackend(other.to_owned())),
         };
 
-        Ok(Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None })))
+        Ok(Box::into_raw(Box::new(FastenStoreHandle {
+            store,
+            drainer: Mutex::new(None),
+            retiring: Mutex::new(Vec::new()),
+            retired: Condvar::new(),
+        })))
     });
 
     match result {
@@ -118,6 +129,8 @@ pub unsafe extern "C" fn fasten_store_open(
 }
 
 /// Insert a JSON-encoded audit row.
+///
+/// `monotonic_seq` 0 means the store allocates the next seq for the node.
 ///
 /// `handle`:    handle returned by `fasten_store_open`; must be non-null.
 /// `row_json`:  UTF-8 JSON object matching the fasten wire schema.
@@ -340,6 +353,7 @@ pub unsafe extern "C" fn fasten_store_purge(
 }
 
 /// Return the maximum `monotonic_seq` across all stored rows, or 0 if empty.
+/// Table-wide, not per node; do not use it to allocate a seq.
 ///
 /// `out_seq`:  set to the maximum sequence number on success; must be non-null.
 /// `out_err`:  set on error; may be NULL.
@@ -371,7 +385,90 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
     }
 }
 
-/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`.
+/// List rows a PII retention horizon would redact (spec §7.1).
+///
+/// `before_iso8601`:  rows with `timestamp` strictly older are candidates.
+/// `codes_json`:      UTF-8 JSON array of codes, e.g. `["USER_LOGIN"]`.
+/// `out_json`:        on success, a JSON array of
+///                    `{"id": ..., "monotonic_seq": ...}` ordered by
+///                    `monotonic_seq`. Free with `fasten_store_free_str`.
+/// `out_skipped`:     on success, the number of matching sealed rows left
+///                    out of `out_json`. May be NULL.
+/// `out_err`:         set on error; may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
+    handle: *mut FastenStoreHandle,
+    before_iso8601: *const c_char,
+    codes_json: *const c_char,
+    out_json: *mut *mut c_char,
+    out_skipped: *mut u64,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
+        let codes: Vec<String> = serde_json::from_str(read_str(codes_json).ok_or(Error::NullArg)?)?;
+        let found = (*handle).store.list_redaction_candidates(before, &codes)?;
+        let out: Vec<_> = found
+            .rows
+            .into_iter()
+            .map(|(id, seq)| serde_json::json!({"id": id, "monotonic_seq": seq}))
+            .collect();
+        Ok((serde_json::to_string(&out)?, found.skipped))
+    });
+    match r {
+        Ok((json, skipped)) => {
+            set_error(out_json, &json);
+            if !out_skipped.is_null() {
+                *out_skipped = skipped;
+            }
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Set `detail` to JSON `null` on the rows in `ids_json` (spec §7.1).
+///
+/// `ids_json`:      UTF-8 JSON array of ids. Idempotent; sealed rows are
+///                  left alone.
+/// `out_ids_json`:  on success, the JSON array of ids passed in. Free with
+///                  `fasten_store_free_str`. May be NULL.
+/// `out_err`:       set on error; may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_store_redact_rows(
+    handle: *mut FastenStoreHandle,
+    ids_json: *const c_char,
+    out_ids_json: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| {
+        if handle.is_null() {
+            return Err(Error::NullArg);
+        }
+        let ids: Vec<String> = serde_json::from_str(read_str(ids_json).ok_or(Error::NullArg)?)?;
+        let done = (*handle).store.redact_rows(&ids)?;
+        Ok(serde_json::to_string(&done)?)
+    });
+    match r {
+        Ok(json) => {
+            set_error(out_ids_json, &json);
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// C callback: `fn(row_json, userdata) -> 0=ok, nonzero=error`; a negative
+/// code means the row itself was rejected and is not retried.
 pub type CInsertFn = unsafe extern "C" fn(*const c_char, *mut std::ffi::c_void) -> i32;
 
 struct SendRawPtr(*mut std::ffi::c_void);
@@ -395,6 +492,8 @@ impl Store for CallbackStore {
     fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
     fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
     fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+    // Redaction keeps the trait defaults (Unsupported): the callback can
+    // only insert.
 }
 
 /// Create a store handle backed by an insert callback.
@@ -409,7 +508,12 @@ pub unsafe extern "C" fn fasten_store_from_callback(
     _out_err: *mut *mut c_char,
 ) -> *mut FastenStoreHandle {
     let store: Arc<dyn Store> = Arc::new(CallbackStore { fn_ptr, ud: SendRawPtr(userdata) });
-    Box::into_raw(Box::new(FastenStoreHandle { store, drainer: None }))
+    Box::into_raw(Box::new(FastenStoreHandle {
+        store,
+        drainer: Mutex::new(None),
+        retiring: Mutex::new(Vec::new()),
+        retired: Condvar::new(),
+    }))
 }
 
 /// Close the store (and any attached drainer) and release all resources.
@@ -418,12 +522,13 @@ pub unsafe extern "C" fn fasten_store_from_callback(
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
     if !handle.is_null() {
-        // Stop drainer first so its background thread exits cleanly before
-        // the store Arc's ref-count drops to zero.
-        let h = &mut *handle;
-        if let Some(d) = h.drainer.take() {
-            d.stop(std::time::Duration::from_secs(2));
+        // Stop every drainer first, including one an install on another
+        // thread is retiring, so no drain thread outlives the handle.
+        let h = &*handle;
+        if let Some(d) = drainer::swap(h, None) {
+            drainer::retire(h, &d, None);
         }
+        drainer::wait_retired(h);
         drop(Box::from_raw(handle));
     }
 }
@@ -496,5 +601,101 @@ mod tests {
             ud: SendRawPtr(std::ptr::null_mut()),
         };
         assert!(store.insert(&Row::default()).is_ok());
+    }
+
+    unsafe fn take(p: *mut c_char) -> String {
+        let s = std::ffi::CStr::from_ptr(p).to_str().unwrap().to_owned();
+        fasten_store_free_str(p);
+        s
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn redaction_exports_round_trip_json() {
+        let cs = |s: &str| CString::new(s).unwrap();
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = fasten_store_open(
+                cs("sqlite").as_ptr(), cs(":memory:").as_ptr(), cs("audit_log").as_ptr(), &mut err,
+            );
+            assert!(!h.is_null());
+            let row = serde_json::json!({
+                "wire_version": "1", "id": "evt-1", "origin_id": "evt-1", "monotonic_seq": 0,
+                "timestamp": "2020-01-01T00:00:00.000000Z", "code": "USER_LOGIN",
+                "action": "a", "severity": "info", "service_id": "s", "source_node_id": "n",
+                "actor": "u", "actor_kind": "user", "target": "t", "category": "c",
+                "domain": "d", "method": "sdk", "request_id": "r", "detail": {"email": "x"},
+            });
+            let rc = fasten_store_insert(h, cs(&row.to_string()).as_ptr(), &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut skipped: u64 = 99;
+            let rc = fasten_store_list_redaction_candidates(
+                h, cs("2021-01-01T00:00:00Z").as_ptr(), cs(r#"["USER_LOGIN"]"#).as_ptr(),
+                &mut out, &mut skipped, &mut err,
+            );
+            assert_eq!(rc, FastenErrorCode::Ok);
+            assert_eq!(take(out), r#"[{"id":"evt-1","monotonic_seq":1}]"#);
+            assert_eq!(skipped, 0);
+
+            // out_skipped may be NULL.
+            let rc = fasten_store_list_redaction_candidates(
+                h, cs("2021-01-01T00:00:00Z").as_ptr(), cs(r#"["USER_LOGIN"]"#).as_ptr(),
+                &mut out, std::ptr::null_mut(), &mut err,
+            );
+            assert_eq!(rc, FastenErrorCode::Ok);
+            take(out);
+
+            let rc = fasten_store_redact_rows(h, cs(r#"["evt-1"]"#).as_ptr(), &mut out, &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+            assert_eq!(take(out), r#"["evt-1"]"#);
+            fasten_store_close(h);
+        }
+    }
+
+    /// #139: what the SDKs see. A sealed row inserted through the C interface
+    /// comes back from query with every chain field.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sealed_row_round_trips_through_the_c_interface() {
+        let cs = |s: &str| CString::new(s).unwrap();
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = fasten_store_open(
+                cs("sqlite").as_ptr(), cs(":memory:").as_ptr(), cs("audit_log").as_ptr(), &mut err,
+            );
+            assert!(!h.is_null());
+            let chain = serde_json::json!({
+                "prev_hash": "genesis", "hash": "h1", "canonical_form_id": "2",
+                "detail_salt": "salt", "detail_commitment": "commit",
+            });
+            let mut row = serde_json::json!({
+                "wire_version": "1", "id": "evt-1", "origin_id": "evt-1", "monotonic_seq": 1,
+                "timestamp": "2026-01-01T00:00:00.000000Z", "code": "C", "action": "a",
+                "severity": "info", "service_id": "s", "source_node_id": "n", "actor": "u",
+                "actor_kind": "user", "target": "t", "category": "c", "domain": "d",
+                "method": "sdk", "request_id": "r", "detail": {},
+            });
+            row.as_object_mut().unwrap().extend(chain.as_object().unwrap().clone());
+            let rc = fasten_store_insert(h, cs(&row.to_string()).as_ptr(), &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = fasten_store_query(h, std::ptr::null(), &mut out, &mut err);
+            assert_eq!(rc, FastenErrorCode::Ok);
+            let rows: serde_json::Value = serde_json::from_str(&take(out)).unwrap();
+            for (k, v) in chain.as_object().unwrap() {
+                assert_eq!(&rows[0][k], v, "{k}");
+            }
+            fasten_store_close(h);
+        }
+    }
+
+    #[test]
+    fn callback_store_has_no_redaction() {
+        extern "C" fn ok_cb(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 0 }
+        let store = CallbackStore { fn_ptr: ok_cb, ud: SendRawPtr(std::ptr::null_mut()) };
+        assert!(matches!(store.redact_rows(&["x".into()]), Err(Error::Unsupported(_))));
     }
 }

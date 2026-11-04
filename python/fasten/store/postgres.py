@@ -33,6 +33,25 @@ def _utc_iso(dt: datetime) -> str:
     return canonical_ts(dt)
 
 
+def _read_ts(value: Any) -> datetime:
+    """A stored timestamp: canonical TEXT here, TIMESTAMPTZ in a table the Go
+    SDK created (microsecond precision, so nothing is lost)."""
+    from ..canonical_ts import parse_canonical
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    return parse_canonical(value)
+
+
+# Named, not SELECT *: a table the Go SDK created orders its columns
+# differently and has pii_in_detail and wire_version too.
+_COLUMNS = (
+    "id,origin_id,monotonic_seq,timestamp,code,action,severity,"
+    "service_id,source_node_id,tenant_id,actor,actor_kind,"
+    "target,category,domain,method,request_id,detail,shipped_at,"
+    "prev_hash,hash,canonical_form_id,detail_salt,detail_commitment"
+)
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS {table} (
     id               TEXT PRIMARY KEY,
@@ -57,8 +76,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     prev_hash        TEXT NOT NULL DEFAULT 'genesis',
     hash             TEXT NOT NULL DEFAULT '',
     canonical_form_id TEXT NOT NULL DEFAULT '1',
-    -- Form "2" columns (spec 1.4). NULL on form "1" rows, and detail_salt is
-    -- cleared on redaction.
+    -- Form "2" columns (spec 1.4). '' on form "1" rows (NULL in older rows),
+    -- and detail_salt is cleared on redaction.
     detail_salt       TEXT,
     detail_commitment TEXT
 )
@@ -80,6 +99,9 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_{p}_code      ON {t}(code)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_ts        ON {t}(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_{p}_unshipped ON {t}(shipped_at) WHERE shipped_at IS NULL",
+    # Seq allocation and the doctor's chain sample. Not unique: unchained
+    # rows all sit at seq 0.
+    "CREATE INDEX IF NOT EXISTS idx_{p}_node_seq  ON {t}(source_node_id, monotonic_seq)",
 ]
 
 
@@ -222,8 +244,9 @@ class PostgresStore:
             row.prev_hash,
             row.hash,
             row.canonical_form_id,
-            row.detail_salt,
-            row.detail_commitment,
+            # '' rather than NULL: a Go-created table has them NOT NULL.
+            row.detail_salt or "",
+            row.detail_commitment or "",
         )
 
     def _insert_row_core(self, cur: Any, row: AuditRow) -> int:
@@ -358,14 +381,14 @@ class PostgresStore:
             with conn.cursor() as cur:
                 if scoped:
                     cur.execute(
-                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        f"SELECT {_COLUMNS} FROM {self._table} WHERE shipped_at IS NULL "
                         "AND service_id = %s AND source_node_id = %s AND origin_id = id "
                         "ORDER BY monotonic_seq ASC LIMIT %s",
                         (service_id, source_node_id, limit),
                     )
                 else:
                     cur.execute(
-                        f"SELECT * FROM {self._table} WHERE shipped_at IS NULL "
+                        f"SELECT {_COLUMNS} FROM {self._table} WHERE shipped_at IS NULL "
                         "ORDER BY monotonic_seq ASC LIMIT %s",
                         (limit,),
                     )
@@ -485,15 +508,15 @@ class PostgresStore:
                 cur.execute(
                     f"SELECT COUNT(*) FROM {self._table} "
                     "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id <> '2' AND detail <> 'null'",
+                    "AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'",
                     (_utc_iso(before), list(codes)),
                 )
                 skipped = cur.fetchone()[0]
                 if skipped:
                     logger.warning(
                         "fasten redact_expired: %d row(s) past the PII horizon "
-                        "were NOT redacted because canonical_form_id != '2' — "
-                        "their detail is inside the hash, so redacting would "
+                        "were NOT redacted because they are sealed under form "
+                        "'1' — their detail is inside the hash, so redacting would "
                         "break the chain. Personal data in these rows still "
                         "exists. Re-seal under form '2' or erase the chain "
                         "segment.",
@@ -502,7 +525,7 @@ class PostgresStore:
                 cur.execute(
                     f"SELECT id, monotonic_seq FROM {self._table} "
                     "WHERE timestamp < %s AND code = ANY(%s) "
-                    "AND canonical_form_id = '2' AND detail <> 'null' "
+                    "AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' "
                     "ORDER BY monotonic_seq",
                     (_utc_iso(before), list(codes)),
                 )
@@ -522,8 +545,10 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {self._table} "
-                    "SET detail = 'null', detail_salt = NULL "
-                    "WHERE id = ANY(%s) AND canonical_form_id = '2'",
+                    # '' not NULL: a table the Go store created declares
+                    # detail_salt NOT NULL. Both read back as None.
+                    "SET detail = 'null', detail_salt = '' "
+                    "WHERE id = ANY(%s) AND (canonical_form_id = '2' OR hash = '')",
                     (list(ids),),
                 )
             conn.commit()
@@ -623,7 +648,7 @@ class PostgresStore:
                 cur.execute(
                     # Timestamp first: monotonic_seq is per node, so it only
                     # breaks ties (#68).
-                    f"SELECT * FROM {self._table} {where} "
+                    f"SELECT {_COLUMNS} FROM {self._table} {where} "
                     "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s OFFSET %s",
                     (*params, limit, offset),
                 )
@@ -684,7 +709,7 @@ class PostgresStore:
             params.append(tenant_id)
         params.append(limit)
         sql = (
-            f"SELECT * FROM {self._table} WHERE {' AND '.join(conds)} "
+            f"SELECT {_COLUMNS} FROM {self._table} WHERE {' AND '.join(conds)} "
             "ORDER BY timestamp DESC, monotonic_seq DESC LIMIT %s"
         )
 
@@ -724,8 +749,9 @@ class PostgresStore:
                         "service_id": r[1],
                         "tenant_id": r[2],
                         "rows": int(r[3]),
-                        "first_seen": first_seen.isoformat() if hasattr(first_seen, "isoformat") else first_seen,
-                        "last_seen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else last_seen,
+                        # TIMESTAMPTZ in a Go-created table: same canonical form.
+                        "first_seen": _utc_iso(first_seen) if isinstance(first_seen, datetime) else first_seen,
+                        "last_seen": _utc_iso(last_seen) if isinstance(last_seen, datetime) else last_seen,
                     })
                 return out
 
@@ -754,24 +780,39 @@ class PostgresStore:
 
         return self._execute_with_retry(_run)
 
+    def chain_tail(self, source_node_id: str, limit: int) -> list[AuditRow]:
+        """The node's newest ``limit`` rows by monotonic_seq, oldest first.
+        See SQLiteStore.chain_tail."""
+
+        def _run(conn: Any) -> list[AuditRow]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_COLUMNS} FROM {self._table} WHERE source_node_id = %s "
+                    "ORDER BY monotonic_seq DESC LIMIT %s",
+                    (source_node_id, limit),
+                )
+                return [self._row(r) for r in reversed(cur.fetchall())]
+
+        return self._execute_with_retry(_run)
+
     def _row(self, r: tuple) -> AuditRow:
-        from ..canonical_ts import parse_canonical
+        """A row selected as ``_COLUMNS``."""
         return AuditRow(
             id=r[0], origin_id=r[1], monotonic_seq=r[2],
-            # Strict: every row was written by _utc_iso().
-            timestamp=parse_canonical(r[3]),
+            # TIMESTAMPTZ (a Go-created table) or canonical TEXT, parsed
+            # strictly: every TEXT row was written by _utc_iso().
+            timestamp=_read_ts(r[3]),
             code=r[4], action=r[5], severity=r[6],
             service_id=r[7], source_node_id=r[8], tenant_id=r[9],
             actor=r[10], actor_kind=r[11],
             target=r[12], category=r[13], domain=r[14],
             method=r[15], request_id=r[16],
             detail=json.loads(r[17]),
-            shipped_at=parse_canonical(r[18]) if r[18] else None,
-            prev_hash=r[19] if len(r) > 19 else "genesis",
-            hash=r[20] if len(r) > 20 else "",
-            canonical_form_id=r[21] if len(r) > 21 else "1",
-            # SELECT * is positional. The new DDL and the migrations both put
-            # detail_salt and detail_commitment after canonical_form_id.
-            detail_salt=r[22] if len(r) > 22 else None,
-            detail_commitment=r[23] if len(r) > 23 else None,
+            shipped_at=_read_ts(r[18]) if r[18] else None,
+            prev_hash=r[19],
+            hash=r[20],
+            canonical_form_id=r[21],
+            # '' (what the stores write, and what redaction leaves) is none.
+            detail_salt=r[22] or None,
+            detail_commitment=r[23] or None,
         )

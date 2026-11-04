@@ -88,7 +88,7 @@ The runtime layout:
 **Not mitigated:**
 
 - fasten does not enforce authentication. A router mounted with `dependencies=[]` on a public interface has no access control. This is a deployment concern rather than a library concern, but treat the `/logs/*` routes like any internal admin endpoint.
-- The `/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated.
+- The `/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
 
 ---
 
