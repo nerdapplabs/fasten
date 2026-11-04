@@ -113,12 +113,14 @@ def test_one_id_on_two_nodes_in_a_batch_is_rejected():
 
 
 def test_one_id_twice_on_one_node_in_a_batch_is_rejected():
+    # verify_chain keeps one copy per id on a node, and copies that differ
+    # break the chain at the lower seq (spec §3).
     store = SQLiteStore(":memory:")
     rows = _chain([1, 2, 3], rid="evt-x")
     result = ingest(store, rows)
-    assert result.rejected_from_seq == 2 and result.inserted == 1
-    assert "also in this batch" in result.reason
-    assert [s for s, _, _ in _stored(store)] == [1]
+    assert result.rejected_from_seq == 1 and result.inserted == 0
+    assert "two sealed copies with different hashes" in result.reason
+    assert _stored(store) == []
 
 
 def test_a_row_after_a_stored_unsealed_row_links_to_genesis():

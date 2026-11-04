@@ -293,8 +293,9 @@ and `monotonic_seq`.
   is a break at that row; so is a new row whose `prev_hash` does not match the
   stored row at `seq - 1` (`"genesis"` when that row is unsealed, §2), or whose
   `hash` the stored row at `seq + 1` does not link to. Since `id` is unique,
-  a repeat of an `id` within a batch, on the same node or another, is a break
-  at the later row. `ingest` MUST
+  a repeat of an `id` within a batch on another node is a break at the later
+  row; on the same node, `verify_chain` already breaks at the lower seq when
+  the copies differ (§3). `ingest` MUST
   NOT keep one version silently: an insert skipped because another writer
   stored that `id` in the meantime is checked again, not counted as inserted.
   A row stored with the same `hash` is a re-delivery.

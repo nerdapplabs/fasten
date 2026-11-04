@@ -281,12 +281,14 @@ func TestIngestOneIDTwiceOnOneNodeInABatchIsRejected(t *testing.T) {
 	for i := range rows {
 		rows[i].ID, rows[i].OriginID = "evt-x", "evt-x"
 	}
+	// VerifyChain keeps one copy per id on a node, and copies that differ
+	// break the chain at the lower seq (spec §3).
 	res := ingestOK(t, s, resealFrom("genesis", rows))
-	if res.RejectedFromSeq != 2 || res.Inserted != 1 || !strings.Contains(res.Reason, "also in this batch") {
-		t.Fatalf("want a rejection at 2, got %+v", res)
+	if res.RejectedFromSeq != 1 || res.Inserted != 0 || !strings.Contains(res.Reason, "two sealed copies with different hashes") {
+		t.Fatalf("want a rejection at 1, got %+v", res)
 	}
-	if storedCount(t, s) != 1 {
-		t.Fatal("want only seq 1 stored")
+	if storedCount(t, s) != 0 {
+		t.Fatal("want nothing stored")
 	}
 }
 
