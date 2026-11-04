@@ -62,7 +62,7 @@ commit SHA. The first published release will be the v1.0.0 GA tag.
 ## Current scan posture
 
 Each SDK's dependencies are scanned against the minimum supported
-language version (Python 3.10-slim, Go 1.22-alpine, Node 24-alpine). All
+language version (Python 3.10-slim, Go 1.26-alpine, Node 24-alpine). All
 three are clean as of the latest scan:
 
 | Language | Scanner          | Status | Notes |

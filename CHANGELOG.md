@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: Go SDK requires Go 1.26
+
+- The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
+  modernc.org/sqlite v1.61.1 (from v1.34.4) for a current SQLite engine, and
+  that release requires Go 1.26. Go 1.26 is the oldest Go release still
+  supported upstream.
+- Adopters on Go 1.25 or older need to upgrade Go before taking this release.
+
 ### Fixed: Swift `FastenStore` binding (#149)
 
 - `close()` can be called more than once, and `deinit` goes through it. Calls

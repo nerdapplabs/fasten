@@ -1,0 +1,45 @@
+name: Integration smokes
+
+# Each SDK's Docker smoke (tests/integration): register, init, a sys row and
+# an audit row with PII detail, checked against the wire contract by verify.py.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'python/**'
+      - 'go/**'
+      - 'js/**'
+      - 'rust/**'
+      - 'cpp/**'
+      - 'fasten-core/**'
+      - 'tests/integration/**'
+      - '.github/workflows/integration.yml'
+  pull_request:
+    paths:
+      - 'python/**'
+      - 'go/**'
+      - 'js/**'
+      - 'rust/**'
+      - 'cpp/**'
+      - 'fasten-core/**'
+      - 'tests/integration/**'
+      - '.github/workflows/integration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [python, go, node, rust, cpp]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Smoke (${{ matrix.lang }})
+        working-directory: tests/integration
+        run: make test-${{ matrix.lang }}

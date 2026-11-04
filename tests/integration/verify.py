@@ -11,7 +11,7 @@ asserts:
   3. Redaction worked: api_key, customer_token and nested.token (if present)
      are "***"; email is unchanged.
   4. Audit and api request_id values are 12 hex chars.
-  5. The sys row has level, event, request_id and timestamp.
+  5. The startup_ok sys row has level, event, request_id and timestamp.
   6. An api row, if any, has method, path, status, request_id, timestamp.
 
 Exits 0 if every check passes, else 1 with the failed check on stderr.
@@ -30,6 +30,7 @@ Each smoke emits, in any order:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Any
@@ -127,14 +128,17 @@ def main() -> None:
         if nested.get("token") != "***":
             fail("audit.detail.nested.token was NOT redacted", detail)
 
-    sys_row = sys_rows[0]
+    # The SDK may log its own sys events first (e.g. Rust's
+    # audit_chain_unavailable at init), so look for the smoke's row.
+    startup = [r for r in sys_rows if r.get("event") == "startup_ok"]
+    if not startup:
+        fail("no startup_ok sys row", sys_rows)
+    sys_row = startup[0]
     missing = REQUIRED_SYS_FIELDS - set(sys_row.keys())
     if missing:
         fail(f"sys row missing fields: {sorted(missing)}", sys_row)
     if sys_row["level"] not in ("info", "Info", "INFO"):
         fail(f"sys.level expected info, got {sys_row['level']}")
-    if sys_row["event"] != "startup_ok":
-        fail(f"sys.event expected startup_ok, got {sys_row['event']}")
 
     if require_api and not api_rows:
         fail("no {shape: 'api'} row produced")

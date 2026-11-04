@@ -49,6 +49,6 @@ fn main() {
     EmitBuilder::new("USER_CREATED", "u-42")
         .actor("admin", "user")
         .detail(detail)
-        .emit(None)
+        .submit()
         .expect("emit");
 }
