@@ -655,14 +655,11 @@ impl EmitBuilder {
                 let core_row = crate::engine::sdk_row_to_core(&row);
                 if !d.enqueue(core_row) {
                     // The drainer is stopping (a re-init or shutdown), so
-                    // store the row here.
-                    match cfg.audit_store.as_ref() {
-                        Some(s) => engine.store_inline(&**s, &row)?,
-                        // A concurrent re-init dropped the store.
-                        None => return Err(engine.fallback_failed(
-                            &row,
-                            Error::AuditStoreInsert("no audit store".into()),
-                        )),
+                    // store the row here. With no store (a re-init to a
+                    // config without one) stdout has the row, as it does
+                    // on the no-store path.
+                    if let Some(s) = cfg.audit_store.as_ref() {
+                        engine.store_inline(&**s, &row)?;
                     }
                 }
             } else if let Some(s) = cfg.audit_store.as_ref() {
@@ -1550,20 +1547,18 @@ mod tests {
         e.reset_for_tests();
     }
 
-    // A refused row is an error when a re-init has dropped the store.
+    // A refused row is not an error when a re-init has dropped the store.
     #[test]
-    fn submit_errors_when_drainer_stopped_and_store_gone() {
+    fn submit_ok_when_drainer_stopped_and_store_gone() {
         register("store_gone".into(), [("STORE_GONE".into(), plain_meta("store_gone"))]).unwrap();
         let e = Engine::new();
         e.init(queue_config("svc-store-gone", Arc::new(IdStore::default()))).unwrap();
         e.active_drainer().unwrap().stop(Duration::from_secs(2));
         e.config.lock().unwrap().as_mut().unwrap().audit_store = None;
 
-        let err = EmitBuilder::new("STORE_GONE", "t").submit_to(&e).unwrap_err();
-        assert!(matches!(err.source, Error::AuditStoreInsert(_)));
-        let lines = sys_lines("svc-store-gone", "audit_sync_fallback_failed");
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["error_type"], "AuditStoreInsert");
+        EmitBuilder::new("STORE_GONE", "t").submit_to(&e).expect("submit");
+        assert!(sys_lines("svc-store-gone", "audit_sync_fallback_failed").is_empty());
+        assert!(sys_lines("svc-store-gone", "audit_drain_stored_inline").is_empty());
         e.reset_for_tests();
     }
 
@@ -1613,16 +1608,29 @@ mod tests {
         let first = EmitBuilder::new("REINIT_BLOCKED", "t").submit_to(&e).expect("submit");
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let submitting = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|sc| {
-            sc.spawn(|| tx.send(EmitBuilder::new("REINIT_BLOCKED", "t").submit_to(&e)).unwrap());
-            // Let the second submit block on the full queue.
-            std::thread::sleep(Duration::from_millis(200));
+            sc.spawn(|| {
+                submitting.store(true, std::sync::atomic::Ordering::SeqCst);
+                tx.send(EmitBuilder::new("REINIT_BLOCKED", "t").submit_to(&e)).unwrap()
+            });
+            // Wait for the second submit to start on the full queue.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !submitting.load(std::sync::atomic::Ordering::SeqCst)
+                || e.queue_stats().unwrap().depth < 1
+            {
+                assert!(std::time::Instant::now() < deadline, "submit did not start");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
             sc.spawn(|| e.init(cfg.clone()).unwrap());
             // The re-init's flush times out after 5s; its stop wakes the submit.
             let blocked = rx.recv_timeout(Duration::from_secs(20));
             store.release();
             let row = blocked.expect("blocked submit returned").expect("submit");
             assert!(store.ids.lock().unwrap().contains(&row.id), "row was dropped");
+            let inline = sys_lines("svc-reinit-blocked", "audit_drain_stored_inline");
+            assert!(inline.iter().any(|l| l["row_id"] == serde_json::json!(row.id)));
         });
         assert!(store.ids.lock().unwrap().contains(&first.id));
         e.reset_for_tests();

@@ -10,9 +10,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `submit()` stores a row inline when the drainer is stopping and refuses it,
   then emits `audit_drain_stored_inline`. If that insert fails too, it emits
-  `audit_sync_fallback_failed` and returns the error, as it does when a
-  concurrent re-init has dropped the store. Before, such a row was dropped
-  and `submit()` returned `Ok`.
+  `audit_sync_fallback_failed` and returns the error. Before, such a row was
+  dropped and `submit()` returned `Ok`.
 - Redact sys and log lines (`fasten::log::*` included) with the configured
   extra keys and replacement, as the other SDKs do.
 - SDK sys events (`audit_chain_unavailable`, `retention_purge_failed`,
