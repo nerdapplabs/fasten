@@ -25,7 +25,13 @@ _FASTEN_RECORD_TAG = "_fasten_internal"
 
 class LoggingHandler(logging.Handler):
     """Push stdlib log records to fasten's sys stream. Writes nothing to
-    stdout; other handlers keep doing that. Does nothing before init()."""
+    stdout; other handlers keep doing that. Does nothing before init().
+    Records are redacted with ``redactor``, or ``fasten.redactor()`` when
+    none is given."""
+
+    def __init__(self, level: int = logging.NOTSET, redactor: Any = None) -> None:
+        super().__init__(level)
+        self._redactor = redactor
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: A003
         try:
@@ -82,7 +88,7 @@ class LoggingHandler(logging.Handler):
                 row[k] = v
 
             # Apply redaction to scrub secrets from any extras.
-            row = _redactor().redact(row)
+            row = (self._redactor or _redactor()).redact(row)
 
             transport.push_syslog(row)
         except Exception:

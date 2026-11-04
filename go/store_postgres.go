@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -199,8 +200,9 @@ const pgAuditCols = `id, origin_id, monotonic_seq, timestamp, code, action, seve
 	` detail_salt, detail_commitment`
 
 // insertRowExec inserts a row (ON CONFLICT DO NOTHING) on a *sql.DB or
-// *sql.Tx. The originated and replicated checks are in the callers.
-func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) error {
+// *sql.Tx and returns the rows inserted: 0 when the id was already stored.
+// The originated and replicated checks are in the callers.
+func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row Row) (int64, error) {
 	detail, err := json.Marshal(row.Detail)
 	if err != nil {
 		detail = []byte("{}")
@@ -222,7 +224,7 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 	if formID == "" {
 		formID = "1"
 	}
-	_, err = exec.ExecContext(ctx,
+	res, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`INSERT INTO %s (%s) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT (id) DO NOTHING`, s.table, pgAuditCols),
 		row.ID, row.OriginID, row.MonotonicSeq,
 		row.Timestamp.UTC(),
@@ -237,12 +239,16 @@ func (s *PostgresStore) insertRowExec(ctx context.Context, exec execContext, row
 		wv, row.Hash, row.PrevHash, formID,
 		row.DetailSalt, row.DetailCommitment,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // insertRow inserts one row outside a transaction.
 func (s *PostgresStore) insertRow(ctx context.Context, row Row) error {
-	return s.insertRowExec(ctx, s.db, row)
+	_, err := s.insertRowExec(ctx, s.db, row)
+	return err
 }
 
 // InsertOriginated inserts a row this node originated (origin_id == id).
@@ -328,7 +334,7 @@ func (s *PostgresStore) AllocateAndInsertOriginated(ctx context.Context, row Row
 
 	row.MonotonicSeq = nextSeq
 	sealed := Seal(prevHash, row)
-	if err := s.insertRowExec(ctx, tx, sealed); err != nil {
+	if _, err := s.insertRowExec(ctx, tx, sealed); err != nil {
 		return Row{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -346,10 +352,11 @@ func (s *PostgresStore) InsertReplicated(ctx context.Context, row Row) error {
 }
 
 // insertReplicatedTx is InsertReplicated on the caller's transaction;
-// IngestReplicated commits once for the batch.
-func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) error {
+// IngestReplicated commits once for the batch. It returns the rows inserted:
+// 0 when the id was already stored.
+func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext, row Row) (int64, error) {
 	if row.Hash == "" {
-		return fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
+		return 0, fmt.Errorf("fasten insertReplicatedTx: requires a sealed row (non-empty hash); row %q has no hash", row.ID)
 	}
 	return s.insertRowExec(ctx, exec, row)
 }
@@ -357,6 +364,22 @@ func (s *PostgresStore) insertReplicatedTx(ctx context.Context, exec execContext
 // Insert calls InsertOriginated. The drainer writes through it.
 func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 	return s.InsertOriginated(ctx, row)
+}
+
+// ChainTail returns the node's newest limit rows by monotonic_seq, oldest
+// first. See SQLiteStore.ChainTail.
+func (s *PostgresStore) ChainTail(ctx context.Context, sourceNodeID string, limit int) ([]Row, error) {
+	rows, err := s.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT %s FROM %s WHERE source_node_id = $1 ORDER BY monotonic_seq DESC LIMIT $2`, pgAuditCols, s.table),
+		sourceNodeID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanRowsPg(rows)
+	slices.Reverse(out)
+	return out, err
 }
 
 func (s *PostgresStore) Query(ctx context.Context, f Filter) ([]Row, error) {
@@ -639,14 +662,14 @@ func (s *PostgresStore) ListRedactionCandidates(
 	var skipped int64
 	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
 		`SELECT COUNT(*) FROM %s WHERE timestamp < $1 AND code IN (%s) `+
-			`AND canonical_form_id <> '2' AND detail <> 'null'`, s.table, in),
+			`AND canonical_form_id <> '2' AND hash <> '' AND detail <> 'null'`, s.table, in),
 		args...).Scan(&skipped); err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
 		`SELECT id, monotonic_seq FROM %s WHERE timestamp < $1 AND code IN (%s) `+
-			`AND canonical_form_id = '2' AND detail <> 'null' `+
+			`AND (canonical_form_id = '2' OR hash = '') AND detail <> 'null' `+
 			`ORDER BY monotonic_seq`, s.table, in),
 		args...)
 	if err != nil {
@@ -679,7 +702,7 @@ func (s *PostgresStore) RedactRows(ctx context.Context, ids []string) ([]string,
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 		`UPDATE %s SET detail = 'null', detail_salt = '' `+
-			`WHERE id IN (%s) AND canonical_form_id = '2'`,
+			`WHERE id IN (%s) AND (canonical_form_id = '2' OR hash = '')`,
 		s.table, strings.Join(placeholders, ",")), args...); err != nil {
 		return nil, err
 	}

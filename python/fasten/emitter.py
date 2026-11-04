@@ -56,6 +56,12 @@ def flush(timeout: float = 5.0) -> bool:
     return _default.flush(timeout=timeout)
 
 
+def close(timeout: float = 5.0) -> bool:
+    """Flush and stop the drainer within ``timeout``. Returns False if a row
+    was lost. Delegates to the default Engine."""
+    return _default.close(timeout=timeout)
+
+
 def queue_stats() -> Optional[dict[str, Any]]:
     """Drainer stats, or None in raise mode."""
     return _default.queue_stats()
@@ -158,6 +164,7 @@ def ingest_replicated(rows: "list[AuditRow]") -> Any:
     transaction, via the default Engine's store.
 
     Does not raise on a chain break. The returned IngestResult carries
-    ``rejected_from_seq``, the monotonic_seq to resend from.
+    ``rejected_from_seq``, the monotonic_seq to resend from. Ingest stops at
+    the first row from the engine's node_id and reports it as the break.
     """
     return _default.ingest_replicated(rows)

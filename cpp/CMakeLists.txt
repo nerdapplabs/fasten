@@ -76,6 +76,27 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME queue_row_columns_smoke COMMAND queue_row_columns_smoke)
 
+    add_executable(drainer_conformance_smoke tests/drainer_conformance_smoke.cpp)
+    target_link_libraries(drainer_conformance_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(drainer_conformance_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME drainer_conformance_smoke COMMAND drainer_conformance_smoke)
+
+    add_executable(row_fields_smoke tests/row_fields_smoke.cpp)
+    target_link_libraries(row_fields_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(row_fields_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME row_fields_smoke COMMAND row_fields_smoke)
+
+    add_executable(reader_scope_smoke tests/reader_scope_smoke.cpp)
+    target_link_libraries(reader_scope_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(reader_scope_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME reader_scope_smoke COMMAND reader_scope_smoke)
+
     add_executable(redact_substring_smoke tests/redact_substring_smoke.cpp)
     target_link_libraries(redact_substring_smoke PRIVATE fasten)
     if(UNIX AND NOT APPLE)
@@ -98,18 +119,25 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_conformance_smoke COMMAND redact_conformance_smoke)
 
-    # Check the target, not SQLite3_FOUND: older CMake 3.x can set the latter
-    # without creating SQLite3::SQLite3.
+    # sqlite_store_smoke needs sqlite3 at link time. FindSQLite3 names its
+    # imported target SQLite::SQLite3.
     find_package(SQLite3 QUIET)
-    if(TARGET SQLite3::SQLite3)
+    if(TARGET SQLite::SQLite3)
         add_executable(sqlite_store_smoke tests/sqlite_store_smoke.cpp)
-        target_link_libraries(sqlite_store_smoke PRIVATE fasten SQLite3::SQLite3)
+        target_link_libraries(sqlite_store_smoke PRIVATE fasten SQLite::SQLite3)
         if(UNIX AND NOT APPLE)
             target_link_libraries(sqlite_store_smoke PRIVATE pthread)
         endif()
         add_test(NAME sqlite_store_smoke COMMAND sqlite_store_smoke)
+
+        add_executable(pii_redaction_smoke tests/pii_redaction_smoke.cpp)
+        target_link_libraries(pii_redaction_smoke PRIVATE fasten SQLite::SQLite3)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(pii_redaction_smoke PRIVATE pthread)
+        endif()
+        add_test(NAME pii_redaction_smoke COMMAND pii_redaction_smoke)
     else()
-        message(STATUS "SQLite3::SQLite3 target unavailable, skipping sqlite_store_smoke")
+        message(STATUS "SQLite::SQLite3 target unavailable, skipping sqlite_store_smoke and pii_redaction_smoke")
     endif()
 
     find_package(PostgreSQL QUIET)

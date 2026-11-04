@@ -77,7 +77,7 @@ int main() {
         fasten::log::warn("connector_stopped", {{"reason", "timeout"}});
     }
 
-    // Scheduled job, request id "scheduler-<hex>"
+    // Scheduled job, request id "sched-<hex>"
     {
         auto scope = fasten::scheduler::job_run();
         fasten::log::info("health_check_job",
