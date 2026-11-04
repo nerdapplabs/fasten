@@ -463,3 +463,84 @@ test('flush counts a dead-lettered row as done', async () => {
     assert.equal(queueStats().dead_lettered_total, 1);
     assert.equal(queueStats().in_backoff_seconds, 0);
 });
+
+// Re-init (spec §10)
+
+test('close waits for the drainer a re-init is retiring', async () => {
+    const a = new SlowStore(20);
+    const b = new RecordingStore();
+    _initQueue(a);
+    for (let i = 0; i < 5; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    _initQueue(b);
+    assert.equal(await close(5000), true);
+    assert.equal(a.rows.length, 5);
+});
+
+test('flush waits for the drainer a re-init is retiring', async () => {
+    const a = new SlowStore(20);
+    _initQueue(a);
+    for (let i = 0; i < 3; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    _initQueue(new RecordingStore());
+    assert.equal(await flush(5000), true);
+    assert.equal(a.rows.length, 3);
+});
+
+test('re-init reports rows the old drainer could not store', async () => {
+    const store = { insert: () => new Promise(() => {}) };
+    let closed;
+    const captured = await captureSys(async () => {
+        _initQueue(store);
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        emit({ code: 'USER_CREATED', target: 'u-2' });
+        _initQueue(new RecordingStore());
+        const t0 = Date.now();
+        closed = await close(300);
+        assert.ok(Date.now() - t0 < 1500, 'close must keep to its timeout');
+    });
+    assert.equal(closed, false);
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    assert.equal(lost.length, 2);
+    const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
+    assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
+    assert.equal(inc[0].level, 'warn');
+    assert.equal(inc[0].unstored, 2);
+    assert.equal(typeof inc[0].flushed, 'boolean');
+});
+
+test('re-init that stores every row reports nothing', async () => {
+    const captured = await captureSys(async () => {
+        _initQueue(new SlowStore(5));
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        _initQueue(new RecordingStore());
+        assert.equal(await close(2000), true);
+    });
+    assert.ok(!captured.some(r => r.event === 'audit_drain_install_incomplete'));
+});
+
+// Idle drainer
+
+test('an idle drainer lets the process exit', async () => {
+    const { spawn } = await import('node:child_process');
+    const src = new URL('../src/index.js', import.meta.url).href;
+    const script = `
+        import { init, emit, register, flush } from ${JSON.stringify(src)};
+        register('user', { USER_CREATED: { domain: 'user', action: 'create' } });
+        const rows = [];
+        init({ serviceId: 's', nodeId: 'n', auditStore: { insert: (r) => { rows.push(r); } } });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        await flush(1000);
+        process.stderr.write('stored ' + rows.length + '\\n');
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let err = '';
+    child.stderr.on('data', (d) => { err += d; });
+    const t0 = Date.now();
+    const code = await new Promise((resolve) => {
+        const timer = setTimeout(() => { child.kill(); resolve('timeout'); }, 5000);
+        child.on('exit', (c) => { clearTimeout(timer); resolve(c); });
+    });
+    assert.equal(code, 0, `child did not exit on its own (${Date.now() - t0} ms)`);
+    assert.match(err, /stored 1/);
+});

@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: re-init drainer handoff and idle drainer (JS)
+
+- Re-`init()` keeps the old drainer visible to `flush()` and `close()` until
+  it has stopped. `close()` stops it within its own timeout and resolves
+  false if it lost rows, and re-init emits `audit_drain_install_incomplete`
+  when the old drainer's flush timed out or rows were not stored.
+- An idle drainer waits for the next row instead of polling, so it no longer
+  uses CPU or keeps the process from exiting.
+- The phase-1 stdout audit line carries `prev_hash: ""` and `hash: ""`.
+- `index.d.ts` adds `redactReplacement` and `queueDrainMaxAttempts` to
+  `InitOptions`, the dead-letter and `capacity_semantics` fields to
+  `QueueStats`, and `wire_version` to `Row`.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
