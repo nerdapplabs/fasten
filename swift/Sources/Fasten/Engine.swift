@@ -11,7 +11,11 @@ final class Engine: @unchecked Sendable {
     private(set) var transport: StdoutTransport = StdoutTransport()
     private(set) var redactor:  Redactor = Redactor()
     private var drainer:        QueueDrainer?
+    private var retiring:       [QueueDrainer] = []   // old drainers a re-init is stopping
     private var strategy:       FailureStrategy = .queue
+
+    private let installFlushTimeout: TimeInterval = 5.0
+    private let stopTimeout:         TimeInterval = 1.0
 
     private let lock        = Lock()
 
@@ -25,34 +29,51 @@ final class Engine: @unchecked Sendable {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
-        // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
-        if let old = drainer {
-            old.flush(timeout: 5.0)
-            old.close()
-            drainer = nil
+        // Spec §10: build the new drainer and swap it in under the lock, so
+        // no emit sees the slot empty, then flush and stop the old one.
+        var next: QueueDrainer? = nil
+        if strategy == .queue, let s = store {
+            next = QueueDrainer(
+                store:          s,
+                capacity:       queueCapacity,
+                retryInitialMs: 100,
+                retryMaxMs:     60_000,
+                retryJitter:    true,
+                maxAttempts:    50,
+                sysLog: { [weak self] level, event, fields in
+                    self?.log(level: level, event: event, fields: fields)
+                }
+            )
         }
-        lock.withLock {
+        let old: QueueDrainer? = lock.withLock {
             self.serviceID = serviceID
             self.nodeID    = nodeID
             self.tenantID  = tenantID
             self.store     = store
             self.strategy  = strategy
             self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement)
+            let old = drainer
+            drainer = next
+            if let old { retiring.append(old) }
+            return old
         }
         log(level: "error", event: "audit_chain_unavailable", fields: [
             "store":  store.map { "\(type(of: $0))" } ?? "none",
             "reason": "the Swift SDK does not seal rows (spec 2.1); rows are written unsealed",
         ])
-        if strategy == .queue, let s = store {
-            drainer = QueueDrainer(
-                store:          s,
-                capacity:       queueCapacity,
-                retryInitialMs: 100,
-                retryMaxMs:     60_000,
-                retryJitter:    true,
-                maxAttempts:    50
-            )
+        if let old { retire(old) }
+    }
+
+    // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
+    private func retire(_ old: QueueDrainer) {
+        let flushed = old.flush(timeout: installFlushTimeout)
+        old.close(timeout: stopTimeout)
+        let unstored = old.unstoredTotal
+        if !flushed || unstored > 0 {
+            log(level: "warn", event: "audit_drain_install_incomplete",
+                fields: ["flushed": flushed, "unstored": unstored])
         }
+        lock.withLock { retiring.removeAll { $0 === old } }
     }
 
     func emit(
@@ -73,14 +94,32 @@ final class Engine: @unchecked Sendable {
                           actorKind: actorKind, detail: detail, method: method,
                           severity: severity)
 
-        if let d = drainer {
+        let (d, strategy, store) = lock.withLock { (drainer, self.strategy, self.store) }
+        if let d {
             transport.emit(row)
-            d.enqueue(row)
+            // A stopped drainer refuses the row; store it here instead.
+            if !d.enqueue(row) { storeInline(row, in: d.store, refused: true) }
         } else if strategy == .raise, let s = store {
             try s.insert(row)
             transport.emit(row)
+        } else if let s = store {
+            // Queue mode after close().
+            transport.emit(row)
+            storeInline(row, in: s, refused: false)
         } else {
             transport.emit(row)
+        }
+    }
+
+    private func storeInline(_ row: AuditRow, in store: any AuditStore, refused: Bool) {
+        do {
+            try store.insert(row)
+            if refused {
+                log(level: "info", event: "audit_drain_stored_inline", fields: ["row_id": row.id])
+            }
+        } catch {
+            log(level: "error", event: "audit_sync_fallback_failed",
+                fields: ["error": describeError(error), "row_id": row.id])
         }
     }
 
@@ -179,15 +218,31 @@ final class Engine: @unchecked Sendable {
                       redact: redactor.redact)
     }
 
+    /// Also waits for old drainers a concurrent re-init is still flushing.
     func flush(timeout: TimeInterval) -> Bool {
-        drainer?.flush(timeout: timeout) ?? true
+        let all = lock.withLock { retiring + (drainer.map { [$0] } ?? []) }
+        let deadline = Date().addingTimeInterval(timeout)
+        var ok = true
+        for d in all {
+            ok = d.flush(timeout: max(0, deadline.timeIntervalSinceNow)) && ok
+        }
+        return ok
+    }
+
+    /// Stops the drainer (spec §10). Returns false if a row was not stored.
+    /// Later emits in queue mode write to the store inline.
+    func close(timeout: TimeInterval) -> Bool {
+        let (d, old) = lock.withLock { () -> (QueueDrainer?, [QueueDrainer]) in
+            let d = drainer
+            drainer = nil
+            return (d, retiring)
+        }
+        for o in old { o.close(timeout: timeout) }
+        return d?.close(timeout: timeout) ?? true
     }
 
     func reset() {
-        if let d = drainer {
-            d.close()
-            drainer = nil
-        }
+        _ = close(timeout: stopTimeout)
         CodeRegistry.shared.clear()
         lock.withLock {
             serviceID = ""; nodeID = ""; tenantID = nil
@@ -201,8 +256,8 @@ final class Engine: @unchecked Sendable {
 let _defaultEngine = Engine()
 
 /// Error thrown by fasten itself (unknown code, bad table name, SQLite errors).
-/// Its localizedDescription is the message, which the drainer keeps as
-/// last_error.
+/// Its localizedDescription is the message; the drainer's last_error is
+/// "FastenError: <message>".
 public struct FastenError: Error, LocalizedError, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }

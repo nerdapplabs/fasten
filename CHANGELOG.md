@@ -6,6 +6,26 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: drainer stop, re-init and sys events (Swift)
+
+- A row the drainer refuses because it has stopped (a re-init or `close()`
+  raced the emit) is stored inline, with `audit_drain_abandoned` then
+  `audit_drain_stored_inline`. Before, it was dropped without a log line.
+- `configure()` on a running engine swaps in the new drainer under the engine
+  lock before stopping the old one, so an emit during re-init always reaches a
+  drainer. It logs `audit_drain_install_incomplete` when the old drainer's
+  rows were not all stored.
+- New `Fasten.close(timeout:)` stops the drainer per spec §10. Queued rows get
+  one attempt each, an insert in progress is waited for, and rows not stored
+  are logged as `audit_drain_lost_at_stop` and make `close()` return false.
+- The drainer now logs the spec §4 events: `audit_queue_high_water`,
+  `audit_queue_near_full`, `audit_drain_failed`, `audit_drain_degraded`,
+  `audit_drain_recovered`, `audit_drain_dead_letter` and
+  `audit_drain_abandoned`, through the redacted log path.
+- `flush()` counts dead-lettered and lost rows as settled (spec §6), so it no
+  longer times out on a row that was dead-lettered while pending.
+- `last_error` in the drainer stats is `"<ErrorType>: <message>"`.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
