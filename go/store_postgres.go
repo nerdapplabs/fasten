@@ -370,9 +370,8 @@ func (s *PostgresStore) Insert(ctx context.Context, row Row) error {
 // by node id.
 func (s *PostgresStore) ChainTips(ctx context.Context) ([]Row, error) {
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE hash <> '' AND (source_node_id, monotonic_seq) IN `+
-			`(SELECT source_node_id, MAX(monotonic_seq) FROM %s WHERE hash <> '' GROUP BY source_node_id) `+
-			`ORDER BY source_node_id, id`, pgAuditCols, s.table, s.table))
+		`SELECT %s FROM %s JOIN (%s) AS tip ON source_node_id = tip.node AND monotonic_seq = tip.seq `+
+			`WHERE hash <> '' ORDER BY source_node_id, id`, pgAuditCols, s.table, chainTipsSQL(s.table)))
 	if err != nil {
 		return nil, err
 	}

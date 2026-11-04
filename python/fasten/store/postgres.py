@@ -797,14 +797,15 @@ class PostgresStore:
 
     def chain_tips(self) -> list[AuditRow]:
         """Each node's sealed row with the highest monotonic_seq, by node id."""
+        from .repo import chain_tips_sql
 
         def _run(conn: Any) -> list[AuditRow]:
             with conn.cursor() as cur:
+                cols = ",".join(f"t.{c}" for c in _COLUMNS.split(","))
                 cur.execute(
-                    f"SELECT {_COLUMNS} FROM {self._table} WHERE hash <> '' AND "
-                    "(source_node_id, monotonic_seq) IN (SELECT source_node_id, "
-                    f"MAX(monotonic_seq) FROM {self._table} WHERE hash <> '' "
-                    "GROUP BY source_node_id) ORDER BY source_node_id, id"
+                    f"SELECT {cols} FROM {self._table} AS t JOIN ({chain_tips_sql(self._table)}) "
+                    "AS tip ON t.source_node_id = tip.node AND t.monotonic_seq = tip.seq "
+                    "WHERE t.hash <> '' ORDER BY t.source_node_id, t.id"
                 )
                 return [self._row(r) for r in cur.fetchall()]
 

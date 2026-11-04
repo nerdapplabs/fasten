@@ -554,13 +554,24 @@ func (s *SQLiteStore) Count(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// chainTipsSQL selects each node's highest sealed seq, as (node, seq). It
+// walks the (source_node_id, monotonic_seq) index: the next node id after
+// the last, then that node's sealed row with the highest seq. Same in
+// SQLite and Postgres.
+func chainTipsSQL(table string) string {
+	return fmt.Sprintf(`WITH RECURSIVE nodes(node) AS (`+
+		`SELECT MIN(source_node_id) FROM %[1]s UNION ALL `+
+		`SELECT (SELECT MIN(source_node_id) FROM %[1]s WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL) `+
+		`SELECT node, (SELECT monotonic_seq FROM %[1]s WHERE source_node_id = node AND hash <> '' `+
+		`ORDER BY monotonic_seq DESC LIMIT 1) AS seq FROM nodes WHERE node IS NOT NULL`, table)
+}
+
 // ChainTips returns each node's sealed row with the highest monotonic_seq,
 // by node id.
 func (s *SQLiteStore) ChainTips(ctx context.Context) ([]Row, error) {
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE hash != '' AND (source_node_id, monotonic_seq) IN `+
-			`(SELECT source_node_id, MAX(monotonic_seq) FROM %s WHERE hash != '' GROUP BY source_node_id) `+
-			`ORDER BY source_node_id, id`, auditCols, s.table, s.table))
+		`SELECT %s FROM %s JOIN (%s) AS tip ON source_node_id = tip.node AND monotonic_seq = tip.seq `+
+			`WHERE hash <> '' ORDER BY source_node_id, id`, auditCols, s.table, chainTipsSQL(s.table)))
 	if err != nil {
 		return nil, err
 	}
