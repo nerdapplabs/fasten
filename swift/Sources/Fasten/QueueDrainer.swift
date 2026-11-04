@@ -46,9 +46,10 @@ final class QueueDrainer: @unchecked Sendable {
     private var degradedFired:        Bool   = false
     private var highWaterFired:       Bool   = false
     private var nearFullFired:        Bool   = false
+    // Rows close() reported lost while their insert was still running.
+    private var reportedLost:         Set<String> = []
 
     private let cond = NSCondition()
-    private var drainThread: Thread?
 
     init(
         store:          any AuditStore,
@@ -66,9 +67,9 @@ final class QueueDrainer: @unchecked Sendable {
         self.retryJitter    = retryJitter
         self.maxAttempts    = maxAttempts
         self.sysLog         = sysLog
-        let t = Thread { [unowned self] in self._run() }
-        drainThread = t
-        t.start()
+        // The thread keeps the drainer alive until _run returns, so an insert
+        // still running after a close timeout finds it there.
+        Thread { self._run() }.start()
     }
 
     /// Queues the row. Returns false, after logging audit_drain_abandoned,
@@ -127,10 +128,20 @@ final class QueueDrainer: @unchecked Sendable {
         }
     }
 
+    /// Sets the stop signal without waiting. The thread still gives each
+    /// queued row one attempt, then exits.
+    func requestStop() {
+        cond.lock()
+        stopped = true
+        cond.broadcast()
+        cond.unlock()
+    }
+
     /// Stops the drainer (spec §10): queued rows get one insert attempt each,
     /// and an insert in progress is waited for, up to `timeout`. Rows not
     /// stored are reported with audit_drain_lost_at_stop and close returns
-    /// false.
+    /// false. If an insert left running at the deadline later stores its
+    /// row, audit_drain_recovered_at_stop follows.
     @discardableResult
     func close(timeout: TimeInterval = 5.0) -> Bool {
         cond.lock()
@@ -143,14 +154,18 @@ final class QueueDrainer: @unchecked Sendable {
         }
         var lost: [AuditRow] = []
         if !finished {
-            if let c = current { lost.append(c) }
+            if let c = current {
+                lost.append(c)
+                reportedLost.insert(c.id)
+            }
             current = nil
             lost += q
             q.removeAll()
             lostTotal += lost.count
             _rearmLocked()
+            cond.broadcast()
         }
-        let ok = lostTotal == lostBefore
+        let ok = lostTotal == lostBefore && (finished || inFlight == 0)
         cond.unlock()
         for row in lost {
             sysLog("error", "audit_drain_lost_at_stop", ["error_type": "TimeoutError", "row_id": row.id])
@@ -158,7 +173,7 @@ final class QueueDrainer: @unchecked Sendable {
         return ok
     }
 
-    /// Rows dead-lettered or lost at stop.
+    /// Rows dead-lettered or lost at stop, over the drainer's lifetime.
     var unstoredTotal: Int {
         cond.lock()
         defer { cond.unlock() }
@@ -199,8 +214,6 @@ final class QueueDrainer: @unchecked Sendable {
         return s
     }
 
-    deinit { close() }
-
     private var _settledLocked: Int { drainedTotal + deadLetteredTotal + lostTotal }
 
     // Both threshold flags re-arm once depth is below 50 %.
@@ -231,13 +244,6 @@ final class QueueDrainer: @unchecked Sendable {
             cond.unlock()
 
             _drainOne(row)
-
-            cond.lock()
-            inFlight -= 1
-            if current?.id == row.id { current = nil }
-            _rearmLocked()
-            cond.broadcast()
-            cond.unlock()
         }
     }
 
@@ -266,9 +272,24 @@ final class QueueDrainer: @unchecked Sendable {
         }
     }
 
+    // Settles the row taken by _run, after its event is logged, so a flush()
+    // that returns has seen the event and depth 0. A row close() already
+    // counted as lost stays counted there; returns true for such a row.
+    @discardableResult
+    private func _settle(_ row: AuditRow, _ counter: ReferenceWritableKeyPath<QueueDrainer, Int>) -> Bool {
+        cond.lock()
+        inFlight -= 1
+        if current?.id == row.id { current = nil }
+        let reported = reportedLost.remove(row.id) != nil
+        if !reported { self[keyPath: counter] += 1 }
+        _rearmLocked()
+        cond.broadcast()
+        cond.unlock()
+        return reported
+    }
+
     private func _onSuccess(_ row: AuditRow) {
         cond.lock()
-        if current?.id == row.id { current = nil }
         let wasRetrying = retryCount > 0
         let burstStart  = failureBurstStart
         retryCount      = 0
@@ -276,12 +297,13 @@ final class QueueDrainer: @unchecked Sendable {
         failureBurstStart = nil
         lastError       = nil
         degradedFired   = false
-        drainedTotal   += 1
-        cond.broadcast()
         cond.unlock()
         if wasRetrying, let s = burstStart {
             sysLog("info", "audit_drain_recovered",
                    ["recovery_after_seconds": round3(Date().timeIntervalSince(s))])
+        }
+        if _settle(row, \.drainedTotal) {
+            sysLog("info", "audit_drain_recovered_at_stop", ["row_ids": [row.id]])
         }
     }
 
@@ -311,33 +333,29 @@ final class QueueDrainer: @unchecked Sendable {
 
     private func _onDeadLetter(_ row: AuditRow, attempt: Int, error: String) {
         cond.lock()
-        if current?.id == row.id { current = nil }
-        deadLetteredTotal += 1
+        if current?.id == row.id { current = nil }   // close() must not report it lost too
         retryCount         = 0
         inBackoffUntil     = .distantPast
         lastError          = error
         if dlq.count >= 10 { dlq.removeFirst() }
         dlq.append(row)
-        cond.broadcast()
         cond.unlock()
         sysLog("error", "audit_drain_dead_letter",
                ["row_id": row.id, "attempt_count": attempt, "last_error": error])
+        _settle(row, \.deadLetteredTotal)
     }
 
     private func _onLostAtStop(_ row: AuditRow, _ error: Error) {
         cond.lock()
         // close() may have reported it already, on timeout.
-        let report = current?.id == row.id
-        if report {
-            current = nil
-            lostTotal += 1
-            cond.broadcast()
-        }
+        let report = !reportedLost.contains(row.id)
+        if current?.id == row.id { current = nil }
         cond.unlock()
         if report {
             sysLog("error", "audit_drain_lost_at_stop",
                    ["error_type": "\(type(of: error))", "row_id": row.id])
         }
+        _settle(row, \.lostTotal)
     }
 
     // Spec §8, with n = retry_count.

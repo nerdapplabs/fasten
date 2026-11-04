@@ -14,8 +14,11 @@ final class Engine: @unchecked Sendable {
     private var retiring:       [QueueDrainer] = []   // old drainers a re-init is stopping
     private var strategy:       FailureStrategy = .queue
 
-    private let installFlushTimeout: TimeInterval = 5.0
-    private let stopTimeout:         TimeInterval = 1.0
+    // Internal so tests can shorten them.
+    var installFlushTimeout: TimeInterval = 5.0
+    var stopTimeout:         TimeInterval = 1.0
+    var retryInitialMs:      Double       = 100
+    var maxAttempts:         Int          = 50
 
     private let lock        = Lock()
 
@@ -36,10 +39,10 @@ final class Engine: @unchecked Sendable {
             next = QueueDrainer(
                 store:          s,
                 capacity:       queueCapacity,
-                retryInitialMs: 100,
+                retryInitialMs: retryInitialMs,
                 retryMaxMs:     60_000,
                 retryJitter:    true,
-                maxAttempts:    50,
+                maxAttempts:    maxAttempts,
                 sysLog: { [weak self] level, event, fields in
                     self?.log(level: level, event: event, fields: fields)
                 }
@@ -66,9 +69,10 @@ final class Engine: @unchecked Sendable {
 
     // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
     private func retire(_ old: QueueDrainer) {
+        let unstoredBefore = old.unstoredTotal
         let flushed = old.flush(timeout: installFlushTimeout)
         old.close(timeout: stopTimeout)
-        let unstored = old.unstoredTotal
+        let unstored = old.unstoredTotal - unstoredBefore
         if !flushed || unstored > 0 {
             log(level: "warn", event: "audit_drain_install_incomplete",
                 fields: ["flushed": flushed, "unstored": unstored])
@@ -131,6 +135,8 @@ final class Engine: @unchecked Sendable {
         severity: Severity?
     ) -> AuditRow {
         let rowID = _mintID()
+        let (serviceID, nodeID, tenantID, redactor) =
+            lock.withLock { (self.serviceID, self.nodeID, self.tenantID, self.redactor) }
         return AuditRow(
             wireVersion:  "1",
             id:           rowID,
@@ -210,6 +216,7 @@ final class Engine: @unchecked Sendable {
 
     func log(level: String, event: String, fields: [String: Any]) {
         let requestID = _currentRequestID()
+        let (serviceID, nodeID, redactor) = lock.withLock { (self.serviceID, self.nodeID, self.redactor) }
         transport.log(level: level, event: event,
                       serviceID: serviceID.isEmpty ? nil : serviceID,
                       nodeID: nodeID.isEmpty ? nil : nodeID,
@@ -229,16 +236,30 @@ final class Engine: @unchecked Sendable {
         return ok
     }
 
-    /// Stops the drainer (spec §10). Returns false if a row was not stored.
+    /// Stops the drainer and any old ones a re-init is retiring (spec §10),
+    /// all within `timeout`. Returns false if any of them lost a row.
     /// Later emits in queue mode write to the store inline.
     func close(timeout: TimeInterval) -> Bool {
-        let (d, old) = lock.withLock { () -> (QueueDrainer?, [QueueDrainer]) in
+        let all = lock.withLock { () -> [QueueDrainer] in
             let d = drainer
             drainer = nil
-            return (d, retiring)
+            return retiring + (d.map { [$0] } ?? [])
         }
-        for o in old { o.close(timeout: timeout) }
-        return d?.close(timeout: timeout) ?? true
+        // Stop them all first so they drain in parallel.
+        for d in all { d.requestStop() }
+        let deadline = Date().addingTimeInterval(timeout)
+        var ok = true
+        for d in all {
+            ok = d.close(timeout: max(0, deadline.timeIntervalSinceNow)) && ok
+        }
+        return ok
+    }
+
+    // Without this, an engine dropped before close() would leave its drain
+    // thread waiting forever. It does not wait for the rows.
+    deinit {
+        drainer?.requestStop()
+        for d in retiring { d.requestStop() }
     }
 
     func reset() {

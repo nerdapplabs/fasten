@@ -14,17 +14,28 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `configure()` on a running engine swaps in the new drainer under the engine
   lock before stopping the old one, so an emit during re-init always reaches a
   drainer. It logs `audit_drain_install_incomplete` when the old drainer's
-  rows were not all stored.
+  rows were not stored, counting only rows from that re-init, not dead
+  letters from earlier.
 - New `Fasten.close(timeout:)` stops the drainer per spec §10. Queued rows get
   one attempt each, an insert in progress is waited for, and rows not stored
   are logged as `audit_drain_lost_at_stop` and make `close()` return false.
+  It also stops old drainers a re-init is still retiring, all within the one
+  timeout, and returns false if any of them lost a row.
+- An insert still running at the close deadline is reported lost but keeps
+  running. If it then stores its row, `audit_drain_recovered_at_stop` with
+  `row_ids` follows, as in Python. A lost report can be a false alarm; a
+  loss is never missed. The drain thread keeps the drainer alive until that
+  insert returns.
 - The drainer now logs the spec §4 events: `audit_queue_high_water`,
   `audit_queue_near_full`, `audit_drain_failed`, `audit_drain_degraded`,
   `audit_drain_recovered`, `audit_drain_dead_letter` and
   `audit_drain_abandoned`, through the redacted log path.
 - `flush()` counts dead-lettered and lost rows as settled (spec §6), so it no
-  longer times out on a row that was dead-lettered while pending.
+  longer times out on a row that was dead-lettered while pending. It returns
+  only after the row's event is logged and the depth is updated.
 - `last_error` in the drainer stats is `"<ErrorType>: <message>"`.
+- Rows and sys log lines read the service id, node id and redactor under
+  the engine lock, so a concurrent `configure()` can't tear them.
 
 ### Changed: Go SDK requires Go 1.26
 
