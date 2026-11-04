@@ -76,6 +76,12 @@ extern "C" {
         struct FastenStore* store, uint64_t capacity,
         uint64_t retry_initial_ms, uint64_t retry_max_ms,
         int retry_jitter, uint32_t max_attempts, char** out_err);
+    typedef void (*FastenSysLogFn)(const char* event_json, void* userdata);
+    int32_t fasten_drainer_install_with_sys_log(
+        struct FastenStore* store, uint64_t capacity,
+        uint64_t retry_initial_ms, uint64_t retry_max_ms,
+        int retry_jitter, uint32_t max_attempts,
+        FastenSysLogFn sys_log, void* userdata, char** out_err);
     int32_t fasten_drainer_enqueue(
         struct FastenStore* store, const char* row_json, char** out_err);
     int32_t fasten_drainer_flush(
@@ -204,12 +210,47 @@ inline std::string env_or(const char* key, const char* fallback = "") {
 
 inline std::string sev_str(Sev s) { return fasten::to_string(s); }
 
-// JSON-escape a string value (including control chars below 0x20).
+// Length of the valid UTF-8 sequence starting at s[i], or 0 if the bytes
+// there are not one (overlong forms and surrogates included).
+inline size_t utf8_seq_len_(const std::string& s, size_t i) {
+    const auto b = [&s](size_t k) { return static_cast<unsigned char>(s[k]); };
+    const unsigned char c = b(i);
+    size_t n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if      (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c == 0xE0)              { n = 3; lo = 0xA0; }
+    else if (c == 0xED)              { n = 3; hi = 0x9F; }
+    else if (c >= 0xE1 && c <= 0xEF) n = 3;
+    else if (c == 0xF0)              { n = 4; lo = 0x90; }
+    else if (c == 0xF4)              { n = 4; hi = 0x8F; }
+    else if (c >= 0xF1 && c <= 0xF3) n = 4;
+    else return 0;
+    if (i + n > s.size()) return 0;
+    if (b(i + 1) < lo || b(i + 1) > hi) return 0;
+    for (size_t k = 2; k < n; ++k) {
+        if (b(i + k) < 0x80 || b(i + k) > 0xBF) return 0;
+    }
+    return n;
+}
+
+// JSON-escape a string value (including control chars below 0x20). Bytes
+// that are not valid UTF-8 become U+FFFD, so the result is always valid JSON.
 inline std::string json_str(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
     out += '"';
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c >= 0x80) {
+            const size_t n = utf8_seq_len_(s, i);
+            if (n == 0) {
+                out += "\xEF\xBF\xBD";
+            } else {
+                out.append(s, i, n);
+                i += n - 1;
+            }
+            continue;
+        }
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -239,15 +280,18 @@ inline std::string json_str(const std::string& s) {
 // JSON integer (no leading zero, fits int64). Anything else stays a string,
 // so the line is always valid JSON, and the redactor's value-shape checks,
 // which only look at strings, see every other value.
+inline bool is_redacted_seq_number_(const std::string& key, const std::string& val,
+                                    const std::string& code) {
+    return key == "redacted_seq" && code == kAuditRowRedacted &&
+        !val.empty() && val.size() <= 18 &&
+        (val == "0" || val[0] != '0') &&
+        std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
 inline std::string field_json_value_(const std::string& key, const std::string& val,
                                      const std::string& code = "") {
     if (key == "_pii_in_detail") return val == "true" ? "true" : "false";
-    if (key == "redacted_seq" && code == kAuditRowRedacted &&
-        !val.empty() && val.size() <= 18 &&
-        (val == "0" || val[0] != '0') &&
-        std::all_of(val.begin(), val.end(), [](char c) { return c >= '0' && c <= '9'; })) {
-        return val;
-    }
+    if (is_redacted_seq_number_(key, val, code)) return val;
     return json_str(val);
 }
 
@@ -428,6 +472,67 @@ inline Fields parse_flat_json_fields(const std::string& json) {
         if (!key.empty()) out[key] = val;
     }
     return out;
+}
+
+// Splits a JSON object into its keys and the JSON text of each value, so
+// numbers, booleans, null and arrays keep their type.
+inline std::vector<std::pair<std::string, std::string>>
+split_json_object_(const std::string& json) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const auto ws = [&json](size_t& i) {
+        while (i < json.size() && (json[i] == ' ' || json[i] == '\n' ||
+                                   json[i] == '\r' || json[i] == '\t')) ++i;
+    };
+    // Index just past the string starting at json[i] (its opening quote).
+    const auto skip_str = [&json](size_t i) {
+        for (++i; i < json.size() && json[i] != '"'; ++i) {
+            if (json[i] == '\\') ++i;
+        }
+        return i + 1;
+    };
+    size_t i = json.find('{');
+    if (i == std::string::npos) return out;
+    ++i;
+    for (;;) {
+        ws(i);
+        if (i >= json.size() || json[i] != '"') break;
+        ++i;
+        std::string key = read_json_str(json, i);
+        ++i;
+        ws(i);
+        if (i >= json.size() || json[i] != ':') break;
+        ++i;
+        ws(i);
+        const size_t start = i;
+        if (i < json.size() && json[i] == '"') {
+            i = skip_str(i);
+        } else if (i < json.size() && (json[i] == '[' || json[i] == '{')) {
+            int depth = 0;
+            while (i < json.size()) {
+                const char c = json[i];
+                if (c == '"') { i = skip_str(i); continue; }
+                ++i;
+                if (c == '[' || c == '{') ++depth;
+                else if ((c == ']' || c == '}') && --depth == 0) break;
+            }
+        } else {
+            while (i < json.size() && json[i] != ',' && json[i] != '}' &&
+                   json[i] != ' ' && json[i] != '\n') ++i;
+        }
+        if (i > json.size()) break;
+        out.emplace_back(std::move(key), json.substr(start, i - start));
+        ws(i);
+        if (i < json.size() && json[i] == ',') { ++i; continue; }
+        break;
+    }
+    return out;
+}
+
+// The text of a JSON value: a string decoded, anything else as written.
+inline std::string json_value_text_(const std::string& v) {
+    if (v.empty() || v[0] != '"') return v;
+    size_t i = 1;
+    return read_json_str(v, i);
 }
 
 // Serialize a Meta to JSON for fasten_register_codes.
@@ -730,6 +835,19 @@ struct SinkRef {
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields);
+// A sys line field: its key, its value as JSON, and its value as text for
+// the sys ring.
+struct SysField {
+    std::string key;
+    std::string json;
+    std::string text;
+};
+inline void drainer_sys_log_fields(const std::string& level,
+                                   const std::string& event,
+                                   const std::vector<SysField>& fields);
+inline Fields redact(const Fields& f, const std::string& code = "");
+inline std::vector<SysField> redact_json_fields_(
+    const std::vector<std::pair<std::string, std::string>>& fields);
 
 // Queue mode: rows go to the libfasten_core drainer, whose background
 // thread calls the sink with retry and backoff.
@@ -760,13 +878,15 @@ class CFastenDrainer {
         }
         sink_ref_ = ref;
         int jitter = retry_jitter ? 1 : 0;
-        int32_t rc = fasten_drainer_install(
+        int32_t rc = fasten_drainer_install_with_sys_log(
             store_,
             static_cast<uint64_t>(capacity),
             static_cast<uint64_t>(retry_initial.count()),
             static_cast<uint64_t>(retry_max.count()),
             jitter,
             static_cast<uint32_t>(max_attempts),
+            &CFastenDrainer::sys_log_,
+            this,
             &err
         );
         if (rc != 0) {
@@ -830,13 +950,21 @@ class CFastenDrainer {
         return s;
     }
 
+    // The core reads a timeout of 0 as none, so at least 1 ms is passed.
+    // Once shutdown() has started, waits for it to finish closing.
     bool flush(std::chrono::milliseconds timeout) {
-        Use use(*this);
-        if (!use.ok) return true;
-        int drained = 0;
-        fasten_drainer_flush(store_,
-            static_cast<uint64_t>(timeout.count()), &drained, nullptr);
-        return drained != 0;
+        if (timeout.count() < 1) timeout = std::chrono::milliseconds(1);
+        {
+            Use use(*this);
+            if (use.ok) {
+                int drained = 0;
+                fasten_drainer_flush(store_,
+                    static_cast<uint64_t>(timeout.count()), &drained, nullptr);
+                return drained != 0;
+            }
+        }
+        std::unique_lock<std::mutex> lk(mu_);
+        return closed_cv_.wait_for(lk, timeout, [this] { return closed_; });
     }
 
     void shutdown(std::chrono::milliseconds /*timeout*/) {
@@ -848,12 +976,46 @@ class CFastenDrainer {
         }
         delete sink_ref_; sink_ref_ = nullptr;
         fasten_store_close(store_); store_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            closed_ = true;
+        }
+        closed_cv_.notify_all();
     }
+
+    // Rows dead-lettered or lost at stop so far.
+    std::size_t unstored() const { return unstored_.load(); }
+
+    // True once shutdown() has started.
+    bool stopping() const { return stopped_.load(); }
 
   private:
     // fasten_drainer_enqueue's FASTEN_ERR_DRAINER_STOPPED: the drainer is
     // stopping, the row was not queued, and the core has reported it.
     static constexpr int32_t kErrDrainerStopped = 10;
+
+    // The core's drainer events join the SDK's sys stream (stderr and the
+    // sys ring), redacted like other sys lines and keeping their JSON types.
+    // Runs on the drain thread or a thread in the constructor (install),
+    // put() or shutdown(), with no drainer lock held.
+    static void sys_log_(const char* event_json, void* userdata) {
+        if (!event_json) return;
+        try {
+            std::string level, event;
+            std::vector<std::pair<std::string, std::string>> kv;
+            for (auto& e : split_json_object_(event_json)) {
+                if (e.first == "level") level = json_value_text_(e.second);
+                else if (e.first == "event") event = json_value_text_(e.second);
+                else if (e.first != "shape" && e.first != "timestamp" &&
+                         e.first != "request_id" && e.first != "service_id" &&
+                         e.first != "tenant_id") kv.push_back(std::move(e));
+            }
+            if (event == "audit_drain_dead_letter" || event == "audit_drain_lost_at_stop") {
+                ++static_cast<CFastenDrainer*>(userdata)->unstored_;
+            }
+            drainer_sys_log_fields(level, event, redact_json_fields_(kv));
+        } catch (...) {}
+    }
 
     static int32_t bridge_(const char* row_json, void* userdata) {
         auto* ref = static_cast<SinkRef*>(userdata);
@@ -867,6 +1029,7 @@ class CFastenDrainer {
     struct FastenStore*  store_    = nullptr;
     SinkRef*             sink_ref_ = nullptr;
     std::atomic<bool>    stopped_{false};
+    std::atomic<std::size_t> unstored_{0};
 
     // Counts a call in busy_ for its lifetime; ok is false once stopped_ is
     // set. Incrementing before reading stopped_ (both seq_cst) means
@@ -886,6 +1049,9 @@ class CFastenDrainer {
     mutable std::atomic<int>        busy_{0};
     mutable std::mutex              mu_;
     mutable std::condition_variable idle_;
+    // Set under mu_ when shutdown() has finished.
+    bool                            closed_ = false;
+    std::condition_variable         closed_cv_;
 };
 
 // All mutable state. globals() returns one instance per process, however
@@ -901,6 +1067,8 @@ struct Globals {
     std::string service_id;
     std::string node_id;
     std::string tenant_id;
+    // Declared before drainer: a drainer stopping at exit logs through it.
+    RedactConfig redact_cfg;
 
     RingBuffer syslog_ring;
     RingBuffer api_ring;
@@ -916,9 +1084,10 @@ struct Globals {
 
     std::string                     failure_strategy{"queue"};  // "queue" or "raise"
     std::shared_ptr<CFastenDrainer> drainer;  // null in raise mode or with no sink
+    // Drainers a re-init replaced and is still flushing, so flush() waits
+    // for their rows too. Guarded by drainer_mu.
+    std::vector<std::shared_ptr<CFastenDrainer>> retiring_drainers;
     std::mutex                      drainer_mu;
-
-    RedactConfig redact_cfg;
 
     struct Identity {
         std::string service_id;
@@ -1018,11 +1187,44 @@ inline void push_sys_row(Fields row) {
     g.syslog_ring.push(std::move(row));
 }
 
-// Redact detail fields through libfasten_core.
-inline Fields redact(const Fields& f) {
-    if (f.empty()) return f;
-    const RedactConfig cfg = globals().redaction();
-    const std::string in_json = fields_to_json(f);
+template <typename KeyValues>
+inline void write_sys_line(std::ostream& out,
+                           const std::string& level,
+                           const std::string& event,
+                           const KeyValues& fields);
+
+inline void log_redact_failed_(int32_t rc) {
+    // The core's error codes; the message is not logged, it may quote input.
+    const std::string error_type = rc == 3 ? "bad_json"
+                                 : rc == 4 ? "invalid_input"
+                                 : "error_" + std::to_string(rc);
+    write_sys_line(std::cerr, "error", "redact_failed",
+        std::vector<std::pair<std::string, std::string>>{{"error_type", error_type}});
+}
+
+inline std::string redact_replacement_(const RedactConfig& cfg) {
+    return cfg.replacement.empty() ? std::string(fasten::kRedactReplacement)
+                                   : cfg.replacement;
+}
+
+// Used when the core returns an error: every value becomes the replacement
+// and the keys are kept, so nothing passes through unredacted. The
+// redacted_seq of an AUDIT_ROW_REDACTED row (`code`) is a number and kept.
+inline Fields redact_all_values_(const Fields& f, const std::string& replacement,
+                                 int32_t rc, const std::string& code = "") {
+    Fields out;
+    for (const auto& kv : f) {
+        out[kv.first] = is_redacted_seq_number_(kv.first, kv.second, code)
+            ? kv.second : replacement;
+    }
+    log_redact_failed_(rc);
+    return out;
+}
+
+// Runs a JSON object through libfasten_core's redactor. Returns the core's
+// error code; `out` is set only on success.
+inline int32_t core_redact_json_(const std::string& in_json, const RedactConfig& cfg,
+                                 std::string& out) {
     char* out_json = nullptr;
     char* out_err  = nullptr;
     int32_t rc;
@@ -1045,13 +1247,56 @@ inline Fields redact(const Fields& f) {
                                 &out_json, &out_err);
     }
     if (out_err) { fasten_store_free_str(out_err); }
-    if (rc != 0 || !out_json) {
+    if (rc == 0 && !out_json) rc = 99;
+    if (rc != 0) {
         if (out_json) fasten_store_free_str(out_json);
-        return f; // on error, return original (safe fallback)
+        return rc;
     }
-    std::string result(out_json);
+    out = out_json;
     fasten_store_free_str(out_json);
+    return 0;
+}
+
+// Redact detail fields through libfasten_core. `code` is the row's code.
+inline Fields redact(const Fields& f, const std::string& code) {
+    if (f.empty()) return f;
+    const RedactConfig cfg = globals().redaction();
+    std::string result;
+    const int32_t rc = core_redact_json_(fields_to_json(f, code), cfg, result);
+    if (rc != 0) return redact_all_values_(f, redact_replacement_(cfg), rc, code);
     return parse_flat_json_fields(result);
+}
+
+// Redacts fields whose values are JSON text, keeping each value's type. If
+// the core returns an error, strings, arrays and objects become the
+// replacement; numbers, booleans and null are kept.
+inline std::vector<SysField> redact_json_fields_(
+    const std::vector<std::pair<std::string, std::string>>& fields) {
+    std::vector<SysField> out;
+    if (fields.empty()) return out;
+    std::string in = "{";
+    for (const auto& kv : fields) {
+        if (in.size() > 1) in += ',';
+        in += json_str(kv.first) + ':' + kv.second;
+    }
+    in += '}';
+    const RedactConfig cfg = globals().redaction();
+    std::string result;
+    const int32_t rc = core_redact_json_(in, cfg, result);
+    if (rc != 0) {
+        const std::string repl = redact_replacement_(cfg);
+        for (const auto& kv : fields) {
+            const char c = kv.second.empty() ? '"' : kv.second[0];
+            if (c == '"' || c == '[' || c == '{') out.push_back({kv.first, json_str(repl), repl});
+            else out.push_back({kv.first, kv.second, kv.second});
+        }
+        log_redact_failed_(rc);
+        return out;
+    }
+    for (auto& kv : split_json_object_(result)) {
+        out.push_back({kv.first, kv.second, json_value_text_(kv.second)});
+    }
+    return out;
 }
 
 } // namespace detail_
@@ -1321,11 +1566,10 @@ namespace detail_ {
 
 // Write a {"shape":"sys"} NDJSON line to `out` and add it to the sys ring.
 // `fields` is written as given; callers redact first if needed.
-template <typename KeyValues>
-inline void write_sys_line(std::ostream& out,
-                           const std::string& level,
-                           const std::string& event,
-                           const KeyValues& fields) {
+inline void write_sys_fields_(std::ostream& out,
+                              const std::string& level,
+                              const std::string& event,
+                              const std::vector<SysField>& fields) {
     const auto id = globals().identity();
     const std::string rid = sys_request_id();
     Fields ring_row;
@@ -1336,9 +1580,9 @@ inline void write_sys_line(std::ostream& out,
     js += ",\"service_id\":" + json_str(id.service_id);
     if (!id.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(id.tenant_id);
     js += ",\"timestamp\":"  + json_str(now_iso8601());
-    for (const auto& kv : fields) {
-        js += ',' + json_str(kv.first) + ':' + json_str(kv.second);
-        ring_row[kv.first] = kv.second;
+    for (const auto& f : fields) {
+        js += ',' + json_str(f.key) + ':' + f.json;
+        ring_row[f.key] = f.text;
     }
     js += "}\n";
     ring_row["level"]      = level;
@@ -1348,11 +1592,27 @@ inline void write_sys_line(std::ostream& out,
     out << js << std::flush;
 }
 
+template <typename KeyValues>
+inline void write_sys_line(std::ostream& out,
+                           const std::string& level,
+                           const std::string& event,
+                           const KeyValues& fields) {
+    std::vector<SysField> sf;
+    for (const auto& kv : fields) sf.push_back({kv.first, json_str(kv.second), kv.second});
+    write_sys_fields_(out, level, event, sf);
+}
+
 // SDK self-reports go to stderr so a slow stdout reader can't stall them.
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields) {
     write_sys_line(std::cerr, level, event, fields);
+}
+
+inline void drainer_sys_log_fields(const std::string& level,
+                                   const std::string& event,
+                                   const std::vector<SysField>& fields) {
+    write_sys_fields_(std::cerr, level, event, fields);
 }
 
 }  // namespace detail_
@@ -1385,10 +1645,23 @@ inline void install_drainer_(const Config& cfg) {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         old = g.drainer;
         g.drainer = next;
+        if (old) g.retiring_drainers.push_back(old);
     }
     if (old) {
-        old->flush(std::chrono::seconds(5));
+        const std::size_t unstored_before = old->unstored();
+        const bool flushed = old->flush(std::chrono::seconds(5));
         old->shutdown(std::chrono::seconds(2));
+        const std::size_t unstored = old->unstored() - unstored_before;
+        {
+            std::lock_guard<std::mutex> lk(g.drainer_mu);
+            auto& r = g.retiring_drainers;
+            r.erase(std::remove(r.begin(), r.end(), old), r.end());
+        }
+        if (!flushed || unstored > 0) {
+            detail_::drainer_sys_log_fields("warn", "audit_drain_install_incomplete", {
+                {"flushed", flushed ? "true" : "false", flushed ? "true" : "false"},
+                {"unstored", std::to_string(unstored), std::to_string(unstored)}});
+        }
     }
 }
 
@@ -1403,15 +1676,27 @@ inline std::unique_ptr<QueueStats> queue_stats() {
 
 // Wait until queued audit rows are written or the timeout passes. Returns
 // true if everything drained, and true at once when no drainer is running.
+// A drainer a re-init is replacing is waited for as well. Each drainer gets
+// at least 1 ms, so flush(0) is true when nothing is queued.
 inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
     auto& g = detail_::globals();
-    std::shared_ptr<detail_::CFastenDrainer> d;
+    std::vector<std::shared_ptr<detail_::CFastenDrainer>> ds;
     {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
-        d = g.drainer;
+        ds = g.retiring_drainers;
+        if (g.drainer) ds.push_back(g.drainer);
     }
-    if (!d) return true;
-    return d->flush(timeout);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool drained = true;
+    for (const auto& d : ds) {
+        const auto left = deadline - std::chrono::steady_clock::now();
+        // Rounded up, and never below 1 ms.
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(left);
+        if (ms < left) ++ms;
+        if (ms < std::chrono::milliseconds(1)) ms = std::chrono::milliseconds(1);
+        if (!d->flush(ms)) drained = false;
+    }
+    return drained;
 }
 
 // Stop the drainer; rows still queued get one last attempt without retries.
@@ -1547,11 +1832,11 @@ inline Row make_row_(const std::string& code, const EmitOpts& o) {
             auto it = o.fields.find(k);
             if (it != o.fields.end()) kept[k] = it->second;
         }
-        row.detail = detail_::redact(kept);
+        row.detail = detail_::redact(kept, code);
         row.detail["_redacted"]      = kRedactReplacement;
         row.detail["_pii_in_detail"] = "true";
     } else {
-        row.detail = detail_::redact(o.fields);
+        row.detail = detail_::redact(o.fields, code);
     }
 
     // NDJSON audit line on stdout: the row's JSON with "shape" first.
