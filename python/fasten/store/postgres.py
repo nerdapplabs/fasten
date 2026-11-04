@@ -426,12 +426,6 @@ class PostgresStore:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         verified, verified_reject, verified_reason = verified_prefix(rows)
-        for row in verified:
-            if not row.hash:
-                raise ValueError(
-                    "ingest_replicated requires sealed rows (non-empty hash); "
-                    f"row {row.id!r} has no hash"
-                )
 
         def _run(conn: Any) -> "IngestResult":
             try:

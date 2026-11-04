@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: ingest of repeated and unsealed rows, rows without a form id (Python, Go)
+
+- A row sent twice in one batch on the same node, with the same hash, is a
+  re-delivery: ingest stores it once instead of rejecting the batch from it.
+- An unsealed row below a node's first sealed row, which `verify_chain`
+  skips, is left out of the insert. Ingest no longer raises (Python) or fails
+  the batch (Go) on it (spec §4).
+- Python reads a sealed row with an empty `canonical_form_id` as form "1",
+  as Go does (spec §1.5), so it verifies in both SDKs.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to

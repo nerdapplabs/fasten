@@ -161,18 +161,26 @@ def verified_prefix(
       so the verified portion can be inserted while the break and everything
       after it is rejected.
 
+    The prefix leaves out unsealed rows, which verify_chain skips and
+    replication does not insert, and keeps one of identical copies of a row
+    on a node (a re-delivery, spec §4).
+
     No I/O — callers insert the prefix and report ``first_break_at`` as
     ``rejected_from_seq`` so the sender resyncs from the break.
     """
     sorted_rows = sorted(rows, key=lambda r: r.monotonic_seq)
     result = verify_chain(sorted_rows)
-    if result.ok:
-        return sorted_rows, None, ""
-    # verify_chain always sets first_break_at when ok is False; the `is not None`
-    # keeps the comparison type-safe (mypy) without assuming the invariant.
     break_at = result.first_break_at
-    prefix = [r for r in sorted_rows
-              if break_at is not None and r.monotonic_seq < break_at]
+    if not result.ok:
+        # verify_chain always sets first_break_at when ok is False; the `is not
+        # None` keeps the comparison type-safe (mypy) without assuming it.
+        sorted_rows = [r for r in sorted_rows
+                       if break_at is not None and r.monotonic_seq < break_at]
+    prefix, seen = [], set()
+    for r in sorted_rows:
+        if r.hash and (r.id, r.source_node_id, r.hash) not in seen:
+            seen.add((r.id, r.source_node_id, r.hash))
+            prefix.append(r)
     return prefix, break_at, result.reason or ""
 
 

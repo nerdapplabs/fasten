@@ -39,6 +39,10 @@ type execContext interface {
 //   - intact -> (allSorted, rejectedFromSeq=0, reason="")
 //   - broken -> (rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
 //
+// The prefix leaves out unsealed rows, which VerifyChain skips and
+// replication does not insert, and keeps one of identical copies of a row on a
+// node (a re-delivery, spec §4).
+//
 // No I/O; the caller inserts the prefix and reports firstBreakAt as
 // RejectedFromSeq.
 func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason string) {
@@ -49,11 +53,15 @@ func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason str
 	})
 
 	res := VerifyChain(sorted)
-	if res.OK {
-		return sorted, 0, ""
-	}
+	type copyKey struct{ id, node, hash string }
+	seen := map[copyKey]bool{}
 	for _, row := range sorted {
-		if row.MonotonicSeq < res.FirstBreakAt {
+		if !res.OK && row.MonotonicSeq >= res.FirstBreakAt {
+			continue
+		}
+		key := copyKey{row.ID, row.SourceNodeID, row.Hash}
+		if row.Hash != "" && !seen[key] {
+			seen[key] = true
 			prefix = append(prefix, row)
 		}
 	}

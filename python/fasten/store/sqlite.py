@@ -350,12 +350,6 @@ class SQLiteStore:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
-        for row in prefix:
-            if not row.hash:
-                raise ValueError(
-                    "ingest_replicated requires sealed rows (non-empty hash); "
-                    f"row {row.id!r} has no hash"
-                )
         inserted = 0
         with self._txn():
             conn = self._connect()

@@ -78,6 +78,21 @@ def test_form_1_hash_unchanged_by_new_fields():
     )
 
 
+def test_a_row_without_canonical_form_id_is_form_1():
+    """The Go vector row has no canonical_form_id; both SDKs read it as form "1"."""
+    row = AuditRow(
+        id="evt-abc123", origin_id="evt-abc123", monotonic_seq=1,
+        timestamp=datetime(2026, 6, 15, 10, 30, 45, 123456, tzinfo=timezone.utc),
+        code="ORDER_PLACED", action="create", severity="info",
+        service_id="gateway", source_node_id="node-1", tenant_id="tenant-x",
+        actor="alice", actor_kind="user", target="order/42",
+        category="order", domain="sales", method="http", request_id="req-xyz",
+        detail={"qty": 3, "sku": "WIDGET"}, prev_hash="genesis", canonical_form_id="",
+        hash="cbf5a1ee4bb7baeb0b433bedfa60434bdea42627b9671183895970bbff02f9ac",
+    )
+    assert verify_chain([row]).ok
+
+
 def test_form_1_hash_ignores_commitment_fields():
     """Populating the new fields must not perturb a form-"1" hash either."""
     bare = dataclasses.replace(_row(), canonical_form_id="1")

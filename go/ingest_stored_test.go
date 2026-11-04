@@ -292,6 +292,30 @@ func TestIngestOneIDTwiceOnOneNodeInABatchIsRejected(t *testing.T) {
 	}
 }
 
+func TestIngestARowSentTwiceInABatchIsStoredOnce(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(3, "svc", "node-1")
+	res := ingestOK(t, s, []Row{rows[0], rows[1], rows[1], rows[2]})
+	if res.RejectedFromSeq != 0 || res.Inserted != 3 || storedCount(t, s) != 3 {
+		t.Fatalf("want 3 rows stored, got %+v, %d rows", res, storedCount(t, s))
+	}
+}
+
+// unsealedHead is an unsealed row at seq 1, then a sealed chain linked to
+// genesis.
+func unsealedHead() []Row {
+	rows := makeRemoteChain(3, "svc", "node-1")
+	rows[0].Hash, rows[0].PrevHash = "", ""
+	return append(rows[:1], resealFrom("genesis", rows[1:])...)
+}
+
+func TestIngestAnUnsealedRowBeforeTheChainIsNotInserted(t *testing.T) {
+	s := ingestStore(t)
+	res := ingestOK(t, s, unsealedHead())
+	if res.RejectedFromSeq != 0 || res.Inserted != 2 || storedCount(t, s) != 2 {
+		t.Fatalf("want rows 2 and 3 stored, got %+v, %d rows", res, storedCount(t, s))
+	}
+}
+
 func TestIngestARowAfterAStoredUnsealedRowLinksToGenesis(t *testing.T) {
 	s, rows := ingestStore(t), makeRemoteChain(2, "svc", "node-1")
 	unsealed := rows[0]

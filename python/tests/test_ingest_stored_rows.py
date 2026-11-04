@@ -123,6 +123,25 @@ def test_one_id_twice_on_one_node_in_a_batch_is_rejected():
     assert _stored(store) == []
 
 
+def test_a_row_sent_twice_in_a_batch_is_stored_once():
+    store, rows = SQLiteStore(":memory:"), _chain([1, 2, 3])
+    result = ingest(store, [rows[0], rows[1], rows[1], rows[2]])
+    assert result.rejected_from_seq is None and result.inserted == 3
+    assert [s for s, _, _ in _stored(store)] == [1, 2, 3]
+
+
+def _unsealed_head() -> list[AuditRow]:
+    """An unsealed row at seq 1, then a sealed chain linked to genesis."""
+    return [dataclasses.replace(_row(1), hash="", prev_hash="")] + _chain([2, 3])
+
+
+def test_an_unsealed_row_before_the_chain_is_not_inserted():
+    store = SQLiteStore(":memory:")
+    result = ingest(store, _unsealed_head())
+    assert result.rejected_from_seq is None and result.inserted == 2
+    assert [s for s, _, _ in _stored(store)] == [2, 3]
+
+
 def test_a_row_after_a_stored_unsealed_row_links_to_genesis():
     store = SQLiteStore(":memory:")
     store.insert_originated(dataclasses.replace(_row(1), hash="", prev_hash=""))
@@ -178,3 +197,21 @@ def test_a_row_stored_meanwhile_is_checked_again_postgres(monkeypatch):
         with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
+
+
+@pytest.mark.skipif(not os.getenv("FASTEN_TEST_POSTGRES_DSN"),
+                    reason="FASTEN_TEST_POSTGRES_DSN not set")
+def test_repeated_and_unsealed_rows_postgres():
+    import uuid
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    store = PostgresStore.from_dsn(f"{os.environ['FASTEN_TEST_POSTGRES_DSN']}?table={table}")
+    try:
+        rows = _unsealed_head()
+        result = ingest(store, rows + [rows[2]])
+        assert result.rejected_from_seq is None and result.inserted == 2
+        assert [s for s, _, _ in _stored(store)] == [2, 3]
+    finally:
+        import psycopg
+        with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
