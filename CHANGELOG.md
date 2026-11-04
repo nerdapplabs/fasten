@@ -14,8 +14,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `configure()` on a running engine swaps in the new drainer under the engine
   lock before stopping the old one, so an emit during re-init always reaches a
   drainer. It logs `audit_drain_install_incomplete` when the old drainer's
-  rows were not stored, counting only rows from that re-init, not dead
-  letters from earlier.
+  rows were not stored, counting from the swap, so a dead letter from
+  earlier is not counted and one right after the swap is.
 - New `Fasten.close(timeout:)` stops the drainer per spec §10. Queued rows get
   one attempt each, an insert in progress is waited for, and rows not stored
   are logged as `audit_drain_lost_at_stop` and make `close()` return false.

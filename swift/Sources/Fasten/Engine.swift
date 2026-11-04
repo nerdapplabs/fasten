@@ -48,7 +48,9 @@ final class Engine: @unchecked Sendable {
                 }
             )
         }
-        let old: QueueDrainer? = lock.withLock {
+        // The old drainer's unstored count is read at the swap, so a row
+        // pending then that dead-letters before retire() is still counted.
+        let (old, unstoredBefore): (QueueDrainer?, Int) = lock.withLock {
             self.serviceID = serviceID
             self.nodeID    = nodeID
             self.tenantID  = tenantID
@@ -58,18 +60,17 @@ final class Engine: @unchecked Sendable {
             let old = drainer
             drainer = next
             if let old { retiring.append(old) }
-            return old
+            return (old, old?.unstoredTotal ?? 0)
         }
         log(level: "error", event: "audit_chain_unavailable", fields: [
             "store":  store.map { "\(type(of: $0))" } ?? "none",
             "reason": "the Swift SDK does not seal rows (spec 2.1); rows are written unsealed",
         ])
-        if let old { retire(old) }
+        if let old { retire(old, unstoredBefore: unstoredBefore) }
     }
 
     // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
-    private func retire(_ old: QueueDrainer) {
-        let unstoredBefore = old.unstoredTotal
+    private func retire(_ old: QueueDrainer, unstoredBefore: Int) {
         let flushed = old.flush(timeout: installFlushTimeout)
         old.close(timeout: stopTimeout)
         let unstored = old.unstoredTotal - unstoredBefore

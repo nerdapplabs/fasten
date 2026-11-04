@@ -152,6 +152,46 @@ final class DrainerConformanceTests: XCTestCase {
         XCTAssertTrue(engine.close(timeout: 1))
     }
 
+    // A row pending at the swap that dead-letters before retire() starts
+    // still makes the re-init incomplete.
+    func testReinitCountsADeadLetterRightAfterTheSwap() throws {
+        let store = TestStore(failures: 1, gateOpen: false)
+        let engine = Engine()
+        engine.maxAttempts = 1
+        engine.configure(serviceID: "svc", nodeID: "node", store: store)
+        let log = SysLog()
+        log.capture(engine)
+        let flags = Lock()
+        var held = false, swapping = false
+        let write = engine.transport.write
+        engine.transport.write = { [unowned engine] line in
+            // Hold the dead-letter line until the re-init has swapped
+            // drainers, then let the row settle before the re-init's own log
+            // line is written.
+            if line.contains("audit_drain_dead_letter") {
+                flags.withLock { held = true }
+                _ = waitUntil { flags.withLock { swapping } }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if line.contains("audit_chain_unavailable") {
+                _ = engine.flush(timeout: 2)
+            }
+            write(line)
+        }
+        try engine.emit(code: "USER_CREATED", target: "a", actor: "x")
+        XCTAssertTrue(waitUntil { store.insertCalls == 1 })
+        store.setGate(true)
+        XCTAssertTrue(waitUntil { flags.withLock { held } })
+        flags.withLock { swapping = true }
+        engine.configure(serviceID: "svc", nodeID: "node", store: MemoryStore())
+
+        let incomplete = log.named("audit_drain_install_incomplete")
+        XCTAssertEqual(incomplete.count, 1, "\(log.events)")
+        XCTAssertEqual(incomplete.first?["unstored"] as? Int, 1)
+        XCTAssertEqual(incomplete.first?["flushed"] as? Bool, true)
+        XCTAssertTrue(engine.close(timeout: 1))
+    }
+
     // §10: close() covers a drainer a re-init is still retiring, and every
     // drainer shares the one deadline.
     func testEngineCloseCoversRetiringDrainers() throws {
@@ -354,7 +394,6 @@ final class DrainerStopTests: XCTestCase {
         let log = SysLog()
         let store = TestStore(gateOpen: false)
         var drainer: QueueDrainer? = QueueDrainer(store: store, sysLog: log.add)
-        weak var released = drainer
         drainer?.enqueue(row("r1"))
         XCTAssertTrue(waitUntil { store.insertCalls == 1 })
 
@@ -364,10 +403,10 @@ final class DrainerStopTests: XCTestCase {
         let elapsed = Date().timeIntervalSince(start)
         XCTAssertFalse(closed)
         XCTAssertLessThan(elapsed, 1.0)
-        XCTAssertNotNil(released)
 
+        // The insert returns after the drainer was released.
         store.setGate(true)
-        XCTAssertTrue(waitUntil { released == nil })
+        XCTAssertTrue(waitUntil { !log.named("audit_drain_recovered_at_stop").isEmpty })
         XCTAssertEqual(store.stored, ["r1"])
         XCTAssertEqual(log.named("audit_drain_lost_at_stop").compactMap { $0["row_id"] as? String }, ["r1"])
         XCTAssertEqual(log.named("audit_drain_recovered_at_stop").first?["row_ids"] as? [String], ["r1"])
