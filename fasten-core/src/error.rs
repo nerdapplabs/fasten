@@ -97,6 +97,11 @@ pub enum Error {
     /// Retrying cannot help, so the drainer dead-letters the row at once.
     #[error("seq clash: {0}")]
     SeqClash(String),
+
+    /// A store insert failed. Carries only the error type, as a message can
+    /// quote row values. The drainer retries the row.
+    #[error("{0}")]
+    Store(String),
 }
 
 // Without the sqlite or postgres feature the backend variants are absent and
@@ -143,6 +148,7 @@ impl From<&Error> for FastenErrorCode {
             Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
             Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
             Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
+            Error::Store(_)            => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

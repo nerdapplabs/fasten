@@ -72,7 +72,7 @@ curl http://localhost:8080/users/u-42
 ## Audit-store failure handling
 
 `fasten.emit()` defaults to **queue mode**: rows go onto an in-memory queue,
-and a `setImmediate`-driven drainer writes them to the sink with exponential
+and a drainer writes them to the sink with exponential
 backoff (100 ms to 60 s, plus or minus 20 % jitter). Sink failures stay off
 the request path. Set `auditStoreFailureStrategy: 'raise'` for synchronous
 writes that throw `AuditStoreError`. With an async store such as
@@ -82,7 +82,12 @@ it to see the `AuditStoreError`. `queueStats()`, `flush(timeoutMs)` and
 it flushes, then stops the drainer, giving rows still queued one more
 attempt each. A row that fails it, or is still unstored at the timeout, is
 reported as `audit_drain_lost_at_stop`, and `close()` resolves false.
-Re-`init()` stops the old drainer the same way.
+Re-`init()` flushes the old drainer for up to 5 s, then stops it the same
+way, also when the new config is raise mode or has no store. `flush()` and
+`close()` wait for it, rows it could not store are reported with
+`audit_drain_install_incomplete`, and the next `close()` resolves false if
+it lost rows. An idle drainer does not
+keep the process alive.
 
 **Chain.** The JS SDK does not seal rows. `emit()` returns the row with
 `monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the

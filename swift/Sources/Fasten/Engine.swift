@@ -11,7 +11,14 @@ final class Engine: @unchecked Sendable {
     private(set) var transport: StdoutTransport = StdoutTransport()
     private(set) var redactor:  Redactor = Redactor()
     private var drainer:        QueueDrainer?
+    private var retiring:       [QueueDrainer] = []   // old drainers a re-init is stopping
     private var strategy:       FailureStrategy = .queue
+
+    // Internal so tests can shorten them.
+    var installFlushTimeout: TimeInterval = 5.0
+    var stopTimeout:         TimeInterval = 1.0
+    var retryInitialMs:      Double       = 100
+    var maxAttempts:         Int          = 50
 
     private let lock        = Lock()
 
@@ -25,34 +32,53 @@ final class Engine: @unchecked Sendable {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
-        // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
-        if let old = drainer {
-            old.flush(timeout: 5.0)
-            old.close()
-            drainer = nil
+        // Spec §10: build the new drainer and swap it in under the lock, so
+        // no emit sees the slot empty, then flush and stop the old one.
+        var next: QueueDrainer? = nil
+        if strategy == .queue, let s = store {
+            next = QueueDrainer(
+                store:          s,
+                capacity:       queueCapacity,
+                retryInitialMs: retryInitialMs,
+                retryMaxMs:     60_000,
+                retryJitter:    true,
+                maxAttempts:    maxAttempts,
+                sysLog: { [weak self] level, event, fields in
+                    self?.log(level: level, event: event, fields: fields)
+                }
+            )
         }
-        lock.withLock {
+        // The old drainer's unstored count is read at the swap, so a row
+        // pending then that dead-letters before retire() is still counted.
+        let (old, unstoredBefore): (QueueDrainer?, Int) = lock.withLock {
             self.serviceID = serviceID
             self.nodeID    = nodeID
             self.tenantID  = tenantID
             self.store     = store
             self.strategy  = strategy
             self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement)
+            let old = drainer
+            drainer = next
+            if let old { retiring.append(old) }
+            return (old, old?.unstoredTotal ?? 0)
         }
         log(level: "error", event: "audit_chain_unavailable", fields: [
             "store":  store.map { "\(type(of: $0))" } ?? "none",
             "reason": "the Swift SDK does not seal rows (spec 2.1); rows are written unsealed",
         ])
-        if strategy == .queue, let s = store {
-            drainer = QueueDrainer(
-                store:          s,
-                capacity:       queueCapacity,
-                retryInitialMs: 100,
-                retryMaxMs:     60_000,
-                retryJitter:    true,
-                maxAttempts:    50
-            )
+        if let old { retire(old, unstoredBefore: unstoredBefore) }
+    }
+
+    // Give the old queue up to 5 s to drain so rows already emitted reach the old store.
+    private func retire(_ old: QueueDrainer, unstoredBefore: Int) {
+        let flushed = old.flush(timeout: installFlushTimeout)
+        old.close(timeout: stopTimeout)
+        let unstored = old.unstoredTotal - unstoredBefore
+        if !flushed || unstored > 0 {
+            log(level: "warn", event: "audit_drain_install_incomplete",
+                fields: ["flushed": flushed, "unstored": unstored])
         }
+        lock.withLock { retiring.removeAll { $0 === old } }
     }
 
     func emit(
@@ -73,14 +99,32 @@ final class Engine: @unchecked Sendable {
                           actorKind: actorKind, detail: detail, method: method,
                           severity: severity)
 
-        if let d = drainer {
+        let (d, strategy, store) = lock.withLock { (drainer, self.strategy, self.store) }
+        if let d {
             transport.emit(row)
-            d.enqueue(row)
+            // A stopped drainer refuses the row; store it here instead.
+            if !d.enqueue(row) { storeInline(row, in: d.store, refused: true) }
         } else if strategy == .raise, let s = store {
             try s.insert(row)
             transport.emit(row)
+        } else if let s = store {
+            // Queue mode after close().
+            transport.emit(row)
+            storeInline(row, in: s, refused: false)
         } else {
             transport.emit(row)
+        }
+    }
+
+    private func storeInline(_ row: AuditRow, in store: any AuditStore, refused: Bool) {
+        do {
+            try store.insert(row)
+            if refused {
+                log(level: "info", event: "audit_drain_stored_inline", fields: ["row_id": row.id])
+            }
+        } catch {
+            log(level: "error", event: "audit_sync_fallback_failed",
+                fields: ["error": describeError(error), "row_id": row.id])
         }
     }
 
@@ -92,6 +136,8 @@ final class Engine: @unchecked Sendable {
         severity: Severity?
     ) -> AuditRow {
         let rowID = _mintID()
+        let (serviceID, nodeID, tenantID, redactor) =
+            lock.withLock { (self.serviceID, self.nodeID, self.tenantID, self.redactor) }
         return AuditRow(
             wireVersion:  "1",
             id:           rowID,
@@ -171,6 +217,7 @@ final class Engine: @unchecked Sendable {
 
     func log(level: String, event: String, fields: [String: Any]) {
         let requestID = _currentRequestID()
+        let (serviceID, nodeID, redactor) = lock.withLock { (self.serviceID, self.nodeID, self.redactor) }
         transport.log(level: level, event: event,
                       serviceID: serviceID.isEmpty ? nil : serviceID,
                       nodeID: nodeID.isEmpty ? nil : nodeID,
@@ -179,15 +226,60 @@ final class Engine: @unchecked Sendable {
                       redact: redactor.redact)
     }
 
+    /// Also waits for old drainers a concurrent re-init is still flushing.
     func flush(timeout: TimeInterval) -> Bool {
-        drainer?.flush(timeout: timeout) ?? true
+        let all = lock.withLock { retiring + (drainer.map { [$0] } ?? []) }
+        let deadline = Date().addingTimeInterval(timeout)
+        var ok = true
+        for d in all {
+            ok = d.flush(timeout: max(0, deadline.timeIntervalSinceNow)) && ok
+        }
+        return ok
+    }
+
+    /// Flushes for up to half of `timeout`, then stops the drainer and any
+    /// old ones a re-init is retiring (spec §10), all within `timeout`.
+    /// Returns false if any of them lost a row. Later emits in queue mode
+    /// write to the store inline.
+    func close(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        let seen = lock.withLock { retiring + (drainer.map { [$0] } ?? []) }
+        // Counted before any drainer stops: a stop can make another one's
+        // row fail its last attempt while close waits on the first.
+        var lostBefore = Dictionary(uniqueKeysWithValues: seen.map { (ObjectIdentifier($0), $0.lostCount) })
+        _ = flush(timeout: timeout / 2)
+        let all = lock.withLock { () -> [QueueDrainer] in
+            let d = drainer
+            drainer = nil
+            return retiring + (d.map { [$0] } ?? [])
+        }
+        // A drainer a re-init installed during the flush starts from now.
+        for d in all where lostBefore[ObjectIdentifier(d)] == nil {
+            lostBefore[ObjectIdentifier(d)] = d.lostCount
+        }
+        // A drainer already retired during the flush is checked too.
+        let checked = seen + all.filter { d in !seen.contains { $0 === d } }
+        // Stop them all first so they drain in parallel.
+        for d in all { d.requestStop() }
+        var ok = true
+        for d in all {
+            ok = d.close(timeout: max(0, deadline.timeIntervalSinceNow)) && ok
+        }
+        for d in checked where d.lostCount > lostBefore[ObjectIdentifier(d)] ?? 0 {
+            ok = false
+        }
+        return ok
+    }
+
+    // Without this, an engine dropped before close() would leave its drain
+    // thread waiting forever. It does not wait for the rows.
+    deinit {
+        drainer?.requestStop()
+        for d in retiring { d.requestStop() }
     }
 
     func reset() {
-        if let d = drainer {
-            d.close()
-            drainer = nil
-        }
+        _ = close(timeout: stopTimeout)
         CodeRegistry.shared.clear()
         lock.withLock {
             serviceID = ""; nodeID = ""; tenantID = nil
@@ -201,8 +293,8 @@ final class Engine: @unchecked Sendable {
 let _defaultEngine = Engine()
 
 /// Error thrown by fasten itself (unknown code, bad table name, SQLite errors).
-/// Its localizedDescription is the message, which the drainer keeps as
-/// last_error.
+/// Its localizedDescription is the message; the drainer's last_error is
+/// "FastenError: <message>".
 public struct FastenError: Error, LocalizedError, CustomStringConvertible {
     public let message: String
     public init(_ message: String) { self.message = message }

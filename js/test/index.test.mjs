@@ -282,6 +282,22 @@ describe('emit', () => {
         assert.equal(r2.monotonic_seq, 0);
     });
 
+    test('stdout line carries empty prev_hash and hash', () => {
+        initTestSDK();
+        const orig = process.stdout.write;
+        const lines = [];
+        process.stdout.write = (chunk) => { lines.push(String(chunk)); return true; };
+        try {
+            emit({ code: 'USER_CREATED', target: 'u-1' });
+        } finally {
+            process.stdout.write = orig;
+        }
+        const line = lines.map((l) => JSON.parse(l)).find((l) => l.shape === 'audit');
+        assert.equal(line.prev_hash, '');
+        assert.equal(line.hash, '');
+        assert.equal(line.monotonic_seq, 0);
+    });
+
     test('PII redaction in detail', () => {
         initTestSDK();
         const row = emit({

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Print the --latest value for the GitHub release of a tag: true for a
+# vX.Y.Z tag that is the highest vX.Y.Z tag, false for anything else
+# (go/ tags, prereleases, backports).
+#
+# Usage: git tag -l 'v*' | scripts/release/latest-flag.sh <tag>
+set -euo pipefail
+export LC_ALL=C
+
+[ $# -eq 1 ] || { echo "usage: $0 <tag>" >&2; exit 2; }
+tag=$1
+release='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+if ! [[ $tag =~ $release ]]; then
+  echo false
+  exit 0
+fi
+highest=$({ cat; printf '%s\n' "$tag"; } | grep -E "$release" | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -n 1)
+if [ "$highest" = "$tag" ]; then echo true; else echo false; fi

@@ -42,6 +42,10 @@ class AuditQueueDrainer {
 		this._inFlight = 0; // row popped but insert not yet resolved
 		this._current = null; // that row, until stop() gives up on it
 		this._stopped = false;
+		this._wake = null; // resolves the drain loop's wait for a row
+		this._givenUp = new Promise((r) => {
+			this._giveUp = r; // ends every pending stop() once one times out
+		});
 
 		// Stats
 		this._highWater = 0;
@@ -76,6 +80,7 @@ class AuditQueueDrainer {
 			return;
 		}
 		this._q.push(row);
+		this._wake?.();
 		const used = this._q.length + this._inFlight;
 		if (used > this._highWater) this._highWater = used;
 		if (this._capacity > 0) {
@@ -115,6 +120,11 @@ class AuditQueueDrainer {
 		};
 	}
 
+	// Rows dead-lettered or lost at stop.
+	unstoredTotal() {
+		return this._deadLetteredTotal + this._lostTotal;
+	}
+
 	async flush(timeoutMs = 5000) {
 		// Wait only for rows queued before this call (spec §6), so new rows
 		// can't keep flush() waiting forever. A dead-lettered or lost row
@@ -136,6 +146,7 @@ class AuditQueueDrainer {
 	// (audit_drain_lost_at_stop). Resolves false if a row was lost.
 	stop(timeoutMs = 5000) {
 		this._stopped = true;
+		this._wake?.();
 		const lost = this._lostTotal;
 		let timer;
 		const timeout = new Promise((r) => {
@@ -146,6 +157,7 @@ class AuditQueueDrainer {
 		});
 		return Promise.race([
 			this._done.then(() => this._lostTotal === lost),
+			this._givenUp.then(() => false),
 			timeout,
 		]).finally(() => clearTimeout(timer));
 	}
@@ -153,7 +165,12 @@ class AuditQueueDrainer {
 	async _tick() {
 		while (!this._stopped || this._q.length > 0) {
 			if (this._q.length === 0) {
-				await new Promise((r) => setImmediate(r));
+				// A pending promise holds no handle, so an idle drainer
+				// doesn't keep the process alive.
+				await new Promise((r) => {
+					this._wake = r;
+				});
+				this._wake = null;
 				continue;
 			}
 			const row = this._q.shift();
@@ -219,6 +236,7 @@ class AuditQueueDrainer {
 	// stop() timed out: what is still queued or in flight is reported lost
 	// now, since the process may exit before it is tried.
 	_loseUnstored() {
+		this._giveUp();
 		const timedOut = { name: "TimeoutError" };
 		if (this._current) {
 			this._onLostAtStop(this._current, timedOut);

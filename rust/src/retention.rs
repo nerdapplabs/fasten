@@ -108,7 +108,7 @@ fn redact_expired_until(
     let skipped = store.count_skipped_legacy_form(before, &codes)?;
     if skipped > 0 {
         crate::engine::sys_line(
-            &cfg.service_id,
+            Some(cfg),
             "warn",
             "pii_redaction_skipped_legacy_form",
             serde_json::json!({
@@ -140,7 +140,7 @@ fn redact_expired_until(
     Ok(redacted)
 }
 
-fn error_type(e: &Error) -> &'static str {
+pub(crate) fn error_type(e: &Error) -> &'static str {
     match e {
         Error::AuditStoreInsert(_) => "AuditStoreInsert",
         Error::Unsupported(_) => "Unsupported",
@@ -175,7 +175,7 @@ impl Purger {
                 if let Err(e) = redact_expired_until(&cfg, before, "retention", &stopped) {
                     // Type only: a store error message can quote row values.
                     crate::engine::sys_line(
-                        &cfg.service_id,
+                        Some(&cfg),
                         "error",
                         "retention_purge_failed",
                         serde_json::json!({

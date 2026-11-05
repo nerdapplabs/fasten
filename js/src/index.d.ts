@@ -51,6 +51,7 @@ export function dump(): string;
 
 // The row as emitted on stdout and stored.
 export interface Row {
+	wire_version: string; // "1"
 	id: string; // evt-<20 hex chars>
 	origin_id: string; // dedup key for replication
 	monotonic_seq: number;
@@ -91,11 +92,15 @@ export interface InitOptions {
 	auditStore?: AuditRepository | null;
 	apiStore?: AuditRepository | null;
 	extraRedactKeys?: string[];
+	/** Replaces redacted values. Also read from FASTEN_REDACT_REPLACEMENT. */
+	redactReplacement?: string | null;
 	auditStoreFailureStrategy?: "queue" | "raise";
 	queueCapacity?: number;
 	queueRetryInitialMs?: number;
 	queueRetryMaxMs?: number;
 	queueRetryJitter?: boolean;
+	/** Attempts per row before it is dead-lettered. Defaults to 50. */
+	queueDrainMaxAttempts?: number;
 	/**
 	 * Redact PII rows older than this ("30d", "24h"). Also read from
 	 * FASTEN_RETENTION_PII. Checked on init and then hourly.
@@ -145,6 +150,10 @@ export interface QueueStats {
 	retry_count_active: number;
 	in_backoff_seconds: number;
 	last_error: string | null;
+	dead_lettered_total: number;
+	dead_letter_depth: number;
+	// emit() never blocks; capacity only sets the warning thresholds.
+	capacity_semantics: "warn_only";
 }
 
 // Returns null in raise mode (no drainer running).

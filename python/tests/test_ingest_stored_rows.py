@@ -1,5 +1,6 @@
 """Ingest checks a batch against what the store already holds (spec §4): a
 row that disagrees with a stored row is rejected and reported, not ignored."""
+import contextlib
 import dataclasses
 import os
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from fasten.attrs import AuditRow
-from fasten.chain import seal
+from fasten.chain import _row_hash, seal, verify_chain
 from fasten.replication import ingest
 from fasten.store.sqlite import SQLiteStore
 
@@ -123,6 +124,100 @@ def test_one_id_twice_on_one_node_in_a_batch_is_rejected():
     assert _stored(store) == []
 
 
+def test_a_row_sent_twice_in_a_batch_is_stored_once():
+    store, rows = SQLiteStore(":memory:"), _chain([1, 2, 3])
+    result = ingest(store, [rows[0], rows[1], rows[1], rows[2]])
+    assert result.rejected_from_seq is None and result.inserted == 3
+    assert [s for s, _, _ in _stored(store)] == [1, 2, 3]
+
+
+def _unsealed_head() -> list[AuditRow]:
+    """An unsealed row at seq 1, then a sealed chain linked to genesis."""
+    return [dataclasses.replace(_row(1), hash="", prev_hash="")] + _chain([2, 3])
+
+
+def test_an_unsealed_row_before_the_chain_is_not_inserted():
+    store = SQLiteStore(":memory:")
+    result = ingest(store, _unsealed_head())
+    assert result.rejected_from_seq is None and result.inserted == 2
+    assert [s for s, _, _ in _stored(store)] == [2, 3]
+
+
+def test_an_unsealed_row_after_the_chain_starts_is_a_break():
+    store, rows = SQLiteStore(":memory:"), _chain([2])
+    batch = [dataclasses.replace(_row(1), hash="", prev_hash=""), rows[0],
+             dataclasses.replace(_row(5), hash="", prev_hash="")]
+    result = ingest(store, batch)
+    assert result.rejected_from_seq == 5 and result.inserted == 1
+    assert "no hash after the node's chain started" in result.reason
+    assert [s for s, _, _ in _stored(store)] == [2]
+
+
+def _unsealed(seq: int) -> AuditRow:
+    return dataclasses.replace(_row(seq), hash="", prev_hash="")
+
+
+@pytest.mark.parametrize("batch", [
+    lambda: [_unsealed(4)] + _chain([5, 6]),
+    lambda: [_unsealed(4)],
+], ids=["with-rows-after", "alone"])
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_an_unsealed_row_after_stored_rows_is_a_break(backend, batch):
+    with _store(backend) as store:
+        ingest(store, _chain([1, 2, 3]))
+        result = ingest(store, batch())
+        assert result.rejected_from_seq == 4 and result.inserted == 0
+        assert result.reason == "row evt-4: no hash after the node's chain started"
+        assert [s for s, _, _ in _stored(store)] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_an_unsealed_row_with_nothing_stored_below_is_skipped(backend):
+    with _store(backend) as store:
+        result = ingest(store, _unsealed_head())
+        assert result.rejected_from_seq is None and result.inserted == 2
+        assert [s for s, _, _ in _stored(store)] == [2, 3]
+
+
+@contextlib.contextmanager
+def _store(backend):
+    if backend == "sqlite":
+        yield SQLiteStore(":memory:")
+        return
+    dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
+    import uuid
+
+    import psycopg
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    try:
+        yield PostgresStore.from_dsn(f"{dsn}?table={table}")
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+def _form_1(form_id) -> AuditRow:
+    """A sealed form-1 row, its canonical_form_id then set to ``form_id``."""
+    row = dataclasses.replace(_row(1), canonical_form_id="1", prev_hash="genesis")
+    row = dataclasses.replace(row, hash=_row_hash(row.to_dict()))
+    return dataclasses.replace(row, canonical_form_id=form_id)
+
+
+def _check_form_1_stored(store, form_id):
+    assert ingest(store, [_form_1(form_id)]).inserted == 1
+    stored = store.query(limit=10)
+    assert [r.canonical_form_id for r in stored] == ["1"]
+    assert verify_chain(stored).ok
+
+
+@pytest.mark.parametrize("form_id", [None, ""])
+def test_a_form_1_row_without_a_form_id_is_stored_as_form_1(form_id):
+    _check_form_1_stored(SQLiteStore(":memory:"), form_id)
+
+
 def test_a_row_after_a_stored_unsealed_row_links_to_genesis():
     store = SQLiteStore(":memory:")
     store.insert_originated(dataclasses.replace(_row(1), hash="", prev_hash=""))
@@ -137,9 +232,9 @@ def _blind_first_check(monkeypatch):
     from fasten.store import repo
     real, calls = repo.stored_conflict, []
 
-    def blind(prefix, by_id, at_seq):
+    def blind(*args):
         calls.append(1)
-        return None if len(calls) == 1 else real(prefix, by_id, at_seq)
+        return None if len(calls) == 1 else real(*args)
     monkeypatch.setattr(repo, "stored_conflict", blind)
     return calls
 
@@ -178,3 +273,37 @@ def test_a_row_stored_meanwhile_is_checked_again_postgres(monkeypatch):
         with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
+
+
+@pytest.mark.skipif(not os.getenv("FASTEN_TEST_POSTGRES_DSN"),
+                    reason="FASTEN_TEST_POSTGRES_DSN not set")
+def test_repeated_and_unsealed_rows_postgres():
+    import uuid
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    store = PostgresStore.from_dsn(f"{os.environ['FASTEN_TEST_POSTGRES_DSN']}?table={table}")
+    try:
+        rows = _unsealed_head()
+        result = ingest(store, rows + [rows[2]])
+        assert result.rejected_from_seq is None and result.inserted == 2
+        assert [s for s, _, _ in _stored(store)] == [2, 3]
+    finally:
+        import psycopg
+        with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.skipif(not os.getenv("FASTEN_TEST_POSTGRES_DSN"),
+                    reason="FASTEN_TEST_POSTGRES_DSN not set")
+@pytest.mark.parametrize("form_id", [None, ""])
+def test_a_form_1_row_without_a_form_id_is_stored_as_form_1_postgres(form_id):
+    import uuid
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    store = PostgresStore.from_dsn(f"{os.environ['FASTEN_TEST_POSTGRES_DSN']}?table={table}")
+    try:
+        _check_form_1_stored(store, form_id)
+    finally:
+        import psycopg
+        with psycopg.connect(os.environ["FASTEN_TEST_POSTGRES_DSN"], autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
