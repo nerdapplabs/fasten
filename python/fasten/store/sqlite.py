@@ -201,7 +201,7 @@ class SQLiteStore:
                 row.method, row.request_id,
                 json.dumps(row.detail),
                 _utc_iso(row.shipped_at) if row.shipped_at else None,
-                row.canonical_form_id,
+                row.canonical_form_id or "1",
                 row.prev_hash,
                 row.hash,
                 # '' rather than NULL: a Go-created table has them NOT NULL,
@@ -351,18 +351,14 @@ class SQLiteStore:
         (see ``repo.ingest_without_local_node``).
         """
         from .repo import (IngestResult, check_inserted, cut_at_conflict,
-                           ingest_without_local_node, stored_conflict, verified_prefix)
+                           ingest_without_local_node, skipped_unsealed, stored_conflict,
+                           verified_prefix)
 
         if local_node_id:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         prefix, rejected_from_seq, reason = verified_prefix(rows)
-        for row in prefix:
-            if not row.hash:
-                raise ValueError(
-                    "ingest_replicated requires sealed rows (non-empty hash); "
-                    f"row {row.id!r} has no hash"
-                )
+        unsealed = skipped_unsealed(rows, rejected_from_seq)
         inserted = 0
         with self._txn():
             conn = self._connect()
@@ -383,8 +379,15 @@ class SQLiteStore:
                         (node, seq)).fetchone()
                     return (r[0], r[1], r[2]) if r else None
 
+                def sealed_below(node: str, seq: int) -> bool:
+                    return conn.execute(
+                        f"SELECT 1 FROM {self._table} WHERE source_node_id = ? "
+                        "AND monotonic_seq < ? AND hash <> '' LIMIT 1",
+                        (node, seq)).fetchone() is not None
+
                 prefix, rejected_from_seq, reason = cut_at_conflict(
-                    prefix, rejected_from_seq, reason, stored_conflict(prefix, by_id, at_seq))
+                    prefix, rejected_from_seq, reason,
+                    stored_conflict(prefix, by_id, at_seq, unsealed, sealed_below))
                 # BEGIN IMMEDIATE holds off other writers, so a skipped insert
                 # here means the checks missed something: fail, don't drop it.
                 for row in prefix:

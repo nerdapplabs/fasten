@@ -36,8 +36,12 @@ type execContext interface {
 // verifiedPrefix returns the longest verified run of rows from the chain start.
 //
 // Rows are sorted by MonotonicSeq, then the hash chain is verified:
-//   - intact -> (allSorted, rejectedFromSeq=0, reason="")
-//   - broken -> (rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
+//   - intact -> (the sealed rows, rejectedFromSeq=0, reason="")
+//   - broken -> (the sealed rows with MonotonicSeq < firstBreakAt, firstBreakAt, reason)
+//
+// Unsealed rows, which VerifyChain skips and replication does not insert, are
+// left out, and identical copies of a row on a node (a re-delivery, spec §4)
+// appear once.
 //
 // No I/O; the caller inserts the prefix and reports firstBreakAt as
 // RejectedFromSeq.
@@ -49,15 +53,31 @@ func verifiedPrefix(rows []Row) (prefix []Row, rejectedFromSeq int64, reason str
 	})
 
 	res := VerifyChain(sorted)
-	if res.OK {
-		return sorted, 0, ""
-	}
+	type copyKey struct{ id, node, hash string }
+	seen := map[copyKey]bool{}
 	for _, row := range sorted {
-		if row.MonotonicSeq < res.FirstBreakAt {
+		if !res.OK && row.MonotonicSeq >= res.FirstBreakAt {
+			continue
+		}
+		key := copyKey{row.ID, row.SourceNodeID, row.Hash}
+		if row.Hash != "" && !seen[key] {
+			seen[key] = true
 			prefix = append(prefix, row)
 		}
 	}
 	return prefix, res.FirstBreakAt, res.Reason
+}
+
+// skippedUnsealed returns the unsealed rows verifiedPrefix left out without a
+// break: those below the batch's first break, if any.
+func skippedUnsealed(rows []Row, rejectedFromSeq int64) []Row {
+	var out []Row
+	for _, r := range rows {
+		if r.Hash == "" && (rejectedFromSeq == 0 || r.MonotonicSeq < rejectedFromSeq) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // txConn is what the ingest transaction runs on: a *sql.Tx, or a dedicated
@@ -100,14 +120,28 @@ func (l storedLookup) atSeq(ctx context.Context, tx txConn, node string, seq int
 	return r, err == nil, err
 }
 
+// sealedBelow reports whether the store holds a sealed row on node below seq.
+func (l storedLookup) sealedBelow(ctx context.Context, tx txConn, node string, seq int64) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx,
+		"SELECT 1 FROM "+l.table+" WHERE source_node_id = "+l.ph(1)+
+			" AND monotonic_seq < "+l.ph(2)+" AND hash <> '' LIMIT 1", node, seq).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // storedConflict returns the first row of a verified prefix that disagrees with
 // what the store already holds (spec §4): its seq and why, or 0. A row already
-// stored with the same hash is a re-delivery, not a conflict.
-func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix []Row) (int64, string, error) {
+// stored with the same hash is a re-delivery, not a conflict. An unsealed row
+// is a break when the store holds a sealed row for its node at a lower seq, as
+// VerifyChain would report it.
+func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix, unsealed []Row) (int64, string, error) {
 	// The stored neighbours are checked even when the batch holds one too: the
 	// batch neighbour may be cut by a later break, and if both are kept they
 	// must agree anyway.
-	ordered := append([]Row(nil), prefix...)
+	ordered := append(append([]Row(nil), prefix...), unsealed...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		if ordered[i].MonotonicSeq != ordered[j].MonotonicSeq {
 			return ordered[i].MonotonicSeq < ordered[j].MonotonicSeq
@@ -117,6 +151,14 @@ func storedConflict(ctx context.Context, tx txConn, l storedLookup, prefix []Row
 	seen := map[string]Row{}
 	for _, row := range ordered {
 		node, seq := row.SourceNodeID, row.MonotonicSeq
+		if row.Hash == "" {
+			if below, err := l.sealedBelow(ctx, tx, node, seq); err != nil {
+				return 0, "", err
+			} else if below {
+				return seq, fmt.Sprintf("row %s: no hash after the node's chain started", row.ID), nil
+			}
+			continue
+		}
 		// id is unique, so the store could keep only one row with it.
 		if first, ok := seen[row.ID]; ok {
 			return seq, fmt.Sprintf("row %s: also in this batch at seq %d on node '%s'", row.ID, first.MonotonicSeq, first.SourceNodeID), nil
@@ -171,13 +213,14 @@ func ingestReplicatedTx(
 	look storedLookup,
 ) (IngestResult, error) {
 	prefix, rejectedFromSeq, reason := verifiedPrefix(rows)
-	if len(prefix) == 0 {
+	unsealed := skippedUnsealed(rows, rejectedFromSeq)
+	if len(prefix) == 0 && len(unsealed) == 0 {
 		return IngestResult{Inserted: 0, RejectedFromSeq: rejectedFromSeq, Reason: reason}, nil
 	}
 	// The node locks don't cover ids, which are unique across nodes; if an
 	// ingest for another node stored one of these ids meanwhile, check again.
 	for range 3 {
-		res, err := ingestPrefix(ctx, db, prefix, rejectedFromSeq, reason, insertTx, look)
+		res, err := ingestPrefix(ctx, db, prefix, unsealed, rejectedFromSeq, reason, insertTx, look)
 		if !errors.Is(err, errStoredMeanwhile) {
 			return res, err
 		}
@@ -194,7 +237,7 @@ var errStoredMeanwhile = errors.New("row stored meanwhile")
 func ingestPrefix(
 	ctx context.Context,
 	db *sql.DB,
-	prefix []Row,
+	prefix, unsealed []Row,
 	rejectedFromSeq int64,
 	reason string,
 	insertTx func(context.Context, execContext, Row) (int64, error),
@@ -208,7 +251,7 @@ func ingestPrefix(
 	// §4): a conflicting row is reported, never ignored.
 	if look.lock != nil {
 		nodes := map[string]bool{}
-		for _, r := range prefix {
+		for _, r := range append(append([]Row(nil), prefix...), unsealed...) {
 			nodes[r.SourceNodeID] = true
 		}
 		sortedNodes := make([]string, 0, len(nodes))
@@ -223,7 +266,7 @@ func ingestPrefix(
 			}
 		}
 	}
-	conflictSeq, why, err := storedConflict(ctx, tx, look, prefix)
+	conflictSeq, why, err := storedConflict(ctx, tx, look, prefix, unsealed)
 	if err != nil {
 		rollback()
 		return IngestResult{}, err

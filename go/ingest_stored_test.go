@@ -264,7 +264,7 @@ func TestIngestOneIDOnTwoNodesInABatchIsRejected(t *testing.T) {
 	b := a
 	b.SourceNodeID = "node-b"
 	b = Seal("genesis", b)
-	res, err := ingestPrefix(context.Background(), s.db, []Row{a, b}, 0, "", s.insertReplicatedTx, s.lookup())
+	res, err := ingestPrefix(context.Background(), s.db, []Row{a, b}, nil, 0, "", s.insertReplicatedTx, s.lookup())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,6 +290,101 @@ func TestIngestOneIDTwiceOnOneNodeInABatchIsRejected(t *testing.T) {
 	if storedCount(t, s) != 0 {
 		t.Fatal("want nothing stored")
 	}
+}
+
+func TestIngestARowSentTwiceInABatchIsStoredOnce(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(3, "svc", "node-1")
+	res := ingestOK(t, s, []Row{rows[0], rows[1], rows[1], rows[2]})
+	if res.RejectedFromSeq != 0 || res.Inserted != 3 || storedCount(t, s) != 3 {
+		t.Fatalf("want 3 rows stored, got %+v, %d rows", res, storedCount(t, s))
+	}
+}
+
+// unsealedHead is an unsealed row at seq 1, then a sealed chain linked to
+// genesis.
+func unsealedHead() []Row {
+	rows := makeRemoteChain(3, "svc", "node-1")
+	rows[0].Hash, rows[0].PrevHash = "", ""
+	return append(rows[:1], resealFrom("genesis", rows[1:])...)
+}
+
+func TestIngestAnUnsealedRowBeforeTheChainIsNotInserted(t *testing.T) {
+	s := ingestStore(t)
+	res := ingestOK(t, s, unsealedHead())
+	if res.RejectedFromSeq != 0 || res.Inserted != 2 || storedCount(t, s) != 2 {
+		t.Fatalf("want rows 2 and 3 stored, got %+v, %d rows", res, storedCount(t, s))
+	}
+}
+
+func TestIngestAnUnsealedRowAfterTheChainStartsIsABreak(t *testing.T) {
+	s, rows := ingestStore(t), makeRemoteChain(5, "svc", "node-1")
+	rows[0].Hash, rows[0].PrevHash = "", ""
+	rows[4].Hash, rows[4].PrevHash = "", ""
+	batch := []Row{rows[0], resealFrom("genesis", rows[1:2])[0], rows[4]}
+	res := ingestOK(t, s, batch)
+	if res.RejectedFromSeq != 5 || res.Inserted != 1 || storedCount(t, s) != 1 {
+		t.Fatalf("want row 2 stored and a break at 5, got %+v, %d rows", res, storedCount(t, s))
+	}
+	if !strings.Contains(res.Reason, "no hash after the node's chain started") {
+		t.Fatalf("reason = %q", res.Reason)
+	}
+}
+
+// checkUnsealedAfterStoredRows checks that an unsealed row above a stored
+// sealed row on its node is a break, as VerifyChain reports it on the stored
+// chain, while one with no sealed row below it is skipped.
+func checkUnsealedAfterStoredRows(t *testing.T, newStore func() ingestQuerier) {
+	t.Helper()
+	ctx := context.Background()
+	rows := makeRemoteChain(6, "svc", "node-1")
+	u4 := rows[3]
+	u4.Hash, u4.PrevHash = "", ""
+	tail := resealFrom("genesis", rows[4:])
+	batches := map[string][]Row{"with rows after": {u4, tail[0], tail[1]}, "alone": {u4}}
+	for name, batch := range batches {
+		t.Run(name, func(t *testing.T) {
+			s := newStore()
+			if _, err := s.IngestReplicated(ctx, rows[:3]); err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.IngestReplicated(ctx, batch)
+			if err != nil || res.RejectedFromSeq != 4 || res.Inserted != 0 {
+				t.Fatalf("want a break at 4, got %+v, %v", res, err)
+			}
+			if want := "row " + u4.ID + ": no hash after the node's chain started"; res.Reason != want {
+				t.Fatalf("reason = %q", res.Reason)
+			}
+			if n := queryCount(t, s); n != 3 {
+				t.Fatalf("stored %d rows, want 3", n)
+			}
+		})
+	}
+	t.Run("nothing stored", func(t *testing.T) {
+		s := newStore()
+		res, err := s.IngestReplicated(ctx, unsealedHead())
+		if err != nil || res.RejectedFromSeq != 0 || res.Inserted != 2 || queryCount(t, s) != 2 {
+			t.Fatalf("want rows 2 and 3 stored, got %+v, %v", res, err)
+		}
+	})
+}
+
+// ingestQuerier is a store that ingests and can be queried.
+type ingestQuerier interface {
+	IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error)
+	Query(ctx context.Context, f Filter) ([]Row, error)
+}
+
+func queryCount(t *testing.T, s ingestQuerier) int {
+	t.Helper()
+	rows, err := s.Query(context.Background(), Filter{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows)
+}
+
+func TestIngestAnUnsealedRowAfterStoredRowsIsABreak(t *testing.T) {
+	checkUnsealedAfterStoredRows(t, func() ingestQuerier { return ingestStore(t) })
 }
 
 func TestIngestARowAfterAStoredUnsealedRowLinksToGenesis(t *testing.T) {

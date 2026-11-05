@@ -287,7 +287,10 @@ and `monotonic_seq`.
 
 - **Verified prefix, not all-or-nothing.** `ingest` verifies the incoming chain
   and inserts the longest verified prefix (the rows before the first break). It
-  MUST NOT raise on a break.
+  MUST NOT raise on a break. An unsealed row below its node's first sealed
+  row, in the batch and in the store, is not inserted (§5) and is not a break.
+  If the store holds a sealed row for its node at a lower seq, it is a break at
+  that row, with the reason `verify_chain` gives (§2).
 - **`IngestResult`** reports:
   - `inserted`: rows passed to the idempotent insert,
   - `rejected_from_seq`: the `monotonic_seq` of the first broken row, or null
@@ -304,7 +307,8 @@ and `monotonic_seq`.
   `hash` the stored row at `seq + 1` does not link to. Since `id` is unique,
   a repeat of an `id` within a batch on another node is a break at the later
   row; on the same node, `verify_chain` already breaks at the lower seq when
-  the copies differ (§3). `ingest` MUST
+  the copies differ (§3), and copies with the same `hash` are a re-delivery,
+  inserted once. `ingest` MUST
   NOT keep one version silently: an insert skipped because another writer
   stored that `id` in the meantime is checked again, not counted as inserted.
   A row stored with the same `hash` is a re-delivery.

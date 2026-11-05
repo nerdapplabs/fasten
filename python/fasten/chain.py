@@ -227,11 +227,12 @@ class ChainVerifyResult:
 def _row_break(row: "AuditRow") -> Optional[str]:
     """Check a sealed row on its own: its form, its detail commitment and its
     hash. Returns why it fails, or None if it checks out."""
-    form_id = str(row.canonical_form_id)
+    # A row without the field predates it, so it is form "1" (spec §1.5).
+    form_id = str(row.canonical_form_id or "1")
     hash_fn = _HASH_FN_BY_FORM.get(form_id)
     if hash_fn is None:
         return f'row {row.id}: unknown canonical_form_id "{form_id}"'
-    row_d = {k: v for k, v in row.to_dict().items()}
+    row_d = {**row.to_dict(), "canonical_form_id": form_id}
 
     # Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
     # sealed with DEL in a hashed string matches only that way. Each check
