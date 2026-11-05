@@ -220,6 +220,36 @@ def test_structlog_event_and_stdlib_extras_are_redacted(initialized, capsys):
         logging.getLogger().setLevel(saved_level)
 
 
+
+def test_structlog_configure_before_init_uses_init_redaction(mem_store, monkeypatch, capsys):
+    """configure() before init() still applies init's redaction keys."""
+    pytest.importorskip("structlog")
+    import structlog
+    from fasten.shim.structlog import configure
+
+    for name in ("FASTEN_REDACT_KEYS", "FASTEN_REDACT_REPLACEMENT",
+                 "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"):
+        monkeypatch.delenv(name, raising=False)
+    saved_handlers = list(logging.getLogger().handlers)
+    saved_level = logging.getLogger().level
+    try:
+        configure(json=True, quiet=(), extra_redact_keys=["ssn"])
+        fasten.init(service_id="test-svc", node_id="test-node", audit_store=mem_store,
+                    audit_store_failure_strategy="raise", extra_redact_keys=["badge"])
+        structlog.get_logger().info("late_init_event", badge="B-1234", ssn="123-45-6789")
+        out = capsys.readouterr().out
+        assert "B-1234" not in out and "123-45-6789" not in out
+        assert '"badge": "***"' in out
+
+        # Guard only: the syslog store also redacts with the engine's redactor.
+        logging.getLogger("app").info("late_init_stdlib", extra={"badge": "B-5678", "ssn": "1"})
+        rows = fasten.transport().query_syslog(limit=20)
+        row = next(r for r in rows if r.get("event") == "late_init_stdlib")
+        assert row["badge"] == "***" and row["ssn"] == "***"
+    finally:
+        logging.getLogger().handlers = saved_handlers
+        logging.getLogger().setLevel(saved_level)
+
 # Meta.id is optional; register() fills it from the dict key
 
 def test_register_dict_form_fills_id_from_key():

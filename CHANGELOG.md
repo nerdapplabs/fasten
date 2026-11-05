@@ -32,6 +32,77 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   drainer retries it, and it maps to `ErrBackend`. The C ABI is unchanged.
 - `PostgresStore::redact_rows` returns only the ids it redacted.
 
+### Fixed: `fasten doctor` absolute SQLite paths and structlog redaction after init (Python)
+
+- `fasten doctor` reads the audit DSN path as the SQLite store does, so
+  `sqlite:////abs/audit.db` and a bare `/abs/audit.db` are checked at that
+  path instead of being reported as not found. The api DSN check takes its
+  path from the same helper as the stream store, so a DSN such as
+  `./api;v2.db` is checked at `./api`. The path it prints is the path it
+  checks.
+- `fasten.shim.structlog.configure()` uses the engine's current redactor for
+  each event, so redaction settings from an `init()` that runs after
+  `configure()` apply to structlog output and the stdlib bridge.
+
+### Fixed: re-init drainer handoff and idle drainer (JS)
+
+- Re-`init()` keeps the old drainer visible to `flush()` and `close()` until
+  it has stopped. `close()` stops it within its own timeout and resolves
+  false if it lost rows, and re-init emits `audit_drain_install_incomplete`
+  when the old drainer's flush timed out or rows were not stored.
+- A re-`init()` to raise mode, or with no store, flushes the old drainer for
+  up to 5 s too, instead of giving a row in backoff one try. Rows it loses
+  are reported with `audit_drain_lost_at_stop` and
+  `audit_drain_install_incomplete`; a later `close()` reports only rows lost
+  during that close, as in Python and Go.
+- `resetForTests()` also stops the drainers a re-init is retiring, and
+  resolves once they have stopped.
+- An idle drainer waits for the next row instead of polling, so it no longer
+  uses CPU or keeps the process from exiting.
+- The phase-1 stdout audit line carries `prev_hash: ""` and `hash: ""`.
+- `index.d.ts` adds `redactReplacement` and `queueDrainMaxAttempts` to
+  `InitOptions`, the dead-letter and `capacity_semantics` fields to
+  `QueueStats`, and `wire_version` to `Row`.
+
+### Fixed: form-2 rows read back from stdout and the reader verify (Go)
+
+- The sealed stdout line and the `/audit`, `/correlate` and `/search`
+  responses now carry `detail_salt` and `detail_commitment`. Without them a
+  form-2 row read back from either place failed `VerifyChain` in Go and
+  Python and could not be ingested again.
+- Canonical JSON writes DEL (0x7f) as `\u007f`, as Python's `json.dumps`
+  does, so a row holding that byte hashes the same in Go and Python.
+- Rows Go sealed earlier with DEL left raw still verify, in Go and Python:
+  when the commitment or hash misses, the check is retried with DEL raw
+  (spec §1.2).
+- The Go workflow also runs when `spec/` changes, since Go tests read it.
+
+### Fixed: redact values when the core can't parse the input (C++)
+
+- Strings are now written as valid UTF-8 JSON: bytes that are not valid
+  UTF-8 become U+FFFD, so the core can redact detail and log fields that
+  contain them. Before, such fields were returned unredacted.
+- If the core still returns an error, every value is replaced with the
+  redaction token (keys are kept) and a `redact_failed` sys event with
+  `error_type` is written to stderr and the sys ring.
+- `fasten::flush()` during a re-init also waits for the drainer being
+  replaced, not only the new one.
+- The core drainer's sys events (`audit_drain_*`, `audit_queue_*`) now go
+  through the SDK's sys log, redacted, so they reach `query_syslog()` as
+  well as stderr. Their numbers and booleans stay JSON numbers and
+  booleans on the stderr line.
+- `fasten::flush()` with under 1 ms left, including `flush(0)`, no longer
+  waits with no timeout: each drainer gets at least 1 ms, so it returns
+  true at once when nothing is queued and false after 1 ms when rows are
+  still pending.
+- `fasten::flush()` while a re-init is stopping the old drainer waits for
+  the stop to finish, and returns false if it does not finish in time.
+- A re-init whose old drainer did not flush in time, or held rows that
+  were not stored, emits `audit_drain_install_incomplete` with `flushed`
+  and `unstored`.
+- When the core returns an error, an `AUDIT_ROW_REDACTED` row keeps its
+  numeric `redacted_seq`.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to
