@@ -111,6 +111,13 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME redact_env_keys_smoke COMMAND redact_env_keys_smoke)
 
+    add_executable(redact_invalid_utf8_smoke tests/redact_invalid_utf8_smoke.cpp)
+    target_link_libraries(redact_invalid_utf8_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(redact_invalid_utf8_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME redact_invalid_utf8_smoke COMMAND redact_invalid_utf8_smoke)
+
     # Cases from spec/redact-conformance.json.
     add_executable(redact_conformance_smoke tests/redact_conformance_smoke.cpp)
     target_link_libraries(redact_conformance_smoke PRIVATE fasten)
