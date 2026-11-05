@@ -1,4 +1,4 @@
-"""PostgreSQL AuditRepository (psycopg 3). Needs ``pip install "fasten[postgres]"``.
+"""PostgreSQL AuditRepository (psycopg 3). Needs ``pip install "fasten-sdk[postgres]"``.
 
 DSN: ``postgres[ql]://user:pass@host/db?table=X``. The table is created on
 first use.

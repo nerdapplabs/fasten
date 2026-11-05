@@ -323,7 +323,7 @@ def run(
         from rich.live import Live
     except ImportError:
         sys.stderr.write(
-            "fasten TUI requires `rich` — install via `pip install fasten[tui]`\n"
+            "fasten TUI requires `rich` — install via `pip install "fasten-sdk[tui]"`\n"
         )
         return 2
 

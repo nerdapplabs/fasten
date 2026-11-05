@@ -1729,7 +1729,7 @@ pub use postgres_store::PostgresStore;
 
 // Yaml catalogs, behind the `codes-yaml` feature:
 //
-//   fasten = { version = "1", features = ["codes-yaml"] }
+//   fasten-sdk = { version = "1", features = ["codes-yaml"] }
 //   fasten::codes::load("fleet.codes.yaml")?;
 //   fasten::codes::reload()?;
 
