@@ -6,6 +6,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `fasten doctor` absolute SQLite paths and structlog redaction after init (Python)
+
+- `fasten doctor` reads the audit DSN path as the SQLite store does, so
+  `sqlite:////abs/audit.db` and a bare `/abs/audit.db` are checked at that
+  path instead of being reported as not found. The api DSN check takes its
+  path from the same helper as the stream store, so a DSN such as
+  `./api;v2.db` is checked at `./api`. The path it prints is the path it
+  checks.
+- `fasten.shim.structlog.configure()` uses the engine's current redactor for
+  each event, so redaction settings from an `init()` that runs after
+  `configure()` apply to structlog output and the stdlib bridge.
+
 ### Fixed: re-init drainer handoff and idle drainer (JS)
 
 - Re-`init()` keeps the old drainer visible to `flush()` and `close()` until
