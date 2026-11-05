@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 from ..store.sqlite import sqlite_dsn_path
 
@@ -158,15 +158,14 @@ def _check_api_dsn() -> CheckResult:
         )
     # Same scheme test and SQLite path as the engine's stream store.
     try:
-        u = urlsplit(dsn)
+        scheme = urlparse(dsn).scheme.lower()
     except ValueError:
         return CheckResult(name="api_dsn", status="fail", message="unparseable DSN")
-    scheme = u.scheme.lower()
     if scheme not in ("sqlite", "postgres", "postgresql", ""):
         return CheckResult(name="api_dsn", status="fail",
                            message=f"unsupported DSN scheme {scheme!r}")
-    path = u.path[1:] if scheme and u.path.startswith("/") else u.path
-    return _check_store("api_dsn", dsn, scheme in ("postgres", "postgresql"), path, "api_log")
+    return _check_store("api_dsn", dsn, scheme in ("postgres", "postgresql"),
+                        sqlite_dsn_path(dsn), "api_log")
 
 
 def _check_catalog() -> CheckResult:
