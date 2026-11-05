@@ -101,8 +101,10 @@ struct SdkStoreAdapter(Arc<dyn AuditStore>);
 impl fasten_core::store::Store for SdkStoreAdapter {
     fn insert(&self, row: &fasten_core::Row) -> Result<(), fasten_core::Error> {
         let sdk_row = core_to_sdk_row(row);
+        // Type only: a store error message can quote row values. The
+        // drainer retries the row.
         self.0.insert(&sdk_row)
-            .map_err(|e| fasten_core::Error::InvalidTableName(e.to_string()))
+            .map_err(|e| fasten_core::Error::Store(crate::retention::error_type(&e).into()))
     }
     fn ping(&self) -> Result<(), fasten_core::Error> { Ok(()) }
     fn query(&self, _: &fasten_core::store::Filter)
@@ -166,7 +168,7 @@ impl Engine {
         *self.config.lock_or_recover() = Some(cfg_stored.clone());
 
         // Spec §8.1: say once per init that rows are not chained.
-        self.log_sys("error", "audit_chain_unavailable", serde_json::json!({
+        self.sys_event("error", "audit_chain_unavailable", serde_json::json!({
             "reason": "the Rust SDK does not seal rows (spec 2.1); rows are written unsealed",
         }));
 
@@ -213,8 +215,16 @@ impl Engine {
         let new = Drainer::new(Box::new(SdkStoreAdapter(store)), cfg);
         let old = { let mut slot = self.drainer.lock_or_recover(); slot.replace(new) };
         if let Some(old) = old {
-            old.flush(Duration::from_secs(5));
+            let unstored_before = old.unstored_total();
+            let flushed = old.flush(Duration::from_secs(5));
             old.stop(Duration::from_secs(2));
+            let unstored = old.unstored_total() - unstored_before;
+            if !flushed || unstored > 0 {
+                self.sys_event("warn", "audit_drain_install_incomplete", serde_json::json!({
+                    "flushed": flushed,
+                    "unstored": unstored,
+                }));
+            }
         }
     }
 
@@ -242,19 +252,58 @@ impl Engine {
         *self.config.lock_or_recover() = None;
     }
 
+    /// Write a log line (`fasten::log`) to stdout.
     pub fn log_sys(&self, level: &str, event: &str, fields: serde_json::Value) {
-        let service_id = self.current_config().map(|c| c.service_id).unwrap_or_default();
-        sys_line(&service_id, level, event, fields);
+        let cfg = self.config.lock_or_recover().clone();
+        write_sys(true, cfg.as_ref(), level, event, fields);
+    }
+
+    /// Write an SDK sys event to stderr.
+    pub(crate) fn sys_event(&self, level: &str, event: &str, fields: serde_json::Value) {
+        let cfg = self.config.lock_or_recover().clone();
+        sys_line(cfg.as_ref(), level, event, fields);
+    }
+
+    /// Store a row the drainer refused. A failure is reported, not returned.
+    pub(crate) fn store_inline(&self, store: &dyn AuditStore, row: &crate::Row) {
+        match store.insert(row) {
+            // Follows the drainer's audit_drain_abandoned.
+            Ok(()) => self.sys_event("info", "audit_drain_stored_inline", serde_json::json!({
+                "row_id": row.id,
+            })),
+            Err(e) => self.fallback_failed(row, e),
+        }
+    }
+
+    /// Report a queue-mode row submit could not store inline.
+    pub(crate) fn fallback_failed(&self, row: &crate::Row, e: Error) {
+        // Type only: a store error message can quote row values.
+        self.sys_event("error", "audit_sync_fallback_failed", serde_json::json!({
+            "error_type": crate::retention::error_type(&e),
+            "row_id": row.id,
+        }));
     }
 }
 
-pub(crate) fn sys_line(service_id: &str, level: &str, event: &str, fields: serde_json::Value) {
+/// Write an SDK sys event to stderr.
+pub(crate) fn sys_line(cfg: Option<&Config>, level: &str, event: &str, fields: serde_json::Value) {
+    write_sys(false, cfg, level, event, fields);
+}
+
+// The whole line is redacted: a secret can be in any field.
+fn write_sys(
+    stdout: bool,
+    cfg: Option<&Config>,
+    level: &str,
+    event: &str,
+    fields: serde_json::Value,
+) {
     let mut payload = serde_json::json!({
         "shape": "sys",
         "level": level,
         "event": event,
         "request_id": current_request_id().unwrap_or_default(),
-        "service_id": service_id,
+        "service_id": cfg.map(|c| c.service_id.as_str()).unwrap_or_default(),
         "timestamp": crate::canonical_ts(&Utc::now()),
     });
     if let serde_json::Value::Object(merge_into) = &mut payload {
@@ -262,13 +311,29 @@ pub(crate) fn sys_line(service_id: &str, level: &str, event: &str, fields: serde
             for (k, v) in extra { merge_into.insert(k, v); }
         }
     }
+    let payload = crate::redact_value(
+        &payload,
+        cfg.and_then(|c| c.extra_redact_keys.as_deref()),
+        cfg.and_then(|c| c.redact_replacement.as_deref()),
+    );
     #[cfg(test)]
-    SYS_CAPTURE.lock_or_recover().push(payload.clone());
-    println!("{payload}");
+    {
+        SYS_CAPTURE.lock_or_recover().push(payload.clone());
+        if stdout {
+            SYS_STDOUT.lock_or_recover().push(payload.clone());
+        }
+    }
+    if stdout {
+        println!("{payload}");
+    } else {
+        eprintln!("{payload}");
+    }
 }
 
 #[cfg(test)]
 pub(crate) static SYS_CAPTURE: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static SYS_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
 impl Default for Engine {
     fn default() -> Self { Self::new() }
@@ -276,3 +341,31 @@ impl Default for Engine {
 
 /// The engine behind the free functions (`init`, `flush`, ...).
 pub static DEFAULT: Engine = Engine::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fasten_core::store::Store;
+
+    struct FailStore;
+    impl AuditStore for FailStore {
+        fn insert(&self, _: &crate::Row) -> Result<(), Error> {
+            Err(Error::AuditStoreInsert("down".into()))
+        }
+    }
+
+    // A failed insert is retried and reported by its type.
+    #[test]
+    fn adapter_maps_store_errors_to_retryable() {
+        crate::register("adapter".into(), [("ADAPTER_EVENT".into(), crate::Meta {
+            domain: "adapter".into(),
+            ..Default::default()
+        })])
+        .unwrap();
+        let cfg = Config { service_id: "s".into(), node_id: "n".into(), ..Default::default() };
+        let row = crate::EmitBuilder::new("ADAPTER_EVENT", "t").build_row(&cfg).unwrap();
+        let row = sdk_row_to_core(&row);
+        let err = SdkStoreAdapter(Arc::new(FailStore)).insert(&row).unwrap_err();
+        assert!(matches!(&err, fasten_core::Error::Store(t) if t == "AuditStoreInsert"), "{err:?}");
+    }
+}

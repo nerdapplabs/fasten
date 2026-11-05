@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import secrets
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -34,9 +35,31 @@ if TYPE_CHECKING:
 CURRENT_CANONICAL_FORM_ID = "2"
 
 
-def _canonical_json(d: dict[str, Any]) -> bytes:
+def _canonical_json(d: Any) -> bytes:
     """Canonical JSON for hash chain: sorted keys, no whitespace, None->null."""
     return json.dumps(d, sort_keys=True, separators=(',', ':'), default=str).encode()
+
+
+# Matched left to right, so an escaped backslash (\\) is taken whole and the
+# text \u007f, which JSON writes as \\u007f, is left as it is.
+_BACKSLASH_OR_DEL_ESCAPE = re.compile(r"\\\\|\\u007f")
+
+
+def _canonical_json_raw_del(d: Any) -> bytes:
+    """``_canonical_json`` with DEL (0x7f) left raw, as the Go SDK wrote it
+    before it escaped DEL as ``\\u007f``. Verification fallback only, never
+    used to seal."""
+    s = json.dumps(d, sort_keys=True, separators=(',', ':'), default=str)
+    return _BACKSLASH_OR_DEL_ESCAPE.sub(
+        lambda m: "\x7f" if m.group() == "\\u007f" else m.group(), s).encode()
+
+
+_Canon = Callable[[Any], bytes]
+
+
+def _has_del(row_dict: dict[str, Any]) -> bool:
+    """Whether any string the row hashes holds DEL."""
+    return "\x7f" in json.dumps(row_dict, default=str, ensure_ascii=False)
 
 
 # detail_salt and detail_commitment belong to form "2" and are not hashed
@@ -54,7 +77,11 @@ def detail_commitment(salt: str, detail: Any) -> str:
     Without the salt a short value such as an email address could be
     recovered by guessing, so redaction clears the salt along with detail.
     """
-    return hashlib.sha256(salt.encode() + _canonical_json(detail)).hexdigest()
+    return _detail_commitment(salt, detail, _canonical_json)
+
+
+def _detail_commitment(salt: str, detail: Any, canon: _Canon) -> str:
+    return hashlib.sha256(salt.encode() + canon(detail)).hexdigest()
 
 
 _TS_HASHED_FIELDS = ("timestamp",)
@@ -90,13 +117,13 @@ def _to_hashed_form(d: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _row_hash_form_1(row_dict: dict[str, Any]) -> str:
+def _row_hash_form_1(row_dict: dict[str, Any], canon: _Canon = _canonical_json) -> str:
     """Form "1": hash of the row with timestamps in isoformat form."""
     d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
-    return hashlib.sha256(_canonical_json(_to_hashed_form(d))).hexdigest()
+    return hashlib.sha256(canon(_to_hashed_form(d))).hexdigest()
 
 
-def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
+def _row_hash_form_1_legacy_z(row_dict: dict[str, Any], canon: _Canon = _canonical_json) -> str:
     """Form "1" as Python ACTUALLY sealed it before the §1.2 conformance fix.
 
     Python hashed the wire timestamp verbatim (always-``Z``) while the spec and
@@ -109,18 +136,20 @@ def _row_hash_form_1_legacy_z(row_dict: dict[str, Any]) -> str:
     form "1" is retired.
     """
     d = _hashed_fields(row_dict, _FORM_1_EXCLUDED)
-    return hashlib.sha256(_canonical_json(d)).hexdigest()
+    return hashlib.sha256(canon(d)).hexdigest()
 
 
-def _row_hash_form_2(row_dict: dict[str, Any]) -> str:
+def _row_hash_form_2(row_dict: dict[str, Any], canon: _Canon = _canonical_json) -> str:
     """Form "2" (spec 1.4): ``detail_commitment`` is hashed instead of
     ``detail``, so detail can be cleared without changing the hash."""
     # Timestamps are hashed as written on the wire; no _to_hashed_form.
     d = _hashed_fields(row_dict, _FORM_2_EXCLUDED)
-    return hashlib.sha256(_canonical_json(d)).hexdigest()
+    return hashlib.sha256(canon(d)).hexdigest()
 
 
-def _row_hashes_over_shipped_at(form_id: str, row_dict: dict[str, Any]) -> list[str]:
+def _row_hashes_over_shipped_at(
+    form_id: str, row_dict: dict[str, Any], canon: _Canon = _canonical_json,
+) -> list[str]:
     """Hashes of a row sealed with ``shipped_at`` already set, as every form
     hashed it before §1.1 nulled it: the stored value, rendered like the
     timestamp next to it. Emit never sealed such rows; a caller passing
@@ -133,16 +162,16 @@ def _row_hashes_over_shipped_at(form_id: str, row_dict: dict[str, Any]) -> list[
         hashed = _to_hashed_form(d)
         hashed["shipped_at"] = _hashed_ts(d["shipped_at"])
         # The second is the legacy-"Z" spelling (#91), both fields verbatim.
-        return [hashlib.sha256(_canonical_json(x)).hexdigest() for x in (hashed, d)]
+        return [hashlib.sha256(canon(x)).hexdigest() for x in (hashed, d)]
     if form_id == "2":
         d = {k: v for k, v in row_dict.items() if k not in _FORM_2_EXCLUDED}
-        return [hashlib.sha256(_canonical_json(d)).hexdigest()]
+        return [hashlib.sha256(canon(d)).hexdigest()]
     return []
 
 
 # A new form is added here and stamped in seal(). verify_chain rejects ids
 # not in this map.
-_HASH_FN_BY_FORM: dict[str, Callable[[dict[str, Any]], str]] = {
+_HASH_FN_BY_FORM: dict[str, Callable[[dict[str, Any], _Canon], str]] = {
     "1": _row_hash_form_1,
     "2": _row_hash_form_2,
 }
@@ -152,7 +181,7 @@ def _row_hash(row_dict: dict[str, Any]) -> str:
     """Hash a row dict with its canonical_form_id's function, or the current
     form if it has none. Raises KeyError on an unknown id."""
     form_id = str(row_dict.get("canonical_form_id", CURRENT_CANONICAL_FORM_ID))
-    return _HASH_FN_BY_FORM[form_id](row_dict)
+    return _HASH_FN_BY_FORM[form_id](row_dict, _canonical_json)
 
 
 def seal(prev_hash: str, row: "AuditRow") -> "AuditRow":
@@ -204,6 +233,20 @@ def _row_break(row: "AuditRow") -> Optional[str]:
         return f'row {row.id}: unknown canonical_form_id "{form_id}"'
     row_d = {k: v for k, v in row.to_dict().items()}
 
+    # Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
+    # sealed with DEL in a hashed string matches only that way. Each check
+    # below is retried with DEL raw on a miss; nothing else about the
+    # encoding changes. Looking for DEL costs an encode, so only a miss pays.
+    has_del: Optional[bool] = None
+
+    def matches(check: Callable[[_Canon], bool]) -> bool:
+        nonlocal has_del
+        if check(_canonical_json):
+            return True
+        if has_del is None:
+            has_del = _has_del(row_d)
+        return has_del and check(_canonical_json_raw_del)
+
     # Form "2" hashes detail_commitment, not detail, so a changed detail
     # with the commitment left as it was still matches the hash. While
     # detail and its salt are present, recompute the commitment and
@@ -217,24 +260,31 @@ def _row_break(row: "AuditRow") -> Optional[str]:
         if not row.detail_salt:
             return (f"row {row.id}: detail present but detail_salt "
                     "is missing — commitment cannot be verified")
-        recomputed = detail_commitment(row.detail_salt, row.detail)
-        if recomputed != (row.detail_commitment or ""):
+        salt = row.detail_salt
+        if not matches(lambda c: _detail_commitment(salt, row.detail, c)
+                       == (row.detail_commitment or "")):
             return f"row {row.id}: detail does not match its commitment"
 
-    expected = hash_fn(row_d)
-    if expected != row.hash and form_id == "1":
-        # Before #91, Python sealed form "1" over the wire "Z" spelling.
-        # Accept it rather than report our own spec fix as tampering.
-        if _row_hash_form_1_legacy_z(row_d) == row.hash:
-            expected = row.hash
-    if expected != row.hash and row.shipped_at is not None:
-        # Sealed with shipped_at already set, before §1.1 hashed it as
-        # null. Such a row matches only over its exact stored value.
-        if row.hash in _row_hashes_over_shipped_at(form_id, row_d):
-            expected = row.hash
-    if expected != row.hash:
+    if not matches(lambda c: _hash_matches(row, form_id, hash_fn, row_d, c)):
         return f"row {row.id}: hash mismatch"
     return None
+
+
+def _hash_matches(row: "AuditRow", form_id: str,
+                  hash_fn: Callable[[dict[str, Any], _Canon], str],
+                  row_d: dict[str, Any], canon: _Canon) -> bool:
+    """Whether row.hash is the row's hash under canon, its form's own or one
+    of the fallbacks below."""
+    if hash_fn(row_d, canon) == row.hash:
+        return True
+    # Before #91, Python sealed form "1" over the wire "Z" spelling.
+    # Accept it rather than report our own spec fix as tampering.
+    if form_id == "1" and _row_hash_form_1_legacy_z(row_d, canon) == row.hash:
+        return True
+    # Sealed with shipped_at already set, before §1.1 hashed it as
+    # null. Such a row matches only over its exact stored value.
+    return (row.shipped_at is not None
+            and row.hash in _row_hashes_over_shipped_at(form_id, row_d, canon))
 
 
 def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":

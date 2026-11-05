@@ -60,7 +60,30 @@ def test_sqlite_dsn_shows_its_path(doctor_env, monkeypatch, capsys):
     SQLiteStore.from_dsn("sqlite:///./audit.db")
     monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite:///./audit.db")
     out = _run(capsys)
-    assert "sqlite /./audit.db (connected" in out
+    assert "sqlite ./audit.db (connected" in out
+
+
+
+@pytest.mark.parametrize("form", ["sqlite:///{}", "{}", "sqlite:///./{}"])
+def test_absolute_and_relative_sqlite_dsns_are_opened(doctor_env, monkeypatch, capsys, tmp_path, form):
+    path = tmp_path / "abs.db" if form != "sqlite:///./{}" else "abs.db"
+    sqlite3.connect(tmp_path / "abs.db").execute("CREATE TABLE audit_log (id TEXT)")
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", form.format(path))
+    out = _run(capsys)
+    assert "SQLite file not found" not in out
+    assert "(connected, sample query returned 0 row[s])" in out
+
+
+@pytest.mark.parametrize("form", ["./api;v2.db", "api.db", "sqlite:///./api.db",
+                                  "sqlite:///{}/api.db", "{}/api.db"])
+def test_api_dsn_probes_the_path_the_stream_store_opens(
+        doctor_env, monkeypatch, capsys, tmp_path, form):
+    from fasten.engine import _stream_store_from_dsn
+    dsn = form.format(tmp_path)
+    store = _stream_store_from_dsn(dsn, "api_log")
+    monkeypatch.setenv("FASTEN_API_DSN", dsn)
+    out = _run(capsys)
+    assert f"api_dsn       sqlite {store._path} (connected" in out
 
 
 def test_a_missing_sqlite_file_fails_and_is_not_created(doctor_env, monkeypatch, capsys, tmp_path):

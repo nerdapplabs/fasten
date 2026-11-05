@@ -140,12 +140,10 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
         return PostgresStreamStore.from_dsn(dsn, default_table)
     from .store.stream import StreamStore
 
+    from .store.sqlite import sqlite_dsn_path
+
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
-    # SQLAlchemy-style paths: strip only the one separator slash, so
-    # sqlite:///rel.db is relative and sqlite:////abs/path.db is absolute.
-    path = u.path
-    if u.scheme and path.startswith("/"):
-        path = path[1:]
+    path = sqlite_dsn_path(dsn)
     if not path:
         raise ValueError(
             f"fasten: stream DSN {dsn!r} has no path. Use sqlite:///./streams.db"
@@ -729,7 +727,7 @@ class Engine:
                                 "reason": "no_drainer", "row_id": row.id,
                             })
                         elif d.gen != gen:
-                            pass    # init is switching stores: store it inline in the new one
+                            pass    # init is switching stores: store it inline in the one read above
                         else:
                             store = d.store
                             with d.lock:
