@@ -6,6 +6,39 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: drainer stop, re-init and sys events (Swift)
+
+- A row the drainer refuses because it has stopped (a re-init or `close()`
+  raced the emit) is stored inline, with `audit_drain_abandoned` then
+  `audit_drain_stored_inline`. Before, it was dropped without a log line.
+- `configure()` on a running engine swaps in the new drainer under the engine
+  lock before stopping the old one, so an emit during re-init always reaches a
+  drainer. It logs `audit_drain_install_incomplete` when the old drainer's
+  rows were not stored, counting from the swap, so a dead letter from
+  earlier is not counted and one right after the swap is.
+- New `Fasten.close(timeout:)` flushes for up to half the timeout, as Python,
+  Go and JS do, then stops the drainer per spec §10. Queued rows get one
+  attempt each, an insert in progress is waited for, and rows not stored are
+  logged as `audit_drain_lost_at_stop` and make `close()` return false. It
+  also stops old drainers a re-init is still retiring, all within the one
+  timeout, and returns false if any of them lost a row, counting from before
+  any of them stopped.
+- An insert still running at the close deadline is reported lost but keeps
+  running. If it then stores its row, `audit_drain_recovered_at_stop` with
+  `row_ids` follows, as in Python. A lost report can be a false alarm; a
+  loss is never missed. The drain thread keeps the drainer alive until that
+  insert returns.
+- The drainer now logs the spec §4 events: `audit_queue_high_water`,
+  `audit_queue_near_full`, `audit_drain_failed`, `audit_drain_degraded`,
+  `audit_drain_recovered`, `audit_drain_dead_letter` and
+  `audit_drain_abandoned`, through the redacted log path.
+- `flush()` counts dead-lettered and lost rows as settled (spec §6), so it no
+  longer times out on a row that was dead-lettered while pending. It returns
+  only after the row's event is logged and the depth is updated.
+- `last_error` in the drainer stats is `"<ErrorType>: <message>"`.
+- Rows and sys log lines read the service id, node id and redactor under
+  the engine lock, so a concurrent `configure()` can't tear them.
+
 ### Fixed: queued rows, sys and log lines, re-init report (Rust)
 
 - `submit()` stores a row inline when the drainer is stopping and refuses it,
