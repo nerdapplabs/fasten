@@ -462,15 +462,18 @@ export class PostgresStore {
 	 */
 	async purge({ before, respectUnshipped = true }) {
 		await this._ensureReady();
-		// Rows at seq 0 are not chained and go by age alone.
+		// Rows at seq 0 are not chained and go by age alone. Each node's
+		// lowest kept seq is one walk up the (source_node_id, monotonic_seq)
+		// index; the LIMIT keeps the planner from repeating it per row.
 		const t = this._table;
 		const keep = `timestamp >= $1${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
-		const shipped = respectUnshipped ? " AND shipped_at IS NOT NULL" : "";
+		const shipped = respectUnshipped ? " AND d.shipped_at IS NOT NULL" : "";
+		const max = "9223372036854775807";
 		const sql =
-			`DELETE FROM ${t} WHERE id IN (SELECT d.id FROM ${t} AS d ` +
-			`LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM ${t} ` +
-			`WHERE monotonic_seq > 0 AND (${keep}) GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id ` +
-			`WHERE d.timestamp < $1${shipped} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))`;
+			`WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM ${t} UNION ALL ` +
+			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
+			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
+			`DELETE FROM ${t} AS d USING bound WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < $1${shipped}`;
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
 	}

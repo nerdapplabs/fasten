@@ -408,7 +408,7 @@ impl Store for PostgresStore {
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
-        let sql = purge_sql(&self.table, "$1", respect_unshipped);
+        let sql = purge_sql(&self.table, "$1", respect_unshipped, true);
         self.with_reconnect(|inner| {
             inner
                 .client

@@ -194,21 +194,36 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 /// lowest seq it keeps, a row at or after the cutoff or, with
 /// `respect_unshipped`, an unshipped row, so what is left is a seq suffix.
 /// Rows at seq 0 are not chained and go by age alone. `param` is the
-/// cutoff's placeholder. Same in SQLite and Postgres.
-pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool) -> String {
+/// cutoff's placeholder.
+///
+/// Each node's lowest kept seq is one walk up the (source_node_id,
+/// monotonic_seq) index, and the LIMIT keeps the planner from repeating it
+/// per row. Postgres deletes with USING; SQLite has no USING, so it matches
+/// ids.
+pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
     let (unshipped, shipped) = if respect_unshipped {
-        (" OR shipped_at IS NULL", " AND shipped_at IS NOT NULL")
+        (" OR shipped_at IS NULL", " AND d.shipped_at IS NOT NULL")
     } else {
         ("", "")
     };
-    format!(
-        "DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d \
-         LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} \
-         WHERE monotonic_seq > 0 AND (timestamp >= {param}{unshipped}) GROUP BY source_node_id) AS k \
-         ON k.source_node_id = d.source_node_id \
-         WHERE d.timestamp < {param}{shipped} \
-         AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
-    )
+    let max = i64::MAX;
+    let bound = format!(
+        "WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM {table} UNION ALL \
+         SELECT (SELECT MIN(source_node_id) FROM {table} WHERE source_node_id > node) \
+         FROM nodes WHERE node IS NOT NULL), \
+         bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM {table} WHERE source_node_id = node \
+         AND monotonic_seq > 0 AND (timestamp >= {param}{unshipped}) ORDER BY monotonic_seq LIMIT 1), \
+         {max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT {max}) "
+    );
+    let matches = format!(
+        "d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from \
+         AND d.timestamp < {param}{shipped}"
+    );
+    if postgres {
+        format!("{bound}DELETE FROM {table} AS d USING bound WHERE {matches}")
+    } else {
+        format!("DELETE FROM {table} WHERE id IN ({bound}SELECT d.id FROM bound, {table} AS d WHERE {matches})")
+    }
 }
 
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {

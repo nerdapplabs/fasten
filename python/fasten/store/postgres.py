@@ -561,7 +561,7 @@ class PostgresStore:
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
         from .repo import purge_sql
-        sql = purge_sql(self._table, "%s", respect_unshipped)
+        sql = purge_sql(self._table, "%s", respect_unshipped, postgres=True)
         params = [_utc_iso(before)] * sql.count("%s")
 
         def _run(conn: Any) -> int:

@@ -311,7 +311,7 @@ impl Store for SqliteStore {
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
-        let sql = purge_sql(&self.table, "?1", respect_unshipped);
+        let sql = purge_sql(&self.table, "?1", respect_unshipped, false);
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.execute(&sql, rusqlite::params![before])?;
         Ok(n as u64)

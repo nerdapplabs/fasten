@@ -317,8 +317,10 @@ pub unsafe extern "C" fn fasten_store_mark_shipped(
 /// Delete rows whose `timestamp` is before `before_iso8601`.
 ///
 /// `before_iso8601`:     ISO-8601 UTC upper bound; rows strictly older are
-///                       deleted.
-/// `respect_unshipped`:  non-zero: skip rows with `shipped_at IS NULL`.
+///                       deleted, per node only below the lowest kept seq
+///                       (spec §2.3).
+/// `respect_unshipped`:  non-zero: keep rows with `shipped_at IS NULL` and
+///                       the rows above them on their node.
 /// `out_deleted`:        set to the count of deleted rows; may be NULL.
 /// `out_err`:            set on error; may be NULL.
 ///

@@ -288,23 +288,39 @@ def chain_tips_sql(table: str) -> str:
     )
 
 
-def purge_sql(table: str, param: str, respect_unshipped: bool) -> str:
+def purge_sql(table: str, param: str, respect_unshipped: bool, postgres: bool = False) -> str:
     """SQL for an age purge (spec §2.3). Per node it deletes only the rows
     below the lowest seq it keeps, a row at or after the cutoff or, with
     respect_unshipped, an unshipped row, so what is left is a seq suffix.
     Rows at seq 0 are not chained and go by age alone. ``param`` is the
-    cutoff's placeholder; bind the cutoff once per occurrence. Same in
-    SQLite and Postgres."""
-    shipped = " AND shipped_at IS NOT NULL" if respect_unshipped else ""
+    cutoff's placeholder; bind the cutoff once per occurrence.
+
+    Each node's lowest kept seq is one walk up the (source_node_id,
+    monotonic_seq) index, and the LIMIT keeps the planner from repeating it
+    per row. Postgres deletes with USING; SQLite has no USING, so it
+    matches ids."""
     keep = f"timestamp >= {param}" + (" OR shipped_at IS NULL" if respect_unshipped else "")
-    return (
-        f"DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d "
-        f"LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} "
-        f"WHERE monotonic_seq > 0 AND ({keep}) GROUP BY source_node_id) AS k "
-        f"ON k.source_node_id = d.source_node_id "
-        f"WHERE d.timestamp < {param}{shipped} "
-        f"AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
+    shipped = " AND d.shipped_at IS NOT NULL" if respect_unshipped else ""
+    bound = (
+        "WITH RECURSIVE nodes(node) AS ("
+        f"SELECT MIN(source_node_id) FROM {table} UNION ALL "
+        f"SELECT (SELECT MIN(source_node_id) FROM {table} WHERE source_node_id > node) "
+        "FROM nodes WHERE node IS NOT NULL), "
+        "bound AS (SELECT node, COALESCE("
+        f"(SELECT monotonic_seq FROM {table} WHERE source_node_id = node "
+        f"AND monotonic_seq > 0 AND ({keep}) ORDER BY monotonic_seq LIMIT 1), "
+        f"{_MAX_SEQ}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT {_MAX_SEQ}) "
     )
+    match = (
+        "d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from "
+        f"AND d.timestamp < {param}{shipped}"
+    )
+    if postgres:
+        return f"{bound}DELETE FROM {table} AS d USING bound WHERE {match}"
+    return f"DELETE FROM {table} WHERE id IN ({bound}SELECT d.id FROM bound, {table} AS d WHERE {match})"
+
+
+_MAX_SEQ = 9223372036854775807
 
 
 class StoredMeanwhile(Exception):
