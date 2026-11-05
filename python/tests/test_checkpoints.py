@@ -86,9 +86,35 @@ def test_a_resealed_chain_fails_against_the_earlier_checkpoint():
     assert result.reason == f"row {resealed[-1].id}: hash differs from checkpoint at seq 5"
 
 
-def test_a_retention_purge_below_the_newest_checkpoint_verifies():
+def test_a_checkpoint_below_the_oldest_row_fails_a_whole_chain_verify():
     rows = _chain(range(1, 11))
-    assert verify_chain(rows[4:], checkpoints=[_cp(rows[1]), _cp(rows[-1])]).ok
+    cps = [_cp(rows[1]), _cp(rows[-1])]
+    result = verify_chain(rows[4:], checkpoints=cps)
+    assert not result.ok and result.first_break_at == 5
+    assert result.reason == "node 'node-1': rows start at seq 5, after the checkpoint at seq 2"
+    assert verify_chain(rows[4:], checkpoints=cps, partial=True).ok
+
+
+def test_rows_resealed_above_an_old_checkpoint_fail_after_the_next_publish():
+    # Every row deleted and edited copies re-sealed from seq 21, then the
+    # next publish checkpoints the new tip. The checkpoint at 20 still fails.
+    rows = _chain(range(1, 21))
+    resealed = _chain(range(21, 31), target="u/2")
+    cps = [_cp(rows[-1]), _cp(resealed[-1])]
+    assert verify_chain(resealed).ok
+    result = verify_chain(resealed, checkpoints=cps)
+    assert not result.ok and result.first_break_at == 21
+    assert result.reason == "node 'node-1': rows start at seq 21, after the checkpoint at seq 20"
+    assert verify_chain(resealed, checkpoints=cps, partial=True).ok
+
+
+def test_a_purge_verifies_with_the_checkpoints_since_it():
+    rows = _chain(range(1, 11))
+    cps = [_cp_at(rows[1], "2026-06-15T11:00:00.000000Z"),
+           _cp_at(rows[-1], "2026-06-15T12:00:00.000000Z")]
+    assert not verify_chain(rows[4:], checkpoints=cps).ok
+    kept = checkpoints_since(cps, datetime(2026, 6, 15, 12, tzinfo=timezone.utc))
+    assert verify_chain(rows[4:], checkpoints=kept).ok
 
 
 def test_a_chain_resealed_above_the_newest_checkpoint_fails():
@@ -98,7 +124,7 @@ def test_a_chain_resealed_above_the_newest_checkpoint_fails():
     result = verify_chain(resealed, checkpoints=[_cp(rows[4]), _cp(rows[-1])])
     assert not result.ok and result.first_break_at == 11
     assert result.reason == ("node 'node-1': rows start at seq 11, "
-                             "after the newest checkpoint at seq 10")
+                             "after the checkpoint at seq 5")
 
 
 def test_a_checkpointed_node_with_no_rows_fails():
@@ -283,6 +309,7 @@ def test_publish_keeps_a_complete_last_line_without_a_newline(tmp_path):
 class _Server:
     def __init__(self, status: int):
         self.bodies: list = []
+        self.auth: list = []
         self.gets = 0
         outer = self
 
@@ -291,6 +318,7 @@ class _Server:
                 n = int(self.headers["Content-Length"])
                 outer.bodies.append((self.headers["Content-Type"],
                                      json.loads(self.rfile.read(n))))
+                outer.auth.append(self.headers.get("Authorization"))
                 self.send_response(status)
                 if 300 <= status < 400:
                     self.send_header("Location", "/elsewhere")
@@ -312,8 +340,10 @@ class _Server:
         self.thread.start()
 
     def close(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        if self.thread.is_alive():
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            self.thread.join()
 
 
 @pytest.fixture
@@ -329,6 +359,16 @@ def test_http_sink_posts_a_json_array(server):
     cps = [_cp(r) for r in _chain(range(1, 3))]
     HttpCheckpointSink(server.url, timeout=5).publish(cps)
     assert server.bodies == [("application/json", [c.to_dict() for c in cps])]
+
+
+@pytest.mark.parametrize("server", [204], indirect=True)
+def test_http_sink_sends_userinfo_as_basic_auth(server):
+    host = server.url.removeprefix("http://")
+    cps = [_cp(_chain([1])[0])]
+    HttpCheckpointSink(f"http://user:p%40ss@{host}", timeout=5).publish(cps)
+    HttpCheckpointSink(server.url, timeout=5).publish(cps)
+    assert server.auth == ["Basic dXNlcjpwQHNz", None]  # user:p@ss
+    assert len(server.bodies) == 2
 
 
 @pytest.mark.parametrize("server", [500], indirect=True)
@@ -350,13 +390,16 @@ def test_http_sink_errors_leave_out_userinfo_and_query(server):
     with pytest.raises(OSError) as err:
         HttpCheckpointSink(f"{server.url}?token=tok-456", timeout=5).publish(cps)
     assert str(err.value) == f"checkpoint sink {server.url}: HTTP 500"
-    # urllib takes userinfo as part of the host name, so this one fails to
-    # connect.
     host = server.url.removeprefix("http://")
     with pytest.raises(OSError) as err:
         HttpCheckpointSink(f"http://user:pw-123@{host}?token=tok-456", timeout=5).publish(cps)
+    assert str(err.value) == f"checkpoint sink {server.url}: HTTP 500"
+    assert err.value.__cause__ is None
+    server.close()
+    with pytest.raises(OSError) as err:
+        HttpCheckpointSink(f"http://user:pw-123@{host}?token=tok-456", timeout=5).publish(cps)
     assert str(err.value).startswith(f"checkpoint sink {server.url}: ")
-    assert "pw-123" not in str(err.value) and err.value.__cause__ is None
+    assert "pw-123" not in str(err.value) and "tok-456" not in str(err.value)
     with pytest.raises(ValueError) as verr:
         HttpCheckpointSink("ftp://user:pw-123@example.com/x?token=tok-456")
     assert str(verr.value).endswith("ftp://example.com/x")

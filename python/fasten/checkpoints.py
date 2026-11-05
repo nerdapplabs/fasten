@@ -10,12 +10,13 @@ a chain cut short at the end, or re-sealed from genesis:
     verify_chain(rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
 
 ``rows`` there must be the whole chain; pass ``partial=True`` to verify a page
-or one node. With retention, a node whose rows have all been purged still has
-checkpoints, which fail a whole-chain verify; pass only the checkpoints taken
-since the latest purge finished (see checkpoints_since).
+or one node. With retention, checkpoints taken before a purge fail a
+whole-chain verify; pass only the checkpoints taken since the latest purge
+finished (see checkpoints_since).
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import logging
@@ -138,9 +139,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HttpCheckpointSink:
-    """POSTs the checkpoints as one JSON array to ``url``. Raises OSError
-    unless the response is 2xx; redirects are not followed. Errors name the
-    url without userinfo or query."""
+    """POSTs the checkpoints as one JSON array to ``url``. Userinfo in the
+    url (``http://user:pass@host/path``) is sent as Basic auth, as Go does.
+    Raises OSError unless the response is 2xx; redirects are not followed.
+    Errors name the url without userinfo or query."""
 
     def __init__(self, url: str, timeout: float = 10.0) -> None:
         if not url.startswith(("http://", "https://")):
@@ -148,14 +150,21 @@ class HttpCheckpointSink:
         self.url = url
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_NoRedirect)
+        parts = urllib.parse.urlsplit(url)
+        userinfo, at, host = parts.netloc.rpartition("@")
+        self._request_url = urllib.parse.urlunsplit(parts._replace(netloc=host))
+        self._headers = {"Content-Type": "application/json"}
+        if at:
+            user, _, password = userinfo.partition(":")
+            cred = f"{urllib.parse.unquote(user)}:{urllib.parse.unquote(password)}"
+            self._headers["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
 
     def publish(self, checkpoints: list[Checkpoint]) -> None:
         if not checkpoints:
             return
         body = json.dumps([cp.to_dict() for cp in checkpoints]).encode()
         req = urllib.request.Request(
-            self.url, data=body, method="POST",
-            headers={"Content-Type": "application/json"},
+            self._request_url, data=body, method="POST", headers=self._headers,
         )
         where = _redact_url(self.url)
         # The errors are raised from None: HTTPError carries the full url.
@@ -227,9 +236,10 @@ def checkpoints_since(checkpoints: "Sequence[Checkpoint]", cutoff: datetime) -> 
     canonical form.
 
     For a whole-chain verify of a store with retention, pass the time the
-    latest purge finished: a node whose rows that purge removed was last
-    checkpointed before it, while every node still in the store has a
-    checkpoint from the next publish. The retention period alone is not a
+    latest purge finished: a checkpoint taken before it can fall among the
+    rows it removed, or belong to a node with no rows left, and fails the
+    verify, while every node still in the store has a checkpoint from the
+    next publish. The retention period alone is not a
     safe cutoff, since a node's last checkpoint can be taken just before its
     rows are purged::
 

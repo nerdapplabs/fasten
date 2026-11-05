@@ -23,7 +23,7 @@ import dataclasses
 import hashlib
 import json
 import secrets
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 if TYPE_CHECKING:
     from .attrs import AuditRow
@@ -273,28 +273,37 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
     return None
 
 
+class _NodeIndex:
+    """One node's rows by seq, with the lowest and highest seq."""
+
+    def __init__(self, rows: "Iterable[AuditRow]") -> None:
+        self.by_seq: dict[int, list["AuditRow"]] = {}
+        for row in rows:
+            self.by_seq.setdefault(row.monotonic_seq, []).append(row)
+        self.lowest = min(self.by_seq)
+        self.highest = max(self.by_seq)
+
+
 def _checkpoint_break(
-    rows: "list[AuditRow]", cp: "Checkpoint", newest: bool,
+    node: _NodeIndex, cp: "Checkpoint", partial: bool,
 ) -> "tuple[int, str] | None":
     """Check one node's rows against a checkpoint of that node (spec §9), as
-    (monotonic_seq, reason); None if they agree. A checkpoint older than the
-    oldest row is skipped unless ``newest`` says it must be covered."""
+    (monotonic_seq, reason); None if they agree. A checkpoint below the
+    oldest row is skipped only in a partial verify."""
     seq = cp.monotonic_seq
-    at = sorted((r for r in rows if r.monotonic_seq == seq), key=lambda r: r.id)
+    at = node.by_seq.get(seq)
     if at:
         if any(r.hash == cp.hash for r in at):
             return None
-        return seq, f"row {at[0].id}: hash differs from checkpoint at seq {seq}"
-    lowest = min(r.monotonic_seq for r in rows)
-    highest = max(r.monotonic_seq for r in rows)
-    if seq > highest:
-        return highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
-                             f"{highest} before checkpoint at seq {seq}")
-    if seq < lowest:
-        if newest:
-            return lowest, (f"node '{cp.source_node_id}': rows start at seq {lowest}, "
-                            f"after the newest checkpoint at seq {seq}")
-        return None  # purged by retention
+        return seq, f"row {min(r.id for r in at)}: hash differs from checkpoint at seq {seq}"
+    if seq > node.highest:
+        return node.highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
+                                  f"{node.highest} before checkpoint at seq {seq}")
+    if seq < node.lowest:
+        if partial:
+            return None  # the batch starts later
+        return node.lowest, (f"node '{cp.source_node_id}': rows start at seq {node.lowest}, "
+                             f"after the checkpoint at seq {seq}")
     return seq, f"node '{cp.source_node_id}': no row at checkpointed seq {seq}"
 
 
@@ -313,13 +322,12 @@ def verify_chain(
     ``checkpoints`` published earlier outside the store (spec §9). Each
     checkpoint within a node's rows must match the row at its seq. By default
     ``rows`` are taken as the whole chain: every checkpointed node must have
-    rows, and its newest checkpoint must fall within them; only older
-    checkpoints below a node's oldest row (purged by retention) are skipped.
-    For a page, one node or a sample, pass ``partial=True``: then a
-    checkpoint below a node's oldest row, or for a node with no rows here, is
-    skipped. Rows after a node's newest checkpoint are not covered by it.
-    Under retention, pass only the checkpoints taken since the latest purge
-    (``checkpoints_since``): a node whose rows were all purged would fail.
+    rows, and no checkpoint may be below its node's oldest row. For a page,
+    one node or a sample, pass ``partial=True``: then a checkpoint below a
+    node's oldest row, or for a node with no rows here, is skipped. Rows
+    after a node's newest checkpoint are not covered by it. Under retention,
+    pass only the checkpoints taken since the latest purge
+    (``checkpoints_since``): an older one below the purged rows fails.
 
     Rows with an empty ``hash`` field (written before hash-chain support, or in
     stdout-only mode) are skipped below their node's first sealed seq; they are
@@ -372,17 +380,17 @@ def verify_chain(
     newest: dict[str, int] = {}
     for cp in checkpoints or ():
         newest[cp.source_node_id] = max(cp.monotonic_seq, newest.get(cp.source_node_id, cp.monotonic_seq))
+    index = {n: _NodeIndex(by_node[n].values()) for n in newest if by_node.get(n)}
     for cp in sorted(checkpoints or (), key=lambda c: (c.source_node_id, c.monotonic_seq)):
-        must_cover = not partial and cp.monotonic_seq == newest[cp.source_node_id]
-        node_rows = by_node.get(cp.source_node_id)
-        if not node_rows:
-            if must_cover:
+        node = index.get(cp.source_node_id)
+        if node is None:
+            if not partial and cp.monotonic_seq == newest[cp.source_node_id]:
                 found = cp.monotonic_seq, (f"node '{cp.source_node_id}': no rows, but "
                                            f"checkpointed at seq {cp.monotonic_seq}")
                 if first is None or found[0] < first[0]:
                     first = found
             continue
-        found = _checkpoint_break(list(node_rows.values()), cp, must_cover)
+        found = _checkpoint_break(node, cp, partial)
         if found is not None and (first is None or found[0] < first[0]):
             first = found
     if first is not None:

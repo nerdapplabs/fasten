@@ -187,15 +187,16 @@ result = verify_chain(all_rows, checkpoints=load_checkpoints("/mnt/worm/checkpoi
 ```
 
 By default the rows are taken as the whole chain: every checkpointed node
-must have rows, and its newest checkpoint must fall within them. To check
+must have rows, and no checkpoint may be below its oldest row. To check
 a page or one node, pass `partial=True`; checkpoints below its rows, or for
 nodes not in them, are then skipped. If the file's last line was cut short
 by a crash, `load_checkpoints` skips it and logs a warning, and the next
 publish drops it. Use one publisher per file.
 
-With retention, a node whose rows have all been purged still has
-checkpoints, and they fail a whole-chain verify. Pass only the checkpoints
-taken since the latest purge finished, and publish again after each purge:
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. Pass only the checkpoints taken since the latest purge finished,
+and publish again after each purge:
 
 ```python
 from fasten.checkpoints import checkpoints_since
@@ -204,9 +205,9 @@ cps = checkpoints_since(load_checkpoints("/mnt/worm/checkpoints.jsonl"), purged_
 result = verify_chain(all_rows, checkpoints=cps)
 ```
 
-A whole-chain verify does not show rows deleted from the start of a chain
-as long as the newest checkpointed row and the rows after it remain; that
-looks the same as a purge.
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
 
 ## Tests
 

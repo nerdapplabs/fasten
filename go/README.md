@@ -174,25 +174,26 @@ res := fasten.VerifyChainWithCheckpoints(allRows, cps, fasten.CheckpointOptions{
 ```
 
 By default the rows are taken as the whole chain: every checkpointed node
-must have rows, and its newest checkpoint must fall within them. To check
+must have rows, and no checkpoint may be below its oldest row. To check
 a page or one node, set `CheckpointOptions{Partial: true}`; checkpoints
 below its rows, or for nodes not in them, are then skipped. If the file's
 last line was cut short by a crash, `LoadCheckpoints` returns the earlier
 checkpoints with `ErrPartialLastLine`, and the next publish drops it. Use
 one publisher per file.
 
-With retention, a node whose rows have all been purged still has
-checkpoints, and they fail a whole-chain verify. Pass only the checkpoints
-taken since the latest purge finished, and publish again after each purge:
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. Pass only the checkpoints taken since the latest purge finished,
+and publish again after each purge:
 
 ```go
 kept, err := fasten.CheckpointsSince(cps, purgedAt)
 res := fasten.VerifyChainWithCheckpoints(allRows, kept, fasten.CheckpointOptions{})
 ```
 
-A whole-chain verify does not show rows deleted from the start of a chain
-as long as the newest checkpointed row and the rows after it remain; that
-looks the same as a purge.
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
 
 ## Tests
 

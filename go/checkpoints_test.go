@@ -83,9 +83,43 @@ func TestCheckpointResealedChainFails(t *testing.T) {
 		"row "+resealed[4].ID+": hash differs from checkpoint at seq 5")
 }
 
-func TestCheckpointRetentionPurgeBelowTheNewestVerifies(t *testing.T) {
+func TestCheckpointBelowTheOldestRowFailsAWholeChainVerify(t *testing.T) {
 	rows := cpChain(10, "node-1", "u1")
-	if res := VerifyChainWithCheckpoints(rows[4:], []Checkpoint{cpOf(rows[1]), cpOf(rows[9])}, CheckpointOptions{}); !res.OK {
+	cps := []Checkpoint{cpOf(rows[1]), cpOf(rows[9])}
+	wantBreak(t, VerifyChainWithCheckpoints(rows[4:], cps, CheckpointOptions{}), 5,
+		"node 'node-1': rows start at seq 5, after the checkpoint at seq 2")
+	if res := VerifyChainWithCheckpoints(rows[4:], cps, CheckpointOptions{Partial: true}); !res.OK {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestCheckpointRowsResealedAboveAnOldCheckpointFailAfterTheNextPublish(t *testing.T) {
+	// Every row deleted and edited copies re-sealed from seq 21, then the
+	// next publish checkpoints the new tip. The checkpoint at 20 still fails.
+	rows := cpChain(20, "node-1", "u1")
+	resealed := cpChainFrom(21, 10, "node-1", "u2")
+	cps := []Checkpoint{cpOf(rows[19]), cpOf(resealed[9])}
+	if !VerifyChain(resealed).OK {
+		t.Fatal("a re-sealed chain verifies on its own")
+	}
+	wantBreak(t, VerifyChainWithCheckpoints(resealed, cps, CheckpointOptions{}), 21,
+		"node 'node-1': rows start at seq 21, after the checkpoint at seq 20")
+	if res := VerifyChainWithCheckpoints(resealed, cps, CheckpointOptions{Partial: true}); !res.OK {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestCheckpointPurgeVerifiesWithTheCheckpointsSinceIt(t *testing.T) {
+	rows := cpChain(10, "node-1", "u1")
+	cps := []Checkpoint{cpAt(rows[1], "2026-06-15T11:00:00.000000Z"), cpAt(rows[9], "2026-06-15T12:00:00.000000Z")}
+	if VerifyChainWithCheckpoints(rows[4:], cps, CheckpointOptions{}).OK {
+		t.Fatal("a checkpoint from before the purge passed")
+	}
+	kept, err := CheckpointsSince(cps, time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := VerifyChainWithCheckpoints(rows[4:], kept, CheckpointOptions{}); !res.OK {
 		t.Fatalf("got %+v", res)
 	}
 }
@@ -124,7 +158,7 @@ func TestCheckpointChainResealedAboveTheNewestFails(t *testing.T) {
 		t.Fatal("a re-sealed chain verifies on its own")
 	}
 	wantBreak(t, VerifyChainWithCheckpoints(resealed, []Checkpoint{cpOf(rows[4]), cpOf(rows[9])}, CheckpointOptions{}), 11,
-		"node 'node-1': rows start at seq 11, after the newest checkpoint at seq 10")
+		"node 'node-1': rows start at seq 11, after the checkpoint at seq 5")
 }
 
 func TestCheckpointedNodeWithNoRowsFails(t *testing.T) {
@@ -353,6 +387,26 @@ func TestHTTPCheckpointSinkRedirectFails(t *testing.T) {
 func TestHTTPCheckpointSinkDefaultTimeout(t *testing.T) {
 	if c := (HTTPCheckpointSink{}).client(); c.Timeout != 10*time.Second || c == http.DefaultClient {
 		t.Fatalf("got %+v", c)
+	}
+}
+
+func TestHTTPCheckpointSinkSendsUserinfoAsBasicAuth(t *testing.T) {
+	var auth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = append(auth, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	cps := []Checkpoint{cpOf(cpChain(1, "node-1", "u1")[0])}
+	for _, u := range []string{"http://user:p%40ss@" + host, srv.URL} {
+		if err := (HTTPCheckpointSink{URL: u}).Publish(context.Background(), cps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// user:p@ss
+	if want := []string{"Basic dXNlcjpwQHNz", ""}; !slices.Equal(auth, want) {
+		t.Fatalf("got %q, want %q", auth, want)
 	}
 }
 

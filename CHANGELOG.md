@@ -23,15 +23,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `VerifyChainWithCheckpoints`; `VerifyChain` is unchanged. `SQLiteStore`
   and `PostgresStore` gain `ChainTips`.
 - A verify with checkpoints covers the whole chain by default: a
-  checkpointed node with no rows, or whose rows start after its newest
-  checkpoint, fails. A partial verify (a page, one node) opts out. With
+  checkpointed node with no rows, or whose rows start after any of its
+  checkpoints, fails. A partial verify (a page, one node) opts out. With
   retention, pass only the checkpoints taken since the latest purge
-  (`checkpoints_since` / `CheckpointsSince`), so a node whose rows were all
-  purged does not fail.
+  (`checkpoints_since` / `CheckpointsSince`): older ones fail.
 - The file sinks drop an unfinished last line, left by a crash mid-append,
   before the next append, so the file keeps loading.
-- The HTTP sinks treat a redirect as a failed publish, time out after 10 s
-  by default, and leave userinfo and query out of error messages.
+- The HTTP sinks send userinfo in the URL as Basic auth, treat a redirect
+  as a failed publish, time out after 10 s by default, and leave userinfo
+  and query out of error messages.
 - `spec/checkpoint-vectors.json` holds cases both SDKs must agree on.
 
 ### Fixed: redact values when the core can't parse the input (C++)

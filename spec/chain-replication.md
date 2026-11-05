@@ -468,8 +468,10 @@ missing newline after a complete last line. A file has one publisher at a
 time; concurrent appends to one file are not supported. An HTTP sink receives a JSON array of them in one `POST`. Any
 status other than 2xx, a 3xx included, is a failed publish: a redirect is
 not followed, since a client would repeat a `POST` as a `GET` without the
-body. Error messages name the sink URL as `scheme://host[:port]/path`,
-without userinfo or query.
+body. Userinfo in the sink URL (`user:password@`) is sent as an
+`Authorization: Basic` header and is not part of the request URL. Error
+messages name the sink URL as `scheme://host[:port]/path`, without
+userinfo or query.
 
 ### §9.2 Where to publish
 
@@ -487,7 +489,7 @@ against checkpoints, in two modes:
 
 - **Whole chain** (the default): the batch is taken to be every row the
   store holds. Every node that has a checkpoint MUST have rows in the
-  batch, and each node's newest checkpoint MUST fall within its rows.
+  batch, and no checkpoint may be below its node's lowest row seq.
 - **Partial** (an explicit option): the batch is a page, one node or a
   sample, so a checkpoint outside it says nothing about it.
 
@@ -502,12 +504,12 @@ has rows in the batch:
 2. The checkpoint's seq is above the node's highest row seq: the chain was cut
    off. It breaks at the node's highest seq + 1, with reason
    `node '<node>': chain ends at seq <highest> before checkpoint at seq <seq>`.
-3. The checkpoint's seq is below the node's lowest row seq. If it is not the
-   node's newest checkpoint, or the verify is partial, the rows were purged
-   (or the batch starts later) and the checkpoint is skipped. Otherwise the
-   chain was rewritten or re-sealed above every checkpoint: it breaks at the
-   node's lowest seq, with reason
-   `node '<node>': rows start at seq <lowest>, after the newest checkpoint at seq <seq>`.
+3. The checkpoint's seq is below the node's lowest row seq. In a partial
+   verify the batch starts later and the checkpoint is skipped. In a
+   whole-chain verify the rows it covers were deleted, or the chain was
+   rewritten or re-sealed above it: it breaks at the node's lowest seq, with
+   reason
+   `node '<node>': rows start at seq <lowest>, after the checkpoint at seq <seq>`.
 4. Otherwise the row is missing from inside the span. The chain breaks at the
    checkpoint's seq, with reason
    `node '<node>': no row at checkpointed seq <seq>`.
@@ -522,9 +524,9 @@ across the §3 breaks and the checkpoint breaks; on a tie the §3 break is
 reported, and between checkpoint breaks the first in that order.
 
 A whole-chain verify of a store under retention MUST be given only the
-checkpoints taken since the latest purge finished. A node whose rows have
-all been purged keeps its old checkpoints, and its newest one would fail
-the verify as a node with no rows. A cutoff of the retention period alone
+checkpoints taken since the latest purge finished. A checkpoint taken
+before it is below the purged rows and fails the verify by rule 3, and a
+node whose rows have all been purged fails as a node with no rows. A cutoff of the retention period alone
 is not enough, since a node's last checkpoint can be taken just before the
 purge that removes its rows. Python's `checkpoints_since(checkpoints,
 cutoff)` and Go's `CheckpointsSince(checkpoints, cutoff)` keep the
@@ -532,10 +534,10 @@ checkpoints whose `anchored_at` is at or after the cutoff, and reject an
 `anchored_at` that is not in the canonical form. Publish again after each
 purge, so that every node still in the store has a checkpoint after it.
 
-A whole-chain verify cannot tell a head purge from a deletion of the head.
-Deleting every row of a node below its newest checkpoint, while keeping the
-checkpointed row and the rows after it, verifies: the older checkpoints
-below the lowest row are skipped as purged.
+Rows deleted from the start of a chain show only when a checkpoint given
+to the verify falls among them. Deleting rows below every given checkpoint
+looks the same as a purge, so the checkpoints since the latest purge cover
+only what was written after it.
 
 A checkpoint covers a node's rows up to its seq. Rows written after a
 node's newest checkpoint are not covered until the next checkpoint is

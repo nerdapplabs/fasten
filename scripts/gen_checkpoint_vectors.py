@@ -76,7 +76,9 @@ def build() -> dict:
     add("older_checkpoint_inside", chain, [_cp(chain[1]), _cp(chain[-1])])
     add("tail_truncated", chain[:4], [_cp(chain[-1])])
     add("resealed_from_genesis", _chain(6, target="order/2"), [_cp(chain[-1])])
-    add("purged_head_skipped", chain[3:], [_cp(chain[0]), _cp(chain[-1])])
+    add("checkpoint_below_rows", chain[3:], [_cp(chain[0]), _cp(chain[-1])])
+    add("checkpoint_below_rows_partial", chain[3:], [_cp(chain[0]), _cp(chain[-1])],
+        partial=True)
     unsealed = [dataclasses.replace(_row(s, "node-1", "order/0"), hash="", prev_hash="",
                                     detail_salt=None) for s in (1, 2)]
     add("missing_row_in_span", unsealed + chain[3:], [_cp(chain[2])])
@@ -86,9 +88,15 @@ def build() -> dict:
     add("no_rows", [], [_cp(chain[-1])])
     add("no_rows_partial", [], [_cp(chain[-1])], partial=True)
     resealed_above = _chain(6, target="order/3", start=7)
-    add("rows_start_after_newest_checkpoint", resealed_above, [_cp(chain[2]), _cp(chain[-1])])
-    add("rows_start_after_newest_checkpoint_partial", resealed_above,
+    add("rows_start_after_checkpoints", resealed_above, [_cp(chain[2]), _cp(chain[-1])])
+    add("rows_start_after_checkpoints_partial", resealed_above,
         [_cp(chain[2]), _cp(chain[-1])], partial=True)
+    # Rows deleted and re-sealed above the checkpoint at 6, and the next
+    # publish checkpointed the new tip.
+    add("resealed_above_with_new_tip_checkpoint", resealed_above,
+        [_cp(chain[-1]), _cp(resealed_above[-1])])
+    add("resealed_above_with_new_tip_checkpoint_partial", resealed_above,
+        [_cp(chain[-1]), _cp(resealed_above[-1])], partial=True)
     a, b = _chain(6, node="node-a"), _chain(6, node="node-b")
     add("two_nodes_lowest_break", a[:5] + b[:2], [_cp(a[-1]), _cp(b[-1])])
     edited = list(chain[:4])

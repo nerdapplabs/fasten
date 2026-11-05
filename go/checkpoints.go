@@ -106,8 +106,9 @@ func endLastLine(f *os.File) ([]byte, error) {
 
 // HTTPCheckpointSink POSTs the checkpoints as one JSON array to URL. Client
 // nil means a client with a 10 s timeout; the context also bounds the
-// request. Redirects are not followed, whatever the client, and errors name
-// the URL without userinfo or query.
+// request. Userinfo in the URL is sent as Basic auth. Redirects are not
+// followed, whatever the client, and errors name the URL without userinfo
+// or query.
 type HTTPCheckpointSink struct {
 	URL    string
 	Client *http.Client
@@ -250,9 +251,10 @@ func LoadCheckpoints(path string) ([]Checkpoint, error) {
 // their order. An AnchoredAt not in the canonical form is an error.
 //
 // For a whole-chain verify of a store with retention, pass the time the
-// latest purge finished: a node whose rows that purge removed was last
-// checkpointed before it, while every node still in the store has a
-// checkpoint from the next publish. The retention period alone is not a
+// latest purge finished: a checkpoint taken before it can fall among the
+// rows it removed, or belong to a node with no rows left, and fails the
+// verify, while every node still in the store has a checkpoint from the
+// next publish. The retention period alone is not a
 // safe cutoff, since a node's last checkpoint can be taken just before its
 // rows are purged:
 //
@@ -299,15 +301,11 @@ func parseCheckpoint(line []byte) (Checkpoint, error) {
 
 // checkpointBreak checks rows, one copy per id, against checkpoints and
 // returns the lowest-seq break, or nil. Checkpoints are taken by node, then
-// seq, as in Python, so both report the same break. Unless partial, each
-// node's newest checkpoint must fall within its rows.
+// seq, as in Python, so both report the same break. Unless partial, every
+// checkpoint must fall within its node's rows.
 func checkpointBreak(rows []Row, checkpoints []Checkpoint, partial bool) *VerifyResult {
 	if len(checkpoints) == 0 {
 		return nil
-	}
-	byNode := map[string][]Row{}
-	for _, row := range rows {
-		byNode[row.SourceNodeID] = append(byNode[row.SourceNodeID], row)
 	}
 	newest := map[string]int64{}
 	for _, cp := range checkpoints {
@@ -315,17 +313,29 @@ func checkpointBreak(rows []Row, checkpoints []Checkpoint, partial bool) *Verify
 			newest[cp.SourceNodeID] = cp.MonotonicSeq
 		}
 	}
+	index := map[string]*nodeIndex{}
+	for _, row := range rows {
+		if _, ok := newest[row.SourceNodeID]; !ok {
+			continue
+		}
+		n := index[row.SourceNodeID]
+		if n == nil {
+			n = &nodeIndex{bySeq: map[int64][]Row{}, lowest: row.MonotonicSeq, highest: row.MonotonicSeq}
+			index[row.SourceNodeID] = n
+		}
+		n.bySeq[row.MonotonicSeq] = append(n.bySeq[row.MonotonicSeq], row)
+		n.lowest, n.highest = min(n.lowest, row.MonotonicSeq), max(n.highest, row.MonotonicSeq)
+	}
 	sorted := slices.Clone(checkpoints)
 	slices.SortStableFunc(sorted, func(a, b Checkpoint) int {
 		return cmp.Or(cmp.Compare(a.SourceNodeID, b.SourceNodeID), cmp.Compare(a.MonotonicSeq, b.MonotonicSeq))
 	})
 	var first *VerifyResult
 	for _, cp := range sorted {
-		mustCover := !partial && cp.MonotonicSeq == newest[cp.SourceNodeID]
 		var found *VerifyResult
-		if nodeRows := byNode[cp.SourceNodeID]; len(nodeRows) > 0 {
-			found = checkpointMismatch(nodeRows, cp, mustCover)
-		} else if mustCover {
+		if n := index[cp.SourceNodeID]; n != nil {
+			found = checkpointMismatch(n, cp, partial)
+		} else if !partial && cp.MonotonicSeq == newest[cp.SourceNodeID] {
 			found = &VerifyResult{FirstBreakAt: cp.MonotonicSeq, Reason: fmt.Sprintf(
 				"node '%s': no rows, but checkpointed at seq %d", cp.SourceNodeID, cp.MonotonicSeq)}
 		}
@@ -336,34 +346,32 @@ func checkpointBreak(rows []Row, checkpoints []Checkpoint, partial bool) *Verify
 	return first
 }
 
+// nodeIndex is one node's rows by seq, with the lowest and highest seq.
+type nodeIndex struct {
+	bySeq           map[int64][]Row
+	lowest, highest int64
+}
+
 // checkpointMismatch checks one node's rows against a checkpoint of that
-// node; nil if they agree. A checkpoint older than the oldest row is
-// skipped unless newest says it must be covered.
-func checkpointMismatch(rows []Row, cp Checkpoint, newest bool) *VerifyResult {
+// node; nil if they agree. A checkpoint below the oldest row is skipped
+// only in a partial verify.
+func checkpointMismatch(n *nodeIndex, cp Checkpoint, partial bool) *VerifyResult {
 	seq := cp.MonotonicSeq
-	lowest, highest := rows[0].MonotonicSeq, rows[0].MonotonicSeq
-	var at []Row
-	for _, row := range rows {
-		lowest, highest = min(lowest, row.MonotonicSeq), max(highest, row.MonotonicSeq)
-		if row.MonotonicSeq == seq {
-			if row.Hash == cp.Hash {
-				return nil
-			}
-			at = append(at, row)
-		}
-	}
+	at := n.bySeq[seq]
 	switch {
+	case slices.ContainsFunc(at, func(r Row) bool { return r.Hash == cp.Hash }):
+		return nil
 	case len(at) > 0:
 		id := slices.MinFunc(at, func(a, b Row) int { return cmp.Compare(a.ID, b.ID) }).ID
 		return &VerifyResult{FirstBreakAt: seq, Reason: fmt.Sprintf("row %s: hash differs from checkpoint at seq %d", id, seq)}
-	case seq > highest:
-		return &VerifyResult{FirstBreakAt: highest + 1, Reason: fmt.Sprintf(
-			"node '%s': chain ends at seq %d before checkpoint at seq %d", cp.SourceNodeID, highest, seq)}
-	case seq < lowest && newest:
-		return &VerifyResult{FirstBreakAt: lowest, Reason: fmt.Sprintf(
-			"node '%s': rows start at seq %d, after the newest checkpoint at seq %d", cp.SourceNodeID, lowest, seq)}
-	case seq < lowest:
-		return nil // purged by retention
+	case seq > n.highest:
+		return &VerifyResult{FirstBreakAt: n.highest + 1, Reason: fmt.Sprintf(
+			"node '%s': chain ends at seq %d before checkpoint at seq %d", cp.SourceNodeID, n.highest, seq)}
+	case seq < n.lowest && partial:
+		return nil // the batch starts later
+	case seq < n.lowest:
+		return &VerifyResult{FirstBreakAt: n.lowest, Reason: fmt.Sprintf(
+			"node '%s': rows start at seq %d, after the checkpoint at seq %d", cp.SourceNodeID, n.lowest, seq)}
 	default:
 		return &VerifyResult{FirstBreakAt: seq, Reason: fmt.Sprintf("node '%s': no row at checkpointed seq %d", cp.SourceNodeID, seq)}
 	}

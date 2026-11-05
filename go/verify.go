@@ -116,12 +116,11 @@ type CheckpointOptions struct {
 // checkpoints published earlier outside the store (spec §9). Each
 // checkpoint within a node's rows must match the row at its seq. Unless
 // opts.Partial is set, rows are taken as the whole chain: every
-// checkpointed node must have rows, and its newest checkpoint must fall
-// within them; only older checkpoints below a node's oldest row (purged by
-// retention) are skipped. Rows after a node's newest checkpoint are not
-// covered by it. Under retention, pass only the checkpoints taken since the
-// latest purge (CheckpointsSince): a node whose rows were all purged would
-// fail. FirstBreakAt is the lowest seq of any break.
+// checkpointed node must have rows, and no checkpoint may be below its
+// node's oldest row. Rows after a node's newest checkpoint are not covered
+// by it. Under retention, pass only the checkpoints taken since the latest
+// purge (CheckpointsSince): an older one below the purged rows fails.
+// FirstBreakAt is the lowest seq of any break.
 func VerifyChainWithCheckpoints(rows []Row, checkpoints []Checkpoint, opts CheckpointOptions) VerifyResult {
 	total := len(rows)
 	if total == 0 && (opts.Partial || len(checkpoints) == 0) {
