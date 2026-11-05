@@ -183,7 +183,12 @@ func TestCheckpointPartialSkipsCheckpointsOutsideTheRows(t *testing.T) {
 			t.Fatalf("got %+v", res)
 		}
 	}
-	wantBreak(t, VerifyChainWithCheckpoints(rows[:6], cps, partial), 7,
+	// An older page: the checkpoint above it says nothing about rows 3 to 6.
+	if res := VerifyChainWithCheckpoints(rows[2:6], cps, partial); !res.OK {
+		t.Fatalf("older page: got %+v", res)
+	}
+	// The whole chain cut off at 6 is still caught.
+	wantBreak(t, VerifyChainWithCheckpoints(rows[:6], cps[:1], CheckpointOptions{}), 7,
 		"node 'node-1': chain ends at seq 6 before checkpoint at seq 10")
 }
 

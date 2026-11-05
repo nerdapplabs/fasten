@@ -108,8 +108,9 @@ func VerifyChain(rows []Row) VerifyResult {
 // CheckpointOptions configures VerifyChainWithCheckpoints.
 type CheckpointOptions struct {
 	// Partial marks rows as a page, one node or a sample rather than the
-	// whole chain: a checkpoint below a node's oldest row, or for a node
-	// with no rows, is then skipped.
+	// whole chain: a checkpoint below a node's oldest row or above its newest,
+	// or for a node with no rows, is then skipped. Only a whole-chain verify
+	// detects a cut-off tail.
 	Partial bool
 }
 
@@ -118,7 +119,7 @@ type CheckpointOptions struct {
 // checkpoint within a node's rows must match the row at its seq. Unless
 // opts.Partial is set, rows are taken as the whole chain: every
 // checkpointed node must have rows, and no checkpoint may be below its
-// node's oldest row. Rows after a node's newest checkpoint are not covered
+// node's oldest row or above its newest. Rows after a node's newest checkpoint are not covered
 // by it. Under retention, pass only the checkpoints taken since the latest
 // purge (CheckpointsSince): an older one below the purged rows fails.
 // FirstBreakAt is the lowest seq of any break.

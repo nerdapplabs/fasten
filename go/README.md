@@ -174,9 +174,10 @@ res := fasten.VerifyChainWithCheckpoints(allRows, cps, fasten.CheckpointOptions{
 ```
 
 By default the rows are taken as the whole chain: every checkpointed node
-must have rows, and no checkpoint may be below its oldest row. To check
-a page or one node, set `CheckpointOptions{Partial: true}`; checkpoints
-below its rows, or for nodes not in them, are then skipped. If the file's
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, set `CheckpointOptions{Partial: true}`;
+checkpoints below or above its rows, or for nodes not in them, are then
+skipped, so only a whole-chain verify detects a cut-off tail. If the file's
 last line was cut short by a crash, `LoadCheckpoints` returns the earlier
 checkpoints with `ErrPartialLastLine`, and the next publish drops it. Use
 one publisher per file.

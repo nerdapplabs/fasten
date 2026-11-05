@@ -339,8 +339,8 @@ def _checkpoint_break(
     node: _NodeIndex, cp: "Checkpoint", partial: bool,
 ) -> "tuple[int, str] | None":
     """Check one node's rows against a checkpoint of that node (spec §9), as
-    (monotonic_seq, reason); None if they agree. A checkpoint below the
-    oldest row is skipped only in a partial verify."""
+    (monotonic_seq, reason); None if they agree. A checkpoint outside the rows,
+    below the oldest or above the newest, is skipped only in a partial verify."""
     seq = cp.monotonic_seq
     at = node.by_seq.get(seq)
     if at:
@@ -348,6 +348,8 @@ def _checkpoint_break(
             return None
         return seq, f"row {min(r.id for r in at)}: hash differs from checkpoint at seq {seq}"
     if seq > node.highest:
+        if partial:
+            return None  # the batch ends earlier
         return node.highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
                                   f"{node.highest} before checkpoint at seq {seq}")
     if seq < node.lowest:
@@ -375,7 +377,8 @@ def verify_chain(
     ``rows`` are taken as the whole chain: every checkpointed node must have
     rows, and no checkpoint may be below its node's oldest row. For a page,
     one node or a sample, pass ``partial=True``: then a checkpoint below a
-    node's oldest row, or for a node with no rows here, is skipped. Rows
+    node's oldest row or above its newest, or for a node with no rows here, is
+    skipped, so only a whole-chain verify detects a cut-off tail. Rows
     after a node's newest checkpoint are not covered by it. Under retention,
     pass only the checkpoints taken since the latest purge
     (``checkpoints_since``): an older one below the purged rows fails.

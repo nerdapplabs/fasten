@@ -144,8 +144,12 @@ def test_partial_skips_checkpoints_outside_the_rows():
     assert verify_chain(resealed, checkpoints=cps, partial=True).ok
     assert verify_chain([], checkpoints=cps, partial=True).ok
     assert verify_chain(rows[4:], checkpoints=cps, partial=True).ok
-    result = verify_chain(rows[:6], checkpoints=cps, partial=True)
-    assert result.first_break_at == 7 and "chain ends at seq 6" in result.reason
+    # An older page: the checkpoint above it says nothing about rows 3 to 6.
+    assert verify_chain(rows[2:6], checkpoints=cps, partial=True).ok
+    # The whole chain cut off at 6 is still caught.
+    result = verify_chain(rows[:6], checkpoints=cps[:1])
+    assert result.first_break_at == 7
+    assert result.reason == "node 'node-1': chain ends at seq 6 before checkpoint at seq 10"
 
 
 def test_a_missing_checkpointed_row_inside_the_chain_breaks_there():

@@ -187,9 +187,10 @@ result = verify_chain(all_rows, checkpoints=load_checkpoints("/mnt/worm/checkpoi
 ```
 
 By default the rows are taken as the whole chain: every checkpointed node
-must have rows, and no checkpoint may be below its oldest row. To check
-a page or one node, pass `partial=True`; checkpoints below its rows, or for
-nodes not in them, are then skipped. If the file's last line was cut short
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, pass `partial=True`; checkpoints below
+or above its rows, or for nodes not in them, are then skipped, so only a
+whole-chain verify detects a cut-off tail. If the file's last line was cut short
 by a crash, `load_checkpoints` skips it and logs a warning, and the next
 publish drops it. Use one publisher per file.
 

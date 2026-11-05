@@ -23,8 +23,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `VerifyChainWithCheckpoints`; `VerifyChain` is unchanged. `SQLiteStore`
   and `PostgresStore` gain `ChainTips`.
 - A verify with checkpoints covers the whole chain by default: a
-  checkpointed node with no rows, or whose rows start after any of its
-  checkpoints, fails. A partial verify (a page, one node) opts out. With
+  checkpointed node with no rows, or whose rows start after or end before
+  any of its checkpoints, fails. A partial verify (a page, one node) skips
+  those checkpoints, so only a whole-chain verify detects a cut-off tail. With
   retention, pass only the checkpoints taken since the latest purge
   (`checkpoints_since` / `CheckpointsSince`): older ones fail.
 - The file sinks drop an unfinished last line, left by a crash mid-append,

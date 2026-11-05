@@ -364,6 +364,8 @@ func checkpointMismatch(n *nodeIndex, cp Checkpoint, partial bool) *VerifyResult
 	case len(at) > 0:
 		id := slices.MinFunc(at, func(a, b Row) int { return cmp.Compare(a.ID, b.ID) }).ID
 		return &VerifyResult{FirstBreakAt: seq, Reason: fmt.Sprintf("row %s: hash differs from checkpoint at seq %d", id, seq)}
+	case seq > n.highest && partial:
+		return nil // the batch ends earlier
 	case seq > n.highest:
 		return &VerifyResult{FirstBreakAt: n.highest + 1, Reason: fmt.Sprintf(
 			"node '%s': chain ends at seq %d before checkpoint at seq %d", cp.SourceNodeID, n.highest, seq)}

@@ -502,7 +502,8 @@ against checkpoints, in two modes:
 
 - **Whole chain** (the default): the batch is taken to be every row the
   store holds. Every node that has a checkpoint MUST have rows in the
-  batch, and no checkpoint may be below its node's lowest row seq.
+  batch, and no checkpoint may be below its lowest row seq or above its
+  highest.
 - **Partial** (an explicit option): the batch is a page, one node or a
   sample, so a checkpoint outside it says nothing about it.
 
@@ -514,9 +515,12 @@ has rows in the batch:
    must). Otherwise the chain breaks at that seq, with reason
    `row <id>: hash differs from checkpoint at seq <seq>`, naming the row with
    the lowest `id`.
-2. The checkpoint's seq is above the node's highest row seq: the chain was cut
-   off. It breaks at the node's highest seq + 1, with reason
+2. The checkpoint's seq is above the node's highest row seq. In a partial
+   verify the batch ends earlier and the checkpoint is skipped. In a
+   whole-chain verify the chain was cut off: it breaks at the node's highest
+   seq + 1, with reason
    `node '<node>': chain ends at seq <highest> before checkpoint at seq <seq>`.
+   Tail truncation is therefore detected only by a whole-chain verify.
 3. The checkpoint's seq is below the node's lowest row seq. In a partial
    verify the batch starts later and the checkpoint is skipped. In a
    whole-chain verify the rows it covers were deleted, or the chain was

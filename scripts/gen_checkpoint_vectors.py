@@ -75,6 +75,7 @@ def build() -> dict:
     add("matches_tip", chain, [_cp(chain[-1])])
     add("older_checkpoint_inside", chain, [_cp(chain[1]), _cp(chain[-1])])
     add("tail_truncated", chain[:4], [_cp(chain[-1])])
+    add("checkpoint_above_rows_partial", chain[1:4], [_cp(chain[-1])], partial=True)
     add("resealed_from_genesis", _chain(6, target="order/2"), [_cp(chain[-1])])
     add("checkpoint_below_rows", chain[3:], [_cp(chain[0]), _cp(chain[-1])])
     add("checkpoint_below_rows_partial", chain[3:], [_cp(chain[0]), _cp(chain[-1])],
