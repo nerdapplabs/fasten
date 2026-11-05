@@ -404,13 +404,11 @@ class SQLiteStore:
         )
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
+        from .repo import purge_sql
         with self._txn():
             conn = self._connect()
-            sql = f"DELETE FROM {self._table} WHERE timestamp < ?"
-            params: tuple = (_utc_iso(before),)
-            if respect_unshipped:
-                sql += " AND shipped_at IS NOT NULL"
-            cur = conn.execute(sql, params)
+            cutoff = _utc_iso(before)
+            cur = conn.execute(purge_sql(self._table, "?", respect_unshipped), (cutoff, cutoff))
             conn.commit()
             return cur.rowcount
 

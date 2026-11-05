@@ -114,10 +114,12 @@ pub trait Store: Send + Sync {
     /// IDs that do not exist are silently ignored.
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
 
-    /// Delete rows whose `timestamp` is before `before_iso8601`.
+    /// Delete rows whose `timestamp` is before `before_iso8601`, per node only
+    /// a seq prefix (spec §2.3): rows above a kept row stay, so the rows left
+    /// still verify.
     ///
     /// When `respect_unshipped` is `true`, rows with `shipped_at IS NULL` are
-    /// preserved regardless of age.
+    /// preserved regardless of age, and so are the rows above them.
     ///
     /// Returns the number of deleted rows.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
@@ -188,6 +190,21 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 
 /// `''` and NULL both mean "no salt / commitment" (form "1").
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+/// The age purge (spec §2.3). Per node it deletes only the rows below the
+/// lowest seq it keeps, a row at or after the cutoff or, with
+/// `respect_unshipped`, an unshipped row, so what is left is a seq suffix.
+/// `param` is the cutoff's placeholder. Same in SQLite and Postgres.
+pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool) -> String {
+    let unshipped = if respect_unshipped { " OR shipped_at IS NULL" } else { "" };
+    format!(
+        "DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d \
+         LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} \
+         WHERE timestamp >= {param}{unshipped} GROUP BY source_node_id) AS k \
+         ON k.source_node_id = d.source_node_id \
+         WHERE d.timestamp < {param} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
+    )
+}
+
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }

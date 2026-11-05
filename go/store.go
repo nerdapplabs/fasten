@@ -532,13 +532,27 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 	return err
 }
 
-func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
-	q := fmt.Sprintf(`DELETE FROM %s WHERE timestamp < ?`, s.table)
-	args := []any{canonicalTS(before)}
+// purgeSQL is the age purge (spec §2.3). Per node it deletes only the rows
+// below the lowest seq it keeps, a row at or after the cutoff or, with
+// respectUnshipped, an unshipped row, so what is left is a seq suffix. param
+// is the cutoff's placeholder; SQLite binds it twice. Same in Postgres.
+func purgeSQL(table, param string, respectUnshipped bool) string {
+	keep := "timestamp >= " + param
 	if respectUnshipped {
-		q += " AND shipped_at IS NOT NULL"
+		keep += " OR shipped_at IS NULL"
 	}
-	res, err := s.db.ExecContext(ctx, q, args...)
+	return fmt.Sprintf(`DELETE FROM %[1]s WHERE id IN (SELECT d.id FROM %[1]s AS d `+
+		`LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM %[1]s `+
+		`WHERE %[2]s GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id `+
+		`WHERE d.timestamp < %[3]s AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))`,
+		table, keep, param)
+}
+
+// Purge deletes rows older than before, per node only a seq prefix (spec
+// §2.3), so the rows left still verify.
+func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
+	cutoff := canonicalTS(before)
+	res, err := s.db.ExecContext(ctx, purgeSQL(s.table, "?", respectUnshipped), cutoff, cutoff)
 	if err != nil {
 		return 0, err
 	}

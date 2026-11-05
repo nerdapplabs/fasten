@@ -452,16 +452,22 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Delete rows whose timestamp is before `before`.
-	 * When respectUnshipped is true (default), only shipped rows are purged.
+	 * Delete rows whose timestamp is before `before`, per node only a seq
+	 * prefix (spec §2.3): rows above a kept row stay, so the rows left still
+	 * verify. When respectUnshipped is true (default), unshipped rows are kept,
+	 * and so are the rows above them.
 	 *
 	 * @param {{ before: string, respectUnshipped?: boolean }} opts
 	 * @returns {Promise<number>}  Number of rows deleted.
 	 */
 	async purge({ before, respectUnshipped = true }) {
 		await this._ensureReady();
-		let sql = `DELETE FROM ${this._table} WHERE timestamp < $1`;
-		if (respectUnshipped) sql += " AND shipped_at IS NOT NULL";
+		const t = this._table;
+		const keep = `timestamp >= $1${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
+		const sql = `DELETE FROM ${t} WHERE id IN (SELECT d.id FROM ${t} AS d `
+			+ `LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM ${t} `
+			+ `WHERE ${keep} GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id `
+			+ `WHERE d.timestamp < $1 AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))`;
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
 	}

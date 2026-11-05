@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: an age purge no longer leaves a hole in a chain (all stores)
+
+- `purge(before)` deletes, per `source_node_id`, only the rows below the
+  lowest seq it keeps (a row at or after the cutoff, or an unshipped row when
+  `respect_unshipped` is set). A row's timestamp is taken at emit and its seq
+  at insert, so seq N+1 can be older than seq N; deleting by timestamp alone
+  could remove N+1, keep N and N+2, and break `verify_chain` at N+2. An old
+  row above a kept one now stays until that row ages out too (spec §2.3).
+- Same SQL in the Python and Go SQLite and Postgres stores, the fasten-core
+  stores (Rust, C++, Swift) and the JS `PostgresStore`.
+- With `respect_unshipped`, a shipped row above an older unshipped row is no
+  longer deleted.
+
 ### Added: chain checkpoints (Python + Go)
 
 - A checkpoint records a node's latest sealed row (`source_node_id`,

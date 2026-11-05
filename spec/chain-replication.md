@@ -255,6 +255,21 @@ Because §2.1 puts allocation in the store transaction, **sealing happens at
 drain/insert time, not at `emit()`**, and `emit()` returns an unsealed row. §8
 covers what the stdout stream carries until then.
 
+### §2.3 Purge (normative)
+
+An age purge (`purge(before, respect_unshipped)`) MUST delete only a seq
+prefix of each node's rows. Per `source_node_id`, the rows it keeps are those
+with `timestamp >= before` and, when `respect_unshipped` is set, those with
+`shipped_at` null. It deletes the rows below the lowest kept seq, and every
+row of a node with nothing to keep. A row older than the cutoff above a kept
+row stays until that row ages out too.
+
+`timestamp` order is not `monotonic_seq` order: the timestamp is taken at
+emit and the seq at insert (§2.1), and a clock stepped back stamps later rows
+earlier. Deleting by `timestamp < before` alone can remove a row above a kept
+one, and the next kept row's `prev_hash` then names a deleted row, a §3
+break. A prefix leaves a purged head, which verifies (§3).
+
 ---
 
 ## §3 Verification

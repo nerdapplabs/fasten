@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 
 from fasten.attrs import AuditRow
+from fasten.chain import seal, verify_chain
 from fasten.context import mint_id
 from fasten.store.sqlite import SQLiteStore
 
@@ -183,6 +184,46 @@ def test_purge_force(store):
     store.insert(old)
     deleted = store.purge(before=datetime.now(timezone.utc), respect_unshipped=False)
     assert deleted == 1
+
+
+def _chain(node, minutes_ago, now):
+    """Sealed rows seq 1.. on ``node``, stamped ``minutes_ago`` before now."""
+    rows, prev = [], "genesis"
+    for seq, mins in enumerate(minutes_ago, 1):
+        r = seal(prev, make_row(id=f"evt-{node}-{seq}", origin_id=f"evt-{node}-{seq}",
+                                monotonic_seq=seq, source_node_id=node,
+                                timestamp=now - timedelta(minutes=mins), detail={}))
+        rows.append(r)
+        prev = r.hash
+    return rows
+
+
+def _seqs(store, node):
+    return sorted(r.monotonic_seq for r in store.query(limit=100) if r.source_node_id == node)
+
+
+def test_purge_deletes_only_a_seq_prefix(store):
+    # Seq 3 is newer than the cutoff and seq 4 older: a timestamp-only
+    # delete takes 4 and keeps 3 and 5, and the chain breaks at 5.
+    now = datetime.now(timezone.utc)
+    store.ingest_replicated(_chain("node-a", [100, 90, 79, 80, 70, 60], now))
+    store.ingest_replicated(_chain("node-b", [100, 90], now))   # all old
+    deleted = store.purge(before=now - timedelta(minutes=79, seconds=30),
+                          respect_unshipped=False)
+    assert deleted == 4
+    assert _seqs(store, "node-a") == [3, 4, 5, 6]
+    assert _seqs(store, "node-b") == []
+    assert verify_chain(store.query(limit=100)).ok
+
+
+def test_purge_keeps_rows_above_an_unshipped_row(store):
+    now = datetime.now(timezone.utc)
+    store.ingest_replicated(_chain("node-a", [100, 90, 80, 10], now))
+    store.mark_shipped(["evt-node-a-1", "evt-node-a-3"])
+    deleted = store.purge(before=now - timedelta(minutes=30), respect_unshipped=True)
+    assert deleted == 1
+    assert _seqs(store, "node-a") == [2, 3, 4]
+    assert verify_chain(store.query(limit=100)).ok
 
 
 # max_monotonic_seq

@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{non_empty, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -311,14 +311,7 @@ impl Store for SqliteStore {
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
-        let sql = if respect_unshipped {
-            format!(
-                "DELETE FROM {} WHERE timestamp < ?1 AND shipped_at IS NOT NULL",
-                self.table
-            )
-        } else {
-            format!("DELETE FROM {} WHERE timestamp < ?1", self.table)
-        };
+        let sql = purge_sql(&self.table, "?1", respect_unshipped);
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.execute(&sql, rusqlite::params![before])?;
         Ok(n as u64)
@@ -698,6 +691,41 @@ mod tests {
     fn seqs(store: &SqliteStore, node: &str) -> Vec<u64> {
         let f = Filter { source_node_id: Some(node.into()), ..Default::default() };
         store.query(&f).unwrap().iter().map(|r| r.monotonic_seq).collect()
+    }
+
+    #[test]
+    fn purge_deletes_only_a_seq_prefix() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        // Seq 2 is newer than the cutoff and seq 3 older: a timestamp-only
+        // delete takes 3 and keeps 2 and 4, and the chain breaks at 4.
+        for (id, node, ts) in [
+            ("evt-a1", "node-a", "2020-01-01"),
+            ("evt-a2", "node-a", "2020-01-03"),
+            ("evt-a3", "node-a", "2020-01-02"),
+            ("evt-a4", "node-a", "2020-01-04"),
+            ("evt-b1", "node-b", "2020-01-01"),
+            ("evt-b2", "node-b", "2020-01-02"),
+        ] {
+            let mut r = row_on(id, node);
+            r.timestamp = format!("{ts}T00:00:00.000Z");
+            store.insert(&r).unwrap();
+        }
+        assert_eq!(store.purge("2020-01-02T12:00:00.000Z", false).unwrap(), 3);
+        assert_eq!(seqs(&store, "node-a"), vec![2, 3, 4]);
+        assert!(seqs(&store, "node-b").is_empty());
+    }
+
+    #[test]
+    fn purge_keeps_rows_above_an_unshipped_row() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        for (id, ts) in [("evt-u1", "2020-01-01"), ("evt-u2", "2020-01-02"), ("evt-u3", "2020-01-03")] {
+            let mut r = row_on(id, "node-a");
+            r.timestamp = format!("{ts}T00:00:00.000Z");
+            store.insert(&r).unwrap();
+        }
+        store.mark_shipped(&["evt-u1".to_string(), "evt-u3".to_string()]).unwrap();
+        assert_eq!(store.purge("2021-01-01T00:00:00.000Z", true).unwrap(), 1);
+        assert_eq!(seqs(&store, "node-a"), vec![2, 3]);
     }
 
     /// A temp file path, removed (with its WAL files) on drop.

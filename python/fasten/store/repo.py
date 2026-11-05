@@ -117,7 +117,10 @@ class AuditRepository(Protocol):
 
     def list_unshipped(self, limit: int = 100) -> list[AuditRow]: ...
     def mark_shipped(self, ids: list[str]) -> None: ...
-    def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int: ...
+    def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
+        """Delete rows older than ``before``, per node only a seq prefix
+        (spec §2.3), so the rows left still verify."""
+        ...
 
     def ingest_replicated(
         self, rows: list[AuditRow], local_node_id: str | None = None,
@@ -282,6 +285,21 @@ def chain_tips_sql(table: str) -> str:
         f"SELECT node, (SELECT monotonic_seq FROM {table} WHERE source_node_id = node "
         "AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1) AS seq "
         "FROM nodes WHERE node IS NOT NULL"
+    )
+
+
+def purge_sql(table: str, param: str, respect_unshipped: bool) -> str:
+    """SQL for an age purge (spec §2.3). Per node it deletes only the rows
+    below the lowest seq it keeps, a row at or after the cutoff or, with
+    respect_unshipped, an unshipped row, so what is left is a seq suffix.
+    ``param`` is the cutoff's placeholder; bind the cutoff twice. Same in
+    SQLite and Postgres."""
+    keep = f"timestamp >= {param}" + (" OR shipped_at IS NULL" if respect_unshipped else "")
+    return (
+        f"DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d "
+        f"LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} "
+        f"WHERE {keep} GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id "
+        f"WHERE d.timestamp < {param} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
     )
 
 

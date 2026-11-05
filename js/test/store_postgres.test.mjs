@@ -150,8 +150,9 @@ test('purge respects unshipped rows', { skip }, async () => {
 
 // 6. purge shipped
 test('purge deletes shipped rows older than cutoff', { skip }, async () => {
+    // Its own node: an older unshipped row on node-1 keeps the rows above it.
     const oldTs = _daysAgo(31);
-    const row = makeRow({ timestamp: oldTs });
+    const row = makeRow({ timestamp: oldTs, source_node_id: `node-${randomUUID()}`, monotonic_seq: 1 });
     await store.insert(row);
     await store.markShipped([row.id]);
 
@@ -160,6 +161,19 @@ test('purge deletes shipped rows older than cutoff', { skip }, async () => {
 
     const remaining = await store.count({ requestId: row.request_id });
     assert.equal(remaining, 0);
+});
+
+// 6b. purge keeps a seq suffix per node (spec §2.3)
+test('purge deletes only a seq prefix of each node', { skip }, async () => {
+    // Seq 2 is newer than the cutoff and seq 3 older: a timestamp-only
+    // delete takes 3 and keeps 2 and 4, and the chain breaks at 4.
+    const node = `node-${randomUUID()}`;
+    for (const [seq, days] of [[1, 40], [2, 20], [3, 35], [4, 10]]) {
+        await store.insert(makeRow({ source_node_id: node, monotonic_seq: seq, timestamp: _daysAgo(days) }));
+    }
+    await store.purge({ before: _daysAgo(30), respectUnshipped: false });
+    const left = await store.query({ sourceNodeId: node });
+    assert.deepEqual(left.map((r) => r.monotonicSeq).sort((a, b) => a - b), [2, 3, 4]);
 });
 
 // 7. count filtered
