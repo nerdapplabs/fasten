@@ -19,6 +19,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - The source archives are reproducible with GNU tar, GNU gzip and the stock
   Python zlib. `release-check.yml` builds them twice from separate clones and
   fails if the bytes differ. It runs on changes to any file the archives hold.
+- fasten-core is built with the checkout mounted read-only and its target
+  directory outside the checkout. `build-artifacts.sh` stops with an error
+  when a tracked file differs from HEAD.
 - The PyPI release sets `attestations: true` (PEP 740) explicitly.
 - SECURITY.md lists the commands to verify a release for each SDK, including
   how to match the Go zip's `h1:` hash with `go.sum`.

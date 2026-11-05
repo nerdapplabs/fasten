@@ -7,7 +7,8 @@
 #              library when core-lib-dir holds a release build of it.
 #   go/vX.Y.Z  The Go module zip, laid out as the module proxy serves it.
 #
-# Archives hold only tracked files at HEAD. Entries are sorted, owned by
+# Archives hold only tracked files at HEAD, and the script stops if any
+# tracked file differs from HEAD. Entries are sorted, owned by
 # 0:0, stamped with the commit time and use normalized modes, so the same
 # commit always gives the same bytes. Needs git, GNU tar, gzip, sha256sum
 # and python3.
@@ -25,6 +26,11 @@ tar --version 2>/dev/null | grep -q 'GNU tar' || { echo "GNU tar is required" >&
 [ -z "$core_lib" ] || core_lib=$(cd "$core_lib" && pwd)
 
 cd "$(git rev-parse --show-toplevel)"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "tracked files differ from HEAD; build from a clean checkout:" >&2
+  git status --short --untracked-files=no >&2
+  exit 1
+fi
 epoch=$(git log -1 --format=%ct HEAD)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)

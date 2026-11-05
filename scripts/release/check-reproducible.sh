@@ -88,6 +88,30 @@ entries() { tar -tzf "$1" | grep -vc '/LICENSE$' || true; }
 [ "$(entries "$m/fasten-swift-$tag.tar.gz")" -eq "$(count swift)" ] || { echo "FAIL: swift file count"; fail=1; }
 [ "$(entries "$m/fasten-cpp-$tag.tar.gz")" -eq "$(count cpp/include)" ] || { echo "FAIL: cpp file count"; fail=1; }
 
+# A tracked file that differs from HEAD stops the build, staged or not.
+dirty() { # dirty <name> <command>: build in a clone after the command
+  local name=$1 log; shift
+  clone "$name"
+  (cd "$work/$name" && "$@")
+  log=$work/$name.log
+  if (cd "$work/$name" && scripts/release/build-artifacts.sh "$tag" "$work/out-$name" "$work/lib") >"$log" 2>&1; then
+    echo "FAIL: build ran with $name changes"; fail=1
+  elif ! grep -q 'tracked files differ from HEAD' "$log"; then
+    echo "FAIL: $name build failed for another reason:"; cat "$log"; fail=1
+  elif [ -e "$work/out-$name" ]; then
+    echo "FAIL: $name build wrote files"; fail=1
+  fi
+}
+dirty modified sh -c 'echo x >> swift/Package.swift'
+dirty staged sh -c 'echo x >> cpp/include/fasten.hpp && git add cpp/include/fasten.hpp'
+# Untracked files are not packed, so they don't stop the build.
+clone untracked
+touch "$work/untracked/swift/extra.swift"
+(cd "$work/untracked" && scripts/release/build-artifacts.sh "$tag" "$work/out-untracked" "$work/lib" >/dev/null) \
+  || { echo "FAIL: untracked file stopped the build"; fail=1; }
+cmp -s "$work/out-a/main/SHA256SUMS" "$work/out-untracked/SHA256SUMS" \
+  || { echo "FAIL: untracked file changed the archives"; fail=1; }
+
 if [ "$fail" -ne 0 ]; then
   echo "release artifacts check failed"
   exit 1
