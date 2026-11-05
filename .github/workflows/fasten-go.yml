@@ -6,11 +6,13 @@ on:
     paths:
       - 'go/**'
       - 'fasten-core/**'
+      - 'spec/**'
       - '.github/workflows/fasten-go.yml'
   pull_request:
     paths:
       - 'go/**'
       - 'fasten-core/**'
+      - 'spec/**'
       - '.github/workflows/fasten-go.yml'
   workflow_call:
 
