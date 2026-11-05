@@ -34,18 +34,20 @@ private final class SysLog: @unchecked Sendable {
     }
 }
 
-/// Fails the first `failures` inserts, then stores rows. Inserts wait while
-/// the gate is closed.
+/// Fails the first `failures` inserts, and any insert before `downUntil`,
+/// then stores rows. Inserts wait while the gate is closed.
 private final class TestStore: AuditStore, @unchecked Sendable {
     private let lock = Lock()
     private var rows: [AuditRow] = []
     private var failuresLeft: Int
     private var gateOpen: Bool
     private var calls = 0
+    private let downUntil: Date
 
-    init(failures: Int = 0, gateOpen: Bool = true) {
+    init(failures: Int = 0, gateOpen: Bool = true, downFor: TimeInterval = 0) {
         self.failuresLeft = failures
         self.gateOpen = gateOpen
+        self.downUntil = Date().addingTimeInterval(downFor)
     }
 
     func insert(_ row: AuditRow) throws {
@@ -56,6 +58,7 @@ private final class TestStore: AuditStore, @unchecked Sendable {
                 failuresLeft -= 1
                 throw FastenError("insert failed")
             }
+            if Date() < downUntil { throw FastenError("store down") }
             rows.append(row)
         }
     }
@@ -221,6 +224,62 @@ final class DrainerConformanceTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 1.6)
         first.setGate(true)
         second.setGate(true)
+        wait(for: [reinit], timeout: 15)
+    }
+
+    // §10: close() flushes for half the timeout first, so a store back
+    // within that time gets the row.
+    func testCloseFlushesBeforeStopping() throws {
+        let store = TestStore(downFor: 0.3)
+        let engine = Engine()
+        engine.configure(serviceID: "svc", nodeID: "node", store: store)
+        let log = SysLog()
+        log.capture(engine)
+        try engine.emit(code: "USER_CREATED", target: "a", actor: "x")
+        Thread.sleep(forTimeInterval: 0.05)
+        XCTAssertTrue(engine.close(timeout: 2))
+        XCTAssertEqual(store.stored.count, 1)
+        XCTAssertTrue(log.named("audit_drain_lost_at_stop").isEmpty, "\(log.events)")
+    }
+
+    func testCloseWithTheStoreDownReturnsFalseWithinTheTimeout() throws {
+        let store = TestStore(failures: 1_000)
+        let engine = Engine()
+        engine.configure(serviceID: "svc", nodeID: "node", store: store)
+        try engine.emit(code: "USER_CREATED", target: "a", actor: "x")
+        let start = Date()
+        XCTAssertFalse(engine.close(timeout: 1))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
+    }
+
+    // §10: a row the new drainer loses while close() waits on a slow insert
+    // in the retiring one still makes close() return false.
+    func testCloseCountsALossWhileWaitingOnARetiringDrainer() throws {
+        let first = TestStore(gateOpen: false)
+        let second = TestStore(failures: 1_000)
+        let engine = Engine()
+        engine.installFlushTimeout = 10
+        engine.stopTimeout = 10
+        engine.configure(serviceID: "svc", nodeID: "node", store: first)
+        let log = SysLog()
+        log.capture(engine)
+        try engine.emit(code: "USER_CREATED", target: "a", actor: "x")
+        XCTAssertTrue(waitUntil { first.insertCalls == 1 })
+
+        let reinit = expectation(description: "re-init returns")
+        DispatchQueue.global().async {
+            engine.configure(serviceID: "svc", nodeID: "node", store: second)
+            reinit.fulfill()
+        }
+        XCTAssertTrue(waitUntil { !log.named("audit_chain_unavailable").isEmpty })
+        try engine.emit(code: "USER_CREATED", target: "b", actor: "x")
+        XCTAssertTrue(waitUntil { second.insertCalls >= 1 })
+
+        // The slow insert finishes after the flush, well inside the timeout.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.3) { first.setGate(true) }
+        XCTAssertFalse(engine.close(timeout: 2))
+        XCTAssertEqual(first.stored.count, 1)
+        XCTAssertEqual(log.named("audit_drain_lost_at_stop").count, 1, "\(log.events)")
         wait(for: [reinit], timeout: 15)
     }
 

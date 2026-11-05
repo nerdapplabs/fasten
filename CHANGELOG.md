@@ -16,11 +16,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   drainer. It logs `audit_drain_install_incomplete` when the old drainer's
   rows were not stored, counting from the swap, so a dead letter from
   earlier is not counted and one right after the swap is.
-- New `Fasten.close(timeout:)` stops the drainer per spec §10. Queued rows get
-  one attempt each, an insert in progress is waited for, and rows not stored
-  are logged as `audit_drain_lost_at_stop` and make `close()` return false.
-  It also stops old drainers a re-init is still retiring, all within the one
-  timeout, and returns false if any of them lost a row.
+- New `Fasten.close(timeout:)` flushes for up to half the timeout, as Python,
+  Go and JS do, then stops the drainer per spec §10. Queued rows get one
+  attempt each, an insert in progress is waited for, and rows not stored are
+  logged as `audit_drain_lost_at_stop` and make `close()` return false. It
+  also stops old drainers a re-init is still retiring, all within the one
+  timeout, and returns false if any of them lost a row, counting from before
+  any of them stopped.
 - An insert still running at the close deadline is reported lost but keeps
   running. If it then stores its row, `audit_drain_recovered_at_stop` with
   `row_ids` follows, as in Python. A lost report can be a false alarm; a

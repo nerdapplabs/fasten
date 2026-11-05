@@ -180,6 +180,13 @@ final class QueueDrainer: @unchecked Sendable {
         return deadLetteredTotal + lostTotal
     }
 
+    /// Rows lost at stop, over the drainer's lifetime.
+    var lostCount: Int {
+        cond.lock()
+        defer { cond.unlock() }
+        return lostTotal
+    }
+
     var statsJSON: String {
         cond.lock()
         let depth  = q.count + inFlight

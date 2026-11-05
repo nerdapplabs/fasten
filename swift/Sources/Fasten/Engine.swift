@@ -237,21 +237,36 @@ final class Engine: @unchecked Sendable {
         return ok
     }
 
-    /// Stops the drainer and any old ones a re-init is retiring (spec §10),
-    /// all within `timeout`. Returns false if any of them lost a row.
-    /// Later emits in queue mode write to the store inline.
+    /// Flushes for up to half of `timeout`, then stops the drainer and any
+    /// old ones a re-init is retiring (spec §10), all within `timeout`.
+    /// Returns false if any of them lost a row. Later emits in queue mode
+    /// write to the store inline.
     func close(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        let seen = lock.withLock { retiring + (drainer.map { [$0] } ?? []) }
+        // Counted before any drainer stops: a stop can make another one's
+        // row fail its last attempt while close waits on the first.
+        var lostBefore = Dictionary(uniqueKeysWithValues: seen.map { (ObjectIdentifier($0), $0.lostCount) })
+        _ = flush(timeout: timeout / 2)
         let all = lock.withLock { () -> [QueueDrainer] in
             let d = drainer
             drainer = nil
             return retiring + (d.map { [$0] } ?? [])
         }
+        // A drainer a re-init installed during the flush starts from now.
+        for d in all where lostBefore[ObjectIdentifier(d)] == nil {
+            lostBefore[ObjectIdentifier(d)] = d.lostCount
+        }
+        // A drainer already retired during the flush is checked too.
+        let checked = seen + all.filter { d in !seen.contains { $0 === d } }
         // Stop them all first so they drain in parallel.
         for d in all { d.requestStop() }
-        let deadline = Date().addingTimeInterval(timeout)
         var ok = true
         for d in all {
             ok = d.close(timeout: max(0, deadline.timeIntervalSinceNow)) && ok
+        }
+        for d in checked where d.lostCount > lostBefore[ObjectIdentifier(d)] ?? 0 {
+            ok = false
         }
         return ok
     }
