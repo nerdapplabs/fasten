@@ -193,15 +193,21 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 /// The age purge (spec §2.3). Per node it deletes only the rows below the
 /// lowest seq it keeps, a row at or after the cutoff or, with
 /// `respect_unshipped`, an unshipped row, so what is left is a seq suffix.
-/// `param` is the cutoff's placeholder. Same in SQLite and Postgres.
+/// Rows at seq 0 are not chained and go by age alone. `param` is the
+/// cutoff's placeholder. Same in SQLite and Postgres.
 pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool) -> String {
-    let unshipped = if respect_unshipped { " OR shipped_at IS NULL" } else { "" };
+    let (unshipped, shipped) = if respect_unshipped {
+        (" OR shipped_at IS NULL", " AND shipped_at IS NOT NULL")
+    } else {
+        ("", "")
+    };
     format!(
         "DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d \
          LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} \
-         WHERE timestamp >= {param}{unshipped} GROUP BY source_node_id) AS k \
+         WHERE monotonic_seq > 0 AND (timestamp >= {param}{unshipped}) GROUP BY source_node_id) AS k \
          ON k.source_node_id = d.source_node_id \
-         WHERE d.timestamp < {param} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
+         WHERE d.timestamp < {param}{shipped} \
+         AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
     )
 }
 

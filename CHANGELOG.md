@@ -18,6 +18,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   stores (Rust, C++, Swift) and the JS `PostgresStore`.
 - With `respect_unshipped`, a shipped row above an older unshipped row is no
   longer deleted.
+- Rows at seq 0 (not chained) are still purged by age alone.
+- A purge can now delete and report fewer rows than before, and it reads the
+  whole table once to find each node's lowest kept seq: about 0.5 s per
+  million rows on SQLite, against about 0.15 s for the old delete.
 
 ### Added: chain checkpoints (Python + Go)
 

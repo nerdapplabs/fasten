@@ -462,13 +462,15 @@ export class PostgresStore {
 	 */
 	async purge({ before, respectUnshipped = true }) {
 		await this._ensureReady();
+		// Rows at seq 0 are not chained and go by age alone.
 		const t = this._table;
 		const keep = `timestamp >= $1${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
+		const shipped = respectUnshipped ? " AND shipped_at IS NOT NULL" : "";
 		const sql =
 			`DELETE FROM ${t} WHERE id IN (SELECT d.id FROM ${t} AS d ` +
 			`LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM ${t} ` +
-			`WHERE ${keep} GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id ` +
-			`WHERE d.timestamp < $1 AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))`;
+			`WHERE monotonic_seq > 0 AND (${keep}) GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id ` +
+			`WHERE d.timestamp < $1${shipped} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))`;
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
 	}

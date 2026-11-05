@@ -407,8 +407,8 @@ class SQLiteStore:
         from .repo import purge_sql
         with self._txn():
             conn = self._connect()
-            cutoff = _utc_iso(before)
-            cur = conn.execute(purge_sql(self._table, "?", respect_unshipped), (cutoff, cutoff))
+            sql = purge_sql(self._table, "?", respect_unshipped)
+            cur = conn.execute(sql, (_utc_iso(before),) * sql.count("?"))
             conn.commit()
             return cur.rowcount
 

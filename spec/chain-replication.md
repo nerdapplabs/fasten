@@ -262,7 +262,9 @@ prefix of each node's rows. Per `source_node_id`, the rows it keeps are those
 with `timestamp >= before` and, when `respect_unshipped` is set, those with
 `shipped_at` null. It deletes the rows below the lowest kept seq, and every
 row of a node with nothing to keep. A row older than the cutoff above a kept
-row stays until that row ages out too.
+row stays until that row ages out too. Rows at seq 0 are not chained; they
+never count as kept for this rule and are deleted by age, unshipped ones
+staying when `respect_unshipped` is set.
 
 `timestamp` order is not `monotonic_seq` order: the timestamp is taken at
 emit and the seq at insert (§2.1), and a clock stepped back stamps later rows

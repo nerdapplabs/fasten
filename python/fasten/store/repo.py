@@ -292,14 +292,18 @@ def purge_sql(table: str, param: str, respect_unshipped: bool) -> str:
     """SQL for an age purge (spec §2.3). Per node it deletes only the rows
     below the lowest seq it keeps, a row at or after the cutoff or, with
     respect_unshipped, an unshipped row, so what is left is a seq suffix.
-    ``param`` is the cutoff's placeholder; bind the cutoff twice. Same in
+    Rows at seq 0 are not chained and go by age alone. ``param`` is the
+    cutoff's placeholder; bind the cutoff once per occurrence. Same in
     SQLite and Postgres."""
+    shipped = " AND shipped_at IS NOT NULL" if respect_unshipped else ""
     keep = f"timestamp >= {param}" + (" OR shipped_at IS NULL" if respect_unshipped else "")
     return (
         f"DELETE FROM {table} WHERE id IN (SELECT d.id FROM {table} AS d "
         f"LEFT JOIN (SELECT source_node_id, MIN(monotonic_seq) AS keep_from FROM {table} "
-        f"WHERE {keep} GROUP BY source_node_id) AS k ON k.source_node_id = d.source_node_id "
-        f"WHERE d.timestamp < {param} AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
+        f"WHERE monotonic_seq > 0 AND ({keep}) GROUP BY source_node_id) AS k "
+        f"ON k.source_node_id = d.source_node_id "
+        f"WHERE d.timestamp < {param}{shipped} "
+        f"AND (k.keep_from IS NULL OR d.monotonic_seq < k.keep_from))"
     )
 
 

@@ -226,6 +226,20 @@ def test_purge_keeps_rows_above_an_unshipped_row(store):
     assert verify_chain(store.query(limit=100)).ok
 
 
+def test_purge_takes_seq_0_rows_by_age(store):
+    # Rows at seq 0 are not chained: a recent one must not hold back the
+    # node's old rows, and an old unshipped one stays under respect_unshipped.
+    now = datetime.now(timezone.utc)
+    old, new = now - timedelta(days=31), now - timedelta(days=1)
+    store.insert(make_row(id="evt-z-old", origin_id="evt-z-old", monotonic_seq=0, timestamp=old))
+    store.insert(make_row(id="evt-z-new", origin_id="evt-z-new", monotonic_seq=0, timestamp=new))
+    store.insert(make_row(id="evt-z-unshipped", origin_id="evt-z-unshipped", monotonic_seq=0, timestamp=old))
+    store.mark_shipped(["evt-z-old", "evt-z-new"])
+    deleted = store.purge(before=now - timedelta(days=30), respect_unshipped=True)
+    assert deleted == 1
+    assert sorted(r.id for r in store.query(limit=10)) == ["evt-z-new", "evt-z-unshipped"]
+
+
 # max_monotonic_seq
 
 def test_max_monotonic_seq_empty(store):
