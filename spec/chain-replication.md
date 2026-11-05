@@ -75,9 +75,18 @@ Every SDK MUST produce the same bytes:
 | Key order | Sorted ascending, **recursively** (top level and every nested object). |
 | Whitespace | None: `,` and `:` separators, no spaces. |
 | Non-ASCII | Escaped as `\uXXXX` (UTF-16 surrogate pairs for astral characters), as with CPython `ensure_ascii=True`. |
+| DEL (0x7f) | Escaped as `\u007f`, as CPython does. |
 | `<` `>` `&` | Left **literal**. CPython does NOT HTML-escape; a Go encoder MUST turn HTML escaping off. |
 | Null | `None` renders as `null` for `tenant_id` when absent; `shipped_at` is always `null` (§1.1). |
 | Timestamps | `datetime.isoformat()` of a tz-aware UTC value: `+00:00` offset (not `Z`), six-digit microseconds only when nonzero. Applies to `timestamp`. |
+
+Rows the Go SDK sealed before it escaped DEL hold it raw in the hashed bytes.
+When a row's detail commitment or hash does not match and a hashed string holds
+DEL, verifiers MUST retry that check with DEL written raw, every other rule
+unchanged, and accept the row if it then matches. This applies to every form
+and combines with the other hash fallbacks: the `shipped_at` rule in §1.1, and
+for form `"1"` a hash over the wire `Z` timestamp, as Python sealed form `"1"`
+before it used `+00:00`.
 
 ### §1.3 Number rendering (cross-language hazard)
 
@@ -278,7 +287,10 @@ and `monotonic_seq`.
 
 - **Verified prefix, not all-or-nothing.** `ingest` verifies the incoming chain
   and inserts the longest verified prefix (the rows before the first break). It
-  MUST NOT raise on a break.
+  MUST NOT raise on a break. An unsealed row below its node's first sealed
+  row, in the batch and in the store, is not inserted (§5) and is not a break.
+  If the store holds a sealed row for its node at a lower seq, it is a break at
+  that row, with the reason `verify_chain` gives (§2).
 - **`IngestResult`** reports:
   - `inserted`: rows passed to the idempotent insert,
   - `rejected_from_seq`: the `monotonic_seq` of the first broken row, or null
@@ -295,7 +307,8 @@ and `monotonic_seq`.
   `hash` the stored row at `seq + 1` does not link to. Since `id` is unique,
   a repeat of an `id` within a batch on another node is a break at the later
   row; on the same node, `verify_chain` already breaks at the lower seq when
-  the copies differ (§3). `ingest` MUST
+  the copies differ (§3), and copies with the same `hash` are a re-delivery,
+  inserted once. `ingest` MUST
   NOT keep one version silently: an insert skipped because another writer
   stored that `id` in the meantime is checked again, not counted as inserted.
   A row stored with the same `hash` is a re-delivery.

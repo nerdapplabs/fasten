@@ -37,6 +37,31 @@ def make_fasten_processor() -> Callable[[Any, str, dict[str, Any]], dict[str, An
     return _processor
 
 
+class _CurrentRedactor:
+    """The engine's current redactor with ``extra_keys`` added. The copy is
+    rebuilt when init() replaces the engine's redactor."""
+
+    def __init__(self, extra_keys: Optional[list[str]]) -> None:
+        self._extra_keys = extra_keys
+        self._cached: Optional[tuple[Any, Any]] = None
+
+    def _get(self) -> Any:
+        from fasten import redactor as _redactor
+        base = _redactor()
+        cached = self._cached
+        if cached is None or cached[0] is not base:
+            cached = (base, base.with_extra_keys(self._extra_keys))
+            self._cached = cached
+        return cached[1]
+
+    def redact(self, value: Any) -> Any:
+        return self._get().redact(value)
+
+    def structlog_processor(self, logger: Any, method: str,
+                            event_dict: dict[str, Any]) -> dict[str, Any]:
+        return self._get().as_structlog_processor()(logger, method, event_dict)
+
+
 # Loggers set to WARNING by configure() unless quiet= is given.
 _DEFAULT_QUIET = (
     "urllib3",
@@ -78,13 +103,13 @@ def configure(
             "install with: pip install structlog"
         ) from e
 
-    from fasten import redactor as _redactor
     from fasten.shim.stdlib import LoggingHandler
 
     level = logging.DEBUG if debug else logging.INFO
     # One redactor for structlog and the stdlib bridge, so both honour
-    # extra_redact_keys.
-    redactor = _redactor().with_extra_keys(extra_redact_keys)
+    # extra_redact_keys. It uses the engine's current redactor, so an init()
+    # after configure() applies to both.
+    redactor = _CurrentRedactor(extra_redact_keys)
 
     # PrintLoggerFactory writes straight to stdout without stdlib logging, so
     # make_fasten_processor() is how structlog events reach fasten.
@@ -96,7 +121,7 @@ def configure(
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
-        redactor.as_structlog_processor(),
+        redactor.structlog_processor,
         make_fasten_processor(),
     ]
     if extra_processors:
