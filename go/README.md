@@ -137,6 +137,65 @@ returns within about `timeout`, reports rows not stored by then as
 call still running then, such as a lib/pq query to a server that stopped
 answering, is left to finish in the background.
 
+## Verifying the chain
+
+`fasten.VerifyChain` checks the hash chain over a set of rows and reports
+the first break: an edited, inserted, deleted or reordered row
+([spec §3](../spec/chain-replication.md#3-verification)). Chains sealed by
+the Go and Python SDKs verify in either.
+
+```go
+rows, err := store.Query(ctx, fasten.Filter{Limit: 10000})
+if err != nil {
+	return err
+}
+if res := fasten.VerifyChain(rows); !res.OK {
+	log.Printf("chain breaks at seq %d: %s", res.FirstBreakAt, res.Reason)
+}
+```
+
+## Chain checkpoints
+
+`VerifyChain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later
+([spec §9](../spec/chain-replication.md#9-checkpoints)):
+
+```go
+sink := fasten.FileCheckpointSink{Path: "/mnt/worm/checkpoints.jsonl"}
+// fasten.HTTPCheckpointSink{URL: url} POSTs them instead.
+if _, err := fasten.PublishCheckpoints(ctx, store, sink); err != nil {
+    return err
+}
+
+cps, err := fasten.LoadCheckpoints("/mnt/worm/checkpoints.jsonl")
+res := fasten.VerifyChainWithCheckpoints(allRows, cps, fasten.CheckpointOptions{})
+```
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, set `CheckpointOptions{Partial: true}`;
+checkpoints below or above its rows, or for nodes not in them, are then
+skipped, so only a whole-chain verify detects a cut-off tail. If the file's
+last line was cut short by a crash, `LoadCheckpoints` returns the earlier
+checkpoints with `ErrPartialLastLine`, and the next publish drops it. Use
+one publisher per file.
+
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. Pass only the checkpoints taken since the latest purge finished,
+and publish again after each purge:
+
+```go
+kept, err := fasten.CheckpointsSince(cps, purgedAt)
+res := fasten.VerifyChainWithCheckpoints(allRows, kept, fasten.CheckpointOptions{})
+```
+
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
+
 ## Tests
 
 The same steps CI runs (see

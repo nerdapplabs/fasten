@@ -269,6 +269,22 @@ def ingest_without_local_node(
     )
 
 
+def chain_tips_sql(table: str) -> str:
+    """SQL for each node's highest sealed seq, as (node, seq) rows. It walks
+    the (source_node_id, monotonic_seq) index: the next node id after the
+    last, then that node's sealed row with the highest seq. Same in SQLite
+    and Postgres."""
+    return (
+        "WITH RECURSIVE nodes(node) AS ("
+        f"SELECT MIN(source_node_id) FROM {table} UNION ALL "
+        f"SELECT (SELECT MIN(source_node_id) FROM {table} WHERE source_node_id > node) "
+        "FROM nodes WHERE node IS NOT NULL) "
+        f"SELECT node, (SELECT monotonic_seq FROM {table} WHERE source_node_id = node "
+        "AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1) AS seq "
+        "FROM nodes WHERE node IS NOT NULL"
+    )
+
+
 class StoredMeanwhile(Exception):
     """Another writer stored a row with this id after the stored-row checks
     ran, so the insert was skipped. The caller rolls back and checks again."""

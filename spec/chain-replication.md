@@ -210,7 +210,8 @@ stamp it at seal time.
   a gap below it, as left by a purged head, the chain is checked from that row
   on. A gap between two sealed rows is a `prev_hash` break. Since an
   unsealed row can carry any seq, losing the head of a chain is detectable only
-  against an external record of it, as with tail truncation.
+  against an external record of it; tail truncation is detected against a
+  checkpoint (§9).
 
 ### §2.1 Allocation (normative)
 
@@ -257,6 +258,10 @@ covers what the stdout stream carries until then.
 ---
 
 ## §3 Verification
+
+The SDKs that verify name it `verify_chain(rows)` (Python) and
+`VerifyChain(rows)` (Go); this spec uses the Python name. Both follow
+these steps and give the same result for the same rows.
 
 `verify_chain(rows)`:
 
@@ -399,8 +404,8 @@ gone and we can show why".
   records that the destruction happened.
 - It does **not** give non-repudiation. An operator who can redact can also
   re-seal the whole chain from genesis. Redaction is only meaningfully
-  constrained when the chain tip is anchored externally, so that a full re-seal
-  fails against a digest published before the rewrite.
+  constrained when the chain tip is checkpointed externally (§9), so that a
+  full re-seal fails against a checkpoint published before the rewrite.
 
 ---
 
@@ -440,3 +445,123 @@ example one writing through fasten-core. Such rows have an empty `hash`;
 
 A node that writes unsealed rows MUST NOT share its `source_node_id` with a
 writer that seals; give it a distinct node id.
+
+---
+
+## §9 Checkpoints
+
+The chain shows edits, insertions, deletions and reordering on its own. It
+cannot show rows cut off at the end, or a chain re-sealed from genesis by
+someone with write access to the store: both leave a chain that verifies.
+A checkpoint records a node's latest sealed row so that both can be detected
+later.
+
+### §9.1 Format
+
+A checkpoint is a JSON object with exactly these fields:
+
+| Field | Type | Value |
+|---|---|---|
+| `source_node_id` | string | The node (§2). |
+| `monotonic_seq` | integer | `monotonic_seq` of the node's sealed row (`hash <> ''`) with the highest seq. |
+| `hash` | string | That row's `hash`. |
+| `anchored_at` | string | When the checkpoint was taken, in the canonical timestamp form ([persistent-streams.md §4.3](./persistent-streams.md)). |
+
+Taking checkpoints yields one per node that has a sealed row; unsealed rows
+are not checkpointed. A file of checkpoints holds one object per line,
+each ending in a newline. A reader MUST reject a line that is not such an
+object (another key, a key in other case, a missing key or a value of
+another type), with one exception: when the file does not end in a newline
+and its last line is not valid JSON, as a crash part way through an append
+leaves it, that line is skipped and the reader reports it to the caller (Go
+returns `ErrPartialLastLine` with the checkpoints before it; Python logs a
+warning). Before appending, a file sink MUST truncate such an unfinished
+last line, so that it never ends up before a later line, and MUST add the
+missing newline after a complete last line. A file has one publisher at a
+time; concurrent appends to one file are not supported. An HTTP sink receives a JSON array of them in one `POST`. Any
+status other than 2xx, a 3xx included, is a failed publish: a redirect is
+not followed, since a client would repeat a `POST` as a `GET` without the
+body. Userinfo in the sink URL (`user:password@`) is sent as an
+`Authorization: Basic` header and is not part of the request URL. Error
+messages name the sink URL as `scheme://host[:port]/path`, without
+userinfo or query.
+
+### §9.2 Where to publish
+
+Where checkpoints are published is the operator's choice. They SHOULD go
+somewhere outside the operator's own write control, such as a write-once
+bucket, a transparency log or a third party, and SHOULD be published often
+enough that the rows written since the last checkpoint are an acceptable
+loss. A checkpoint held where the store's operator can rewrite it proves
+nothing about that operator.
+
+### §9.3 Verifying against checkpoints
+
+SDKs that verify chains (Python, Go) MUST be able to verify a batch of rows
+against checkpoints, in two modes:
+
+- **Whole chain** (the default): the batch is taken to be every row the
+  store holds. Every node that has a checkpoint MUST have rows in the
+  batch, and no checkpoint may be below its lowest row seq or above its
+  highest.
+- **Partial** (an explicit option): the batch is a page, one node or a
+  sample, so a checkpoint outside it says nothing about it.
+
+In either mode these rules apply after §3 step 1, per checkpoint whose node
+has rows in the batch:
+
+1. A row of that node at the checkpoint's seq exists: its `hash` MUST equal
+   the checkpoint's `hash` (when more than one row holds that seq, one of them
+   must). Otherwise the chain breaks at that seq, with reason
+   `row <id>: hash differs from checkpoint at seq <seq>`, naming the row with
+   the lowest `id`.
+2. The checkpoint's seq is above the node's highest row seq. In a partial
+   verify the batch ends earlier and the checkpoint is skipped. In a
+   whole-chain verify the chain was cut off: it breaks at the node's highest
+   seq + 1, with reason
+   `node '<node>': chain ends at seq <highest> before checkpoint at seq <seq>`.
+   Tail truncation is therefore detected only by a whole-chain verify.
+3. The checkpoint's seq is below the node's lowest row seq. In a partial
+   verify the batch starts later and the checkpoint is skipped. In a
+   whole-chain verify the rows it covers were deleted, or the chain was
+   rewritten or re-sealed above it: it breaks at the node's lowest seq, with
+   reason
+   `node '<node>': rows start at seq <lowest>, after the checkpoint at seq <seq>`.
+4. Otherwise the row is missing from inside the span. The chain breaks at the
+   checkpoint's seq, with reason
+   `node '<node>': no row at checkpointed seq <seq>`.
+
+A node with checkpoints but no rows in the batch is skipped in a partial
+verify. In a whole-chain verify it breaks at the seq of its newest
+checkpoint, with reason
+`node '<node>': no rows, but checkpointed at seq <seq>`; this holds for an
+empty batch too. Checkpoints are checked ordered by
+`source_node_id`, then `monotonic_seq`. `first_break_at` is the lowest seq
+across the §3 breaks and the checkpoint breaks; on a tie the §3 break is
+reported, and between checkpoint breaks the first in that order.
+
+A whole-chain verify of a store under retention MUST be given only the
+checkpoints taken since the latest purge finished. A checkpoint taken
+before it is below the purged rows and fails the verify by rule 3, and a
+node whose rows have all been purged fails as a node with no rows. A cutoff of the retention period alone
+is not enough, since a node's last checkpoint can be taken just before the
+purge that removes its rows. Python's `checkpoints_since(checkpoints,
+cutoff)` and Go's `CheckpointsSince(checkpoints, cutoff)` keep the
+checkpoints whose `anchored_at` is at or after the cutoff, and reject an
+`anchored_at` that is not in the canonical form. Publish again after each
+purge, so that every node still in the store has a checkpoint after it.
+
+Rows deleted from the start of a chain show only when a checkpoint given
+to the verify falls among them. Deleting rows below every given checkpoint
+looks the same as a purge, so the checkpoints since the latest purge cover
+only what was written after it.
+
+A checkpoint covers a node's rows up to its seq. Rows written after a
+node's newest checkpoint are not covered until the next checkpoint is
+published: they can be cut off or rewritten without a break, and a node
+first seen since then has no checkpoint at all.
+
+`spec/checkpoint-vectors.json` (generated by
+`scripts/gen_checkpoint_vectors.py`) holds rows, checkpoints, `partial`
+and the expected `ok`, `first_break_at` and `reason`; every verifying SDK
+MUST reproduce them.

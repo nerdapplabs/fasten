@@ -722,6 +722,17 @@ class SQLiteStore:
             )
             return [self._row(r) for r in reversed(cur.fetchall())]
 
+    def chain_tips(self) -> list[AuditRow]:
+        """Each node's sealed row with the highest monotonic_seq, by node id."""
+        from .repo import chain_tips_sql
+        with self._txn():
+            cur = self._connect().execute(
+                f"SELECT t.* FROM {self._table} AS t JOIN ({chain_tips_sql(self._table)}) AS tip "
+                "ON t.source_node_id = tip.node AND t.monotonic_seq = tip.seq "
+                "WHERE t.hash != '' ORDER BY t.source_node_id, t.id"
+            )
+            return [self._row(r) for r in cur.fetchall()]
+
     def _row(self, r: sqlite3.Row) -> AuditRow:
         from ..canonical_ts import parse_canonical
         keys = r.keys()

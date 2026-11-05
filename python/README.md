@@ -153,6 +153,63 @@ in the same way, and emits `audit_drain_install_incomplete` if that
 drainer's flush timed out or a row it held was not stored. Until it is
 retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
+## Verifying the chain
+
+`verify_chain` checks the hash chain over a set of rows and reports the
+first break: an edited, inserted, deleted or reordered row
+([spec §3](../spec/chain-replication.md#3-verification)). Chains sealed by
+the Python and Go SDKs verify in either.
+
+```python
+from fasten import verify_chain
+
+result = verify_chain(store.query(limit=10_000))
+if not result.ok:
+    print(result.first_break_at, result.reason)
+```
+
+## Chain checkpoints
+
+`verify_chain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later
+([spec §9](../spec/chain-replication.md#9-checkpoints)):
+
+```python
+from fasten import verify_chain
+from fasten.checkpoints import FileCheckpointSink, load_checkpoints, publish_checkpoints
+
+publish_checkpoints(store, FileCheckpointSink("/mnt/worm/checkpoints.jsonl"))
+# HttpCheckpointSink(url) POSTs them instead.
+
+result = verify_chain(all_rows, checkpoints=load_checkpoints("/mnt/worm/checkpoints.jsonl"))
+```
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, pass `partial=True`; checkpoints below
+or above its rows, or for nodes not in them, are then skipped, so only a
+whole-chain verify detects a cut-off tail. If the file's last line was cut short
+by a crash, `load_checkpoints` skips it and logs a warning, and the next
+publish drops it. Use one publisher per file.
+
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. Pass only the checkpoints taken since the latest purge finished,
+and publish again after each purge:
+
+```python
+from fasten.checkpoints import checkpoints_since
+
+cps = checkpoints_since(load_checkpoints("/mnt/worm/checkpoints.jsonl"), purged_at)
+result = verify_chain(all_rows, checkpoints=cps)
+```
+
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
+
 ## Tests
 
 The same steps CI runs (see

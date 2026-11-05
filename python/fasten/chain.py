@@ -24,10 +24,11 @@ import hashlib
 import json
 import re
 import secrets
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 if TYPE_CHECKING:
     from .attrs import AuditRow
+    from .checkpoints import Checkpoint
 
 # Form stamped by seal(). Form "2" commits to detail rather than hashing it,
 # so detail can be destroyed for retention without changing the row hash
@@ -323,16 +324,64 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
     return None
 
 
-def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
+class _NodeIndex:
+    """One node's rows by seq, with the lowest and highest seq."""
+
+    def __init__(self, rows: "Iterable[AuditRow]") -> None:
+        self.by_seq: dict[int, list["AuditRow"]] = {}
+        for row in rows:
+            self.by_seq.setdefault(row.monotonic_seq, []).append(row)
+        self.lowest = min(self.by_seq)
+        self.highest = max(self.by_seq)
+
+
+def _checkpoint_break(
+    node: _NodeIndex, cp: "Checkpoint", partial: bool,
+) -> "tuple[int, str] | None":
+    """Check one node's rows against a checkpoint of that node (spec §9), as
+    (monotonic_seq, reason); None if they agree. A checkpoint outside the rows,
+    below the oldest or above the newest, is skipped only in a partial verify."""
+    seq = cp.monotonic_seq
+    at = node.by_seq.get(seq)
+    if at:
+        if any(r.hash == cp.hash for r in at):
+            return None
+        return seq, f"row {min(r.id for r in at)}: hash differs from checkpoint at seq {seq}"
+    if seq > node.highest:
+        if partial:
+            return None  # the batch ends earlier
+        return node.highest + 1, (f"node '{cp.source_node_id}': chain ends at seq "
+                                  f"{node.highest} before checkpoint at seq {seq}")
+    if seq < node.lowest:
+        if partial:
+            return None  # the batch starts later
+        return node.lowest, (f"node '{cp.source_node_id}': rows start at seq {node.lowest}, "
+                             f"after the checkpoint at seq {seq}")
+    return seq, f"node '{cp.source_node_id}': no row at checkpointed seq {seq}"
+
+
+def verify_chain(
+    rows: "list[AuditRow]", checkpoints: "Sequence[Checkpoint] | None" = None,
+    *, partial: bool = False,
+) -> ChainVerifyResult:
     """Walk the per-row hash chain and return a verification result.
 
     The canonical hashed form, the cross-language rendering rules (including the
     whole-number-float hazard), the canonical_form_id registry, and the
     replication contract are normative in ``spec/chain-replication.md``.
 
-    Detects field tampering, row insertion, deletion, and reorder. Does NOT
-    detect tail truncation; that needs an external anchor for the latest
-    hash.
+    Detects field tampering, row insertion, deletion, and reorder. Tail
+    truncation and a full re-seal from genesis are detected only against
+    ``checkpoints`` published earlier outside the store (spec §9). Each
+    checkpoint within a node's rows must match the row at its seq. By default
+    ``rows`` are taken as the whole chain: every checkpointed node must have
+    rows, and no checkpoint may be below its node's oldest row. For a page,
+    one node or a sample, pass ``partial=True``: then a checkpoint below a
+    node's oldest row or above its newest, or for a node with no rows here, is
+    skipped, so only a whole-chain verify detects a cut-off tail. Rows
+    after a node's newest checkpoint are not covered by it. Under retention,
+    pass only the checkpoints taken since the latest purge
+    (``checkpoints_since``): an older one below the purged rows fails.
 
     Rows with an empty ``hash`` field (written before hash-chain support, or in
     stdout-only mode) are skipped below their node's first sealed seq; they are
@@ -348,7 +397,7 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
     is not-ok and the reason names the offending id) so a node can never silently
     accept a row sealed under a form it does not understand.
     """
-    if not rows:
+    if not rows and (partial or not checkpoints):
         return ChainVerifyResult(ok=True, total_rows=0, first_break_at=None, reason=None)
 
     # Chains are per node (spec §2), so the prev_hash walk MUST be scoped by
@@ -382,6 +431,22 @@ def verify_chain(rows: "list[AuditRow]") -> ChainVerifyResult:
             first = found
     if dup is not None and (first is None or dup[0] < first[0]):
         first = dup
+    newest: dict[str, int] = {}
+    for cp in checkpoints or ():
+        newest[cp.source_node_id] = max(cp.monotonic_seq, newest.get(cp.source_node_id, cp.monotonic_seq))
+    index = {n: _NodeIndex(by_node[n].values()) for n in newest if by_node.get(n)}
+    for cp in sorted(checkpoints or (), key=lambda c: (c.source_node_id, c.monotonic_seq)):
+        node = index.get(cp.source_node_id)
+        if node is None:
+            if not partial and cp.monotonic_seq == newest[cp.source_node_id]:
+                found = cp.monotonic_seq, (f"node '{cp.source_node_id}': no rows, but "
+                                           f"checkpointed at seq {cp.monotonic_seq}")
+                if first is None or found[0] < first[0]:
+                    first = found
+            continue
+        found = _checkpoint_break(node, cp, partial)
+        if found is not None and (first is None or found[0] < first[0]):
+            first = found
     if first is not None:
         return ChainVerifyResult(ok=False, total_rows=len(rows), first_break_at=first[0], reason=first[1])
 

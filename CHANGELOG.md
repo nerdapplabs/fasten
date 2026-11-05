@@ -6,6 +6,35 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: chain checkpoints (Python + Go)
+
+- A checkpoint records a node's latest sealed row (`source_node_id`,
+  `monotonic_seq`, `hash`, `anchored_at`). Checked against checkpoints
+  published earlier outside the store, verification now reports rows cut off
+  the end of a chain and a chain re-sealed from genesis (spec §9).
+- Python: `fasten.checkpoints` with `Checkpoint`, `FileCheckpointSink`,
+  `HttpCheckpointSink`, `CheckpointStore`, `take_checkpoints`,
+  `publish_checkpoints`, `load_checkpoints` and `checkpoints_since`, and
+  `verify_chain(rows, checkpoints=..., partial=False)`. `SQLiteStore` and
+  `PostgresStore` gain `chain_tips()`.
+- Go: `Checkpoint`, `FileCheckpointSink`, `HTTPCheckpointSink`,
+  `TakeCheckpoints`, `PublishCheckpoints`, `LoadCheckpoints`,
+  `CheckpointsSince`, `ErrPartialLastLine`, `CheckpointOptions` and
+  `VerifyChainWithCheckpoints`; `VerifyChain` is unchanged. `SQLiteStore`
+  and `PostgresStore` gain `ChainTips`.
+- A verify with checkpoints covers the whole chain by default: a
+  checkpointed node with no rows, or whose rows start after or end before
+  any of its checkpoints, fails. A partial verify (a page, one node) skips
+  those checkpoints, so only a whole-chain verify detects a cut-off tail. With
+  retention, pass only the checkpoints taken since the latest purge
+  (`checkpoints_since` / `CheckpointsSince`): older ones fail.
+- The file sinks drop an unfinished last line, left by a crash mid-append,
+  before the next append, so the file keeps loading.
+- The HTTP sinks send userinfo in the URL as Basic auth, treat a redirect
+  as a failed publish, time out after 10 s by default, and leave userinfo
+  and query out of error messages.
+- `spec/checkpoint-vectors.json` holds cases both SDKs must agree on.
+
 ### Added: release provenance
 
 - `release-provenance.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
