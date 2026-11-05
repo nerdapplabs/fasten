@@ -6,6 +6,26 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: release provenance
+
+- `release-provenance.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
+  Swift, C++ and Rust source archives and the fasten-core library for linux
+  x86_64 (or the Go module zip for `go/` tags) with
+  `scripts/release/build-artifacts.sh`, writes `SHA256SUMS`, attests every
+  file with GitHub artifact attestations, runs `gh attestation verify` on each
+  one and then uploads them to the tag's GitHub release. Only the highest
+  `vX.Y.Z` tag is marked as the repo's latest release; `go/` tags,
+  prereleases and backports are not.
+- The source archives are reproducible with GNU tar, GNU gzip and the stock
+  Python zlib. `release-check.yml` builds them twice from separate clones and
+  fails if the bytes differ. It runs on changes to any file the archives hold.
+- fasten-core is built with the checkout mounted read-only and its target
+  directory outside the checkout. `build-artifacts.sh` stops with an error
+  when a tracked file differs from HEAD.
+- The PyPI release sets `attestations: true` (PEP 740) explicitly.
+- SECURITY.md lists the commands to verify a release for each SDK, including
+  how to match the Go zip's `h1:` hash with `go.sum`.
+
 ### Fixed: ingest of repeated and unsealed rows, rows without a form id (Python, Go)
 
 - A row sent twice in one batch on the same node, with the same hash, is a

@@ -38,3 +38,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: python/dist/
+          # PEP 740 attestations, signed with the Trusted Publishing identity.
+          attestations: true

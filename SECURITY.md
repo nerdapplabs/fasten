@@ -47,17 +47,71 @@ commit SHA. The first published release will be the v1.0.0 GA tag.
 
 **Configured, and active from the first published release:**
 
-- PyPI Trusted Publishing (OIDC, no long-lived tokens), in
-  [`release-python.yml`](.github/workflows/release-python.yml).
+- PyPI Trusted Publishing (OIDC, no long-lived tokens) with PEP 740
+  attestations, in [`release-python.yml`](.github/workflows/release-python.yml).
 - npm `--provenance` (linked back to the source commit), in
   [`release-js.yml`](.github/workflows/release-js.yml).
+- GitHub artifact attestations (signed with [Sigstore](https://www.sigstore.dev/))
+  for every file on a [GitHub release](https://github.com/nerdapplabs/fasten/releases),
+  in [`release-provenance.yml`](.github/workflows/release-provenance.yml).
+  A `vX.Y.Z` release carries Swift, C++ and Rust source archives and the
+  fasten-core library for linux x86_64. A `go/vX.Y.Z` release carries the Go
+  module zip. Each release also has a `SHA256SUMS` file. The source archives
+  and the Go module zip are reproducible: `scripts/release/build-artifacts.sh
+  <tag> <dir>` run on the tagged commit gives the same bytes when built with
+  GNU tar, GNU gzip and the stock Python zlib, as CI does on Ubuntu. Other
+  compressor builds (zlib-ng, for one) can give different bytes for the same
+  content.
 
 **Planned for the v1.0.0 GA tag:**
 
-- Release artifacts signed with [Sigstore](https://www.sigstore.dev/) cosign,
-  with verification instructions on each
-  [release](https://github.com/nerdapplabs/fasten/releases).
 - A per-language SBOM published with each release.
+
+### Verifying a release
+
+Replace `1.0.0` / `v1.0.0` with the release you install.
+
+Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestations):
+
+```bash
+uvx pypi-attestations verify pypi --repository https://github.com/nerdapplabs/fasten \
+  pypi:fasten-1.0.0-py3-none-any.whl
+```
+
+JavaScript (npm), in the project that installed `@nerdapplabs/fasten`:
+
+```bash
+npm audit signatures
+```
+
+GitHub release files (Swift, C++, Rust, fasten-core library), with the
+[GitHub CLI](https://cli.github.com/):
+
+```bash
+gh release download v1.0.0 --repo nerdapplabs/fasten --dir fasten-v1.0.0
+cd fasten-v1.0.0
+sha256sum -c SHA256SUMS
+for f in *; do
+  gh attestation verify "$f" --repo nerdapplabs/fasten --source-ref refs/tags/v1.0.0 \
+    --signer-workflow nerdapplabs/fasten/.github/workflows/release-provenance.yml
+done
+```
+
+Go: the same commands with the `go/v1.0.0` tag and
+`--source-ref refs/tags/go/v1.0.0`. The `go` command does not download this
+zip; the module proxy builds its own from the tag. To tie the two, compute
+the zip's `h1:` hash and compare it with the one `go` records:
+
+```bash
+python3 -c 'import sys, zipfile, hashlib, base64
+z = zipfile.ZipFile(sys.argv[1])
+s = "".join(hashlib.sha256(z.read(n)).hexdigest() + "  " + n + "\n" for n in sorted(z.namelist()))
+print("h1:" + base64.b64encode(hashlib.sha256(s.encode()).digest()).decode())' fasten-go-v1.0.0.zip
+go mod download -json github.com/nerdapplabs/fasten/go@v1.0.0 | grep '"Sum"'
+```
+
+The two `h1:` values must match. The second is also the hash in `go.sum` and
+on sum.golang.org for `github.com/nerdapplabs/fasten/go v1.0.0`.
 
 ## Current scan posture
 
