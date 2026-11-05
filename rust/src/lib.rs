@@ -627,7 +627,9 @@ impl EmitBuilder {
 
     /// Build the row and send it to the configured store. In `queue` mode
     /// it goes to the drainer; in `raise` mode it is inserted synchronously
-    /// and errors are wrapped in [`AuditStoreError`].
+    /// and errors are wrapped in [`AuditStoreError`]. In `queue` mode, a row
+    /// the drainer can't take is inserted synchronously; if that fails,
+    /// `audit_sync_fallback_failed` is emitted and the row is still returned.
     ///
     /// The row is also written to stdout (`{"shape":"audit",...}`) in
     /// either mode.
@@ -659,14 +661,14 @@ impl EmitBuilder {
                     // config without one) stdout has the row, as it does
                     // on the no-store path.
                     if let Some(s) = cfg.audit_store.as_ref() {
-                        engine.store_inline(&**s, &row)?;
+                        engine.store_inline(&**s, &row);
                     }
                 }
             } else if let Some(s) = cfg.audit_store.as_ref() {
                 // No drainer installed; insert synchronously rather than
                 // drop the row.
                 if let Err(e) = s.insert(&row) {
-                    return Err(AuditStoreError { source: e });
+                    engine.fallback_failed(&row, e);
                 }
             }
         } else if let Some(s) = cfg.audit_store.as_ref() {
@@ -1468,9 +1470,9 @@ mod tests {
         e.reset_for_tests();
     }
 
-    // If the inline insert fails too, submit returns the error.
+    // In queue mode a failed inline insert is reported and submit returns Ok.
     #[test]
-    fn submit_errors_when_drainer_stopped_and_insert_fails() {
+    fn submit_ok_when_drainer_stopped_and_insert_fails() {
         register("inline_fail".into(), [("INLINE_FAIL".into(), plain_meta("inline_fail"))])
             .unwrap();
         let store = Arc::new(IdStore { fail: true, ..Default::default() });
@@ -1478,12 +1480,49 @@ mod tests {
         e.init(queue_config("svc-inline-fail", store)).unwrap();
         e.active_drainer().unwrap().stop(Duration::from_secs(2));
 
-        let err = EmitBuilder::new("INLINE_FAIL", "t").submit_to(&e).unwrap_err();
-        assert!(matches!(err.source, Error::AuditStoreInsert(_)));
+        let row = EmitBuilder::new("INLINE_FAIL", "t").submit_to(&e).expect("submit");
         let lines = sys_lines("svc-inline-fail", "audit_sync_fallback_failed");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["error_type"], "AuditStoreInsert");
+        assert_eq!(lines[0]["row_id"], serde_json::json!(row.id));
         assert!(lines[0].get("error").is_none());
+        e.reset_for_tests();
+    }
+
+    // Same with no drainer installed.
+    #[test]
+    fn submit_ok_when_no_drainer_and_insert_fails() {
+        register("no_drainer".into(), [("NO_DRAINER".into(), plain_meta("no_drainer"))])
+            .unwrap();
+        let store = Arc::new(IdStore { fail: true, ..Default::default() });
+        let e = Engine::new();
+        e.init(queue_config("svc-no-drainer", store)).unwrap();
+        e.uninstall_drainer();
+
+        let row = EmitBuilder::new("NO_DRAINER", "t").submit_to(&e).expect("submit");
+        let lines = sys_lines("svc-no-drainer", "audit_sync_fallback_failed");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["error_type"], "AuditStoreInsert");
+        assert_eq!(lines[0]["row_id"], serde_json::json!(row.id));
+        e.reset_for_tests();
+    }
+
+    // Raise mode returns the insert error.
+    #[test]
+    fn submit_errors_in_raise_mode_when_insert_fails() {
+        register("raise_fail".into(), [("RAISE_FAIL".into(), plain_meta("raise_fail"))])
+            .unwrap();
+        let store = Arc::new(IdStore { fail: true, ..Default::default() });
+        let e = Engine::new();
+        e.init(Config {
+            audit_store_failure_strategy: Some("raise".into()),
+            ..queue_config("svc-raise-fail", store)
+        })
+        .unwrap();
+
+        let err = EmitBuilder::new("RAISE_FAIL", "t").submit_to(&e).unwrap_err();
+        assert!(matches!(err.source, Error::AuditStoreInsert(_)));
+        assert!(sys_lines("svc-raise-fail", "audit_sync_fallback_failed").is_empty());
         e.reset_for_tests();
     }
 

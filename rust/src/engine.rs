@@ -264,30 +264,24 @@ impl Engine {
         sys_line(cfg.as_ref(), level, event, fields);
     }
 
-    /// Store a row the drainer refused. On failure the error is returned.
-    pub(crate) fn store_inline(&self, store: &dyn AuditStore, row: &crate::Row)
-        -> Result<(), crate::AuditStoreError>
-    {
+    /// Store a row the drainer refused. A failure is reported, not returned.
+    pub(crate) fn store_inline(&self, store: &dyn AuditStore, row: &crate::Row) {
         match store.insert(row) {
-            Ok(()) => {
-                // Follows the drainer's audit_drain_abandoned.
-                self.sys_event("info", "audit_drain_stored_inline", serde_json::json!({
-                    "row_id": row.id,
-                }));
-                Ok(())
-            }
-            Err(e) => Err(self.fallback_failed(row, e)),
+            // Follows the drainer's audit_drain_abandoned.
+            Ok(()) => self.sys_event("info", "audit_drain_stored_inline", serde_json::json!({
+                "row_id": row.id,
+            })),
+            Err(e) => self.fallback_failed(row, e),
         }
     }
 
-    /// Report a row submit could not store after the drainer refused it.
-    pub(crate) fn fallback_failed(&self, row: &crate::Row, e: Error) -> crate::AuditStoreError {
+    /// Report a queue-mode row submit could not store inline.
+    pub(crate) fn fallback_failed(&self, row: &crate::Row, e: Error) {
         // Type only: a store error message can quote row values.
         self.sys_event("error", "audit_sync_fallback_failed", serde_json::json!({
             "error_type": crate::retention::error_type(&e),
             "row_id": row.id,
         }));
-        crate::AuditStoreError { source: e }
     }
 }
 
