@@ -28,6 +28,7 @@ import Foundation
 ///
 /// // 5. Shutdown
 /// Fasten.flush(timeout: 5.0)
+/// Fasten.close()
 /// ```
 public enum Fasten {
 
@@ -167,6 +168,15 @@ public enum Fasten {
     @discardableResult
     public static func flush(timeout: TimeInterval = 5.0) -> Bool {
         _defaultEngine.flush(timeout: timeout)
+    }
+
+    /// Stop the queue drainer at shutdown. Queued rows get one insert attempt
+    /// each, within `timeout`. A row not stored is logged as
+    /// `audit_drain_lost_at_stop` and close returns false. Later emits in
+    /// `.queue` mode write to the store inline.
+    @discardableResult
+    public static func close(timeout: TimeInterval = 5.0) -> Bool {
+        _defaultEngine.close(timeout: timeout)
     }
 
     /// Reset the default engine. For tests only.

@@ -551,6 +551,12 @@ func rowToMap(r Row) map[string]any {
 	if r.Hash != "" {
 		d["hash"] = r.Hash
 	}
+	if r.DetailSalt != "" {
+		d["detail_salt"] = r.DetailSalt
+	}
+	if r.DetailCommitment != "" {
+		d["detail_commitment"] = r.DetailCommitment
+	}
 	return d
 }
 

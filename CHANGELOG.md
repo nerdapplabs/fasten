@@ -18,6 +18,136 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   form "1" and stores it as "1", as Go does (spec §1.5), so it verifies in
   both SDKs. SQLite no longer skips such a row and Postgres no longer rejects it.
 
+### Fixed: drainer stop, re-init and sys events (Swift)
+
+- A row the drainer refuses because it has stopped (a re-init or `close()`
+  raced the emit) is stored inline, with `audit_drain_abandoned` then
+  `audit_drain_stored_inline`. Before, it was dropped without a log line.
+- `configure()` on a running engine swaps in the new drainer under the engine
+  lock before stopping the old one, so an emit during re-init always reaches a
+  drainer. It logs `audit_drain_install_incomplete` when the old drainer's
+  rows were not stored, counting from the swap, so a dead letter from
+  earlier is not counted and one right after the swap is.
+- New `Fasten.close(timeout:)` flushes for up to half the timeout, as Python,
+  Go and JS do, then stops the drainer per spec §10. Queued rows get one
+  attempt each, an insert in progress is waited for, and rows not stored are
+  logged as `audit_drain_lost_at_stop` and make `close()` return false. It
+  also stops old drainers a re-init is still retiring, all within the one
+  timeout, and returns false if any of them lost a row, counting from before
+  any of them stopped.
+- An insert still running at the close deadline is reported lost but keeps
+  running. If it then stores its row, `audit_drain_recovered_at_stop` with
+  `row_ids` follows, as in Python. A lost report can be a false alarm; a
+  loss is never missed. The drain thread keeps the drainer alive until that
+  insert returns.
+- The drainer now logs the spec §4 events: `audit_queue_high_water`,
+  `audit_queue_near_full`, `audit_drain_failed`, `audit_drain_degraded`,
+  `audit_drain_recovered`, `audit_drain_dead_letter` and
+  `audit_drain_abandoned`, through the redacted log path.
+- `flush()` counts dead-lettered and lost rows as settled (spec §6), so it no
+  longer times out on a row that was dead-lettered while pending. It returns
+  only after the row's event is logged and the depth is updated.
+- `last_error` in the drainer stats is `"<ErrorType>: <message>"`.
+- Rows and sys log lines read the service id, node id and redactor under
+  the engine lock, so a concurrent `configure()` can't tear them.
+
+### Fixed: queued rows, sys and log lines, re-init report (Rust)
+
+- `submit()` stores a row inline when the drainer is stopping and refuses it,
+  then emits `audit_drain_stored_inline`. If that insert fails too, it emits
+  `audit_sync_fallback_failed {error_type, row_id}` and returns `Ok`, as
+  Python and Go do. Before, such a row was dropped.
+- With no drainer installed in queue mode, a failed inline insert also emits
+  `audit_sync_fallback_failed` and returns `Ok`. Before, it returned the
+  error with no sys event. Raise mode still returns the error.
+- Redact sys and log lines (`fasten::log::*` included) with the configured
+  extra keys and replacement, as the other SDKs do.
+- SDK sys events (`audit_chain_unavailable`, `retention_purge_failed`,
+  `pii_redaction_skipped_legacy_form`) go to stderr, as spec
+  drainer-conformance §4 asks. `fasten::log::*` lines stay on stdout.
+- Re-init emits `audit_drain_install_incomplete {flushed, unstored}` when the
+  old drainer's flush timed out or rows it held were not stored (spec §10).
+- A failed insert through the drainer is retried and reported by the store
+  error's type (e.g. `AuditStoreInsert`) in `audit_drain_failed.error`,
+  `audit_drain_dead_letter.last_error`, `audit_drain_lost_at_stop.error_type`
+  and `queue_stats().last_error`. Before, it was reported as
+  `InvalidTableName`.
+- fasten-core: `Drainer::unstored_total` is now public, and the new
+  `Error::Store(String)` is a store error that carries only its type. The
+  drainer retries it, and it maps to `ErrBackend`. The C ABI is unchanged.
+- `PostgresStore::redact_rows` returns only the ids it redacted.
+
+### Fixed: `fasten doctor` absolute SQLite paths and structlog redaction after init (Python)
+
+- `fasten doctor` reads the audit DSN path as the SQLite store does, so
+  `sqlite:////abs/audit.db` and a bare `/abs/audit.db` are checked at that
+  path instead of being reported as not found. The api DSN check takes its
+  path from the same helper as the stream store, so a DSN such as
+  `./api;v2.db` is checked at `./api`. The path it prints is the path it
+  checks.
+- `fasten.shim.structlog.configure()` uses the engine's current redactor for
+  each event, so redaction settings from an `init()` that runs after
+  `configure()` apply to structlog output and the stdlib bridge.
+
+### Fixed: re-init drainer handoff and idle drainer (JS)
+
+- Re-`init()` keeps the old drainer visible to `flush()` and `close()` until
+  it has stopped. `close()` stops it within its own timeout and resolves
+  false if it lost rows, and re-init emits `audit_drain_install_incomplete`
+  when the old drainer's flush timed out or rows were not stored.
+- A re-`init()` to raise mode, or with no store, flushes the old drainer for
+  up to 5 s too, instead of giving a row in backoff one try. Rows it loses
+  are reported with `audit_drain_lost_at_stop` and
+  `audit_drain_install_incomplete`; a later `close()` reports only rows lost
+  during that close, as in Python and Go.
+- `resetForTests()` also stops the drainers a re-init is retiring, and
+  resolves once they have stopped.
+- An idle drainer waits for the next row instead of polling, so it no longer
+  uses CPU or keeps the process from exiting.
+- The phase-1 stdout audit line carries `prev_hash: ""` and `hash: ""`.
+- `index.d.ts` adds `redactReplacement` and `queueDrainMaxAttempts` to
+  `InitOptions`, the dead-letter and `capacity_semantics` fields to
+  `QueueStats`, and `wire_version` to `Row`.
+
+### Fixed: form-2 rows read back from stdout and the reader verify (Go)
+
+- The sealed stdout line and the `/audit`, `/correlate` and `/search`
+  responses now carry `detail_salt` and `detail_commitment`. Without them a
+  form-2 row read back from either place failed `VerifyChain` in Go and
+  Python and could not be ingested again.
+- Canonical JSON writes DEL (0x7f) as `\u007f`, as Python's `json.dumps`
+  does, so a row holding that byte hashes the same in Go and Python.
+- Rows Go sealed earlier with DEL left raw still verify, in Go and Python:
+  when the commitment or hash misses, the check is retried with DEL raw
+  (spec §1.2).
+- The Go workflow also runs when `spec/` changes, since Go tests read it.
+
+### Fixed: redact values when the core can't parse the input (C++)
+
+- Strings are now written as valid UTF-8 JSON: bytes that are not valid
+  UTF-8 become U+FFFD, so the core can redact detail and log fields that
+  contain them. Before, such fields were returned unredacted.
+- If the core still returns an error, every value is replaced with the
+  redaction token (keys are kept) and a `redact_failed` sys event with
+  `error_type` is written to stderr and the sys ring.
+- `fasten::flush()` during a re-init also waits for the drainer being
+  replaced, not only the new one.
+- The core drainer's sys events (`audit_drain_*`, `audit_queue_*`) now go
+  through the SDK's sys log, redacted, so they reach `query_syslog()` as
+  well as stderr. Their numbers and booleans stay JSON numbers and
+  booleans on the stderr line.
+- `fasten::flush()` with under 1 ms left, including `flush(0)`, no longer
+  waits with no timeout: each drainer gets at least 1 ms, so it returns
+  true at once when nothing is queued and false after 1 ms when rows are
+  still pending.
+- `fasten::flush()` while a re-init is stopping the old drainer waits for
+  the stop to finish, and returns false if it does not finish in time.
+- A re-init whose old drainer did not flush in time, or held rows that
+  were not stored, emits `audit_drain_install_incomplete` with `flushed`
+  and `unstored`.
+- When the core returns an error, an `AUDIT_ROW_REDACTED` row keeps its
+  numeric `redacted_seq`.
+
 ### Changed: Go SDK requires Go 1.26
 
 - The Go module now declares `go 1.26.0`, up from `go 1.22`. It moves to

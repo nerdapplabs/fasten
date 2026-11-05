@@ -405,12 +405,12 @@ impl crate::AuditStore for PostgresStore {
         let salt = if self.cols.salt_nullable { "NULL" } else { "''" };
         let sql = format!(
             "UPDATE {} SET detail = 'null', detail_salt = {salt} \
-             WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2')",
+             WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2') RETURNING id",
             self.table
         );
         let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
-        self.lock().execute(&sql as &str, &[&ids_ref]).map_err(pg_err)?;
-        Ok(ids.to_vec())
+        let rows = self.lock().query(&sql as &str, &[&ids_ref]).map_err(pg_err)?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 }
 
@@ -946,6 +946,32 @@ mod tests {
         assert_eq!(lines[0]["level"], "warn");
         assert_eq!(lines[0]["rows"], 1);
         engine.reset_for_tests();
+    }
+
+    // Only the rows the UPDATE matched come back.
+    #[test]
+    fn test_redact_rows_returns_matched_ids() {
+        use crate::AuditStore;
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_redact_rows_ids";
+        let store = fresh_store(&dsn, table);
+        let unsealed = uniq("evt");
+        store.insert(&make_row(&unsealed, "PG_RR")).expect("insert");
+        let sealed = uniq("evt");
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (id, origin_id, monotonic_seq, timestamp, code, \
+                     source_node_id, detail, prev_hash, hash, canonical_form_id) \
+                     VALUES ($1, $1, 2, '2020-01-01T00:00:00.000000Z', 'PG_RR', \
+                     'node-1', '{{}}', 'genesis', 'abc123', '1')"
+                ),
+                &[&sealed],
+            )
+            .expect("insert sealed");
+        let ids = vec![unsealed.clone(), sealed, uniq("missing")];
+        assert_eq!(store.redact_rows(&ids).expect("redact_rows"), vec![unsealed]);
     }
 
     #[test]

@@ -69,6 +69,17 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 """
 
 
+def sqlite_dsn_path(dsn: str) -> str:
+    """File path of a SQLite DSN. Strips only the URL-separator slash, as the
+    stream store does: sqlite:///rel.db is relative, sqlite:////abs/path.db
+    and a bare /abs/path.db are absolute."""
+    u = urlparse(dsn)
+    path = u.path
+    if u.scheme and path.startswith("/"):
+        path = path[1:]
+    return path
+
+
 class SQLiteStore:
     """Thread-safe SQLite AuditRepository.
 
@@ -157,11 +168,7 @@ class SQLiteStore:
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
         u = urlparse(dsn)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        # Strip only the URL-separator slash, as the stream store does:
-        # sqlite:///rel.db is relative, sqlite:////abs/path.db is absolute.
-        path = u.path
-        if u.scheme and path.startswith("/"):
-            path = path[1:]
+        path = sqlite_dsn_path(dsn)
         if not path:
             raise ValueError(
                 f"fasten SQLiteStore: DSN {dsn!r} has no path. "
