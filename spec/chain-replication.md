@@ -278,8 +278,10 @@ and `monotonic_seq`.
 
 - **Verified prefix, not all-or-nothing.** `ingest` verifies the incoming chain
   and inserts the longest verified prefix (the rows before the first break). It
-  MUST NOT raise on a break. An unsealed row that `verify_chain` skips (§2) is
-  not inserted (§5) and is not a break.
+  MUST NOT raise on a break. An unsealed row below its node's first sealed
+  row, in the batch and in the store, is not inserted (§5) and is not a break.
+  If the store holds a sealed row for its node at a lower seq, it is a break at
+  that row, with the reason `verify_chain` gives (§2).
 - **`IngestResult`** reports:
   - `inserted`: rows passed to the idempotent insert,
   - `rejected_from_seq`: the `monotonic_seq` of the first broken row, or null

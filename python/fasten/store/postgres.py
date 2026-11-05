@@ -420,12 +420,14 @@ class PostgresStore:
         (see ``repo.ingest_without_local_node``).
         """
         from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
-                           ingest_without_local_node, stored_conflict, verified_prefix)
+                           ingest_without_local_node, skipped_unsealed, stored_conflict,
+                           verified_prefix)
 
         if local_node_id:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
 
         verified, verified_reject, verified_reason = verified_prefix(rows)
+        unsealed = skipped_unsealed(rows, verified_reject)
 
         def _run(conn: Any) -> "IngestResult":
             try:
@@ -434,7 +436,7 @@ class PostgresStore:
                     # (same lock as allocate_and_insert_originated), then check
                     # against what is already stored (spec §4): a conflicting
                     # row is reported, never ignored.
-                    for node in sorted({r.source_node_id for r in verified}):
+                    for node in sorted({r.source_node_id for r in verified + unsealed}):
                         cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (node,))
 
                     def by_id(row_id: str) -> str | None:
@@ -450,9 +452,16 @@ class PostgresStore:
                         r = cur.fetchone()
                         return (r[0], r[1], r[2]) if r else None
 
+                    def sealed_below(node: str, seq: int) -> bool:
+                        cur.execute(
+                            f"SELECT 1 FROM {self._table} WHERE source_node_id = %s "
+                            "AND monotonic_seq < %s AND hash <> '' LIMIT 1",
+                            (node, seq))
+                        return cur.fetchone() is not None
+
                     prefix, rejected_from_seq, reason = cut_at_conflict(
                         verified, verified_reject, verified_reason,
-                        stored_conflict(verified, by_id, at_seq))
+                        stored_conflict(verified, by_id, at_seq, unsealed, sealed_below))
                     for row in prefix:
                         check_inserted(self._insert_row_core(cur, row), row, by_id)
                 conn.commit()

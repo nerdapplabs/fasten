@@ -1,5 +1,6 @@
 """Ingest checks a batch against what the store already holds (spec §4): a
 row that disagrees with a stored row is rejected and reported, not ignored."""
+import contextlib
 import dataclasses
 import os
 from datetime import datetime, timezone
@@ -152,6 +153,52 @@ def test_an_unsealed_row_after_the_chain_starts_is_a_break():
     assert [s for s, _, _ in _stored(store)] == [2]
 
 
+def _unsealed(seq: int) -> AuditRow:
+    return dataclasses.replace(_row(seq), hash="", prev_hash="")
+
+
+@pytest.mark.parametrize("batch", [
+    lambda: [_unsealed(4)] + _chain([5, 6]),
+    lambda: [_unsealed(4)],
+], ids=["with-rows-after", "alone"])
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_an_unsealed_row_after_stored_rows_is_a_break(backend, batch):
+    with _store(backend) as store:
+        ingest(store, _chain([1, 2, 3]))
+        result = ingest(store, batch())
+        assert result.rejected_from_seq == 4 and result.inserted == 0
+        assert result.reason == "row evt-4: no hash after the node's chain started"
+        assert [s for s, _, _ in _stored(store)] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_an_unsealed_row_with_nothing_stored_below_is_skipped(backend):
+    with _store(backend) as store:
+        result = ingest(store, _unsealed_head())
+        assert result.rejected_from_seq is None and result.inserted == 2
+        assert [s for s, _, _ in _stored(store)] == [2, 3]
+
+
+@contextlib.contextmanager
+def _store(backend):
+    if backend == "sqlite":
+        yield SQLiteStore(":memory:")
+        return
+    dsn = os.getenv("FASTEN_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("FASTEN_TEST_POSTGRES_DSN not set")
+    import uuid
+
+    import psycopg
+    from fasten.store.postgres import PostgresStore
+    table = f"ingest_{uuid.uuid4().hex[:8]}"
+    try:
+        yield PostgresStore.from_dsn(f"{dsn}?table={table}")
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def _form_1(form_id) -> AuditRow:
     """A sealed form-1 row, its canonical_form_id then set to ``form_id``."""
     row = dataclasses.replace(_row(1), canonical_form_id="1", prev_hash="genesis")
@@ -185,9 +232,9 @@ def _blind_first_check(monkeypatch):
     from fasten.store import repo
     real, calls = repo.stored_conflict, []
 
-    def blind(prefix, by_id, at_seq):
+    def blind(*args):
         calls.append(1)
-        return None if len(calls) == 1 else real(prefix, by_id, at_seq)
+        return None if len(calls) == 1 else real(*args)
     monkeypatch.setattr(repo, "stored_conflict", blind)
     return calls
 

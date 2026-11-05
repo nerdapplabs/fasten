@@ -10,9 +10,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - A row sent twice in one batch on the same node, with the same hash, is a
   re-delivery: ingest stores it once instead of rejecting the batch from it.
-- An unsealed row below a node's first sealed row, which `verify_chain`
-  skips, is left out of the insert. Ingest no longer raises (Python) or fails
-  the batch (Go) on it (spec §4).
+- An unsealed row below a node's first sealed row, in the batch and in the
+  store, is left out of the insert. Ingest no longer raises (Python) or fails
+  the batch (Go) on it. One above a sealed row the store already holds for its
+  node is a break at that row (spec §4).
 - Python reads a sealed row with an empty or missing `canonical_form_id` as
   form "1" and stores it as "1", as Go does (spec §1.5), so it verifies in
   both SDKs. SQLite no longer skips such a row and Postgres no longer rejects it.

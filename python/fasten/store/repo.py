@@ -184,10 +184,21 @@ def verified_prefix(
     return prefix, break_at, result.reason or ""
 
 
+def skipped_unsealed(
+    rows: list[AuditRow], rejected_from_seq: int | None,
+) -> list[AuditRow]:
+    """The unsealed rows verified_prefix left out without a break: those below
+    the batch's first break, if any."""
+    return [r for r in rows if not r.hash
+            and (rejected_from_seq is None or r.monotonic_seq < rejected_from_seq)]
+
+
 def stored_conflict(
     prefix: list[AuditRow],
     by_id: Callable[[str], "str | None"],
     at_seq: Callable[[str, int], "tuple[str, str, str] | None"],
+    unsealed: "list[AuditRow] | None" = None,
+    sealed_below: "Callable[[str, int], bool] | None" = None,
 ) -> tuple[int, str] | None:
     """The first row of a verified prefix that disagrees with what the store
     already holds (spec §4), as ``(monotonic_seq, reason)``; None if none does.
@@ -195,13 +206,21 @@ def stored_conflict(
     ``by_id(id)`` returns the stored row's hash, ``at_seq(node, seq)`` the
     stored ``(id, hash, prev_hash)`` at that position; each None if absent.
     A row already stored with the same hash is a re-delivery, not a conflict.
+    An ``unsealed`` row is a break when ``sealed_below(node, seq)`` says the
+    store holds a sealed row for its node at a lower seq, as verify_chain
+    would report it.
     """
     # The stored neighbours are checked even when the batch holds one too: the
     # batch neighbour may be cut by a later break, and if both are kept they
     # must agree anyway.
     seen: dict[str, tuple[str, int]] = {}
-    for row in sorted(prefix, key=lambda r: (r.monotonic_seq, r.source_node_id)):
+    rows = prefix + (unsealed or [])
+    for row in sorted(rows, key=lambda r: (r.monotonic_seq, r.source_node_id)):
         node, seq = row.source_node_id, row.monotonic_seq
+        if not row.hash:
+            if sealed_below is not None and sealed_below(node, seq):
+                return seq, f"row {row.id}: no hash after the node's chain started"
+            continue
         # id is unique, so the store could keep only one row with it.
         if row.id in seen:
             n, s = seen[row.id]

@@ -49,3 +49,16 @@ func TestIngestRepeatedAndUnsealedRowsPostgres(t *testing.T) {
 		t.Fatalf("stored %d rows, %v", len(stored), err)
 	}
 }
+
+func TestIngestAnUnsealedRowAfterStoredRowsIsABreakPostgres(t *testing.T) {
+	db := pgDB(t)
+	checkUnsealedAfterStoredRows(t, func() ingestQuerier {
+		table := uniqueTable("ingest_unsealed")
+		t.Cleanup(func() { dropTable(t, db, table) })
+		s, err := NewPostgresStore(db, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	})
+}
