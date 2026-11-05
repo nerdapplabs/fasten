@@ -4,9 +4,9 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     init, emit, register, registry as _reg,
-    AuditStoreError, queueStats, flush, close, _clearCoreRegistry,
+    AuditStoreError, queueStats, flush, close, _clearCoreRegistry, defaultEngine,
 } from '../src/index.js';
-import { uninstallDrainer } from '../src/audit_queue.js';
+import { uninstallDrainer, activeDrainer } from '../src/audit_queue.js';
 
 // Stub stores
 
@@ -57,14 +57,14 @@ const TEST_META = {
 };
 
 beforeEach(async () => {
-    await uninstallDrainer();
+    await defaultEngine.resetForTests();
     _clearCoreRegistry();
     _reg().clear();
     register('user', TEST_META);
 });
 
 afterEach(async () => {
-    await uninstallDrainer();
+    await defaultEngine.resetForTests();
 });
 
 function _initQueue(store, opts = {}) {
@@ -462,4 +462,143 @@ test('flush counts a dead-lettered row as done', async () => {
     assert.ok(Date.now() - t0 < 1000);
     assert.equal(queueStats().dead_lettered_total, 1);
     assert.equal(queueStats().in_backoff_seconds, 0);
+});
+
+// Re-init (spec §10)
+
+test('close waits for the drainer a re-init is retiring', async () => {
+    const a = new SlowStore(20);
+    const b = new RecordingStore();
+    _initQueue(a);
+    for (let i = 0; i < 5; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    _initQueue(b);
+    assert.equal(await close(5000), true);
+    assert.equal(a.rows.length, 5);
+});
+
+test('flush waits for the drainer a re-init is retiring', async () => {
+    const a = new SlowStore(20);
+    _initQueue(a);
+    for (let i = 0; i < 3; i++) emit({ code: 'USER_CREATED', target: `u-${i}` });
+    _initQueue(new RecordingStore());
+    assert.equal(await flush(5000), true);
+    assert.equal(a.rows.length, 3);
+});
+
+test('re-init reports rows the old drainer could not store', async () => {
+    const store = { insert: () => new Promise(() => {}) };
+    let closed;
+    const captured = await captureSys(async () => {
+        _initQueue(store);
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        emit({ code: 'USER_CREATED', target: 'u-2' });
+        _initQueue(new RecordingStore());
+        const t0 = Date.now();
+        closed = await close(300);
+        assert.ok(Date.now() - t0 < 1500, 'close must keep to its timeout');
+    });
+    assert.equal(closed, false);
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    assert.equal(lost.length, 2);
+    const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
+    assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
+    assert.equal(inc[0].level, 'warn');
+    assert.equal(inc[0].unstored, 2);
+    assert.equal(typeof inc[0].flushed, 'boolean');
+});
+
+test('re-init that stores every row reports nothing', async () => {
+    const captured = await captureSys(async () => {
+        _initQueue(new SlowStore(5));
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        _initQueue(new RecordingStore());
+        assert.equal(await close(2000), true);
+    });
+    assert.ok(!captured.some(r => r.event === 'audit_drain_install_incomplete'));
+});
+
+for (const [name, reinit] of [
+    ['queue mode', () => _initQueue(new RecordingStore())],
+    ['raise mode with no store', () => init({
+        serviceId: 'svc', nodeId: 'node', auditStoreFailureStrategy: 'raise',
+    })],
+]) {
+    test(`re-init to ${name} flushes the old drainer and reports its loss`, async () => {
+        const store = new BrokenStore();
+        let closed;
+        const captured = await captureSys(async (seen) => {
+            _initQueue(store, {
+                queueRetryInitialMs: 60_000,
+                queueRetryMaxMs: 60_000,
+                queueRetryJitter: false,
+            });
+            emit({ code: 'USER_CREATED', target: 'u-1' });
+            while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
+            reinit();
+            await new Promise(r => setTimeout(r, 50));
+            assert.equal(store.attempts, 1, 'the row waits out the flush first');
+            const deadline = Date.now() + 8000;
+            while (!seen.some(r => r.event === 'audit_drain_install_incomplete')
+                && Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 20));
+            }
+            closed = await close(1000);
+        });
+        const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
+        assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
+        assert.equal(inc[0].flushed, false);
+        assert.equal(inc[0].unstored, 1);
+        // The loss is reported by the re-init's events; a close() with
+        // nothing pending afterwards loses nothing, as in Python and Go.
+        assert.equal(closed, true);
+    });
+}
+
+test('close keeps to its timeout while a re-init is stopping the old drainer', async () => {
+    const store = { insert: () => new Promise(() => {}) };
+    let closed;
+    await captureSys(async () => {
+        _initQueue(store);
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        const old = activeDrainer();
+        _initQueue(new RecordingStore());
+        // The re-init's 5 s flush times out and it starts its own stop.
+        const deadline = Date.now() + 8000;
+        while (!old._stopped && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 20));
+        }
+        assert.ok(old._stopped);
+        const t0 = Date.now();
+        closed = await close(300);
+        assert.ok(Date.now() - t0 < 1000, `close took ${Date.now() - t0} ms`);
+    });
+    assert.equal(closed, false);
+});
+
+// Idle drainer
+
+test('an idle drainer lets the process exit', async () => {
+    const { spawn } = await import('node:child_process');
+    const src = new URL('../src/index.js', import.meta.url).href;
+    const script = `
+        import { init, emit, register, flush } from ${JSON.stringify(src)};
+        register('user', { USER_CREATED: { domain: 'user', action: 'create' } });
+        const rows = [];
+        init({ serviceId: 's', nodeId: 'n', auditStore: { insert: (r) => { rows.push(r); } } });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        await flush(1000);
+        process.stderr.write('stored ' + rows.length + '\\n');
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let err = '';
+    child.stderr.on('data', (d) => { err += d; });
+    const t0 = Date.now();
+    const code = await new Promise((resolve) => {
+        const timer = setTimeout(() => { child.kill(); resolve('timeout'); }, 5000);
+        child.on('exit', (c) => { clearTimeout(timer); resolve(c); });
+    });
+    assert.equal(code, 0, `child did not exit on its own (${Date.now() - t0} ms)`);
+    assert.match(err, /stored 1/);
 });
