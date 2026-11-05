@@ -26,6 +26,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `InitOptions`, the dead-letter and `capacity_semantics` fields to
   `QueueStats`, and `wire_version` to `Row`.
 
+### Fixed: form-2 rows read back from stdout and the reader verify (Go)
+
+- The sealed stdout line and the `/audit`, `/correlate` and `/search`
+  responses now carry `detail_salt` and `detail_commitment`. Without them a
+  form-2 row read back from either place failed `VerifyChain` in Go and
+  Python and could not be ingested again.
+- Canonical JSON writes DEL (0x7f) as `\u007f`, as Python's `json.dumps`
+  does, so a row holding that byte hashes the same in Go and Python.
+- Rows Go sealed earlier with DEL left raw still verify, in Go and Python:
+  when the commitment or hash misses, the check is retried with DEL raw
+  (spec §1.2).
+- The Go workflow also runs when `spec/` changes, since Go tests read it.
+
 ### Fixed: redact values when the core can't parse the input (C++)
 
 - Strings are now written as valid UTF-8 JSON: bytes that are not valid

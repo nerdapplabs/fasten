@@ -97,7 +97,7 @@ func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
 		if got := detailCommitment(r.DetailSalt, r.Detail); got != r.DetailCommitment {
 			t.Errorf("%s: commitment drifted:\n got %s\nwant %s", r.ID, got, r.DetailCommitment)
 		}
-		if got := hashFnByForm[r.CanonicalFormID](r); got != r.Hash {
+		if got := hashFnByForm[r.CanonicalFormID](r, canonicalJSON); got != r.Hash {
 			t.Errorf("%s: hash drifted — regenerate the vector and update Python:\n got %s\nwant %s",
 				r.ID, got, r.Hash)
 		}
