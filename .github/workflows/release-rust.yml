@@ -1,0 +1,67 @@
+name: Release Rust SDK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write   # fasten-rust.yml uploads coverage through Codecov OIDC
+
+jobs:
+  test:
+    uses: ./.github/workflows/fasten-rust.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: rust:1.90
+
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/fasten
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Tag matches the package version
+        run: scripts/release/check-version.sh rust "$GITHUB_REF_NAME"
+
+      # fasten-core is versioned on its own, so a release of the SDK often
+      # reuses a fasten-core version that is already on crates.io.
+      - name: Publish fasten-core
+        working-directory: fasten-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq pkg-config libssl-dev
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ -n "$version" ] || { echo "::error::no fasten-core version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_ENV"
+          if curl -fsS https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
+            echo "fasten-core $version is already on crates.io"
+          else
+            cargo publish --locked
+          fi
+
+      - name: Wait for fasten-core in the index
+        run: |
+          for _ in $(seq 60); do
+            if curl -fsS https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::fasten-core $version not in the crates.io index after 10 minutes"
+          exit 1
+
+      - name: Publish the SDK
+        working-directory: rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

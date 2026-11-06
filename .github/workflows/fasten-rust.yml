@@ -14,6 +14,7 @@ on:
       # fasten-core's own tests run only in this workflow.
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
+  workflow_call:
 
 permissions:
   contents: read
