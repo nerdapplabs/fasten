@@ -15,7 +15,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `audit_drain_abandoned`.
 - Python: fasten's own error log lines (drainer, retention, Postgres
   reconnect) give the exception type and traceback frames with the message
-  redacted, instead of the raw message and traceback.
+  redacted, instead of the raw message and traceback. The exceptions it was
+  raised from are listed the same way. Drainer and retention lines use the
+  engine's redaction settings; `start_purger()` takes a `redactor`.
+- Python: before `init()`, a log line whose fields can't be redacted keeps
+  its event name.
 
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 

@@ -219,7 +219,7 @@ def test_log_before_init_drops_values_without_the_core(caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger="fasten"):
         fasten.log.info("startup_probe", password="hunter2")
     text = "\n".join(r.message for r in caplog.records)
-    assert text
+    assert '"event": "startup_probe"' in text
     assert "hunter2" not in text
 
 

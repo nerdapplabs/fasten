@@ -15,7 +15,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from .redact import describe_error
+from .redact import Redactor, describe_error
 
 logger = logging.getLogger("fasten.retention")
 
@@ -70,6 +70,8 @@ def start_purger(
     stop_event: Optional[threading.Event] = None,
     on_error: Optional[Callable[[str, Exception], None]] = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    # For the messages of errors it logs; None means the default patterns.
+    redactor: Optional[Redactor] = None,
 ) -> threading.Thread:
     """Start a daemon thread that purges or redacts ``store`` once right
     away, then every ``check_interval``. Set ``stop_event`` to stop it.
@@ -94,7 +96,7 @@ def start_purger(
             try:
                 now = now_fn()
             except Exception as e:  # noqa: BLE001
-                logger.error("fasten retention now_fn raised: %s", describe_error(e))
+                logger.error("fasten retention now_fn raised: %s", describe_error(e, redactor))
                 continue
 
             def _report(label: str, e: BaseException) -> None:
@@ -105,9 +107,9 @@ def start_purger(
                         on_error(label, e)  # type: ignore[arg-type]
                     except Exception as cb_e:  # noqa: BLE001
                         logger.error("retention on_error callback raised: %s",
-                                     describe_error(cb_e))
+                                     describe_error(cb_e, redactor))
                 else:
-                    logger.warning("fasten retention %s failed: %s", label, describe_error(e))
+                    logger.warning("fasten retention %s failed: %s", label, describe_error(e, redactor))
 
             # Separate try blocks so a redaction failure does not skip the
             # purge.

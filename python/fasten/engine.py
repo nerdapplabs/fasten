@@ -168,6 +168,7 @@ class _QueueDrainer:
     # were emitted under, and init can change the engine's while it drains.
     stdout: Any = None
     service_id: str = ""
+    redactor: Optional[Redactor] = None
     gen: int = 0                # engine store generation it writes to
     install: dict[str, Any] = dataclasses.field(default_factory=dict)  # to reinstall after fork
     deadline: Optional[float] = None    # time.monotonic(); close starts no insert after it
@@ -245,7 +246,7 @@ class _QueueDrainer:
                 result = call.fn(*call.args)
             except BaseException as e:  # noqa: BLE001 — the drain thread is waiting on it
                 logging.getLogger("fasten").error("drainer store call failed: %s",
-                                                  describe_error(e))
+                                                  describe_error(e, self.redactor))
                 result = 1
             self.settle(call, result)
 
@@ -574,6 +575,7 @@ class Engine:
             t = start_purger(
                 store=store, stream=stream, retention=retention,
                 stop_event=self._retention_stop, on_error=_log_err,
+                redactor=self._redactor,
             )
             self._retention_threads.append(t)
 
@@ -586,6 +588,7 @@ class Engine:
                 retention=None, pii_retention=pii_retention,
                 redact_fn=self.redact_expired,
                 stop_event=self._retention_stop, on_error=_log_err,
+                redactor=self._redactor,
             ))
 
     def _stop_retention_threads(self) -> None:
@@ -1093,7 +1096,8 @@ class Engine:
         max_attempts = max_attempts or 50   # fasten-core's default for 0
         pending: dict[str, list[Any]] = {}
         d = _QueueDrainer(None, None, pending, store, stdout=self._stdout,
-                          service_id=self._service_id, gen=self._store_gen)
+                          service_id=self._service_id, redactor=self._redactor,
+                          gen=self._store_gen)
         d.install = dict(store=store, capacity=capacity, retry_initial_ms=retry_initial_ms,
                          retry_max_ms=retry_max_ms, retry_jitter=retry_jitter,
                          max_attempts=max_attempts)
@@ -1449,8 +1453,12 @@ class _Logger:
             eng._stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
             # No transport before init(), so redact here. If the core can't
-            # load, the redactor drops the values.
-            line = eng._redactor.redact(json.loads(json.dumps(payload, default=str)))
+            # load, the redactor drops the values. The event is redacted on
+            # its own and kept as given if it can't be, so the line keeps it.
+            rest = {k: v for k, v in payload.items() if k != "event"}
+            ev = eng._redactor.redact([event])
+            line = {"event": ev[0] if isinstance(ev, list) else event,
+                    **eng._redactor.redact(json.loads(json.dumps(rest, default=str)))}
             eng._stdlib_logger.log(
                 level,
                 json.dumps(line, default=str),
