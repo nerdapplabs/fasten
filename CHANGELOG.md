@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: Python and Rust packages are named `fasten-sdk`
+
+- `fasten` is taken on PyPI and crates.io by unrelated projects, so the
+  Python and Rust packages are published as `fasten-sdk`:
+  `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
+- Code does not change: Python still imports `fasten`, Rust still uses
+  `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
+- Go (`github.com/nerdapplabs/fasten/go`), npm (`@nerdapplabs/fasten`) and
+  `fasten-core` keep their names.
+
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
 - `purge(before)` deletes, per `source_node_id`, only the rows below the
