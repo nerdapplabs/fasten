@@ -29,11 +29,49 @@ impl std::fmt::Debug for SqliteStore {
 /// created, `Connection::open` reports the error.
 #[cfg(unix)]
 fn create_owner_only(path: &str) {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
-    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+    let bytes = match path.strip_prefix("file:") {
+        Some(uri) => match uri_file_path(uri) {
+            Some(p) => p,
+            None => return,
+        },
+        None => path.as_bytes().to_vec(),
+    };
+    if bytes.is_empty() || bytes == b":memory:" {
         return;
     }
+    let path = std::ffi::OsStr::from_bytes(&bytes);
     let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+}
+
+/// File path of a SQLite `file:` URI (after the scheme), or `None` when the
+/// URI names no file to create (in-memory, read-only, or another host).
+#[cfg(unix)]
+fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.split('#').next().unwrap_or("");
+    let (mut rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if query.split('&').any(|p| matches!(p, "mode=memory" | "mode=ro" | "mode=rw")) {
+        return None;
+    }
+    if let Some(after) = rest.strip_prefix("//") {
+        let slash = after.find('/').unwrap_or(after.len());
+        if !matches!(&after[..slash], "" | "localhost") {
+            return None;
+        }
+        rest = &after[slash..];
+    }
+    let mut out = Vec::with_capacity(rest.len());
+    let mut b = rest.bytes();
+    while let Some(c) = b.next() {
+        if c == b'%' {
+            let hex = [b.next()?, b.next()?];
+            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(not(unix))]
@@ -1190,7 +1228,9 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// Under the usual 022 umask SQLite alone would create these 0644.
+    /// Under the usual 022 umask SQLite alone would create these 0644. The
+    /// test relies on that default: the umask is process-wide and tests run
+    /// in threads, so it does not set one.
     #[cfg(unix)]
     #[test]
     fn new_file_and_wal_are_0600() {
@@ -1210,5 +1250,22 @@ mod tests {
         std::fs::set_permissions(&db.0, std::fs::Permissions::from_mode(0o644)).unwrap();
         SqliteStore::open(&db.0, "audit_log", true).unwrap();
         assert_eq!(file_mode(&db.0), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_is_0600() {
+        let db = TempDb::new("mode uri");
+        let uri = format!("file://{}?cache=private", db.0.replace(' ', "%20"));
+        SqliteStore::open(&uri, "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_file_uri_creates_nothing() {
+        let db = TempDb::new("mode_ro");
+        assert!(SqliteStore::open(&format!("file:{}?mode=ro", db.0), "audit_log", true).is_err());
+        assert!(!std::path::Path::new(&db.0).exists());
     }
 }

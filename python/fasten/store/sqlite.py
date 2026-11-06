@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Sequence
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..attrs import AuditRow
 
@@ -70,10 +70,28 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 """
 
 
-def create_owner_only(path: str) -> None:
+def _uri_file_path(uri: str) -> str:
+    """File path of a SQLite ``file:`` URI, or "" when the URI names no file
+    to create (in-memory, read-only, or another host)."""
+    rest = uri[len("file:"):].partition("#")[0]
+    rest, _, query = rest.partition("?")
+    if any(p in ("mode=memory", "mode=ro", "mode=rw") for p in query.split("&")):
+        return ""
+    if rest.startswith("//"):
+        host, sep, tail = rest[2:].partition("/")
+        if host not in ("", "localhost"):
+            return ""
+        rest = sep + tail
+    return unquote(rest)
+
+
+def _create_owner_only(path: str | os.PathLike[str]) -> None:
     """Create a missing database file with mode 0600, so SQLite does not
     create it with the umask. An existing file keeps its mode."""
-    if path in ("", ":memory:") or path.startswith("file:"):
+    path = os.fspath(path)
+    if path.startswith("file:"):
+        path = _uri_file_path(path)
+    if path in ("", ":memory:"):
         return
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -121,7 +139,7 @@ class SQLiteStore:
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
-        create_owner_only(self._path)
+        _create_owner_only(self._path)
         # Create the table and run migrations before other threads connect.
         bootstrap = self._connect()
         if wal and not self._is_memory:

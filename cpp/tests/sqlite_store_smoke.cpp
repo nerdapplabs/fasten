@@ -1,9 +1,12 @@
 // Smoke tests for fasten_store_sqlite.hpp.
-// All tests use ":memory:", so nothing touches the filesystem.
+// Most tests use ":memory:"; the file mode tests use files under /tmp.
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
 #include <cassert>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
@@ -242,6 +245,62 @@ void test_two_stores_one_node_get_distinct_seqs() {
     std::cout << "  test_two_stores_one_node_get_distinct_seqs: PASS\n";
 }
 
+#ifndef _WIN32
+// Under the usual 022 umask SQLite alone would create these 0644.
+int file_mode(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) return -1;
+    return static_cast<int>(st.st_mode & 0777);
+}
+
+void remove_db(const std::string& path) {
+    for (const char* ext : {"", "-wal", "-shm"}) std::remove((path + ext).c_str());
+}
+
+void test_new_file_and_wal_are_0600() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        store.insert(make_row("evt-mode-1", "TEST_MODE"));
+        assert(file_mode(path) == 0600);
+        assert(file_mode(path + "-wal") == 0600);
+    }
+    remove_db(path);
+    std::cout << "  test_new_file_and_wal_are_0600: PASS\n";
+}
+
+void test_existing_file_keeps_its_mode() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    std::fclose(f);
+    chmod(path.c_str(), 0644);
+    { fasten::SqliteStore store(path); }
+    assert(file_mode(path) == 0644);
+    remove_db(path);
+    std::cout << "  test_existing_file_keeps_its_mode: PASS\n";
+}
+
+void test_file_uri_is_0600() {
+    const std::string path = "/tmp/fasten mode " + fasten::mint_id() + ".db";
+    std::string uri = "file://";
+    for (char c : path) uri += c == ' ' ? std::string("%20") : std::string(1, c);
+    { fasten::SqliteStore store(uri + "?cache=private"); }
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_is_0600: PASS\n";
+}
+
+void test_read_only_file_uri_creates_nothing() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    bool threw = false;
+    try { fasten::SqliteStore store("file:" + path + "?mode=ro"); }
+    catch (const std::runtime_error&) { threw = true; }
+    assert(threw);
+    assert(file_mode(path) == -1);
+    std::cout << "  test_read_only_file_uri_creates_nothing: PASS\n";
+}
+#endif
+
 int main() {
     std::cout << "=== sqlite_store_smoke ===\n";
     test_insert_idempotent();
@@ -256,6 +315,12 @@ int main() {
     test_next_seq_uses_index();
     test_failed_commit_does_not_wedge_the_store();
     test_two_stores_one_node_get_distinct_seqs();
+#ifndef _WIN32
+    test_new_file_and_wal_are_0600();
+    test_existing_file_keeps_its_mode();
+    test_file_uri_is_0600();
+    test_read_only_file_uri_creates_nothing();
+#endif
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;
 }

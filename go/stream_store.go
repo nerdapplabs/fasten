@@ -81,16 +81,42 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 // does not create it with the umask. An existing file keeps its mode. If the
 // file cannot be created, the driver reports the error on first use.
 func createOwnerOnly(path string) {
-	if i := strings.IndexByte(path, '?'); i >= 0 {
+	if strings.HasPrefix(path, "file:") {
+		path = uriFilePath(path)
+	} else if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
 	}
-	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+	if path == "" || path == ":memory:" {
 		return
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err == nil {
 		f.Close()
 	}
+}
+
+// uriFilePath returns the file path of a SQLite file: URI, or "" when the URI
+// names no file to create (in-memory, read-only, or another host).
+func uriFilePath(uri string) string {
+	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
+	rest, query, _ := strings.Cut(rest, "?")
+	for _, p := range strings.Split(query, "&") {
+		if p == "mode=memory" || p == "mode=ro" || p == "mode=rw" {
+			return ""
+		}
+	}
+	if strings.HasPrefix(rest, "//") {
+		host, tail, _ := strings.Cut(rest[2:], "/")
+		if host != "" && host != "localhost" {
+			return ""
+		}
+		rest = "/" + tail
+	}
+	p, err := url.PathUnescape(rest)
+	if err != nil {
+		return ""
+	}
+	return p
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc

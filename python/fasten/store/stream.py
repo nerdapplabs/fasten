@@ -21,7 +21,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
-from .sqlite import create_owner_only
+from .sqlite import _create_owner_only
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -74,7 +74,7 @@ class StreamStore:
         # makes the reader report "store-degraded". No lock: a lost increment
         # only undercounts.
         self._write_failures = 0
-        create_owner_only(path)
+        _create_owner_only(path)
         bootstrap = self._connect()
         for stmt in _DDL.format(table=table).split(";"):
             if stmt.strip():

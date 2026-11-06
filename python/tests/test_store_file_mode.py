@@ -1,5 +1,6 @@
 """New SQLite store files are created 0600; existing files keep their mode."""
 import os
+import sqlite3
 import stat
 import sys
 
@@ -58,3 +59,23 @@ def test_wal_file_is_0600(tmp_path, umask_022, open_store):
     assert wal.exists()
     assert _mode(wal) == 0o600
     del store
+
+
+@pytest.mark.parametrize("store_cls", [SQLiteStore, StreamStore])
+def test_pathlib_path_is_0600(tmp_path, umask_022, store_cls):
+    path = tmp_path / "store.db"
+    store_cls(path, "t")
+    assert _mode(path) == 0o600
+
+
+def test_file_uri_is_0600(tmp_path, umask_022):
+    path = tmp_path / "my store.db"
+    StreamStore("file://" + str(path).replace(" ", "%20") + "?cache=private", "t")
+    assert _mode(path) == 0o600
+
+
+def test_read_only_file_uri_creates_nothing(tmp_path, umask_022):
+    path = tmp_path / "store.db"
+    with pytest.raises(sqlite3.OperationalError):
+        StreamStore(f"file:{path}?mode=ro", "t")
+    assert not path.exists()

@@ -27,6 +27,11 @@
 
 #include <sqlite3.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "fasten.hpp"
 
 namespace fasten {
@@ -39,6 +44,8 @@ public:
     /// `path`:  file path, or ":memory:".
     /// `table`: must match [A-Za-z_][A-Za-z0-9_]*.
     /// `wal`:   enable WAL journal mode (default true). Ignored for ":memory:".
+    ///
+    /// A new database file is created owner-only (0600) on POSIX systems.
     explicit SqliteStore(const std::string& path,
                          const std::string& table = "audit_log",
                          bool wal = true)
@@ -46,6 +53,7 @@ public:
     {
         validate_table_name(table_);
 
+        create_owner_only(path);
         int rc = sqlite3_open(path.c_str(), &db_);
         if (rc != SQLITE_OK) {
             std::string msg = db_ ? sqlite3_errmsg(db_) : "sqlite3_open failed";
@@ -283,6 +291,53 @@ private:
                 return false;
         }
         return true;
+    }
+
+    // File path of a SQLite file: URI, or "" when the URI names no file to
+    // create (in-memory, read-only, or another host).
+    static std::string uri_file_path(const std::string& uri) {
+        std::string rest = uri.substr(5, uri.find('#') - 5);
+        std::string query;
+        const auto q = rest.find('?');
+        if (q != std::string::npos) {
+            query = "&" + rest.substr(q + 1) + "&";
+            rest.resize(q);
+        }
+        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&"})
+            if (query.find(m) != std::string::npos) return "";
+        if (rest.rfind("//", 0) == 0) {
+            auto slash = rest.find('/', 2);
+            if (slash == std::string::npos) slash = rest.size();
+            std::string host = rest.substr(2, slash - 2);
+            if (!host.empty() && host != "localhost") return "";
+            rest.erase(0, slash);
+        }
+        std::string out;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (rest[i] == '%' && i + 2 < rest.size() &&
+                std::isxdigit(static_cast<unsigned char>(rest[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(rest[i + 2]))) {
+                out += static_cast<char>(std::stoi(rest.substr(i + 1, 2), nullptr, 16));
+                i += 2;
+            } else {
+                out += rest[i];
+            }
+        }
+        return out;
+    }
+
+    // Create a missing database file with mode 0600, so SQLite does not
+    // create it with the umask. An existing file keeps its mode. If the file
+    // cannot be created, sqlite3_open reports the error.
+    static void create_owner_only(const std::string& path) {
+#ifndef _WIN32
+        std::string file = path.rfind("file:", 0) == 0 ? uri_file_path(path) : path;
+        if (file.empty() || file == ":memory:") return;
+        int fd = ::open(file.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd >= 0) ::close(fd);
+#else
+        (void)path;
+#endif
     }
 
     static void validate_table_name(const std::string& table) {

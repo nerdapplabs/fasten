@@ -6,7 +6,8 @@ import CSQLite3
 #endif
 
 /// AuditStore backed by the system SQLite3 library (install libsqlite3-dev on
-/// Linux). Pass ":memory:" as the path for an in-memory database.
+/// Linux). Pass ":memory:" as the path for an in-memory database. A new
+/// database file is created owner-only (0600).
 public final class SQLiteStore: AuditStore, @unchecked Sendable {
 
     private(set) var db: OpaquePointer?   // internal for tests
@@ -28,6 +29,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         self.table = table
         // NOMUTEX: `lock` is the only thing serializing this connection, on
         // every platform, whatever threading mode the system SQLite was built with.
+        Self.createOwnerOnly(path)
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
         if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             throw FastenError("cannot open SQLite at \(path)")
@@ -37,6 +39,36 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     deinit { sqlite3_close(db) }
+
+    /// Creates a missing database file with mode 0600, so SQLite does not
+    /// create it with the umask. An existing file keeps its mode. If the file
+    /// cannot be created, sqlite3_open_v2 reports the error.
+    static func createOwnerOnly(_ path: String) {
+        let file = path.hasPrefix("file:") ? uriFilePath(path) : path
+        guard let file, !file.isEmpty, file != ":memory:" else { return }
+        let fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        if fd >= 0 { close(fd) }
+    }
+
+    /// File path of a SQLite file: URI, or nil when the URI names no file to
+    /// create (in-memory, read-only, or another host).
+    static func uriFilePath(_ uri: String) -> String? {
+        var rest = Substring(uri.dropFirst(5).prefix { $0 != "#" })
+        var query = Substring("")
+        if let q = rest.firstIndex(of: "?") {
+            query = rest[rest.index(after: q)...]
+            rest = rest[..<q]
+        }
+        let modes: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw"]
+        if query.split(separator: "&").contains(where: modes.contains) { return nil }
+        if rest.hasPrefix("//") {
+            let after = rest.dropFirst(2)
+            let slash = after.firstIndex(of: "/") ?? after.endIndex
+            guard ["", "localhost"].contains(after[..<slash]) else { return nil }
+            rest = after[slash...]
+        }
+        return String(rest).removingPercentEncoding
+    }
 
     private func bootstrap() throws {
         let ddl = """

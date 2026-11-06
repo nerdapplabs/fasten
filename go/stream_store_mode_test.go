@@ -5,6 +5,7 @@ package fasten
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -55,5 +56,29 @@ func TestOpenStreamStore_ExistingFileKeepsMode(t *testing.T) {
 	defer s.db.Close()
 	if m := fileMode(t, path); m != 0o644 {
 		t.Errorf("store file mode = %o, want 644", m)
+	}
+}
+
+func TestOpenStreamStore_FileURIIs0600(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	path := filepath.Join(t.TempDir(), "my store.db")
+	s, err := OpenStreamStore("file:"+strings.ReplaceAll(path, " ", "%20")+"?cache=private", "api_stream")
+	if err != nil {
+		t.Fatalf("OpenStreamStore: %v", err)
+	}
+	defer s.db.Close()
+	if m := fileMode(t, path); m != 0o600 {
+		t.Errorf("store file mode = %o, want 600", m)
+	}
+}
+
+func TestOpenStreamStore_ReadOnlyFileURICreatesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "streams.db")
+	if s, err := OpenStreamStore("file:"+path+"?mode=ro", "api_stream"); err == nil {
+		s.db.Close()
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("read-only URI created %s (stat err %v)", path, err)
 	}
 }
