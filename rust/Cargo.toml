@@ -2,7 +2,7 @@
 name = "fasten"
 version = "1.0.0-beta.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "Apache-2.0"
 description = "Audit + correlation SDK: 5 Ws + H anchors, one request_id across every transport"
 repository = "https://github.com/nerdapplabs/fasten"
