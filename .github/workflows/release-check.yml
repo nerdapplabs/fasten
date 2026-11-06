@@ -44,3 +44,6 @@ jobs:
 
       - name: Tag and package versions
         run: scripts/release/test-check-version.sh
+
+      - name: Published fasten-core matches the tree
+        run: scripts/release/test-core-published.sh

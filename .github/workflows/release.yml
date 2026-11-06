@@ -114,8 +114,9 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # npm refuses a prerelease version without --tag, so 1.0.0-beta.0
-      # goes out under the beta dist-tag and a plain version under latest.
-      # A re-run skips a version that is already on npm.
+      # goes out under the beta dist-tag. A plain version goes out under
+      # latest only when it is above every version on npm; a backport gets
+      # release-X.Y. A re-run skips a version that is already on npm.
       - name: Publish to npm (with provenance)
         run: |
           name=$(node -p 'require("./package.json").name')
@@ -124,7 +125,13 @@ jobs:
             echo "$name $version is already on npm"
             exit 0
           fi
-          npm publish --provenance --access public --tag "$(../scripts/release/npm-dist-tag.sh "$version")"
+          if ! npm view "$name" versions --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/view.err"; then
+            grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
+            echo '[]' > "$RUNNER_TEMP/versions.json"
+          fi
+          tag=$(node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
+            | ../scripts/release/npm-dist-tag.sh "$version")
+          npm publish --provenance --access public --tag "$tag"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -145,8 +152,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # fasten-core is versioned on its own, so a release of the SDK often
-      # reuses a fasten-core version that is already on crates.io.
+      # fasten-core is versioned on its own, so a release of the SDK can
+      # reuse a fasten-core version that is already on crates.io. That is
+      # only allowed when the published files match the tree; otherwise
+      # core-published.sh fails and fasten-core needs a version bump.
       - name: Publish fasten-core
         working-directory: fasten-core
         env:
@@ -157,8 +166,9 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           [ -n "$version" ] || { echo "::error::no fasten-core version"; exit 1; }
           echo "version=$version" >> "$GITHUB_ENV"
-          if curl -fsS https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
-            echo "fasten-core $version is already on crates.io"
+          state=$(../scripts/release/core-published.sh .)
+          if [ "$state" = skip ]; then
+            echo "fasten-core $version is already on crates.io with the same files"
           else
             cargo publish --locked
           fi

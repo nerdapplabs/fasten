@@ -21,11 +21,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `pyproject.toml`.
 - npm: a prerelease version is published under its first prerelease
   identifier as the dist-tag (`1.0.0-beta.0` under `beta`, `1.0.0-0` under
-  `next`), a plain version under `latest`. npm refuses a prerelease publish
-  without `--tag`.
-- crates.io: fasten-core is published first (skipped when that version is
-  already there), then the SDK once the index has it. The SDK's fasten-core
-  dependency now carries `version = "0.1.0"`, which crates.io needs.
+  `next`). npm refuses a prerelease publish without `--tag`. A plain version
+  goes under `latest` only when it is above every version on npm; a backport
+  such as 1.0.1 after 1.1.0 goes under `release-1.0`, so `latest` stays on
+  1.1.0. `scripts/release/npm-dist-tag.sh` picks the tag with the same check
+  as the GitHub release (`latest-flag.sh`).
+- crates.io: fasten-core is published first, then the SDK once the index
+  has it. When that fasten-core version is already on crates.io,
+  `scripts/release/core-published.sh` compares the published `.crate` with
+  `cargo package` of the tree: the same files skip the publish, any change
+  fails the job, since fasten-core then needs a new version. The SDK's
+  fasten-core dependency now carries `version = "0.1.0"`, which crates.io
+  needs.
 - A re-run skips a version that is already on PyPI or npm.
 - `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
   requires.

@@ -66,10 +66,12 @@ check fail python v1.0.0-beta.0
 repo 1.0.0b0 1.0.0b0 1.0.0-beta.0 1.0.0-beta.0 0.1.0 0.2.0
 check fail rust v1.0.0-beta.0
 
-tag() { # tag <want> <version>
-  got=$("$dir/npm-dist-tag.sh" "$2")
-  if [ "$got" != "$1" ]; then
-    echo "FAIL: npm-dist-tag $2: got $got, want $1"
+tag() { # tag <want> <version> [published versions...]
+  want=$1 version=$2
+  shift 2
+  got=$(printf 'v%s\n' "$@" | "$dir/npm-dist-tag.sh" "$version")
+  if [ "$got" != "$want" ]; then
+    echo "FAIL: npm-dist-tag $version with [$*]: got $got, want $want"
     fail=1
   fi
 }
@@ -82,6 +84,14 @@ tag next 1.0.0-0
 tag next 1.0.0-1.beta
 tag latest 1.0.0
 tag latest 1.0.0+build.5
+tag latest 1.1.0 1.0.0 1.0.1
+tag latest 1.10.0 1.9.0 1.2.0 2.0.0-beta.0
+tag latest 1.0.1 1.0.0 1.0.1
+tag release-1.0 1.0.1 1.0.0 1.1.0
+tag release-1.9 1.9.1 1.10.0
+tag release-0.9 0.9.1+build.5 1.0.0
+tag beta 1.0.1-beta.0 1.1.0
+tag next 1.0.1-0 1.1.0
 
 [ "$fail" -eq 0 ] || exit 1
 echo "check-version: ok"

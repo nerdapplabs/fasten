@@ -1,17 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Print the --latest value for the GitHub release of a tag: true for a
 # vX.Y.Z tag that is the highest vX.Y.Z tag, false for anything else
 # (go/ tags, prereleases, backports).
 #
 # Usage: git tag -l 'v*' | scripts/release/latest-flag.sh <tag>
-set -euo pipefail
+set -eu
 export LC_ALL=C
 
 [ $# -eq 1 ] || { echo "usage: $0 <tag>" >&2; exit 2; }
 tag=$1
 release='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
-if ! [[ $tag =~ $release ]]; then
+if ! printf '%s\n' "$tag" | grep -Eq "$release"; then
   echo false
   exit 0
 fi
