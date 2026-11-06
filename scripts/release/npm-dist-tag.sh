@@ -1,6 +1,7 @@
 #!/bin/sh
 # Print the npm dist-tag for a package version: the first prerelease
-# identifier for a prerelease (1.0.0-beta.0 -> beta), latest otherwise.
+# identifier for a prerelease (1.0.0-beta.0 -> beta), next when that
+# identifier is a number (1.0.0-0), latest otherwise.
 #
 # Usage: scripts/release/npm-dist-tag.sh <version>
 set -eu
@@ -10,7 +11,11 @@ version=${1%%+*}
 case $version in
   *-*)
     pre=${version#*-}
-    echo "${pre%%.*}"
+    pre=${pre%%.*}
+    case $pre in
+      *[!0-9]*) echo "$pre" ;;
+      *) echo next ;;
+    esac
     ;;
   *) echo latest ;;
 esac

@@ -78,6 +78,8 @@ tag beta 1.0.0-beta.0
 tag beta 1.0.0-beta
 tag rc 2.1.0-rc.3
 tag alpha 1.0.0-alpha.1+build.5
+tag next 1.0.0-0
+tag next 1.0.0-1.beta
 tag latest 1.0.0
 tag latest 1.0.0+build.5
 
