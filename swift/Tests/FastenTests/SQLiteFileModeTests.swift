@@ -89,6 +89,11 @@ final class SQLiteFileModeTests: XCTestCase {
             }
             XCTAssertEqual(rc, 0)
             XCTAssertEqual(Int(st.st_mode) & 0o777, 0o600)
+            // Linux Foundation traps on a non-UTF-8 name, so tearDown's
+            // removeItem must not find this file.
+            _ = raw.withUnsafeBufferPointer {
+                $0.withMemoryRebound(to: CChar.self) { unlink($0.baseAddress!) }
+            }
         }
     }
 }
