@@ -41,3 +41,6 @@ jobs:
 
       - name: Latest release choice
         run: scripts/release/test-latest-flag.sh
+
+      - name: Tag and package versions
+        run: scripts/release/test-check-version.sh

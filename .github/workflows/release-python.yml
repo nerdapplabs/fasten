@@ -12,7 +12,11 @@ permissions:
   id-token: write  # required for Trusted Publishing OIDC exchange
 
 jobs:
+  test:
+    uses: ./.github/workflows/fasten-py.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     container:
       image: python:3.10-slim
@@ -27,6 +31,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Tag matches the package version
+        run: ../scripts/release/check-version.sh python "$GITHUB_REF_NAME"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
