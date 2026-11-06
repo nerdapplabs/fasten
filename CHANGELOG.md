@@ -8,20 +8,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ### Fixed: release workflows check before they publish
 
-- A `v*` tag now runs the SDK's test suite (`fasten-py.yml`,
-  `fasten-js.yml`, `fasten-rust.yml`, called through `workflow_call`) before
-  the PyPI, npm or crates.io publish job starts.
-- Each publish job first checks that the tag matches the package version
-  (`scripts/release/check-version.sh`). Python versions are compared after
-  PEP 440 normalisation, so `v1.0.0-beta.0` matches `1.0.0b0`, and
-  `__version__` in `fasten/__init__.py` must match `pyproject.toml`.
+- One `release.yml` replaces `release-python.yml`, `release-js.yml` and
+  `release-provenance.yml`. A `v*` tag runs the Python, JS and Rust test
+  suites (`fasten-py.yml`, `fasten-js.yml`, `fasten-rust.yml`, called through
+  `workflow_call`) and checks the tag against every package version; the
+  PyPI, npm, crates.io and GitHub release jobs start only when all of them
+  pass. `go/v*` tags and the `workflow_dispatch` dry run still build the
+  GitHub release files.
+- The version check is `scripts/release/check-version.sh`. Python versions
+  are compared after PEP 440 normalisation, so `v1.0.0-beta.0` matches
+  `1.0.0b0`, and `__version__` in `fasten/__init__.py` must match
+  `pyproject.toml`.
 - npm: a prerelease version is published under its first prerelease
-  identifier as the dist-tag (`1.0.0-beta.0` under `beta`), a plain version
-  under `latest`. npm refuses a prerelease publish without `--tag`.
-- New `release-rust.yml` publishes to crates.io: fasten-core first (skipped
-  when that version is already there), then the SDK once the index has it.
-  The SDK's fasten-core dependency now carries `version = "0.1.0"`, which
-  crates.io needs.
+  identifier as the dist-tag (`1.0.0-beta.0` under `beta`, `1.0.0-0` under
+  `next`), a plain version under `latest`. npm refuses a prerelease publish
+  without `--tag`.
+- crates.io: fasten-core is published first (skipped when that version is
+  already there), then the SDK once the index has it. The SDK's fasten-core
+  dependency now carries `version = "0.1.0"`, which crates.io needs.
+- A re-run skips a version that is already on PyPI or npm.
 - `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
   requires.
 
@@ -73,7 +78,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ### Added: release provenance
 
-- `release-provenance.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
+- `release.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
   Swift, C++ and Rust source archives and the fasten-core library for linux
   x86_64 (or the Go module zip for `go/` tags) with
   `scripts/release/build-artifacts.sh`, writes `SHA256SUMS`, attests every
