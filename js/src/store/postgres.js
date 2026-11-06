@@ -452,16 +452,28 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Delete rows whose timestamp is before `before`.
-	 * When respectUnshipped is true (default), only shipped rows are purged.
+	 * Delete rows whose timestamp is before `before`, per node only a seq
+	 * prefix (spec §2.3): rows above a kept row stay, so the rows left still
+	 * verify. When respectUnshipped is true (default), unshipped rows are kept,
+	 * and so are the rows above them.
 	 *
 	 * @param {{ before: string, respectUnshipped?: boolean }} opts
 	 * @returns {Promise<number>}  Number of rows deleted.
 	 */
 	async purge({ before, respectUnshipped = true }) {
 		await this._ensureReady();
-		let sql = `DELETE FROM ${this._table} WHERE timestamp < $1`;
-		if (respectUnshipped) sql += " AND shipped_at IS NOT NULL";
+		// Rows at seq 0 are not chained and go by age alone. Each node's
+		// lowest kept seq is one walk up the (source_node_id, monotonic_seq)
+		// index; the LIMIT keeps the planner from repeating it per row.
+		const t = this._table;
+		const keep = `timestamp >= $1${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
+		const shipped = respectUnshipped ? " AND d.shipped_at IS NOT NULL" : "";
+		const max = "9223372036854775807";
+		const sql =
+			`WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM ${t} UNION ALL ` +
+			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
+			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
+			`DELETE FROM ${t} AS d USING bound WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < $1${shipped}`;
 		const res = await this._pool.query(sql, [before]);
 		return res.rowCount ?? 0;
 	}

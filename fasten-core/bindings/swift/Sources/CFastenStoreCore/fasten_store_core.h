@@ -226,14 +226,16 @@ FastenErrorCode fasten_store_mark_shipped(
 );
 
 /**
- * Delete rows whose timestamp is before `before_iso8601`.
+ * Delete rows whose timestamp is before `before_iso8601`, per node only a
+ * seq prefix (spec §2.3): an old row above a kept row stays until that row
+ * is old too, so the rows left still verify. Rows at seq 0 go by age alone.
  *
  * @param store             Non-null handle.
  * @param before_iso8601    ISO-8601 UTC timestamp; rows strictly older are
- *                          deleted.
- * @param respect_unshipped Non-zero: preserve rows with shipped_at IS NULL.
- *                          Zero: delete all matching rows regardless of
- *                          shipping status.
+ *                          deleted, per node only below the lowest kept seq.
+ * @param respect_unshipped Non-zero: rows with shipped_at IS NULL are kept,
+ *                          and so are the rows above them on their node.
+ *                          Zero: shipping status is ignored.
  * @param out_deleted       Set to the count of deleted rows; may be NULL.
  * @param out_err           Set on error; may be NULL.
  *

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -532,11 +533,42 @@ func (s *SQLiteStore) MarkShipped(ctx context.Context, ids []string) error {
 	return err
 }
 
-func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
-	q := fmt.Sprintf(`DELETE FROM %s WHERE timestamp < ?`, s.table)
-	args := []any{canonicalTS(before)}
+// purgeSQL is the age purge (spec §2.3). Per node it deletes only the rows
+// below the lowest seq it keeps, a row at or after the cutoff or, with
+// respectUnshipped, an unshipped row, so what is left is a seq suffix. Rows
+// at seq 0 are not chained and go by age alone. param is the cutoff's
+// placeholder; bind the cutoff once per occurrence.
+//
+// Each node's lowest kept seq is one walk up the (source_node_id,
+// monotonic_seq) index, and the LIMIT keeps the planner from repeating it
+// per row. Postgres deletes with USING; SQLite has no USING, so it matches
+// ids.
+func purgeSQL(table, param string, respectUnshipped, postgres bool) string {
+	keep, shipped := "timestamp >= "+param, ""
 	if respectUnshipped {
-		q += " AND shipped_at IS NOT NULL"
+		keep += " OR shipped_at IS NULL"
+		shipped = " AND d.shipped_at IS NOT NULL"
+	}
+	bound := fmt.Sprintf(`WITH RECURSIVE nodes(node) AS (`+
+		`SELECT MIN(source_node_id) FROM %[1]s UNION ALL `+
+		`SELECT (SELECT MIN(source_node_id) FROM %[1]s WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), `+
+		`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM %[1]s WHERE source_node_id = node `+
+		`AND monotonic_seq > 0 AND (%[2]s) ORDER BY monotonic_seq LIMIT 1), %[3]d) AS keep_from `+
+		`FROM nodes WHERE node IS NOT NULL LIMIT %[3]d) `, table, keep, int64(math.MaxInt64))
+	match := "d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < " + param + shipped
+	if postgres {
+		return bound + "DELETE FROM " + table + " AS d USING bound WHERE " + match
+	}
+	return "DELETE FROM " + table + " WHERE id IN (" + bound + "SELECT d.id FROM bound, " + table + " AS d WHERE " + match + ")"
+}
+
+// Purge deletes rows older than before, per node only a seq prefix (spec
+// §2.3), so the rows left still verify.
+func (s *SQLiteStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
+	q := purgeSQL(s.table, "?", respectUnshipped, false)
+	args := make([]any, strings.Count(q, "?"))
+	for i := range args {
+		args[i] = canonicalTS(before)
 	}
 	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {

@@ -528,13 +528,10 @@ func (s *PostgresStore) MarkShipped(ctx context.Context, ids []string) error {
 	return err
 }
 
+// Purge deletes rows older than before, per node only a seq prefix (spec
+// §2.3), so the rows left still verify.
 func (s *PostgresStore) Purge(ctx context.Context, before time.Time, respectUnshipped bool) (int, error) {
-	q := fmt.Sprintf(`DELETE FROM %s WHERE timestamp < $1`, s.table)
-	args := []any{before.UTC()}
-	if respectUnshipped {
-		q += " AND shipped_at IS NOT NULL"
-	}
-	res, err := s.db.ExecContext(ctx, q, args...)
+	res, err := s.db.ExecContext(ctx, purgeSQL(s.table, "$1", respectUnshipped, true), before.UTC())
 	if err != nil {
 		return 0, err
 	}

@@ -560,10 +560,9 @@ class PostgresStore:
         return cast("list[str]", self._execute_with_retry(_run))
 
     def purge(self, *, before: datetime, respect_unshipped: bool = True) -> int:
-        sql = f"DELETE FROM {self._table} WHERE timestamp < %s"
-        params: list[Any] = [_utc_iso(before)]
-        if respect_unshipped:
-            sql += " AND shipped_at IS NOT NULL"
+        from .repo import purge_sql
+        sql = purge_sql(self._table, "%s", respect_unshipped, postgres=True)
+        params = [_utc_iso(before)] * sql.count("%s")
 
         def _run(conn: Any) -> int:
             with conn.cursor() as cur:
