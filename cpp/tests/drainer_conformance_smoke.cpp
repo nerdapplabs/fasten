@@ -482,6 +482,26 @@ void core_event_fields_are_redacted() {
     std::cout << "core event fields are redacted: PASS\n";
 }
 
+// The sink's error text is redacted in the sys line.
+void sync_fallback_error_is_redacted() {
+    reset_state();
+    const std::string jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl";
+    fasten::set_audit_sink([&](const fasten::Row&) {
+        throw std::runtime_error("insert failed: bearer " + jwt);
+    });
+    fasten::init(cfg("queue"));
+    fasten::uninstall_drainer();
+    Stderr err; err.start();
+    emit_one();
+    auto out = err.stop();
+    assert(count(out, "audit_sync_fallback_failed") == 1);
+    assert(out.find(jwt) == std::string::npos);
+    for (auto& r : fasten::query_syslog(1000)) {
+        for (auto& kv : r) assert(kv.second.find(jwt) == std::string::npos);
+    }
+    std::cout << "sync fallback error is redacted: PASS\n";
+}
+
 // A re-init whose old drainer holds a row it could not store reports it (§10).
 void reinit_reports_unstored_rows() {
     reset_state();
@@ -549,6 +569,7 @@ int main() {
     zero_flush_with_idle_drainer();
     core_events_keep_json_types();
     core_event_fields_are_redacted();
+    sync_fallback_error_is_redacted();
     reinit_reports_unstored_rows();
     flush_during_shutdown_waits_for_close();
     return 0;

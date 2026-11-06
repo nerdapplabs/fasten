@@ -1440,9 +1440,12 @@ class _Logger:
         if eng._stdout is not None:
             eng._stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
+            # No transport before init(), so redact here. If the core can't
+            # load, the redactor drops the values.
+            line = eng._redactor.redact(json.loads(json.dumps(payload, default=str)))
             eng._stdlib_logger.log(
                 level,
-                json.dumps(payload, default=str),
+                json.dumps(line, default=str),
                 extra={"_fasten_internal": True},
             )
 

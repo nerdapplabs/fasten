@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: remaining log lines go through the redactor (Python, C++)
+
+- Python: `fasten.log.*` before `init()` redacts the line before handing it
+  to the stdlib logger. If libfasten_core can't load, the values are dropped.
+- C++: the SDK's own sys lines on stderr are redacted, including the sink
+  error text in `audit_sync_fallback_failed` and the core's message in
+  `audit_drain_abandoned`.
+
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
 - `purge(before)` deletes, per `source_node_id`, only the rows below the
