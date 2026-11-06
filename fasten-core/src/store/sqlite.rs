@@ -24,6 +24,21 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
+/// Create a missing database file with mode 0600, so SQLite does not create
+/// it with the umask. An existing file keeps its mode. If the file cannot be
+/// created, `Connection::open` reports the error.
+#[cfg(unix)]
+fn create_owner_only(path: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(_path: &str) {}
+
 impl SqliteStore {
     /// Open (or create) the SQLite database at `path` and bootstrap the
     /// audit table + indexes.
@@ -32,9 +47,12 @@ impl SqliteStore {
     /// `table` must match `[A-Za-z_][A-Za-z0-9_]*`; a schema prefix is not
     /// supported here.
     /// `wal`  enables WAL journal mode (ignored for `:memory:` databases).
+    ///
+    /// A new database file is created owner-only (0600) on Unix.
     pub fn open(path: &str, table: &str, wal: bool) -> Result<Self, Error> {
         validate_table_name(table)?;
 
+        create_owner_only(path);
         let conn = Connection::open(path)?;
         // Another handle on the same file may hold the write lock while it
         // allocates a seq; wait for it instead of failing with SQLITE_BUSY.
@@ -1164,5 +1182,33 @@ mod tests {
         assert_eq!(chain_of(&got[0]), [Some(""), Some(""), Some("1"), None, None]);
         assert_eq!(chain_of(&got[1]), chain_of(&row));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Under the usual 022 umask SQLite alone would create these 0644.
+    #[cfg(unix)]
+    #[test]
+    fn new_file_and_wal_are_0600() {
+        let db = TempDb::new("mode_new");
+        let store = SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        store.insert(&make_row("evt-mode", "TEST")).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+        assert_eq!(file_mode(&format!("{}-wal", db.0)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = TempDb::new("mode_existing");
+        std::fs::File::create(&db.0).unwrap();
+        std::fs::set_permissions(&db.0, std::fs::Permissions::from_mode(0o644)).unwrap();
+        SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o644);
     }
 }

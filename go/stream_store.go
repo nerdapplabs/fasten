@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -54,6 +55,8 @@ var streamIndexedFields = []string{
 // modernc.org/sqlite driver. WAL and synchronous=NORMAL go in the DSN so
 // every pooled connection gets them, not just the one migrate runs on.
 //
+// A new database file is created owner-only (0600).
+//
 // For another driver, or an existing *sql.DB, use NewStreamStore and set the
 // pragmas in your own DSN.
 func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
@@ -61,6 +64,7 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	createOwnerOnly(path)
 	db, err := sql.Open("sqlite", streamPragmaDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("fasten StreamStore open: %w", err)
@@ -71,6 +75,22 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// createOwnerOnly creates a missing database file with mode 0600, so SQLite
+// does not create it with the umask. An existing file keeps its mode. If the
+// file cannot be created, the driver reports the error on first use.
+func createOwnerOnly(path string) {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		f.Close()
+	}
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc

@@ -1,5 +1,6 @@
 """SQLite AuditRepository. DSN: ``sqlite:///path?table=X&wal=true``. The table
-is created on first use; WAL is on by default."""
+is created on first use; WAL is on by default. A new database file is created
+owner-only (0600)."""
 from __future__ import annotations
 
 import contextlib
@@ -69,6 +70,19 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 """
 
 
+def create_owner_only(path: str) -> None:
+    """Create a missing database file with mode 0600, so SQLite does not
+    create it with the umask. An existing file keeps its mode."""
+    if path in ("", ":memory:") or path.startswith("file:"):
+        return
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        # Exists already, or cannot be created; sqlite3 reports the latter.
+        return
+    os.close(fd)
+
+
 def sqlite_dsn_path(dsn: str) -> str:
     """File path of a SQLite DSN. Strips only the URL-separator slash, as the
     stream store does: sqlite:///rel.db is relative, sqlite:////abs/path.db
@@ -107,6 +121,7 @@ class SQLiteStore:
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
+        create_owner_only(self._path)
         # Create the table and run migrations before other threads connect.
         bootstrap = self._connect()
         if wal and not self._is_memory:
