@@ -5,7 +5,7 @@ on:
     branches: [main, dev]
     paths:
       - 'scripts/release/**'
-      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/release-check.yml'
       - 'swift/**'
       - 'cpp/include/**'
@@ -17,7 +17,7 @@ on:
   pull_request:
     paths:
       - 'scripts/release/**'
-      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/release-check.yml'
       - 'swift/**'
       - 'cpp/include/**'
