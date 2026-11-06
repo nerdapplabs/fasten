@@ -15,6 +15,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+from .redact import describe_error
+
 logger = logging.getLogger("fasten.retention")
 
 
@@ -91,8 +93,8 @@ def start_purger(
             first = False
             try:
                 now = now_fn()
-            except Exception:  # noqa: BLE001
-                logger.exception("fasten retention now_fn raised")
+            except Exception as e:  # noqa: BLE001
+                logger.error("fasten retention now_fn raised: %s", describe_error(e))
                 continue
 
             def _report(label: str, e: BaseException) -> None:
@@ -101,13 +103,11 @@ def start_purger(
                 if on_error is not None:
                     try:
                         on_error(label, e)  # type: ignore[arg-type]
-                    except Exception:  # noqa: BLE001
-                        logger.exception("retention on_error callback raised")
+                    except Exception as cb_e:  # noqa: BLE001
+                        logger.error("retention on_error callback raised: %s",
+                                     describe_error(cb_e))
                 else:
-                    logger.warning(
-                        "fasten retention %s failed: %s: %s",
-                        label, type(e).__name__, e,
-                    )
+                    logger.warning("fasten retention %s failed: %s", label, describe_error(e))
 
             # Separate try blocks so a redaction failure does not skip the
             # purge.

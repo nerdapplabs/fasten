@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import traceback
 from typing import Any, Callable, Optional
 
 from . import core_ffi
@@ -181,3 +182,24 @@ class Redactor:
             redacted  = self.redact(payload)
             return {**internals, **redacted}
         return _processor
+
+
+def describe_error(exc: BaseException, redactor: Optional[Redactor] = None) -> str:
+    """``type: message`` with the message redacted, then the traceback
+    frames as ``file:line in function``. No source lines or locals. If the
+    core can't redact, the message is the unredactable marker."""
+    out = (redactor or Redactor()).redact([str(exc)])
+    msg = out[0] if isinstance(out, list) else out
+    lines = [f"{type(exc).__name__}: {msg}"]
+    for f in traceback.extract_tb(exc.__traceback__):
+        lines.append(f"  {f.filename}:{f.lineno} in {f.name}")
+    return "\n".join(lines)
+
+
+def redacted_json(raw: Any, redactor: Optional[Redactor] = None) -> str:
+    """A JSON payload, redacted, for a log line. Not JSON: a placeholder."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return "<not json>"
+    return json.dumps((redactor or Redactor()).redact(value), default=str)

@@ -33,7 +33,7 @@ from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_c
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
 from . import core_ffi as _ffi
-from .redact import Redactor
+from .redact import Redactor, describe_error, redacted_json
 from .transport.stdout import StdoutTransport
 
 # The chain helpers live in fasten.chain; re-exported here for existing imports.
@@ -243,8 +243,9 @@ class _QueueDrainer:
                 return
             try:
                 result = call.fn(*call.args)
-            except BaseException:  # noqa: BLE001 — the drain thread is waiting on it
-                logging.getLogger("fasten").exception("drainer store call failed")
+            except BaseException as e:  # noqa: BLE001 — the drain thread is waiting on it
+                logging.getLogger("fasten").error("drainer store call failed: %s",
+                                                  describe_error(e))
                 result = 1
             self.settle(call, result)
 
@@ -1025,8 +1026,9 @@ class Engine:
         if stdout is not None and sealed.hash:
             try:
                 stdout.write_audit(sealed.to_dict())
-            except Exception:  # noqa: BLE001 — the row is stored; don't report it as failed
-                logging.getLogger("fasten").exception("sealed stdout line failed for %s", sealed.id)
+            except Exception as e:  # noqa: BLE001 — the row is stored; don't report it as failed
+                logging.getLogger("fasten").error("sealed stdout line failed for %s: %s",
+                                                  sealed.id, describe_error(e, self._redactor))
         return sealed
 
     def _mark_write_lost(self, store: Any, gen: int) -> None:
@@ -1127,7 +1129,8 @@ class Engine:
                     self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
                 return 0
             except BaseException as e:  # noqa: BLE001 — a failed insert, never "stored"
-                cb_logger.exception("insert_cb failed for row %s", row_id)
+                cb_logger.error("insert_cb failed for row %s: %s", row_id,
+                                describe_error(e, self._redactor))
                 rejected = _rejects_row(e)
                 with d.lock:
                     failed = pending.get(row_id)
@@ -1151,8 +1154,10 @@ class Engine:
                 # drainer_close: a hung syslog store would keep it in
                 # Python above fasten-core's frames into exit.
                 _sys_event(event_json, persist=threading.get_ident() != d.retire_ident)
-            except BaseException:  # noqa: BLE001 — a sys event must not fail the drainer
-                cb_logger.exception("drainer sys event failed: %r", event_json)
+            except BaseException as e:  # noqa: BLE001 — a sys event must not fail the drainer
+                cb_logger.error("drainer sys event failed: %s: %s",
+                                redacted_json(event_json, self._redactor),
+                                describe_error(e, self._redactor))
 
         def _sys_event(event_json: bytes, persist: bool = True) -> int:
             fields = json.loads(event_json.decode("utf-8"))
@@ -1241,7 +1246,8 @@ class Engine:
             try:
                 self._install_drainer(**old.install)
             except Exception as e:  # noqa: BLE001 — emits then store inline (no drainer)
-                logging.getLogger("fasten").exception("drainer reinstall after fork failed")
+                logging.getLogger("fasten").error("drainer reinstall after fork failed: %s",
+                                                  describe_error(e, self._redactor))
                 self._drainer_sys_log("error", "audit_drain_reinstall_failed",
                                       {"error_type": type(e).__name__})
 
@@ -1356,8 +1362,9 @@ class Engine:
         try:
             try:
                 self._mark_write_lost(d.store, d.gen)
-            except Exception:  # noqa: BLE001 — still report the rows
-                log.exception("marking the audit store degraded failed")
+            except Exception as e:  # noqa: BLE001 — still report the rows
+                log.error("marking the audit store degraded failed: %s",
+                          describe_error(e, self._redactor))
             for row_id in row_ids:
                 try:
                     # close() waits for these, so the syslog store, which
@@ -1367,8 +1374,9 @@ class Engine:
                         "error_type": error_type,
                         "row_id": row_id,
                     }, via=d, persist=not d.past_deadline(), background=True)
-                except Exception:  # noqa: BLE001 — report the rest
-                    log.exception("lost_at_stop event failed for %s", row_id)
+                except Exception as e:  # noqa: BLE001 — report the rest
+                    log.error("lost_at_stop event failed for %s: %s", row_id,
+                              describe_error(e, self._redactor))
         finally:
             with d.lock:
                 d.reporting -= len(row_ids)

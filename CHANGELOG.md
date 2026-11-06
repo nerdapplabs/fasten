@@ -13,6 +13,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - C++: the SDK's own sys lines on stderr are redacted, including the sink
   error text in `audit_sync_fallback_failed` and the core's message in
   `audit_drain_abandoned`.
+- Python: fasten's own error log lines (drainer, retention, Postgres
+  reconnect) give the exception type and traceback frames with the message
+  redacted, instead of the raw message and traceback.
 
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
