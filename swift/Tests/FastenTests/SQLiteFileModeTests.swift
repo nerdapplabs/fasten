@@ -63,5 +63,33 @@ final class SQLiteFileModeTests: XCTestCase {
         _ = try SQLiteStore(path: "file:\(path)")
         XCTAssertEqual(try mode(path), 0o600)
     }
+
+    func testFileURIPathEndsAtNUL() throws {
+        _ = try SQLiteStore(path: "file:\(dir.path)/a%00x.db")
+        XCTAssertEqual(try mode(dir.appendingPathComponent("a").path), 0o600)
+    }
+
+    func testFileURIImmutableForms() {
+        for (value, creates) in [("TRUE", false), ("7", false), ("0", true), ("off", true)] {
+            let got = SQLiteStore.uriFilePath("file:/d/a.db?immutable=\(value)")
+            XCTAssertEqual(got == Array("/d/a.db".utf8), creates, value)
+        }
+    }
+
+    /// %FF is not UTF-8. macOS refuses such a name; Linux stores the raw byte.
+    func testFileURINonUTF8NameIsNotReplaced() throws {
+        let store = try? SQLiteStore(path: "file:\(dir.path)/a%FFb.db")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("a\u{FFFD}b.db").path))
+        if store != nil {
+            var st = stat()
+            let raw = Array(dir.path.utf8) + Array("/a".utf8) + [0xFF] + Array("b.db".utf8) + [0]
+            let rc = raw.withUnsafeBufferPointer {
+                $0.withMemoryRebound(to: CChar.self) { stat($0.baseAddress!, &st) }
+            }
+            XCTAssertEqual(rc, 0)
+            XCTAssertEqual(Int(st.st_mode) & 0o777, 0o600)
+        }
+    }
 }
 #endif

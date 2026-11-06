@@ -321,6 +321,30 @@ void test_file_uri_keeps_an_invalid_escape() {
     remove_db(path);
     std::cout << "  test_file_uri_keeps_an_invalid_escape: PASS\n";
 }
+
+void test_file_uri_path_ends_at_nul() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id();
+    { fasten::SqliteStore store("file:" + path + "%00x.db"); }
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_path_ends_at_nul: PASS\n";
+}
+
+void test_file_uri_immutable_forms() {
+    // A true form: fasten must not create the file 0600 (some SQLite
+    // versions create an empty one themselves, with the umask).
+    const std::string on = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    try { fasten::SqliteStore store("file:" + on + "?immutable=Yes"); }
+    catch (const std::runtime_error&) {}
+    assert(file_mode(on) == -1 || file_mode(on) == 0644);
+    remove_db(on);
+    // A false form is not immutable.
+    const std::string off = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    { fasten::SqliteStore store("file:" + off + "?immutable=0"); }
+    assert(file_mode(off) == 0600);
+    remove_db(off);
+    std::cout << "  test_file_uri_immutable_forms: PASS\n";
+}
 #endif
 
 int main() {
@@ -344,6 +368,8 @@ int main() {
     test_read_only_file_uri_creates_nothing();
     test_file_uri_without_a_file_to_create_creates_nothing();
     test_file_uri_keeps_an_invalid_escape();
+    test_file_uri_path_ends_at_nul();
+    test_file_uri_immutable_forms();
 #endif
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;

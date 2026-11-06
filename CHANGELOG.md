@@ -16,9 +16,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   mode, and `:memory:` is left alone.
 - The stores that take a `file:` URI (Python `StreamStore`, Go
   `OpenStreamStore`, fasten-core, C++, Swift) treat the file it names the
-  same way, unless it sets `mode=memory`, `mode=ro`, `mode=rw`,
-  `immutable=1` or a `vfs`, or names another host. Python `SQLiteStore`
-  makes its path absolute, so it never reads a URI.
+  same way, unless it sets `mode=memory`, `mode=ro`, `mode=rw`, a true
+  `immutable` or a `vfs`, or names another host. The path is decoded as
+  SQLite decodes it, ending at a `%00`. Python `SQLiteStore` makes its path
+  absolute, so it never reads a URI.
 - Go `NewSQLiteStore` and `NewStreamStore` take a `*sql.DB` the caller opened,
   so the caller's driver creates that file.
 

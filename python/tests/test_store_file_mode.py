@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from fasten.store.sqlite import SQLiteStore
+from fasten.store.sqlite import SQLiteStore, _uri_file_path
 from fasten.store.stream import StreamStore
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
@@ -95,3 +95,13 @@ def test_file_uri_without_a_file_to_create_creates_nothing(tmp_path, umask_022, 
 def test_file_uri_keeps_an_invalid_escape(tmp_path, umask_022):
     StreamStore(f"file:{tmp_path}/a%zzb.db", "t")
     assert _mode(tmp_path / "a%zzb.db") == 0o600
+
+
+def test_file_uri_path_ends_at_nul(tmp_path, umask_022):
+    StreamStore(f"file:{tmp_path}/a%00x.db", "t")
+    assert _mode(tmp_path / "a") == 0o600
+
+
+@pytest.mark.parametrize("value,creates", [("TRUE", False), ("7", False), ("0", True), ("off", True)])
+def test_file_uri_immutable_forms(value, creates):
+    assert (_uri_file_path(f"file:/d/a.db?immutable={value}") == "/d/a.db") is creates

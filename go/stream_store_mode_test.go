@@ -113,3 +113,25 @@ func TestOpenStreamStore_FileURIKeepsAnInvalidEscape(t *testing.T) {
 		t.Errorf("store file mode = %o, want 600", m)
 	}
 }
+
+func TestOpenStreamStore_FileURIPathEndsAtNUL(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	dir := t.TempDir()
+	s, err := OpenStreamStore("file:"+dir+"/a%00x.db", "api_stream")
+	if err != nil {
+		t.Fatalf("OpenStreamStore: %v", err)
+	}
+	defer s.db.Close()
+	if m := fileMode(t, filepath.Join(dir, "a")); m != 0o600 {
+		t.Errorf("store file mode = %o, want 600", m)
+	}
+}
+
+func TestURIFilePath_ImmutableForms(t *testing.T) {
+	for value, creates := range map[string]bool{"TRUE": false, "7": false, "0": true, "off": true} {
+		if got := uriFilePath("file:/d/a.db?immutable="+value) == "/d/a.db"; got != creates {
+			t.Errorf("immutable=%s: creates = %v, want %v", value, got, creates)
+		}
+	}
+}

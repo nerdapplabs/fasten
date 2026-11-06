@@ -103,9 +103,10 @@ func uriFilePath(uri string) string {
 	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
 	rest, query, _ := strings.Cut(rest, "?")
 	for _, p := range strings.Split(query, "&") {
+		key, value, _ := strings.Cut(p, "=")
 		switch {
-		case p == "mode=memory", p == "mode=ro", p == "mode=rw", p == "immutable=1",
-			strings.HasPrefix(p, "vfs="):
+		case p == "mode=memory", p == "mode=ro", p == "mode=rw", key == "vfs",
+			key == "immutable" && uriTrue(value):
 			return ""
 		}
 	}
@@ -116,7 +117,25 @@ func uriFilePath(uri string) string {
 		}
 		rest = "/" + tail
 	}
-	return uriUnescape(rest)
+	p := uriUnescape(rest)
+	// SQLite ends the path at a %00.
+	if i := strings.IndexByte(p, 0); i >= 0 {
+		p = p[:i]
+	}
+	return p
+}
+
+// uriTrue reads a URI boolean as sqlite3_uri_boolean does.
+func uriTrue(v string) bool {
+	if v != "" && v[0] >= '0' && v[0] <= '9' {
+		digits := v[:len(v)-len(strings.TrimLeft(v, "0123456789"))]
+		return strings.Trim(digits, "0") != ""
+	}
+	switch strings.ToLower(v) {
+	case "yes", "on", "true", "full", "extra", "normal":
+		return true
+	}
+	return false
 }
 
 // uriUnescape decodes %XX escapes as SQLite does: a '%' without two hex

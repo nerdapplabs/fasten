@@ -54,7 +54,10 @@ fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.split('#').next().unwrap_or("");
     let (mut rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let no_create = |p: &str| {
-        matches!(p, "mode=memory" | "mode=ro" | "mode=rw" | "immutable=1") || p.starts_with("vfs=")
+        let (key, value) = p.split_once('=').unwrap_or((p, ""));
+        matches!(p, "mode=memory" | "mode=ro" | "mode=rw")
+            || key == "vfs"
+            || (key == "immutable" && uri_true(value))
     };
     if query.split('&').any(no_create) {
         return None;
@@ -72,6 +75,8 @@ fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
     while i < raw.len() {
         let hex = raw.get(i + 1..i + 3).filter(|h| raw[i] == b'%' && h.iter().all(u8::is_ascii_hexdigit));
         match hex.and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()) {
+            // SQLite ends the path at a %00.
+            Some(0) => break,
             Some(v) => {
                 out.push(v);
                 i += 3;
@@ -83,6 +88,15 @@ fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// A URI boolean as `sqlite3_uri_boolean` reads it.
+#[cfg(unix)]
+fn uri_true(value: &str) -> bool {
+    if value.starts_with(|c: char| c.is_ascii_digit()) {
+        return value.chars().take_while(char::is_ascii_digit).any(|c| c != '0');
+    }
+    ["yes", "on", "true", "full", "extra", "normal"].iter().any(|w| value.eq_ignore_ascii_case(w))
 }
 
 #[cfg(not(unix))]
@@ -1299,5 +1313,22 @@ mod tests {
         let db = TempDb::new("mode%zz%+f");
         SqliteStore::open(&format!("file:{}", db.0), "audit_log", true).unwrap();
         assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_path_ends_at_nul() {
+        let db = TempDb::new("mode_nul");
+        SqliteStore::open(&format!("file:{}%00x.db", db.0), "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_immutable_forms() {
+        for (value, creates) in [("TRUE", false), ("7", false), ("0", true), ("off", true)] {
+            let got = uri_file_path(&format!("/d/a.db?immutable={value}"));
+            assert_eq!(got.as_deref() == Some(&b"/d/a.db"[..]), creates, "immutable={value}");
+        }
     }
 }

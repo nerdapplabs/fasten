@@ -46,25 +46,33 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     static func createOwnerOnly(_ path: String) {
         // file: is read as a URI, as the system SQLite does (built with URI
         // support on macOS, Debian/Ubuntu, Alpine).
-        let file = path.hasPrefix("file:") ? uriFilePath(path) : path
-        guard let file, !file.isEmpty, file != ":memory:" else { return }
-        let fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        let file = path.hasPrefix("file:") ? uriFilePath(path) : Array(path.utf8)
+        guard let file, !file.isEmpty, file != Array(":memory:".utf8) else { return }
+        // From the raw bytes, so a name that is not UTF-8 matches what SQLite opens.
+        let fd = (file + [0]).withUnsafeBufferPointer {
+            $0.withMemoryRebound(to: CChar.self) { open($0.baseAddress!, O_CREAT | O_EXCL | O_WRONLY, 0o600) }
+        }
         if fd >= 0 { close(fd) }
     }
 
-    /// File path of a SQLite file: URI, or nil when the URI names no file to
-    /// create (in-memory, read-only, another VFS, or another host). Escapes
-    /// decode as in SQLite: a `%` without two hex digits stays as it is.
-    static func uriFilePath(_ uri: String) -> String? {
+    /// File path bytes of a SQLite file: URI, or nil when the URI names no
+    /// file to create (in-memory, read-only, another VFS, or another host).
+    /// Escapes decode as in SQLite: a `%` without two hex digits stays as it
+    /// is, and the path ends at a %00.
+    static func uriFilePath(_ uri: String) -> [UInt8]? {
         var rest = Substring(uri.dropFirst(5).prefix { $0 != "#" })
         var query = Substring("")
         if let q = rest.firstIndex(of: "?") {
             query = rest[rest.index(after: q)...]
             rest = rest[..<q]
         }
-        let noCreate: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw", "immutable=1"]
-        if query.split(separator: "&").contains(where: { noCreate.contains($0) || $0.hasPrefix("vfs=") }) {
-            return nil
+        let noCreate: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw"]
+        for p in query.split(separator: "&") {
+            let kv = p.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let value = kv.count > 1 ? kv[1] : ""
+            if noCreate.contains(p) || kv[0] == "vfs" || (kv[0] == "immutable" && uriTrue(value)) {
+                return nil
+            }
         }
         if rest.hasPrefix("//") {
             let after = rest.dropFirst(2)
@@ -78,6 +86,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         while i < raw.count {
             if raw[i] == UInt8(ascii: "%"), i + 2 < raw.count,
                let hi = hexValue(raw[i + 1]), let lo = hexValue(raw[i + 2]) {
+                if hi == 0 && lo == 0 { break }
                 out.append(hi << 4 | lo)
                 i += 3
             } else {
@@ -85,7 +94,15 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
                 i += 1
             }
         }
-        return String(decoding: out, as: UTF8.self)
+        return out
+    }
+
+    /// A URI boolean as sqlite3_uri_boolean reads it.
+    static func uriTrue(_ value: Substring) -> Bool {
+        if let first = value.first, first.isASCII, first.isNumber {
+            return value.prefix { $0.isASCII && $0.isNumber }.contains { $0 != "0" }
+        }
+        return ["yes", "on", "true", "full", "extra", "normal"].contains(value.lowercased())
     }
 
     private static func hexValue(_ c: UInt8) -> UInt8? {

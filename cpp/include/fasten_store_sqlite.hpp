@@ -293,9 +293,26 @@ private:
         return true;
     }
 
+    // A URI boolean as sqlite3_uri_boolean reads it.
+    static bool uri_true(const std::string& v) {
+        if (!v.empty() && std::isdigit(static_cast<unsigned char>(v[0]))) {
+            for (char c : v) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) break;
+                if (c != '0') return true;
+            }
+            return false;
+        }
+        std::string lower;
+        for (char c : v) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (const char* w : {"yes", "on", "true", "full", "extra", "normal"})
+            if (lower == w) return true;
+        return false;
+    }
+
     // File path of a SQLite file: URI, or "" when the URI names no file to
     // create (in-memory, read-only, another VFS, or another host). Escapes
-    // decode as in SQLite: a '%' without two hex digits stays as it is.
+    // decode as in SQLite: a '%' without two hex digits stays as it is, and
+    // the path ends at a %00.
     static std::string uri_file_path(const std::string& uri) {
         std::string rest = uri.substr(5, uri.find('#') - 5);
         std::string query;
@@ -304,8 +321,13 @@ private:
             query = "&" + rest.substr(q + 1) + "&";
             rest.resize(q);
         }
-        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&", "&immutable=1&", "&vfs="})
+        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&", "&vfs="})
             if (query.find(m) != std::string::npos) return "";
+        for (auto at = query.find("&immutable="); at != std::string::npos;
+             at = query.find("&immutable=", at + 1)) {
+            const auto from = at + 11;
+            if (uri_true(query.substr(from, query.find('&', from) - from))) return "";
+        }
         if (rest.rfind("//", 0) == 0) {
             auto slash = rest.find('/', 2);
             if (slash == std::string::npos) slash = rest.size();
@@ -324,7 +346,7 @@ private:
                 out += rest[i];
             }
         }
-        return out;
+        return out.substr(0, out.find('\0'));
     }
 
     // Create a missing database file with mode 0600, so SQLite does not

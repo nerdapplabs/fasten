@@ -71,24 +71,34 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 
 
 # URI parameters under which SQLite opens no file or does not create one.
-_NO_CREATE_PARAMS = ("mode=memory", "mode=ro", "mode=rw", "immutable=1")
+_NO_CREATE_PARAMS = ("mode=memory", "mode=ro", "mode=rw")
+
+
+def _uri_true(value: str) -> bool:
+    """A URI boolean as sqlite3_uri_boolean reads it."""
+    if value[:1].isdigit():
+        digits = value[: len(value) - len(value.lstrip("0123456789"))]
+        return digits.strip("0") != ""
+    return value.lower() in ("yes", "on", "true", "full", "extra", "normal")
 
 
 def _uri_file_path(uri: str) -> str:
     """File path of a SQLite ``file:`` URI, or "" when the URI names no file
     to create (in-memory, read-only, another VFS, or another host). Escapes
-    decode as in SQLite: a ``%`` without two hex digits stays as it is."""
+    decode as in SQLite: a ``%`` without two hex digits stays as it is, and
+    the path ends at a ``%00``."""
     rest = uri[len("file:"):].partition("#")[0]
     rest, _, query = rest.partition("?")
     for p in query.split("&"):
-        if p in _NO_CREATE_PARAMS or p.startswith("vfs="):
+        key, _, value = p.partition("=")
+        if p in _NO_CREATE_PARAMS or key == "vfs" or (key == "immutable" and _uri_true(value)):
             return ""
     if rest.startswith("//"):
         host, sep, tail = rest[2:].partition("/")
         if host not in ("", "localhost"):
             return ""
         rest = sep + tail
-    return os.fsdecode(unquote_to_bytes(rest))
+    return os.fsdecode(unquote_to_bytes(rest).partition(b"\0")[0])
 
 
 def _create_owner_only(path: str | os.PathLike[str]) -> None:
