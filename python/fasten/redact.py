@@ -229,8 +229,10 @@ def describe_error(exc: BaseException, redactor: Optional[Redactor] = None) -> s
             cur = None
         if cur is not None:
             lines.append(link + ":")
-    if cur is not None and lines:
-        lines.pop()     # the chain was cut or loops
+    if cur is not None:
+        lines.pop()     # the link to an exception not printed
+        if id(cur) not in seen:
+            lines.append(f"  ... (chain cut at {_MAX_CHAIN})")
     return "\n".join(lines)
 
 
@@ -239,7 +241,7 @@ def redacted_json(raw: Any, redactor: Optional[Redactor] = None) -> str:
     redactable: a placeholder. Never raises."""
     try:
         value = json.loads(raw)
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001  not JSON, or nested too deep
         return "<not json>"
     try:
         return json.dumps((redactor or Redactor()).redact(value), default=str)

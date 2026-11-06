@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -1134,7 +1135,7 @@ class Engine:
                 return 0
             except BaseException as e:  # noqa: BLE001 — a failed insert, never "stored"
                 cb_logger.error("insert_cb failed for row %s: %s", row_id,
-                                describe_error(e, self._redactor))
+                                describe_error(e, d.redactor))
                 rejected = _rejects_row(e)
                 with d.lock:
                     failed = pending.get(row_id)
@@ -1160,8 +1161,8 @@ class Engine:
                 _sys_event(event_json, persist=threading.get_ident() != d.retire_ident)
             except BaseException as e:  # noqa: BLE001 — a sys event must not fail the drainer
                 cb_logger.error("drainer sys event failed: %s: %s",
-                                redacted_json(event_json, self._redactor),
-                                describe_error(e, self._redactor))
+                                redacted_json(event_json, d.redactor),
+                                describe_error(e, d.redactor))
 
         def _sys_event(event_json: bytes, persist: bool = True) -> int:
             fields = json.loads(event_json.decode("utf-8"))
@@ -1368,7 +1369,7 @@ class Engine:
                 self._mark_write_lost(d.store, d.gen)
             except Exception as e:  # noqa: BLE001 — still report the rows
                 log.error("marking the audit store degraded failed: %s",
-                          describe_error(e, self._redactor))
+                          describe_error(e, d.redactor))
             for row_id in row_ids:
                 try:
                     # close() waits for these, so the syslog store, which
@@ -1380,7 +1381,7 @@ class Engine:
                     }, via=d, persist=not d.past_deadline(), background=True)
                 except Exception as e:  # noqa: BLE001 — report the rest
                     log.error("lost_at_stop event failed for %s: %s", row_id,
-                              describe_error(e, self._redactor))
+                              describe_error(e, d.redactor))
         finally:
             with d.lock:
                 d.reporting -= len(row_ids)
@@ -1410,6 +1411,10 @@ class Engine:
         grace = time.monotonic() + 2.0
         for d in retiring:
             d.drain_stopped.wait(max(0.0, grace - time.monotonic()))
+
+
+# An event name with no free text in it, safe to log unredacted.
+_EVENT_NAME_RE = re.compile(r"[\w.:-]{1,128}")
 
 
 class _Logger:
@@ -1454,10 +1459,14 @@ class _Logger:
         else:
             # No transport before init(), so redact here. If the core can't
             # load, the redactor drops the values. The event is redacted on
-            # its own and kept as given if it can't be, so the line keeps it.
+            # its own; if it can't be, a plain name is kept as given.
             rest = {k: v for k, v in payload.items() if k != "event"}
             ev = eng._redactor.redact([event])
-            line = {"event": ev[0] if isinstance(ev, list) else event,
+            if isinstance(ev, list):
+                ev = ev[0]
+            elif isinstance(event, str) and _EVENT_NAME_RE.fullmatch(event):
+                ev = event
+            line = {"event": ev,
                     **eng._redactor.redact(json.loads(json.dumps(rest, default=str)))}
             eng._stdlib_logger.log(
                 level,

@@ -96,6 +96,38 @@ def test_describe_error_stops_on_a_cycle():
     assert not text.endswith(":")
 
 
+def test_describe_error_says_where_the_chain_is_cut():
+    from fasten.redact import describe_error
+
+    excs = [ValueError(f"e{i}") for i in range(8)]
+    for outer, inner in zip(excs, excs[1:]):
+        outer.__cause__ = inner
+    text = describe_error(excs[0])
+    assert text.count("ValueError:") == 5
+    assert text.endswith("  ... (chain cut at 5)")
+
+
+def test_describe_error_skips_a_suppressed_context():
+    from fasten.redact import describe_error
+
+    try:
+        try:
+            _raise(KeyError("inner"))
+        except KeyError:
+            raise ValueError("outer") from None
+    except ValueError as e:
+        text = describe_error(e)
+    assert "ValueError: outer" in text
+    assert "KeyError" not in text
+    assert "during handling of" not in text
+
+
+def test_redacted_json_survives_deep_nesting():
+    from fasten.redact import redacted_json
+
+    assert redacted_json("[" * 100_000 + "]" * 100_000) == "<not json>"
+
+
 class _DataError(Exception):
     """Named like the DB-API error, so the drainer dead-letters at once."""
 
@@ -238,3 +270,23 @@ def test_retention_keeps_running_after_a_raising_str(caplog):
     with caplog.at_level(logging.WARNING, logger="fasten.retention"):
         _run_purger(store, lambda: store.calls >= 2, interval=timedelta(milliseconds=10))
     assert "_BadStr: <str failed>" in caplog.text
+
+
+def test_retiring_drainer_logs_with_its_own_redactor(caplog, monkeypatch):
+    from fasten.emitter import _default
+
+    fasten.init(service_id="svc", node_id="n", audit_store=_FailingStore(),
+                audit_store_failure_strategy="queue",
+                extra_value_redact_patterns=[("acct", r"acct-\d+", "[acct]")])
+    old = _default._drainer
+    fasten.init(service_id="svc", node_id="n", audit_store=_FailingStore(),
+                audit_store_failure_strategy="queue")
+    assert _default._drainer is not old
+    monkeypatch.setattr(_default, "_drainer_sys_log",
+                        lambda *a, **k: _raise(RuntimeError("sys write failed: acct-12345")))
+    event = '{"level": "error", "event": "audit_drain_failed", "error": "acct-67890"}'
+    with caplog.at_level(logging.ERROR, logger="fasten"):
+        old.sys_callback(event.encode(), None)
+    assert "drainer sys event failed" in caplog.text
+    assert "acct-12345" not in caplog.text
+    assert "acct-67890" not in caplog.text

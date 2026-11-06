@@ -223,6 +223,32 @@ def test_log_before_init_drops_values_without_the_core(caplog, monkeypatch):
     assert "hunter2" not in text
 
 
+def test_log_before_init_drops_a_free_text_event_without_the_core(caplog, monkeypatch):
+    from fasten import core_ffi
+
+    def _no_core(*_a, **_k):
+        raise OSError("libfasten_core not found")
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl"
+    monkeypatch.setattr(core_ffi, "get_lib", _no_core)
+    with caplog.at_level(logging.INFO, logger="fasten"):
+        fasten.log.info(f"login failed for a@b.com {jwt}")
+    text = "\n".join(r.message for r in caplog.records)
+    assert text
+    assert "a@b.com" not in text
+    assert jwt not in text
+
+
+def test_log_before_init_drops_an_oversize_event(caplog, monkeypatch):
+    monkeypatch.setenv("FASTEN_MAX_DETAIL_BYTES", "64")
+    note = "note " + "x" * 200
+    with caplog.at_level(logging.INFO, logger="fasten"):
+        fasten.log.info(note)
+    text = "\n".join(r.message for r in caplog.records)
+    assert text
+    assert note not in text
+
+
 # Datetime round-trip through the drainer (#36)
 
 
