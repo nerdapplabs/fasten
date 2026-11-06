@@ -14,9 +14,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `fasten_store_sqlite.hpp` `SqliteStore` and the Swift `SQLiteStore`. SQLite
   gives its -wal and -shm files the same mode. An existing file keeps its
   mode, and `:memory:` is left alone.
-- A `file:` URI gets the same treatment for the file it names, unless it sets
-  `mode=memory`, `mode=ro` or `mode=rw` (SQLite does not create the file
-  then) or names another host.
+- The stores that take a `file:` URI (Python `StreamStore`, Go
+  `OpenStreamStore`, fasten-core, C++, Swift) treat the file it names the
+  same way, unless it sets `mode=memory`, `mode=ro`, `mode=rw`,
+  `immutable=1` or a `vfs`, or names another host. Python `SQLiteStore`
+  makes its path absolute, so it never reads a URI.
 - Go `NewSQLiteStore` and `NewStreamStore` take a `*sql.DB` the caller opened,
   so the caller's driver creates that file.
 

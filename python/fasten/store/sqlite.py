@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Sequence
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote_to_bytes, urlparse
 
 from ..attrs import AuditRow
 
@@ -70,25 +70,33 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 """
 
 
+# URI parameters under which SQLite opens no file or does not create one.
+_NO_CREATE_PARAMS = ("mode=memory", "mode=ro", "mode=rw", "immutable=1")
+
+
 def _uri_file_path(uri: str) -> str:
     """File path of a SQLite ``file:`` URI, or "" when the URI names no file
-    to create (in-memory, read-only, or another host)."""
+    to create (in-memory, read-only, another VFS, or another host). Escapes
+    decode as in SQLite: a ``%`` without two hex digits stays as it is."""
     rest = uri[len("file:"):].partition("#")[0]
     rest, _, query = rest.partition("?")
-    if any(p in ("mode=memory", "mode=ro", "mode=rw") for p in query.split("&")):
-        return ""
+    for p in query.split("&"):
+        if p in _NO_CREATE_PARAMS or p.startswith("vfs="):
+            return ""
     if rest.startswith("//"):
         host, sep, tail = rest[2:].partition("/")
         if host not in ("", "localhost"):
             return ""
         rest = sep + tail
-    return unquote(rest)
+    return os.fsdecode(unquote_to_bytes(rest))
 
 
 def _create_owner_only(path: str | os.PathLike[str]) -> None:
     """Create a missing database file with mode 0600, so SQLite does not
     create it with the umask. An existing file keeps its mode."""
     path = os.fspath(path)
+    # file: is read as a URI, as the system SQLite does (built with URI
+    # support on macOS, Debian/Ubuntu, Alpine).
     if path.startswith("file:"):
         path = _uri_file_path(path)
     if path in ("", ":memory:"):

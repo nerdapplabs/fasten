@@ -294,7 +294,8 @@ private:
     }
 
     // File path of a SQLite file: URI, or "" when the URI names no file to
-    // create (in-memory, read-only, or another host).
+    // create (in-memory, read-only, another VFS, or another host). Escapes
+    // decode as in SQLite: a '%' without two hex digits stays as it is.
     static std::string uri_file_path(const std::string& uri) {
         std::string rest = uri.substr(5, uri.find('#') - 5);
         std::string query;
@@ -303,7 +304,7 @@ private:
             query = "&" + rest.substr(q + 1) + "&";
             rest.resize(q);
         }
-        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&"})
+        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&", "&immutable=1&", "&vfs="})
             if (query.find(m) != std::string::npos) return "";
         if (rest.rfind("//", 0) == 0) {
             auto slash = rest.find('/', 2);
@@ -331,6 +332,8 @@ private:
     // cannot be created, sqlite3_open reports the error.
     static void create_owner_only(const std::string& path) {
 #ifndef _WIN32
+        // file: is read as a URI, as the system SQLite does (built with URI
+        // support on macOS, Debian/Ubuntu, Alpine).
         std::string file = path.rfind("file:", 0) == 0 ? uri_file_path(path) : path;
         if (file.empty() || file == ":memory:") return;
         int fd = ::open(file.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);

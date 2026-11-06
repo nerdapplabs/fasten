@@ -48,5 +48,20 @@ final class SQLiteFileModeTests: XCTestCase {
         XCTAssertThrowsError(try SQLiteStore(path: "file:\(path)?mode=ro"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
+
+    func testFileURIWithoutAFileToCreateCreatesNothing() throws {
+        let path = dir.appendingPathComponent("audit.db").path
+        _ = try? SQLiteStore(path: "file:\(path)?vfs=memdb")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        // Checked on the helper: some SQLite versions (macOS 3.51) create an
+        // empty file for immutable=1 themselves.
+        XCTAssertNil(SQLiteStore.uriFilePath("file:\(path)?immutable=1"))
+    }
+
+    func testFileURIKeepsAnInvalidEscape() throws {
+        let path = dir.appendingPathComponent("a%zz%+fb.db").path
+        _ = try SQLiteStore(path: "file:\(path)")
+        XCTAssertEqual(try mode(path), 0o600)
+    }
 }
 #endif

@@ -44,6 +44,8 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     /// create it with the umask. An existing file keeps its mode. If the file
     /// cannot be created, sqlite3_open_v2 reports the error.
     static func createOwnerOnly(_ path: String) {
+        // file: is read as a URI, as the system SQLite does (built with URI
+        // support on macOS, Debian/Ubuntu, Alpine).
         let file = path.hasPrefix("file:") ? uriFilePath(path) : path
         guard let file, !file.isEmpty, file != ":memory:" else { return }
         let fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 0o600)
@@ -51,7 +53,8 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     /// File path of a SQLite file: URI, or nil when the URI names no file to
-    /// create (in-memory, read-only, or another host).
+    /// create (in-memory, read-only, another VFS, or another host). Escapes
+    /// decode as in SQLite: a `%` without two hex digits stays as it is.
     static func uriFilePath(_ uri: String) -> String? {
         var rest = Substring(uri.dropFirst(5).prefix { $0 != "#" })
         var query = Substring("")
@@ -59,15 +62,39 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
             query = rest[rest.index(after: q)...]
             rest = rest[..<q]
         }
-        let modes: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw"]
-        if query.split(separator: "&").contains(where: modes.contains) { return nil }
+        let noCreate: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw", "immutable=1"]
+        if query.split(separator: "&").contains(where: { noCreate.contains($0) || $0.hasPrefix("vfs=") }) {
+            return nil
+        }
         if rest.hasPrefix("//") {
             let after = rest.dropFirst(2)
             let slash = after.firstIndex(of: "/") ?? after.endIndex
             guard ["", "localhost"].contains(after[..<slash]) else { return nil }
             rest = after[slash...]
         }
-        return String(rest).removingPercentEncoding
+        let raw = Array(rest.utf8)
+        var out: [UInt8] = []
+        var i = 0
+        while i < raw.count {
+            if raw[i] == UInt8(ascii: "%"), i + 2 < raw.count,
+               let hi = hexValue(raw[i + 1]), let lo = hexValue(raw[i + 2]) {
+                out.append(hi << 4 | lo)
+                i += 3
+            } else {
+                out.append(raw[i])
+                i += 1
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    private static func hexValue(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
     }
 
     private func bootstrap() throws {

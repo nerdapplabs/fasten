@@ -46,12 +46,17 @@ fn create_owner_only(path: &str) {
 }
 
 /// File path of a SQLite `file:` URI (after the scheme), or `None` when the
-/// URI names no file to create (in-memory, read-only, or another host).
+/// URI names no file to create (in-memory, read-only, another VFS, or
+/// another host). Escapes decode as in SQLite: a `%` without two hex digits
+/// stays as it is.
 #[cfg(unix)]
 fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.split('#').next().unwrap_or("");
     let (mut rest, query) = rest.split_once('?').unwrap_or((rest, ""));
-    if query.split('&').any(|p| matches!(p, "mode=memory" | "mode=ro" | "mode=rw")) {
+    let no_create = |p: &str| {
+        matches!(p, "mode=memory" | "mode=ro" | "mode=rw" | "immutable=1") || p.starts_with("vfs=")
+    };
+    if query.split('&').any(no_create) {
         return None;
     }
     if let Some(after) = rest.strip_prefix("//") {
@@ -61,14 +66,20 @@ fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
         }
         rest = &after[slash..];
     }
-    let mut out = Vec::with_capacity(rest.len());
-    let mut b = rest.bytes();
-    while let Some(c) = b.next() {
-        if c == b'%' {
-            let hex = [b.next()?, b.next()?];
-            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
-        } else {
-            out.push(c);
+    let raw = rest.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw.get(i + 1..i + 3).filter(|h| raw[i] == b'%' && h.iter().all(u8::is_ascii_hexdigit));
+        match hex.and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()) {
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(raw[i]);
+                i += 1;
+            }
         }
     }
     Some(out)
@@ -1267,5 +1278,26 @@ mod tests {
         let db = TempDb::new("mode_ro");
         assert!(SqliteStore::open(&format!("file:{}?mode=ro", db.0), "audit_log", true).is_err());
         assert!(!std::path::Path::new(&db.0).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_without_a_file_to_create_creates_nothing() {
+        for param in ["immutable=1", "vfs=memdb"] {
+            let db = TempDb::new("mode_nocreate");
+            let _ = SqliteStore::open(&format!("file:{}?{param}", db.0), "audit_log", false);
+            // Some SQLite versions create an empty file for immutable=1
+            // themselves, with the umask; fasten must not create one 0600 first.
+            let exists = std::path::Path::new(&db.0).exists();
+            assert!(!exists || (param == "immutable=1" && file_mode(&db.0) == 0o644), "{param}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_keeps_an_invalid_escape() {
+        let db = TempDb::new("mode%zz%+f");
+        SqliteStore::open(&format!("file:{}", db.0), "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
     }
 }

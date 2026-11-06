@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -96,12 +97,15 @@ func createOwnerOnly(path string) {
 }
 
 // uriFilePath returns the file path of a SQLite file: URI, or "" when the URI
-// names no file to create (in-memory, read-only, or another host).
+// names no file to create (in-memory, read-only, another VFS, or another
+// host).
 func uriFilePath(uri string) string {
 	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
 	rest, query, _ := strings.Cut(rest, "?")
 	for _, p := range strings.Split(query, "&") {
-		if p == "mode=memory" || p == "mode=ro" || p == "mode=rw" {
+		switch {
+		case p == "mode=memory", p == "mode=ro", p == "mode=rw", p == "immutable=1",
+			strings.HasPrefix(p, "vfs="):
 			return ""
 		}
 	}
@@ -112,11 +116,24 @@ func uriFilePath(uri string) string {
 		}
 		rest = "/" + tail
 	}
-	p, err := url.PathUnescape(rest)
-	if err != nil {
-		return ""
+	return uriUnescape(rest)
+}
+
+// uriUnescape decodes %XX escapes as SQLite does: a '%' without two hex
+// digits after it stays as it is.
+func uriUnescape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
 	}
-	return p
+	return b.String()
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc
