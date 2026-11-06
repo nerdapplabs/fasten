@@ -10,7 +10,11 @@ permissions:
   id-token: write  # required for npm --provenance
 
 jobs:
+  test:
+    uses: ./.github/workflows/fasten-js.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     container:
       image: node:24-alpine
@@ -26,13 +30,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Tag matches the package version
+        run: ../scripts/release/check-version.sh js "$GITHUB_REF_NAME"
+
       - name: Configure npm registry
         run: |
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # npm refuses a prerelease version without --tag, so 1.0.0-beta.0
+      # goes out under the beta dist-tag and a plain version under latest.
       - name: Publish to npm (with provenance)
-        run: npm publish --provenance --access public
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          npm publish --provenance --access public --tag "$(../scripts/release/npm-dist-tag.sh "$version")"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
