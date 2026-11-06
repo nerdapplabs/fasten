@@ -105,3 +105,30 @@ def test_file_uri_path_ends_at_nul(tmp_path, umask_022):
 @pytest.mark.parametrize("value,creates", [("TRUE", False), ("7", False), ("0", True), ("off", True)])
 def test_file_uri_immutable_forms(value, creates):
     assert (_uri_file_path(f"file:/d/a.db?immutable={value}") == "/d/a.db") is creates
+
+
+@pytest.mark.parametrize("open_store", [_open_audit, _open_stream])
+def test_dangling_symlink_target_is_0600(tmp_path, umask_022, open_store):
+    target = tmp_path / "target.db"
+    link = tmp_path / "link.db"
+    link.symlink_to(target)
+    open_store(link)
+    assert _mode(target) == 0o600
+
+
+def test_file_uri_without_sqlite_uri_support(tmp_path, monkeypatch):
+    # A SQLite built without SQLITE_USE_URI reads "file:..." as a plain
+    # file name unless connect() is given uri=True.
+    real_connect = sqlite3.connect
+
+    def connect(database, *args, uri=False, **kwargs):
+        if not uri and str(database).startswith("file:"):
+            database = "./" + str(database)
+        return real_connect(database, *args, uri=uri, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.chdir(tmp_path)
+    _open_stream("file:rel.db")
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.startswith("rel.db-")) == ["rel.db"]
+    with real_connect(tmp_path / "rel.db") as conn:
+        assert conn.execute("SELECT count(*) FROM api_stream").fetchone() == (1,)

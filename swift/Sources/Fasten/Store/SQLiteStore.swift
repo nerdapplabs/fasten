@@ -30,7 +30,7 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         // NOMUTEX: `lock` is the only thing serializing this connection, on
         // every platform, whatever threading mode the system SQLite was built with.
         Self.createOwnerOnly(path)
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI
         if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             throw FastenError("cannot open SQLite at \(path)")
         }
@@ -44,13 +44,14 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     /// create it with the umask. An existing file keeps its mode. If the file
     /// cannot be created, sqlite3_open_v2 reports the error.
     static func createOwnerOnly(_ path: String) {
-        // file: is read as a URI, as the system SQLite does (built with URI
-        // support on macOS, Debian/Ubuntu, Alpine).
+        // file: is a URI; init opens with SQLITE_OPEN_URI.
         let file = path.hasPrefix("file:") ? uriFilePath(path) : Array(path.utf8)
         guard let file, !file.isEmpty, file != Array(":memory:".utf8) else { return }
         // From the raw bytes, so a name that is not UTF-8 matches what SQLite opens.
         let fd = (file + [0]).withUnsafeBufferPointer {
-            $0.withMemoryRebound(to: CChar.self) { open($0.baseAddress!, O_CREAT | O_EXCL | O_WRONLY, 0o600) }
+            // No O_EXCL: like SQLite, follow a symlink to a missing file.
+            // The mode applies only when the file is created.
+            $0.withMemoryRebound(to: CChar.self) { open($0.baseAddress!, O_CREAT | O_WRONLY, 0o600) }
         }
         if fd >= 0 { close(fd) }
     }

@@ -105,16 +105,17 @@ def _create_owner_only(path: str | os.PathLike[str]) -> None:
     """Create a missing database file with mode 0600, so SQLite does not
     create it with the umask. An existing file keeps its mode."""
     path = os.fspath(path)
-    # file: is read as a URI, as the system SQLite does (built with URI
-    # support on macOS, Debian/Ubuntu, Alpine).
+    # StreamStore opens a file: path with uri=True.
     if path.startswith("file:"):
         path = _uri_file_path(path)
     if path in ("", ":memory:"):
         return
+    # No O_EXCL: like SQLite, follow a symlink to a missing file. The mode
+    # applies only when the file is created.
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
     except OSError:
-        # Exists already, or cannot be created; sqlite3 reports the latter.
+        # Cannot be opened or created; sqlite3 reports it.
         return
     os.close(fd)
 

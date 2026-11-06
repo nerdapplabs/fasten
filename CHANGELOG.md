@@ -13,12 +13,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `OpenStreamStore`, the fasten-core `SqliteStore` used by Rust, the C++
   `fasten_store_sqlite.hpp` `SqliteStore` and the Swift `SQLiteStore`. SQLite
   gives its -wal and -shm files the same mode. An existing file keeps its
-  mode, and `:memory:` is left alone.
+  mode, and `:memory:` is left alone. A symlink to a missing file is
+  followed, as SQLite follows it, and the file it names is created 0600.
 - The stores that take a `file:` URI (Python `StreamStore`, Go
   `OpenStreamStore`, fasten-core, C++, Swift) treat the file it names the
   same way, unless it sets `mode=memory`, `mode=ro`, `mode=rw`, a true
   `immutable` or a `vfs`, or names another host. The path is decoded as
-  SQLite decodes it, ending at a `%00`. Python `SQLiteStore` makes its path
+  SQLite decodes it, ending at a `%00`. These stores open a `file:` path as
+  a URI even when SQLite is built without URI support, so the file SQLite
+  opens is the one created 0600. Python `SQLiteStore` makes its path
   absolute, so it never reads a URI.
 - Go `NewSQLiteStore` and `NewStreamStore` take a `*sql.DB` the caller opened,
   so the caller's driver creates that file.

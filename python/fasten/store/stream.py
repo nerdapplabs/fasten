@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -89,7 +90,9 @@ class StreamStore:
             return self._mem_conn
         conn = getattr(self._tls, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self._path)
+            # uri=True so a file: path opens the file _create_owner_only made,
+            # also on a SQLite built without URI support.
+            conn = sqlite3.connect(self._path, uri=os.fspath(self._path).startswith("file:"))
             conn.row_factory = sqlite3.Row
             if self._wal:
                 conn.execute("PRAGMA journal_mode=WAL")

@@ -135,3 +135,25 @@ func TestURIFilePath_ImmutableForms(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenStreamStore_DanglingSymlinkTargetIs0600(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.db")
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStreamStore(link, "api_stream")
+	if err != nil {
+		t.Fatalf("OpenStreamStore: %v", err)
+	}
+	defer s.db.Close()
+	if err := s.Insert(map[string]any{"request_id": "r1", "event": "e"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if m := fileMode(t, target); m != 0o600 {
+		t.Errorf("target file mode = %o, want 600", m)
+	}
+}

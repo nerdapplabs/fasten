@@ -36,6 +36,14 @@ final class SQLiteFileModeTests: XCTestCase {
         XCTAssertEqual(try mode(path), 0o644)
     }
 
+    func testDanglingSymlinkTargetIs0600() throws {
+        let target = dir.appendingPathComponent("target.db").path
+        let link = dir.appendingPathComponent("link.db").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: target)
+        _ = try SQLiteStore(path: link)
+        XCTAssertEqual(try mode(target), 0o600)
+    }
+
     func testFileURIIs0600() throws {
         let path = dir.appendingPathComponent("my audit.db").path
         let uri = "file://" + path.replacingOccurrences(of: " ", with: "%20") + "?cache=private"

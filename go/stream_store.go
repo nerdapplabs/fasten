@@ -90,7 +90,9 @@ func createOwnerOnly(path string) {
 	if path == "" || path == ":memory:" {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	// No O_EXCL: like SQLite, follow a symlink to a missing file. The mode
+	// applies only when the file is created.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err == nil {
 		f.Close()
 	}

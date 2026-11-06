@@ -6,6 +6,7 @@
 #include <cassert>
 #ifndef _WIN32
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 #include <cstdio>
 #include <iostream>
@@ -345,6 +346,43 @@ void test_file_uri_immutable_forms() {
     remove_db(off);
     std::cout << "  test_file_uri_immutable_forms: PASS\n";
 }
+
+void test_dangling_symlink_target_is_0600() {
+    const std::string target = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    const std::string link = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    const int rc = symlink(target.c_str(), link.c_str());
+    assert(rc == 0);
+    {
+        fasten::SqliteStore store(link);
+        store.insert(make_row("evt-mode-link", "TEST_MODE"));
+    }
+    assert(file_mode(target) == 0600);
+    std::remove(link.c_str());
+    remove_db(target);
+    std::cout << "  test_dangling_symlink_target_is_0600: PASS\n";
+}
+
+// A SQLite built without URI support reads file: as a plain name unless the
+// open passes SQLITE_OPEN_URI. Turn URI support off for this test only.
+void test_file_uri_without_sqlite_uri_support() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    sqlite3_shutdown();
+    sqlite3_config(SQLITE_CONFIG_URI, 0);
+    sqlite3_initialize();
+    bool opened = false;
+    try {
+        fasten::SqliteStore store("file:" + path);
+        store.insert(make_row("evt-mode-uri", "TEST_MODE"));
+        opened = true;
+    } catch (const std::runtime_error&) {}
+    sqlite3_shutdown();
+    sqlite3_config(SQLITE_CONFIG_URI, 1);
+    sqlite3_initialize();
+    assert(opened);
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_without_sqlite_uri_support: PASS\n";
+}
 #endif
 
 int main() {
@@ -370,6 +408,8 @@ int main() {
     test_file_uri_keeps_an_invalid_escape();
     test_file_uri_path_ends_at_nul();
     test_file_uri_immutable_forms();
+    test_dangling_symlink_target_is_0600();
+    test_file_uri_without_sqlite_uri_support();
 #endif
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;

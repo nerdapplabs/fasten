@@ -42,7 +42,9 @@ fn create_owner_only(path: &str) {
         return;
     }
     let path = std::ffi::OsStr::from_bytes(&bytes);
-    let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    // Not create_new: like SQLite, follow a symlink to a missing file. The
+    // mode applies only when the file is created.
+    let _ = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(path);
 }
 
 /// File path of a SQLite `file:` URI (after the scheme), or `None` when the
@@ -1275,6 +1277,17 @@ mod tests {
         std::fs::set_permissions(&db.0, std::fs::Permissions::from_mode(0o644)).unwrap();
         SqliteStore::open(&db.0, "audit_log", true).unwrap();
         assert_eq!(file_mode(&db.0), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_target_is_0600() {
+        let target = TempDb::new("mode_target");
+        let link = TempDb::new("mode_link");
+        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
+        let store = SqliteStore::open(&link.0, "audit_log", true).unwrap();
+        store.insert(&make_row("evt-link", "TEST")).unwrap();
+        assert_eq!(file_mode(&target.0), 0o600);
     }
 
     #[cfg(unix)]

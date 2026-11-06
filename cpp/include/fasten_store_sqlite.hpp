@@ -54,9 +54,11 @@ public:
         validate_table_name(table_);
 
         create_owner_only(path);
-        int rc = sqlite3_open(path.c_str(), &db_);
+        int rc = sqlite3_open_v2(path.c_str(), &db_,
+                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                                 nullptr);
         if (rc != SQLITE_OK) {
-            std::string msg = db_ ? sqlite3_errmsg(db_) : "sqlite3_open failed";
+            std::string msg = db_ ? sqlite3_errmsg(db_) : "sqlite3_open_v2 failed";
             sqlite3_close(db_);
             db_ = nullptr;
             throw std::runtime_error("fasten SqliteStore: " + msg);
@@ -351,14 +353,15 @@ private:
 
     // Create a missing database file with mode 0600, so SQLite does not
     // create it with the umask. An existing file keeps its mode. If the file
-    // cannot be created, sqlite3_open reports the error.
+    // cannot be created, sqlite3_open_v2 reports the error.
     static void create_owner_only(const std::string& path) {
 #ifndef _WIN32
-        // file: is read as a URI, as the system SQLite does (built with URI
-        // support on macOS, Debian/Ubuntu, Alpine).
+        // file: is a URI; the constructor opens with SQLITE_OPEN_URI.
         std::string file = path.rfind("file:", 0) == 0 ? uri_file_path(path) : path;
         if (file.empty() || file == ":memory:") return;
-        int fd = ::open(file.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        // No O_EXCL: like SQLite, follow a symlink to a missing file. The
+        // mode applies only when the file is created.
+        int fd = ::open(file.c_str(), O_CREAT | O_WRONLY, 0600);
         if (fd >= 0) ::close(fd);
 #else
         (void)path;
