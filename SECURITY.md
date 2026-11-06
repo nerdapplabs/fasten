@@ -75,7 +75,7 @@ Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestati
 
 ```bash
 uvx pypi-attestations verify pypi --repository https://github.com/nerdapplabs/fasten \
-  pypi:fasten-1.0.0-py3-none-any.whl
+  pypi:fasten_sdk-1.0.0-py3-none-any.whl
 ```
 
 JavaScript (npm), in the project that installed `@nerdapplabs/fasten`:
