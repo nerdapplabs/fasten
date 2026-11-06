@@ -12,6 +12,7 @@ on:
       - 'python/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-py.yml'
+  workflow_call:
 
 permissions:
   contents: read

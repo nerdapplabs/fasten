@@ -12,6 +12,7 @@ on:
       - 'js/**'
       - 'spec/**'
       - '.github/workflows/fasten-js.yml'
+  workflow_call:
 
 permissions:
   contents: read
