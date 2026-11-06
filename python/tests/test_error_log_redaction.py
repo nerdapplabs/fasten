@@ -94,6 +94,7 @@ def test_describe_error_stops_on_a_cycle():
     text = describe_error(a)
     assert text.count("ValueError:") == 2
     assert not text.endswith(":")
+    assert "chain cut" not in text
 
 
 def test_describe_error_says_where_the_chain_is_cut():

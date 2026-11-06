@@ -21,7 +21,6 @@ import logging
 import math
 import os
 import queue
-import re
 import threading
 import time
 import uuid
@@ -1413,10 +1412,6 @@ class Engine:
             d.drain_stopped.wait(max(0.0, grace - time.monotonic()))
 
 
-# An event name with no free text in it, safe to log unredacted.
-_EVENT_NAME_RE = re.compile(r"[\w.:-]{1,128}")
-
-
 class _Logger:
     """Structured sys log writer for an Engine.
 
@@ -1459,14 +1454,10 @@ class _Logger:
         else:
             # No transport before init(), so redact here. If the core can't
             # load, the redactor drops the values. The event is redacted on
-            # its own; if it can't be, a plain name is kept as given.
+            # its own, so an oversize field doesn't drop it.
             rest = {k: v for k, v in payload.items() if k != "event"}
             ev = eng._redactor.redact([event])
-            if isinstance(ev, list):
-                ev = ev[0]
-            elif isinstance(event, str) and _EVENT_NAME_RE.fullmatch(event):
-                ev = event
-            line = {"event": ev,
+            line = {"event": ev[0] if isinstance(ev, list) else ev,
                     **eng._redactor.redact(json.loads(json.dumps(rest, default=str)))}
             eng._stdlib_logger.log(
                 level,

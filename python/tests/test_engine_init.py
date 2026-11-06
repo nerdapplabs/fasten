@@ -219,8 +219,23 @@ def test_log_before_init_drops_values_without_the_core(caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger="fasten"):
         fasten.log.info("startup_probe", password="hunter2")
     text = "\n".join(r.message for r in caplog.records)
-    assert '"event": "startup_probe"' in text
+    assert '"event": "<unredactable>"' in text
     assert "hunter2" not in text
+
+
+def test_log_before_init_drops_a_bare_secret_event_without_the_core(caplog, monkeypatch):
+    from fasten import core_ffi
+
+    def _no_core(*_a, **_k):
+        raise OSError("libfasten_core not found")
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJl"
+    monkeypatch.setattr(core_ffi, "get_lib", _no_core)
+    with caplog.at_level(logging.INFO, logger="fasten"):
+        fasten.log.info(jwt)
+    text = "\n".join(r.message for r in caplog.records)
+    assert '"event": "<unredactable>"' in text
+    assert jwt not in text
 
 
 def test_log_before_init_drops_a_free_text_event_without_the_core(caplog, monkeypatch):

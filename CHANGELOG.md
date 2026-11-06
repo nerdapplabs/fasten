@@ -18,9 +18,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   redacted, instead of the raw message and traceback. The exceptions it was
   raised from are listed the same way. Drainer and retention lines use the
   engine's redaction settings; `start_purger()` takes a `redactor`.
-- Python: before `init()`, a log line whose fields can't be redacted keeps
-  its event if the event is a plain name (letters, digits, `_.:-`, up to 128
-  characters); other events are replaced by the marker.
+- Python: before `init()`, the event is redacted on its own, so an
+  oversize field doesn't drop it. An event that can't be redacted is
+  replaced by the marker.
 
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
