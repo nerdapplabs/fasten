@@ -6,6 +6,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: release workflows check before they publish
+
+- A `v*` tag now runs the SDK's test suite (`fasten-py.yml`,
+  `fasten-js.yml`, `fasten-rust.yml`, called through `workflow_call`) before
+  the PyPI, npm or crates.io publish job starts.
+- Each publish job first checks that the tag matches the package version
+  (`scripts/release/check-version.sh`). Python versions are compared after
+  PEP 440 normalisation, so `v1.0.0-beta.0` matches `1.0.0b0`, and
+  `__version__` in `fasten/__init__.py` must match `pyproject.toml`.
+- npm: a prerelease version is published under its first prerelease
+  identifier as the dist-tag (`1.0.0-beta.0` under `beta`), a plain version
+  under `latest`. npm refuses a prerelease publish without `--tag`.
+- New `release-rust.yml` publishes to crates.io: fasten-core first (skipped
+  when that version is already there), then the SDK once the index has it.
+  The SDK's fasten-core dependency now carries `version = "0.1.0"`, which
+  crates.io needs.
+- `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
+  requires.
+
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
 - `purge(before)` deletes, per `source_node_id`, only the rows below the
