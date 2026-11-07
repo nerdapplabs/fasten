@@ -6,6 +6,22 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: remaining log lines go through the redactor (Python, C++)
+
+- Python: `fasten.log.*` before `init()` redacts the line before handing it
+  to the stdlib logger. If libfasten_core can't load, the values are dropped.
+- C++: the SDK's own sys lines on stderr are redacted, including the sink
+  error text in `audit_sync_fallback_failed` and the core's message in
+  `audit_drain_abandoned`.
+- Python: fasten's own error log lines (drainer, retention, Postgres
+  reconnect) give the exception type and traceback frames with the message
+  redacted, instead of the raw message and traceback. The exceptions it was
+  raised from are listed the same way. Drainer and retention lines use the
+  engine's redaction settings; `start_purger()` takes a `redactor`.
+- Python: before `init()`, the event is redacted on its own, so an
+  oversize field doesn't drop it. An event that can't be redacted is
+  replaced by the marker.
+
 ### Fixed: SQLite store files are created 0600 (Python, Go, Rust, C++, Swift)
 
 - A new database file is now created owner-only (0600) instead of with the
