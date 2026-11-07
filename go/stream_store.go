@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -54,6 +56,8 @@ var streamIndexedFields = []string{
 // modernc.org/sqlite driver. WAL and synchronous=NORMAL go in the DSN so
 // every pooled connection gets them, not just the one migrate runs on.
 //
+// A new database file is created owner-only (0600).
+//
 // For another driver, or an existing *sql.DB, use NewStreamStore and set the
 // pragmas in your own DSN.
 func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
@@ -61,6 +65,7 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	createOwnerOnly(path)
 	db, err := sql.Open("sqlite", streamPragmaDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("fasten StreamStore open: %w", err)
@@ -71,6 +76,85 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// createOwnerOnly creates a missing database file with mode 0600, so SQLite
+// does not create it with the umask. An existing file keeps its mode. If the
+// file cannot be created, the driver reports the error on first use.
+func createOwnerOnly(path string) {
+	if strings.HasPrefix(path, "file:") {
+		path = uriFilePath(path)
+	} else if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" || path == ":memory:" {
+		return
+	}
+	// No O_EXCL: like SQLite, follow a symlink to a missing file. The mode
+	// applies only when the file is created.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err == nil {
+		f.Close()
+	}
+}
+
+// uriFilePath returns the file path of a SQLite file: URI, or "" when the URI
+// names no file to create (in-memory, read-only, another VFS, or another
+// host).
+func uriFilePath(uri string) string {
+	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
+	rest, query, _ := strings.Cut(rest, "?")
+	for _, p := range strings.Split(query, "&") {
+		key, value, _ := strings.Cut(p, "=")
+		switch {
+		case p == "mode=memory", p == "mode=ro", p == "mode=rw", key == "vfs",
+			key == "immutable" && uriTrue(value):
+			return ""
+		}
+	}
+	if strings.HasPrefix(rest, "//") {
+		host, tail, _ := strings.Cut(rest[2:], "/")
+		if host != "" && host != "localhost" {
+			return ""
+		}
+		rest = "/" + tail
+	}
+	p := uriUnescape(rest)
+	// SQLite ends the path at a %00.
+	if i := strings.IndexByte(p, 0); i >= 0 {
+		p = p[:i]
+	}
+	return p
+}
+
+// uriTrue reads a URI boolean as sqlite3_uri_boolean does.
+func uriTrue(v string) bool {
+	if v != "" && v[0] >= '0' && v[0] <= '9' {
+		digits := v[:len(v)-len(strings.TrimLeft(v, "0123456789"))]
+		return strings.Trim(digits, "0") != ""
+	}
+	switch strings.ToLower(v) {
+	case "yes", "on", "true", "full", "extra", "normal":
+		return true
+	}
+	return false
+}
+
+// uriUnescape decodes %XX escapes as SQLite does: a '%' without two hex
+// digits after it stays as it is.
+func uriUnescape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc

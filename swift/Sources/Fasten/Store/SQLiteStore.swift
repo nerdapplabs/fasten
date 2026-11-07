@@ -6,7 +6,8 @@ import CSQLite3
 #endif
 
 /// AuditStore backed by the system SQLite3 library (install libsqlite3-dev on
-/// Linux). Pass ":memory:" as the path for an in-memory database.
+/// Linux). Pass ":memory:" as the path for an in-memory database. A new
+/// database file is created owner-only (0600).
 public final class SQLiteStore: AuditStore, @unchecked Sendable {
 
     private(set) var db: OpaquePointer?   // internal for tests
@@ -28,7 +29,8 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
         self.table = table
         // NOMUTEX: `lock` is the only thing serializing this connection, on
         // every platform, whatever threading mode the system SQLite was built with.
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
+        Self.createOwnerOnly(path)
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI
         if sqlite3_open_v2(path, &db, flags, nil) != SQLITE_OK {
             throw FastenError("cannot open SQLite at \(path)")
         }
@@ -37,6 +39,81 @@ public final class SQLiteStore: AuditStore, @unchecked Sendable {
     }
 
     deinit { sqlite3_close(db) }
+
+    /// Creates a missing database file with mode 0600, so SQLite does not
+    /// create it with the umask. An existing file keeps its mode. If the file
+    /// cannot be created, sqlite3_open_v2 reports the error.
+    static func createOwnerOnly(_ path: String) {
+        // file: is a URI; init opens with SQLITE_OPEN_URI.
+        let file = path.hasPrefix("file:") ? uriFilePath(path) : Array(path.utf8)
+        guard let file, !file.isEmpty, file != Array(":memory:".utf8) else { return }
+        // From the raw bytes, so a name that is not UTF-8 matches what SQLite opens.
+        let fd = (file + [0]).withUnsafeBufferPointer {
+            // No O_EXCL: like SQLite, follow a symlink to a missing file.
+            // The mode applies only when the file is created.
+            $0.withMemoryRebound(to: CChar.self) { open($0.baseAddress!, O_CREAT | O_WRONLY, 0o600) }
+        }
+        if fd >= 0 { close(fd) }
+    }
+
+    /// File path bytes of a SQLite file: URI, or nil when the URI names no
+    /// file to create (in-memory, read-only, another VFS, or another host).
+    /// Escapes decode as in SQLite: a `%` without two hex digits stays as it
+    /// is, and the path ends at a %00.
+    static func uriFilePath(_ uri: String) -> [UInt8]? {
+        var rest = Substring(uri.dropFirst(5).prefix { $0 != "#" })
+        var query = Substring("")
+        if let q = rest.firstIndex(of: "?") {
+            query = rest[rest.index(after: q)...]
+            rest = rest[..<q]
+        }
+        let noCreate: Set<Substring> = ["mode=memory", "mode=ro", "mode=rw"]
+        for p in query.split(separator: "&") {
+            let kv = p.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let value = kv.count > 1 ? kv[1] : ""
+            if noCreate.contains(p) || kv[0] == "vfs" || (kv[0] == "immutable" && uriTrue(value)) {
+                return nil
+            }
+        }
+        if rest.hasPrefix("//") {
+            let after = rest.dropFirst(2)
+            let slash = after.firstIndex(of: "/") ?? after.endIndex
+            guard ["", "localhost"].contains(after[..<slash]) else { return nil }
+            rest = after[slash...]
+        }
+        let raw = Array(rest.utf8)
+        var out: [UInt8] = []
+        var i = 0
+        while i < raw.count {
+            if raw[i] == UInt8(ascii: "%"), i + 2 < raw.count,
+               let hi = hexValue(raw[i + 1]), let lo = hexValue(raw[i + 2]) {
+                if hi == 0 && lo == 0 { break }
+                out.append(hi << 4 | lo)
+                i += 3
+            } else {
+                out.append(raw[i])
+                i += 1
+            }
+        }
+        return out
+    }
+
+    /// A URI boolean as sqlite3_uri_boolean reads it.
+    static func uriTrue(_ value: Substring) -> Bool {
+        if let first = value.first, first.isASCII, first.isNumber {
+            return value.prefix { $0.isASCII && $0.isNumber }.contains { $0 != "0" }
+        }
+        return ["yes", "on", "true", "full", "extra", "normal"].contains(value.lowercased())
+    }
+
+    private static func hexValue(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
 
     private func bootstrap() throws {
         let ddl = """
