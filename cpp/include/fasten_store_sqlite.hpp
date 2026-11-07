@@ -27,6 +27,11 @@
 
 #include <sqlite3.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "fasten.hpp"
 
 namespace fasten {
@@ -39,6 +44,8 @@ public:
     /// `path`:  file path, or ":memory:".
     /// `table`: must match [A-Za-z_][A-Za-z0-9_]*.
     /// `wal`:   enable WAL journal mode (default true). Ignored for ":memory:".
+    ///
+    /// A new database file is created owner-only (0600) on POSIX systems.
     explicit SqliteStore(const std::string& path,
                          const std::string& table = "audit_log",
                          bool wal = true)
@@ -46,9 +53,12 @@ public:
     {
         validate_table_name(table_);
 
-        int rc = sqlite3_open(path.c_str(), &db_);
+        create_owner_only(path);
+        int rc = sqlite3_open_v2(path.c_str(), &db_,
+                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+                                 nullptr);
         if (rc != SQLITE_OK) {
-            std::string msg = db_ ? sqlite3_errmsg(db_) : "sqlite3_open failed";
+            std::string msg = db_ ? sqlite3_errmsg(db_) : "sqlite3_open_v2 failed";
             sqlite3_close(db_);
             db_ = nullptr;
             throw std::runtime_error("fasten SqliteStore: " + msg);
@@ -283,6 +293,79 @@ private:
                 return false;
         }
         return true;
+    }
+
+    // A URI boolean as sqlite3_uri_boolean reads it.
+    static bool uri_true(const std::string& v) {
+        if (!v.empty() && std::isdigit(static_cast<unsigned char>(v[0]))) {
+            for (char c : v) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) break;
+                if (c != '0') return true;
+            }
+            return false;
+        }
+        std::string lower;
+        for (char c : v) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (const char* w : {"yes", "on", "true", "full", "extra", "normal"})
+            if (lower == w) return true;
+        return false;
+    }
+
+    // File path of a SQLite file: URI, or "" when the URI names no file to
+    // create (in-memory, read-only, another VFS, or another host). Escapes
+    // decode as in SQLite: a '%' without two hex digits stays as it is, and
+    // the path ends at a %00.
+    static std::string uri_file_path(const std::string& uri) {
+        std::string rest = uri.substr(5, uri.find('#') - 5);
+        std::string query;
+        const auto q = rest.find('?');
+        if (q != std::string::npos) {
+            query = "&" + rest.substr(q + 1) + "&";
+            rest.resize(q);
+        }
+        for (const char* m : {"&mode=memory&", "&mode=ro&", "&mode=rw&", "&vfs="})
+            if (query.find(m) != std::string::npos) return "";
+        for (auto at = query.find("&immutable="); at != std::string::npos;
+             at = query.find("&immutable=", at + 1)) {
+            const auto from = at + 11;
+            if (uri_true(query.substr(from, query.find('&', from) - from))) return "";
+        }
+        if (rest.rfind("//", 0) == 0) {
+            auto slash = rest.find('/', 2);
+            if (slash == std::string::npos) slash = rest.size();
+            std::string host = rest.substr(2, slash - 2);
+            if (!host.empty() && host != "localhost") return "";
+            rest.erase(0, slash);
+        }
+        std::string out;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (rest[i] == '%' && i + 2 < rest.size() &&
+                std::isxdigit(static_cast<unsigned char>(rest[i + 1])) &&
+                std::isxdigit(static_cast<unsigned char>(rest[i + 2]))) {
+                out += static_cast<char>(std::stoi(rest.substr(i + 1, 2), nullptr, 16));
+                i += 2;
+            } else {
+                out += rest[i];
+            }
+        }
+        return out.substr(0, out.find('\0'));
+    }
+
+    // Create a missing database file with mode 0600, so SQLite does not
+    // create it with the umask. An existing file keeps its mode. If the file
+    // cannot be created, sqlite3_open_v2 reports the error.
+    static void create_owner_only(const std::string& path) {
+#ifndef _WIN32
+        // file: is a URI; the constructor opens with SQLITE_OPEN_URI.
+        std::string file = path.rfind("file:", 0) == 0 ? uri_file_path(path) : path;
+        if (file.empty() || file == ":memory:") return;
+        // No O_EXCL: like SQLite, follow a symlink to a missing file. The
+        // mode applies only when the file is created.
+        int fd = ::open(file.c_str(), O_CREAT | O_WRONLY, 0600);
+        if (fd >= 0) ::close(fd);
+#else
+        (void)path;
+#endif
     }
 
     static void validate_table_name(const std::string& table) {
