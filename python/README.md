@@ -14,7 +14,7 @@ pip install ./python[postgres]      # + Postgres store
 ```
 
 Redaction, the code catalog and the audit queue run in `libfasten_core`
-(the Rust library in [`fasten-core/`](../fasten-core)), loaded through
+(the Rust library in [`fasten-core/`](https://github.com/nerdapplabs/fasten/tree/main/fasten-core)), loaded through
 ctypes. Build it first:
 
 ```bash
@@ -65,7 +65,7 @@ without it (and without `audit_store=`), audit rows go to stdout only.
 
 A minimal HTTP service with `X-Request-ID` propagation, one audit row per
 request, and the mountable `/logs/*` reader: see
-[`examples/fastapi_app.py`](examples/fastapi_app.py).
+[`examples/fastapi_app.py`](https://github.com/nerdapplabs/fasten/blob/main/python/examples/fastapi_app.py).
 
 ```bash
 pip install ./python[fastapi] uvicorn
@@ -157,7 +157,7 @@ retired, `fasten.flush()` and `fasten.close()` wait for its rows too.
 
 `verify_chain` checks the hash chain over a set of rows and reports the
 first break: an edited, inserted, deleted or reordered row
-([spec §3](../spec/chain-replication.md#3-verification)). Chains sealed by
+([spec §3](https://github.com/nerdapplabs/fasten/blob/main/spec/chain-replication.md#3-verification)). Chains sealed by
 the Python and Go SDKs verify in either.
 
 ```python
@@ -174,7 +174,7 @@ if not result.ok:
 chain, or that the whole chain was re-sealed. Publish checkpoints (each
 node's latest seq and hash) somewhere the store's operator cannot rewrite,
 and verify against them later
-([spec §9](../spec/chain-replication.md#9-checkpoints)):
+([spec §9](https://github.com/nerdapplabs/fasten/blob/main/spec/chain-replication.md#9-checkpoints)):
 
 ```python
 from fasten import verify_chain
@@ -213,7 +213,7 @@ checkpoint look the same as a purge.
 ## Tests
 
 The same steps CI runs (see
-[`fasten-py.yml`](../.github/workflows/fasten-py.yml)), from the repo root:
+[`fasten-py.yml`](https://github.com/nerdapplabs/fasten/blob/main/.github/workflows/fasten-py.yml)), from the repo root:
 
 ```bash
 (cd fasten-core && cargo build --release --locked --features all)
@@ -227,4 +227,4 @@ Set `FASTEN_TEST_POSTGRES_DSN` to include the Postgres tests.
 ## Docs and design
 
 Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/).
-Design and cross-language design: [README.md](../README.md).
+Design and cross-language design: [README.md](https://github.com/nerdapplabs/fasten/blob/main/README.md).

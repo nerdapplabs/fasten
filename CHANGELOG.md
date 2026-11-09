@@ -10,6 +10,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
   a description. `twine check` no longer warns about it.
+- `python/README.md` links point at github.com, since relative links lead
+  nowhere on PyPI.
 
 ### Docs: C++ install steps
 
