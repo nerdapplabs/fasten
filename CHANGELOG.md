@@ -6,6 +6,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: PyPI page shows the Python README
+
+- `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
+  a description. `twine check` no longer warns about it.
+
 ### Docs: C++ install steps
 
 - `cpp/README.md` Install covers the release files (`fasten-cpp-vX.Y.Z.tar.gz`
