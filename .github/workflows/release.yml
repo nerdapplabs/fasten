@@ -63,7 +63,7 @@ jobs:
 
     environment:
       name: pypi
-      url: https://pypi.org/p/fasten
+      url: https://pypi.org/p/fasten-sdk
 
     defaults:
       run:
@@ -143,8 +143,6 @@ jobs:
     container:
       image: rust:1.90
 
-    # The crate name fasten on crates.io is another project's; this job
-    # works once rust/Cargo.toml publishes the SDK as fasten-sdk.
     environment:
       name: crates-io
       url: https://crates.io/crates/fasten-sdk

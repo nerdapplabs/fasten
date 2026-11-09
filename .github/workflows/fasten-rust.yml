@@ -106,7 +106,8 @@ jobs:
 
   swift-binding:
     # The Swift binding in fasten-core/bindings/swift links libfasten_core.
-    runs-on: ubuntu-latest
+    # setup-swift@v2 does not support Ubuntu 26.04 yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     services:

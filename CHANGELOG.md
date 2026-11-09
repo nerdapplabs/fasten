@@ -37,6 +37,52 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
   requires.
 
+### Changed: Python and Rust packages are named `fasten-sdk`
+
+- `fasten` is taken on PyPI and crates.io by unrelated projects, so the
+  Python and Rust packages are published as `fasten-sdk`:
+  `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
+- Code does not change: Python still imports `fasten`, Rust still uses
+  `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
+- Go (`github.com/nerdapplabs/fasten/go`), npm (`@nerdapplabs/fasten`) and
+  `fasten-core` keep their names.
+
+### Fixed: remaining log lines go through the redactor (Python, C++)
+
+- Python: `fasten.log.*` before `init()` redacts the line before handing it
+  to the stdlib logger. If libfasten_core can't load, the values are dropped.
+- C++: the SDK's own sys lines on stderr are redacted, including the sink
+  error text in `audit_sync_fallback_failed` and the core's message in
+  `audit_drain_abandoned`.
+- Python: fasten's own error log lines (drainer, retention, Postgres
+  reconnect) give the exception type and traceback frames with the message
+  redacted, instead of the raw message and traceback. The exceptions it was
+  raised from are listed the same way. Drainer and retention lines use the
+  engine's redaction settings; `start_purger()` takes a `redactor`.
+- Python: before `init()`, the event is redacted on its own, so an
+  oversize field doesn't drop it. An event that can't be redacted is
+  replaced by the marker.
+
+### Fixed: SQLite store files are created 0600 (Python, Go, Rust, C++, Swift)
+
+- A new database file is now created owner-only (0600) instead of with the
+  process umask: the Python `SQLiteStore` and `StreamStore`, Go
+  `OpenStreamStore`, the fasten-core `SqliteStore` used by Rust, the C++
+  `fasten_store_sqlite.hpp` `SqliteStore` and the Swift `SQLiteStore`. SQLite
+  gives its -wal and -shm files the same mode. An existing file keeps its
+  mode, and `:memory:` is left alone. A symlink to a missing file is
+  followed, as SQLite follows it, and the file it names is created 0600.
+- The stores that take a `file:` URI (Python `StreamStore`, Go
+  `OpenStreamStore`, fasten-core, C++, Swift) treat the file it names the
+  same way, unless it sets `mode=memory`, `mode=ro`, `mode=rw`, a true
+  `immutable` or a `vfs`, or names another host. The path is decoded as
+  SQLite decodes it, ending at a `%00`. These stores open a `file:` path as
+  a URI even when SQLite is built without URI support, so the file SQLite
+  opens is the one created 0600. Python `SQLiteStore` makes its path
+  absolute, so it never reads a URI.
+- Go `NewSQLiteStore` and `NewStreamStore` take a `*sql.DB` the caller opened,
+  so the caller's driver creates that file.
+
 ### Fixed: an age purge no longer leaves a hole in a chain (all stores)
 
 - `purge(before)` deletes, per `source_node_id`, only the rows below the

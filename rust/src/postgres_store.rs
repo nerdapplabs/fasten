@@ -1,5 +1,5 @@
 //! PostgreSQL-backed AuditStore (sync, `postgres` crate).
-//! Enable with: fasten = { features = ["store-postgres"] }
+//! Enable with: fasten-sdk = { features = ["store-postgres"] }
 //!
 //! Uses the synchronous `postgres` crate (as `pg`), since `AuditStore` is a
 //! sync trait. The client sits behind a `Mutex` so the drainer thread can

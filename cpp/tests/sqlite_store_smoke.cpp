@@ -1,9 +1,13 @@
 // Smoke tests for fasten_store_sqlite.hpp.
-// All tests use ":memory:", so nothing touches the filesystem.
+// Most tests use ":memory:"; the file mode tests use files under /tmp.
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
 #include <cassert>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
@@ -242,6 +246,145 @@ void test_two_stores_one_node_get_distinct_seqs() {
     std::cout << "  test_two_stores_one_node_get_distinct_seqs: PASS\n";
 }
 
+#ifndef _WIN32
+// Under the usual 022 umask SQLite alone would create these 0644.
+int file_mode(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) return -1;
+    return static_cast<int>(st.st_mode & 0777);
+}
+
+void remove_db(const std::string& path) {
+    for (const char* ext : {"", "-wal", "-shm"}) std::remove((path + ext).c_str());
+}
+
+void test_new_file_and_wal_are_0600() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        store.insert(make_row("evt-mode-1", "TEST_MODE"));
+        assert(file_mode(path) == 0600);
+        assert(file_mode(path + "-wal") == 0600);
+    }
+    remove_db(path);
+    std::cout << "  test_new_file_and_wal_are_0600: PASS\n";
+}
+
+void test_existing_file_keeps_its_mode() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    std::fclose(f);
+    chmod(path.c_str(), 0644);
+    { fasten::SqliteStore store(path); }
+    assert(file_mode(path) == 0644);
+    remove_db(path);
+    std::cout << "  test_existing_file_keeps_its_mode: PASS\n";
+}
+
+void test_file_uri_is_0600() {
+    const std::string path = "/tmp/fasten mode " + fasten::mint_id() + ".db";
+    std::string uri = "file://";
+    for (char c : path) uri += c == ' ' ? std::string("%20") : std::string(1, c);
+    { fasten::SqliteStore store(uri + "?cache=private"); }
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_is_0600: PASS\n";
+}
+
+void test_read_only_file_uri_creates_nothing() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    bool threw = false;
+    try { fasten::SqliteStore store("file:" + path + "?mode=ro"); }
+    catch (const std::runtime_error&) { threw = true; }
+    assert(threw);
+    assert(file_mode(path) == -1);
+    std::cout << "  test_read_only_file_uri_creates_nothing: PASS\n";
+}
+
+void test_file_uri_without_a_file_to_create_creates_nothing() {
+    for (const char* param : {"immutable=1", "vfs=memdb"}) {
+        const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+        try { fasten::SqliteStore store("file:" + path + "?" + param); }
+        catch (const std::runtime_error&) {}
+        // Some SQLite versions create an empty file for immutable=1
+        // themselves, with the umask; fasten must not create one 0600 first.
+        const int mode = file_mode(path);
+        assert(mode == -1 || (std::string(param) == "immutable=1" && mode == 0644));
+        remove_db(path);
+    }
+    std::cout << "  test_file_uri_without_a_file_to_create_creates_nothing: PASS\n";
+}
+
+void test_file_uri_keeps_an_invalid_escape() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + "%zz.db";
+    { fasten::SqliteStore store("file:" + path); }
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_keeps_an_invalid_escape: PASS\n";
+}
+
+void test_file_uri_path_ends_at_nul() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id();
+    { fasten::SqliteStore store("file:" + path + "%00x.db"); }
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_path_ends_at_nul: PASS\n";
+}
+
+void test_file_uri_immutable_forms() {
+    // A true form: fasten must not create the file 0600 (some SQLite
+    // versions create an empty one themselves, with the umask).
+    const std::string on = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    try { fasten::SqliteStore store("file:" + on + "?immutable=Yes"); }
+    catch (const std::runtime_error&) {}
+    assert(file_mode(on) == -1 || file_mode(on) == 0644);
+    remove_db(on);
+    // A false form is not immutable.
+    const std::string off = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    { fasten::SqliteStore store("file:" + off + "?immutable=0"); }
+    assert(file_mode(off) == 0600);
+    remove_db(off);
+    std::cout << "  test_file_uri_immutable_forms: PASS\n";
+}
+
+void test_dangling_symlink_target_is_0600() {
+    const std::string target = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    const std::string link = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    const int rc = symlink(target.c_str(), link.c_str());
+    assert(rc == 0);
+    {
+        fasten::SqliteStore store(link);
+        store.insert(make_row("evt-mode-link", "TEST_MODE"));
+    }
+    assert(file_mode(target) == 0600);
+    std::remove(link.c_str());
+    remove_db(target);
+    std::cout << "  test_dangling_symlink_target_is_0600: PASS\n";
+}
+
+// A SQLite built without URI support reads file: as a plain name unless the
+// open passes SQLITE_OPEN_URI. Turn URI support off for this test only.
+void test_file_uri_without_sqlite_uri_support() {
+    const std::string path = "/tmp/fasten_mode_" + fasten::mint_id() + ".db";
+    sqlite3_shutdown();
+    sqlite3_config(SQLITE_CONFIG_URI, 0);
+    sqlite3_initialize();
+    bool opened = false;
+    try {
+        fasten::SqliteStore store("file:" + path);
+        store.insert(make_row("evt-mode-uri", "TEST_MODE"));
+        opened = true;
+    } catch (const std::runtime_error&) {}
+    sqlite3_shutdown();
+    sqlite3_config(SQLITE_CONFIG_URI, 1);
+    sqlite3_initialize();
+    assert(opened);
+    assert(file_mode(path) == 0600);
+    remove_db(path);
+    std::cout << "  test_file_uri_without_sqlite_uri_support: PASS\n";
+}
+#endif
+
 int main() {
     std::cout << "=== sqlite_store_smoke ===\n";
     test_insert_idempotent();
@@ -256,6 +399,18 @@ int main() {
     test_next_seq_uses_index();
     test_failed_commit_does_not_wedge_the_store();
     test_two_stores_one_node_get_distinct_seqs();
+#ifndef _WIN32
+    test_new_file_and_wal_are_0600();
+    test_existing_file_keeps_its_mode();
+    test_file_uri_is_0600();
+    test_read_only_file_uri_creates_nothing();
+    test_file_uri_without_a_file_to_create_creates_nothing();
+    test_file_uri_keeps_an_invalid_escape();
+    test_file_uri_path_ends_at_nul();
+    test_file_uri_immutable_forms();
+    test_dangling_symlink_target_is_0600();
+    test_file_uri_without_sqlite_uri_support();
+#endif
     std::cout << "All SQLite store smoke tests passed.\n";
     return 0;
 }

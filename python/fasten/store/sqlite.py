@@ -1,5 +1,6 @@
 """SQLite AuditRepository. DSN: ``sqlite:///path?table=X&wal=true``. The table
-is created on first use; WAL is on by default."""
+is created on first use; WAL is on by default. A new database file is created
+owner-only (0600)."""
 from __future__ import annotations
 
 import contextlib
@@ -12,7 +13,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Sequence
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote_to_bytes, urlparse
 
 from ..attrs import AuditRow
 
@@ -69,6 +70,56 @@ CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monot
 """
 
 
+# URI parameters under which SQLite opens no file or does not create one.
+_NO_CREATE_PARAMS = ("mode=memory", "mode=ro", "mode=rw")
+
+
+def _uri_true(value: str) -> bool:
+    """A URI boolean as sqlite3_uri_boolean reads it."""
+    if value[:1].isdigit():
+        digits = value[: len(value) - len(value.lstrip("0123456789"))]
+        return digits.strip("0") != ""
+    return value.lower() in ("yes", "on", "true", "full", "extra", "normal")
+
+
+def _uri_file_path(uri: str) -> str:
+    """File path of a SQLite ``file:`` URI, or "" when the URI names no file
+    to create (in-memory, read-only, another VFS, or another host). Escapes
+    decode as in SQLite: a ``%`` without two hex digits stays as it is, and
+    the path ends at a ``%00``."""
+    rest = uri[len("file:"):].partition("#")[0]
+    rest, _, query = rest.partition("?")
+    for p in query.split("&"):
+        key, _, value = p.partition("=")
+        if p in _NO_CREATE_PARAMS or key == "vfs" or (key == "immutable" and _uri_true(value)):
+            return ""
+    if rest.startswith("//"):
+        host, sep, tail = rest[2:].partition("/")
+        if host not in ("", "localhost"):
+            return ""
+        rest = sep + tail
+    return os.fsdecode(unquote_to_bytes(rest).partition(b"\0")[0])
+
+
+def _create_owner_only(path: str | os.PathLike[str]) -> None:
+    """Create a missing database file with mode 0600, so SQLite does not
+    create it with the umask. An existing file keeps its mode."""
+    path = os.fspath(path)
+    # StreamStore opens a file: path with uri=True.
+    if path.startswith("file:"):
+        path = _uri_file_path(path)
+    if path in ("", ":memory:"):
+        return
+    # No O_EXCL: like SQLite, follow a symlink to a missing file. The mode
+    # applies only when the file is created.
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    except OSError:
+        # Cannot be opened or created; sqlite3 reports it.
+        return
+    os.close(fd)
+
+
 def sqlite_dsn_path(dsn: str) -> str:
     """File path of a SQLite DSN. Strips only the URL-separator slash, as the
     stream store does: sqlite:///rel.db is relative, sqlite:////abs/path.db
@@ -107,6 +158,7 @@ class SQLiteStore:
         self._tls = threading.local()
         self._mem_conn: sqlite3.Connection | None = None
         self._mem_lock = threading.RLock()
+        _create_owner_only(self._path)
         # Create the table and run migrations before other threads connect.
         bootstrap = self._connect()
         if wal and not self._is_memory:

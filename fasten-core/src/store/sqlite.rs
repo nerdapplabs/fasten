@@ -24,6 +24,86 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
+/// Create a missing database file with mode 0600, so SQLite does not create
+/// it with the umask. An existing file keeps its mode. If the file cannot be
+/// created, `Connection::open` reports the error.
+#[cfg(unix)]
+fn create_owner_only(path: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = match path.strip_prefix("file:") {
+        Some(uri) => match uri_file_path(uri) {
+            Some(p) => p,
+            None => return,
+        },
+        None => path.as_bytes().to_vec(),
+    };
+    if bytes.is_empty() || bytes == b":memory:" {
+        return;
+    }
+    let path = std::ffi::OsStr::from_bytes(&bytes);
+    // Not create_new: like SQLite, follow a symlink to a missing file. The
+    // mode applies only when the file is created.
+    let _ = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(path);
+}
+
+/// File path of a SQLite `file:` URI (after the scheme), or `None` when the
+/// URI names no file to create (in-memory, read-only, another VFS, or
+/// another host). Escapes decode as in SQLite: a `%` without two hex digits
+/// stays as it is.
+#[cfg(unix)]
+fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.split('#').next().unwrap_or("");
+    let (mut rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let no_create = |p: &str| {
+        let (key, value) = p.split_once('=').unwrap_or((p, ""));
+        matches!(p, "mode=memory" | "mode=ro" | "mode=rw")
+            || key == "vfs"
+            || (key == "immutable" && uri_true(value))
+    };
+    if query.split('&').any(no_create) {
+        return None;
+    }
+    if let Some(after) = rest.strip_prefix("//") {
+        let slash = after.find('/').unwrap_or(after.len());
+        if !matches!(&after[..slash], "" | "localhost") {
+            return None;
+        }
+        rest = &after[slash..];
+    }
+    let raw = rest.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw.get(i + 1..i + 3).filter(|h| raw[i] == b'%' && h.iter().all(u8::is_ascii_hexdigit));
+        match hex.and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()) {
+            // SQLite ends the path at a %00.
+            Some(0) => break,
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A URI boolean as `sqlite3_uri_boolean` reads it.
+#[cfg(unix)]
+fn uri_true(value: &str) -> bool {
+    if value.starts_with(|c: char| c.is_ascii_digit()) {
+        return value.chars().take_while(char::is_ascii_digit).any(|c| c != '0');
+    }
+    ["yes", "on", "true", "full", "extra", "normal"].iter().any(|w| value.eq_ignore_ascii_case(w))
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(_path: &str) {}
+
 impl SqliteStore {
     /// Open (or create) the SQLite database at `path` and bootstrap the
     /// audit table + indexes.
@@ -32,9 +112,12 @@ impl SqliteStore {
     /// `table` must match `[A-Za-z_][A-Za-z0-9_]*`; a schema prefix is not
     /// supported here.
     /// `wal`  enables WAL journal mode (ignored for `:memory:` databases).
+    ///
+    /// A new database file is created owner-only (0600) on Unix.
     pub fn open(path: &str, table: &str, wal: bool) -> Result<Self, Error> {
         validate_table_name(table)?;
 
+        create_owner_only(path);
         let conn = Connection::open(path)?;
         // Another handle on the same file may hold the write lock while it
         // allocates a seq; wait for it instead of failing with SQLITE_BUSY.
@@ -1164,5 +1247,101 @@ mod tests {
         assert_eq!(chain_of(&got[0]), [Some(""), Some(""), Some("1"), None, None]);
         assert_eq!(chain_of(&got[1]), chain_of(&row));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Under the usual 022 umask SQLite alone would create these 0644. The
+    /// test relies on that default: the umask is process-wide and tests run
+    /// in threads, so it does not set one.
+    #[cfg(unix)]
+    #[test]
+    fn new_file_and_wal_are_0600() {
+        let db = TempDb::new("mode_new");
+        let store = SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        store.insert(&make_row("evt-mode", "TEST")).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+        assert_eq!(file_mode(&format!("{}-wal", db.0)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = TempDb::new("mode_existing");
+        std::fs::File::create(&db.0).unwrap();
+        std::fs::set_permissions(&db.0, std::fs::Permissions::from_mode(0o644)).unwrap();
+        SqliteStore::open(&db.0, "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_target_is_0600() {
+        let target = TempDb::new("mode_target");
+        let link = TempDb::new("mode_link");
+        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
+        let store = SqliteStore::open(&link.0, "audit_log", true).unwrap();
+        store.insert(&make_row("evt-link", "TEST")).unwrap();
+        assert_eq!(file_mode(&target.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_is_0600() {
+        let db = TempDb::new("mode uri");
+        let uri = format!("file://{}?cache=private", db.0.replace(' ', "%20"));
+        SqliteStore::open(&uri, "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_file_uri_creates_nothing() {
+        let db = TempDb::new("mode_ro");
+        assert!(SqliteStore::open(&format!("file:{}?mode=ro", db.0), "audit_log", true).is_err());
+        assert!(!std::path::Path::new(&db.0).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_without_a_file_to_create_creates_nothing() {
+        for param in ["immutable=1", "vfs=memdb"] {
+            let db = TempDb::new("mode_nocreate");
+            let _ = SqliteStore::open(&format!("file:{}?{param}", db.0), "audit_log", false);
+            // Some SQLite versions create an empty file for immutable=1
+            // themselves, with the umask; fasten must not create one 0600 first.
+            let exists = std::path::Path::new(&db.0).exists();
+            assert!(!exists || (param == "immutable=1" && file_mode(&db.0) == 0o644), "{param}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_keeps_an_invalid_escape() {
+        let db = TempDb::new("mode%zz%+f");
+        SqliteStore::open(&format!("file:{}", db.0), "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_path_ends_at_nul() {
+        let db = TempDb::new("mode_nul");
+        SqliteStore::open(&format!("file:{}%00x.db", db.0), "audit_log", true).unwrap();
+        assert_eq!(file_mode(&db.0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_immutable_forms() {
+        for (value, creates) in [("TRUE", false), ("7", false), ("0", true), ("off", true)] {
+            let got = uri_file_path(&format!("/d/a.db?immutable={value}"));
+            assert_eq!(got.as_deref() == Some(&b"/d/a.db"[..]), creates, "immutable={value}");
+        }
     }
 }

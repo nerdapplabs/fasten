@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fasten"
+name = "fasten-sdk"
 version = "1.0.0b0"
 description = "Audit + correlation SDK: 5 Ws + H anchors, one request_id across every transport"
 license = { text = "Apache-2.0" }

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import traceback
 from typing import Any, Callable, Optional
 
 from . import core_ffi
@@ -181,3 +182,68 @@ class Redactor:
             redacted  = self.redact(payload)
             return {**internals, **redacted}
         return _processor
+
+
+# Exceptions in a chain that describe_error() prints.
+_MAX_CHAIN = 5
+
+
+def _redact_text(exc: BaseException, redactor: Optional[Redactor]) -> str:
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001
+        return "<str failed>"
+    try:
+        out = (redactor or Redactor()).redact([text])
+        msg = out[0] if isinstance(out, list) else out
+    except Exception:  # noqa: BLE001
+        msg = None
+    return msg if isinstance(msg, str) else "<unredactable>"
+
+
+def _frames(exc: BaseException) -> list[str]:
+    try:
+        return [f"  {f.filename}:{f.lineno} in {f.name}"
+                for f in traceback.extract_tb(exc.__traceback__)]
+    except Exception:  # noqa: BLE001
+        return ["  <traceback failed>"]
+
+
+def describe_error(exc: BaseException, redactor: Optional[Redactor] = None) -> str:
+    """``type: message`` with the message redacted, then the traceback
+    frames as ``file:line in function``, for ``exc`` and the exceptions it
+    was raised from or during. No source lines or locals. A message the
+    core can't redact is the unredactable marker. Never raises."""
+    lines: list[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen and len(seen) < _MAX_CHAIN:
+        seen.add(id(cur))
+        lines.append(f"{type(cur).__name__}: {_redact_text(cur, redactor)}")
+        lines.extend(_frames(cur))
+        if cur.__cause__ is not None:
+            cur, link = cur.__cause__, "caused by"
+        elif cur.__context__ is not None and not cur.__suppress_context__:
+            cur, link = cur.__context__, "during handling of"
+        else:
+            cur = None
+        if cur is not None:
+            lines.append(link + ":")
+    if cur is not None:
+        lines.pop()     # the link to an exception not printed
+        if id(cur) not in seen:
+            lines.append(f"  ... (chain cut at {_MAX_CHAIN})")
+    return "\n".join(lines)
+
+
+def redacted_json(raw: Any, redactor: Optional[Redactor] = None) -> str:
+    """A JSON payload, redacted, for a log line. Not JSON, or not
+    redactable: a placeholder. Never raises."""
+    try:
+        value = json.loads(raw)
+    except Exception:  # noqa: BLE001  not JSON, or nested too deep
+        return "<not json>"
+    try:
+        return json.dumps((redactor or Redactor()).redact(value), default=str)
+    except Exception:  # noqa: BLE001
+        return "<unredactable>"

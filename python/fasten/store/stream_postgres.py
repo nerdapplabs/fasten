@@ -3,7 +3,7 @@
 Same columns, indexes and query behaviour as
 :class:`fasten.store.stream.StreamStore`, for streams too busy for SQLite's
 single writer. One connection per thread, reconnecting once if it has gone
-stale. Needs ``pip install "fasten[postgres]"``.
+stale. Needs ``pip install "fasten-sdk[postgres]"``.
 """
 from __future__ import annotations
 

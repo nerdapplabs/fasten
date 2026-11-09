@@ -28,7 +28,7 @@ def require_bearer(token_env: str = "FASTEN_READER_TOKEN") -> Any:
         from fastapi import Header, HTTPException
     except ImportError as e:
         raise RuntimeError(
-            "fasten.reader.require_bearer requires fastapi; install fasten[fastapi]"
+            "fasten.reader.require_bearer requires fastapi; install fasten-sdk[fastapi]"
         ) from e
 
     expected = os.environ.get(token_env, "")

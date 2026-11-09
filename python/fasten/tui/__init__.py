@@ -1,6 +1,6 @@
 """Terminal UI for the reader: like `fasten tail`, with audit rows on top
 and the sys and api streams below. Polls the same /api/v1/logs routes every
-``--interval`` seconds. Needs ``pip install fasten[tui]``.
+``--interval`` seconds. Needs ``pip install "fasten-sdk[tui]"``.
 
     fasten tui                                  # default endpoint
     fasten tui --url http://edge:9000/api/v1/logs
