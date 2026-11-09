@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: PyPI gets wheels only, no sdist
+
+- The `pypi` job runs `uv build --wheel`. The sdist held only the Python
+  files: it installed, then the first `register()` or `emit()` failed with
+  `libfasten_core not found` and pointed at `fasten-core/`, which is not in
+  the sdist. Without an sdist, pip on a platform with no wheel says there
+  is no matching distribution.
+
 ### Fixed: release workflows check before they publish
 
 - One `release.yml` replaces `release-python.yml`, `release-js.yml` and
