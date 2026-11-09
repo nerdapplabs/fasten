@@ -36,7 +36,7 @@ The binary loads `libfasten_core` at run time, so tell the loader where it
 is:
 
 ```bash
-LD_LIBRARY_PATH=../fasten/fasten-core/target/release ./myapp
+LD_LIBRARY_PATH=$PWD/../fasten/fasten-core/target/release ./myapp
 ```
 
 On macOS use `DYLD_LIBRARY_PATH` instead.
