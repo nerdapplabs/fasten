@@ -5,7 +5,7 @@ on:
     branches: [main, dev]
     paths:
       - 'scripts/release/**'
-      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/release-check.yml'
       - 'swift/**'
       - 'cpp/include/**'
@@ -17,7 +17,7 @@ on:
   pull_request:
     paths:
       - 'scripts/release/**'
-      - '.github/workflows/release-provenance.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/release-check.yml'
       - 'swift/**'
       - 'cpp/include/**'
@@ -41,3 +41,9 @@ jobs:
 
       - name: Latest release choice
         run: scripts/release/test-latest-flag.sh
+
+      - name: Tag and package versions
+        run: scripts/release/test-check-version.sh
+
+      - name: Published fasten-core matches the tree
+        run: scripts/release/test-core-published.sh

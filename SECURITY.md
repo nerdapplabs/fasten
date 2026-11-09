@@ -48,12 +48,12 @@ commit SHA. The first published release will be the v1.0.0 GA tag.
 **Configured, and active from the first published release:**
 
 - PyPI Trusted Publishing (OIDC, no long-lived tokens) with PEP 740
-  attestations, in [`release-python.yml`](.github/workflows/release-python.yml).
+  attestations, in [`release.yml`](.github/workflows/release.yml).
 - npm `--provenance` (linked back to the source commit), in
-  [`release-js.yml`](.github/workflows/release-js.yml).
+  [`release.yml`](.github/workflows/release.yml).
 - GitHub artifact attestations (signed with [Sigstore](https://www.sigstore.dev/))
   for every file on a [GitHub release](https://github.com/nerdapplabs/fasten/releases),
-  in [`release-provenance.yml`](.github/workflows/release-provenance.yml).
+  in [`release.yml`](.github/workflows/release.yml).
   A `vX.Y.Z` release carries Swift, C++ and Rust source archives and the
   fasten-core library for linux x86_64. A `go/vX.Y.Z` release carries the Go
   module zip. Each release also has a `SHA256SUMS` file. The source archives
@@ -93,7 +93,7 @@ cd fasten-v1.0.0
 sha256sum -c SHA256SUMS
 for f in *; do
   gh attestation verify "$f" --repo nerdapplabs/fasten --source-ref refs/tags/v1.0.0 \
-    --signer-workflow nerdapplabs/fasten/.github/workflows/release-provenance.yml
+    --signer-workflow nerdapplabs/fasten/.github/workflows/release.yml
 done
 ```
 
