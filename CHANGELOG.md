@@ -12,6 +12,33 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   and the Linux x86_64 `fasten-core` library), a build from a clone, and a
   CMake project, with the compile and link flags each header needs.
 
+### Changed: PyPI gets wheels only, no sdist
+
+- The `pypi` job runs `uv build --wheel`. The sdist held only the Python
+  files: it installed, then the first `register()` or `emit()` failed with
+  `libfasten_core not found` and pointed at `fasten-core/`, which is not in
+  the sdist. Without an sdist, pip on a platform with no wheel says there
+  is no matching distribution.
+
+### Added: manual dry run of the release workflow
+
+- Running `release.yml` by hand (Actions tab or
+  `gh workflow run release.yml`) runs the test suites, checks that the
+  Python, JS and Rust package versions agree, and builds everything a tag
+  would: `uv build --wheel` and `twine check`, `npm publish --dry-run`,
+  `cargo publish --dry-run` for fasten-core and the SDK, and the GitHub
+  release files.
+- A dry run publishes, attests and releases nothing, and enters no
+  deployment environment, so it needs no approval.
+
+### Docs: Go and Swift install steps
+
+- `go/README.md`: `go get` alone does not build the Go SDK, since its cgo
+  flags need `fasten-core` next to `go/`. The install section now clones the
+  repo, builds `fasten-core`, and uses a `replace` directive.
+- New `swift/README.md`: requirements, install as a local package
+  (`.package(path: "../fasten/swift")`), and a quickstart.
+
 ### Fixed: release workflows check before they publish
 
 - One `release.yml` replaces `release-python.yml`, `release-js.yml` and

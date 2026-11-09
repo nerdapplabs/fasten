@@ -6,13 +6,14 @@ name: Release
 # unless every test job and the version check pass.
 # go/vX.Y.Z tags: the Go module zip on the GitHub release (release-go.yml
 # runs the Go tests).
+# Dry run: start it from the Actions tab (Release, Run workflow) or with
+# `gh workflow run release.yml --ref <branch>`. It runs the tests, the
+# version check and every build, and publishes, attests and releases nothing.
 on:
   push:
     tags:
       - 'v*'
       - 'go/v*'
-  # A dry run of the GitHub release files: builds, attests and verifies
-  # v0.0.0-dryrun files from the selected branch and publishes nothing.
   workflow_dispatch:
 
 permissions:
@@ -20,40 +21,58 @@ permissions:
 
 jobs:
   test-python:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-py.yml
     uses: ./.github/workflows/fasten-py.yml
 
   test-js:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-js.yml
     uses: ./.github/workflows/fasten-js.yml
 
   test-rust:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-rust.yml
     uses: ./.github/workflows/fasten-rust.yml
 
   versions:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Tag matches every package version
+      # A dry run has no tag: it takes v<js/package.json version>, so the
+      # check fails when the package versions disagree.
+      - name: Release tag
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          scripts/release/check-version.sh python "$GITHUB_REF_NAME"
-          scripts/release/check-version.sh js "$GITHUB_REF_NAME"
-          scripts/release/check-version.sh rust "$GITHUB_REF_NAME"
+          if [ "$EVENT" = push ]; then
+            tag=$REF_NAME
+          else
+            tag=v$(sed -n 's/^  "version": "\(.*\)",*$/\1/p' js/package.json | head -n 1)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Tag matches every package version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          scripts/release/check-version.sh python "$TAG"
+          scripts/release/check-version.sh js "$TAG"
+          scripts/release/check-version.sh rust "$TAG"
 
   pypi:
     needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -75,8 +94,9 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
-      - name: Build distributions
-        run: uv build
+      # Wheel only: an sdist has no libfasten_core and fails at first use.
+      - name: Build wheel
+        run: uv build --wheel
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -89,6 +109,7 @@ jobs:
 
   npm:
     needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -137,6 +158,7 @@ jobs:
 
   crates-io:
     needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -190,8 +212,82 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
 
-  # GitHub release files. On go/ tags and dry runs the test and version
-  # jobs are skipped, so this runs unless one of them failed.
+  # Dry run of the three publish jobs: same images and builds, no
+  # environment (so no approval), no registry token, nothing uploaded.
+  pypi-dry-run:
+    needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.10-slim
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      # Wheel only, as the pypi job publishes.
+      - name: Build wheel
+        run: |
+          uv build --wheel
+          ls -l dist
+
+      # The upload action runs this check before it publishes.
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+  npm-dry-run:
+    needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: node:24-alpine
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v6
+
+      # The dist-tag is worked out without the versions on npm, so a
+      # backport shows latest here instead of release-X.Y.
+      - name: npm publish --dry-run
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          tag=$(../scripts/release/npm-dist-tag.sh "$version" < /dev/null)
+          npm publish --dry-run --access public --tag "$tag"
+
+  crates-io-dry-run:
+    needs: [test-python, test-js, test-rust, versions]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: cargo publish --dry-run fasten-core
+        working-directory: fasten-core
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq pkg-config libssl-dev
+          state=$(../scripts/release/core-published.sh .)
+          if [ "$state" = skip ]; then
+            echo "fasten-core is already on crates.io with the same files"
+          else
+            cargo publish --dry-run --locked
+          fi
+
+      # fasten-core may not be on crates.io yet, so the SDK is packaged and
+      # built against the fasten-core in the tree.
+      - name: cargo publish --dry-run the SDK
+        working-directory: rust
+        run: cargo publish --dry-run --config 'patch.crates-io.fasten-core.path="../fasten-core"'
+
+  # GitHub release files. On go/ tags the test and version jobs are
+  # skipped, so this runs unless one of them failed.
   build:
     needs: [test-python, test-js, test-rust, versions]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
@@ -237,6 +333,7 @@ jobs:
           esac
 
       - name: Attest build provenance
+        if: ${{ github.event_name == 'push' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
@@ -260,12 +357,16 @@ jobs:
           name: release-files
           path: dist
 
-      - name: Verify checksums and attestations
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Verify attestations
+        if: ${{ github.event_name == 'push' }}
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sha256sum -c SHA256SUMS
           for f in *; do
             gh attestation verify "$f" \
               --repo "$GITHUB_REPOSITORY" \
