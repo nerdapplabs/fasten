@@ -228,9 +228,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
-      - name: Build distributions
+      # Wheel only, as the pypi job publishes.
+      - name: Build wheel
         run: |
-          uv build
+          uv build --wheel
           ls -l dist
 
   npm-dry-run:
