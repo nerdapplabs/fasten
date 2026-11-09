@@ -234,6 +234,10 @@ jobs:
           uv build --wheel
           ls -l dist
 
+      # The upload action runs this check before it publishes.
+      - name: Check metadata
+        run: uvx twine check dist/*
+
   npm-dry-run:
     needs: [test-python, test-js, test-rust, versions]
     if: ${{ github.event_name == 'workflow_dispatch' }}
