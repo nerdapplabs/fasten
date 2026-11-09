@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: manual dry run of the release workflow
+
+- Running `release.yml` by hand (Actions tab or
+  `gh workflow run release.yml`) runs the test suites, checks that the
+  Python, JS and Rust package versions agree, and builds everything a tag
+  would: `uv build`, `npm publish --dry-run`, `cargo publish --dry-run` for
+  fasten-core and the SDK, and the GitHub release files.
+- A dry run publishes, attests and releases nothing, and enters no
+  deployment environment, so it needs no approval.
+
 ### Fixed: release workflows check before they publish
 
 - One `release.yml` replaces `release-python.yml`, `release-js.yml` and
