@@ -4,22 +4,42 @@ Audit and correlation SDK for Go services. v1.0.0-beta.
 
 ## Install
 
-```bash
-go get github.com/nerdapplabs/fasten/go
-```
-
 The SDK calls `libfasten_core` (the Rust library in
-[`fasten-core/`](../fasten-core)) through cgo, so it needs `CGO_ENABLED=1`
-and the library built first:
+[`fasten-core/`](../fasten-core)) through cgo. Its cgo flags point at
+`../fasten-core` next to the `go/` directory, so a plain `go get` does not
+build: the module download has no `fasten-core`. Use a clone of the repo
+instead.
 
-Clone the repo, then:
+You need Go 1.26+, a C compiler, and rustup (it picks up Rust 1.90 from
+[`rust-toolchain.toml`](../rust-toolchain.toml)). On Linux, also
+`pkg-config` and the OpenSSL headers (`libssl-dev`).
+
+Clone the repo and build the library:
 
 ```bash
-cd fasten-core && cargo build --release --features all
-export CGO_CFLAGS=-I$PWD/include
-export CGO_LDFLAGS=-L$PWD/target/release
-export LD_LIBRARY_PATH=$PWD/target/release   # Linux, at run time
+git clone https://github.com/nerdapplabs/fasten.git
+cd fasten/fasten-core
+cargo build --release --locked --features all
 ```
+
+In your own module, next to the clone, point the SDK at it with a
+`replace` directive:
+
+```bash
+go mod edit -require=github.com/nerdapplabs/fasten/go@v0.0.0 \
+            -replace=github.com/nerdapplabs/fasten/go=../fasten/go
+go mod tidy
+CGO_ENABLED=1 go build -o myapp .
+```
+
+The binary loads `libfasten_core` at run time, so tell the loader where it
+is:
+
+```bash
+LD_LIBRARY_PATH=../fasten/fasten-core/target/release ./myapp
+```
+
+On macOS use `DYLD_LIBRARY_PATH` instead.
 
 ## Quickstart
 

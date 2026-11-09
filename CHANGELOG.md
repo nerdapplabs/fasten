@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Docs: Go and Swift install steps
+
+- `go/README.md`: `go get` alone does not build the Go SDK, since its cgo
+  flags need `fasten-core` next to `go/`. The install section now clones the
+  repo, builds `fasten-core`, and uses a `replace` directive.
+- New `swift/README.md`: requirements, install as a local package
+  (`.package(path: "../fasten/swift")`), and a quickstart.
+
 ### Fixed: release workflows check before they publish
 
 - One `release.yml` replaces `release-python.yml`, `release-js.yml` and
