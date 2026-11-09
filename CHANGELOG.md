@@ -6,6 +6,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Docs: C++ install steps
+
+- `cpp/README.md` Install covers the release files (`fasten-cpp-vX.Y.Z.tar.gz`
+  and the Linux x86_64 `fasten-core` library), a build from a clone, and a
+  CMake project, with the compile and link flags each header needs.
+
 ### Changed: PyPI gets wheels only, no sdist
 
 - The `pypi` job runs `uv build --wheel`. The sdist held only the Python

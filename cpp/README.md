@@ -8,17 +8,75 @@ so programs must link with `-lfasten_core`.
 
 ## Install
 
-1. Build `libfasten_core`:
+You need the headers in [`include/`](include/) and `libfasten_core`, built
+with `--features all`. A program that only includes `fasten.hpp` compiles
+with `-std=c++14` (or later) and links `-lfasten_core -pthread`. Add
+`-lsqlite3` when you include `fasten_store_sqlite.hpp`, `-lpq` (and the
+libpq include path, `-I/usr/include/postgresql` on Debian) for
+`fasten_store_postgres.hpp`, and `-lyaml-cpp` for
+`include/fasten/codes_yaml.hpp` (it loads code catalogs from YAML).
+`fasten_core.h` is not needed; `fasten.hpp` declares the functions it calls.
 
-   ```bash
-   cd fasten-core && cargo build --release --features all
-   ```
+### From a GitHub release
 
-2. Copy [`include/fasten.hpp`](include/fasten.hpp) into your project and
-   link against `fasten-core/target/release/libfasten_core`.
+Each `vX.Y.Z` release has two files for C++:
 
-Optional: `include/fasten/codes_yaml.hpp` loads code catalogs from YAML. It
-adds a libyaml-cpp dependency only when you include it.
+- `fasten-cpp-vX.Y.Z.tar.gz`: the headers, under
+  `fasten-cpp-vX.Y.Z/cpp/include/`.
+- `fasten-core-vX.Y.Z-linux-x86_64.tar.gz`: `lib/libfasten_core.so`,
+  `lib/libfasten_core.a` and `include/fasten_core.h`. It needs glibc 2.34 or
+  later and OpenSSL 3 (`libssl3`) at run time.
+
+The release has a prebuilt library for Linux x86_64 only. On macOS or
+another target, build it from a clone (below). `SHA256SUMS` on the release
+lists the checksum of each file.
+
+From the directory with your `app.cpp` and the two downloaded files:
+
+```bash
+V=vX.Y.Z
+tar xzf fasten-cpp-$V.tar.gz
+tar xzf fasten-core-$V-linux-x86_64.tar.gz
+g++ -std=c++14 -O2 -I fasten-cpp-$V/cpp/include app.cpp \
+    -L fasten-core-$V-linux-x86_64/lib -lfasten_core -lsqlite3 -pthread -o app
+LD_LIBRARY_PATH=$PWD/fasten-core-$V-linux-x86_64/lib ./app
+```
+
+Drop `-lsqlite3` if you do not use `SqliteStore`. To skip
+`LD_LIBRARY_PATH`, copy `libfasten_core.so` to a directory the loader
+searches (for example `/usr/local/lib`, then run `ldconfig`).
+
+### From a clone
+
+Building `libfasten_core` needs Rust (the version in
+[`rust-toolchain.toml`](../rust-toolchain.toml)), `pkg-config` and the
+OpenSSL headers (`libssl-dev` on Debian).
+
+```bash
+git clone https://github.com/nerdapplabs/fasten.git
+(cd fasten/fasten-core && cargo build --release --locked --features all)
+g++ -std=c++14 -O2 -I fasten/cpp/include app.cpp \
+    -L fasten/fasten-core/target/release -lfasten_core -lsqlite3 -pthread -o app
+LD_LIBRARY_PATH=$PWD/fasten/fasten-core/target/release ./app
+```
+
+On macOS the library is `libfasten_core.dylib`; use `DYLD_LIBRARY_PATH`
+instead of `LD_LIBRARY_PATH`.
+
+With CMake, add the clone's `cpp/` directory and link the `fasten`
+target. It finds `libfasten_core` in `fasten-core/target/release` of the
+same clone (set `FASTEN_CORE_LIB_DIR` to use another directory):
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(app LANGUAGES CXX)
+set(FASTEN_BUILD_EXAMPLES OFF CACHE BOOL "")
+add_subdirectory(fasten/cpp fasten)
+find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
+add_executable(app app.cpp)
+target_link_libraries(app PRIVATE fasten SQLite::SQLite3 Threads::Threads)
+```
 
 ## Quickstart
 
