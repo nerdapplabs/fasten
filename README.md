@@ -71,7 +71,8 @@ Start at **[fasten.sh/docs](https://fasten.sh/docs/)**. The install steps
 for every language and a runnable Python quickstart are at the top of the
 page. Each SDK directory also has its own README:
 [Python](python/README.md), [Go](go/README.md), [Node](js/README.md),
-[Rust](rust/README.md), [C++](cpp/README.md), [Java](java/README.md).
+[Rust](rust/README.md), [C++](cpp/README.md), [Swift](swift/README.md),
+[Java](java/README.md).
 
 ---
 
