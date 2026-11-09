@@ -9,14 +9,17 @@ the v1.0 GA tag.
 
 ```toml
 [dependencies]
-fasten = { path = "../fasten/rust" }     # local clone
+fasten-sdk = { path = "../fasten/rust" }     # local clone
 # or, once published:
-fasten = "1.0.0-beta"
+fasten-sdk = "1.0.0-beta"
 ```
 
 The crate depends on [`fasten-core`](../fasten-core) by path, so build from
 a full clone of the repo. `fasten-core` sets `rust-version = "1.90"`, which
 is the minimum toolchain (see [`rust-toolchain.toml`](../rust-toolchain.toml)).
+
+The crate is named `fasten-sdk`; code imports it as `fasten`
+(`use fasten::...`).
 
 Optional features: `async`, `store-sqlite`, `store-postgres`,
 `shim-tracing`, `codes-yaml`.

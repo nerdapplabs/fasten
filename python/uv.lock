@@ -229,7 +229,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fasten"
+name = "fasten-sdk"
 version = "1.0.0b0"
 source = { editable = "." }
 

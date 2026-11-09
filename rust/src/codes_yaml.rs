@@ -3,7 +3,7 @@
 //!
 //! ```ignore
 //! // in Cargo.toml:
-//! // fasten = { version = "1", features = ["codes-yaml"] }
+//! // fasten-sdk = { version = "1", features = ["codes-yaml"] }
 //! fasten::codes::load("fleet.codes.yaml")?;
 //! fasten::codes::reload()?;
 //! ```

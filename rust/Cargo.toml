@@ -1,5 +1,5 @@
 [package]
-name = "fasten"
+name = "fasten-sdk"
 version = "1.0.0-beta.0"
 edition = "2021"
 rust-version = "1.85"
@@ -25,6 +25,10 @@ sqlx        = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"
 # sync trait; sqlx is async-only and block_on() panics inside a tokio runtime.
 pg          = { package = "postgres", version = "0.19", optional = true }
 serde_yaml  = { version = "0.9", optional = true }
+
+# The crate is published as fasten-sdk; code still says `use fasten::`.
+[lib]
+name = "fasten"
 
 [features]
 default = []

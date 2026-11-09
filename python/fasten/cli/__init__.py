@@ -3,7 +3,7 @@
   fasten dump            print registered codes as id,domain,severity
   fasten tail            poll /logs/* from a service with the reader mounted
   fasten doctor          check config, stores and correlation
-  fasten tui             multi-pane live view (needs fasten[tui])
+  fasten tui             multi-pane live view (needs fasten-sdk[tui])
   fasten codes typegen   write type stubs for a yaml catalog
 """
 from __future__ import annotations

@@ -86,7 +86,7 @@ def router(
         from fastapi import APIRouter, HTTPException, Query
     except ImportError as e:
         raise RuntimeError(
-            "fasten.reader.router() requires fastapi; install fasten[fastapi]"
+            "fasten.reader.router() requires fastapi; install fasten-sdk[fastapi]"
         ) from e
 
     if dependencies is None:

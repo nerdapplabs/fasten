@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: Python and Rust packages are named `fasten-sdk`
+
+- `fasten` is taken on PyPI and crates.io by unrelated projects, so the
+  Python and Rust packages are published as `fasten-sdk`:
+  `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
+- Code does not change: Python still imports `fasten`, Rust still uses
+  `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
+- Go (`github.com/nerdapplabs/fasten/go`), npm (`@nerdapplabs/fasten`) and
+  `fasten-core` keep their names.
+
 ### Fixed: remaining log lines go through the redactor (Python, C++)
 
 - Python: `fasten.log.*` before `init()` redacts the line before handing it
