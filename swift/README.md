@@ -83,4 +83,4 @@ swift test
 ## Docs and design
 
 Full reference: [https://fasten.sh/docs/](https://fasten.sh/docs/).
-Design and cross-language design: [README.md](../README.md).
+Design: [README.md](../README.md).
