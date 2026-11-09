@@ -24,8 +24,8 @@ Each `vX.Y.Z` release has two files for C++:
 - `fasten-cpp-vX.Y.Z.tar.gz`: the headers, under
   `fasten-cpp-vX.Y.Z/cpp/include/`.
 - `fasten-core-vX.Y.Z-linux-x86_64.tar.gz`: `lib/libfasten_core.so`,
-  `lib/libfasten_core.a` and `include/fasten_core.h`. It is built on
-  Debian 12 and needs OpenSSL 3 (`libssl3`) at run time.
+  `lib/libfasten_core.a` and `include/fasten_core.h`. It needs glibc 2.34 or
+  later and OpenSSL 3 (`libssl3`) at run time.
 
 The release has a prebuilt library for Linux x86_64 only. On macOS or
 another target, build it from a clone (below). `SHA256SUMS` on the release
