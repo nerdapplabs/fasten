@@ -14,8 +14,8 @@ with `-std=c++14` (or later) and links `-lfasten_core -pthread`. Add
 `-lsqlite3` when you include `fasten_store_sqlite.hpp`, `-lpq` (and the
 libpq include path, `-I/usr/include/postgresql` on Debian) for
 `fasten_store_postgres.hpp`, and `-lyaml-cpp` for
-`include/fasten/codes_yaml.hpp` (it loads code catalogs from YAML). `fasten_core.h` is not needed; `fasten.hpp`
-declares the functions it calls.
+`include/fasten/codes_yaml.hpp` (it loads code catalogs from YAML).
+`fasten_core.h` is not needed; `fasten.hpp` declares the functions it calls.
 
 ### From a GitHub release
 
