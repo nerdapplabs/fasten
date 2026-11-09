@@ -1603,10 +1603,13 @@ inline void write_sys_line(std::ostream& out,
 }
 
 // SDK self-reports go to stderr so a slow stdout reader can't stall them.
+// Redacted like other sys lines: a store error message can quote row values.
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields) {
-    write_sys_line(std::cerr, level, event, fields);
+    std::vector<std::pair<std::string, std::string>> kv;
+    for (const auto& f : fields) kv.push_back({f.first, json_str(f.second)});
+    write_sys_fields_(std::cerr, level, event, redact_json_fields_(kv));
 }
 
 inline void drainer_sys_log_fields(const std::string& level,

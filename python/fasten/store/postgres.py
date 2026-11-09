@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from ..attrs import AuditRow
+from ..redact import describe_error
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,7 @@ class PostgresStore:
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             logger.warning(
                 "fasten audit store connection lost (%s); reconnecting and retrying once",
-                exc,
+                describe_error(exc),
             )
             return _call(self._connect_fresh())
 
