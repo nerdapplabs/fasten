@@ -7,11 +7,13 @@ on:
       - 'swift/**'
       - 'spec/**'
       - '.github/workflows/fasten-swift.yml'
+      - '.github/actions/setup-swift/**'
   pull_request:
     paths:
       - 'swift/**'
       - 'spec/**'
       - '.github/workflows/fasten-swift.yml'
+      - '.github/actions/setup-swift/**'
   workflow_call:
 
 permissions:
@@ -29,10 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Set up Swift 5.10
+      - name: Set up Swift 5.10.1
         uses: ./.github/actions/setup-swift
         with:
           version: "5.10.1"
+          # Swift 5.x Release Signing Key
+          key-fingerprint: "A62AE125BBBFBB96A6E042EC925CC1CCED3D1561"
 
       - name: Install system deps
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libsqlite3-dev
