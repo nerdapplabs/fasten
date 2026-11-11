@@ -6,6 +6,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: Python wheels with libfasten_core inside
+
+- PyPI gets one wheel per platform, each with `libfasten_core` in the
+  package: Linux x86_64 and aarch64 (`manylinux_2_34`, glibc 2.34 or later,
+  OpenSSL bundled by auditwheel) and macOS arm64 and x86_64 (11.0 or later).
+  `pip install fasten-sdk` then needs no Rust build and no `FASTEN_CORE_LIB`.
+  Other platforms get no wheel, so pip reports no matching distribution.
+- New `python-wheels.yml` builds the wheels, installs each one in a clean
+  environment and checks that it emits rows and verifies the chain
+  (`scripts/release/wheel-smoke.py`). `release.yml` publishes those wheels.
+- `python/hatch_build.py` tags the wheel for the platform and adds the
+  library when `FASTEN_WHEEL_LIB` and `FASTEN_WHEEL_PLAT` are set. Without
+  them the wheel stays pure Python, as before.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

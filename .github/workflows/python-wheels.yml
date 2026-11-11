@@ -1,0 +1,153 @@
+name: Python wheels
+
+# Builds one fasten-sdk wheel per platform with libfasten_core inside, then
+# installs each wheel in a clean environment, emits rows and verifies the
+# chain (scripts/release/wheel-smoke.py). release.yml calls this and
+# publishes the wheels it uploads (artifacts wheel-*).
+on:
+  pull_request:
+    paths:
+      - 'python/**'
+      - 'fasten-core/**'
+      - 'rust-toolchain.toml'
+      - 'scripts/release/wheel-smoke.py'
+      - '.github/workflows/python-wheels.yml'
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # glibc 2.34, the same floor as the release's C++ library.
+    container:
+      image: quay.io/pypa/manylinux_2_34_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # rustup installs the version in rust-toolchain.toml on first use.
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build libfasten_core
+        working-directory: fasten-core
+        run: |
+          dnf install -y -q openssl-devel
+          cargo build --release --locked --features all
+
+      # auditwheel copies libssl and libcrypto into the wheel, so it needs no
+      # OpenSSL on the host.
+      - name: Build wheel
+        working-directory: python
+        env:
+          FASTEN_WHEEL_PLAT: linux_${{ matrix.arch }}
+        run: |
+          export FASTEN_WHEEL_LIB="$GITHUB_WORKSPACE/fasten-core/target/release/libfasten_core.so"
+          /opt/python/cp312-cp312/bin/python -m pip install -q uv
+          /opt/python/cp312-cp312/bin/uv build --wheel -o raw
+          auditwheel repair --plat manylinux_2_34_${{ matrix.arch }} -w dist raw/*.whl
+          auditwheel show dist/*.whl
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  linux-check:
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: python:3.10-slim
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/release
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: wheel
+
+      - name: Install the wheel and verify a chain
+        run: |
+          pip install -q wheel/*.whl
+          cd "$RUNNER_TEMP"
+          python -I "$GITHUB_WORKSPACE/scripts/release/wheel-smoke.py"
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v6
+
+      # rustup on the runner installs the version in rust-toolchain.toml.
+      - name: Build libfasten_core
+        working-directory: fasten-core
+        run: cargo build --release --locked --features all
+
+      # Only system libraries: TLS goes through the Security framework.
+      - name: Check linked libraries
+        run: |
+          lib=fasten-core/target/release/libfasten_core.dylib
+          otool -L "$lib"
+          other=$(otool -L "$lib" | tail -n +2 \
+            | grep -v -e /usr/lib/ -e /System/Library/ -e libfasten_core || true)
+          if [ -n "$other" ]; then
+            echo "::error::non-system libraries: $other"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Build wheel
+        working-directory: python
+        env:
+          FASTEN_WHEEL_PLAT: macosx_11_0_${{ matrix.arch }}
+        run: |
+          export FASTEN_WHEEL_LIB="$GITHUB_WORKSPACE/fasten-core/target/release/libfasten_core.dylib"
+          uv build --wheel
+          ls -l dist
+
+      - name: Install the wheel and verify a chain
+        run: |
+          uv venv --python 3.10 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" python/dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/python" -I "$GITHUB_WORKSPACE/scripts/release/wheel-smoke.py"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-macos-${{ matrix.arch }}
+          path: python/dist/*.whl
+          if-no-files-found: error
