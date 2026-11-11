@@ -446,10 +446,17 @@ where
     f()
 }
 
-/// Polls `fut` with the thread-local id cleared, so the task-local id is the
-/// one `current_request_id()` sees.
+/// Polls and drops `fut` with the thread-local id cleared, so the task-local
+/// id is the one `current_request_id()` sees.
 #[cfg(feature = "async")]
-struct ClearThreadRequestId<F>(std::pin::Pin<Box<F>>);
+struct ClearThreadRequestId<F>(Option<std::pin::Pin<Box<F>>>);
+
+#[cfg(feature = "async")]
+impl<F> ClearThreadRequestId<F> {
+    fn new(fut: F) -> Self {
+        Self(Some(Box::pin(fut)))
+    }
+}
 
 #[cfg(feature = "async")]
 impl<F: std::future::Future> std::future::Future for ClearThreadRequestId<F> {
@@ -457,14 +464,22 @@ impl<F: std::future::Future> std::future::Future for ClearThreadRequestId<F> {
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
         let _restore = RestoreRequestId::set(None);
-        self.0.as_mut().poll(cx)
+        self.0.as_mut().expect("polled after drop").as_mut().poll(cx)
+    }
+}
+
+#[cfg(feature = "async")]
+impl<F> Drop for ClearThreadRequestId<F> {
+    fn drop(&mut self) {
+        let _restore = RestoreRequestId::set(None);
+        self.0.take();
     }
 }
 
 /// Run `fut` with `rid` as its request_id, across every `.await`.
 #[cfg(feature = "async")]
 pub async fn scope_request_id<F: std::future::Future>(rid: String, fut: F) -> F::Output {
-    TASK_REQUEST_ID.scope(rid, ClearThreadRequestId(Box::pin(fut))).await
+    TASK_REQUEST_ID.scope(rid, ClearThreadRequestId::new(fut)).await
 }
 
 /// `tokio::spawn` that carries the current request_id into the new task, or
@@ -477,7 +492,7 @@ where
     F::Output: Send + 'static,
 {
     let rid = current_request_id().unwrap_or_else(mint_id);
-    tokio::spawn(TASK_REQUEST_ID.scope(rid, ClearThreadRequestId(Box::pin(fut))))
+    tokio::spawn(TASK_REQUEST_ID.scope(rid, ClearThreadRequestId::new(fut)))
 }
 
 // NDJSON sys lines on stdout without needing `tracing` or `log`. Each line
@@ -1885,8 +1900,32 @@ mod async_request_id_tests {
     async fn panic_does_not_leave_a_stale_id() {
         let crashed = tokio::spawn(async { with_request_id("stale".into(), || panic!("boom")) }).await;
         assert!(crashed.is_err());
-        let rid = spawn(scope_request_id("fresh".into(), async { current_request_id() })).await.unwrap();
-        assert_eq!(rid.as_deref(), Some("fresh"));
+        // One worker, so this runs on the thread that panicked.
+        let rid = tokio::spawn(async { current_request_id() }).await.unwrap();
+        assert_eq!(rid, None);
+    }
+
+    // A scoped future dropped before it finishes (a timeout, a select) runs
+    // its drop code with the task's id, not the caller's.
+    #[test]
+    fn dropped_scope_sees_task_id() {
+        struct Record(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl Drop for Record {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = current_request_id();
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = Record(seen.clone());
+        let mut fut = Box::pin(scope_request_id("task".into(), async move {
+            let _record = record;
+            std::future::pending::<()>().await;
+        }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
+        with_request_id("outer".into(), || drop(fut));
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("task"));
     }
 
     #[test]
