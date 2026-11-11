@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   test:
-    # setup-swift@v2 does not support Ubuntu 26.04 yet.
+    # .github/actions/setup-swift installs the Ubuntu 24.04 build of Swift.
     runs-on: ubuntu-24.04
 
     defaults:
@@ -30,9 +30,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Swift 5.10
-        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        uses: ./.github/actions/setup-swift
         with:
-          swift-version: "5.10"
+          version: "5.10.1"
 
       - name: Install system deps
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libsqlite3-dev
