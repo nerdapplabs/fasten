@@ -209,8 +209,9 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
 
-  # Dry run of the three publish jobs: same images and builds, no
-  # environment (so no approval), no registry token, nothing uploaded.
+  # Dry run of the three publish jobs: no environment (so no approval), no
+  # registry token, nothing uploaded. npm and crates.io repeat the real
+  # builds; PyPI checks the wheels from the wheels job.
   pypi-dry-run:
     needs: [test-python, test-js, test-rust, versions, wheels]
     if: ${{ github.event_name == 'workflow_dispatch' }}

@@ -111,9 +111,15 @@ jobs:
       - uses: actions/checkout@v6
 
       # rustup on the runner installs the version in rust-toolchain.toml.
+      # The linker records the build path as the install name; use @rpath
+      # instead. The change breaks the ad-hoc signature, so sign it again.
       - name: Build libfasten_core
         working-directory: fasten-core
-        run: cargo build --release --locked --features all
+        run: |
+          cargo build --release --locked --features all
+          lib=target/release/libfasten_core.dylib
+          install_name_tool -id @rpath/libfasten_core.dylib "$lib"
+          codesign --force --sign - "$lib"
 
       # Only system libraries: TLS goes through the Security framework.
       - name: Check linked libraries
