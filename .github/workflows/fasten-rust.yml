@@ -8,12 +8,14 @@ on:
       # fasten-core's own tests run only in this workflow.
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
+      - '.github/actions/setup-swift/**'
   pull_request:
     paths:
       - 'rust/**'
       # fasten-core's own tests run only in this workflow.
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
+      - '.github/actions/setup-swift/**'
   workflow_call:
 
 permissions:
@@ -144,10 +146,12 @@ jobs:
         working-directory: fasten-core
         run: cargo build --release --locked --features all
 
-      - name: Set up Swift 5.10
+      - name: Set up Swift 5.10.1
         uses: ./.github/actions/setup-swift
         with:
           version: "5.10.1"
+          # Swift 5.x Release Signing Key
+          key-fingerprint: "A62AE125BBBFBB96A6E042EC925CC1CCED3D1561"
 
       - name: Test
         working-directory: fasten-core/bindings/swift
