@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: Rust request_id follows tokio tasks
+
+- With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the
+  request_id across every `.await`, and `fasten::spawn(fut)` carries the
+  current id into a new task. Before, the id was thread-local only and was
+  lost when a task moved threads.
+- `current_request_id()` reads an id set by `with_request_id` first, then the
+  task's id.
+- CI runs the Rust lint and tests with `async` on.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

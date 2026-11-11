@@ -381,19 +381,19 @@ pub fn dump() -> String {
         .join("\n")
 }
 
-// The request id is thread-local, so it does not follow `tokio::spawn`:
-//
-//     with_request_id("abc".into(), || {
-//         tokio::spawn(async move {
-//             // current_request_id() is None here
-//             fasten::EmitBuilder::new("CODE", "target").submit().unwrap();
-//         });
-//     });
-//
-// Read the id before spawning and call `with_request_id` again inside the task.
+// The request id lives in a thread-local, set by `with_request_id` for the
+// length of a closure. That does not survive an `.await` that moves the task
+// to another thread, so with the `async` feature a tokio task-local carries
+// it too: `scope_request_id` sets it for a future and `spawn` copies the
+// current id into a new task. A plain `tokio::spawn` does not copy it.
 
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "async")]
+tokio::task_local! {
+    static TASK_REQUEST_ID: String;
 }
 
 /// Mint a 12-char request id.
@@ -401,9 +401,20 @@ pub fn mint_id() -> String {
     uuid::Uuid::new_v4().simple().to_string().chars().take(12).collect()
 }
 
-/// Read the ambient request_id (None if unset).
+/// Read the ambient request_id (None if unset). An id set by
+/// `with_request_id` wins over the task's id from `scope_request_id`.
 pub fn current_request_id() -> Option<String> {
-    REQUEST_ID.with(|cell| cell.borrow().clone())
+    REQUEST_ID.with(|cell| cell.borrow().clone()).or_else(task_request_id)
+}
+
+#[cfg(feature = "async")]
+fn task_request_id() -> Option<String> {
+    TASK_REQUEST_ID.try_with(|r| r.clone()).ok()
+}
+
+#[cfg(not(feature = "async"))]
+fn task_request_id() -> Option<String> {
+    None
 }
 
 /// Run `f` with `rid` set as ambient correlation. Restores prior id on exit.
@@ -417,6 +428,24 @@ where
         *cell.borrow_mut() = prev;
     });
     out
+}
+
+/// Run `fut` with `rid` as its request_id, across every `.await`.
+#[cfg(feature = "async")]
+pub async fn scope_request_id<F: std::future::Future>(rid: String, fut: F) -> F::Output {
+    TASK_REQUEST_ID.scope(rid, fut).await
+}
+
+/// `tokio::spawn` that carries the current request_id into the new task, or
+/// a new id if there is none.
+#[cfg(feature = "async")]
+pub fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let rid = current_request_id().unwrap_or_else(mint_id);
+    tokio::spawn(TASK_REQUEST_ID.scope(rid, fut))
 }
 
 // NDJSON sys lines on stdout without needing `tracing` or `log`. Each line
@@ -1739,4 +1768,72 @@ pub mod codes_yaml;
 #[cfg(feature = "codes-yaml")]
 pub mod codes {
     pub use super::codes_yaml::{load, reload};
+}
+
+#[cfg(all(test, feature = "async"))]
+mod async_request_id_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scope_survives_await() {
+        scope_request_id("r1".into(), async {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                assert_eq!(current_request_id().as_deref(), Some("r1"));
+            }
+        })
+        .await;
+        assert_eq!(current_request_id(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_carries_id() {
+        let h = with_request_id("r2".into(), || spawn(async { current_request_id() }));
+        assert_eq!(h.await.unwrap().as_deref(), Some("r2"));
+
+        let h = scope_request_id("r3".into(), async { spawn(async { current_request_id() }) }).await;
+        assert_eq!(h.await.unwrap().as_deref(), Some("r3"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_without_id_mints_one() {
+        let rid = spawn(async { current_request_id() }).await.unwrap();
+        assert_eq!(rid.map(|r| r.len()), Some(12));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_tasks_keep_their_ids() {
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let rid = format!("req-{i}");
+                let want = rid.clone();
+                tokio::spawn(scope_request_id(rid, async move {
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                        assert_eq!(current_request_id(), Some(want.clone()));
+                    }
+                }))
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn with_request_id_wins_inside_scope() {
+        scope_request_id("outer".into(), async {
+            with_request_id("inner".into(), || {
+                assert_eq!(current_request_id().as_deref(), Some("inner"));
+            });
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plain_tokio_spawn_has_no_id() {
+        let h = scope_request_id("r4".into(), async { tokio::spawn(async { current_request_id() }) }).await;
+        assert_eq!(h.await.unwrap(), None);
+    }
 }
