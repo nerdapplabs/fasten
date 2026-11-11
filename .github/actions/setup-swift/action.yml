@@ -31,8 +31,14 @@ runs:
         curl -fsSL --retry 5 --retry-all-errors -o swift.tar.gz.sig "$url.sig"
         curl -fsSL --compressed --retry 5 --retry-all-errors https://www.swift.org/keys/all-keys.asc | gpg --batch --quiet --import
         gpg --batch --status-fd 3 --verify swift.tar.gz.sig swift.tar.gz 3> gpg-status
+        # gpg exits 0 for a good signature from a revoked key.
+        if grep -q '^\[GNUPG:\] REVKEYSIG ' gpg-status; then
+          echo "::error::Swift tarball is signed by a revoked key"
+          exit 1
+        fi
         # The last field of VALIDSIG is the signing key's primary fingerprint.
-        signer=$(awk '$2 == "VALIDSIG" { print $NF }' gpg-status)
+        # Every signature in the .sig must come from that key.
+        signer=$(awk '$2 == "VALIDSIG" { print $NF }' gpg-status | sort -u | paste -sd, -)
         if [ "$signer" != "$want" ]; then
           echo "::error::Swift tarball is signed by '${signer}', expected '${want}'"
           exit 1
