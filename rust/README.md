@@ -102,7 +102,8 @@ fasten::spawn(async move {
 });
 ```
 
-A plain `tokio::spawn` does not copy the id.
+A plain `tokio::spawn`, `spawn_blocking` or `std::thread::spawn` does not
+copy the id; read it with `current_request_id()` and set it again there.
 
 ## Audit-store failure handling
 

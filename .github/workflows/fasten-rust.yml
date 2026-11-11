@@ -92,7 +92,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Coverage
-        run: cargo llvm-cov --locked --lcov --output-path coverage.lcov
+        run: cargo llvm-cov --locked --features async --lcov --output-path coverage.lcov
 
       - name: Install Codecov runtime deps
         run: apt-get update -qq && apt-get install -y --no-install-recommends gpg

@@ -386,6 +386,8 @@ pub fn dump() -> String {
 // to another thread, so with the `async` feature a tokio task-local carries
 // it too: `scope_request_id` sets it for a future and `spawn` copies the
 // current id into a new task. A plain `tokio::spawn` does not copy it.
+// While a scoped future is polled the thread-local is cleared, so an id left
+// on the thread by the caller does not override the task's id.
 
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -401,7 +403,7 @@ pub fn mint_id() -> String {
     uuid::Uuid::new_v4().simple().to_string().chars().take(12).collect()
 }
 
-/// Read the ambient request_id (None if unset). An id set by
+/// Read the ambient request_id (None if unset). Inside a task, an id set by
 /// `with_request_id` wins over the task's id from `scope_request_id`.
 pub fn current_request_id() -> Option<String> {
     REQUEST_ID.with(|cell| cell.borrow().clone()).or_else(task_request_id)
@@ -417,27 +419,57 @@ fn task_request_id() -> Option<String> {
     None
 }
 
-/// Run `f` with `rid` set as ambient correlation. Restores prior id on exit.
+/// Puts the previous thread-local id back on drop, so a panic does not leave
+/// the id set on the thread.
+struct RestoreRequestId(Option<String>);
+
+impl RestoreRequestId {
+    fn set(rid: Option<String>) -> Self {
+        Self(REQUEST_ID.with(|cell| cell.replace(rid)))
+    }
+}
+
+impl Drop for RestoreRequestId {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = REQUEST_ID.try_with(|cell| *cell.borrow_mut() = prev);
+    }
+}
+
+/// Run `f` with `rid` set as ambient correlation. Restores prior id on exit,
+/// also when `f` panics.
 pub fn with_request_id<F, T>(rid: String, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev = REQUEST_ID.with(|cell| cell.replace(Some(rid)));
-    let out = f();
-    REQUEST_ID.with(|cell| {
-        *cell.borrow_mut() = prev;
-    });
-    out
+    let _restore = RestoreRequestId::set(Some(rid));
+    f()
+}
+
+/// Polls `fut` with the thread-local id cleared, so the task-local id is the
+/// one `current_request_id()` sees.
+#[cfg(feature = "async")]
+struct ClearThreadRequestId<F>(std::pin::Pin<Box<F>>);
+
+#[cfg(feature = "async")]
+impl<F: std::future::Future> std::future::Future for ClearThreadRequestId<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        let _restore = RestoreRequestId::set(None);
+        self.0.as_mut().poll(cx)
+    }
 }
 
 /// Run `fut` with `rid` as its request_id, across every `.await`.
 #[cfg(feature = "async")]
 pub async fn scope_request_id<F: std::future::Future>(rid: String, fut: F) -> F::Output {
-    TASK_REQUEST_ID.scope(rid, fut).await
+    TASK_REQUEST_ID.scope(rid, ClearThreadRequestId(Box::pin(fut))).await
 }
 
 /// `tokio::spawn` that carries the current request_id into the new task, or
-/// a new id if there is none.
+/// a new id if there is none. Like `tokio::spawn`, it panics outside a tokio
+/// runtime.
 #[cfg(feature = "async")]
 pub fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
 where
@@ -445,7 +477,7 @@ where
     F::Output: Send + 'static,
 {
     let rid = current_request_id().unwrap_or_else(mint_id);
-    tokio::spawn(TASK_REQUEST_ID.scope(rid, fut))
+    tokio::spawn(TASK_REQUEST_ID.scope(rid, ClearThreadRequestId(Box::pin(fut))))
 }
 
 // NDJSON sys lines on stdout without needing `tracing` or `log`. Each line
@@ -792,6 +824,16 @@ pub struct Filter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_request_id_restores_after_panic() {
+        with_request_id("outer".into(), || {
+            let r = std::panic::catch_unwind(|| with_request_id("inner".into(), || panic!("boom")));
+            assert!(r.is_err());
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        });
+        assert_eq!(current_request_id(), None);
+    }
 
     fn meta(id: &str, domain: &str) -> Meta {
         Meta {
@@ -1774,15 +1816,17 @@ pub mod codes {
 mod async_request_id_tests {
     use super::*;
 
+    // Runs in a spawned task, so the worker threads can move it between polls.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scope_survives_await() {
-        scope_request_id("r1".into(), async {
+        tokio::spawn(scope_request_id("r1".into(), async {
             for _ in 0..200 {
                 tokio::task::yield_now().await;
                 assert_eq!(current_request_id().as_deref(), Some("r1"));
             }
-        })
-        .await;
+        }))
+        .await
+        .unwrap();
         assert_eq!(current_request_id(), None);
     }
 
@@ -1791,8 +1835,8 @@ mod async_request_id_tests {
         let h = with_request_id("r2".into(), || spawn(async { current_request_id() }));
         assert_eq!(h.await.unwrap().as_deref(), Some("r2"));
 
-        let h = scope_request_id("r3".into(), async { spawn(async { current_request_id() }) }).await;
-        assert_eq!(h.await.unwrap().as_deref(), Some("r3"));
+        let rid = scope_request_id("r3".into(), async { spawn(async { current_request_id() }).await.unwrap() }).await;
+        assert_eq!(rid.as_deref(), Some("r3"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1833,7 +1877,25 @@ mod async_request_id_tests {
 
     #[tokio::test]
     async fn plain_tokio_spawn_has_no_id() {
-        let h = scope_request_id("r4".into(), async { tokio::spawn(async { current_request_id() }) }).await;
-        assert_eq!(h.await.unwrap(), None);
+        let rid = scope_request_id("r4".into(), async { tokio::spawn(async { current_request_id() }).await.unwrap() }).await;
+        assert_eq!(rid, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn panic_does_not_leave_a_stale_id() {
+        let crashed = tokio::spawn(async { with_request_id("stale".into(), || panic!("boom")) }).await;
+        assert!(crashed.is_err());
+        let rid = spawn(scope_request_id("fresh".into(), async { current_request_id() })).await.unwrap();
+        assert_eq!(rid.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn scope_beats_outer_with_request_id() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        with_request_id("outer".into(), || {
+            let rid = rt.block_on(scope_request_id("inner".into(), async { current_request_id() }));
+            assert_eq!(rid.as_deref(), Some("inner"));
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        });
     }
 }
