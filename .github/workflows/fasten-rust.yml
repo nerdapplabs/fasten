@@ -106,7 +106,7 @@ jobs:
 
   swift-binding:
     # The Swift binding in fasten-core/bindings/swift links libfasten_core.
-    # setup-swift@v2 does not support Ubuntu 26.04 yet.
+    # .github/actions/setup-swift installs the Ubuntu 24.04 build of Swift.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -145,9 +145,9 @@ jobs:
         run: cargo build --release --locked --features all
 
       - name: Set up Swift 5.10
-        uses: swift-actions/setup-swift@v2
+        uses: ./.github/actions/setup-swift
         with:
-          swift-version: "5.10"
+          version: "5.10.1"
 
       - name: Test
         working-directory: fasten-core/bindings/swift

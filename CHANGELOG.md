@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: CI installs Swift from swift.org
+
+- The Swift SDK and Rust `swift-binding` jobs install Swift 5.10.1 with
+  `.github/actions/setup-swift`: download the swift.org tarball, import the
+  swift.org keys, check the signature, unpack. `swift-actions/setup-swift`
+  also refreshed the keys from keyserver.ubuntu.com and failed the job
+  whenever that server was down.
+
 ### Added: Rust request_id follows tokio tasks
 
 - With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the
