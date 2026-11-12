@@ -30,6 +30,13 @@ pub struct AuditStoreError {
     pub source: Error,
 }
 
+/// Lets `submit()?` work in a function that returns `fasten::Error`.
+impl From<AuditStoreError> for Error {
+    fn from(e: AuditStoreError) -> Self {
+        e.source
+    }
+}
+
 /// Block until pending audit rows drain (or `timeout` elapses).
 /// Returns `true` at once when no drainer is installed.
 pub fn flush(timeout: std::time::Duration) -> bool { DEFAULT.flush(timeout) }
@@ -152,6 +159,7 @@ pub struct Row {
 
     pub code: String,
     pub action: String,
+    #[serde(with = "severity_wire")]
     pub severity: Severity,
 
     pub service_id: String,
@@ -188,6 +196,29 @@ pub struct Row {
 /// `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 pub fn canonical_ts(dt: &DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+// Severity on the wire is the lowercase name (row-schema.json), as the
+// store writes it. Reading accepts any case, so older "Info" rows parse.
+mod severity_wire {
+    use super::Severity;
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(sev: &Severity, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(sev)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Severity, D::Error> {
+        let v = String::deserialize(d)?;
+        Ok(match v.to_ascii_lowercase().as_str() {
+            "debug" => Severity::Debug,
+            "info" => Severity::Info,
+            "warn" => Severity::Warn,
+            "error" => Severity::Error,
+            "critical" => Severity::Critical,
+            _ => return Err(D::Error::unknown_variant(&v, &["debug", "info", "warn", "error", "critical"])),
+        })
+    }
 }
 
 mod canonical_ts_serde {
@@ -558,7 +589,7 @@ pub fn config_from_env() -> Result<Config, Error> {
     Ok(Config {
         service_id,
         node_id,
-        tenant_id: std::env::var("FASTEN_TENANT_ID").ok(),
+        tenant_id: std::env::var("FASTEN_TENANT_ID").ok().filter(|s| !s.is_empty()),
         extra_redact_keys: extra,
         redact_replacement: replacement,
         retention_pii: std::env::var("FASTEN_RETENTION_PII").ok().filter(|s| !s.is_empty()),
@@ -1380,6 +1411,40 @@ mod tests {
             "shipped_at": shipped,
         }))
         .unwrap()
+    }
+
+    // The README quickstart: `submit()?` in a function that returns
+    // fasten::Error. Never called; it only has to compile.
+    #[allow(dead_code)]
+    fn quickstart_submit_question_mark() -> Result<(), Error> {
+        EmitBuilder::new("USER_CREATED", "u-42").actor("admin", "user").submit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn severity_is_lowercase_on_the_wire_and_read_in_any_case() {
+        let row = ts_row("2026-01-02T03:04:05Z", serde_json::Value::Null);
+        assert_eq!(row.severity, Severity::Info);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["severity"], "info");
+        let mut lower = v.clone();
+        lower["severity"] = "critical".into();
+        assert_eq!(serde_json::from_value::<Row>(lower).unwrap().severity, Severity::Critical);
+        let mut bad = v;
+        bad["severity"] = "loud".into();
+        assert!(serde_json::from_value::<Row>(bad).is_err());
+    }
+
+    #[test]
+    fn empty_tenant_env_is_unset() {
+        std::env::set_var("FASTEN_SERVICE_ID", "s");
+        std::env::set_var("FASTEN_NODE_ID", "n");
+        std::env::set_var("FASTEN_TENANT_ID", "");
+        let cfg = config_from_env().unwrap();
+        std::env::remove_var("FASTEN_TENANT_ID");
+        std::env::remove_var("FASTEN_SERVICE_ID");
+        std::env::remove_var("FASTEN_NODE_ID");
+        assert_eq!(cfg.tenant_id, None);
     }
 
     // Spec §4.3: six fractional digits on the wire, whole seconds included.

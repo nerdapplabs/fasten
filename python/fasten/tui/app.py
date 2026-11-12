@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import select
 import sys
@@ -35,6 +36,11 @@ from typing import Any
 DEFAULT_URL = "http://localhost:9000/api/v1/logs"
 STREAMS = ("audit", "sys", "api")
 
+# Set by run(): the reader's bearer token, and the last fetch error per
+# stream, shown in the footer instead of an empty table.
+_token: str | None = None
+_errors: dict[str, str] = {}
+
 
 # HTTP helpers
 def _fetch(base_url: str, stream: str, request_id: str | None, limit: int) -> list[dict[str, Any]]:
@@ -42,13 +48,25 @@ def _fetch(base_url: str, stream: str, request_id: str | None, limit: int) -> li
     if request_id:
         params["request_id"] = request_id
     url = f"{base_url.rstrip('/')}/{stream}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url)
+    if _token:
+        req.add_header("Authorization", f"Bearer {_token}")
     try:
-        with urllib.request.urlopen(url, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             payload = json.loads(resp.read())
-        rows = payload.get("rows") or []
-        return rows if isinstance(rows, list) else []
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+    except urllib.error.HTTPError as e:
+        hint = " (set FASTEN_READER_TOKEN or --token)" if e.code in (401, 403) else ""
+        _errors[stream] = f"reader returned HTTP {e.code}{hint}"
         return []
+    except (urllib.error.URLError, TimeoutError) as e:
+        _errors[stream] = f"reader unreachable ({e})"
+        return []
+    except json.JSONDecodeError:
+        _errors[stream] = "bad JSON from reader"
+        return []
+    _errors.pop(stream, None)
+    rows = payload.get("rows") or []
+    return rows if isinstance(rows, list) else []
 
 
 def _fetch_recent_ids(base_url: str, limit: int = 200) -> list[str]:
@@ -306,6 +324,9 @@ def _build_view(
         f"audit:{len(audit_rows)} sys:{len(sys_rows)} api:{len(api_rows)} "
         f"· Δ{interval:.1f}s[/]"
     )
+    if _errors:
+        from rich.markup import escape
+        footer_txt += "  [bold red]" + escape("; ".join(sorted(set(_errors.values())))) + "[/]"
     layout["footer"].update(Panel.fit(footer_txt, border_style="dim"))
     return layout
 
@@ -317,7 +338,11 @@ def run(
     request_id: str | None = None,
     interval: float = 2.0,
     no_pick: bool = False,
+    token: str | None = None,
 ) -> int:
+    global _token
+    _token = token or os.environ.get("FASTEN_READER_TOKEN")
+    _errors.clear()
     try:
         from rich.console import Console
         from rich.live import Live
@@ -436,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="poll interval in seconds")
     p.add_argument("--no-pick",    action="store_true",
                    help="skip the initial request_id picker; watch all streams")
+    p.add_argument("--token",      default=None,
+                   help="bearer token for the reader (overrides FASTEN_READER_TOKEN)")
     args = p.parse_args(argv)
     return run(
         url=args.url,
@@ -443,4 +470,5 @@ def main(argv: list[str] | None = None) -> int:
         request_id=args.request_id,
         interval=args.interval,
         no_pick=args.no_pick,
+        token=args.token,
     )

@@ -120,7 +120,8 @@ Two complete examples are in [`examples/`](examples/):
 - [`connector.cpp`](examples/connector.cpp): a Modbus TCP stub showing
   `RequestScope`, `emit`, and retry-with-context wiring.
 - [`reader_example.cpp`](examples/reader_example.cpp): the reader
-  endpoints backed by `FastenReader`. To serve them over HTTP, use
+  endpoints, the `fasten::reader::handle_*` functions in
+  [`include/fasten_reader.hpp`](include/fasten_reader.hpp). To serve them over HTTP, use
   [`include/fasten_reader_simplehttp.hpp`](include/fasten_reader_simplehttp.hpp),
   the Simple-Web-Server adapter.
 

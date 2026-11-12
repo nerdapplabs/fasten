@@ -6,6 +6,36 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `fasten tail`, `fasten-tui` and `fasten dump`
+
+- `fasten tail` and the TUI send the reader token as `Authorization: Bearer`,
+  which `fasten.reader.require_bearer` checks. They read it from
+  `FASTEN_READER_TOKEN` or `--token`; `fasten tail` used `X-Fasten-Key`
+  from `FASTEN_READER_KEY` / `--key`, and every request got a 401.
+- A 401 says to set the token, instead of "reader unreachable" (tail) or an
+  empty "(no rows)" table (TUI, which now shows fetch errors in its footer).
+- `fasten dump --catalog PATH` loads a codes YAML file first. With no codes
+  registered it exits 1 instead of printing nothing.
+
+### Fixed: C++ build and README
+
+- Configuring with `-DSIMPLE_WEB_SERVER_DIR` no longer fails: the
+  `reader_simplehttp` example target pointed at a file that doesn't exist,
+  and is removed. Serve the reader with `fasten_reader_simplehttp.hpp`.
+- `cmake_minimum_required` is 3.18, which `find_library(... REQUIRED)` needs.
+- The README names the reader API (`fasten::reader::handle_*`), and
+  `fasten_store_sqlite.hpp` names the right CMake target, `SQLite::SQLite3`.
+
+### Fixed: Rust quickstart, severity on stdout, empty tenant
+
+- The README quickstart compiles: `submit()?` now converts into
+  `fasten::Error`.
+- Audit rows on stdout carry `"severity": "info"`, lowercase like the store
+  and `spec/row-schema.json`, not `"Info"`. Reading accepts either case.
+- An empty `FASTEN_TENANT_ID` is treated as unset (null), as in Python.
+- Removed the `store-sqlite` and `shim-tracing` features: they added
+  dependencies (`sqlx`, `tracing`) but no code used them.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
