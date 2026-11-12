@@ -6,17 +6,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed: CI installs Swift from swift.org
-
-- The Swift SDK and Rust `swift-binding` jobs install Swift 5.10.1 with
-  `.github/actions/setup-swift`: download the swift.org tarball, import the
-  swift.org keys, check the signature, unpack. Every signature must come
-  from the Swift 5.x release key, not just any key swift.org lists, and the
-  key must not be revoked.
-  `swift-actions/setup-swift` also refreshed the keys from
-  keyserver.ubuntu.com and failed the job whenever that server was down.
-- Both workflows also run when the action changes.
-
 ### Added: Rust request_id follows tokio tasks
 
 - With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the
@@ -27,7 +16,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   id the caller left on the thread does not.
 - `with_request_id` restores the previous id when its closure panics. Before,
   the id stayed set on the thread.
-- CI runs the Rust lint, tests and coverage with `async` on.
 
 ### Changed: PyPI page shows the Python README
 
