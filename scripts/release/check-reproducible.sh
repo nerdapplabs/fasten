@@ -67,24 +67,26 @@ has() { # has <listing> <entry>...
 }
 m=$work/out-a/main
 has "$(tar -tzf "$m/fasten-swift-$tag.tar.gz")" \
-  "fasten-swift-$tag/swift/Package.swift" "fasten-swift-$tag/LICENSE"
+  "fasten-swift-$tag/swift/Package.swift" "fasten-swift-$tag/LICENSE" "fasten-swift-$tag/NOTICE"
 has "$(tar -tzf "$m/fasten-cpp-$tag.tar.gz")" \
-  "fasten-cpp-$tag/cpp/include/fasten.hpp" "fasten-cpp-$tag/LICENSE"
+  "fasten-cpp-$tag/cpp/include/fasten.hpp" "fasten-cpp-$tag/LICENSE" "fasten-cpp-$tag/NOTICE"
 has "$(tar -tzf "$m/fasten-rust-$tag.tar.gz")" \
   "fasten-rust-$tag/rust/Cargo.toml" "fasten-rust-$tag/fasten-core/Cargo.lock" \
-  "fasten-rust-$tag/fasten-core/include/fasten_core.h" "fasten-rust-$tag/rust-toolchain.toml"
+  "fasten-rust-$tag/fasten-core/include/fasten_core.h" "fasten-rust-$tag/rust-toolchain.toml" \
+  "fasten-rust-$tag/LICENSE" "fasten-rust-$tag/NOTICE"
 core=fasten-core-$tag-linux-$arch
 has "$(tar -tzf "$m/$core.tar.gz")" \
   "$core/lib/libfasten_core.so" "$core/lib/libfasten_core.a" \
-  "$core/include/fasten_core.h" "$core/LICENSE"
+  "$core/include/fasten_core.h" "$core/LICENSE" "$core/NOTICE"
 gozip=$work/out-a/go/fasten-go-v0.0.0-check.zip
 has "$(python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$gozip")" \
   "github.com/nerdapplabs/fasten/go@v0.0.0-check/go.mod" \
-  "github.com/nerdapplabs/fasten/go@v0.0.0-check/LICENSE"
+  "github.com/nerdapplabs/fasten/go@v0.0.0-check/LICENSE" \
+  "github.com/nerdapplabs/fasten/go@v0.0.0-check/NOTICE"
 
 # Every tracked file of each SDK is in its archive.
 count() { git -C "$work/a" ls-files -- "$@" | wc -l; }
-entries() { tar -tzf "$1" | grep -vc '/LICENSE$' || true; }
+entries() { tar -tzf "$1" | grep -vcE '^[^/]+/(LICENSE|NOTICE)$' || true; }
 [ "$(entries "$m/fasten-swift-$tag.tar.gz")" -eq "$(count swift)" ] || { echo "FAIL: swift file count"; fail=1; }
 [ "$(entries "$m/fasten-cpp-$tag.tar.gz")" -eq "$(count cpp/include)" ] || { echo "FAIL: cpp file count"; fail=1; }
 
