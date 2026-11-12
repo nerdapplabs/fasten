@@ -16,7 +16,9 @@ name: Release
 # releases, not while one is partly published. A skip also checks that
 # the package is owned by one of the repository variables CRATES_OWNERS or
 # NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
-# covers it).
+# covers it). Set both before the first release tag: a re-run after a
+# partial publish, and any SDK release that reuses the published
+# fasten-core, takes the skip path.
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
