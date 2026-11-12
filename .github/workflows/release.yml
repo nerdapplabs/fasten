@@ -9,7 +9,9 @@ name: Release
 # GitHub prerelease only; set the repository variable PUBLISH_PRERELEASES to
 # true to also publish them to the registries.
 # A version that is already published is skipped only when the published
-# files match this build; otherwise the job fails.
+# files match this build; otherwise the job fails. The wheel and the npm
+# tarball embed the hatchling and npm versions, so re-run a partial release
+# before either changes, or bump the version.
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
@@ -247,7 +249,9 @@ jobs:
       - name: Build wheel
         run: uv build --wheel
 
-      # skip-existing below then only skips files that match this build.
+      # No skip-existing on the upload: PyPI accepts a file it already has
+      # with the same bytes and rejects one with different bytes, so a
+      # rebuilt wheel fails the upload too if this check missed it.
       - name: Files already on PyPI match this build
         run: python3 ../scripts/release/pypi-check.py dist
 
@@ -257,8 +261,6 @@ jobs:
           packages-dir: python/dist/
           # PEP 740 attestations, signed with the Trusted Publishing identity.
           attestations: true
-          # A re-run after another publish job failed.
-          skip-existing: true
 
   npm:
     needs: [tag, crates-io]
@@ -294,18 +296,10 @@ jobs:
       # the same tarball, and fails if the tarball differs.
       - name: Publish to npm (with provenance)
         run: |
+          state=$(../scripts/release/npm-check.sh .)
+          [ "$state" = publish ] || exit 0
           name=$(node -p 'require("./package.json").name')
           version=$(node -p 'require("./package.json").version')
-          published=$(npm view "$name@$version" dist.integrity 2>/dev/null || true)
-          if [ -n "$published" ]; then
-            built=$(npm pack --dry-run --json | node -e 'let s = ""; process.stdin.on("data", (d) => { s += d; }).on("end", () => console.log(JSON.parse(s)[0].integrity))')
-            if [ "$published" = "$built" ]; then
-              echo "$name $version is already on npm with the same tarball"
-              exit 0
-            fi
-            echo "::error::$name $version on npm has integrity $published, this build has $built"
-            exit 1
-          fi
           if ! npm view "$name" versions --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/view.err"; then
             grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
             echo '[]' > "$RUNNER_TEMP/versions.json"
@@ -498,8 +492,9 @@ jobs:
           path: dist
 
       # Files already on the release are left alone when their sha256
-      # matches, so a re-run uploads only what is missing. A file with the
-      # same name and different bytes fails the job.
+      # matches, so a re-run uploads only what is missing. A file left
+      # unfinished by an interrupted upload is replaced. A finished file
+      # with the same name and different bytes fails the job.
       - name: Upload to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -514,15 +509,22 @@ jobs:
               --title "$TAG" "${pre[@]}" --latest="$latest" \
               --notes "Verify these files with the steps in SECURITY.md (Verifying a release)."
           fi
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | "\(.name) \(.digest // "")"')
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | "\(.name) \(.state) \(.id) \(.digest // "none")"')
           upload=()
           for f in dist/*; do
             name=$(basename "$f")
-            digest=$(printf '%s\n' "$existing" | awk -v n="$name" '$1 == n { print ($2 == "" ? "none" : $2) }')
-            if [ -z "$digest" ]; then
+            asset=$(printf '%s\n' "$existing" | awk -v n="$name" '$1 == n { print $2, $3, $4; exit }')
+            if [ -z "$asset" ]; then
+              upload+=("$f")
+              continue
+            fi
+            read -r state id digest <<< "$asset"
+            if [ "$state" != uploaded ]; then
+              echo "$name on release $TAG is $state from an interrupted upload; replacing it"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
               upload+=("$f")
             elif [ "$digest" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
-              echo "::error::$name on release $TAG has digest $digest, which does not match this build"
+              echo "::error::$name on release $TAG has digest $digest, which does not match this build; delete it from the release if this build should replace it"
               exit 1
             else
               echo "$name is already on release $TAG"

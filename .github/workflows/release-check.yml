@@ -50,3 +50,6 @@ jobs:
 
       - name: Files on PyPI match the build
         run: scripts/release/test-pypi-check.sh
+
+      - name: Tarball on npm matches the build
+        run: scripts/release/test-npm-check.sh

@@ -9,46 +9,90 @@ trap '[ -z "$pid" ] || kill "$pid"; rm -rf "$tmp"' EXIT
 fail=0
 
 mkdir -p "$tmp/www" "$tmp/dist"
+# Paths under /fail/ answer 500.
 python3 -c '
 import functools, http.server, sys
 class H(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/fail/"):
+            self.send_error(500)
+        else:
+            super().do_GET()
 s = http.server.HTTPServer(("127.0.0.1", 0), functools.partial(H, directory=sys.argv[1]))
 open(sys.argv[2], "w").write(str(s.server_port))
 s.serve_forever()
 ' "$tmp/www" "$tmp/port" &
 pid=$!
 for _ in $(seq 50); do [ -s "$tmp/port" ] && break; sleep 0.1; done
-export PYPI_URL="http://127.0.0.1:$(cat "$tmp/port")"
+url="http://127.0.0.1:$(cat "$tmp/port")"
 
 whl=fasten_sdk-1.0.0-py3-none-any.whl
-echo built > "$tmp/dist/$whl"
+abi3=fasten_sdk-1.0.0-cp310-abi3-manylinux_2_34_x86_64.whl
 sha() { python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"; }
 
-# Serve a PyPI version page listing <filename> with the sha256 of <content>.
-serve() { # serve <filename> <content>
-  mkdir -p "$tmp/www/fasten-sdk/1.0.0"
-  printf '{"urls":[{"filename":"%s","digests":{"sha256":"%s"}}]}' "$1" "$(sha "$2")" \
-    > "$tmp/www/fasten-sdk/1.0.0/json"
+build() { # build <filename>... : dist holds these files, each containing "built"
+  rm -f "$tmp/dist"/*
+  for f in "$@"; do echo built > "$tmp/dist/$f"; done
 }
 
-check() { # check <0|1> <case>
+# Serve a PyPI version page listing each <filename> with the sha256 of
+# <content>; with no arguments, the version is not on PyPI.
+serve() { # serve [<filename> <content>]...
+  rm -rf "$tmp/www/fasten-sdk"
+  [ $# -gt 0 ] || return 0
+  local urls=
+  while [ $# -gt 0 ]; do
+    urls="$urls${urls:+,}{\"filename\":\"$1\",\"digests\":{\"sha256\":\"$(sha "$2")\"}}"
+    shift 2
+  done
+  mkdir -p "$tmp/www/fasten-sdk/1.0.0"
+  printf '{"urls":[%s]}' "$urls" > "$tmp/www/fasten-sdk/1.0.0/json"
+}
+
+check() { # check <exit> <case> [<stderr pattern>]
   local got=0
-  "$dir/pypi-check.py" "$tmp/dist" >/dev/null 2>&1 || got=$?
+  PYPI_URL=${base:-$url} "$dir/pypi-check.py" "$tmp/dist" >/dev/null 2>"$tmp/err" || got=$?
   if [ "$got" != "$1" ]; then
     echo "FAIL: $2: exit $got, want $1"
+    fail=1
+  elif [ $# -ge 3 ] && ! grep -q "$3" "$tmp/err"; then
+    echo "FAIL: $2: stderr has no '$3'"
+    cat "$tmp/err"
     fail=1
   else
     echo "ok: $2"
   fi
 }
 
+built=$'built\n'
+build "$whl"
+serve
 check 0 "version not on PyPI"
-serve "$whl" $'built\n'
+serve "$whl" "$built"
 check 0 "same file already on PyPI"
 serve "$whl" $'other\n'
-check 1 "same file name, different bytes"
-serve fasten_sdk-1.0.0-cp310-abi3-manylinux_2_34_x86_64.whl $'other\n'
+check 1 "same file name, different bytes" "::error::$whl on PyPI has sha256"
+serve "$abi3" $'other\n'
 check 0 "only other files on PyPI"
+
+build "$whl" "$abi3"
+serve "$whl" "$built"
+check 0 "one file on PyPI and the same, one not there yet"
+serve "$whl" "$built" "$abi3" $'other\n'
+check 1 "one file the same, one different" "::error::$abi3 on PyPI has sha256"
+serve "$abi3" $'other\n'
+check 1 "first file not there yet, second different" "::error::$abi3 on PyPI has sha256"
+
+build "$whl"
+mkdir -p "$tmp/www/fasten-sdk/1.0.0"
+echo '{}' > "$tmp/www/fasten-sdk/1.0.0/json"
+check 1 "version page without urls"
+echo 'not json' > "$tmp/www/fasten-sdk/1.0.0/json"
+check 1 "version page not JSON"
+base="$url/fail" check 1 "PyPI answers 500" "HTTP Error 500"
+base="http://127.0.0.1:1" check 1 "PyPI unreachable"
+rm -f "$tmp/dist"/*
+check 1 "no distributions" "no distributions"
 
 exit "$fail"
