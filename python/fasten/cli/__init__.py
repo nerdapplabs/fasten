@@ -1,6 +1,6 @@
 """Debugging CLI.
 
-  fasten dump            print registered codes as id,domain,severity
+  fasten dump            print the codes in --catalog files as id,domain,severity
   fasten tail            poll /logs/* from a service with the reader mounted
   fasten doctor          check config, stores and correlation
   fasten tui             multi-pane live view (needs fasten-sdk[tui])
@@ -18,7 +18,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="fasten")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("dump", help="print id,domain,severity sorted")
+    p_dump = sub.add_parser("dump", help="print id,domain,severity sorted")
+    p_dump.add_argument("--catalog", action="append", default=[], metavar="PATH",
+                        help="load a *.codes.yaml catalog first (repeatable)")
 
     p_doctor = sub.add_parser("doctor", help="verify init config + store + correlation wiring")
     p_doctor.add_argument("--json", action="store_true", help="emit results as JSON")
@@ -29,7 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     p_tail.add_argument("--request-id", default=None, help="filter by request_id")
     p_tail.add_argument("--interval", type=float, default=2.0, help="poll interval (sec)")
     p_tail.add_argument("--json", action="store_true", help="emit rows as NDJSON")
-    p_tail.add_argument("--key", default=None, help="X-Fasten-Key value (overrides FASTEN_READER_KEY)")
+    p_tail.add_argument("--token", default=None,
+                        help="bearer token for the reader (overrides FASTEN_READER_TOKEN)")
 
     # `fasten codes typegen <yaml> --lang <lang>`
     p_codes = sub.add_parser("codes", help="catalog tools (typegen, ...)")
@@ -58,10 +61,19 @@ def main(argv: list[str] | None = None) -> int:
                        help="primary pane")
     p_tui.add_argument("--request-id", default=None, help="filter by request_id")
     p_tui.add_argument("--interval", type=float, default=2.0, help="poll interval (sec)")
+    p_tui.add_argument("--token", default=None,
+                       help="bearer token for the reader (overrides FASTEN_READER_TOKEN)")
 
     args = p.parse_args(argv)
     if args.cmd == "dump":
-        print(dump_codes())
+        from ..codes import load as load_catalog
+        for path in args.catalog:
+            load_catalog(path)
+        out = dump_codes()
+        if not out:
+            sys.stderr.write("fasten dump: no codes registered; pass --catalog PATH\n")
+            return 1
+        print(out)
         return 0
     if args.cmd == "doctor":
         from ._doctor import run as doctor_run
@@ -74,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             request_id=args.request_id,
             interval=args.interval,
             as_json=args.json,
-            api_key=args.key,
+            token=args.token,
         )
     if args.cmd == "tui":
         from ..tui import run as tui_run
@@ -83,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             stream=args.stream,
             request_id=args.request_id,
             interval=args.interval,
+            token=args.token,
         )
     if args.cmd == "codes":
         if args.codes_cmd == "typegen":

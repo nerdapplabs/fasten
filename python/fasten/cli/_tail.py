@@ -1,6 +1,7 @@
 """`fasten tail`: poll /api/v1/logs/{audit,sys,api} and print new rows.
 
-Sends FASTEN_READER_KEY (or --key) as X-Fasten-Key. --json prints NDJSON.
+Sends FASTEN_READER_TOKEN (or --token) as `Authorization: Bearer`, which
+fasten.reader.require_bearer checks. --json prints NDJSON.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ def _fetch(
     request_id: str | None,
     since_iso: str | None,
     limit: int,
-    api_key: str | None,
+    token: str | None,
 ) -> list[dict[str, Any]]:
     params: dict[str, str] = {"limit": str(limit)}
     if request_id:
@@ -32,11 +33,15 @@ def _fetch(
     url = f"{base_url.rstrip('/')}/{stream}?{urllib.parse.urlencode(params)}"
 
     req = urllib.request.Request(url)
-    if api_key:
-        req.add_header("X-Fasten-Key", api_key)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        hint = " (set FASTEN_READER_TOKEN or --token)" if e.code in (401, 403) else ""
+        sys.stderr.write(f"fasten tail: reader returned HTTP {e.code}{hint}\n")
+        return []
     except (urllib.error.URLError, TimeoutError) as e:
         sys.stderr.write(f"fasten tail: reader unreachable ({e})\n")
         return []
@@ -89,13 +94,13 @@ def run(
     request_id: str | None = None,
     interval: float = 2.0,
     as_json: bool = False,
-    api_key: str | None = None,
+    token: str | None = None,
 ) -> int:
     if stream not in _FORMATTERS:
         sys.stderr.write(f"unknown stream {stream!r} — choose audit / sys / api\n")
         return 2
 
-    api_key = api_key or os.environ.get("FASTEN_READER_KEY")
+    token = token or os.environ.get("FASTEN_READER_TOKEN")
 
     # The first poll shows the last five minutes.
     last_seen = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
@@ -107,7 +112,7 @@ def run(
 
     try:
         while True:
-            rows = _fetch(url, stream, request_id, last_seen, limit=100, api_key=api_key)
+            rows = _fetch(url, stream, request_id, last_seen, limit=100, token=token)
 
             # Dedupe by id, or by timestamp, code and event for rows without one.
             new_rows = []

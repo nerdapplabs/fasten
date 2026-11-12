@@ -86,10 +86,18 @@ Console scripts installed by `pip install`:
 
 | Tool        | Invoke                             | What it does                                  |
 |-------------|------------------------------------|-----------------------------------------------|
-| CLI         | `fasten dump`                      | Print registered codes (CI consistency gate)  |
+| CLI         | `fasten dump --catalog codes.yaml` | Print a catalog's codes (CI consistency gate) |
 | CLI         | `fasten doctor`                    | Verify init config + correlation wiring       |
 | CLI         | `fasten tail --stream sys`         | Stream rows from a mounted reader             |
 | TUI         | `fasten-tui --request-id <id>`     | Live multi-pane audit + sys + API feed (Rich) |
+
+`fasten tail` and `fasten-tui` send `FASTEN_READER_TOKEN` (or `--token`) as
+a Bearer token, and default to `http://localhost:9000/api/v1/logs`. For the
+example above:
+
+```bash
+fasten tail --url http://localhost:8000/logs --token demo-token --stream audit
+```
 
 ## Reading logs back: whole record or recent window?
 
