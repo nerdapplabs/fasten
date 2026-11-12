@@ -40,21 +40,21 @@ tar_flags=(--create --no-recursion --null --files-from=-
   --mtime="@$epoch" --owner=0 --group=0 --numeric-owner
   --mode='u=rwX,go=rX' --format=gnu)
 
-# pack <name> <path>...: tracked files under the paths, plus LICENSE,
-# under a top-level <name>/ directory.
+# pack <name> <path>...: tracked files under the paths, plus LICENSE and
+# NOTICE, under a top-level <name>/ directory.
 pack() {
   local name=$1; shift
-  git ls-files -z -- "$@" LICENSE | sort -z \
+  git ls-files -z -- "$@" LICENSE NOTICE | sort -z \
     | tar "${tar_flags[@]}" --transform="s,^,$name/," \
     | gzip -9n > "$out/$name.tar.gz"
 }
 
 # The Go module zip: tracked files in go/ except nested modules, with the
-# repo LICENSE when go/ has none, under <module>@<version>/.
+# repo LICENSE and NOTICE when go/ has none, under <module>@<version>/.
 pack_go() {
   local version=$1 module
   module=$(awk '$1 == "module" { print $2; exit }' go/go.mod)
-  git ls-files -z -- go LICENSE | python3 -c '
+  git ls-files -z -- go LICENSE NOTICE | python3 -c '
 import sys, time, zipfile, posixpath
 out, prefix, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
 files = [p for p in sys.stdin.read().split("\0") if p]
@@ -64,8 +64,9 @@ entries = {}
 for p in files:
     if p.startswith("go/") and not any(p.startswith(d) for d in nested):
         entries[p[len("go/"):]] = p
-if "LICENSE" not in entries and "LICENSE" in files:
-    entries["LICENSE"] = "LICENSE"
+for top in ("LICENSE", "NOTICE"):
+    if top not in entries and top in files:
+        entries[top] = top
 stamp = max(time.gmtime(epoch)[:6], (1980, 1, 1, 0, 0, 0))
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for name in sorted(entries):
@@ -84,7 +85,7 @@ pack_core_lib() {
   mkdir -p "$stage/$name/lib" "$stage/$name/include"
   cp "$core_lib/libfasten_core.so" "$core_lib/libfasten_core.a" "$stage/$name/lib/"
   cp fasten-core/include/fasten_core.h "$stage/$name/include/"
-  cp LICENSE "$stage/$name/"
+  cp LICENSE NOTICE "$stage/$name/"
   (cd "$stage" && find "$name" -type f -print0 | sort -z \
     | tar "${tar_flags[@]}") | gzip -9n > "$out/$name.tar.gz"
   rm -rf "$stage"
