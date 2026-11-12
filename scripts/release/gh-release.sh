@@ -10,7 +10,8 @@
 # draft is published, as the repo's latest release when <latest> is true.
 #
 # Usage: scripts/release/gh-release.sh <tag> <latest: true|false> <dist dir>
-# Needs GITHUB_REPOSITORY. GH overrides the gh command (for the tests).
+# Needs GITHUB_REPOSITORY. GH overrides the gh command and
+# RELEASE_POLL_SECONDS the wait between release lookups (for the tests).
 set -euo pipefail
 
 [ $# -eq 3 ] || { echo "usage: $0 <tag> <true|false> <dist dir>" >&2; exit 2; }
@@ -38,7 +39,12 @@ if [ -z "$release" ]; then
   "$gh" release create "$tag" --repo "$repo" --draft --verify-tag --title "$tag" \
     --prerelease="$prerelease" \
     --notes "Verify these files with the steps in SECURITY.md (Verifying a release)."
-  release=$(find_release)
+  # The release list can lag a few seconds behind the create.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    release=$(find_release)
+    [ -z "$release" ] || break
+    sleep "${RELEASE_POLL_SECONDS:-3}"
+  done
 fi
 case $release in
   '') echo "::error::release $tag not found after creating it" >&2; exit 1 ;;

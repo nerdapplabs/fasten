@@ -24,14 +24,23 @@ edit() { # edit <file> <jq program> [jq args...]
 case "$*" in
   'api --paginate repos/o/r/releases --jq '*)
     [ -z "${LIST_FAIL:-}" ] || { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
-    jq -r "$5" "$s/releases.json" ;;
+    # After a create, the list leaves the new release out for $s/lag calls,
+    # as GitHub's list can lag behind the create.
+    lag=$(cat "$s/lag" 2>/dev/null || echo 0)
+    if [ "$lag" -gt 0 ]; then
+      echo $((lag - 1)) > "$s/lag"
+      jq -r "map(select(.id != 7)) | $5" "$s/releases.json"
+    else
+      jq -r "$5" "$s/releases.json"
+    fi ;;
   'api --paginate repos/o/r/releases/7/assets --jq '*)
     [ -z "${ASSETS_FAIL:-}" ] || { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
     jq -r "$5" "$s/assets.json" ;;
   'api -X DELETE repos/o/r/releases/assets/'*)
     edit assets.json 'map(select(.id != $id))' --argjson id "${4##*/}" ;;
   'release create '*)
-    edit releases.json '. + [{id: 7, tag_name: $t, draft: true}]' --arg t "$3" ;;
+    edit releases.json '. + [{id: 7, tag_name: $t, draft: true}]' --arg t "$3"
+    echo "${CREATE_LAG:-0}" > "$s/lag" ;;
   'release upload '*)
     tag=$3
     shift 3
@@ -49,7 +58,7 @@ case "$*" in
 esac
 EOF
 chmod +x "$tmp/gh"
-export GH="$tmp/gh" GITHUB_REPOSITORY=o/r STATE="$tmp/state"
+export GH="$tmp/gh" GITHUB_REPOSITORY=o/r STATE="$tmp/state" RELEASE_POLL_SECONDS=0
 
 mkdir -p "$tmp/dist"
 echo a > "$tmp/dist/a.tar.gz"
@@ -119,6 +128,20 @@ expect "b uploaded" on_release b.tar.gz
 expect "published as latest" logged 'release edit v1.0.0 --repo o/r --draft=false --latest=true'
 expect "published" draft_is false
 expect "other release untouched" other_untouched
+
+given "" ""
+CREATE_LAG=3 run "release list lags behind the create" v1.0.0 true
+expect "exit 0" exit_is 0
+expect "created once" [ "$(grep -c 'release create' "$STATE/log")" -eq 1 ]
+expect "a uploaded" on_release a.tar.gz
+expect "published" draft_is false
+
+given "" ""
+CREATE_LAG=20 run "release never shows up in the list" v1.0.0 true
+expect "exit 1" exit_is 1
+expect "says why" said '::error::release v1.0.0 not found after creating it'
+expect "created once" [ "$(grep -c 'release create' "$STATE/log")" -eq 1 ]
+expect "nothing uploaded" not_logged 'release upload'
 
 given "$(rel 7 v1.0.0 false)" "$a_ok,$b_ok"
 run "re-run on the published release" v1.0.0 true
