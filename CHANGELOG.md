@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ build and README
+
+- Configuring with `-DSIMPLE_WEB_SERVER_DIR` no longer fails: the
+  `reader_simplehttp` example target pointed at a file that doesn't exist,
+  and is removed. Serve the reader with `fasten_reader_simplehttp.hpp`.
+- `cmake_minimum_required` is 3.18, which `find_library(... REQUIRED)` needs.
+- The README names the reader API (`fasten::reader::handle_*`), and
+  `fasten_store_sqlite.hpp` names the right CMake target, `SQLite::SQLite3`.
+
 ### Fixed: Rust quickstart, severity on stdout, empty tenant
 
 - The README quickstart compiles: `submit()?` now converts into

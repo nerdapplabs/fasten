@@ -1,7 +1,8 @@
 // fasten_store_sqlite.hpp: header-only SQLite audit store for fasten.hpp
 //
 // Requires: sqlite3 development headers + library
-// CMake:    target_link_libraries(mytarget PRIVATE SQLite3::SQLite3)
+// CMake:    find_package(SQLite3 REQUIRED)
+//           target_link_libraries(mytarget PRIVATE SQLite::SQLite3)
 //
 // Usage:
 //   #include "fasten.hpp"
