@@ -11,8 +11,9 @@ name: Release
 # A version that is already published is skipped only when the published
 # files match this build; otherwise the job fails. The wheel records the
 # hatchling version and the npm tarball's gzip bytes depend on the npm
-# version, so re-run a partial release before either changes, or bump the
-# version.
+# version, so both are pinned (python/pyproject.toml, and the node image in
+# the npm jobs) and a re-run builds the same bytes. Bump them between
+# releases, not while one is partly published.
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
@@ -277,7 +278,7 @@ jobs:
       contents: read
       id-token: write  # required for npm --provenance
     container:
-      image: node:24-alpine
+      image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
 
     environment:
       name: npm
@@ -366,7 +367,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     container:
-      image: node:24-alpine
+      image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
     defaults:
       run:
         working-directory: js

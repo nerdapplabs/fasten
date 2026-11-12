@@ -1,5 +1,7 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned: the wheel records the hatchling version, so a release re-run
+# rebuilds the same bytes only with the same hatchling.
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
