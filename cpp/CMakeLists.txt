@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.14)
+# find_library(... REQUIRED) needs 3.18.
+cmake_minimum_required(VERSION 3.18)
 project(fasten-cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
@@ -48,12 +49,6 @@ if(FASTEN_BUILD_EXAMPLES)
         target_link_libraries(reader_example PRIVATE pthread)
     endif()
 
-    # Only with -DSIMPLE_WEB_SERVER_DIR=/path/to/Simple-Web-Server.
-    if(SIMPLE_WEB_SERVER_DIR)
-        add_executable(reader_simplehttp examples/reader_simplehttp_main.cpp)
-        target_include_directories(reader_simplehttp PRIVATE ${SIMPLE_WEB_SERVER_DIR})
-        target_link_libraries(reader_simplehttp PRIVATE fasten pthread)
-    endif()
 endif()
 
 # Tests are off by default; CI passes -DFASTEN_BUILD_TESTS=ON.
