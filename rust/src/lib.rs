@@ -424,8 +424,10 @@ fn task_request_id() -> Option<String> {
 struct RestoreRequestId(Option<String>);
 
 impl RestoreRequestId {
+    // try_with, as in drop: ClearThreadRequestId's destructor calls this and
+    // can run during thread-local teardown, when `with` would panic.
     fn set(rid: Option<String>) -> Self {
-        Self(REQUEST_ID.with(|cell| cell.replace(rid)))
+        Self(REQUEST_ID.try_with(|cell| cell.replace(rid)).unwrap_or(None))
     }
 }
 
@@ -1936,5 +1938,22 @@ mod async_request_id_tests {
             assert_eq!(rid.as_deref(), Some("inner"));
             assert_eq!(current_request_id().as_deref(), Some("outer"));
         });
+    }
+
+    // A scoped future dropped during thread-local teardown, after
+    // REQUEST_ID is gone, must not panic in its destructor (that aborts).
+    #[test]
+    fn drop_after_request_id_teardown_does_not_panic() {
+        thread_local! {
+            static HELD: RefCell<Option<ClearThreadRequestId<std::future::Ready<()>>>> =
+                const { RefCell::new(None) };
+        }
+        std::thread::spawn(|| {
+            // HELD registers its destructor first, so it runs after REQUEST_ID's.
+            HELD.with(|h| *h.borrow_mut() = Some(ClearThreadRequestId::new(std::future::ready(()))));
+            REQUEST_ID.with(|_| {});
+        })
+        .join()
+        .unwrap();
     }
 }
