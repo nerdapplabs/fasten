@@ -13,12 +13,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   OpenSSL bundled by auditwheel) and macOS arm64 and x86_64 (11.0 or later).
   `pip install fasten-sdk` then needs no Rust build and no `FASTEN_CORE_LIB`.
   Other platforms get no wheel, so pip reports no matching distribution.
-- New `python-wheels.yml` builds the wheels, installs each one in a clean
-  environment and checks that it emits rows and verifies the chain
-  (`scripts/release/wheel-smoke.py`). `release.yml` publishes those wheels.
-- `python/hatch_build.py` tags the wheel for the platform and adds the
-  library when `FASTEN_WHEEL_LIB` and `FASTEN_WHEEL_PLAT` are set. Without
-  them the wheel stays pure Python, as before.
 
 ### Changed: PyPI page shows the Python README
 
