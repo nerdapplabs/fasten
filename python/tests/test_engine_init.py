@@ -29,6 +29,51 @@ def test_init_stdout_only_when_no_audit_store_and_no_dsn(monkeypatch):
     assert _default._audit_store is None
 
 
+@pytest.mark.parametrize("with_store", [False, True], ids=["stdout-only", "raise-strategy"])
+def test_init_raises_without_the_core(monkeypatch, mem_store, with_store):
+    """Without libfasten_core every log line would be unredactable, so
+    init() fails instead of starting. These are the setups without a
+    drainer, which used to start: stdout-only, and a store with the
+    "raise" failure strategy."""
+    from fasten import core_ffi
+
+    def _no_core(*_a, **_k):
+        raise OSError("libfasten_core not found")
+
+    monkeypatch.delenv("FASTEN_AUDIT_DSN", raising=False)
+    monkeypatch.setattr(core_ffi, "get_lib", _no_core)
+    kwargs = {"audit_store": mem_store, "audit_store_failure_strategy": "raise"} if with_store else {}
+    with pytest.raises(OSError, match="libfasten_core not found"):
+        fasten.init(service_id="svc", node_id="n", **kwargs)
+    assert _default.last_init_at() is None
+
+
+def test_core_load_error_names_the_path(monkeypatch, tmp_path):
+    from fasten import core_ffi
+
+    bad = tmp_path / "libfasten_core.so"
+    bad.write_text("not a library")
+    monkeypatch.setenv("FASTEN_CORE_LIB", str(bad))
+    monkeypatch.setattr(core_ffi, "_lib", None)
+    with pytest.raises(OSError, match=f"could not load libfasten_core from {bad}"):
+        core_ffi.get_lib()
+
+
+def test_core_missing_a_symbol_is_an_oserror_and_not_cached(monkeypatch):
+    """A library that loads but lacks a symbol (an older build) raises
+    OSError naming the path, and is not cached half-configured."""
+    from fasten import core_ffi
+
+    def _old_build(_lib):
+        raise AttributeError("undefined symbol: fasten_new_function")
+
+    monkeypatch.setattr(core_ffi, "_lib", None)
+    monkeypatch.setattr(core_ffi, "_configure", _old_build)
+    with pytest.raises(OSError, match="could not load libfasten_core from .*undefined symbol"):
+        core_ffi.get_lib()
+    assert core_ffi._lib is None
+
+
 def test_init_raises_on_invalid_strategy(mem_store):
     with pytest.raises(RuntimeError, match="audit_store_failure_strategy"):
         fasten.init(
