@@ -114,6 +114,20 @@ def test_dump_prints_the_catalog_codes(catalog, capsys):
     assert "DUMPTEST_DONE,dumptest,warn" in capsys.readouterr().out.splitlines()
 
 
+def test_dump_reports_a_bad_catalog_in_one_line(tmp_path, capsys):
+    missing = tmp_path / "missing.codes.yaml"
+    assert cli.main(["dump", "--catalog", str(missing)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"fasten dump: {missing}: ")
+    assert "Traceback" not in err
+
+
+def test_dump_names_an_empty_catalog(catalog, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "dump_codes", lambda: "")
+    assert cli.main(["dump", "--catalog", str(catalog)]) == 1
+    assert "the catalog has no codes" in capsys.readouterr().err
+
+
 def test_dump_fails_with_no_codes(monkeypatch, capsys):
     monkeypatch.setattr(cli, "dump_codes", lambda: "")
     assert cli.main(["dump"]) == 1
