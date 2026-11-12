@@ -13,7 +13,10 @@ name: Release
 # hatchling version and the npm tarball's gzip bytes depend on the npm
 # version, so both are pinned (python/pyproject.toml, and the node image in
 # the npm jobs) and a re-run builds the same bytes. Bump them between
-# releases, not while one is partly published.
+# releases, not while one is partly published. A skip also checks that
+# the package is owned by one of the repository variables CRATES_OWNERS or
+# NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
+# covers it).
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
@@ -189,6 +192,7 @@ jobs:
         working-directory: fasten-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
@@ -219,6 +223,7 @@ jobs:
         working-directory: rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: |
           state=$(../scripts/release/core-published.sh .)
           if [ "$state" = skip ]; then
@@ -326,6 +331,7 @@ jobs:
           npm publish --provenance --access public --tag "$tag"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OWNERS: ${{ vars.NPM_OWNERS }}
 
   # Dry run of the three publish jobs: same images and builds, no
   # environment (so no approval), no registry token, nothing uploaded.
@@ -377,12 +383,13 @@ jobs:
       - name: Install bash
         run: apk add --no-cache bash
 
-      # The same check the npm job runs, in the same image. Between
-      # releases js/package.json holds the published version and the
-      # tarball differs, so that (exit 3) is a warning here.
+      # The same check the npm job runs, in the same image. Exit 3 is a
+      # warning here: between releases js/package.json holds the published
+      # version and the tarball differs, or NPM_OWNERS is not set.
       - name: Already on npm
         env:
           RELEASE_CHECK_LEVEL: warning
+          NPM_OWNERS: ${{ vars.NPM_OWNERS }}
         run: ../scripts/release/npm-check.sh . || [ $? -eq 3 ]
 
       # The dist-tag is worked out without the versions on npm, so a
@@ -402,12 +409,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # A fasten-core that changed since its version was published (exit 3)
-      # is a warning here; the crates-io job would fail on it.
+      # Exit 3 is a warning here; the crates-io job would fail on it:
+      # fasten-core changed since its version was published, or it is
+      # published with the same files but CRATES_OWNERS is not set.
       - name: cargo publish --dry-run fasten-core
         working-directory: fasten-core
         env:
           RELEASE_CHECK_LEVEL: warning
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
@@ -416,18 +425,20 @@ jobs:
           case $state in
             skip) echo "fasten-core is already on crates.io with the same files" ;;
             publish) cargo publish --dry-run --locked ;;
-            # Changed since its version was published: still check it packages.
+            # Exit 3 (changed, or owner not checked): still check it packages.
             *) cargo package --locked ;;
           esac
 
       # The check the crates-io job runs before publishing the SDK. It
       # packages the SDK against fasten-core from crates.io, so it runs
-      # only when the tree's fasten-core is published with the same files.
+      # only when the tree's fasten-core is published with the same files
+      # and an owner in CRATES_OWNERS; otherwise the step above warned.
       - name: SDK already on crates.io
         if: ${{ env.core_state == 'skip' }}
         working-directory: rust
         env:
           RELEASE_CHECK_LEVEL: warning
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: ../scripts/release/core-published.sh . || [ $? -eq 3 ]
 
       # fasten-core may not be on crates.io yet, so the SDK is packaged and

@@ -6,14 +6,20 @@
 # yanked; RELEASE_CHECK_LEVEL=warning reports that as a warning, for dry
 # runs. Exits 1 when crates.io cannot be read or cargo package fails.
 #
+# Skip also needs one of CRATES_OWNERS among the crate's owners on
+# crates.io (comma-separated logins; a user, or a team as github:org:team).
+# Other owners exit 1; an unset CRATES_OWNERS exits 3.
+#
 # Usage: scripts/release/core-published.sh <crate dir>
-# CRATES_INDEX and CRATES_DL override the crates.io URLs (for the tests).
+# CRATES_INDEX, CRATES_DL and CRATES_API override the crates.io URLs (for
+# the tests).
 set -euo pipefail
 export LC_ALL=C
 
 [ $# -eq 1 ] || { echo "usage: $0 <crate dir>" >&2; exit 2; }
 index=${CRATES_INDEX:-https://index.crates.io}
 dl=${CRATES_DL:-https://static.crates.io/crates}
+api=${CRATES_API:-https://crates.io/api/v1}
 dir=$(cd "$1" && pwd)
 
 field() { sed -n "s/^$1 = \"\(.*\)\"\$/\1/p" "$dir/Cargo.toml" | head -n 1; }
@@ -65,4 +71,20 @@ case $diff_rc in
   1) echo "::$level::$name changed since $version was published; bump its version" >&2; exit 3 ;;
   *) echo "::error::could not compare $name with the published $version" >&2; exit 1 ;;
 esac
-echo skip
+
+if [ -z "${CRATES_OWNERS:-}" ]; then
+  echo "::$level::$name $version is on crates.io with the same files, but CRATES_OWNERS is not set, so its owner can't be checked" >&2
+  exit 3
+fi
+# crates.io asks API clients for a User-Agent.
+curl -fsS --max-time 60 -A "fasten-release-check" -o "$tmp/owners" "$api/crates/$name/owners" \
+  || { echo "::error::could not read the crates.io owners of $name" >&2; exit 1; }
+owners=$({ grep -o '"login":"[^"]*"' "$tmp/owners" || true; } | cut -d'"' -f4)
+for want in $(printf '%s' "$CRATES_OWNERS" | tr ',' ' '); do
+  if printf '%s\n' "$owners" | grep -qxF -- "$want"; then
+    echo skip
+    exit 0
+  fi
+done
+echo "::error::$name on crates.io is owned by '$(printf '%s' "$owners" | tr '\n' ' ')', none of CRATES_OWNERS ($CRATES_OWNERS)" >&2
+exit 1

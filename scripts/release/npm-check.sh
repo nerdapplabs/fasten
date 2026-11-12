@@ -5,6 +5,9 @@
 # integrity differs (RELEASE_CHECK_LEVEL=warning reports that as a warning,
 # for dry runs), and 1 when the registry lookup or npm pack fails.
 #
+# Skip also needs one of NPM_OWNERS (comma-separated npm users) among the
+# package's owners. Other owners exit 1; an unset NPM_OWNERS exits 3.
+#
 # Usage: scripts/release/npm-check.sh <package dir>
 # NPM overrides the npm command (for the tests).
 set -euo pipefail
@@ -54,5 +57,23 @@ if [ "$published" != "$built" ]; then
   echo "::${RELEASE_CHECK_LEVEL:-error}::$name $version on npm has integrity $published, this build has $built" >&2
   exit 3
 fi
-echo "$name $version is already on npm with the same tarball" >&2
-echo skip
+
+if [ -z "${NPM_OWNERS:-}" ]; then
+  echo "::${RELEASE_CHECK_LEVEL:-error}::$name $version is on npm with the same tarball, but NPM_OWNERS is not set, so its owner can't be checked" >&2
+  exit 3
+fi
+if ! "$npm" owner ls "$name" > "$tmp/owners" 2> "$tmp/err"; then
+  cat "$tmp/err" >&2
+  echo "::error::npm owner ls $name failed" >&2
+  exit 1
+fi
+owners=$(awk '{ print $1 }' "$tmp/owners")
+for want in $(printf '%s' "$NPM_OWNERS" | tr ',' ' '); do
+  if printf '%s\n' "$owners" | grep -qxF -- "$want"; then
+    echo "$name $version is already on npm with the same tarball" >&2
+    echo skip
+    exit 0
+  fi
+done
+echo "::error::$name on npm is owned by '$(printf '%s' "$owners" | tr '\n' ' ')', none of NPM_OWNERS ($NPM_OWNERS)" >&2
+exit 1

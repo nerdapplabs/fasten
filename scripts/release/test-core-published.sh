@@ -8,7 +8,7 @@ pid=
 trap '[ -z "$pid" ] || kill "$pid"; rm -rf "$tmp"' EXIT
 fail=0
 
-mkdir -p "$tmp/www/index/fa/st" "$tmp/www/dl/fasten-core" "$tmp/crate/src"
+mkdir -p "$tmp/www/index/fa/st" "$tmp/www/dl/fasten-core" "$tmp/www/api/crates/fasten-core" "$tmp/crate/src"
 # Paths under /fail/ answer 500; under /short/, a 200 whose body is cut off.
 python3 -c '
 import functools, http.server, sys
@@ -33,7 +33,14 @@ s.serve_forever()
 pid=$!
 for _ in $(seq 50); do [ -s "$tmp/port" ] && break; sleep 0.1; done
 url="http://127.0.0.1:$(cat "$tmp/port")"
-export CRATES_INDEX="$url/index" CRATES_DL="$url/dl"
+export CRATES_INDEX="$url/index" CRATES_DL="$url/dl" CRATES_API="$url/api"
+export CRATES_OWNERS="release-bot,github:nerdapplabs:release"
+owners() { # owners <login>...: the crate's owners as the crates.io API lists them
+  local users= l
+  for l in "$@"; do users="$users${users:+,}{\"kind\":\"user\",\"login\":\"$l\"}"; done
+  printf '{"users":[%s]}' "$users" > "$tmp/www/api/crates/fasten-core/owners"
+}
+owners someone github:nerdapplabs:release
 
 printf '[package]\nname = "fasten-core"\nversion = "0.1.0"\nedition = "2021"\nlicense = "Apache-2.0"\ndescription = "test"\n' \
   > "$tmp/crate/Cargo.toml"
@@ -71,6 +78,14 @@ printf '{"name":"fasten-core","vers":"0.0.9"}\n' > "$tmp/www/index/fa/st/fasten-
 check publish "another version on crates.io"
 publish
 check skip "same files on crates.io"
+owners someone
+check fail "same files, owned by someone else" "::error::fasten-core on crates.io is owned by 'someone', none of CRATES_OWNERS"
+owners release-bot-x
+check fail "same files, owner name only starts like ours" "owned by 'release-bot-x'"
+owners someone github:nerdapplabs:release
+CRATES_API="$url/fail/api" check fail "same files, owner lookup fails" "::error::could not read the crates.io owners"
+CRATES_OWNERS= check differs "same files, CRATES_OWNERS not set" "::error::.*CRATES_OWNERS is not set"
+CRATES_OWNERS= RELEASE_CHECK_LEVEL=warning check differs "same files, CRATES_OWNERS not set, as a warning" "::warning::.*CRATES_OWNERS is not set"
 CRATES_DL="$url/fail/dl" check fail "published .crate download fails" "::error::could not download fasten-core 0.1.0"
 cp "$tmp/www/index/fa/st/fasten-core" "$tmp/index.bak"
 printf '{"name":"fasten-core","vers":"0.0.9"}\n{"name":"fasten-core","vers":"0.1.0","yanked":true}\n' \

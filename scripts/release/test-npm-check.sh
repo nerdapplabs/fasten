@@ -12,8 +12,9 @@ printf '{"name":"@nerdapplabs/fasten","version":"1.0.0"}\n' > "$tmp/pkg/package.
 
 # The stand-in answers `npm view <name>@<version> dist.integrity` from
 # VIEW_OUT, VIEW_ERR and VIEW_RC, and `npm pack --dry-run --json` with
-# PACK_OUT (default: a pack result with the integrity in PACK) and PACK_RC.
-# Any other command line exits 99.
+# PACK_OUT (default: a pack result with the integrity in PACK) and PACK_RC,
+# and `npm owner ls <name>` with OWNERS_OUT and OWNERS_RC. Any other command
+# line exits 99.
 cat > "$tmp/npm" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
@@ -26,11 +27,14 @@ case "$*" in
       printf '[{"integrity":"%s"}]\n' "$PACK"
     fi
     exit "${PACK_RC:-0}" ;;
+  'owner ls @nerdapplabs/fasten')
+    printf '%s\n' "${OWNERS_OUT:-}"; exit "${OWNERS_RC:-0}" ;;
   *) echo "unexpected: npm $*" >&2; exit 99 ;;
 esac
 EOF
 chmod +x "$tmp/npm"
-export NPM="$tmp/npm" PACK=sha512-built
+export NPM="$tmp/npm" PACK=sha512-built NPM_OWNERS=release-bot,nerdapplabs
+export OWNERS_OUT='nerdapplabs <ops@example.com>'
 
 check() { # check <publish|skip|differs|fail> <case> [<stderr pattern>]
   local got rc=0
@@ -59,6 +63,18 @@ VIEW_OUT= VIEW_ERR="$missing" VIEW_RC=1 check publish "version not on npm"
 VIEW_OUT= VIEW_ERR= VIEW_RC=0 check publish "version not on npm (older npm)"
 VIEW_OUT= VIEW_ERR="$never" VIEW_RC=1 check publish "package never published"
 VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 check skip "same tarball on npm"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 OWNERS_OUT=$'someone <a@example.com>\nnerdapplabs <ops@example.com>' \
+  check skip "same tarball, one of several owners is ours"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 OWNERS_OUT='someone <a@example.com>' \
+  check fail "same tarball, owned by someone else" "::error::.*owned by 'someone', none of NPM_OWNERS"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 OWNERS_OUT='nerdapplabs-x <a@example.com>' \
+  check fail "same tarball, owner name only starts like ours" "owned by 'nerdapplabs-x'"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 OWNERS_RC=1 \
+  check fail "same tarball, owner lookup fails" "::error::npm owner ls .* failed"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 NPM_OWNERS= \
+  check differs "same tarball, NPM_OWNERS not set" "::error::.*NPM_OWNERS is not set"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 NPM_OWNERS= RELEASE_CHECK_LEVEL=warning \
+  check differs "same tarball, NPM_OWNERS not set, as a warning" "::warning::.*NPM_OWNERS is not set"
 VIEW_OUT=sha512-other VIEW_ERR= VIEW_RC=0 check differs "different tarball on npm" "::error::.*has integrity sha512-other, this build has sha512-built"
 VIEW_OUT=sha512-other VIEW_ERR= VIEW_RC=0 RELEASE_CHECK_LEVEL=warning check differs "different tarball, as a warning" "::warning::.*has integrity sha512-other"
 VIEW_OUT= VIEW_ERR='npm error code ETIMEDOUT' VIEW_RC=1 check fail "registry unreachable" "npm view .* failed"
