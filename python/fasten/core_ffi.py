@@ -34,8 +34,9 @@ def _find_lib() -> str:
 
     raise OSError(
         "libfasten_core not found. "
-        "Build it with `cargo build --release --features all` in fasten-core/, "
-        "then set FASTEN_CORE_LIB=/path/to/libfasten_core.so."
+        "Install a fasten-sdk wheel built for this platform, or build it with "
+        "`cargo build --release --features all` in fasten-core/ and set "
+        "FASTEN_CORE_LIB=/path/to/libfasten_core.so."
     )
 
 
@@ -127,8 +128,14 @@ _lib: Optional[ctypes.CDLL] = None
 def get_lib() -> ctypes.CDLL:
     global _lib
     if _lib is None:
-        _lib = ctypes.CDLL(_find_lib())
-        _configure(_lib)
+        path = _find_lib()
+        try:
+            lib = ctypes.CDLL(path)
+            # An older build lacks a symbol: AttributeError.
+            _configure(lib)
+        except (OSError, AttributeError) as e:
+            raise OSError(f"could not load libfasten_core from {path}: {e}") from e
+        _lib = lib
     return _lib
 
 

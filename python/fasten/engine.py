@@ -454,6 +454,10 @@ class Engine:
     def start(self, cfg: FastenConfig) -> None:
         """Apply a FastenConfig. Can be called again to reconfigure; the
         previous drainer and purger threads are stopped first."""
+        # Redaction runs in libfasten_core. Without it every log line would
+        # be replaced by the unredactable marker, so refuse to start.
+        _ffi.get_lib()
+
         # Old purgers would otherwise keep running against the old store.
         self._stop_retention_threads()
 

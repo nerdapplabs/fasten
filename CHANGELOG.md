@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Python `init()` fails when libfasten_core can't be loaded
+
+- `fasten.init()` started without the core library when no drainer was
+  needed (stdout-only, or a store with `audit_store_failure_strategy="raise"`),
+  and every `fasten.log.*` line was then replaced by
+  `{"_redact_failed": true, "_summary": "<unredactable>"}`, with no error.
+  It now raises `OSError` saying how to install or build the library.
+- A library that exists but can't be loaded (wrong platform, bad file, an
+  older build missing a function) raises `OSError` naming its path.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
