@@ -3,10 +3,14 @@
 
 Exits 0 when the version is not on PyPI, or when every file PyPI has for it
 is in <dist dir> with the same sha256 (built files not on PyPI yet are fine:
-a re-run after a partial upload). Exits 1 when a file differs, when PyPI has
-a file this build does not, or when PyPI cannot be read.
-
-Wheels only, as the release publishes; an sdist in <dist dir> is an error.
+a re-run after a partial upload).
+Exits 3 when the version is on PyPI and this build cannot be published as
+it: a file differs, PyPI has a file this build does not, the version is
+yanked, or its files were deleted. RELEASE_CHECK_LEVEL=warning reports
+these as warnings (dry runs).
+Exits 1 when PyPI cannot be read or answers with something unexpected, when
+<dist dir> has no wheels, or when it has an sdist (the release publishes
+wheels only).
 
 Usage: scripts/release/pypi-check.py <dist dir>
 PYPI_URL overrides https://pypi.org/pypi (for the tests).
@@ -20,9 +24,18 @@ import urllib.error
 import urllib.request
 
 
+DIFFERS = 3
+
+
 def error(msg: str) -> int:
     print(f"::error::{msg}", file=sys.stderr)
     return 1
+
+
+def differs(msg: str) -> int:
+    level = os.environ.get("RELEASE_CHECK_LEVEL", "error")
+    print(f"::{level}::{msg}", file=sys.stderr)
+    return DIFFERS
 
 
 def main() -> int:
@@ -43,7 +56,9 @@ def main() -> int:
     url = f"{os.environ.get('PYPI_URL', 'https://pypi.org/pypi')}/{project}/{version}/json"
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
-            published = {u["filename"]: u["digests"]["sha256"] for u in json.load(r)["urls"]}
+            urls = json.load(r)["urls"]
+            published = {u["filename"]: u["digests"]["sha256"] for u in urls}
+            yanked = any(u.get("yanked") for u in urls)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             print(f"{project} {version} is not on PyPI")
@@ -54,9 +69,13 @@ def main() -> int:
     except (ValueError, KeyError, TypeError) as e:
         return error(f"{url}: unexpected response: {e!r}")
 
+    if not published:
+        return differs(f"{project} {version} is on PyPI with no files (deleted); bump the version")
+    if yanked:
+        return differs(f"{project} {version} is yanked on PyPI; bump the version")
     bad = 0
     for f in sorted(set(published) - set(files)):
-        bad = error(f"{f} is on PyPI for {version} but not in this build")
+        bad = differs(f"{f} is on PyPI for {version} but not in this build")
     for f in files:
         if f not in published:
             print(f"{f}: not on PyPI yet")
@@ -66,7 +85,7 @@ def main() -> int:
         if local == published[f]:
             print(f"{f}: already on PyPI with the same sha256")
         else:
-            bad = error(f"{f} on PyPI has sha256 {published[f]}, this build has {local}")
+            bad = differs(f"{f} on PyPI has sha256 {published[f]}, this build has {local}")
     return bad
 
 

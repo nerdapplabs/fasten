@@ -32,9 +32,10 @@ EOF
 chmod +x "$tmp/npm"
 export NPM="$tmp/npm" PACK=sha512-built
 
-check() { # check <publish|skip|fail> <case> [<stderr pattern>]
-  local got
-  got=$("$dir/npm-check.sh" "$tmp/pkg" 2>"$tmp/err") || got=fail
+check() { # check <publish|skip|differs|fail> <case> [<stderr pattern>]
+  local got rc=0
+  got=$("$dir/npm-check.sh" "$tmp/pkg" 2>"$tmp/err") || rc=$?
+  case $rc in 0) ;; 3) got=differs ;; *) got=fail ;; esac
   if [ "$got" != "$1" ]; then
     echo "FAIL: $2: got $got, want $1"
     cat "$tmp/err"
@@ -58,12 +59,15 @@ VIEW_OUT= VIEW_ERR="$missing" VIEW_RC=1 check publish "version not on npm"
 VIEW_OUT= VIEW_ERR= VIEW_RC=0 check publish "version not on npm (older npm)"
 VIEW_OUT= VIEW_ERR="$never" VIEW_RC=1 check publish "package never published"
 VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 check skip "same tarball on npm"
-VIEW_OUT=sha512-other VIEW_ERR= VIEW_RC=0 check fail "different tarball on npm" "has integrity sha512-other, this build has sha512-built"
+VIEW_OUT=sha512-other VIEW_ERR= VIEW_RC=0 check differs "different tarball on npm" "::error::.*has integrity sha512-other, this build has sha512-built"
+VIEW_OUT=sha512-other VIEW_ERR= VIEW_RC=0 RELEASE_CHECK_LEVEL=warning check differs "different tarball, as a warning" "::warning::.*has integrity sha512-other"
 VIEW_OUT= VIEW_ERR='npm error code ETIMEDOUT' VIEW_RC=1 check fail "registry unreachable" "npm view .* failed"
 VIEW_OUT= VIEW_ERR='npm error code E500' VIEW_RC=1 check fail "registry error" "npm view .* failed"
 VIEW_OUT= VIEW_ERR='npm error code E404' VIEW_RC=1 check fail "other 404" "npm view .* failed"
 VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 PACK_RC=1 check fail "npm pack fails"
 VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 PACK_OUT='not json' check fail "npm pack prints no JSON" "SyntaxError"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 PACK_OUT='[{}]' check fail "npm pack reports no integrity" "reported no sha512 integrity"
+VIEW_OUT=sha512-built VIEW_ERR= VIEW_RC=0 PACK_OUT='[]' check fail "npm pack reports nothing" "reported no sha512 integrity"
 
 [ "$fail" -eq 0 ] || exit 1
 echo "npm-check: ok"

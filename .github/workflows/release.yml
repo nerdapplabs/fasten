@@ -353,12 +353,13 @@ jobs:
       - name: Check metadata
         run: uvx twine check dist/*
 
-      # As in npm-dry-run, a warning only: between releases the version in
-      # the tree is usually already on PyPI with other bytes.
+      # Between releases the version in the tree is usually already on
+      # PyPI with other bytes, so that (exit 3) is a warning here; any
+      # other failure, such as PyPI not answering, fails the dry run.
       - name: Files already on PyPI
-        run: |
-          python3 ../scripts/release/pypi-check.py dist \
-            || echo "::warning::pypi-check.py failed; a release of this version would fail the pypi job"
+        env:
+          RELEASE_CHECK_LEVEL: warning
+        run: python3 ../scripts/release/pypi-check.py dist || [ $? -eq 3 ]
 
   npm-dry-run:
     needs: [test-python, test-js, test-rust, versions]
@@ -375,13 +376,13 @@ jobs:
       - name: Install bash
         run: apk add --no-cache bash
 
-      # The same check the npm job runs, in the same image. Only a warning:
-      # between releases js/package.json holds the published version, and
-      # any change to the package makes the tarball differ.
+      # The same check the npm job runs, in the same image. Between
+      # releases js/package.json holds the published version and the
+      # tarball differs, so that (exit 3) is a warning here.
       - name: Already on npm
-        run: |
-          ../scripts/release/npm-check.sh . \
-            || echo "::warning::npm-check.sh failed; a release of this version would fail the npm job"
+        env:
+          RELEASE_CHECK_LEVEL: warning
+        run: ../scripts/release/npm-check.sh . || [ $? -eq 3 ]
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
@@ -400,26 +401,33 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # A fasten-core that changed since its version was published (exit 3)
+      # is a warning here; the crates-io job would fail on it.
       - name: cargo publish --dry-run fasten-core
         working-directory: fasten-core
+        env:
+          RELEASE_CHECK_LEVEL: warning
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
-          state=$(../scripts/release/core-published.sh .)
-          if [ "$state" = skip ]; then
-            echo "fasten-core is already on crates.io with the same files"
-          else
-            cargo publish --dry-run --locked
-          fi
+          state=$(../scripts/release/core-published.sh .) || [ $? -eq 3 ]
+          echo "core_state=$state" >> "$GITHUB_ENV"
+          case $state in
+            skip) echo "fasten-core is already on crates.io with the same files" ;;
+            publish) cargo publish --dry-run --locked ;;
+            # Changed since its version was published: still check it packages.
+            *) cargo package --locked ;;
+          esac
 
-      # The check the crates-io job runs before publishing the SDK. A warning
-      # only: it packages against fasten-core on crates.io, which fails
-      # while the tree's fasten-core version is not published.
+      # The check the crates-io job runs before publishing the SDK. It
+      # packages the SDK against fasten-core from crates.io, so it runs
+      # only when the tree's fasten-core is published with the same files.
       - name: SDK already on crates.io
+        if: ${{ env.core_state == 'skip' }}
         working-directory: rust
-        run: |
-          ../scripts/release/core-published.sh . \
-            || echo "::warning::core-published.sh failed for the SDK; a release of this tree would fail the crates-io job"
+        env:
+          RELEASE_CHECK_LEVEL: warning
+        run: ../scripts/release/core-published.sh . || [ $? -eq 3 ]
 
       # fasten-core may not be on crates.io yet, so the SDK is packaged and
       # built against the fasten-core in the tree.
@@ -498,9 +506,19 @@ jobs:
           name: release-files
           path: dist
 
+      # Every file is checked, and every file is listed: one missing from
+      # SHA256SUMS would go out with no published checksum.
       - name: Verify checksums
         working-directory: dist
-        run: sha256sum -c SHA256SUMS
+        run: |
+          sha256sum -c SHA256SUMS
+          listed=$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort)
+          present=$(ls -A | grep -vx SHA256SUMS | sort)
+          if [ "$listed" != "$present" ]; then
+            echo "::error::the files in dist and in SHA256SUMS differ"
+            diff <(echo "$listed") <(echo "$present") || true
+            exit 1
+          fi
 
       - name: Verify attestations
         if: ${{ github.event_name == 'push' }}
@@ -534,53 +552,14 @@ jobs:
           name: release-files
           path: dist
 
-      # Files already on the release are left alone when their sha256
-      # matches, so a re-run uploads only what is missing. A file left
-      # unfinished by an interrupted upload is replaced. A finished file
-      # with the same name and different bytes fails the job.
+      # gh-release.sh creates the release as a draft, uploads what is
+      # missing, checks every file's digest and only then publishes it.
       - name: Upload to the GitHub release
         shell: bash   # adds pipefail, for the git tag | latest-flag.sh pipe
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if ! err=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --silent 2>&1); then
-            case $err in
-              *"HTTP 404"*) ;;
-              *) echo "$err"; echo "::error::could not look up release $TAG"; exit 1 ;;
-            esac
-            pre=()
-            case $TAG in *-*) pre=(--prerelease) ;; esac
-            # Only the highest vX.Y.Z tag becomes the repo's latest release.
-            latest=$(git tag -l 'v*' | scripts/release/latest-flag.sh "$TAG")
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "$TAG" "${pre[@]}" --latest="$latest" \
-              --notes "Verify these files with the steps in SECURITY.md (Verifying a release)."
-          fi
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | "\(.name) \(.state) \(.id) \(.digest // "none")"')
-          upload=()
-          for f in dist/*; do
-            name=$(basename "$f")
-            asset=$(printf '%s\n' "$existing" | awk -v n="$name" '$1 == n { print $2, $3, $4 }')
-            if [ -z "$asset" ]; then
-              upload+=("$f")
-              continue
-            fi
-            read -r state id digest <<< "$asset"
-            if [ "$state" != uploaded ]; then
-              echo "$name on release $TAG is $state from an interrupted upload; replacing it"
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
-              upload+=("$f")
-            elif [ "$digest" = none ]; then
-              echo "::error::$name on release $TAG has no digest on GitHub, so it cannot be compared with this build; delete it from the release and re-run"
-              exit 1
-            elif [ "$digest" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
-              echo "::error::$name on release $TAG has digest $digest, which does not match this build; delete it from the release if this build should replace it"
-              exit 1
-            else
-              echo "$name is already on release $TAG"
-            fi
-          done
-          if [ ${#upload[@]} -gt 0 ]; then
-            gh release upload "$TAG" "${upload[@]}" --repo "$GITHUB_REPOSITORY"
-          fi
+          # Only the highest vX.Y.Z tag becomes the repo's latest release.
+          latest=$(git tag -l 'v*' | scripts/release/latest-flag.sh "$TAG")
+          scripts/release/gh-release.sh "$TAG" "$latest" dist

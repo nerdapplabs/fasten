@@ -37,13 +37,14 @@ build() { # build <filename>... : dist holds these files, each containing "built
 }
 
 # Serve a PyPI version page listing each <filename> with the sha256 of
-# <content>; with no arguments, the version is not on PyPI.
+# <content>; with no arguments, the version is not on PyPI. YANKED=true
+# marks the files yanked.
 serve() { # serve [<filename> <content>]...
   rm -rf "$tmp/www/fasten-sdk"
   [ $# -gt 0 ] || return 0
   local urls=
   while [ $# -gt 0 ]; do
-    urls="$urls${urls:+,}{\"filename\":\"$1\",\"digests\":{\"sha256\":\"$(sha "$2")\"}}"
+    urls="$urls${urls:+,}{\"filename\":\"$1\",\"yanked\":${YANKED:-false},\"digests\":{\"sha256\":\"$(sha "$2")\"}}"
     shift 2
   done
   mkdir -p "$tmp/www/fasten-sdk/1.0.0"
@@ -72,22 +73,28 @@ check 0 "version not on PyPI"
 serve "$whl" "$built"
 check 0 "same file already on PyPI"
 serve "$whl" $'other\n'
-check 1 "same file name, different bytes" "::error::$whl on PyPI has sha256"
+check 3 "same file name, different bytes" "::error::$whl on PyPI has sha256"
 serve "$abi3" $'other\n'
-check 1 "only other files on PyPI" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
+check 3 "only other files on PyPI" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
 serve "$whl" "$built" "$abi3" $'other\n'
-check 1 "same file on PyPI, plus one not in this build" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
+check 3 "same file on PyPI, plus one not in this build" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
 
 build "$whl" "$abi3"
 serve "$whl" "$built"
 check 0 "one file on PyPI and the same, one not there yet"
 serve "$whl" "$built" "$abi3" $'other\n'
-check 1 "one file the same, one different" "::error::$abi3 on PyPI has sha256"
+check 3 "one file the same, one different" "::error::$abi3 on PyPI has sha256"
 serve "$abi3" $'other\n'
-check 1 "first file not there yet, second different" "::error::$abi3 on PyPI has sha256"
+check 3 "first file not there yet, second different" "::error::$abi3 on PyPI has sha256"
 
 build "$whl"
+YANKED=true serve "$whl" "$built"
+check 3 "same file on PyPI, version yanked" "::error::fasten-sdk 1.0.0 is yanked on PyPI"
+serve "$whl" $'other\n'
+RELEASE_CHECK_LEVEL=warning check 3 "different bytes, as a warning" "::warning::$whl on PyPI has sha256"
 mkdir -p "$tmp/www/fasten-sdk/1.0.0"
+echo '{"urls":[]}' > "$tmp/www/fasten-sdk/1.0.0/json"
+check 3 "version on PyPI with no files" "::error::fasten-sdk 1.0.0 is on PyPI with no files"
 echo '{}' > "$tmp/www/fasten-sdk/1.0.0/json"
 check 1 "version page without urls" "unexpected response"
 echo 'not json' > "$tmp/www/fasten-sdk/1.0.0/json"

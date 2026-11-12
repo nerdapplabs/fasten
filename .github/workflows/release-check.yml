@@ -53,3 +53,6 @@ jobs:
 
       - name: Tarball on npm matches the build
         run: scripts/release/test-npm-check.sh
+
+      - name: GitHub release upload
+        run: scripts/release/test-gh-release.sh

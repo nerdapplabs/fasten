@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Decide whether the npm package in <package dir> needs publishing. Prints
 # publish when its version is not on npm, skip when it is and the published
-# tarball has the same integrity as `npm pack` of the tree. Fails when the
-# integrity differs or the registry lookup fails.
+# tarball has the same integrity as `npm pack` of the tree. Exits 3 when the
+# integrity differs (RELEASE_CHECK_LEVEL=warning reports that as a warning,
+# for dry runs), and 1 when the registry lookup or npm pack fails.
 #
 # Usage: scripts/release/npm-check.sh <package dir>
 # NPM overrides the npm command (for the tests).
@@ -37,10 +38,21 @@ if [ -z "$published" ]; then
   exit 0
 fi
 
-built=$("$npm" pack --dry-run --json | node -e 'let s = ""; process.stdin.on("data", (d) => { s += d; }).on("end", () => console.log(JSON.parse(s)[0].integrity))')
+# Fails unless npm pack reports a sha512 integrity, so a change in its
+# output is an error rather than a mismatch.
+built=$("$npm" pack --dry-run --json | node -e '
+let s = "";
+process.stdin.on("data", (d) => { s += d; }).on("end", () => {
+  const i = JSON.parse(s)[0]?.integrity;
+  if (typeof i !== "string" || !i.startsWith("sha512-")) {
+    console.error(`npm pack --json reported no sha512 integrity: ${s.slice(0, 200)}`);
+    process.exit(1);
+  }
+  console.log(i);
+});')
 if [ "$published" != "$built" ]; then
-  echo "::error::$name $version on npm has integrity $published, this build has $built" >&2
-  exit 1
+  echo "::${RELEASE_CHECK_LEVEL:-error}::$name $version on npm has integrity $published, this build has $built" >&2
+  exit 3
 fi
 echo "$name $version is already on npm with the same tarball" >&2
 echo skip
