@@ -6,6 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `fasten tail`, `fasten-tui` and `fasten dump`
+
+- `fasten tail` and the TUI send the reader token as `Authorization: Bearer`,
+  which `fasten.reader.require_bearer` checks. They read it from
+  `FASTEN_READER_TOKEN` or `--token`; `fasten tail` used `X-Fasten-Key`
+  from `FASTEN_READER_KEY` / `--key`, and every request got a 401.
+- A 401 says to set the token, instead of "reader unreachable" (tail) or an
+  empty "(no rows)" table (TUI, which now shows fetch errors in its footer).
+- `fasten dump --catalog PATH` loads a codes YAML file first. With no codes
+  registered it exits 1 instead of printing nothing.
+
 ### Fixed: C++ build and README
 
 - Configuring with `-DSIMPLE_WEB_SERVER_DIR` no longer fails: the
