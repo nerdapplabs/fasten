@@ -22,7 +22,7 @@ version=$(field version)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-code=$(curl -sS -o "$tmp/index" -w '%{http_code}' "$index/${name:0:2}/${name:2:2}/$name")
+code=$(curl -sS --max-time 60 -o "$tmp/index" -w '%{http_code}' "$index/${name:0:2}/${name:2:2}/$name")
 case $code in
   404) echo publish; exit 0 ;;
   200) ;;
@@ -33,7 +33,7 @@ if ! grep -q "\"vers\":\"$version\"" "$tmp/index"; then
   exit 0
 fi
 
-curl -fsS -o "$tmp/published.crate" "$dl/$name/$name-$version.crate"
+curl -fsS --max-time 60 -o "$tmp/published.crate" "$dl/$name/$name-$version.crate"
 (cd "$dir" && CARGO_TARGET_DIR="$tmp/target" cargo package -q --no-verify --allow-dirty)
 
 mkdir "$tmp/published" "$tmp/tree"

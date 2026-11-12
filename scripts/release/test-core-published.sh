@@ -9,10 +9,16 @@ trap '[ -z "$pid" ] || kill "$pid"; rm -rf "$tmp"' EXIT
 fail=0
 
 mkdir -p "$tmp/www/index/fa/st" "$tmp/www/dl/fasten-core" "$tmp/crate/src"
+# Paths under /fail/ answer 500.
 python3 -c '
 import functools, http.server, sys
 class H(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/fail/"):
+            self.send_error(500)
+        else:
+            super().do_GET()
 s = http.server.HTTPServer(("127.0.0.1", 0), functools.partial(H, directory=sys.argv[1]))
 open(sys.argv[2], "w").write(str(s.server_port))
 s.serve_forever()
@@ -43,10 +49,13 @@ check() { # check <publish|skip|fail> <case>
 }
 
 check publish "not on crates.io"
+CRATES_INDEX="$url/fail/index" check fail "index answers 500"
+CRATES_INDEX="http://127.0.0.1:1" check fail "index unreachable"
 printf '{"name":"fasten-core","vers":"0.0.9"}\n' > "$tmp/www/index/fa/st/fasten-core"
 check publish "another version on crates.io"
 publish
 check skip "same files on crates.io"
+CRATES_DL="$url/fail/dl" check fail "published .crate download fails"
 touch "$tmp/crate/src/lib.rs"
 check skip "same files, newer mtime"
 echo 'pub fn g() -> u8 { 2 }' >> "$tmp/crate/src/lib.rs"

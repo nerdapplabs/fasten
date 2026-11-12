@@ -10,13 +10,16 @@ fail=0
 mkdir -p "$tmp/pkg"
 printf '{"name":"@nerdapplabs/fasten","version":"1.0.0"}\n' > "$tmp/pkg/package.json"
 
-# The stand-in answers `npm view` from VIEW_OUT, VIEW_ERR and VIEW_RC, and
-# `npm pack --dry-run --json` with the integrity in PACK.
+# The stand-in answers `npm view <name>@<version> dist.integrity` from
+# VIEW_OUT, VIEW_ERR and VIEW_RC, and `npm pack --dry-run --json` with the
+# integrity in PACK. Any other command line exits 99.
 cat > "$tmp/npm" <<'EOF'
 #!/usr/bin/env bash
-case $1 in
-  view) printf '%s' "${VIEW_OUT:-}"; printf '%s' "${VIEW_ERR:-}" >&2; exit "${VIEW_RC:-0}" ;;
-  pack) printf '[{"integrity":"%s"}]\n' "$PACK" ;;
+case "$*" in
+  'view @nerdapplabs/fasten@1.0.0 dist.integrity')
+    printf '%s' "${VIEW_OUT:-}"; printf '%s' "${VIEW_ERR:-}" >&2; exit "${VIEW_RC:-0}" ;;
+  'pack --dry-run --json') printf '[{"integrity":"%s"}]\n' "$PACK" ;;
+  *) echo "unexpected: npm $*" >&2; exit 99 ;;
 esac
 EOF
 chmod +x "$tmp/npm"

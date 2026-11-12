@@ -9,9 +9,10 @@ name: Release
 # GitHub prerelease only; set the repository variable PUBLISH_PRERELEASES to
 # true to also publish them to the registries.
 # A version that is already published is skipped only when the published
-# files match this build; otherwise the job fails. The wheel and the npm
-# tarball embed the hatchling and npm versions, so re-run a partial release
-# before either changes, or bump the version.
+# files match this build; otherwise the job fails. The wheel records the
+# hatchling version and the npm tarball's gzip bytes depend on the npm
+# version, so re-run a partial release before either changes, or bump the
+# version.
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
@@ -24,6 +25,12 @@ on:
 
 permissions:
   contents: read
+
+# One run per tag at a time: a re-pushed tag waits for the run in progress,
+# so two builds never upload to the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   tag:
@@ -197,7 +204,7 @@ jobs:
       - name: Wait for fasten-core in the index
         run: |
           for _ in $(seq 60); do
-            if curl -fsS https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
+            if curl -fsS --max-time 30 https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
               exit 0
             fi
             sleep 10
@@ -289,6 +296,10 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # npm-check.sh is a bash script; the alpine image has only sh.
+      - name: Install bash
+        run: apk add --no-cache bash
+
       # npm refuses a prerelease version without --tag, so 1.0.0-beta.0
       # goes out under the beta dist-tag. A plain version goes out under
       # latest only when it is above every version on npm; a backport gets
@@ -304,8 +315,9 @@ jobs:
             grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
             echo '[]' > "$RUNNER_TEMP/versions.json"
           fi
-          tag=$(node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
-            | ../scripts/release/npm-dist-tag.sh "$version")
+          node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
+            > "$RUNNER_TEMP/versions.txt"
+          tag=$(../scripts/release/npm-dist-tag.sh "$version" < "$RUNNER_TEMP/versions.txt")
           npm publish --provenance --access public --tag "$tag"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -348,6 +360,13 @@ jobs:
         working-directory: js
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install bash
+        run: apk add --no-cache bash
+
+      # The same check the npm job runs, in the same image.
+      - name: Already on npm
+        run: ../scripts/release/npm-check.sh .
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
@@ -500,7 +519,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if ! err=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --silent 2>&1); then
+            case $err in
+              *"HTTP 404"*) ;;
+              *) echo "$err"; echo "::error::could not look up release $TAG"; exit 1 ;;
+            esac
             pre=()
             case $TAG in *-*) pre=(--prerelease) ;; esac
             # Only the highest vX.Y.Z tag becomes the repo's latest release.
@@ -523,6 +546,9 @@ jobs:
               echo "$name on release $TAG is $state from an interrupted upload; replacing it"
               gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id"
               upload+=("$f")
+            elif [ "$digest" = none ]; then
+              echo "::error::$name on release $TAG has no digest on GitHub, so it cannot be compared with this build; delete it from the release and re-run"
+              exit 1
             elif [ "$digest" != "sha256:$(sha256sum "$f" | cut -d' ' -f1)" ]; then
               echo "::error::$name on release $TAG has digest $digest, which does not match this build; delete it from the release if this build should replace it"
               exit 1
