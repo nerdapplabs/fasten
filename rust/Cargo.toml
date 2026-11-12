@@ -41,3 +41,4 @@ codes-yaml = ["serde_yaml"]
 [dev-dependencies]
 serde_yaml  = "0.9"
 tiny_http   = "0.12"   # examples/server.rs
+tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }   # async request_id tests

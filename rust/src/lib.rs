@@ -381,19 +381,21 @@ pub fn dump() -> String {
         .join("\n")
 }
 
-// The request id is thread-local, so it does not follow `tokio::spawn`:
-//
-//     with_request_id("abc".into(), || {
-//         tokio::spawn(async move {
-//             // current_request_id() is None here
-//             fasten::EmitBuilder::new("CODE", "target").submit().unwrap();
-//         });
-//     });
-//
-// Read the id before spawning and call `with_request_id` again inside the task.
+// The request id lives in a thread-local, set by `with_request_id` for the
+// length of a closure. That does not survive an `.await` that moves the task
+// to another thread, so with the `async` feature a tokio task-local carries
+// it too: `scope_request_id` sets it for a future and `spawn` copies the
+// current id into a new task. A plain `tokio::spawn` does not copy it.
+// While a scoped future is polled the thread-local is cleared, so an id left
+// on the thread by the caller does not override the task's id.
 
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "async")]
+tokio::task_local! {
+    static TASK_REQUEST_ID: String;
 }
 
 /// Mint a 12-char request id.
@@ -401,22 +403,98 @@ pub fn mint_id() -> String {
     uuid::Uuid::new_v4().simple().to_string().chars().take(12).collect()
 }
 
-/// Read the ambient request_id (None if unset).
+/// Read the ambient request_id (None if unset). Inside a task, an id set by
+/// `with_request_id` wins over the task's id from `scope_request_id`.
 pub fn current_request_id() -> Option<String> {
-    REQUEST_ID.with(|cell| cell.borrow().clone())
+    REQUEST_ID.with(|cell| cell.borrow().clone()).or_else(task_request_id)
 }
 
-/// Run `f` with `rid` set as ambient correlation. Restores prior id on exit.
+#[cfg(feature = "async")]
+fn task_request_id() -> Option<String> {
+    TASK_REQUEST_ID.try_with(|r| r.clone()).ok()
+}
+
+#[cfg(not(feature = "async"))]
+fn task_request_id() -> Option<String> {
+    None
+}
+
+/// Puts the previous thread-local id back on drop, so a panic does not leave
+/// the id set on the thread.
+struct RestoreRequestId(Option<String>);
+
+impl RestoreRequestId {
+    // try_with, as in drop: ClearThreadRequestId's destructor calls this and
+    // can run during thread-local teardown, when `with` would panic.
+    fn set(rid: Option<String>) -> Self {
+        Self(REQUEST_ID.try_with(|cell| cell.replace(rid)).unwrap_or(None))
+    }
+}
+
+impl Drop for RestoreRequestId {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = REQUEST_ID.try_with(|cell| *cell.borrow_mut() = prev);
+    }
+}
+
+/// Run `f` with `rid` set as ambient correlation. Restores prior id on exit,
+/// also when `f` panics.
 pub fn with_request_id<F, T>(rid: String, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let prev = REQUEST_ID.with(|cell| cell.replace(Some(rid)));
-    let out = f();
-    REQUEST_ID.with(|cell| {
-        *cell.borrow_mut() = prev;
-    });
-    out
+    let _restore = RestoreRequestId::set(Some(rid));
+    f()
+}
+
+/// Polls and drops `fut` with the thread-local id cleared, so the task-local
+/// id is the one `current_request_id()` sees.
+#[cfg(feature = "async")]
+struct ClearThreadRequestId<F>(Option<std::pin::Pin<Box<F>>>);
+
+#[cfg(feature = "async")]
+impl<F> ClearThreadRequestId<F> {
+    fn new(fut: F) -> Self {
+        Self(Some(Box::pin(fut)))
+    }
+}
+
+#[cfg(feature = "async")]
+impl<F: std::future::Future> std::future::Future for ClearThreadRequestId<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        let _restore = RestoreRequestId::set(None);
+        self.0.as_mut().expect("polled after drop").as_mut().poll(cx)
+    }
+}
+
+#[cfg(feature = "async")]
+impl<F> Drop for ClearThreadRequestId<F> {
+    fn drop(&mut self) {
+        let _restore = RestoreRequestId::set(None);
+        self.0.take();
+    }
+}
+
+/// Run `fut` with `rid` as its request_id, across every `.await`.
+#[cfg(feature = "async")]
+pub async fn scope_request_id<F: std::future::Future>(rid: String, fut: F) -> F::Output {
+    TASK_REQUEST_ID.scope(rid, ClearThreadRequestId::new(fut)).await
+}
+
+/// `tokio::spawn` that carries the current request_id into the new task, or
+/// a new id if there is none. Like `tokio::spawn`, it panics outside a tokio
+/// runtime.
+#[cfg(feature = "async")]
+pub fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let rid = current_request_id().unwrap_or_else(mint_id);
+    tokio::spawn(TASK_REQUEST_ID.scope(rid, ClearThreadRequestId::new(fut)))
 }
 
 // NDJSON sys lines on stdout without needing `tracing` or `log`. Each line
@@ -763,6 +841,16 @@ pub struct Filter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_request_id_restores_after_panic() {
+        with_request_id("outer".into(), || {
+            let r = std::panic::catch_unwind(|| with_request_id("inner".into(), || panic!("boom")));
+            assert!(r.is_err());
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        });
+        assert_eq!(current_request_id(), None);
+    }
 
     fn meta(id: &str, domain: &str) -> Meta {
         Meta {
@@ -1739,4 +1827,133 @@ pub mod codes_yaml;
 #[cfg(feature = "codes-yaml")]
 pub mod codes {
     pub use super::codes_yaml::{load, reload};
+}
+
+#[cfg(all(test, feature = "async"))]
+mod async_request_id_tests {
+    use super::*;
+
+    // Runs in a spawned task, so the worker threads can move it between polls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scope_survives_await() {
+        tokio::spawn(scope_request_id("r1".into(), async {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                assert_eq!(current_request_id().as_deref(), Some("r1"));
+            }
+        }))
+        .await
+        .unwrap();
+        assert_eq!(current_request_id(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_carries_id() {
+        let h = with_request_id("r2".into(), || spawn(async { current_request_id() }));
+        assert_eq!(h.await.unwrap().as_deref(), Some("r2"));
+
+        let rid = scope_request_id("r3".into(), async { spawn(async { current_request_id() }).await.unwrap() }).await;
+        assert_eq!(rid.as_deref(), Some("r3"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_without_id_mints_one() {
+        let rid = spawn(async { current_request_id() }).await.unwrap();
+        assert_eq!(rid.map(|r| r.len()), Some(12));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_tasks_keep_their_ids() {
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let rid = format!("req-{i}");
+                let want = rid.clone();
+                tokio::spawn(scope_request_id(rid, async move {
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                        assert_eq!(current_request_id(), Some(want.clone()));
+                    }
+                }))
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn with_request_id_wins_inside_scope() {
+        scope_request_id("outer".into(), async {
+            with_request_id("inner".into(), || {
+                assert_eq!(current_request_id().as_deref(), Some("inner"));
+            });
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plain_tokio_spawn_has_no_id() {
+        let rid = scope_request_id("r4".into(), async { tokio::spawn(async { current_request_id() }).await.unwrap() }).await;
+        assert_eq!(rid, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn panic_does_not_leave_a_stale_id() {
+        let crashed = tokio::spawn(async { with_request_id("stale".into(), || panic!("boom")) }).await;
+        assert!(crashed.is_err());
+        // One worker, so this runs on the thread that panicked.
+        let rid = tokio::spawn(async { current_request_id() }).await.unwrap();
+        assert_eq!(rid, None);
+    }
+
+    // A scoped future dropped before it finishes (a timeout, a select) runs
+    // its drop code with the task's id, not the caller's.
+    #[test]
+    fn dropped_scope_sees_task_id() {
+        struct Record(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl Drop for Record {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = current_request_id();
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = Record(seen.clone());
+        let mut fut = Box::pin(scope_request_id("task".into(), async move {
+            let _record = record;
+            std::future::pending::<()>().await;
+        }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
+        with_request_id("outer".into(), || drop(fut));
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("task"));
+    }
+
+    #[test]
+    fn scope_beats_outer_with_request_id() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        with_request_id("outer".into(), || {
+            let rid = rt.block_on(scope_request_id("inner".into(), async { current_request_id() }));
+            assert_eq!(rid.as_deref(), Some("inner"));
+            assert_eq!(current_request_id().as_deref(), Some("outer"));
+        });
+    }
+
+    // A scoped future dropped during thread-local teardown, after
+    // REQUEST_ID is gone, must not panic in its destructor (that aborts).
+    #[test]
+    fn drop_after_request_id_teardown_does_not_panic() {
+        thread_local! {
+            static HELD: RefCell<Option<ClearThreadRequestId<std::future::Ready<()>>>> =
+                const { RefCell::new(None) };
+        }
+        std::thread::spawn(|| {
+            // HELD registers its destructor first, so it runs after REQUEST_ID's.
+            HELD.with(|h| *h.borrow_mut() = Some(ClearThreadRequestId::new(std::future::ready(()))));
+            REQUEST_ID.with(|_| {});
+        })
+        .join()
+        .unwrap();
+    }
 }

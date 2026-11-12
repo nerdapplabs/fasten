@@ -81,6 +81,31 @@ curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 curl http://localhost:8080/users/u-42
 ```
 
+## request_id in async code
+
+`with_request_id(rid, || ...)` sets the id for one closure on the current
+thread. In tokio code, where a task can move between threads at an
+`.await`, enable the `async` feature and use:
+
+- `fasten::scope_request_id(rid, fut)` to run a future with that id across
+  every `.await`;
+- `fasten::spawn(fut)` in place of `tokio::spawn`, to carry the current id
+  into the new task (or mint one if there is none).
+
+```rust
+fasten::spawn(async move {
+    process_refund().await;
+    EmitBuilder::new("REFUND_ISSUED", "order-1042").submit()?;
+    send_receipt().await;
+    EmitBuilder::new("RECEIPT_SENT", "order-1042").submit()?;
+    Ok::<_, fasten::AuditStoreError>(())
+});
+```
+
+A plain `tokio::spawn`, `spawn_blocking` or `std::thread::spawn` does not
+reliably copy the id; read it with `current_request_id()` and set it again
+there.
+
 ## Audit-store failure handling
 
 `EmitBuilder::submit()` defaults to **queue mode**: rows go onto a bounded
