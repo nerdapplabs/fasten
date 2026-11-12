@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Rust quickstart, severity on stdout, empty tenant
+
+- The README quickstart compiles: `submit()?` now converts into
+  `fasten::Error`.
+- Audit rows on stdout carry `"severity": "info"`, lowercase like the store
+  and `spec/row-schema.json`, not `"Info"`. Reading accepts either case.
+- An empty `FASTEN_TENANT_ID` is treated as unset (null), as in Python.
+- Removed the `store-sqlite` and `shim-tracing` features: they added
+  dependencies (`sqlx`, `tracing`) but no code used them.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

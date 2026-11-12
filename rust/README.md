@@ -21,8 +21,7 @@ is the minimum toolchain (see [`rust-toolchain.toml`](../rust-toolchain.toml)).
 The crate is named `fasten-sdk`; code imports it as `fasten`
 (`use fasten::...`).
 
-Optional features: `async`, `store-sqlite`, `store-postgres`,
-`shim-tracing`, `codes-yaml`.
+Optional features: `async`, `store-postgres`, `codes-yaml`.
 
 ## Quickstart
 
