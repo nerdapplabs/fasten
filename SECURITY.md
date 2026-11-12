@@ -44,6 +44,9 @@ GitHub acts as a CNA; advisories are published to the NVD automatically on relea
 **No releases have been published to PyPI, npm or crates.io yet.**
 v1.0.0-beta is source-only: clone the repo and build from a pinned
 commit SHA. The first published release will be the v1.0.0 GA tag.
+Release tags must point at a commit on `main`, and prerelease tags
+(`vX.Y.Z-beta.N`) get a GitHub prerelease but are not published to the
+registries.
 
 **Configured, and active from the first published release:**
 
