@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: the Apache-2.0 licence ships with every package
+
+- `LICENSE` now holds the full Apache-2.0 text; the copyright line moved to
+  `NOTICE`. GitHub recognised the old file as no licence.
+- The npm package, the wheel, both crates and the GitHub release files
+  include `LICENSE` and `NOTICE`.
+- The npm package ships `src/` only, without `test/` and `examples/`.
+- `fasten-core` has a README for its crates.io page.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
