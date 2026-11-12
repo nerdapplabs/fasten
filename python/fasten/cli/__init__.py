@@ -66,12 +66,17 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     if args.cmd == "dump":
-        from ..codes import load as load_catalog
+        from ..codes import AuditCatalogError, load as load_catalog
         for path in args.catalog:
-            load_catalog(path)
+            try:
+                load_catalog(path)
+            except (OSError, RuntimeError, AuditCatalogError) as e:
+                sys.stderr.write(f"fasten dump: {path}: {e}\n")
+                return 1
         out = dump_codes()
         if not out:
-            sys.stderr.write("fasten dump: no codes registered; pass --catalog PATH\n")
+            hint = "the catalog has no codes" if args.catalog else "pass --catalog PATH"
+            sys.stderr.write(f"fasten dump: no codes registered; {hint}\n")
             return 1
         print(out)
         return 0
