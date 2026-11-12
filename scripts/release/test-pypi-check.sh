@@ -74,7 +74,9 @@ check 0 "same file already on PyPI"
 serve "$whl" $'other\n'
 check 1 "same file name, different bytes" "::error::$whl on PyPI has sha256"
 serve "$abi3" $'other\n'
-check 0 "only other files on PyPI"
+check 1 "only other files on PyPI" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
+serve "$whl" "$built" "$abi3" $'other\n'
+check 1 "same file on PyPI, plus one not in this build" "::error::$abi3 is on PyPI for 1.0.0 but not in this build"
 
 build "$whl" "$abi3"
 serve "$whl" "$built"
@@ -87,12 +89,14 @@ check 1 "first file not there yet, second different" "::error::$abi3 on PyPI has
 build "$whl"
 mkdir -p "$tmp/www/fasten-sdk/1.0.0"
 echo '{}' > "$tmp/www/fasten-sdk/1.0.0/json"
-check 1 "version page without urls"
+check 1 "version page without urls" "unexpected response"
 echo 'not json' > "$tmp/www/fasten-sdk/1.0.0/json"
-check 1 "version page not JSON"
+check 1 "version page not JSON" "unexpected response"
 base="$url/fail" check 1 "PyPI answers 500" "HTTP Error 500"
-base="http://127.0.0.1:1" check 1 "PyPI unreachable"
-rm -f "$tmp/dist"/*
-check 1 "no distributions" "no distributions"
+base="http://127.0.0.1:1" check 1 "PyPI unreachable" "::error::http://127.0.0.1:1/"
+build "$whl" fasten_sdk-1.0.0.tar.gz
+check 1 "sdist in dist" "only wheels are checked"
+build
+check 1 "no wheels" "no wheels"
 
 exit "$fail"

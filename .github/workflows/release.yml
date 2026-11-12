@@ -308,7 +308,11 @@ jobs:
       - name: Publish to npm (with provenance)
         run: |
           state=$(../scripts/release/npm-check.sh .)
-          [ "$state" = publish ] || exit 0
+          case $state in
+            publish) ;;
+            skip) exit 0 ;;
+            *) echo "::error::npm-check.sh printed '$state'"; exit 1 ;;
+          esac
           name=$(node -p 'require("./package.json").name')
           version=$(node -p 'require("./package.json").version')
           if ! npm view "$name" versions --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/view.err"; then
@@ -349,6 +353,13 @@ jobs:
       - name: Check metadata
         run: uvx twine check dist/*
 
+      # As in npm-dry-run, a warning only: between releases the version in
+      # the tree is usually already on PyPI with other bytes.
+      - name: Files already on PyPI
+        run: |
+          python3 ../scripts/release/pypi-check.py dist \
+            || echo "::warning::pypi-check.py failed; a release of this version would fail the pypi job"
+
   npm-dry-run:
     needs: [test-python, test-js, test-rust, versions]
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -364,9 +375,13 @@ jobs:
       - name: Install bash
         run: apk add --no-cache bash
 
-      # The same check the npm job runs, in the same image.
+      # The same check the npm job runs, in the same image. Only a warning:
+      # between releases js/package.json holds the published version, and
+      # any change to the package makes the tarball differ.
       - name: Already on npm
-        run: ../scripts/release/npm-check.sh .
+        run: |
+          ../scripts/release/npm-check.sh . \
+            || echo "::warning::npm-check.sh failed; a release of this version would fail the npm job"
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
@@ -396,6 +411,15 @@ jobs:
           else
             cargo publish --dry-run --locked
           fi
+
+      # The check the crates-io job runs before publishing the SDK. A warning
+      # only: it packages against fasten-core on crates.io, which fails
+      # while the tree's fasten-core version is not published.
+      - name: SDK already on crates.io
+        working-directory: rust
+        run: |
+          ../scripts/release/core-published.sh . \
+            || echo "::warning::core-published.sh failed for the SDK; a release of this tree would fail the crates-io job"
 
       # fasten-core may not be on crates.io yet, so the SDK is packaged and
       # built against the fasten-core in the tree.
@@ -515,6 +539,7 @@ jobs:
       # unfinished by an interrupted upload is replaced. A finished file
       # with the same name and different bytes fails the job.
       - name: Upload to the GitHub release
+        shell: bash   # adds pipefail, for the git tag | latest-flag.sh pipe
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -536,7 +561,7 @@ jobs:
           upload=()
           for f in dist/*; do
             name=$(basename "$f")
-            asset=$(printf '%s\n' "$existing" | awk -v n="$name" '$1 == n { print $2, $3, $4; exit }')
+            asset=$(printf '%s\n' "$existing" | awk -v n="$name" '$1 == n { print $2, $3, $4 }')
             if [ -z "$asset" ]; then
               upload+=("$f")
               continue

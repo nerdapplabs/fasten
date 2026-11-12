@@ -17,10 +17,13 @@ version=$(node -p 'require("./package.json").version')
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# A missing version of a published package prints nothing and exits 0; a
-# package that was never published fails with E404.
+# npm 11 fails with "404 No match found for version" for a missing version
+# of a published package, and "404 Not Found - GET" for a package that was
+# never published (npm says the same when the token has no access; npm
+# publish then refuses a version that exists). Older npm printed nothing
+# and exited 0 for a missing version.
 if ! "$npm" view "$name@$version" dist.integrity > "$tmp/out" 2> "$tmp/err"; then
-  if grep -q E404 "$tmp/out" "$tmp/err"; then
+  if grep -Eq '404 (No match found for version|Not Found - GET)' "$tmp/out" "$tmp/err"; then
     echo publish
     exit 0
   fi
