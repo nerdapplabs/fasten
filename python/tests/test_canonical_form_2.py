@@ -402,6 +402,21 @@ def test_python_verifies_a_go_sealed_form_2_chain():
     assert result.ok, f"Python rejects a Go-sealed form-2 chain: {result.reason}"
 
 
+GO_NUMBERS_VECTOR = GO_VECTOR.with_name("go-sealed-numbers.json")
+
+
+def test_python_verifies_go_sealed_numbers():
+    """A Go-sealed detail with small, large and negative-zero floats, big
+    ints, non-ASCII text and nesting verifies in Python (spec §1.3)."""
+    rows = _rows_from_dicts(json.loads(GO_NUMBERS_VECTOR.read_text()))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.detail_salt is not None
+    assert detail_commitment(row.detail_salt, row.detail) == row.detail_commitment
+    result = verify_chain(rows)
+    assert result.ok, f"Python rejects a Go-sealed row with numbers: {result.reason}"
+
+
 def test_go_sealed_commitment_recomputes_under_python():
     """Both SDKs must agree on sha256(salt || canonical_json(detail))."""
     for row in _rows_from_go_vector():

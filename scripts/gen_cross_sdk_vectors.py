@@ -77,14 +77,24 @@ FROZEN_PREFIX_ROW = {
 PINNED_SALT = "b" * 64
 
 
-def _row(row_id: str, ts: datetime) -> AuditRow:
+# Numbers Go and CPython render differently, a big int, non-ASCII text and
+# nesting (spec §1.3). Go reads the tokens back and must hash them as written.
+NUMBERS_DETAIL = {
+    "tiny": 5e-05, "tinier": 1e-07, "neg_zero": -0.0, "big": 1e16,
+    "huge": 1e21, "frac": 12.5, "whole": 75.0, "count": 7,
+    "bigint": 12345678901234567890, "text": "café ✓", "empty": "",
+    "nested": {"list": [1, 2.5, {"x": 0.0001}]},
+}
+
+
+def _row(row_id: str, ts: datetime, detail: dict | None = None) -> AuditRow:
     return AuditRow(
         id=row_id, origin_id=row_id, monotonic_seq=1, timestamp=ts,
         code="ORDER_PLACED", action="create", severity="info",
         service_id="gateway", source_node_id="node-1", tenant_id=None,
         actor="alice", actor_kind="user", target="order/42",
         category="order", domain="sales", method="http",
-        request_id="req-xyz", detail={"qty": 3, "sku": "WIDGET"},
+        request_id="req-xyz", detail=detail or {"qty": 3, "sku": "WIDGET"},
     )
 
 
@@ -121,6 +131,9 @@ def build() -> dict:
         r = dataclasses.replace(_row(f"evt-{label}", ts),
                                 detail_salt=PINNED_SALT)
         add(label, seal("genesis", r))
+
+    add("form2_numbers", seal("genesis", dataclasses.replace(
+        _row("evt-form2_numbers", MICROS, NUMBERS_DETAIL), detail_salt=PINNED_SALT)))
 
     # Shipped rows: sealed with shipped_at null, then marked shipped. Every
     # form hashes shipped_at as null (spec §1.1), so marking moves no hash.
