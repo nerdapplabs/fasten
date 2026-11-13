@@ -93,9 +93,8 @@ pub enum Error {
     #[error("{0} is not supported by this store")]
     Unsupported(&'static str),
 
-    /// A purge cutoff that is not an RFC 3339 timestamp. Compared as text,
-    /// it could sort after every row and delete the whole table.
-    #[error("purge cutoff {0:?} is not an RFC 3339 timestamp")]
+    /// A purge cutoff that is neither an RFC 3339 timestamp nor a date.
+    #[error("purge cutoff {0:?} is not an RFC 3339 timestamp or a date")]
     InvalidTimestamp(String),
 
     /// Another row already holds this `(source_node_id, monotonic_seq)`.
