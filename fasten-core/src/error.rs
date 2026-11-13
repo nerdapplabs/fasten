@@ -93,6 +93,11 @@ pub enum Error {
     #[error("{0} is not supported by this store")]
     Unsupported(&'static str),
 
+    /// A purge cutoff that is not an RFC 3339 timestamp. Compared as text,
+    /// it could sort after every row and delete the whole table.
+    #[error("purge cutoff {0:?} is not an RFC 3339 timestamp")]
+    InvalidTimestamp(String),
+
     /// Another row already holds this `(source_node_id, monotonic_seq)`.
     /// Retrying cannot help, so the drainer dead-letters the row at once.
     #[error("seq clash: {0}")]
@@ -148,6 +153,8 @@ impl From<&Error> for FastenErrorCode {
             Error::TlsConnector(_)     => FastenErrorCode::ErrBackend,
             Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
             Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
+            // An invalid argument, like a NULL or non-UTF-8 one.
+            Error::InvalidTimestamp(_) => FastenErrorCode::ErrNullArg,
             Error::Store(_)            => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,

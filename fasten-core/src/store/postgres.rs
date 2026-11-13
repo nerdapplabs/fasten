@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{check_purge_cutoff, non_empty, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -380,34 +380,23 @@ impl Store for PostgresStore {
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
 
-        // $1 = shipped_at; $2 .. $N = IDs.
-        let placeholders: String = (2..=ids.len() + 1)
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // The ids go in one array parameter: Postgres caps a statement at
+        // 65,535 parameters.
         let sql = format!(
-            "UPDATE {} SET shipped_at = $1 WHERE id IN ({})",
-            self.table, placeholders
+            "UPDATE {} SET shipped_at = $1 WHERE id = ANY($2)",
+            self.table
         );
-
-        let mut all_params: Vec<Box<(dyn ToSql + Sync)>> = Vec::with_capacity(ids.len() + 1);
-        all_params.push(Box::new(now));
-        for id in ids {
-            all_params.push(Box::new(id.clone()));
-        }
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            all_params.iter().map(|p| p.as_ref()).collect();
-
         self.with_reconnect(|inner| {
             inner
                 .client
-                .execute(sql.as_str(), &params_refs)
+                .execute(sql.as_str(), &[&now as &(dyn ToSql + Sync), &ids])
                 .map(|_| ())
                 .map_err(Error::Postgres)
         })
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
+        check_purge_cutoff(before)?;
         let sql = purge_sql(&self.table, "$1", respect_unshipped, true);
         self.with_reconnect(|inner| {
             inner
@@ -918,6 +907,29 @@ mod tests {
         store.mark_shipped(&["evt-u1".to_string(), "evt-u3".to_string()]).unwrap();
         assert_eq!(store.purge("2021-01-01T00:00:00.000Z", true).unwrap(), 1);
         assert_eq!(seqs(&store, "node-a"), vec![2, 3]);
+    }
+
+    #[test]
+    fn purge_rejects_a_cutoff_that_is_not_a_timestamp() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_purge_cutoff");
+        store.insert(&row_on("evt-c1", "node-a")).unwrap();
+        assert!(matches!(store.purge("tomorrow", false), Err(Error::InvalidTimestamp(_))));
+        assert_eq!(seqs(&store, "node-a"), vec![1]);
+    }
+
+    // More ids than Postgres's 65,535 parameters.
+    #[test]
+    fn mark_shipped_takes_any_number_of_ids() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_ship_many");
+        store.insert(&row_on("evt-m1", "node-a")).unwrap();
+        store.insert(&row_on("evt-m2", "node-a")).unwrap();
+        let mut ids: Vec<String> = (0..70_000).map(|i| format!("evt-none-{i}")).collect();
+        ids.push("evt-m1".into());
+        ids.insert(0, "evt-m2".into());
+        store.mark_shipped(&ids).unwrap();
+        assert!(store.list_unshipped(0).unwrap().is_empty());
     }
 
     #[test]

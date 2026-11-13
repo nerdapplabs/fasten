@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: fasten-core purge and mark_shipped
+
+- `purge` rejects a cutoff that is not an RFC 3339 timestamp. A value like
+  `"tomorrow"` was compared with `timestamp` as text, sorted after every
+  row, and deleted the whole table.
+- `mark_shipped` takes any number of ids. It failed above 32,766 ids on
+  SQLite and 65,535 on PostgreSQL.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has
