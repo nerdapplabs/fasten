@@ -110,7 +110,8 @@ pub trait Store: Send + Sync {
     /// `monotonic_seq ASC`.  `limit == 0` returns all unshipped rows.
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error>;
 
-    /// Set `shipped_at` to the current UTC time for all rows in `ids`.
+    /// Set `shipped_at` to the current UTC time for all rows in `ids`, in
+    /// one transaction however many ids there are.
     /// IDs that do not exist are silently ignored.
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
 
@@ -121,7 +122,9 @@ pub trait Store: Send + Sync {
     /// When `respect_unshipped` is `true`, rows with `shipped_at IS NULL` are
     /// preserved regardless of age, and so are the rows above them.
     ///
-    /// Returns the number of deleted rows.
+    /// Returns the number of deleted rows. `before` is an RFC 3339 timestamp
+    /// (any offset) or a date, taken as midnight UTC; anything else is an
+    /// `InvalidTimestamp` error and deletes nothing.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
@@ -224,6 +227,25 @@ pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postg
     } else {
         format!("DELETE FROM {table} WHERE id IN ({bound}SELECT d.id FROM bound, {table} AS d WHERE {matches})")
     }
+}
+
+/// The purge cutoff as a canonical UTC timestamp (spec §4.3), which
+/// purge_sql compares with `timestamp` as text. Takes an RFC 3339 timestamp
+/// with any offset, or a date (midnight UTC); anything else is an
+/// InvalidTimestamp error. As given, an offset or a lowercase `t` sorts
+/// differently from the stored form and deletes too much, and a string
+/// like "tomorrow" sorts after every row.
+pub(crate) fn purge_cutoff(before: &str) -> Result<String, Error> {
+    let bad = || Error::InvalidTimestamp(before.to_string());
+    let utc = match chrono::DateTime::parse_from_rfc3339(before) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => chrono::NaiveDate::parse_from_str(before, "%Y-%m-%d")
+            .map_err(|_| bad())?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(bad)?
+            .and_utc(),
+    };
+    Ok(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {

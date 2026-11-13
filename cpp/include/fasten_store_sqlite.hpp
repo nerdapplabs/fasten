@@ -91,6 +91,7 @@ public:
     void insert(const Row& row) {
         std::string detail_json = detail_::fields_to_json(row.detail, row.code);
         int         pii_int     = row.pii_in_detail ? 1 : 0;
+        detail_::reject_nul_text("fasten SqliteStore", row, detail_json);
 
         std::lock_guard<std::mutex> lk(mu_);
 
@@ -145,6 +146,24 @@ public:
             std::string msg = sqlite3_errmsg(db_);
             if (allocate) rollback();
             throw std::runtime_error("fasten SqliteStore insert: " + msg);
+        }
+        // INSERT OR IGNORE wrote nothing. A retry of this same row is fine;
+        // otherwise the id is held by a different row, or another unique
+        // index (such as a node's seq) refused it.
+        if (sqlite3_changes(db_) == 0) {
+            int held = 0;
+            try {
+                held = stored_row_matches(row);
+            } catch (...) {
+                if (allocate) rollback();  // else the connection stays in the transaction
+                throw;
+            }
+            if (held != 1) {
+                if (allocate) rollback();
+                throw InsertRejected("fasten SqliteStore insert: row " + row.id + " not written: " +
+                    (held == 0 ? "the id is held by a different row"
+                               : "another unique index refused it (a taken node seq?)"));
+            }
         }
         if (allocate) {
             try {
@@ -279,9 +298,38 @@ private:
             throw std::runtime_error(
                 std::string("fasten SqliteStore next seq: ") + sqlite3_errmsg(db_));
         sqlite3_bind_text(q, 1, node.c_str(), -1, SQLITE_TRANSIENT);
-        int64_t seq = sqlite3_step(q) == SQLITE_ROW ? sqlite3_column_int64(q, 0) : 1;
+        if (sqlite3_step(q) != SQLITE_ROW) {
+            std::string msg = sqlite3_errmsg(db_);
+            sqlite3_finalize(q);
+            throw std::runtime_error("fasten SqliteStore next seq: " + msg);
+        }
+        int64_t seq = sqlite3_column_int64(q, 0);
         sqlite3_finalize(q);
         return seq;
+    }
+
+    // 1 when the row stored under row.id is this row (by the columns that tell
+    // two rows apart and never change on a retry), 0 when it is a different
+    // row, -1 when no row has this id.
+    int stored_row_matches(const Row& row) {
+        const std::string sql = "SELECT code, request_id, target, actor, timestamp FROM " +
+                                table_ + " WHERE id = ?";
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &q, nullptr) != SQLITE_OK)
+            throw std::runtime_error(
+                std::string("fasten SqliteStore id check: ") + sqlite3_errmsg(db_));
+        sqlite3_bind_text(q, 1, row.id.c_str(), -1, SQLITE_TRANSIENT);
+        auto col = [&](int i) {
+            const unsigned char* t = sqlite3_column_text(q, i);
+            return t ? std::string(reinterpret_cast<const char*>(t)) : std::string();
+        };
+        int held = -1;
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            held = col(0) == row.code && col(1) == row.request_id && col(2) == row.target &&
+                   col(3) == row.actor && col(4) == row.timestamp;
+        }
+        sqlite3_finalize(q);
+        return held;
     }
 
     static bool is_valid_identifier(const std::string& s) {

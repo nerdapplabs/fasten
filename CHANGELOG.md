@@ -6,6 +6,33 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ stores no longer drop rows while reporting success
+
+- Row ids come from a generator seeded with 256 bits instead of one 32-bit
+  `random_device` value, so two processes no longer draw the same ids.
+- The SQLite and PostgreSQL stores insert with `OR IGNORE` /
+  `ON CONFLICT (id) DO NOTHING`. A different row whose id is already stored
+  was dropped while the insert succeeded; it now throws
+  `fasten::InsertRejected`. The same row inserted again still succeeds. On
+  SQLite, a row another unique index refuses (such as a taken node seq) is
+  rejected too, with a message saying so.
+- Text with a NUL byte was stored cut at the NUL; it now throws
+  `fasten::InsertRejected`.
+- The drainer dead-letters a rejected row at once instead of retrying it.
+- The SQLite store's next seq no longer falls back to 1 when its query
+  fails; the insert fails instead.
+
+### Fixed: fasten-core purge and mark_shipped
+
+- `purge` reads the cutoff as an RFC 3339 timestamp (any offset) or a date
+  (midnight UTC) and compares it in the stored UTC form. It was compared as
+  given, as text: `"tomorrow"` sorted after every row and deleted the whole
+  table, and an offset like `+05:30` or a lowercase `t` deleted rows up to a
+  day newer than the cutoff. Any other cutoff, including a timestamp with
+  no timezone, is now an error (`FASTEN_ERR_NULL_ARG` over the C ABI).
+- `mark_shipped` takes any number of ids. It failed above 32,766 ids on
+  SQLite and 65,535 on PostgreSQL.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

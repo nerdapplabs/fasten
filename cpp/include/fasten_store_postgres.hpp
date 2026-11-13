@@ -194,6 +194,7 @@ private:
         std::string detail_json = detail_::fields_to_json(row.detail, row.code);
         std::string mono_str    = std::to_string(seq);
         const char* pii_str     = row.pii_in_detail ? "1" : "0";
+        detail_::reject_nul_text("fasten PostgresStore", row, detail_json);
 
         // nullptr is sent as SQL NULL.
         const char* tenant_ptr  = row.tenant_id.empty()  ? nullptr : row.tenant_id.c_str();
@@ -251,7 +252,21 @@ private:
             PQclear(res);
             throw std::runtime_error("fasten PostgresStore insert: " + msg);
         }
+        const bool inserted = std::string(PQcmdTuples(res)) != "0";
         PQclear(res);
+        // ON CONFLICT DO NOTHING wrote nothing: the id is taken. A retry of
+        // this same row is fine; a different row with this id is rejected.
+        if (!inserted) {
+            const char* p[6] = {row.id.c_str(), row.code.c_str(), row.request_id.c_str(),
+                                row.target.c_str(), row.actor.c_str(), row.timestamp.c_str()};
+            std::string same = query(
+                "SELECT 1 FROM " + table_ + " WHERE id = $1 AND code = $2"
+                " AND request_id = $3 AND target = $4 AND actor = $5 AND timestamp = $6", 6, p);
+            if (same.empty()) {
+                throw InsertRejected("fasten PostgresStore insert: id " + row.id +
+                                     " is already held by a different row");
+            }
+        }
     }
 
 public:
