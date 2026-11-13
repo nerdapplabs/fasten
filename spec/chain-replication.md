@@ -128,7 +128,13 @@ that Python, reading the stored row, hashes the same bytes:
   notation with a signed exponent of at least two digits.
 
 Go's encoder writes `0.00005`, `1e-7` and `-0`; Go hashes them as `5e-05`,
-`1e-07` and `0`.
+`1e-07` and `0`. A token past float64's range is hashed as `Infinity` or
+`-Infinity`, as CPython writes it.
+
+Go releases before this rule hashed numbers as Go's encoder writes them. The
+Go verifier retries a miss that way, so those rows verify in Go; other
+verifiers are not required to, and Python rejects such a row when its detail
+holds a number the two renderings write differently.
 
 ### §1.4 Canonical form `"2"`: committed detail
 
