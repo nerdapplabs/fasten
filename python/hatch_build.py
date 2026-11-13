@@ -16,11 +16,13 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         lib = os.environ.get("FASTEN_WHEEL_LIB")
-        if self.target_name != "wheel" or version == "editable" or not lib:
-            return
         plat = os.environ.get("FASTEN_WHEEL_PLAT")
-        if not plat:
-            raise ValueError("FASTEN_WHEEL_LIB is set but FASTEN_WHEEL_PLAT is not")
+        if self.target_name != "wheel" or version == "editable" or not (lib or plat):
+            return
+        # One without the other would build a pure wheel, or a platform
+        # wheel without the library.
+        if not lib or not plat:
+            raise ValueError("FASTEN_WHEEL_LIB and FASTEN_WHEEL_PLAT must be set together")
         path = Path(lib)
         if not path.is_file():
             raise FileNotFoundError(f"FASTEN_WHEEL_LIB: {path} not found")

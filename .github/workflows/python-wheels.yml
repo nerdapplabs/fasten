@@ -22,15 +22,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Images pinned by digest, so a re-run of a release builds the same
+        # OpenSSL and auditwheel into the wheel. Bump them between releases.
         include:
           - arch: x86_64
             runner: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_34_x86_64@sha256:b9bb1e7780cebc4a8375c032428411ee1a78c4cd0b8edd1313983166dd3d6cf1
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_34_aarch64@sha256:a742af40e8c0afb854962bde958a40b784408577a2dbdd9998740dac1dd0e9ec
     runs-on: ${{ matrix.runner }}
     # glibc 2.34, the same floor as the release's C++ library.
     container:
-      image: quay.io/pypa/manylinux_2_34_${{ matrix.arch }}
+      image: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v6
 
@@ -130,6 +134,17 @@ jobs:
             | grep -v -e /usr/lib/ -e /System/Library/ -e libfasten_core || true)
           if [ -n "$other" ]; then
             echo "::error::non-system libraries: $other"
+            exit 1
+          fi
+
+      # The wheel is tagged for MACOSX_DEPLOYMENT_TARGET; the library must not
+      # need a newer macOS.
+      - name: Check the minimum macOS version
+        run: |
+          lib=fasten-core/target/release/libfasten_core.dylib
+          minos=$(otool -l "$lib" | awk '/LC_BUILD_VERSION/ { f = 1 } f && $1 == "minos" { print $2; f = 0 }')
+          if [ "$minos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "::error::libfasten_core needs macOS ${minos:-unknown}; the wheel says $MACOSX_DEPLOYMENT_TARGET"
             exit 1
           fi
 
