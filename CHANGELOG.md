@@ -13,7 +13,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - The SQLite and PostgreSQL stores insert with `OR IGNORE` /
   `ON CONFLICT (id) DO NOTHING`. A different row whose id is already stored
   was dropped while the insert succeeded; it now throws
-  `fasten::InsertRejected`. The same row inserted again still succeeds.
+  `fasten::InsertRejected`. The same row inserted again still succeeds. On
+  SQLite, a row another unique index refuses (such as a taken node seq) is
+  rejected too, with a message saying so.
 - Text with a NUL byte was stored cut at the NUL; it now throws
   `fasten::InsertRejected`.
 - The drainer dead-letters a rejected row at once instead of retrying it.
