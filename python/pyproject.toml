@@ -46,6 +46,9 @@ Documentation = "https://github.com/nerdapplabs/fasten/blob/main/README.md"
 [tool.hatch.build.targets.wheel]
 packages = ["fasten"]
 
+# hatch_build.py: adds libfasten_core to platform wheels.
+[tool.hatch.build.hooks.custom]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
