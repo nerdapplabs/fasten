@@ -6,6 +6,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Python verifies Go-sealed rows with small floats
+
+- Go hashed `detail` numbers as Go's encoder writes them (`0.00005`, `1e-7`,
+  `-0`), while Python, reading the stored row, hashes them as CPython renders
+  them (`5e-05`, `1e-07`, `0`). Python then reported an untampered Go row as
+  a commitment mismatch. Go now hashes every number as CPython renders it
+  (spec `chain-replication.md` §1.3), so rows it seals from this release on
+  verify in Python. Rows an older Go release sealed with such numbers still
+  verify in Go, but not in Python.
+- New cross-SDK vectors: `spec/go-sealed-numbers.json` (Go seals, Python
+  verifies) and a `form2_numbers` case in `spec/python-sealed-forms.json`
+  (Python seals, Go verifies).
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

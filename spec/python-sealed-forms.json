@@ -199,6 +199,57 @@
    }
   },
   {
+   "label": "form2_numbers",
+   "row": {
+    "action": "create",
+    "actor": "alice",
+    "actor_kind": "user",
+    "canonical_form_id": "2",
+    "category": "order",
+    "code": "ORDER_PLACED",
+    "detail": {
+     "big": 1e+16,
+     "bigint": 12345678901234567890,
+     "count": 7,
+     "empty": "",
+     "frac": 12.5,
+     "huge": 1e+21,
+     "neg_zero": -0.0,
+     "nested": {
+      "list": [
+       1,
+       2.5,
+       {
+        "x": 0.0001
+       }
+      ]
+     },
+     "text": "caf\u00e9 \u2713",
+     "tinier": 1e-07,
+     "tiny": 5e-05,
+     "whole": 75.0
+    },
+    "detail_commitment": "98d647155e13014875dcc0bdf0dc10cc1fca251734812b825accf15a38f4dcb1",
+    "detail_salt": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "domain": "sales",
+    "hash": "a3da0c4e2d1087637899eabbdd83de4dc2c8b3eaa8ef1d60bcbf8aec36e15aa5",
+    "id": "evt-form2_numbers",
+    "method": "http",
+    "monotonic_seq": 1,
+    "origin_id": "evt-form2_numbers",
+    "prev_hash": "genesis",
+    "request_id": "req-xyz",
+    "service_id": "gateway",
+    "severity": "info",
+    "shipped_at": null,
+    "source_node_id": "node-1",
+    "target": "order/42",
+    "tenant_id": null,
+    "timestamp": "2026-06-15T10:30:45.123456Z",
+    "wire_version": "1"
+   }
+  },
+  {
    "label": "form1_shipped",
    "row": {
     "action": "create",
