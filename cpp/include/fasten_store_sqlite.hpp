@@ -151,7 +151,13 @@ public:
         // otherwise the id is held by a different row, or another unique
         // index (such as a node's seq) refused it.
         if (sqlite3_changes(db_) == 0) {
-            const int held = stored_row_matches(row);
+            int held = 0;
+            try {
+                held = stored_row_matches(row);
+            } catch (...) {
+                if (allocate) rollback();  // else the connection stays in the transaction
+                throw;
+            }
             if (held != 1) {
                 if (allocate) rollback();
                 throw InsertRejected("fasten SqliteStore insert: row " + row.id + " not written: " +
