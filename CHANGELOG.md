@@ -22,9 +22,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ### Fixed: fasten-core purge and mark_shipped
 
-- `purge` rejects a cutoff that is not an RFC 3339 timestamp. A value like
-  `"tomorrow"` was compared with `timestamp` as text, sorted after every
-  row, and deleted the whole table.
+- `purge` reads the cutoff as an RFC 3339 timestamp (any offset) or a date
+  (midnight UTC) and compares it in the stored UTC form. It was compared as
+  given, as text: `"tomorrow"` sorted after every row and deleted the whole
+  table, and an offset like `+05:30` or a lowercase `t` deleted rows up to a
+  day newer than the cutoff. Any other cutoff, including a timestamp with
+  no timezone, is now an error (`FASTEN_ERR_NULL_ARG` over the C ABI).
 - `mark_shipped` takes any number of ids. It failed above 32,766 ids on
   SQLite and 65,535 on PostgreSQL.
 

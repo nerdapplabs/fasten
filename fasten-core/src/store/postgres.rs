@@ -9,7 +9,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{check_purge_cutoff, non_empty, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -396,7 +396,7 @@ impl Store for PostgresStore {
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
-        check_purge_cutoff(before)?;
+        let before = purge_cutoff(before)?;
         let sql = purge_sql(&self.table, "$1", respect_unshipped, true);
         self.with_reconnect(|inner| {
             inner
@@ -916,6 +916,19 @@ mod tests {
         store.insert(&row_on("evt-c1", "node-a")).unwrap();
         assert!(matches!(store.purge("tomorrow", false), Err(Error::InvalidTimestamp(_))));
         assert_eq!(seqs(&store, "node-a"), vec![1]);
+    }
+
+    #[test]
+    fn purge_normalizes_the_cutoff() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_sc_pg_purge_norm");
+        for (id, ts) in [("evt-n1", "2025-12-31T23:00:00.000Z"), ("evt-n2", "2026-01-01T03:00:00.000Z")] {
+            let mut r = row_on(id, "node-a");
+            r.timestamp = ts.into();
+            store.insert(&r).unwrap();
+        }
+        assert_eq!(store.purge("2026-01-01T05:30:00+05:30", false).unwrap(), 1);
+        assert_eq!(seqs(&store, "node-a"), vec![2]);
     }
 
     // More ids than Postgres's 65,535 parameters.

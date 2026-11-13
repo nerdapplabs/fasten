@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{check_purge_cutoff, non_empty, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -392,7 +392,7 @@ impl Store for SqliteStore {
     }
 
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
-        check_purge_cutoff(before)?;
+        let before = purge_cutoff(before)?;
         let sql = purge_sql(&self.table, "?1", respect_unshipped, false);
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.execute(&sql, rusqlite::params![before])?;
@@ -760,10 +760,28 @@ mod tests {
     fn purge_rejects_a_cutoff_that_is_not_a_timestamp() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         store.insert(&make_row("evt-cut-001", "TEST")).unwrap();
-        for bad in ["tomorrow", "", "9999"] {
+        for bad in ["tomorrow", "", "9999", "2026-01-01T00:00:00", "2026-13-01"] {
             assert!(matches!(store.purge(bad, false), Err(Error::InvalidTimestamp(_))), "{bad:?}");
         }
         assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    // An offset, a lowercase `t` and a date all mean 2026-01-01T00:00Z: the
+    // 23:00Z row on the day before goes, the 03:00Z row stays. Compared as
+    // given, the +05:30 and `t` forms would delete the 03:00Z row too.
+    #[test]
+    fn purge_normalizes_the_cutoff() {
+        for cutoff in ["2026-01-01T05:30:00+05:30", "2026-01-01t00:00:00Z", "2026-01-01"] {
+            let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+            let mut old = make_row("evt-norm-001", "TEST");
+            old.timestamp = "2025-12-31T23:00:00.000Z".into();
+            store.insert(&old).unwrap();
+            let mut new = make_row("evt-norm-002", "TEST");
+            new.timestamp = "2026-01-01T03:00:00.000Z".into();
+            store.insert(&new).unwrap();
+            assert_eq!(store.purge(cutoff, false).unwrap(), 1, "{cutoff}");
+            assert_eq!(store.count(&Filter::default()).unwrap(), 1, "{cutoff}");
+        }
     }
 
     // More ids than SQLite's 32,766 bound parameters.

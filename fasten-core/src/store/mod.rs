@@ -122,8 +122,9 @@ pub trait Store: Send + Sync {
     /// When `respect_unshipped` is `true`, rows with `shipped_at IS NULL` are
     /// preserved regardless of age, and so are the rows above them.
     ///
-    /// Returns the number of deleted rows. A `before` that is not an
-    /// RFC 3339 timestamp is an `InvalidTimestamp` error and deletes nothing.
+    /// Returns the number of deleted rows. `before` is an RFC 3339 timestamp
+    /// (any offset) or a date, taken as midnight UTC; anything else is an
+    /// `InvalidTimestamp` error and deletes nothing.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
@@ -228,13 +229,23 @@ pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postg
     }
 }
 
-/// Rejects a purge cutoff that is not an RFC 3339 timestamp. purge_sql
-/// compares it with `timestamp` as text, where a string like "tomorrow"
-/// sorts after every row. A valid cutoff is used as given.
-pub(crate) fn check_purge_cutoff(before: &str) -> Result<(), Error> {
-    chrono::DateTime::parse_from_rfc3339(before)
-        .map(|_| ())
-        .map_err(|_| Error::InvalidTimestamp(before.to_string()))
+/// The purge cutoff as a canonical UTC timestamp (spec §4.3), which
+/// purge_sql compares with `timestamp` as text. Takes an RFC 3339 timestamp
+/// with any offset, or a date (midnight UTC); anything else is an
+/// InvalidTimestamp error. As given, an offset or a lowercase `t` sorts
+/// differently from the stored form and deletes too much, and a string
+/// like "tomorrow" sorts after every row.
+pub(crate) fn purge_cutoff(before: &str) -> Result<String, Error> {
+    let bad = || Error::InvalidTimestamp(before.to_string());
+    let utc = match chrono::DateTime::parse_from_rfc3339(before) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(_) => chrono::NaiveDate::parse_from_str(before, "%Y-%m-%d")
+            .map_err(|_| bad())?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(bad)?
+            .and_utc(),
+    };
+    Ok(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {

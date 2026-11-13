@@ -62,7 +62,7 @@ typedef enum {
     FASTEN_ERR_BACKEND   = 1,   /**< SQLite or PostgreSQL backend error.        */
     FASTEN_ERR_BAD_TABLE = 2,   /**< Invalid table or schema name.              */
     FASTEN_ERR_BAD_JSON  = 3,   /**< JSON parse or schema validation error.     */
-    FASTEN_ERR_NULL_ARG  = 4,   /**< Null pointer or invalid UTF-8 argument.   */
+    FASTEN_ERR_NULL_ARG  = 4,   /**< Invalid argument: NULL, not UTF-8, bad purge cutoff. */
     FASTEN_ERR_BAD_BACKEND = 5, /**< Unknown backend string.                   */
     FASTEN_ERR_UNKNOWN   = 99   /**< Internal panic or unexpected error.        */
 } FastenErrorCode;
@@ -231,7 +231,8 @@ FastenErrorCode fasten_store_mark_shipped(
  * is old too, so the rows left still verify. Rows at seq 0 go by age alone.
  *
  * @param store             Non-null handle.
- * @param before_iso8601    ISO-8601 UTC timestamp; rows strictly older are
+ * @param before_iso8601    RFC 3339 timestamp (any offset) or a date (midnight
+ *                          UTC); anything else is FASTEN_ERR_NULL_ARG. Rows strictly older are
  *                          deleted, per node only below the lowest kept seq.
  * @param respect_unshipped Non-zero: rows with shipped_at IS NULL are kept,
  *                          and so are the rows above them on their node.
