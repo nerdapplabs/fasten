@@ -46,6 +46,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // libfasten_core C ABI, declared here so no extra header is needed.
@@ -333,10 +334,19 @@ inline std::string iso8601(std::chrono::system_clock::time_point tp) {
 
 inline std::string now_iso8601() { return iso8601(std::chrono::system_clock::now()); }
 
-// `bytes` random bytes as lowercase hex.
+// `bytes` random bytes as lowercase hex. The generator is seeded with
+// 256 bits from random_device plus the clock: one 32-bit random_device
+// value let two processes draw the same ids.
 inline std::string mint_id_bytes(size_t bytes) {
     static std::mutex mu;
-    static std::mt19937_64 rng(std::random_device{}());
+    static std::mt19937_64 rng = [] {
+        std::random_device rd;
+        const auto now = static_cast<uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        std::seed_seq seed{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd(),
+                           static_cast<unsigned>(now), static_cast<unsigned>(now >> 32)};
+        return std::mt19937_64(seed);
+    }();
     static const char hex[] = "0123456789abcdef";
     std::lock_guard<std::mutex> lk(mu);
     std::string out;
@@ -677,6 +687,36 @@ struct AuditStoreError : std::runtime_error {
     explicit AuditStoreError(const std::string& msg)
         : std::runtime_error("fasten audit store: " + msg) {}
 };
+
+// Thrown by a store for a row that can never be written: an id another row
+// already holds, or text with a NUL byte. The drainer dead-letters the row
+// at once instead of retrying it.
+struct InsertRejected : std::runtime_error {
+    explicit InsertRejected(const std::string& msg) : std::runtime_error(msg) {}
+};
+
+namespace detail_ {
+
+// A store binds text up to the first NUL byte, and Postgres refuses NUL in
+// text, so a row with one is rejected rather than stored cut short.
+inline void reject_nul_text(const char* store, const Row& row, const std::string& detail_json) {
+    const std::pair<const char*, const std::string*> fields[] = {
+        {"id", &row.id}, {"origin_id", &row.origin_id}, {"timestamp", &row.timestamp},
+        {"code", &row.code}, {"action", &row.action}, {"severity", &row.severity},
+        {"service_id", &row.service_id}, {"source_node_id", &row.source_node_id},
+        {"tenant_id", &row.tenant_id}, {"actor", &row.actor}, {"actor_kind", &row.actor_kind},
+        {"target", &row.target}, {"category", &row.category}, {"domain", &row.domain},
+        {"method", &row.method}, {"request_id", &row.request_id},
+        {"detail", &detail_json}, {"shipped_at", &row.shipped_at},
+    };
+    for (const auto& f : fields) {
+        if (f.second->find('\0') != std::string::npos) {
+            throw InsertRejected(std::string(store) + " insert: " + f.first + " contains a NUL byte");
+        }
+    }
+}
+
+}  // namespace detail_
 
 // Returned by queue_stats(). depth counts queued and in-flight rows.
 struct QueueStats {
@@ -1023,6 +1063,8 @@ class CFastenDrainer {
         try {
             ref->sink(row_from_json_(std::string(row_json)));
             return 0;
+        } catch (const InsertRejected&) {
+            return -1;  // FASTEN_INSERT_REJECTED: dead-letter, no retry
         } catch (...) { return 1; }
     }
 

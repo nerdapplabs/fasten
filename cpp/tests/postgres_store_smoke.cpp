@@ -293,6 +293,44 @@ void test_redaction(const std::string& dsn) {
 
 } // namespace
 
+void test_id_held_by_a_different_row_is_rejected(const std::string& dsn) {
+    const std::string table = "fasten_cpp_dup_" + fasten::mint_id();
+    fasten::PostgresStore store(dsn, table);
+    auto first = make_row("evt-dup-1", "TEST_DUP");
+    store.insert(first);
+    for (int64_t seq : {int64_t(7), int64_t(0)}) {
+        auto other = make_row("evt-dup-1", "TEST_DUP");
+        other.request_id    = "req-other";
+        other.monotonic_seq = seq;
+        bool rejected = false;
+        try {
+            store.insert(other);
+        } catch (const fasten::InsertRejected&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+    store.insert(first);  // the same row again is still fine
+    auto next = make_row("evt-dup-2", "TEST_DUP");
+    next.monotonic_seq = 0;
+    store.insert(next);   // the rolled-back transaction left the store usable
+    std::cout << "  test_id_held_by_a_different_row_is_rejected: PASS\n";
+}
+
+void test_text_with_a_nul_byte_is_rejected(const std::string& dsn) {
+    fasten::PostgresStore store(dsn, "fasten_cpp_pg_test");
+    auto row = make_row("evt-cpp-pg-nul-1", "TEST_NUL");
+    row.actor = std::string("a\0b", 3);
+    bool rejected = false;
+    try {
+        store.insert(row);
+    } catch (const fasten::InsertRejected& e) {
+        rejected = std::string(e.what()).find("actor") != std::string::npos;
+    }
+    assert(rejected);
+    std::cout << "  test_text_with_a_nul_byte_is_rejected: PASS\n";
+}
+
 int main() {
     std::cout << "=== postgres_store_smoke ===\n";
 
@@ -317,6 +355,8 @@ int main() {
     test_concurrent_open_existing_table(dsn);
     test_two_stores_one_node(dsn);
     test_redaction(dsn);
+    test_id_held_by_a_different_row_is_rejected(dsn);
+    test_text_with_a_nul_byte_is_rejected(dsn);
 
     std::cout << "All PostgreSQL store smoke tests passed.\n";
     return 0;
