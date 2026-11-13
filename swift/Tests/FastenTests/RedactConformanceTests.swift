@@ -94,4 +94,17 @@ final class RedactConformanceTests: XCTestCase {
         default: return false
         }
     }
+
+    func testLongValuesRedactQuickly() {
+        let r = Redactor()
+        for note in [String(repeating: "eyJ", count: 50_000) + ".eyJ.x",
+                     String(repeating: "1 ", count: 75_000),
+                     String(repeating: "a://b:", count: 25_000),
+                     String(repeating: "Bearer ", count: 20_000)] {
+            let t0 = Date()
+            _ = r.redact(["note": note])
+            let s = Date().timeIntervalSince(t0)
+            XCTAssertLessThan(s, 2.0, "redacting \(note.count) chars took \(s) s")
+        }
+    }
 }

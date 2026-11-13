@@ -96,6 +96,7 @@
     "notes": [
       "Patterns match field keys, not values.",
       "[_-]? — separator is optional: api_key, api-key, apikey all match.",
+      "^key$ and ^auth$ match only the whole key, so primary_key and author are kept; dsn$ matches only at the end, so goodsName is kept.",
       "Adopters may add keys via init(extra_redact_keys=[...]) but never remove defaults."
     ],
     "patterns": [
@@ -109,10 +110,15 @@
       "m2m[_-]?key",
       "cert[_-]?private",
       "private[_-]?key",
-      "access_key",
-      "session_id",
+      "access[_-]?key",
+      "session[_-]?id",
       "cookie",
-      "credential"
+      "credential",
+      "pwd",
+      "passphrase",
+      "dsn$",
+      "^key$",
+      "^auth$"
     ]
   }
 }
