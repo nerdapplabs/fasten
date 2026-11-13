@@ -247,14 +247,6 @@ void test_two_stores_one_node_get_distinct_seqs() {
     std::cout << "  test_two_stores_one_node_get_distinct_seqs: PASS\n";
 }
 
-#ifndef _WIN32
-// Under the usual 022 umask SQLite alone would create these 0644.
-int file_mode(const std::string& path) {
-    struct stat st{};
-    if (stat(path.c_str(), &st) != 0) return -1;
-    return static_cast<int>(st.st_mode & 0777);
-}
-
 int count_rows(const std::string& path) {
     sqlite3* db = nullptr;
     sqlite3_open(path.c_str(), &db);
@@ -296,6 +288,34 @@ void test_id_held_by_a_different_row_is_rejected() {
     std::cout << "  test_id_held_by_a_different_row_is_rejected: PASS\n";
 }
 
+// A table with a unique (node, seq) index, as the Go store creates: a fresh
+// id at a taken seq is refused by that index, and the error says so.
+void test_taken_seq_is_named_in_the_error() {
+    const std::string path = "/tmp/fasten_seqclash_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        store.insert(make_row("evt-clash-1", "TEST_CLASH"));
+    }
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_exec(db, "CREATE UNIQUE INDEX uq_audit_log_node_seq ON audit_log (source_node_id, monotonic_seq)",
+                 nullptr, nullptr, nullptr);
+    sqlite3_close(db);
+    {
+        fasten::SqliteStore store(path);
+        std::string msg;
+        try {
+            store.insert(make_row("evt-clash-2", "TEST_CLASH"));  // seq 1 again
+        } catch (const fasten::InsertRejected& e) {
+            msg = e.what();
+        }
+        assert(msg.find("another unique index") != std::string::npos);
+    }
+    assert(count_rows(path) == 1);
+    std::remove(path.c_str());
+    std::cout << "  test_taken_seq_is_named_in_the_error: PASS\n";
+}
+
 void test_text_with_a_nul_byte_is_rejected() {
     fasten::SqliteStore store(":memory:");
     auto row = make_row("evt-nul-1", "TEST_NUL");
@@ -316,6 +336,14 @@ void test_minted_ids_do_not_repeat() {
     std::sort(ids.begin(), ids.end());
     assert(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
     std::cout << "  test_minted_ids_do_not_repeat: PASS\n";
+}
+
+#ifndef _WIN32
+// Under the usual 022 umask SQLite alone would create these 0644.
+int file_mode(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) return -1;
+    return static_cast<int>(st.st_mode & 0777);
 }
 
 void remove_db(const std::string& path) {
@@ -464,6 +492,7 @@ int main() {
     test_failed_commit_does_not_wedge_the_store();
     test_two_stores_one_node_get_distinct_seqs();
     test_id_held_by_a_different_row_is_rejected();
+    test_taken_seq_is_named_in_the_error();
     test_text_with_a_nul_byte_is_rejected();
     test_minted_ids_do_not_repeat();
 #ifndef _WIN32

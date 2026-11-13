@@ -257,11 +257,11 @@ private:
         // ON CONFLICT DO NOTHING wrote nothing: the id is taken. A retry of
         // this same row is fine; a different row with this id is rejected.
         if (!inserted) {
-            const char* p[5] = {row.id.c_str(), row.code.c_str(), row.request_id.c_str(),
-                                row.target.c_str(), row.actor.c_str()};
+            const char* p[6] = {row.id.c_str(), row.code.c_str(), row.request_id.c_str(),
+                                row.target.c_str(), row.actor.c_str(), row.timestamp.c_str()};
             std::string same = query(
                 "SELECT 1 FROM " + table_ + " WHERE id = $1 AND code = $2"
-                " AND request_id = $3 AND target = $4 AND actor = $5", 5, p);
+                " AND request_id = $3 AND target = $4 AND actor = $5 AND timestamp = $6", 6, p);
             if (same.empty()) {
                 throw InsertRejected("fasten PostgresStore insert: id " + row.id +
                                      " is already held by a different row");

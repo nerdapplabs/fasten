@@ -147,12 +147,17 @@ public:
             if (allocate) rollback();
             throw std::runtime_error("fasten SqliteStore insert: " + msg);
         }
-        // INSERT OR IGNORE wrote nothing: the id is taken. A retry of this
-        // same row is fine; a different row with this id is rejected.
-        if (sqlite3_changes(db_) == 0 && !stored_row_matches(row)) {
-            if (allocate) rollback();
-            throw InsertRejected("fasten SqliteStore insert: id " + row.id +
-                                 " is already held by a different row");
+        // INSERT OR IGNORE wrote nothing. A retry of this same row is fine;
+        // otherwise the id is held by a different row, or another unique
+        // index (such as a node's seq) refused it.
+        if (sqlite3_changes(db_) == 0) {
+            const int held = stored_row_matches(row);
+            if (held != 1) {
+                if (allocate) rollback();
+                throw InsertRejected("fasten SqliteStore insert: row " + row.id + " not written: " +
+                    (held == 0 ? "the id is held by a different row"
+                               : "another unique index refused it (a taken node seq?)"));
+            }
         }
         if (allocate) {
             try {
@@ -297,10 +302,11 @@ private:
         return seq;
     }
 
-    // Whether the row stored under row.id is this row, by the columns that
-    // tell two rows apart.
-    bool stored_row_matches(const Row& row) {
-        const std::string sql = "SELECT code, request_id, target, actor FROM " +
+    // 1 when the row stored under row.id is this row (by the columns that tell
+    // two rows apart and never change on a retry), 0 when it is a different
+    // row, -1 when no row has this id.
+    int stored_row_matches(const Row& row) {
+        const std::string sql = "SELECT code, request_id, target, actor, timestamp FROM " +
                                 table_ + " WHERE id = ?";
         sqlite3_stmt* q = nullptr;
         if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &q, nullptr) != SQLITE_OK)
@@ -311,10 +317,13 @@ private:
             const unsigned char* t = sqlite3_column_text(q, i);
             return t ? std::string(reinterpret_cast<const char*>(t)) : std::string();
         };
-        bool same = sqlite3_step(q) == SQLITE_ROW && col(0) == row.code &&
-                    col(1) == row.request_id && col(2) == row.target && col(3) == row.actor;
+        int held = -1;
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            held = col(0) == row.code && col(1) == row.request_id && col(2) == row.target &&
+                   col(3) == row.actor && col(4) == row.timestamp;
+        }
         sqlite3_finalize(q);
-        return same;
+        return held;
     }
 
     static bool is_valid_identifier(const std::string& s) {
