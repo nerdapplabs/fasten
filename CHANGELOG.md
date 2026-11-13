@@ -12,8 +12,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `-0`), while Python, reading the stored row, hashes them as CPython renders
   them (`5e-05`, `1e-07`, `0`). Python then reported an untampered Go row as
   a commitment mismatch. Go now hashes every number as CPython renders it
-  (spec `chain-replication.md` §1.3), and still verifies rows it sealed the
-  old way.
+  (spec `chain-replication.md` §1.3), so rows it seals from this release on
+  verify in Python. Rows an older Go release sealed with such numbers still
+  verify in Go, but not in Python.
 - New cross-SDK vectors: `spec/go-sealed-numbers.json` (Go seals, Python
   verifies) and a `form2_numbers` case in `spec/python-sealed-forms.json`
   (Python seals, Go verifies).

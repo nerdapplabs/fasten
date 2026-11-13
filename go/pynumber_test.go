@@ -59,6 +59,11 @@ func TestPyNumbers_RewritesTokensOnly(t *testing.T) {
 	if got := string(pyNumbers([]byte(in))); got != want {
 		t.Errorf("pyNumbers:\n got %s\nwant %s", got, want)
 	}
+	// Python: json.dumps(json.loads(...)) reads overflow as ±inf, underflow as ±0.0.
+	edge := `{"a":1e400,"b":-1e400,"c":1e-400,"d":-1e-400}`
+	if got, want := string(pyNumbers([]byte(edge))), `{"a":Infinity,"b":-Infinity,"c":0.0,"d":-0.0}`; got != want {
+		t.Errorf("pyNumbers out of range:\n got %s\nwant %s", got, want)
+	}
 	same := `{"qty":3,"price":75.0,"rate":5e-05}`
 	if got := string(pyNumbers([]byte(same))); got != same {
 		t.Errorf("CPython-form tokens changed: %s", got)
@@ -115,6 +120,25 @@ func TestVerify_AcceptsRowsSealedWithGoNumbers(t *testing.T) {
 	}
 	if res := VerifyChain([]Row{row}); !res.OK {
 		t.Fatalf("a row sealed with Go's old number rendering no longer verifies: %s", res.Reason)
+	}
+}
+
+// The fallback to Go's old number rendering accepts only the values that were
+// sealed: a changed number fails under every encoding.
+func TestVerify_ChangedNumberOnARowSealedWithGoNumbersFails(t *testing.T) {
+	row := numbersRow()
+	row.CanonicalFormID = currentCanonicalFormID
+	row.PrevHash = "genesis"
+	row.DetailCommitment = detailCommitmentWith(row.DetailSalt, row.Detail, canonicalJSONGoNumbers)
+	row.Hash = hashFnByForm[currentCanonicalFormID](row, canonicalJSONGoNumbers)
+	changed := map[string]any{}
+	for k, v := range row.Detail {
+		changed[k] = v
+	}
+	changed["tiny"] = 0.00006
+	row.Detail = changed
+	if res := VerifyChain([]Row{row}); res.OK {
+		t.Fatal("a changed detail number verified on a row sealed with Go's old rendering")
 	}
 }
 

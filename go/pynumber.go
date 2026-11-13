@@ -1,6 +1,8 @@
 package fasten
 
 import (
+	"errors"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -75,6 +77,14 @@ func pyNumberToken(tok string) string {
 	}
 	f, err := strconv.ParseFloat(tok, 64)
 	if err != nil {
+		// Past float64's range: CPython reads ±inf and json.dumps writes
+		// Infinity. A token that underflows parses as ±0 without an error.
+		if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
+			if f > 0 {
+				return "Infinity"
+			}
+			return "-Infinity"
+		}
 		return tok
 	}
 	return pyFloatRepr(f)
