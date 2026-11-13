@@ -34,7 +34,7 @@ const currentCanonicalFormID = "2"
 const legacyCanonicalFormID = "1"
 
 // hashFnByForm maps a canonical_form_id to its row hash function, which takes
-// the canonical JSON encoder (canonicalJSON, or canonicalJSONRawDEL when
+// the canonical JSON encoder (canonicalJSON, or an older Go encoding when
 // rowBreak retries). A new form is added here and stamped in Seal.
 var hashFnByForm = map[string]func(Row, func(any) []byte) string{
 	"1": rowHashForm1With,
@@ -239,13 +239,13 @@ func rowBreak(row Row) string {
 	if _, ok := hashFnByForm[formID]; !ok {
 		return fmt.Sprintf("row %s: unknown canonical_form_id %q", row.ID, formID)
 	}
-	// Go wrote DEL (0x7f) raw before it escaped it as \u007f, so a row it
-	// sealed with DEL in a hashed string matches only that way. Each check
-	// below is retried with DEL raw on a miss; nothing else about the
-	// encoding changes. Looking for DEL costs an encode, so only a miss pays.
+	// Rows older Go releases sealed match only with their encoding: numbers
+	// as encoding/json writes them, and before that DEL (0x7f) raw too. Each
+	// check below is retried that way on a miss. Looking for DEL costs an
+	// encode, so only a miss pays.
 	delChecked, del := false, false
 	matches := func(check func(canon func(any) []byte) bool) bool {
-		if check(canonicalJSON) {
+		if check(canonicalJSON) || check(canonicalJSONGoNumbers) {
 			return true
 		}
 		if !delChecked {
@@ -466,17 +466,28 @@ func pyISOFormat(t time.Time) string {
 
 // canonicalJSON renders v the way Python's
 // json.dumps(v, sort_keys=True, separators=(',',':'), default=str, ensure_ascii=True)
-// would: sorted keys, compact separators, HTML left literal, non-ASCII escaped.
+// would: sorted keys, compact separators, HTML left literal, non-ASCII escaped,
+// numbers as CPython renders them (spec §1.3).
 //
-// encoding/json already sorts map keys and is compact, so this only turns off
-// HTML escaping and escapes DEL (0x7f) and non-ASCII runes as \uXXXX.
-// encoding/json writes those bytes only inside strings, so that is safe.
+// encoding/json already sorts map keys and is compact, so this turns off HTML
+// escaping, escapes DEL (0x7f) and non-ASCII runes as \uXXXX (encoding/json
+// writes those bytes only inside strings, so that is safe), and rewrites
+// number tokens with pyNumbers.
 func canonicalJSON(v any) []byte {
+	return pyNumbers(asciiEscape(encodeJSON(v), true))
+}
+
+// canonicalJSONGoNumbers is canonicalJSON with numbers as encoding/json
+// writes them, as Go sealed before it matched CPython's number rendering
+// (0.00005, 1e-7 and -0 rather than 5e-05, 1e-07 and 0). Verification
+// fallback only, never used to seal.
+func canonicalJSONGoNumbers(v any) []byte {
 	return asciiEscape(encodeJSON(v), true)
 }
 
-// canonicalJSONRawDEL is canonicalJSON with DEL left raw, as Go wrote it
-// before it escaped DEL. Verification fallback only, never used to seal.
+// canonicalJSONRawDEL is canonicalJSONGoNumbers with DEL left raw, as Go
+// wrote it before it escaped DEL (which was also before it matched CPython's
+// numbers). Verification fallback only, never used to seal.
 func canonicalJSONRawDEL(v any) []byte {
 	return asciiEscape(encodeJSON(v), false)
 }

@@ -99,6 +99,9 @@ them**:
 | `75.0` (whole-number float) | `75.0` | **NOT `75`** |
 | `12.5` | `12.5` | |
 | `1e20` | `1e+20` | |
+| `0.00005` | `5e-05` | scientific below `1e-4` |
+| `1e-7` | `1e-07` | exponent of at least two digits |
+| `1e16` | `1e+16` | scientific from `1e16` |
 
 A Go SDK MUST NOT decode `detail` numbers into `float64` and re-encode them with
 the default encoder. `float64(75.0)` renders as `75`, not CPython's `75.0`. A
@@ -112,6 +115,20 @@ value keeps its source token (`"75.0"`, `"7"`, `"1e+20"`) and is written back
 unchanged. The stored JSON was produced by the canonical (CPython) rendering, so
 keeping its tokens reproduces it byte for byte, whatever type the number had
 originally.
+
+An SDK that seals numbers from its own types (Go's `float64`) MUST hash each
+one as CPython renders the value `json.loads` gives for the token it stores, so
+that Python, reading the stored row, hashes the same bytes:
+
+- A token with no `.`, `e` or `E` is an int to CPython and is hashed as
+  written, except `-0`, which is hashed as `0`.
+- Any other token is a float and is hashed as `repr()` writes it: the
+  shortest digits that round-trip, in fixed notation when the decimal exponent
+  is from -4 to 15 (with `.0` on a whole number), otherwise in scientific
+  notation with a signed exponent of at least two digits.
+
+Go's encoder writes `0.00005`, `1e-7` and `-0`; Go hashes them as `5e-05`,
+`1e-07` and `0`.
 
 ### §1.4 Canonical form `"2"`: committed detail
 
@@ -371,6 +388,10 @@ SDKs SHOULD pin these to catch drift. Each is a single Python-sealed row with
 | Whole-number float | `{"setpoint": 75.0, "tolerance": 12.5, "retries": 7}` | `512021c690ddfd2077192cb6d75921ea36d35b3270a12fdf91888d5ffabcf54b` |
 
 The float vector guards §1.3: it fails for any SDK that renders `75.0` as `75`.
+`spec/go-sealed-numbers.json` (sealed by Go, verified by Python) and the
+`form2_numbers` case in `spec/python-sealed-forms.json` (sealed by Python,
+verified by Go) cover small, large and negative-zero floats, big ints,
+non-ASCII text and nested detail in both directions.
 
 ---
 
