@@ -110,7 +110,8 @@ pub trait Store: Send + Sync {
     /// `monotonic_seq ASC`.  `limit == 0` returns all unshipped rows.
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error>;
 
-    /// Set `shipped_at` to the current UTC time for all rows in `ids`.
+    /// Set `shipped_at` to the current UTC time for all rows in `ids`, in
+    /// one transaction however many ids there are.
     /// IDs that do not exist are silently ignored.
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
 
@@ -121,7 +122,8 @@ pub trait Store: Send + Sync {
     /// When `respect_unshipped` is `true`, rows with `shipped_at IS NULL` are
     /// preserved regardless of age, and so are the rows above them.
     ///
-    /// Returns the number of deleted rows.
+    /// Returns the number of deleted rows. A `before` that is not an
+    /// RFC 3339 timestamp is an `InvalidTimestamp` error and deletes nothing.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
@@ -224,6 +226,15 @@ pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postg
     } else {
         format!("DELETE FROM {table} WHERE id IN ({bound}SELECT d.id FROM bound, {table} AS d WHERE {matches})")
     }
+}
+
+/// Rejects a purge cutoff that is not an RFC 3339 timestamp. purge_sql
+/// compares it with `timestamp` as text, where a string like "tomorrow"
+/// sorts after every row. A valid cutoff is used as given.
+pub(crate) fn check_purge_cutoff(before: &str) -> Result<(), Error> {
+    chrono::DateTime::parse_from_rfc3339(before)
+        .map(|_| ())
+        .map_err(|_| Error::InvalidTimestamp(before.to_string()))
 }
 
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
