@@ -290,6 +290,258 @@
       "group": "nested",
       "input":    {"name": "Alice", "token": "tok-abc", "email": "a@b.com"},
       "expected": {"name": "Alice", "token": "***", "email": "a@b.com"}
+    },
+    {
+      "name": "key_access_key_camel",
+      "group": "key_pattern",
+      "input":    {"accessKey": "xxx"},
+      "expected": {"accessKey": "***"}
+    },
+    {
+      "name": "key_access_key_dash",
+      "group": "key_pattern",
+      "input":    {"access-key": "xxx"},
+      "expected": {"access-key": "***"}
+    },
+    {
+      "name": "key_session_id_camel",
+      "group": "key_pattern",
+      "input":    {"sessionId": "xxx"},
+      "expected": {"sessionId": "***"}
+    },
+    {
+      "name": "key_session_id_dash",
+      "group": "key_pattern",
+      "input":    {"session-id": "xxx"},
+      "expected": {"session-id": "***"}
+    },
+    {
+      "name": "key_pwd",
+      "group": "key_pattern",
+      "input":    {"pwd": "xxx"},
+      "expected": {"pwd": "***"}
+    },
+    {
+      "name": "key_passphrase",
+      "group": "key_pattern",
+      "input":    {"passphrase": "xxx"},
+      "expected": {"passphrase": "***"}
+    },
+    {
+      "name": "key_dsn",
+      "group": "key_pattern",
+      "input":    {"dsn": "postgres://db/x"},
+      "expected": {"dsn": "***"}
+    },
+    {
+      "name": "key_exact_key",
+      "group": "key_pattern",
+      "input":    {"key": "xxx"},
+      "expected": {"key": "***"}
+    },
+    {
+      "name": "key_exact_auth",
+      "group": "key_pattern",
+      "input":    {"Auth": "xxx"},
+      "expected": {"Auth": "***"}
+    },
+    {
+      "name": "key_primary_key_not_matched",
+      "group": "safe",
+      "input":    {"primary_key": "id-1"},
+      "expected": {"primary_key": "id-1"}
+    },
+    {
+      "name": "key_keyword_not_matched",
+      "group": "safe",
+      "input":    {"keyword": "audit"},
+      "expected": {"keyword": "audit"}
+    },
+    {
+      "name": "key_author_not_matched",
+      "group": "safe",
+      "input":    {"author": "alice"},
+      "expected": {"author": "alice"}
+    },
+    {
+      "name": "value_cc_after_timestamp",
+      "group": "value_shape",
+      "input":    {"note": "2026-11-12 08:30:00 payment failed for card 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_order_number",
+      "group": "value_shape",
+      "input":    {"note": "order 1234567890123 card 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_short_number",
+      "group": "value_shape",
+      "input":    {"note": "ref 12 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_punctuation",
+      "group": "value_shape",
+      "input":    {"note": "card:4111111111111111."},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped",
+      "group": "value_shape",
+      "input":    {"note": "4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_long_digit_run_not_cc",
+      "group": "safe",
+      "input":    {"note": "41111111111111110000"},
+      "expected": {"note": "41111111111111110000"}
+    },
+    {
+      "name": "value_pem_encrypted",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHz..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_gh_fine_grained",
+      "group": "value_shape",
+      "input":    {"note": "github_pat_11AAAAAAA0BBBBBBBBBBBBBB"},
+      "expected": {"note": "***GH_TOKEN***"}
+    },
+    {
+      "name": "value_slack_token",
+      "group": "value_shape",
+      "input":    {"note": "xoxb-0000000000-AAAAAAAAAA"},
+      "expected": {"note": "***SLACK_TOKEN***"}
+    },
+    {
+      "name": "value_url_credentials",
+      "group": "value_shape",
+      "input":    {"conn": "postgres://app:s3cret@db.internal:5432/audit"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_url_without_password",
+      "group": "safe",
+      "input":    {"link": "https://alice@example.com/a@b"},
+      "expected": {"link": "https://alice@example.com/a@b"}
+    },
+    {
+      "name": "value_bearer_opaque",
+      "group": "value_shape",
+      "input":    {"note": "Bearer abcdefghijklmnop0123456789"},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic dXNlcjpwYXNzd29yZDEyMw=="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_plan_not_auth",
+      "group": "safe",
+      "input":    {"note": "basic plan upgrade"},
+      "expected": {"note": "basic plan upgrade"}
+    },
+    {
+      "name": "value_jwt_in_sentence",
+      "group": "value_shape",
+      "input":    {"note": "error: invalid token xeyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2ln, retry"},
+      "expected": {"note": "***JWT***"}
+    },
+    {
+      "name": "value_eyj_run_not_jwt",
+      "group": "safe",
+      "input":    {"note": "eyJeyJeyJ.eyJ"},
+      "expected": {"note": "eyJeyJeyJ.eyJ"}
+    },
+    {
+      "name": "value_cc_dashes",
+      "group": "value_shape",
+      "input":    {"note": "4111-1111-1111-1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_amex_layout",
+      "group": "value_shape",
+      "input":    {"note": "3782 822463 10005"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped_after_date",
+      "group": "value_shape",
+      "input":    {"note": "2026-11-12 4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_id_digits_not_cc",
+      "group": "safe",
+      "input":    {"ref": "txn_1731400000005"},
+      "expected": {"ref": "txn_1731400000005"}
+    },
+    {
+      "name": "value_date_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "dates 2026-11-12 2026-11-13 2026-11-14"},
+      "expected": {"note": "dates 2026-11-12 2026-11-13 2026-11-14"}
+    },
+    {
+      "name": "value_count_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "counts 120 340 560 780 900 1200 1500 1800"},
+      "expected": {"note": "counts 120 340 560 780 900 1200 1500 1800"}
+    },
+    {
+      "name": "value_year_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "releases 2019 2020 2021 2004 2023"},
+      "expected": {"note": "releases 2019 2020 2021 2004 2023"}
+    },
+    {
+      "name": "key_suffix_dsn",
+      "group": "key_pattern",
+      "input":    {"sentryDsn": "https://o1.ingest.example/1"},
+      "expected": {"sentryDsn": "***"}
+    },
+    {
+      "name": "key_dsn_inside_word_not_matched",
+      "group": "safe",
+      "input":    {"goodsName": "bolts"},
+      "expected": {"goodsName": "bolts"}
+    },
+    {
+      "name": "value_url_password_only",
+      "group": "value_shape",
+      "input":    {"conn": "redis://:s3cret@cache:6379/0"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_url_query_not_credentials",
+      "group": "safe",
+      "input":    {"link": "https://example.com?next=mailto:bob@example.org"},
+      "expected": {"link": "https://example.com?next=mailto:bob@example.org"}
+    },
+    {
+      "name": "value_basic_in_sentence_not_auth",
+      "group": "safe",
+      "input":    {"note": "Basic internationalization support"},
+      "expected": {"note": "Basic internationalization support"}
+    },
+    {
+      "name": "value_basic_path_not_auth",
+      "group": "safe",
+      "input":    {"note": "Plan includes basic /etc/nginx/nginx.conf"},
+      "expected": {"note": "Plan includes basic /etc/nginx/nginx.conf"}
+    },
+    {
+      "name": "value_bearer_prose_not_auth",
+      "group": "safe",
+      "input":    {"note": "The bearer acknowledges-receipt-of-goods"},
+      "expected": {"note": "The bearer acknowledges-receipt-of-goods"}
     }
   ]
 }
