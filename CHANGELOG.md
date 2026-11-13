@@ -6,6 +6,20 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ stores no longer drop rows while reporting success
+
+- Row ids come from a generator seeded with 256 bits instead of one 32-bit
+  `random_device` value, so two processes no longer draw the same ids.
+- The SQLite and PostgreSQL stores insert with `OR IGNORE` /
+  `ON CONFLICT (id) DO NOTHING`. A different row whose id is already stored
+  was dropped while the insert succeeded; it now throws
+  `fasten::InsertRejected`. The same row inserted again still succeeds.
+- Text with a NUL byte was stored cut at the NUL; it now throws
+  `fasten::InsertRejected`.
+- The drainer dead-letters a rejected row at once instead of retrying it.
+- The SQLite store's next seq no longer falls back to 1 when its query
+  fails; the insert fails instead.
+
 ### Fixed: fasten-core purge and mark_shipped
 
 - `purge` rejects a cutoff that is not an RFC 3339 timestamp. A value like

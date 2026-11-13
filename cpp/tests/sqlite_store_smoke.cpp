@@ -3,6 +3,7 @@
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
+#include <algorithm>
 #include <cassert>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -254,6 +255,69 @@ int file_mode(const std::string& path) {
     return static_cast<int>(st.st_mode & 0777);
 }
 
+int count_rows(const std::string& path) {
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM audit_log", -1, &q, nullptr);
+    int n = sqlite3_step(q) == SQLITE_ROW ? sqlite3_column_int(q, 0) : -1;
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    return n;
+}
+
+// A different row with an id already stored is rejected, not dropped while
+// the insert reports success. Both insert paths: a given seq and seq 0.
+void test_id_held_by_a_different_row_is_rejected() {
+    const std::string path = "/tmp/fasten_dupid_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        auto first = make_row("evt-dup-1", "TEST_DUP");
+        store.insert(first);
+        for (int64_t seq : {int64_t(7), int64_t(0)}) {
+            auto other = make_row("evt-dup-1", "TEST_DUP");
+            other.request_id    = "req-other";
+            other.monotonic_seq = seq;
+            bool rejected = false;
+            try {
+                store.insert(other);
+            } catch (const fasten::InsertRejected&) {
+                rejected = true;
+            }
+            assert(rejected);
+        }
+        store.insert(first);  // the same row again is still fine
+        auto next = make_row("evt-dup-2", "TEST_DUP");
+        next.monotonic_seq = 0;
+        store.insert(next);   // the rolled-back transaction left the store usable
+    }
+    assert(count_rows(path) == 2);
+    std::remove(path.c_str());
+    std::cout << "  test_id_held_by_a_different_row_is_rejected: PASS\n";
+}
+
+void test_text_with_a_nul_byte_is_rejected() {
+    fasten::SqliteStore store(":memory:");
+    auto row = make_row("evt-nul-1", "TEST_NUL");
+    row.target = std::string("a\0b", 3);
+    bool rejected = false;
+    try {
+        store.insert(row);
+    } catch (const fasten::InsertRejected& e) {
+        rejected = std::string(e.what()).find("target") != std::string::npos;
+    }
+    assert(rejected);
+    std::cout << "  test_text_with_a_nul_byte_is_rejected: PASS\n";
+}
+
+void test_minted_ids_do_not_repeat() {
+    std::vector<std::string> ids;
+    for (int i = 0; i < 20000; ++i) ids.push_back(fasten::detail_::mint_id_bytes(10));
+    std::sort(ids.begin(), ids.end());
+    assert(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+    std::cout << "  test_minted_ids_do_not_repeat: PASS\n";
+}
+
 void remove_db(const std::string& path) {
     for (const char* ext : {"", "-wal", "-shm"}) std::remove((path + ext).c_str());
 }
@@ -399,6 +463,9 @@ int main() {
     test_next_seq_uses_index();
     test_failed_commit_does_not_wedge_the_store();
     test_two_stores_one_node_get_distinct_seqs();
+    test_id_held_by_a_different_row_is_rejected();
+    test_text_with_a_nul_byte_is_rejected();
+    test_minted_ids_do_not_repeat();
 #ifndef _WIN32
     test_new_file_and_wal_are_0600();
     test_existing_file_keeps_its_mode();
