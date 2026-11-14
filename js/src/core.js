@@ -108,8 +108,7 @@ const _WORD_CHAR_RE = /[A-Za-z0-9_]/;
 
 // Whether s holds a card number: a group of 13 to 19 digits, or groups in a
 // card layout, that pass the Luhn check. Same rules as fasten-core: digits
-// joined to a letter or "_" are skipped, and so is a grouped layout next to
-// another group of four digits.
+// joined to a letter or "_" are skipped.
 function _hasCard(s) {
 	for (const m of s.matchAll(_DIGIT_RUN_RE)) {
 		const start = m.index;
@@ -127,12 +126,6 @@ function _hasCard(s) {
 			for (const layout of _CARD_LAYOUTS) {
 				const e = i + layout.length;
 				if (e > groups.length || !fitsEnd(e)) continue;
-				if (
-					(i > 0 && groups[i - 1].length === 4) ||
-					(e < groups.length && groups[e].length === 4)
-				) {
-					continue;
-				}
 				const window = groups.slice(i, e);
 				if (
 					window.every((w, k) => w.length === layout[k]) &&

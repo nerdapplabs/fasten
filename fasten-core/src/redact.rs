@@ -70,8 +70,7 @@ fn is_word_byte(b: u8) -> bool {
 
 /// Whether `s` holds a card number: a group of 13 to 19 digits, or groups in
 /// a card layout, that pass the Luhn check. Digits joined to a letter or `_`
-/// are part of an id and are skipped. A grouped layout next to another group
-/// of four digits is skipped too, so a list of years or counts is not a card.
+/// are part of an id and are skipped.
 fn has_card(s: &str) -> bool {
     let bytes = s.as_bytes();
     for run in DIGIT_RUN_RE.find_iter(s) {
@@ -89,9 +88,6 @@ fn has_card(s: &str) -> bool {
             for layout in CARD_LAYOUTS {
                 let end = i + layout.len();
                 if end > groups.len() || !fits_end(end) {
-                    continue;
-                }
-                if (i > 0 && groups[i - 1].len() == 4) || (end < groups.len() && groups[end].len() == 4) {
                     continue;
                 }
                 if groups[i..end].iter().zip(layout.iter()).all(|(g, &n)| g.len() == n)

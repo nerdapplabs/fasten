@@ -134,8 +134,7 @@ public final class Redactor: @unchecked Sendable {
 
     // Whether s holds a card number: a group of 13 to 19 digits, or groups in
     // a card layout, that pass the Luhn check. Same rules as fasten-core:
-    // digits joined to a letter or "_" are skipped, and so is a grouped layout
-    // next to another group of four digits.
+    // digits joined to a letter or "_" are skipped.
     static func hasCard(_ s: String) -> Bool {
         let ns = s as NSString
         for m in digitRun.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
@@ -152,7 +151,6 @@ public final class Redactor: @unchecked Sendable {
                 for layout in cardLayouts {
                     let e = i + layout.count
                     if e > groups.count || !fitsEnd(e) { continue }
-                    if (i > 0 && groups[i - 1].count == 4) || (e < groups.count && groups[e].count == 4) { continue }
                     if zip(groups[i..<e], layout).allSatisfy({ $0.count == $1 })
                         && luhn(Array(groups[i..<e].joined())) {
                         return true
