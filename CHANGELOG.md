@@ -6,6 +6,25 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: C++ `fasten::shutdown()` and `ShutdownGuard`
+
+- `fasten::shutdown()` writes queued audit rows, stops the drainer, drops
+  the audit sink and waits for sink calls still running on other threads.
+  `fasten::ShutdownGuard` calls it at scope exit. The engine is a static,
+  destroyed after `main()`'s locals, so a sink that writes to a store local
+  to `main()` needs one of them before the store goes out of scope.
+
+### Fixed: closing a fasten-core store handle while it is in use
+
+- `fasten_store_close` waits for calls running on other threads before it
+  frees the handle; calls that start during close return
+  `FASTEN_ERR_NULL_ARG`.
+- `fasten_store_from_callback` returns NULL, with an error, for a NULL
+  callback.
+- A string argument that isn't UTF-8 returns `FASTEN_ERR_NULL_ARG`; an
+  invalid optional query filter used to be read as no filter.
+- Go: a `RedactReplacement` that isn't UTF-8 is made valid at `Init`.
+
 ### Fixed: C++ stores no longer drop rows while reporting success
 
 - Row ids come from a generator seeded with 256 bits instead of one 32-bit
