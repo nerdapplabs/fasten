@@ -19,6 +19,20 @@ from ..redact import describe_error
 
 logger = logging.getLogger(__name__)
 
+
+def check_conninfo(dsn: str) -> None:
+    """Raise ValueError if libpq can't parse ``dsn``. The error names no part
+    of the string."""
+    try:
+        from psycopg import conninfo
+    except ImportError:  # the postgres extra isn't installed; connect fails later
+        return
+    try:
+        conninfo.conninfo_to_dict(dsn)
+    except Exception:
+        raise ValueError("fasten: invalid Postgres connection string") from None
+
+
 if TYPE_CHECKING:
     from .repo import IngestResult
 
@@ -114,6 +128,7 @@ class PostgresStore:
     """
 
     def __init__(self, dsn: str, table: str = "audit_log") -> None:
+        check_conninfo(dsn)
         if not _SAFE_IDENTIFIER.match(table):
             raise ValueError(
                 f"fasten PostgresStore: table name {table!r} is not a valid SQL identifier. "

@@ -34,7 +34,7 @@ name = "fasten"
 default = []
 async = ["tokio"]
 store-sqlite = ["sqlx"]
-store-postgres = ["dep:pg"]
+store-postgres = ["dep:pg", "fasten-core/postgres-tls"]
 shim-tracing = ["tracing"]
 codes-yaml = ["serde_yaml"]
 

@@ -22,7 +22,9 @@ The crate is named `fasten-sdk`; code imports it as `fasten`
 (`use fasten::...`).
 
 Optional features: `async`, `store-sqlite`, `store-postgres`,
-`shim-tracing`, `codes-yaml`.
+`shim-tracing`, `codes-yaml`. `store-postgres` connects through native-tls,
+which on Linux needs `pkg-config` and the OpenSSL headers (`libssl-dev` or
+`openssl-devel`).
 
 ## Quickstart
 

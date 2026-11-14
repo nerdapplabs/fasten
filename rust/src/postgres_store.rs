@@ -184,6 +184,11 @@ fn inspect_columns(
 /// the Python, Go and JS stores (spec §2.1). Rows are not sealed: `hash` and
 /// `prev_hash` are empty.
 ///
+/// `sslmode` in the DSN works as in libpq. The default, `prefer`, uses TLS
+/// when the server offers it, without checking the certificate, and
+/// plaintext when it doesn't. `sslmode=require` uses TLS and checks the
+/// certificate and host name; `sslmode=disable` uses plaintext.
+///
 /// ```no_run
 /// use std::sync::Arc;
 /// use fasten::{Config, PostgresStore};
@@ -225,7 +230,12 @@ impl PostgresStore {
             None => (None, table.clone()),
         };
 
-        let mut client = pg::Client::connect(dsn, pg::NoTls).map_err(pg_err)?;
+        // fasten-core's connect, for its sslmode handling (TLS by default,
+        // checked under sslmode=require).
+        let mut client = fasten_core::store::postgres::connect_client(dsn).map_err(|e| match e {
+            fasten_core::error::Error::Postgres(e) => pg_err(e),
+            other => crate::Error::AuditStoreInsert(other.to_string()),
+        })?;
 
         // Serialise bootstrap across processes and SDKs: concurrent CREATE /
         // ALTER on one table deadlock or fail. Same key as the Python store.
@@ -416,6 +426,17 @@ impl crate::AuditStore for PostgresStore {
 
 #[cfg(test)]
 mod tests {
+    /// A connection string that can't be parsed fails before connecting,
+    /// with an error that quotes none of it.
+    #[test]
+    fn unparsable_dsn_error_quotes_none_of_it() {
+        let err = super::PostgresStore::new("host=db password=s3cret port=notaport", "audit_logs")
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
     use super::*;
     use std::collections::HashMap;
 

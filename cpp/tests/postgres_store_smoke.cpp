@@ -74,6 +74,18 @@ void test_connection_error() {
     std::cout << "  test_connection_error: PASS\n";
 }
 
+// A connection string libpq can't parse is reported without its text.
+void test_unparsable_dsn_error_omits_dsn() {
+    std::string msg;
+    try {
+        fasten::PostgresStore store("postgresql://app:s3cret@[::1]x/db", "audit");
+    } catch (const std::runtime_error& e) {
+        msg = e.what();
+    }
+    assert(msg == "fasten PostgresStore: invalid Postgres connection string");
+    std::cout << "  test_unparsable_dsn_error_omits_dsn: PASS\n";
+}
+
 // Live-database tests (require FASTEN_TEST_POSTGRES_DSN)
 
 void test_insert_idempotent(const std::string& dsn) {
@@ -298,6 +310,7 @@ int main() {
 
     test_invalid_table_name();
     test_connection_error();
+    test_unparsable_dsn_error_omits_dsn();
 
     const char* raw_dsn = get_dsn();
     if (!raw_dsn) {

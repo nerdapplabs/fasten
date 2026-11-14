@@ -131,8 +131,8 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     scheme = u.scheme.lower()
     if scheme not in _STREAM_DSN_SCHEMES:
         raise ValueError(
-            f"fasten: stream DSN scheme {scheme!r} not supported "
-            f"(dsn={dsn!r}). Use sqlite:///./streams.db, postgres://..., or a "
+            f"fasten: stream DSN scheme {scheme!r} not supported. "
+            "Use sqlite:///./streams.db, postgres://..., or a "
             "bare filesystem path."
         )
     if scheme in ("postgres", "postgresql"):
@@ -146,7 +146,7 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     path = sqlite_dsn_path(dsn)
     if not path:
         raise ValueError(
-            f"fasten: stream DSN {dsn!r} has no path. Use sqlite:///./streams.db"
+            "fasten: the stream DSN has no path. Use sqlite:///./streams.db"
         )
     return StreamStore(path=path, table=q.get("table", default_table),
                        wal=q.get("wal", "true") != "false")
