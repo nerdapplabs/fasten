@@ -14,6 +14,8 @@ import threading
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from .postgres import check_conninfo
+
 # Bare name ("syslog") or schema-qualified ("fasten.syslog").
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
@@ -60,6 +62,7 @@ class PostgresStreamStore:
                 "(no default: pass \"api_log\" / \"syslog\" explicitly to "
                 "avoid api rows landing in the syslog table)."
             )
+        check_conninfo(dsn)
         if not _SAFE_IDENTIFIER.match(table):
             raise ValueError(
                 f"fasten PostgresStreamStore: table name {table!r} is not a valid SQL "

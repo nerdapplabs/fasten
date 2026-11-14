@@ -120,6 +120,13 @@ The runtime layout:
 - `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields and the value-shape pass to `event` itself. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
 - JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
 - `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
+- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting.
+- The C++ fallback that calls the audit sink directly logs the first line of a store error.
+
+**Postgres connections and TLS:** set `sslmode` in the DSN. Where the default is `prefer` (libpq, so Python and the C++ store; pgx; the Rust SDK and fasten-core), it uses TLS when the server offers it, without checking the server certificate, and otherwise connects in plaintext; it does not protect against an active attacker on the network.
+
+- Python (psycopg), Go (the `database/sql` driver you pass in, such as lib/pq or pgx) and the C++ Postgres store (libpq): use `sslmode=verify-full`, which encrypts and checks the server certificate and host name.
+- The Rust SDK and the fasten-core store (`fasten_store_open`): use `sslmode=require`. Their driver accepts only `disable`, `prefer` and `require`, and under `require` it checks the certificate and host name.
 
 **Not mitigated:**
 

@@ -6,6 +6,32 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: Rust SDK Postgres store supports TLS
+
+- `PostgresStore` connects through native-tls, with `sslmode` working as in
+  libpq: the default, `prefer`, uses TLS when the server offers it without
+  checking the certificate; `sslmode=require` uses TLS and checks the
+  certificate and host name; `sslmode=disable` uses plaintext.
+- The `store-postgres` feature needs `pkg-config` and the OpenSSL headers
+  on Linux.
+
+### Changed: fasten-core Postgres store under `sslmode=prefer`
+
+- With `sslmode` unset or `prefer`, the fasten-core store
+  (`fasten_store_open`) now connects to a server whose certificate it can't
+  verify, as libpq does, instead of refusing it. Use `sslmode=require` to
+  check the certificate and host name.
+- An `sslmode` the driver doesn't accept (`verify-ca`, `verify-full`) gets
+  an error naming the accepted values: `disable`, `prefer`, `require`.
+
+### Changed: store DSN errors
+
+- Python, Go and C++ errors for an unsupported DSN scheme, a DSN with no
+  path, or a Postgres connection string that can't be parsed name no part
+  of the DSN.
+- The C++ fallback that calls the audit sink directly logs the first line
+  of a store error.
+
 ### Changed: PyPI page shows the Python README
 
 - `python/pyproject.toml` sets `readme = "README.md"`, so the PyPI page has

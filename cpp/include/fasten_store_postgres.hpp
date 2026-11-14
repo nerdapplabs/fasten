@@ -54,6 +54,15 @@ public:
 
         validate_table_name(table_);
 
+        // Check the connection string first; the error names no part of it.
+        char* parse_err = nullptr;
+        PQconninfoOption* opts = PQconninfoParse(conninfo.c_str(), &parse_err);
+        if (parse_err) PQfreemem(parse_err);
+        if (!opts) {
+            throw std::runtime_error("fasten PostgresStore: invalid Postgres connection string");
+        }
+        PQconninfoFree(opts);
+
         conn_ = PQconnectdb(conninfo.c_str());
         if (!conn_ || PQstatus(conn_) != CONNECTION_OK) {
             std::string msg = conn_ ? PQerrorMessage(conn_) : "PQconnectdb returned null";
