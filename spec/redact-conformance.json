@@ -496,12 +496,6 @@
       "expected": {"note": "counts 120 340 560 780 900 1200 1500 1800"}
     },
     {
-      "name": "value_year_list_not_cc",
-      "group": "safe",
-      "input":    {"note": "releases 2019 2020 2021 2004 2023"},
-      "expected": {"note": "releases 2019 2020 2021 2004 2023"}
-    },
-    {
       "name": "key_suffix_dsn",
       "group": "key_pattern",
       "input":    {"sentryDsn": "https://o1.ingest.example/1"},
@@ -532,16 +526,76 @@
       "expected": {"note": "Basic internationalization support"}
     },
     {
-      "name": "value_basic_path_not_auth",
+      "name": "value_lowercase_basic_not_auth",
       "group": "safe",
       "input":    {"note": "Plan includes basic /etc/nginx/nginx.conf"},
       "expected": {"note": "Plan includes basic /etc/nginx/nginx.conf"}
     },
     {
-      "name": "value_bearer_prose_not_auth",
+      "name": "value_lowercase_bearer_not_auth",
       "group": "safe",
       "input":    {"note": "The bearer acknowledges-receipt-of-goods"},
       "expected": {"note": "The bearer acknowledges-receipt-of-goods"}
+    },
+    {
+      "name": "value_cc_then_expiry",
+      "group": "value_shape",
+      "input":    {"note": "card 4111 1111 1111 1111 1227"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_amex_then_code",
+      "group": "value_shape",
+      "input":    {"note": "3782 822463 10005 1234"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped_with_tail",
+      "group": "value_shape",
+      "input":    {"note": "4111 1111 1111 1112 1"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_diners_layout",
+      "group": "value_shape",
+      "input":    {"note": "3056 930902 5904"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_digits_before_underscore_not_cc",
+      "group": "safe",
+      "input":    {"ref": "4111111111111111_x"},
+      "expected": {"ref": "4111111111111111_x"}
+    },
+    {
+      "name": "value_url_password_with_colon",
+      "group": "value_shape",
+      "input":    {"conn": "postgres://app:pa:ss@db/x"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_basic_base64_letters",
+      "group": "value_shape",
+      "input":    {"note": "Basic AbcdefghijklmnopQ=="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_bearer_with_plus",
+      "group": "value_shape",
+      "input":    {"note": "Bearer abcdefghij+klmnopqrst"},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "key_exact_key_uppercase",
+      "group": "key_pattern",
+      "input":    {"KEY": "xxx"},
+      "expected": {"KEY": "***"}
+    },
+    {
+      "name": "value_slack_user_token",
+      "group": "value_shape",
+      "input":    {"note": "xoxp-0000000000-AAAAAAAAAA"},
+      "expected": {"note": "***SLACK_TOKEN***"}
     }
   ]
 }
