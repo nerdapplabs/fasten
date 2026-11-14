@@ -223,7 +223,7 @@ class SQLiteStore:
         path = sqlite_dsn_path(dsn)
         if not path:
             raise ValueError(
-                f"fasten SQLiteStore: DSN {dsn!r} has no path. "
+                "fasten SQLiteStore: the DSN has no path. "
                 "Audit storage must be durable — use sqlite:///./audit.db or similar."
             )
         return cls(

@@ -909,6 +909,11 @@ inline bool sys_envelope_key_(const std::string& key) {
            key == "service_id" || key == "timestamp";
 }
 
+// The text before the first newline.
+inline std::string first_line_(const std::string& s) {
+    return s.substr(0, s.find('\n'));
+}
+
 // A sys line field: its key, its value as JSON, and its value as text for
 // the sys ring.
 struct SysField {
@@ -2069,9 +2074,10 @@ inline Row emit(const std::string& code, Opts&&... opts) {
                                 {{"row_id", row.id}});
                         }
                     } catch (const std::exception& e) {
+                        // The first line of the store's error is logged.
                         detail_::drainer_sys_log("error",
                             "audit_sync_fallback_failed",
-                            {{"error", e.what()},
+                            {{"error", detail_::first_line_(e.what())},
                              {"row_id", row.id}});
                     } catch (...) {
                         detail_::drainer_sys_log("error",

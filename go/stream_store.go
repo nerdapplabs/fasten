@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -178,7 +179,12 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 	if strings.HasPrefix(dsn, "sqlite:") {
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", "", fmt.Errorf("fasten StreamStore: invalid sqlite DSN %q: %w", dsn, err)
+			// Report only the cause; the error names no part of the DSN.
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Err
+			}
+			return "", "", fmt.Errorf("fasten StreamStore: invalid sqlite DSN: %w", err)
 		}
 		path = u.Path
 		// Strip the one separator slash: sqlite:///rel.db gives "rel.db",
@@ -193,11 +199,11 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 		// Probably a Postgres or MySQL DSN; reject it rather than treat it as
 		// a file path.
 		return "", "", fmt.Errorf(
-			"fasten StreamStore: DSN scheme not supported for SQLite backend "+
-				"(dsn=%q). Use sqlite:///./path.db or a bare filesystem path.", dsn)
+			"fasten StreamStore: DSN scheme not supported for SQLite backend. " +
+				"Use sqlite:///./path.db or a bare filesystem path.")
 	}
 	if path == "" {
-		return "", "", fmt.Errorf("fasten StreamStore: DSN %q has no path", dsn)
+		return "", "", fmt.Errorf("fasten StreamStore: the DSN has no path")
 	}
 	return path, table, nil
 }
