@@ -26,7 +26,7 @@ use crate::{
     row::Row,
     store::{Filter, Store},
 };
-use util::{read_str, set_error};
+use util::{read_opt, read_req, set_error};
 
 /// Run `f`; catch any Rust panic; return `Ok(R)` or `Err((code, message))`.
 pub(crate) fn guarded<F, R>(f: F) -> Result<R, (FastenErrorCode, String)>
@@ -56,6 +56,71 @@ pub struct FastenStoreHandle {
     retiring: Mutex<Vec<Arc<Drainer>>>,
     // Signalled when a drainer leaves `retiring`.
     retired: Condvar,
+    // Calls running on this handle, and whether close has started.
+    calls: Mutex<Calls>,
+    // Signalled when the last running call returns.
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct Calls {
+    running: usize,
+    closing: bool,
+}
+
+impl FastenStoreHandle {
+    fn new(store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            drainer: Mutex::new(None),
+            retiring: Mutex::new(Vec::new()),
+            retired: Condvar::new(),
+            calls: Mutex::new(Calls::default()),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn calls(&self) -> std::sync::MutexGuard<'_, Calls> {
+        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A call running on a handle. Close waits until every one is dropped.
+pub(crate) struct CallGuard<'a>(&'a FastenStoreHandle);
+
+impl std::ops::Deref for CallGuard<'_> {
+    type Target = FastenStoreHandle;
+    fn deref(&self) -> &FastenStoreHandle {
+        self.0
+    }
+}
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        let mut c = self.0.calls();
+        c.running -= 1;
+        if c.running == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+/// Start a call on `handle`: an error for NULL, or once close has started.
+///
+/// # Safety
+/// `handle` must be null or a handle from `fasten_store_open` /
+/// `fasten_store_from_callback` whose close has not returned.
+pub(crate) unsafe fn enter<'a>(handle: *mut FastenStoreHandle) -> Result<CallGuard<'a>, Error> {
+    if handle.is_null() {
+        return Err(Error::NullArg);
+    }
+    let h = &*handle;
+    let mut c = h.calls();
+    if c.closing {
+        return Err(Error::StoreClosed);
+    }
+    c.running += 1;
+    Ok(CallGuard(h))
 }
 
 /// Write the error string and return the error code.
@@ -93,9 +158,9 @@ pub unsafe extern "C" fn fasten_store_open(
     out_err: *mut *mut c_char,
 ) -> *mut FastenStoreHandle {
     let result = guarded(|| {
-        let backend = read_str(backend).ok_or(Error::NullArg)?;
-        let connstr = read_str(connstr).ok_or(Error::NullArg)?;
-        let table = read_str(table).ok_or(Error::NullArg)?;
+        let backend = read_req(backend)?;
+        let connstr = read_req(connstr)?;
+        let table = read_req(table)?;
 
         let store: Arc<dyn Store> = match backend {
             #[cfg(feature = "sqlite")]
@@ -111,12 +176,7 @@ pub unsafe extern "C" fn fasten_store_open(
             other => return Err(Error::UnknownBackend(other.to_owned())),
         };
 
-        Ok(Box::into_raw(Box::new(FastenStoreHandle {
-            store,
-            drainer: Mutex::new(None),
-            retiring: Mutex::new(Vec::new()),
-            retired: Condvar::new(),
-        })))
+        Ok(Box::into_raw(Box::new(FastenStoreHandle::new(store))))
     });
 
     match result {
@@ -144,14 +204,11 @@ pub unsafe extern "C" fn fasten_store_insert(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let json_str = read_str(row_json).ok_or(Error::NullArg)?;
+        let h = enter(handle)?;
+        let json_str = read_req(row_json)?;
         let row: Row = serde_json::from_str(json_str)?;
-        // SAFETY: handle is non-null and was allocated by fasten_store_open;
-        // no other thread drops it while we hold this shared reference.
-        (*handle).store.insert(&row)?;
+        // `h` keeps close from freeing the handle until this returns.
+        h.store.insert(&row)?;
         Ok(())
     });
     result_to_rc(r, out_err)
@@ -166,10 +223,8 @@ pub unsafe extern "C" fn fasten_store_ping(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        (*handle).store.ping()?;
+        let h = enter(handle)?;
+        h.store.ping()?;
         Ok(())
     });
     result_to_rc(r, out_err)
@@ -195,14 +250,12 @@ pub unsafe extern "C" fn fasten_store_query(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let filter: Filter = match read_str(filter_json) {
+        let h = enter(handle)?;
+        let filter: Filter = match read_opt(filter_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => Filter::default(),
         };
-        (*handle).store.query(&filter)
+        h.store.query(&filter)
     });
     match r {
         Ok(rows) => {
@@ -232,14 +285,12 @@ pub unsafe extern "C" fn fasten_store_count(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let filter: Filter = match read_str(filter_json) {
+        let h = enter(handle)?;
+        let filter: Filter = match read_opt(filter_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => Filter::default(),
         };
-        (*handle).store.count(&filter)
+        h.store.count(&filter)
     });
     match r {
         Ok(n) => {
@@ -271,10 +322,8 @@ pub unsafe extern "C" fn fasten_store_list_unshipped(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        (*handle).store.list_unshipped(limit)
+        let h = enter(handle)?;
+        h.store.list_unshipped(limit)
     });
     match r {
         Ok(rows) => {
@@ -303,12 +352,10 @@ pub unsafe extern "C" fn fasten_store_mark_shipped(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let json_str = read_str(ids_json).ok_or(Error::NullArg)?;
+        let h = enter(handle)?;
+        let json_str = read_req(ids_json)?;
         let ids: Vec<String> = serde_json::from_str(json_str)?;
-        (*handle).store.mark_shipped(&ids)?;
+        h.store.mark_shipped(&ids)?;
         Ok(())
     });
     result_to_rc(r, out_err)
@@ -334,11 +381,9 @@ pub unsafe extern "C" fn fasten_store_purge(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
-        (*handle).store.purge(before, respect_unshipped != 0)
+        let h = enter(handle)?;
+        let before = read_req(before_iso8601)?;
+        h.store.purge(before, respect_unshipped != 0)
     });
     match r {
         Ok(n) => {
@@ -368,10 +413,8 @@ pub unsafe extern "C" fn fasten_store_max_monotonic_seq(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        (*handle).store.max_monotonic_seq()
+        let h = enter(handle)?;
+        h.store.max_monotonic_seq()
     });
     match r {
         Ok(seq) => {
@@ -407,12 +450,10 @@ pub unsafe extern "C" fn fasten_store_list_redaction_candidates(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let before = read_str(before_iso8601).ok_or(Error::NullArg)?;
-        let codes: Vec<String> = serde_json::from_str(read_str(codes_json).ok_or(Error::NullArg)?)?;
-        let found = (*handle).store.list_redaction_candidates(before, &codes)?;
+        let h = enter(handle)?;
+        let before = read_req(before_iso8601)?;
+        let codes: Vec<String> = serde_json::from_str(read_req(codes_json)?)?;
+        let found = h.store.list_redaction_candidates(before, &codes)?;
         let out: Vec<_> = found
             .rows
             .into_iter()
@@ -450,11 +491,9 @@ pub unsafe extern "C" fn fasten_store_redact_rows(
     out_err: *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        if handle.is_null() {
-            return Err(Error::NullArg);
-        }
-        let ids: Vec<String> = serde_json::from_str(read_str(ids_json).ok_or(Error::NullArg)?)?;
-        let done = (*handle).store.redact_rows(&ids)?;
+        let h = enter(handle)?;
+        let ids: Vec<String> = serde_json::from_str(read_req(ids_json)?)?;
+        let done = h.store.redact_rows(&ids)?;
         Ok(serde_json::to_string(&done)?)
     });
     match r {
@@ -477,12 +516,18 @@ struct SendRawPtr(*mut std::ffi::c_void);
 unsafe impl Send for SendRawPtr {}
 unsafe impl Sync for SendRawPtr {}
 
-struct CallbackStore { fn_ptr: CInsertFn, ud: SendRawPtr }
+struct CallbackStore {
+    fn_ptr: CInsertFn,
+    ud: SendRawPtr,
+    // The header promises calls on one handle are serialised.
+    lock: Mutex<()>,
+}
 
 impl Store for CallbackStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
         let json = serde_json::to_string(row)?;
         let cs = CString::new(json).map_err(|_| Error::NullArg)?;
+        let _serial = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let rc = unsafe { (self.fn_ptr)(cs.as_ptr(), self.ud.0) };
         if rc != 0 { Err(Error::CallbackFailed(rc)) }
         else { Ok(()) }
@@ -502,37 +547,75 @@ impl Store for CallbackStore {
 ///
 /// `fn_ptr` is invoked by the drainer's background thread for each row.
 /// `userdata` is passed through unchanged; the caller must keep it valid
-/// while the handle is alive.  Always returns a non-null handle.
+/// while the handle is alive. Returns NULL, with `out_err` set, when
+/// `fn_ptr` is NULL.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_from_callback(
-    fn_ptr: CInsertFn,
+    fn_ptr: Option<CInsertFn>,
     userdata: *mut std::ffi::c_void,
-    _out_err: *mut *mut c_char,
+    out_err: *mut *mut c_char,
 ) -> *mut FastenStoreHandle {
-    let store: Arc<dyn Store> = Arc::new(CallbackStore { fn_ptr, ud: SendRawPtr(userdata) });
-    Box::into_raw(Box::new(FastenStoreHandle {
-        store,
-        drainer: Mutex::new(None),
-        retiring: Mutex::new(Vec::new()),
-        retired: Condvar::new(),
-    }))
+    let result = guarded(|| {
+        let fn_ptr = fn_ptr.ok_or(Error::NullArg)?;
+        let store: Arc<dyn Store> = Arc::new(CallbackStore {
+            fn_ptr,
+            ud: SendRawPtr(userdata),
+            lock: Mutex::new(()),
+        });
+        Ok(Box::into_raw(Box::new(FastenStoreHandle::new(store))))
+    });
+    match result {
+        Ok(ptr) => ptr,
+        Err((_code, msg)) => {
+            set_error(out_err, &msg);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Close the store (and any attached drainer) and release all resources.
 ///
-/// Safe to call with NULL.  After this call the handle is invalid.
+/// New calls on the handle are refused from here on; close waits for calls
+/// already running on other threads before it frees the handle. Safe to
+/// call with NULL. After this call the handle is invalid.
 #[no_mangle]
 pub unsafe extern "C" fn fasten_store_close(handle: *mut FastenStoreHandle) {
-    if !handle.is_null() {
-        // Stop every drainer first, including one an install on another
-        // thread is retiring, so no drain thread outlives the handle.
-        let h = &*handle;
-        if let Some(d) = drainer::swap(h, None) {
-            drainer::retire(h, &d, None);
-        }
-        drainer::wait_retired(h);
-        drop(Box::from_raw(handle));
+    if handle.is_null() {
+        return;
     }
+    let closed = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let h = &*handle;
+        {
+            let mut c = h.calls();
+            if c.closing {
+                return; // another close owns the handle
+            }
+            c.closing = true;
+        }
+        // Stopping the drainer releases an enqueue waiting on a full queue.
+        stop_drainers(h);
+        let mut c = h.calls();
+        while c.running > 0 {
+            c = h.idle.wait(c).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(c);
+        // An install that was running may have added a drainer.
+        stop_drainers(h);
+        drop(Box::from_raw(handle));
+    }));
+    if closed.is_err() {
+        // The handle is left allocated; a drain thread may still be running.
+        eprintln!("fasten-core: internal panic in fasten_store_close; the store was not released");
+    }
+}
+
+/// Stop the installed drainer and wait for any another thread is retiring,
+/// so no drain thread outlives the handle.
+fn stop_drainers(h: &FastenStoreHandle) {
+    if let Some(d) = drainer::swap(h, None) {
+        drainer::retire(h, &d, None);
+    }
+    drainer::wait_retired(h);
 }
 
 /// Free an error string (or JSON output string) returned by this library.
@@ -577,7 +660,7 @@ mod tests {
         }
         let store = CallbackStore {
             fn_ptr: failing_cb,
-            ud: SendRawPtr(std::ptr::null_mut()),
+            ud: SendRawPtr(std::ptr::null_mut()), lock: Mutex::new(()),
         };
         let row = Row::default();
         let err = store.insert(&row).expect_err("non-zero rc must error");
@@ -600,7 +683,7 @@ mod tests {
         }
         let store = CallbackStore {
             fn_ptr: ok_cb,
-            ud: SendRawPtr(std::ptr::null_mut()),
+            ud: SendRawPtr(std::ptr::null_mut()), lock: Mutex::new(()),
         };
         assert!(store.insert(&Row::default()).is_ok());
     }
@@ -697,7 +780,105 @@ mod tests {
     #[test]
     fn callback_store_has_no_redaction() {
         extern "C" fn ok_cb(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 0 }
-        let store = CallbackStore { fn_ptr: ok_cb, ud: SendRawPtr(std::ptr::null_mut()) };
+        let store = CallbackStore { fn_ptr: ok_cb, ud: SendRawPtr(std::ptr::null_mut()), lock: Mutex::new(()) };
         assert!(matches!(store.redact_rows(&["x".into()]), Err(Error::Unsupported(_))));
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SLOW_ENTERED: AtomicBool = AtomicBool::new(false);
+    static SLOW_DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn slow_insert(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
+        SLOW_ENTERED.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        SLOW_DONE.store(true, Ordering::SeqCst);
+        0
+    }
+
+    /// Close waits for a call still running on another thread before it
+    /// frees the handle.
+    #[test]
+    fn close_waits_for_a_running_call() {
+        let h = unsafe { fasten_store_from_callback(Some(slow_insert), std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert!(!h.is_null());
+        let addr = h as usize;
+        let row = CString::new(serde_json::to_string(&Row::default()).unwrap()).unwrap();
+        let t = std::thread::spawn(move || unsafe {
+            fasten_store_insert(addr as *mut FastenStoreHandle, row.as_ptr(), std::ptr::null_mut())
+        });
+        while !SLOW_ENTERED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        unsafe { fasten_store_close(h) };
+        assert!(SLOW_DONE.load(Ordering::SeqCst), "close returned before the insert finished");
+        assert_eq!(t.join().unwrap(), FastenErrorCode::Ok);
+    }
+
+    static GATE_ENTERED: AtomicBool = AtomicBool::new(false);
+    static GATE_OPEN: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn gated_insert(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 {
+        GATE_ENTERED.store(true, Ordering::SeqCst);
+        while !GATE_OPEN.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        0
+    }
+
+    /// While a close waits for a running call, new calls on the handle are
+    /// refused, and drainer close returns without waiting on it.
+    #[test]
+    fn calls_during_close_are_refused() {
+        unsafe {
+            let h = fasten_store_from_callback(Some(gated_insert), std::ptr::null_mut(), std::ptr::null_mut());
+            let addr = h as usize;
+            let row = CString::new(serde_json::to_string(&Row::default()).unwrap()).unwrap();
+            let insert = std::thread::spawn(move || {
+                fasten_store_insert(addr as *mut FastenStoreHandle, row.as_ptr(), std::ptr::null_mut())
+            });
+            while !GATE_ENTERED.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let close = std::thread::spawn(move || fasten_store_close(addr as *mut FastenStoreHandle));
+            // The insert holds the handle open until the gate opens.
+            while !(*h).calls().closing {
+                std::thread::yield_now();
+            }
+            let mut err: *mut c_char = std::ptr::null_mut();
+            assert_eq!(fasten_store_ping(h, &mut err), FastenErrorCode::ErrNullArg);
+            assert_eq!(take(err), "store handle is closed");
+            drainer::fasten_drainer_close(h);
+            GATE_OPEN.store(true, Ordering::SeqCst);
+            assert_eq!(insert.join().unwrap(), FastenErrorCode::Ok);
+            close.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn null_callback_is_an_error() {
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let h = fasten_store_from_callback(None, std::ptr::null_mut(), &mut err);
+            assert!(h.is_null());
+            assert_eq!(take(err), "null pointer argument");
+        }
+    }
+
+    /// A filter that isn't UTF-8 is an error, not "no filter".
+    #[test]
+    fn invalid_utf8_filter_is_an_error() {
+        extern "C" fn ok_cb(_json: *const c_char, _ud: *mut std::ffi::c_void) -> i32 { 0 }
+        unsafe {
+            let h = fasten_store_from_callback(Some(ok_cb), std::ptr::null_mut(), std::ptr::null_mut());
+            let bad = [0xffu8, 0xfe, 0];
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let mut n: u64 = 7;
+            let rc = fasten_store_count(h, bad.as_ptr().cast(), &mut n, &mut err);
+            assert_eq!(rc, FastenErrorCode::ErrNullArg);
+            assert_eq!(take(err), "argument is not valid UTF-8");
+            assert_eq!(n, 7);
+            fasten_store_close(h);
+        }
     }
 }

@@ -856,9 +856,7 @@ inline std::vector<SysField> redact_json_fields_(
 // closes the core drainer, which wakes a put() blocked on a full queue and
 // drains with one attempt per row, then waits for busy_ to reach 0 before it
 // frees store_. A put() that starts after stopped_ is set, including one made
-// by the sink while the drain finishes, never touches store_. Closing while a
-// call is still inside the core needs a core where calls in progress keep
-// their drainer (fasten-core #161).
+// by the sink while the drain finishes, never touches store_.
 class CFastenDrainer {
   public:
     CFastenDrainer(std::function<void(const Row&)> sink,
@@ -983,6 +981,12 @@ class CFastenDrainer {
         closed_cv_.notify_all();
     }
 
+    // Wait until a shutdown() started on any thread has finished.
+    void wait_closed() {
+        std::unique_lock<std::mutex> lk(mu_);
+        closed_cv_.wait(lk, [this] { return closed_; });
+    }
+
     // Rows dead-lettered or lost at stop so far.
     std::size_t unstored() const { return unstored_.load(); }
 
@@ -1081,6 +1085,10 @@ struct Globals {
 
     std::function<void(const Row&)> audit_sink;
     std::mutex                      sink_mu;
+    // emit() calls running a copy of audit_sink, and their end. Guarded by
+    // sink_mu; shutdown() waits for them.
+    std::size_t                     sink_calls = 0;
+    std::condition_variable         sink_idle;
 
     std::string                     failure_strategy{"queue"};  // "queue" or "raise"
     std::shared_ptr<CFastenDrainer> drainer;  // null in raise mode or with no sink
@@ -1717,6 +1725,56 @@ inline void uninstall_drainer() {
     }
 }
 
+// Write queued rows, stop the drainer and drop the audit sink. When it
+// returns, nothing calls the sink: it waits for emit() calls already running
+// the sink on other threads, and for a drainer an init() is replacing. The
+// engine is a static, destroyed after main()'s locals, so call this (or hold
+// a ShutdownGuard) before anything the sink writes to is destroyed. Don't
+// call it from the sink, or while another thread runs init().
+// Returns false if rows were still queued when the timeout passed; they get
+// one last attempt before the drainer stops.
+inline bool shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+    auto& g = detail_::globals();
+    const bool drained = flush(timeout);
+    uninstall_drainer();
+    std::vector<std::shared_ptr<detail_::CFastenDrainer>> retiring;
+    {
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        retiring = g.retiring_drainers;
+    }
+    for (const auto& d : retiring) {
+        d->shutdown(std::chrono::seconds(2));
+        d->wait_closed();
+    }
+    std::unique_lock<std::mutex> lk(g.sink_mu);
+    g.audit_sink = nullptr;
+    g.sink_idle.wait(lk, [&g] { return g.sink_calls == 0; });
+    return drained;
+}
+
+// Calls shutdown() when it goes out of scope. Declare it after the store
+// the sink writes to, so it runs before the store is destroyed:
+//
+//   fasten::SqliteStore store("audit.db");
+//   fasten::set_audit_sink(store.sink());
+//   fasten::init({"svc", "node"});
+//   fasten::ShutdownGuard guard;
+class ShutdownGuard {
+public:
+    ShutdownGuard() = default;
+    ShutdownGuard(const ShutdownGuard&) = delete;
+    ShutdownGuard& operator=(const ShutdownGuard&) = delete;
+    ~ShutdownGuard() {
+        try {
+            shutdown();
+        } catch (const std::exception& e) {
+            std::cerr << "fasten: shutdown failed: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "fasten: shutdown failed" << std::endl;
+        }
+    }
+};
+
 // New 12-char hex request id.
 inline std::string mint_id() {
     return detail_::mint_id_bytes(6);
@@ -1874,7 +1932,18 @@ inline Row emit(const std::string& code, Opts&&... opts) {
             {
                 std::lock_guard<std::mutex> lk(g.sink_mu);
                 sink_copy = g.audit_sink;
+                if (sink_copy) ++g.sink_calls;
             }
+            // Ends the counted call however the sink returns.
+            struct SinkCall {
+                detail_::Globals& g;
+                bool active;
+                ~SinkCall() {
+                    if (!active) return;
+                    std::lock_guard<std::mutex> lk(g.sink_mu);
+                    if (--g.sink_calls == 0) g.sink_idle.notify_all();
+                }
+            } call{g, static_cast<bool>(sink_copy)};
             if (sink_copy) {
                 if (strategy == "raise") {
                     try {

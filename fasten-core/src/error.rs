@@ -17,6 +17,10 @@ pub enum Error {
     #[error("null pointer argument")]
     NullArg,
 
+    /// The store handle is being closed; the call did not run.
+    #[error("store handle is closed")]
+    StoreClosed,
+
     /// A C string argument contained invalid UTF-8.
     #[error("argument is not valid UTF-8")]
     InvalidUtf8,
@@ -136,6 +140,7 @@ impl From<&Error> for FastenErrorCode {
             Error::UnknownBackend(_)   => FastenErrorCode::ErrBadBackend,
             Error::NullArg             => FastenErrorCode::ErrNullArg,
             Error::InvalidUtf8         => FastenErrorCode::ErrNullArg,
+            Error::StoreClosed         => FastenErrorCode::ErrNullArg,
             Error::Json(_)             => FastenErrorCode::ErrBadJson,
             Error::InvalidKey(_)       => FastenErrorCode::ErrInvalidKey,
             Error::IdMismatch { .. }   => FastenErrorCode::ErrIdMismatch,

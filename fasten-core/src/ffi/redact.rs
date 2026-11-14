@@ -4,10 +4,10 @@ use std::os::raw::c_char;
 
 use serde::Deserialize;
 
-use super::util::{read_str, set_error, write_to_buf, write_err_to_buf};
+use super::util::{read_opt, read_req, set_error, write_to_buf, write_err_to_buf};
 use super::guarded;
 use crate::{
-    error::{Error, FastenErrorCode},
+    error::FastenErrorCode,
     redact::Redactor,
 };
 
@@ -26,7 +26,7 @@ pub unsafe extern "C" fn fasten_redact(
     out_err:  *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
         crate::redact::REDACTOR.redact_json(input)
     });
     match r {
@@ -57,7 +57,7 @@ pub unsafe extern "C" fn fasten_redact_buf(
     err_buf_len: u32,
 ) -> i32 {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
         crate::redact::REDACTOR.redact_json(input)
     });
     match r {
@@ -86,17 +86,17 @@ pub unsafe extern "C" fn fasten_redact_full_buf(
     err_buf_len:               u32,
 ) -> i32 {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
 
-        let extra_keys: Vec<String> = match read_str(extra_keys_json) {
+        let extra_keys: Vec<String> = match read_opt(extra_keys_json)? {
             Some(json) if !json.is_empty() => serde_json::from_str(json)?,
             _ => vec![],
         };
         let key_refs: Vec<&str> = extra_keys.iter().map(String::as_str).collect();
 
-        let repl = read_str(replacement).unwrap_or("");
+        let repl = read_opt(replacement)?.unwrap_or("");
 
-        let extra_vp: Vec<ExtraValuePattern> = match read_str(extra_value_patterns_json) {
+        let extra_vp: Vec<ExtraValuePattern> = match read_opt(extra_value_patterns_json)? {
             Some(json) if !json.is_empty() => serde_json::from_str(json)?,
             _ => vec![],
         };
@@ -147,17 +147,17 @@ pub unsafe extern "C" fn fasten_redact_full(
     out_err:                    *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
 
-        let extra_keys: Vec<String> = match read_str(extra_keys_json) {
+        let extra_keys: Vec<String> = match read_opt(extra_keys_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => vec![],
         };
         let key_refs: Vec<&str> = extra_keys.iter().map(String::as_str).collect();
 
-        let repl = read_str(replacement).unwrap_or("");
+        let repl = read_opt(replacement)?.unwrap_or("");
 
-        let extra_vp: Vec<ExtraValuePattern> = match read_str(extra_value_patterns_json) {
+        let extra_vp: Vec<ExtraValuePattern> = match read_opt(extra_value_patterns_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => vec![],
         };
