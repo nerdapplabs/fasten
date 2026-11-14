@@ -9,7 +9,8 @@
 //
 //   fasten::SqliteStore store("path/to/audit.db");
 //   fasten::set_audit_sink(store.sink());
-//   // store must outlive the engine
+//   fasten::init({"svc", "node"});
+//   fasten::ShutdownGuard guard;  // after store: shuts down before it goes
 
 #pragma once
 #ifndef FASTEN_STORE_SQLITE_HPP

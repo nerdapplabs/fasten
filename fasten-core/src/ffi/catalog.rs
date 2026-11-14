@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::os::raw::c_char;
 
-use super::util::{read_str, set_error, write_to_buf, write_err_to_buf};
+use super::util::{read_req, set_error, write_to_buf, write_err_to_buf};
 use super::guarded;
 use crate::{
     catalog::{Meta, GLOBAL_REGISTRY},
-    error::{Error, FastenErrorCode},
+    error::FastenErrorCode,
 };
 
 /// Register a batch of audit codes for a domain.
@@ -34,8 +34,8 @@ pub unsafe extern "C" fn fasten_register_codes(
     out_err:    *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let domain_str = read_str(domain).ok_or(Error::NullArg)?;
-        let json_str   = read_str(codes_json).ok_or(Error::NullArg)?;
+        let domain_str = read_req(domain)?;
+        let json_str   = read_req(codes_json)?;
         let codes: HashMap<String, Meta> = serde_json::from_str(json_str)?;
         GLOBAL_REGISTRY
             .lock()
@@ -68,7 +68,7 @@ pub unsafe extern "C" fn fasten_meta_of(
     out_err:  *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let code_str = read_str(code).ok_or(Error::NullArg)?;
+        let code_str = read_req(code)?;
         let reg = GLOBAL_REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let json = match reg.meta_of(code_str) {
             Some(meta) => serde_json::to_string(meta)?,
@@ -128,8 +128,8 @@ pub unsafe extern "C" fn fasten_register_codes_buf(
     err_buf_len: u32,
 ) -> i32 {
     let r = guarded(|| {
-        let domain_str = read_str(domain).ok_or(Error::NullArg)?;
-        let json_str   = read_str(codes_json).ok_or(Error::NullArg)?;
+        let domain_str = read_req(domain)?;
+        let json_str   = read_req(codes_json)?;
         let codes: HashMap<String, Meta> = serde_json::from_str(json_str)?;
         GLOBAL_REGISTRY
             .lock()
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn fasten_meta_of_buf(
     err_buf_len: u32,
 ) -> i32 {
     let r = guarded(|| {
-        let code_str = read_str(code).ok_or(Error::NullArg)?;
+        let code_str = read_req(code)?;
         let reg = GLOBAL_REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(match reg.meta_of(code_str) {
             Some(meta) => Some(serde_json::to_string(meta)?),
