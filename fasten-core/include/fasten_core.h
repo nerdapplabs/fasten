@@ -350,12 +350,14 @@ const char* fasten_store_version(void);
 /**
  * Redact a JSON value using the global default key-pattern + value-shape rules.
  *
- * Default key patterns (case-insensitive): api_key, password, token, secret,
- * authorization, bearer, m2m_key, private_key, access_key, session_id,
- * cookie, credential, and variants.
+ * Default key patterns (case-insensitive): api_key, password, pwd,
+ * passphrase, token, secret, authorization, bearer, m2m_key, private_key,
+ * access_key, session_id, cookie, credential, a key ending in dsn, the
+ * whole keys key and auth, and variants (spec/row-schema.json).
  *
  * Default value shapes: JWT, PEM private key, AWS key, GitHub token,
- * Stripe live key, OpenAI key, credit-card (Luhn-validated).
+ * Stripe live key, OpenAI key, Slack token, URL credentials, Authorization
+ * value, credit-card (Luhn-validated).
  *
  * @param in_json   NUL-terminated UTF-8 JSON (object, array, or scalar).
  * @param out_json  On success: set to heap-allocated redacted JSON.

@@ -20,6 +20,20 @@ describe('redact conformance', () => {
         });
     }
 
+    test('long values redact quickly', () => {
+        for (const note of [
+            'eyJ'.repeat(50000) + '.eyJ.x',
+            '1 '.repeat(75000),
+            'a://b:'.repeat(25000),
+            'Bearer '.repeat(20000),
+        ]) {
+            const t0 = performance.now();
+            coreRedact(JSON.stringify({ note }));
+            const ms = performance.now() - t0;
+            assert.ok(ms < 1000, `redacting ${note.length} chars took ${ms.toFixed(0)} ms`);
+        }
+    });
+
     // Built at runtime so GitHub push protection doesn't flag the literal.
     test('value_stripe_live', () => {
         const key = 'sk' + '_live_' + 'A'.repeat(24);

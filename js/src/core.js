@@ -18,20 +18,61 @@ const _DEFAULT_PATTERNS = [
 	/m2m[_-]?key/i,
 	/cert[_-]?private/i,
 	/private[_-]?key/i,
-	/access_key/i,
-	/session_id/i,
+	/access[_-]?key/i,
+	/session[_-]?id/i,
 	/cookie/i,
 	/credential/i,
+	/pwd/i,
+	/passphrase/i,
+	/dsn$/i,
+	// Whole key only: as substrings they would match primary_key or author.
+	/^key$/i,
+	/^auth$/i,
 ];
 
-// Matched against string values, anywhere in the string. Same order as
-// fasten-core/src/redact.rs.
+// A JWT: eyJ... "." eyJ... "." signature, in base64url. A linear scan with
+// the same match as fasten-core's regex.
+function _hasJwt(s) {
+	if (!s.includes(".eyJ")) return false;
+	for (const run of s.match(/[A-Za-z0-9_.-]+/g) ?? []) {
+		if (!run.includes(".eyJ")) continue;
+		const parts = run.split(".");
+		for (let k = 0; k + 2 < parts.length; k++) {
+			const h = parts[k].indexOf("eyJ");
+			if (
+				h >= 0 &&
+				h + 3 < parts[k].length &&
+				parts[k + 1].startsWith("eyJ") &&
+				parts[k + 1].length > 3 &&
+				parts[k + 2].length > 0
+			) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Credentials in a URL: scheme://user:password@, user may be empty. Checked
+// from each "://", so a long string without one costs a single scan.
+const _URL_USERINFO_RE = /[^\t\n\v\f\r /:@?#]*:[^\t\n\v\f\r /@?#]+@/y;
+function _hasUrlCredentials(s) {
+	for (let i = s.indexOf("://"); i !== -1; i = s.indexOf("://", i + 1)) {
+		if (i > 0 && /[A-Za-z0-9+.-]/.test(s[i - 1])) {
+			_URL_USERINFO_RE.lastIndex = i + 3;
+			if (_URL_USERINFO_RE.test(s)) return true;
+		}
+	}
+	return false;
+}
+
+// Matched against string values, anywhere in the string: a regex or a test
+// function. Same order as fasten-core/src/redact.rs.
 const _VALUE_SHAPE_RULES = [
-	// JWT: header AND payload must be base64url-encoded JSON (eyJ prefix)
-	[/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, "***JWT***"],
-	// PEM private key block header (RSA, EC, DSA, OPENSSH, or generic)
+	[_hasJwt, "***JWT***"],
+	// PEM private key block header, encrypted or not
 	[
-		/-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----/,
+		/-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |)PRIVATE KEY-----/,
 		"***PRIVATE_KEY***",
 	],
 	// AWS access key: permanent AKIA or short-lived ASIA
@@ -42,10 +83,72 @@ const _VALUE_SHAPE_RULES = [
 	[/sk_live_[A-Za-z0-9]{24,}/, "***STRIPE_KEY***"],
 	// OpenAI API key (legacy sk-... and org sk-proj-... formats)
 	[/sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
+	// GitHub fine-grained personal access token
+	[/github_pat_[A-Za-z0-9_]{22,}/, "***GH_TOKEN***"],
+	// Slack token
+	[/xox[abposr]-[A-Za-z0-9-]{10,}/, "***SLACK_TOKEN***"],
+	[_hasUrlCredentials, "***URL_CREDENTIALS***"],
+	[_hasAuthHeader, "***AUTH_HEADER***"],
 ];
 
-// Card numbers: 13 to 19 digits, optional spaces or dashes, Luhn-checked.
-const _CC_DIGIT_RE = /\b\d[\d\s-]{11,17}\d\b/;
+// A run of digit groups split by spaces or dashes.
+const _DIGIT_RUN_RE = /[0-9]+(?:[ -]+[0-9]+)*/g;
+
+// Card layouts printed in groups, as in fasten-core.
+const _CARD_LAYOUTS = [
+	[4, 4, 4, 4],
+	[4, 4, 4, 4, 1],
+	[4, 4, 4, 4, 2],
+	[4, 4, 4, 4, 3],
+	[4, 6, 5],
+	[4, 6, 4],
+];
+
+const _WORD_CHAR_RE = /[A-Za-z0-9_]/;
+
+// Whether s holds a card number: a group of 13 to 19 digits, or groups in a
+// card layout, that pass the Luhn check. Same rules as fasten-core: digits
+// joined to a letter or "_" are skipped.
+function _hasCard(s) {
+	for (const m of s.matchAll(_DIGIT_RUN_RE)) {
+		const start = m.index;
+		const end = start + m[0].length;
+		const openStart = start === 0 || !_WORD_CHAR_RE.test(s[start - 1]);
+		const openEnd = end === s.length || !_WORD_CHAR_RE.test(s[end]);
+		const groups = m[0].split(/[ -]+/);
+		const fitsEnd = (e) => e < groups.length || openEnd;
+		for (let i = 0; i < groups.length; i++) {
+			if (i === 0 && !openStart) continue;
+			const g = groups[i];
+			if (g.length >= 13 && g.length <= 19 && fitsEnd(i + 1) && _luhn(g)) {
+				return true;
+			}
+			for (const layout of _CARD_LAYOUTS) {
+				const e = i + layout.length;
+				if (e > groups.length || !fitsEnd(e)) continue;
+				const window = groups.slice(i, e);
+				if (
+					window.every((w, k) => w.length === layout[k]) &&
+					_luhn(window.join(""))
+				) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+// An Authorization header value: Bearer or Basic, then a credential that
+// holds a digit or one of + / =, as in fasten-core.
+const _AUTH_HEADER_RE =
+	/(?:^|[^A-Za-z0-9_])(?:Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=-]{16,})/g;
+function _hasAuthHeader(s) {
+	for (const m of s.matchAll(_AUTH_HEADER_RE)) {
+		if (/[0-9+/=]/.test(m[1])) return true;
+	}
+	return false;
+}
 
 function _luhn(digits) {
 	const len = digits.length;
@@ -63,15 +166,9 @@ function _luhn(digits) {
 
 function _checkValueShape(s) {
 	// The Luhn check keeps order numbers and similar ids from matching.
-	const ccMatch = _CC_DIGIT_RE.exec(s);
-	if (ccMatch) {
-		const digits = ccMatch[0].replace(/[\s-]/g, "");
-		if (digits.length >= 13 && digits.length <= 19 && _luhn(digits)) {
-			return "***CC***";
-		}
-	}
-	for (const [re, token] of _VALUE_SHAPE_RULES) {
-		if (re.test(s)) return token;
+	if (_hasCard(s)) return "***CC***";
+	for (const [rule, token] of _VALUE_SHAPE_RULES) {
+		if (typeof rule === "function" ? rule(s) : rule.test(s)) return token;
 	}
 	return null;
 }
