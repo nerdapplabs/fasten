@@ -25,8 +25,16 @@
  *
  * Thread safety
  * -------------
- * A single FastenStore handle may be shared across threads. All operations
- * are serialised internally via a per-handle Mutex.
+ * A single FastenStore handle may be shared across threads. Store operations
+ * are serialised per handle; drainer calls (enqueue, flush, stats) may run
+ * at the same time. fasten_store_close() waits for calls already running on
+ * other threads, and calls that start after it has begun return
+ * FASTEN_ERR_NULL_ARG; a call must not start after close has returned.
+ * Don't call fasten_store_close() or fasten_drainer_close() from an insert
+ * or sys_log callback on the same handle: they wait for that callback.
+ *
+ * String arguments must be UTF-8; a string that isn't, including an
+ * optional one such as a query filter, returns FASTEN_ERR_NULL_ARG.
  */
 
 #ifndef FASTEN_CORE_H
@@ -63,7 +71,7 @@ typedef enum {
     FASTEN_ERR_BACKEND   = 1,   /**< SQLite or PostgreSQL backend error.        */
     FASTEN_ERR_BAD_TABLE = 2,   /**< Invalid table or schema name.              */
     FASTEN_ERR_BAD_JSON  = 3,   /**< JSON parse or schema validation error.     */
-    FASTEN_ERR_NULL_ARG  = 4,   /**< Null pointer or invalid UTF-8 argument.   */
+    FASTEN_ERR_NULL_ARG  = 4,   /**< Null pointer, invalid UTF-8 argument, or a closed handle. */
     FASTEN_ERR_BAD_BACKEND = 5, /**< Unknown backend string.                   */
     FASTEN_ERR_UNKNOWN   = 99   /**< Internal panic or unexpected error.        */
 } FastenErrorCode;
@@ -99,8 +107,10 @@ FastenStore* fasten_store_open(
 /**
  * Close the store and release all associated resources.
  *
- * Safe to call with NULL. After this call the handle is invalid; do not
- * pass it to any other function.
+ * Stops any drainer, refuses new calls on the handle, and waits for calls
+ * still running on other threads before freeing it. Safe to call with
+ * NULL. After this call the handle is invalid; do not pass it to any other
+ * function.
  */
 void fasten_store_close(FastenStore* store);
 
@@ -558,11 +568,12 @@ typedef int32_t (*FastenInsertCallbackFn)(const char* row_json, void* userdata);
  * Create a store handle backed by a C insert callback.
  *
  * Use this to bridge an SDK-owned store into the fasten drainer without
- * migrating the store to fasten_store_open().  Always returns a non-null handle.
+ * migrating the store to fasten_store_open().  Returns NULL, with *out_err
+ * set, when `fn` is NULL.
  *
  * @param fn       Insert callback; must be non-null.
  * @param userdata Passed to every `fn` invocation unchanged.
- * @param out_err  Reserved; currently always succeeds.
+ * @param out_err  Set on error; may be NULL.
  */
 FastenStore* fasten_store_from_callback(
     FastenInsertCallbackFn fn,
@@ -691,7 +702,9 @@ FastenErrorCode fasten_drainer_stats_json(
  * Shut down the drainer. Each queued row gets one more attempt; then close
  * waits for the drain thread, including a store callback in progress, and
  * for a drainer an install on another thread is still retiring.
- * Safe to call with NULL or when no drainer is installed.
+ * Safe to call with NULL or when no drainer is installed. Returns at once
+ * if fasten_store_close() has started on another thread; that close stops
+ * the drainer and waits for it.
  */
 void fasten_drainer_close(FastenStore* store);
 

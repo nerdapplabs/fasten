@@ -1,20 +1,28 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use crate::error::FastenErrorCode;
+use crate::error::{Error, FastenErrorCode};
 
-/// Convert a raw C string pointer to a Rust `&str`.
+/// Read an optional C string argument: `None` for NULL, an error for
+/// invalid UTF-8.
 ///
 /// # Safety
-/// `ptr` must either be null (in which case `None` is returned) or point to a
-/// valid, NUL-terminated, UTF-8-encoded C string that remains valid for the
-/// duration of the returned reference.
-pub(crate) unsafe fn read_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+/// `ptr` must either be null or point to a valid, NUL-terminated C string
+/// that remains valid for the duration of the returned reference.
+pub(crate) unsafe fn read_opt<'a>(ptr: *const c_char) -> Result<Option<&'a str>, Error> {
     if ptr.is_null() {
-        return None;
+        return Ok(None);
     }
     // SAFETY: caller guarantees ptr is valid and NUL-terminated.
-    CStr::from_ptr(ptr).to_str().ok()
+    CStr::from_ptr(ptr).to_str().map(Some).map_err(|_| Error::InvalidUtf8)
+}
+
+/// Read a required C string argument: an error for NULL or invalid UTF-8.
+///
+/// # Safety
+/// As for `read_opt`.
+pub(crate) unsafe fn read_req<'a>(ptr: *const c_char) -> Result<&'a str, Error> {
+    read_opt(ptr)?.ok_or(Error::NullArg)
 }
 
 /// Write an error message into the caller-provided `*out_err` slot.

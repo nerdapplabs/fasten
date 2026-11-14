@@ -106,9 +106,20 @@ int main() {
         fasten::log::info("poll_started", {{"interval_ms", "1000"}});
     }
 
-    fasten::flush(std::chrono::seconds(5));   // drain pending audit rows
+    fasten::shutdown();   // write pending audit rows, stop the drainer
     return 0;
 }
+```
+
+The engine is a static, destroyed after `main()`'s locals. If the sink
+writes to a local store, call `fasten::shutdown()` before the store goes
+out of scope, or declare a `fasten::ShutdownGuard` after it:
+
+```cpp
+fasten::SqliteStore store("audit.db");
+fasten::set_audit_sink(store.sink());
+fasten::init({"edge-svc", "host-01"});
+fasten::ShutdownGuard guard;   // runs before store is destroyed
 ```
 
 Both lines go to stdout as NDJSON with the same `request_id`.
