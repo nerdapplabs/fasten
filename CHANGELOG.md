@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: Python wheels with libfasten_core inside
+
+- PyPI gets one wheel per platform, each with `libfasten_core` in the
+  package: Linux x86_64 and aarch64 (`manylinux_2_34`, glibc 2.34 or later,
+  OpenSSL bundled by auditwheel) and macOS arm64 and x86_64 (11.0 or later).
+  `pip install fasten-sdk` then needs no Rust build and no `FASTEN_CORE_LIB`.
+  Other platforms get no wheel, so pip reports no matching distribution.
+
 ### Fixed: the Apache-2.0 licence ships with every package
 
 - `LICENSE` now holds the full Apache-2.0 text; the copyright line moved to
