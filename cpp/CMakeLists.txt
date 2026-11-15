@@ -121,6 +121,8 @@ if(FASTEN_BUILD_TESTS)
     # Cases from spec/redact-conformance.json.
     add_executable(redact_conformance_smoke tests/redact_conformance_smoke.cpp)
     target_link_libraries(redact_conformance_smoke PRIVATE fasten)
+    target_compile_definitions(redact_conformance_smoke PRIVATE
+        FASTEN_SPEC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../spec")
     if(UNIX AND NOT APPLE)
         target_link_libraries(redact_conformance_smoke PRIVATE pthread)
     endif()

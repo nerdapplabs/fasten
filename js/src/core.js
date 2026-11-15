@@ -22,12 +22,10 @@ const _DEFAULT_PATTERNS = [
 	/session[_-]?id/i,
 	/cookie/i,
 	/credential/i,
-	/pwd/i,
+	// After a separator and at the end: db_pwd, not PWD or OLDPWD.
+	/[_-]pwd$/i,
 	/passphrase/i,
 	/dsn$/i,
-	// Whole key only: as substrings they would match primary_key or author.
-	/^key$/i,
-	/^auth$/i,
 ];
 
 // A JWT: eyJ... "." eyJ... "." signature, in base64url. A linear scan with
@@ -83,7 +81,11 @@ const _VALUE_SHAPE_RULES = [
 	[/sk_live_[A-Za-z0-9]{24,}/, "***STRIPE_KEY***"],
 	// OpenAI API key (legacy sk-... and org sk-proj-... formats), not part
 	// of a longer word such as task-<uuid>
-	[/(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
+	// A percent-encoded character before it (%3D, %20) counts as a boundary.
+	[
+		/(?:^|[^A-Za-z0-9_]|%[0-9A-Fa-f]{2})sk-(?:proj-)?[A-Za-z0-9_-]{32,}/,
+		"***OPENAI_KEY***",
+	],
 	// GitHub fine-grained personal access token
 	[/github_pat_[A-Za-z0-9_]{22,}/, "***GH_TOKEN***"],
 	// Slack token
@@ -92,8 +94,8 @@ const _VALUE_SHAPE_RULES = [
 	[_hasAuthHeader, "***AUTH_HEADER***"],
 ];
 
-// A run of digit groups split by spaces or dashes.
-const _DIGIT_RUN_RE = /[0-9]+(?:[ -]+[0-9]+)*/g;
+// A run of digit groups split by spaces, tabs, no-break spaces or dashes.
+const _DIGIT_RUN_RE = /[0-9]+(?:[ \t\u00A0-]+[0-9]+)*/g;
 
 // Card layouts printed in groups, as in fasten-core.
 const _CARD_LAYOUTS = [
@@ -109,14 +111,15 @@ const _WORD_CHAR_RE = /[A-Za-z0-9_]/;
 
 // Whether s holds a card number: a group of 13 to 19 digits, or groups in a
 // card layout, that pass the Luhn check. Same rules as fasten-core: digits
-// joined to a letter or "_" are skipped.
+// joined to a letter or "_" are skipped, and so is a grouped layout that
+// starts right after another group of four digits.
 function _hasCard(s) {
 	for (const m of s.matchAll(_DIGIT_RUN_RE)) {
 		const start = m.index;
 		const end = start + m[0].length;
 		const openStart = start === 0 || !_WORD_CHAR_RE.test(s[start - 1]);
 		const openEnd = end === s.length || !_WORD_CHAR_RE.test(s[end]);
-		const groups = m[0].split(/[ -]+/);
+		const groups = m[0].split(/[ \t\u00A0-]+/);
 		const fitsEnd = (e) => e < groups.length || openEnd;
 		for (let i = 0; i < groups.length; i++) {
 			if (i === 0 && !openStart) continue;
@@ -124,6 +127,7 @@ function _hasCard(s) {
 			if (g.length >= 13 && g.length <= 19 && fitsEnd(i + 1) && _luhn(g)) {
 				return true;
 			}
+			if (i > 0 && groups[i - 1].length === 4) continue;
 			for (const layout of _CARD_LAYOUTS) {
 				const e = i + layout.length;
 				if (e > groups.length || !fitsEnd(e)) continue;
@@ -140,15 +144,44 @@ function _hasCard(s) {
 	return false;
 }
 
-// An Authorization header value: Bearer or Basic, then a credential that
-// holds a digit or one of + / =, as in fasten-core.
-const _AUTH_HEADER_RE =
-	/(?:^|[^A-Za-z0-9_])(?:Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=-]{16,})/g;
+// An Authorization header value, as in fasten-core. Bearer: a credential of
+// 16 or more characters that holds a digit or one of + / =. Basic: base64
+// that decodes to printable text with a ":" in it (user:password).
+const _BEARER_RE = /(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})/g;
+const _BASIC_RE = /(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})/g;
 function _hasAuthHeader(s) {
-	for (const m of s.matchAll(_AUTH_HEADER_RE)) {
+	for (const m of s.matchAll(_BEARER_RE)) {
 		if (/[0-9+/=]/.test(m[1])) return true;
 	}
+	for (const m of s.matchAll(_BASIC_RE)) {
+		if (_isBasicCredential(m[1])) return true;
+	}
 	return false;
+}
+
+const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Whether token is base64 for user:password: its length is a multiple of
+// four, and it decodes to bytes that are all 0x20 or above, none 0x7F, with
+// a ":" among them.
+function _isBasicCredential(token) {
+	if (token.length === 0 || token.length % 4 !== 0) return false;
+	let acc = 0;
+	let bits = 0;
+	let colon = false;
+	for (const ch of token.replace(/=+$/, "")) {
+		const v = _B64.indexOf(ch);
+		if (v < 0) return false;
+		acc = ((acc << 6) | v) & 0xffffff;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			const byte = (acc >> bits) & 0xff;
+			if (byte < 0x20 || byte === 0x7f) return false;
+			if (byte === 0x3a) colon = true;
+		}
+	}
+	return colon;
 }
 
 function _luhn(digits) {

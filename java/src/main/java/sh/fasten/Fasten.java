@@ -87,11 +87,9 @@ public final class Fasten {
         "session[_-]?id",
         "cookie",
         "credential",
-        "pwd",
+        "[_-]pwd$",
         "passphrase",
         "dsn$",
-        "^key$",
-        "^auth$",
     };
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────
 

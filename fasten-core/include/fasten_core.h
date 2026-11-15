@@ -350,10 +350,10 @@ const char* fasten_store_version(void);
 /**
  * Redact a JSON value using the global default key-pattern + value-shape rules.
  *
- * Default key patterns (case-insensitive): api_key, password, pwd,
- * passphrase, token, secret, authorization, bearer, m2m_key, private_key,
- * access_key, session_id, cookie, credential, a key ending in dsn, the
- * whole keys key and auth, and variants (spec/row-schema.json).
+ * Default key patterns (case-insensitive): api_key, password, passphrase,
+ * token, secret, authorization, bearer, m2m_key, private_key, access_key,
+ * session_id, cookie, credential, a key ending in _pwd or -pwd, a key
+ * ending in dsn, and variants (spec/row-schema.json).
  *
  * Default value shapes: JWT, PEM private key, AWS key, GitHub token,
  * Stripe live key, OpenAI key, Slack token, URL credentials, Authorization

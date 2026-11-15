@@ -96,7 +96,7 @@
     "notes": [
       "Patterns match field keys, not values.",
       "[_-]? — separator is optional: api_key, api-key, apikey all match.",
-      "^key$ and ^auth$ match only the whole key, so primary_key and author are kept; dsn$ matches only at the end, so goodsName is kept.",
+      "dsn$ matches only at the end of a key, so goodsName is kept. [_-]pwd$ needs a separator before it, so db_pwd matches and PWD or OLDPWD do not. A bare key or auth is not matched; add them with extra_redact_keys if needed.",
       "Adopters may add keys via init(extra_redact_keys=[...]) but never remove defaults."
     ],
     "patterns": [
@@ -114,11 +114,9 @@
       "session[_-]?id",
       "cookie",
       "credential",
-      "pwd",
+      "[_-]pwd$",
       "passphrase",
-      "dsn$",
-      "^key$",
-      "^auth$"
+      "dsn$"
     ]
   }
 }

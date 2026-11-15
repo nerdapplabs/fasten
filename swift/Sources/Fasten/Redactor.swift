@@ -17,9 +17,8 @@ public final class Redactor: @unchecked Sendable {
             "authorization", "bearer", "m2m[_-]?key", "cert[_-]?private",
             "private[_-]?key", "access[_-]?key", "session[_-]?id", "cookie", "credential",
             // \z, not $: ICU's $ also matches before a final newline.
-            "pwd", "passphrase", "dsn\\z",
-            // Whole key only: as substrings they would match primary_key or author.
-            "^key\\z", "^auth\\z",
+            // [_-]pwd: after a separator and at the end, so db_pwd, not PWD.
+            "[_-]pwd\\z", "passphrase", "dsn\\z",
         ]
         return specs.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
     }()
@@ -39,7 +38,8 @@ public final class Redactor: @unchecked Sendable {
             (#"sk_live_[A-Za-z0-9]{24,}"#,                                            "***STRIPE_KEY***"),
             // OpenAI API key (legacy sk-... and org sk-proj-... formats, 32+ suffix chars)
             // Not part of a longer word such as task-<uuid>.
-            (#"(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#,               "***OPENAI_KEY***"),
+            // A percent-encoded character before it (%3D, %20) is a boundary.
+            (#"(?:^|[^A-Za-z0-9_]|%[0-9A-Fa-f]{2})sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#, "***OPENAI_KEY***"),
             // GitHub fine-grained personal access token
             (#"github_pat_[A-Za-z0-9_]{22,}"#,                                        "***GH_TOKEN***"),
             // Slack token
@@ -95,14 +95,24 @@ public final class Redactor: @unchecked Sendable {
         return maxDetailBytesDefault
     }
 
-    // UTF-8 bytes of the keys and strings in a value: close to its JSON
-    // size, without serialising it.
+    // Size of a value as JSON, as the other SDKs measure it. A value
+    // JSONSerialization can't write (a Date, say) is estimated from the
+    // UTF-8 bytes of its keys and strings.
     static func textBytes(_ value: Any) -> Int {
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(
+               withJSONObject: value, options: [.withoutEscapingSlashes]) {
+            return data.count
+        }
+        return estimatedBytes(value)
+    }
+
+    private static func estimatedBytes(_ value: Any) -> Int {
         if let s = value as? String { return s.utf8.count }
         if let d = value as? [String: Any] {
-            return d.reduce(0) { $0 + $1.key.utf8.count + textBytes($1.value) }
+            return d.reduce(0) { $0 + $1.key.utf8.count + estimatedBytes($1.value) }
         }
-        if let a = value as? [Any] { return a.reduce(0) { $0 + textBytes($1) } }
+        if let a = value as? [Any] { return a.reduce(0) { $0 + estimatedBytes($1) } }
         return 8
     }
 
@@ -141,22 +151,61 @@ public final class Redactor: @unchecked Sendable {
         return s
     }
 
-    // An Authorization header value: Bearer or Basic, then a credential that
-    // holds a digit or one of + / =, as in fasten-core.
-    private static let authHeader = try! NSRegularExpression(
-        pattern: #"(?:^|[^A-Za-z0-9_])(?:Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=\-]{16,})"#)
+    // An Authorization header value, as in fasten-core. Bearer: a credential
+    // of 16 or more characters that holds a digit or one of + / =. Basic:
+    // base64 that decodes to printable text with a ":" in it (user:password).
+    private static let bearer = try! NSRegularExpression(
+        pattern: #"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})"#)
+    private static let basic = try! NSRegularExpression(
+        pattern: #"(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})"#)
     private static let credentialMark = CharacterSet(charactersIn: "0123456789+/=")
 
     static func hasAuthHeader(_ s: String) -> Bool {
         let ns = s as NSString
-        for m in authHeader.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+        let whole = NSRange(location: 0, length: ns.length)
+        for m in bearer.matches(in: s, range: whole) {
             if ns.substring(with: m.range(at: 1)).rangeOfCharacter(from: credentialMark) != nil { return true }
+        }
+        for m in basic.matches(in: s, range: whole) {
+            if isBasicCredential(ns.substring(with: m.range(at: 1))) { return true }
         }
         return false
     }
 
-    // A run of digit groups split by spaces or dashes.
-    private static let digitRun = try! NSRegularExpression(pattern: #"[0-9]+(?:[ \-]+[0-9]+)*"#)
+    // Whether token is base64 for user:password: its length is a multiple
+    // of four, and it decodes to bytes that are all 0x20 or above, none
+    // 0x7F, with a ":" among them.
+    static func isBasicCredential(_ token: String) -> Bool {
+        let bytes = Array(token.utf8)
+        if bytes.isEmpty || bytes.count % 4 != 0 { return false }
+        var acc: UInt32 = 0
+        var bits = 0
+        var colon = false
+        for b in bytes {
+            if b == 0x3D { break }  // "=": padding, only at the end
+            let v: UInt32
+            switch b {
+            case 0x41...0x5A: v = UInt32(b) - 0x41
+            case 0x61...0x7A: v = UInt32(b) - 0x61 + 26
+            case 0x30...0x39: v = UInt32(b) - 0x30 + 52
+            case 0x2B: v = 62
+            case 0x2F: v = 63
+            default: return false
+            }
+            acc = ((acc << 6) | v) & 0xFFFFFF
+            bits += 6
+            if bits >= 8 {
+                bits -= 8
+                let byte = (acc >> UInt32(bits)) & 0xFF
+                if byte < 0x20 || byte == 0x7F { return false }
+                if byte == 0x3A { colon = true }
+            }
+        }
+        return colon
+    }
+
+    // A run of digit groups split by spaces, tabs, no-break spaces or dashes.
+    private static let digitRun = try! NSRegularExpression(pattern: #"[0-9]+(?:[ \t\x{A0}\-]+[0-9]+)*"#)
 
     // Card layouts printed in groups, as in fasten-core.
     private static let cardLayouts: [[Int]] = [
@@ -169,20 +218,23 @@ public final class Redactor: @unchecked Sendable {
 
     // Whether s holds a card number: a group of 13 to 19 digits, or groups in
     // a card layout, that pass the Luhn check. Same rules as fasten-core:
-    // digits joined to a letter or "_" are skipped.
+    // digits joined to a letter or "_" are skipped, and so is a grouped
+    // layout that starts right after another group of four digits.
     static func hasCard(_ s: String) -> Bool {
         let ns = s as NSString
         for m in digitRun.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
             let start = m.range.location, end = m.range.location + m.range.length
             let openStart = start == 0 || !isWordUnit(ns.character(at: start - 1))
             let openEnd = end == ns.length || !isWordUnit(ns.character(at: end))
-            // The run is ASCII digits, spaces and dashes only.
-            let groups: [[UInt8]] = Array(ns.substring(with: m.range).utf8)
-                .split(whereSeparator: { $0 == 0x20 || $0 == 0x2D }).map(Array.init)
+            // The run is ASCII digits and the four separators.
+            let groups: [[UInt8]] = ns.substring(with: m.range).unicodeScalars
+                .split(whereSeparator: { [0x20, 0x09, 0xA0, 0x2D].contains($0.value) })
+                .map { $0.map { UInt8($0.value) } }
             func fitsEnd(_ e: Int) -> Bool { e < groups.count || openEnd }
             for i in groups.indices {
                 if i == 0 && !openStart { continue }
                 if (13...19).contains(groups[i].count) && fitsEnd(i + 1) && luhn(groups[i]) { return true }
+                if i > 0 && groups[i - 1].count == 4 { continue }
                 for layout in cardLayouts {
                     let e = i + layout.count
                     if e > groups.count || !fitsEnd(e) { continue }

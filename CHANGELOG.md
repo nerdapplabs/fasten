@@ -6,6 +6,26 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: redaction covers more keys and value shapes
+
+Every SDK now masks more by default, so values that were stored before may
+be replaced now.
+
+- Key names: `access-key` / `accessKey`, `session-id` / `sessionId`,
+  `passphrase`, a key ending in `_pwd` or `-pwd`, and a key ending in `dsn`.
+  A bare `key`, `auth` or `pwd` is not matched; add those with
+  `extra_redact_keys`.
+- Value shapes: encrypted PEM private keys, `github_pat_` tokens, Slack
+  tokens, `scheme://user:password@` in a URL (`***URL_CREDENTIALS***`), and
+  `Bearer` / `Basic` Authorization values (`***AUTH_HEADER***`).
+- Card numbers are found anywhere in a string, unbroken or in a card layout
+  (4-4-4-4 with an optional short tail, 4-6-5, 4-6-4) with spaces, tabs,
+  no-break spaces or dashes.
+- OpenAI keys match only when `sk-` is not part of a longer word, so an id
+  such as `task-<uuid>` is kept.
+- JS and Swift: a `detail` or log line over `FASTEN_MAX_DETAIL_BYTES`
+  (default 64 KiB) is replaced by a truncation marker, as in Python and Go.
+
 ### Added: Python wheels with libfasten_core inside
 
 - PyPI gets one wheel per platform, each with `libfasten_core` in the

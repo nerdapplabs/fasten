@@ -34,6 +34,32 @@ describe('detail cap', () => {
         assert.equal(row.detail._max_detail_bytes, 100);
     });
 
+    test('a value that is not all digits keeps the default cap', () => {
+        process.env.FASTEN_MAX_DETAIL_BYTES = '64k';
+        const row = emit({ code: 'USER_SEEN', target: 'u-1', detail: { note: 'x'.repeat(200) } });
+        assert.equal(row.detail._truncated, undefined);
+        assert.equal(row.detail.note.length, 200);
+    });
+
+    test('the event on a line over the cap is redacted whole, then shortened', () => {
+        const lines = [];
+        const orig = process.stderr.write;
+        const origOut = process.stdout.write;
+        const capture = (chunk) => { lines.push(String(chunk)); return true; };
+        process.stderr.write = capture;
+        process.stdout.write = capture;
+        const key = 'sk-' + 'Q'.repeat(40);
+        try {
+            log.info('x'.repeat(240) + ' ' + key, { blob: 'x'.repeat(70_000) });
+        } finally {
+            process.stderr.write = orig;
+            process.stdout.write = origOut;
+        }
+        const line = JSON.parse(lines.find((l) => l.includes('"sys"')));
+        assert.equal(line._truncated, true);
+        assert.ok(!line.event.includes('QQQQ'), line.event);
+    });
+
     test('a log line over the cap keeps its envelope beside the marker', () => {
         const lines = [];
         const orig = process.stderr.write;

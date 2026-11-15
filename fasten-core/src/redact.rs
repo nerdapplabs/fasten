@@ -30,12 +30,10 @@ static REDACT_PATTERNS: &[&str] = &[
     r"session[_-]?id",
     r"cookie",
     r"credential",
-    r"pwd",
+    // After a separator and at the end: db_pwd, not PWD or OLDPWD.
+    r"[_-]pwd$",
     r"passphrase",
     r"dsn$",
-    // Whole key only: as substrings they would match primary_key or author.
-    r"^key$",
-    r"^auth$",
 ];
 
 #[allow(clippy::expect_used)]
@@ -46,11 +44,13 @@ fn build_key_re(extra: &[&str]) -> Regex {
     Regex::new(&format!("(?i)({combined})")).expect("key pattern is valid regex")
 }
 
-// A run of digit groups split by spaces or dashes. [0-9], not \d: \d matches
-// every Unicode digit, and luhn_valid takes ASCII digits only.
+// A run of digit groups split by spaces, tabs, no-break spaces or dashes.
+// [0-9], not \d: \d matches every Unicode digit, and luhn_valid takes ASCII
+// digits only.
 #[allow(clippy::expect_used)]
-static DIGIT_RUN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[0-9]+(?:[ \-]+[0-9]+)*").expect("digit run regex is valid"));
+static DIGIT_RUN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9]+(?:[ \t\x{A0}\-]+[0-9]+)*").expect("digit run regex is valid")
+});
 
 // Card number layouts printed in groups: 4-4-4-4 with an optional short
 // tail, and the 4-6-5 / 4-6-4 layouts. An unbroken group of 13 to 19 digits
@@ -70,13 +70,16 @@ fn is_word_byte(b: u8) -> bool {
 
 /// Whether `s` holds a card number: a group of 13 to 19 digits, or groups in
 /// a card layout, that pass the Luhn check. Digits joined to a letter or `_`
-/// are part of an id and are skipped.
+/// are part of an id and are skipped. A grouped layout that starts right
+/// after another group of four digits is skipped too, so a list of years or
+/// a dashed id is not a card; a card followed by its expiry still is.
 fn has_card(s: &str) -> bool {
     let bytes = s.as_bytes();
     for run in DIGIT_RUN_RE.find_iter(s) {
         let open_start = run.start() == 0 || !is_word_byte(bytes[run.start() - 1]);
         let open_end = run.end() == bytes.len() || !is_word_byte(bytes[run.end()]);
-        let groups: Vec<&str> = run.as_str().split([' ', '-']).filter(|g| !g.is_empty()).collect();
+        let groups: Vec<&str> =
+            run.as_str().split([' ', '\t', '\u{A0}', '-']).filter(|g| !g.is_empty()).collect();
         for i in 0..groups.len() {
             if i == 0 && !open_start {
                 continue;
@@ -84,6 +87,9 @@ fn has_card(s: &str) -> bool {
             let fits_end = |end: usize| end < groups.len() || open_end;
             if (13..=19).contains(&groups[i].len()) && fits_end(i + 1) && luhn_valid(groups[i]) {
                 return true;
+            }
+            if i > 0 && groups[i - 1].len() == 4 {
+                continue;
             }
             for layout in CARD_LAYOUTS {
                 let end = i + layout.len();
@@ -101,19 +107,60 @@ fn has_card(s: &str) -> bool {
     false
 }
 
-// An Authorization header value: Bearer or Basic, then a credential that
-// holds a digit or one of + / =, so a sentence that starts "Basic" is not one.
+// An Authorization header value. Bearer: a credential of 16 or more
+// characters that holds a digit or one of + / =, so a sentence that starts
+// "Bearer" is not one. Basic: base64 that decodes to printable text with a
+// ":" in it (user:password).
 #[allow(clippy::expect_used)]
-static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|[^A-Za-z0-9_])(?:Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=\-]{16,})")
-        .expect("auth header regex is valid")
+static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})")
+        .expect("bearer regex is valid")
+});
+#[allow(clippy::expect_used)]
+static BASIC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})").expect("basic regex is valid")
 });
 
 fn has_auth_header(s: &str) -> bool {
-    AUTH_HEADER_RE.captures_iter(s).any(|c| {
-        c.get(1)
-            .is_some_and(|m| m.as_str().bytes().any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'/' | b'=')))
-    })
+    let token = |c: regex::Captures<'_>| c.get(1).map(|m| m.as_str().to_owned());
+    BEARER_RE
+        .captures_iter(s)
+        .filter_map(token)
+        .any(|t| t.bytes().any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'/' | b'=')))
+        || BASIC_RE.captures_iter(s).filter_map(token).any(|t| is_basic_credential(&t))
+}
+
+/// Whether `token` is base64 for `user:password`: its length is a multiple
+/// of four, and it decodes to bytes that are all 0x20 or above, none 0x7F,
+/// with a ":" among them.
+fn is_basic_credential(token: &str) -> bool {
+    if token.is_empty() || token.len() % 4 != 0 {
+        return false;
+    }
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut colon = false;
+    for b in token.trim_end_matches('=').bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return false,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            let byte = ((acc >> bits) & 0xFF) as u8;
+            if byte < 0x20 || byte == 0x7F {
+                return false;
+            }
+            colon |= byte == b':';
+        }
+    }
+    colon
 }
 
 struct Vp {
@@ -133,8 +180,12 @@ static VALUE_SPECS: &[Vp] = &[
     // Stripe live secret key
     Vp { re: r"sk_live_[A-Za-z0-9]{24,}", repl: "***STRIPE_KEY***" },
     // OpenAI API key (sk-... legacy and sk-proj-... org format), not part
-    // of a longer word such as task-<uuid>
-    Vp { re: r"(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_\-]{32,}", repl: "***OPENAI_KEY***" },
+    // of a longer word such as task-<uuid>; a percent-encoded character
+    // before it (%3D, %20) counts as a boundary
+    Vp {
+        re:   r"(?:^|[^A-Za-z0-9_]|%[0-9A-Fa-f]{2})sk-(?:proj-)?[A-Za-z0-9_\-]{32,}",
+        repl: "***OPENAI_KEY***",
+    },
     // GitHub fine-grained personal access token
     Vp { re: r"github_pat_[A-Za-z0-9_]{22,}", repl: "***GH_TOKEN***" },
     // Slack token
