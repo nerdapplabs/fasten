@@ -3,6 +3,7 @@ package fasten
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -181,5 +182,57 @@ func TestPII_SQLitePersistsColumn(t *testing.T) {
 	}
 	if len(got) != 1 || !got[0].PiiInDetail {
 		t.Fatalf("expected one row with PiiInDetail=true, got %+v", got)
+	}
+}
+
+// A yaml code with pii_in_detail is handled like one from Register: short
+// retention, and Emit keeps only the passthrough keys and the two markers.
+func TestPII_YAMLCode(t *testing.T) {
+	resetYAMLState(t)
+	resetGlobals(t)
+	_ = Init(Config{ServiceID: "svc", NodeID: "node"})
+	path := writeYAML(t, `
+domain: user
+codes:
+  USER_PII_SEEN:
+    pii_in_detail: true
+    retention_class: long
+    detail_passthrough_keys: [tenant]
+`)
+	if err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	m, ok := metaOf("USER_PII_SEEN")
+	if !ok || !m.PiiInDetail || m.RetentionClass != RetShort {
+		t.Fatalf("meta = %+v, want PiiInDetail and RetShort", m)
+	}
+
+	row, err := Emit(context.Background(), "USER_PII_SEEN",
+		Target("u-1"),
+		WithDetail(map[string]any{"email": "alice@example.com", "tenant": "acme"}),
+	)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if _, ok := row.Detail["email"]; ok {
+		t.Fatalf("email must not be kept: %v", row.Detail)
+	}
+	if row.Detail["_redacted"] != "***" || row.Detail["_pii_in_detail"] != true || row.Detail["tenant"] != "acme" {
+		t.Fatalf("detail = %v", row.Detail)
+	}
+	if !row.PiiInDetail {
+		t.Fatal("Row.PiiInDetail must be true")
+	}
+}
+
+// detail_passthrough_keys items that aren't strings are a load error.
+func TestPII_YAMLPassthroughKeysMustBeStrings(t *testing.T) {
+	resetYAMLState(t)
+	for _, v := range []string{"[1, true]", "tenant"} {
+		path := writeYAML(t, "domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: "+v+"\n")
+		err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "BAD_PASS: detail_passthrough_keys must be a list of strings") {
+			t.Fatalf("%s: want a load error naming the code, got %v", v, err)
+		}
 	}
 }

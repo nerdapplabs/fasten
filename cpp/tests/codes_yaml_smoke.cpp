@@ -63,6 +63,32 @@ void test_load_round_trip() {
     std::cout << "load_round_trip: PASS\n";
 }
 
+// A yaml pii_in_detail code is short retention and keeps its passthrough
+// keys, as one from register_codes() does.
+void test_load_pii_code() {
+    reset_state();
+    auto path = write_yaml(
+        "domain: user\ncodes:\n  USER_PII_SEEN:\n    pii_in_detail: true\n"
+        "    retention_class: long\n    detail_passthrough_keys: [tenant]\n",
+        "pii.yaml");
+    fasten::codes::load(path);
+    auto reg = fasten::registry();
+    assert(reg["USER_PII_SEEN"].pii_in_detail);
+    assert(reg["USER_PII_SEEN"].retention_class == fasten::Retention::Short);
+    assert(reg["USER_PII_SEEN"].detail_passthrough_keys == std::vector<std::string>{"tenant"});
+
+    auto bad = write_yaml(
+        "domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: tenant\n",
+        "badpass.yaml");
+    try {
+        fasten::codes::load(bad);
+        assert(false && "expected throw");
+    } catch (const fasten::AuditCatalogError& e) {
+        assert(std::string(e.what()).find("detail_passthrough_keys") != std::string::npos);
+    }
+    std::cout << "load_pii_code: PASS\n";
+}
+
 void test_load_invalid_severity() {
     reset_state();
     auto path = write_yaml(
@@ -171,6 +197,7 @@ int main() {
     test_load_round_trip();
     test_load_invalid_severity();
     test_load_lowercase_key();
+    test_load_pii_code();
     test_reload_removes_codes();
     test_reload_fault_tolerant();
     test_reload_preserves_programmatic();

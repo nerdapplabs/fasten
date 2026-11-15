@@ -6,6 +6,21 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: `pii_in_detail` codes behave the same in every SDK
+
+- Swift: `emit` on a code with `piiInDetail` stores
+  `{"_redacted": "***", "_pii_in_detail": true}` plus the keys in the new
+  `Meta.detailPassthroughKeys`, as the other SDKs do.
+- Go and JS: a code loaded from YAML with `pii_in_detail: true` is handled
+  like one from `Register` / `register()`.
+- YAML codes in every SDK that loads them (Python, Go, JS, Rust, C++) accept
+  `detail_passthrough_keys`, a list of strings, and a `pii_in_detail` code
+  is always short retention.
+- JS: `metaOf()` returns the same camelCase fields for a YAML code as for a
+  registered one (`retentionClass`, `piiInDetail`, `highVolume`,
+  `declaredUnused`, `detailPassthroughKeys`). Code that read
+  `retention_class` from a YAML code's meta needs `retentionClass`.
+
 ### Changed: redaction covers more keys and value shapes
 
 Every SDK now masks more by default, so values that were stored before may

@@ -47,6 +47,10 @@ type yamlCodeEntry struct {
 	Emitter        string `yaml:"emitter"`
 	RetentionClass string `yaml:"retention_class"`
 	HighVolume     bool   `yaml:"high_volume"`
+	PiiInDetail    bool   `yaml:"pii_in_detail"`
+	// Detail keys kept when pii_in_detail is set. Nodes, so a non-string
+	// item is an error and not converted.
+	DetailPassthroughKeys yaml.Node `yaml:"detail_passthrough_keys"`
 }
 
 // Load adds the codes in a yaml file to the registry. Use Reload() to pick
@@ -182,16 +186,39 @@ func buildFromYAMLPaths(paths []string) (map[Code]Meta, error) {
 			if emitter == "" {
 				emitter = f.Emitter
 			}
+			// As in Register: a pii_in_detail code is always short retention.
+			if raw.PiiInDetail {
+				rc = RetShort
+			}
+			var passthrough []string
+			if keys := raw.DetailPassthroughKeys; keys.Kind != 0 {
+				ok := keys.Kind == yaml.SequenceNode
+				for _, n := range keys.Content {
+					if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
+						ok = false
+						break
+					}
+					passthrough = append(passthrough, n.Value)
+				}
+				if !ok {
+					return nil, fmt.Errorf(
+						"fasten: %s:%s: detail_passthrough_keys must be a list of strings",
+						path, codeStr,
+					)
+				}
+			}
 			fresh[Code(codeStr)] = Meta{
-				ID:             Code(codeStr),
-				Domain:         Domain(f.Domain),
-				Category:       raw.Category,
-				Action:         raw.Action,
-				Severity:       sev,
-				Description:    raw.Description,
-				Emitter:        emitter,
-				RetentionClass: rc,
-				HighVolume:     raw.HighVolume,
+				ID:                    Code(codeStr),
+				Domain:                Domain(f.Domain),
+				Category:              raw.Category,
+				Action:                raw.Action,
+				Severity:              sev,
+				Description:           raw.Description,
+				Emitter:               emitter,
+				RetentionClass:        rc,
+				HighVolume:            raw.HighVolume,
+				PiiInDetail:           raw.PiiInDetail,
+				DetailPassthroughKeys: passthrough,
 			}
 		}
 	}

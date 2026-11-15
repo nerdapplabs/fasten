@@ -542,6 +542,31 @@ final class RedactionTests: XCTestCase {
         ])
     }
 
+    /// emit() on a PII code stores the two markers and the passthrough keys.
+    func testEmitReplacesDetailForPiiCodes() throws {
+        Fasten.register("user", codes: [
+            "USER_PII": Meta(id: "USER_PII", domain: "user", category: "account",
+                             action: "read", description: "PII", emitter: "test",
+                             piiInDetail: true, detailPassthroughKeys: ["tenant"]),
+            "USER_PLAIN": Meta(id: "USER_PLAIN", domain: "user", category: "account",
+                               action: "read", description: "not PII", emitter: "test"),
+        ])
+        let store = MemoryStore()
+        try Fasten.configure(serviceID: "svc", nodeID: "node", store: store, strategy: .raise)
+        let detail: [String: Any] = ["email": "alice@example.com", "tenant": "acme"]
+        try Fasten.emit("USER_PII", target: "u-1", actor: "admin", detail: detail)
+        try Fasten.emit("USER_PLAIN", target: "u-1", actor: "admin", detail: detail)
+
+        let rows = store.all()
+        XCTAssertEqual(rows.count, 2)
+        let pii = rows[0].detail
+        XCTAssertEqual(Set(pii.keys), ["_redacted", "_pii_in_detail", "tenant"])
+        XCTAssertEqual(pii["_redacted"]?.value as? String, "***")
+        XCTAssertEqual(pii["_pii_in_detail"]?.value as? Bool, true)
+        XCTAssertEqual(pii["tenant"]?.value as? String, "acme")
+        XCTAssertEqual(rows[1].detail["email"]?.value as? String, "alice@example.com")
+    }
+
     func testPiiCodesFromRegistry() {
         registerCodes()
         Fasten.register("ops", codes: [

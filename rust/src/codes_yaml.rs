@@ -65,6 +65,9 @@ struct YamlCodeEntry {
     high_volume: bool,
     #[serde(default)]
     pii_in_detail: bool,
+    /// Detail keys kept when `pii_in_detail` is set.
+    #[serde(default)]
+    detail_passthrough_keys: Vec<String>,
 }
 
 fn parse_severity(s: &str) -> Result<Severity, Error> {
@@ -127,9 +130,16 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
             let sev = parse_severity(&raw.severity).map_err(|e| {
                 Error::YamlInvalid(format!("{}:{code}: {e}", path.display()))
             })?;
-            let rc = parse_retention(&raw.retention_class).map_err(|e| {
+            let mut rc = parse_retention(&raw.retention_class).map_err(|e| {
                 Error::YamlInvalid(format!("{}:{code}: {e}", path.display()))
             })?;
+            // As in register(): a pii_in_detail code is always short retention.
+            if raw.pii_in_detail && rc != crate::RetentionClass::Short {
+                eprintln!(
+                    "fasten: code {code} has pii_in_detail=true; retention_class forced to SHORT (was {rc})."
+                );
+                rc = crate::RetentionClass::Short;
+            }
             if !raw.domain.is_empty() && raw.domain != doc.domain {
                 return Err(Error::YamlInvalid(format!(
                     "{}:{code}: domain={:?} disagrees with file-level domain={:?}",
@@ -157,7 +167,7 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
                     retention_class: rc,
                     high_volume: raw.high_volume,
                     pii_in_detail: raw.pii_in_detail,
-                    detail_passthrough_keys: Vec::new(),
+                    detail_passthrough_keys: raw.detail_passthrough_keys,
                     declared_unused: false,
                 },
             );
@@ -315,6 +325,23 @@ codes:
         let m2 = super::super::meta_of("FLEET_DEPLOY_FAILED").unwrap();
         assert_eq!(m2.severity, Severity::Error);
         assert_eq!(m2.retention_class, RetentionClass::Long);
+    }
+
+    /// A yaml pii_in_detail code is short retention and keeps its
+    /// passthrough keys, as one from register() does.
+    #[test]
+    fn load_pii_code() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_yaml_state();
+        let f = write_yaml(
+            "domain: fleet\ncodes:\n  FLEET_PII_SEEN:\n    pii_in_detail: true\n    \
+             retention_class: long\n    detail_passthrough_keys: [tenant]\n",
+        );
+        load(f.path()).expect("load");
+        let m = super::super::meta_of("FLEET_PII_SEEN").unwrap();
+        assert!(m.pii_in_detail);
+        assert_eq!(m.retention_class, RetentionClass::Short);
+        assert_eq!(m.detail_passthrough_keys, vec!["tenant".to_string()]);
     }
 
     #[test]

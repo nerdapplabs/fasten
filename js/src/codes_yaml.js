@@ -103,6 +103,25 @@ async function _buildFromPaths(paths) {
 						`file-level domain='${fileDomain}'`,
 				);
 			}
+			const passthrough = raw?.detail_passthrough_keys ?? [];
+			if (
+				!Array.isArray(passthrough) ||
+				passthrough.some((k) => typeof k !== "string")
+			) {
+				throw new Error(
+					`fasten: ${path}:${code}: detail_passthrough_keys must be a list of strings`,
+				);
+			}
+			const pii = !!raw?.pii_in_detail;
+			if (pii && rc !== "short") {
+				console.warn(
+					`fasten: code ${code} has pii_in_detail=true; ` +
+						`retention_class forced to short (was ${rc}).`,
+				);
+			}
+			// The same shape register() stores, so emit(), piiCodes() and
+			// metaOf() read yaml codes the same way. As in register(), a
+			// pii_in_detail code is always short retention.
 			fresh.set(code, {
 				id: code,
 				domain: fileDomain,
@@ -111,10 +130,11 @@ async function _buildFromPaths(paths) {
 				severity: sev,
 				description: raw?.description ?? "",
 				emitter: raw?.emitter ?? fileEmitter,
-				retention_class: rc,
-				high_volume: !!raw?.high_volume,
-				pii_in_detail: !!raw?.pii_in_detail,
-				declared_unused: !!raw?.declared_unused,
+				retentionClass: pii ? "short" : rc,
+				highVolume: !!raw?.high_volume,
+				piiInDetail: pii,
+				declaredUnused: !!raw?.declared_unused,
+				detailPassthroughKeys: passthrough,
 			});
 		}
 	}

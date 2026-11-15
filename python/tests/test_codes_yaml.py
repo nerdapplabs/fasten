@@ -83,6 +83,35 @@ def test_load_round_trip(fasten_yaml, clean_yaml_paths):
     assert reg["FLEET_DEPLOY_FAILED"].retention_class.value == "long"
 
 
+def test_load_pii_code_is_short_and_keeps_passthrough_keys(tmp_path, clean_yaml_paths):
+    p = tmp_path / "pii.codes.yaml"
+    p.write_text(textwrap.dedent("""\
+        domain: user
+        codes:
+          USER_PII_SEEN:
+            pii_in_detail: true
+            retention_class: long
+            detail_passthrough_keys: [tenant]
+    """))
+    load(str(p))
+    meta = registry()["USER_PII_SEEN"]
+    assert meta.pii_in_detail is True
+    assert meta.retention_class.value == "short"
+    assert meta.detail_passthrough_keys == ("tenant",)
+
+
+def test_load_passthrough_keys_must_be_strings(tmp_path, clean_yaml_paths):
+    p = tmp_path / "bad.codes.yaml"
+    p.write_text(textwrap.dedent("""\
+        domain: x
+        codes:
+          BAD_PASS:
+            detail_passthrough_keys: tenant
+    """))
+    with pytest.raises(AuditCatalogError, match="detail_passthrough_keys"):
+        load(str(p))
+
+
 def test_load_invalid_severity_raises(tmp_path, clean_yaml_paths):
     p = tmp_path / "bad.codes.yaml"
     p.write_text(textwrap.dedent("""\

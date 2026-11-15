@@ -142,6 +142,28 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
                 meta.retention_class = parse_retention(raw["retention_class"].as<std::string>(""));
                 meta.high_volume     = raw["high_volume"].as<bool>(false);
                 meta.pii_in_detail   = raw["pii_in_detail"].as<bool>(false);
+                // As in register_codes(): a pii_in_detail code is always
+                // short retention.
+                if (meta.pii_in_detail && meta.retention_class != Retention::Short) {
+                    std::cerr << "fasten: code " << code
+                              << " has pii_in_detail=true; retention_class forced to short (was "
+                              << fasten::to_string(meta.retention_class) << ").\n";
+                    meta.retention_class = Retention::Short;
+                }
+                const auto passthrough = raw["detail_passthrough_keys"];
+                if (passthrough.IsDefined() && !passthrough.IsNull()) {
+                    if (!passthrough.IsSequence()) {
+                        throw AuditCatalogError(
+                            "fasten: detail_passthrough_keys must be a list of strings");
+                    }
+                    for (const auto& k : passthrough) {
+                        if (!k.IsScalar()) {
+                            throw AuditCatalogError(
+                                "fasten: detail_passthrough_keys must be a list of strings");
+                        }
+                        meta.detail_passthrough_keys.push_back(k.as<std::string>());
+                    }
+                }
             } catch (const AuditCatalogError& e) {
                 throw AuditCatalogError(
                     "fasten: " + path + ":" + code + ": " + std::string(e.what()).substr(8));
