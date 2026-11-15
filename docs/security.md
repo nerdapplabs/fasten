@@ -51,6 +51,8 @@ The runtime layout:
 
 - *Value-shape redaction (Python, Go, JS, Rust, C++, Swift; added in v1.0.0-beta):* String values not already redacted by the key-pattern pass are checked against known secret shapes: JWT (three-segment base64url), PEM private key block, AWS access key (`AKIA`/`ASIA`), GitHub tokens (`ghp_`/`ghs_`/etc. and `github_pat_`), Stripe live secret (`sk_live_`), OpenAI key (`sk-`/`sk-proj-`), Slack token (`xoxa-`, `xoxb-`, `xoxp-`, `xoxo-`, `xoxs-`, `xoxr-`), a URL with `user:password@` or `:password@`, an Authorization value (`Bearer`/`Basic` and a credential containing a digit or `+`, `/`, `=`), and credit-card numbers that pass the Luhn checksum anywhere in the string, written unbroken or in a card layout (4-4-4-4 with an optional 1–3 digit tail, 4-6-5, 4-6-4) with spaces or dashes; digits joined to a letter or `_` are treated as part of an id. Matches are replaced with type-hinting tokens (`***JWT***`, `***CC***`, etc.).
 
+- *Size cap (Python, Go, JS, Swift):* a `detail` or log line over `FASTEN_MAX_DETAIL_BYTES` (default 64 KiB) is replaced by a truncation marker (`_truncated`, `_truncated_bytes`, `_max_detail_bytes`, `_summary`) and its content is not written.
+
 - *Structlog processor:* `fasten.redactor().as_structlog_processor()` applies the same two-pass redaction to structlog's event dict, so log lines that reach `fasten.log.*` get the same scrubbing.
 
 **Not mitigated:**

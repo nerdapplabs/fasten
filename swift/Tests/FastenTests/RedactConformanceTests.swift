@@ -97,14 +97,27 @@ final class RedactConformanceTests: XCTestCase {
 
     func testLongValuesRedactQuickly() {
         let r = Redactor()
-        for note in [String(repeating: "eyJ", count: 50_000) + ".eyJ.x",
-                     String(repeating: "1 ", count: 75_000),
-                     String(repeating: "a://b:", count: 25_000),
-                     String(repeating: "Bearer ", count: 20_000)] {
+        // Each just under the 64 KiB cap, so the value is scanned.
+        for note in [String(repeating: "eyJ", count: 20_000) + ".eyJ.x",
+                     String(repeating: "1 ", count: 30_000),
+                     String(repeating: "a://b:", count: 10_000),
+                     String(repeating: "Bearer ", count: 9_000)] {
             let t0 = Date()
-            _ = r.redact(["note": note])
+            let out = r.redact(["note": note])
             let s = Date().timeIntervalSince(t0)
             XCTAssertLessThan(s, 2.0, "redacting \(note.count) chars took \(s) s")
+            XCTAssertNil(out["_truncated"], "the value must be under the cap")
         }
+    }
+
+    /// A value over FASTEN_MAX_DETAIL_BYTES (64 KiB by default) is replaced
+    /// by a truncation marker, as in Python and Go.
+    func testValueOverTheCapBecomesAMarker() {
+        let out = Redactor().redact(["note": String(repeating: "x", count: 70_000)])
+        XCTAssertEqual(out["_truncated"] as? Bool, true)
+        XCTAssertEqual(out["_max_detail_bytes"] as? Int, 65_536)
+        XCTAssertNil(out["note"])
+        let kept = Redactor().redact(["note": String(repeating: "x", count: 60_000)])
+        XCTAssertEqual((kept["note"] as? String)?.count, 60_000)
     }
 }

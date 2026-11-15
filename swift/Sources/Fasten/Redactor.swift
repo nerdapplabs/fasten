@@ -38,7 +38,8 @@ public final class Redactor: @unchecked Sendable {
             // Stripe live secret key (24+ chars after prefix)
             (#"sk_live_[A-Za-z0-9]{24,}"#,                                            "***STRIPE_KEY***"),
             // OpenAI API key (legacy sk-... and org sk-proj-... formats, 32+ suffix chars)
-            (#"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#,                                   "***OPENAI_KEY***"),
+            // Not part of a longer word such as task-<uuid>.
+            (#"(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"#,               "***OPENAI_KEY***"),
             // GitHub fine-grained personal access token
             (#"github_pat_[A-Za-z0-9_]{22,}"#,                                        "***GH_TOKEN***"),
             // Slack token
@@ -67,8 +68,42 @@ public final class Redactor: @unchecked Sendable {
         }
     }
 
+    /// Redacted copy of `dict`. A value over `FASTEN_MAX_DETAIL_BYTES`
+    /// (default 64 KiB) is replaced by a truncation marker, as in Python
+    /// and Go.
     public func redact(_ dict: [String: Any]) -> [String: Any] {
-        _redactDict(dict)
+        let cap = Redactor.maxDetailBytes()
+        let size = Redactor.textBytes(dict)
+        if size > cap {
+            return [
+                "_truncated": true,
+                "_truncated_bytes": size,
+                "_max_detail_bytes": cap,
+                "_summary": "<truncated \(size) bytes; cap \(cap)>",
+            ]
+        }
+        return _redactDict(dict)
+    }
+
+    static let maxDetailBytesDefault = 64 * 1024
+
+    static func maxDetailBytes() -> Int {
+        if let raw = ProcessInfo.processInfo.environment["FASTEN_MAX_DETAIL_BYTES"],
+           let n = Int(raw), n > 0 {
+            return n
+        }
+        return maxDetailBytesDefault
+    }
+
+    // UTF-8 bytes of the keys and strings in a value: close to its JSON
+    // size, without serialising it.
+    static func textBytes(_ value: Any) -> Int {
+        if let s = value as? String { return s.utf8.count }
+        if let d = value as? [String: Any] {
+            return d.reduce(0) { $0 + $1.key.utf8.count + textBytes($1.value) }
+        }
+        if let a = value as? [Any] { return a.reduce(0) { $0 + textBytes($1) } }
+        return 8
     }
 
     private func _redactDict(_ dict: [String: Any]) -> [String: Any] {

@@ -132,8 +132,9 @@ static VALUE_SPECS: &[Vp] = &[
     Vp { re: r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}", repl: "***GH_TOKEN***" },
     // Stripe live secret key
     Vp { re: r"sk_live_[A-Za-z0-9]{24,}", repl: "***STRIPE_KEY***" },
-    // OpenAI API key (sk-... legacy and sk-proj-... org format)
-    Vp { re: r"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}", repl: "***OPENAI_KEY***" },
+    // OpenAI API key (sk-... legacy and sk-proj-... org format), not part
+    // of a longer word such as task-<uuid>
+    Vp { re: r"(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_\-]{32,}", repl: "***OPENAI_KEY***" },
     // GitHub fine-grained personal access token
     Vp { re: r"github_pat_[A-Za-z0-9_]{22,}", repl: "***GH_TOKEN***" },
     // Slack token

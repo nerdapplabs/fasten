@@ -81,8 +81,9 @@ const _VALUE_SHAPE_RULES = [
 	[/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}/, "***GH_TOKEN***"],
 	// Stripe live secret key
 	[/sk_live_[A-Za-z0-9]{24,}/, "***STRIPE_KEY***"],
-	// OpenAI API key (legacy sk-... and org sk-proj-... formats)
-	[/sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
+	// OpenAI API key (legacy sk-... and org sk-proj-... formats), not part
+	// of a longer word such as task-<uuid>
+	[/(?:^|[^A-Za-z0-9_])sk-(?:proj-)?[A-Za-z0-9_-]{32,}/, "***OPENAI_KEY***"],
 	// GitHub fine-grained personal access token
 	[/github_pat_[A-Za-z0-9_]{22,}/, "***GH_TOKEN***"],
 	// Slack token

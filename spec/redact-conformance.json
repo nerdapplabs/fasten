@@ -596,6 +596,24 @@
       "group": "value_shape",
       "input":    {"note": "xoxp-0000000000-AAAAAAAAAA"},
       "expected": {"note": "***SLACK_TOKEN***"}
+    },
+    {
+      "name": "value_openai_after_text",
+      "group": "value_shape",
+      "input":    {"note": "key=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"},
+      "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_task_uuid_not_openai",
+      "group": "safe",
+      "input":    {"ref": "task-550e8400-e29b-41d4-a716-446655440000"},
+      "expected": {"ref": "task-550e8400-e29b-41d4-a716-446655440000"}
+    },
+    {
+      "name": "value_risk_slug_not_openai",
+      "group": "safe",
+      "input":    {"note": "risk-assessment-for-customer-account-number-42"},
+      "expected": {"note": "risk-assessment-for-customer-account-number-42"}
     }
   ]
 }
