@@ -429,3 +429,47 @@ def test_sync_fallback_marks_engine_degraded_even_for_adopter_store_without_noti
     assert resp.status_code == 200
     # The engine-side flag reaches the reader.
     assert resp.json()["completeness"] == {"audit": "store-degraded"}
+
+
+def test_find_lib_falls_back_to_the_loader_search(monkeypatch, tmp_path):
+    """Without ld or gcc, find_library finds nothing; the bare library name
+    is then tried, so a library on LD_LIBRARY_PATH still loads."""
+    import ctypes
+    import ctypes.util
+
+    from fasten import core_ffi
+
+    monkeypatch.delenv("FASTEN_CORE_LIB", raising=False)
+    # No bundled or source-checkout copy next to this (fake) module file.
+    monkeypatch.setattr(core_ffi, "__file__", str(tmp_path / "pkg" / "fasten" / "core_ffi.py"))
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    tried = []
+
+    def fake_cdll(name, *a, **kw):
+        tried.append(name)
+        return object()
+
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    found = core_ffi._find_lib()
+    assert found.startswith("libfasten_core.")
+    assert tried == [found]
+
+
+def test_find_lib_raises_when_the_loader_search_fails(monkeypatch, tmp_path):
+    import ctypes
+    import ctypes.util
+
+    import pytest
+
+    from fasten import core_ffi
+
+    monkeypatch.delenv("FASTEN_CORE_LIB", raising=False)
+    monkeypatch.setattr(core_ffi, "__file__", str(tmp_path / "pkg" / "fasten" / "core_ffi.py"))
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+
+    def failing_cdll(name, *a, **kw):
+        raise OSError("not found")
+
+    monkeypatch.setattr(ctypes, "CDLL", failing_cdll)
+    with pytest.raises(OSError, match="libfasten_core not found"):
+        core_ffi._find_lib()

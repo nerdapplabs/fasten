@@ -27,6 +27,15 @@ def _find_lib() -> str:
     if (found := ctypes.util.find_library("fasten_core")):
         return found
 
+    # find_library needs ld or gcc, which a slim image doesn't have. Let the
+    # loader search LD_LIBRARY_PATH and the system paths for the bare name.
+    bare = f"libfasten_core{suffix}"
+    try:
+        ctypes.CDLL(bare)
+        return bare
+    except OSError:
+        pass
+
     # Source checkout: python/fasten/ next to fasten-core/.
     dev = here.parent.parent / "fasten-core" / "target" / "release" / f"libfasten_core{suffix}"
     if dev.exists():
