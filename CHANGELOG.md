@@ -10,8 +10,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `LICENSE` now holds the full Apache-2.0 text; the copyright line moved to
   `NOTICE`. GitHub recognised the old file as no licence.
-- The npm package, the wheel, both crates and the GitHub release files
-  include `LICENSE` and `NOTICE`.
+- The npm package, the wheel, both crates, the Go module and the GitHub
+  release files include `LICENSE` and `NOTICE`.
 - The npm package ships `src/` only, without `test/` and `examples/`.
 - `fasten-core` has a README for its crates.io page.
 

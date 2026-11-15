@@ -49,8 +49,9 @@ pack() {
     | gzip -9n > "$out/$name.tar.gz"
 }
 
-# The Go module zip: tracked files in go/ except nested modules, with the
-# repo LICENSE and NOTICE when go/ has none, under <module>@<version>/.
+# The Go module zip: tracked files in go/ except nested modules, under
+# <module>@<version>/. go/ has its own LICENSE and NOTICE, as the module
+# proxy builds its zip from go/ alone; the repo ones are a fallback.
 pack_go() {
   local version=$1 module
   module=$(awk '$1 == "module" { print $2; exit }' go/go.mod)
