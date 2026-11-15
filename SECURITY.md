@@ -117,17 +117,17 @@ go mod download -json github.com/nerdapplabs/fasten/go@v1.0.0 | grep '"Sum"'
 The two `h1:` values must match. The second is also the hash in `go.sum` and
 on sum.golang.org for `github.com/nerdapplabs/fasten/go v1.0.0`.
 
-## Current scan posture
+## Dependency scans
 
-Each SDK's dependencies are scanned against the minimum supported
-language version (Python 3.10-slim, Go 1.26-alpine, Node 24-alpine). All
-three are clean as of the latest scan:
+| Language | Scanner       | When it runs | Notes |
+|----------|---------------|--------------|-------|
+| Python   | `pip-audit`   | In CI, on pull requests and on pushes to `main` / `dev` that touch `python/` or `fasten-core/` | Zero runtime deps (`dependencies = []` in `pyproject.toml`). CI installs the project and dev deps into a `uv venv`, which has no `pip` / `wheel` to flag, then runs `uvx pip-audit@2.10.1 --path <venv site-packages>` from its own environment, so the audit covers the project venv and not pip-audit's own dependencies. The job fails if site-packages is not found. |
+| Go       | `govulncheck` | By hand, before a release and after any `go.mod` change | Three direct deps: `gopkg.in/yaml.v3` (catalog parsing), `modernc.org/sqlite` (CGO-free SQLite driver, with its indirect deps in `go.mod`) and `github.com/lib/pq` (Postgres driver). It also reports advisories in the Go standard library, so the result depends on the Go patch release in use. |
+| JS       | `npm audit`   | By hand, before a release and after any dependency change | Zero production deps (`package.json` has an empty `dependencies` block). Uses the `node:async_hooks` and `node:crypto` builtins. `pg` (Postgres store) and `js-yaml` (catalog parsing only) are optional and not installed by default. Dev dependencies are audited too. |
 
-| Language | Scanner          | Status | Notes |
-|----------|------------------|--------|-------|
-| Python   | `pip-audit`      | Clean  | Zero runtime deps (`dependencies = []` in `pyproject.toml`). Runs in CI on every push and pull request that touches `python/` or `fasten-core/`. CI installs the project and dev deps into a `uv venv`, which has no `pip` / `wheel` to flag, then runs `uvx pip-audit@2.10.1 --path <venv site-packages>` from its own environment, so the audit covers the project venv and not pip-audit's own dependencies. The job fails if site-packages is not found. |
-| Go       | `govulncheck`    | Clean  | Three direct deps: `gopkg.in/yaml.v3` (catalog parsing), `modernc.org/sqlite` (CGO-free SQLite driver, which pulls the 13 indirect deps in `go.mod`) and `github.com/lib/pq` (Postgres driver). `govulncheck` reports no advisories against the resolved set. Re-run after any `go.mod` change. |
-| JS       | `npm audit`      | Clean  | Zero production deps (`package.json` has an empty `dependencies` block). Uses the `node:async_hooks` and `node:crypto` builtins. `pg` (Postgres store) and `js-yaml` (catalog parsing only) are optional and not installed by default. |
+Only the Python scan runs in CI today; the Go and JS scans are not gated.
+Advisories in third-party dependencies that are already public are tracked
+in the issue tracker; report anything else privately, as described above.
 
 Re-run after adding any dependency: `pip-audit`, `govulncheck ./...`, `npm audit`.
 

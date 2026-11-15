@@ -178,6 +178,14 @@ runs no background job for this, so call it on a schedule. C++ rows are
 unsealed, so all of them can be redacted. A row sealed under canonical form
 `"1"` by another SDK is left alone and counted on the sys stream.
 
+## Reader authentication
+
+The reader handlers have no authentication of their own.
+`fasten::reader::simplehttp::start(port)` serves `/sys`, `/api` and `/audit`
+to any caller, so use it only on a trusted network; otherwise pass an auth
+function as its third argument, or check the caller in your own server
+before calling the `fasten::reader::handle_*` functions.
+
 ## Reader tenant isolation
 
 On a store shared by several tenants, resolve the caller's tenant from

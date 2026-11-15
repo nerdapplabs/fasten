@@ -1,7 +1,7 @@
 # fasten threat model
 
 **Version:** 1.0.0-beta  
-**Last reviewed:** 2026-05-08  
+**Last reviewed:** 2026-11-15  
 **Scope:** Python (reference SDK), Go, JS/TS, Rust, C++, Swift
 
 This document covers the security model of the fasten SDK: what it protects, what it explicitly does not protect, and the attack surfaces to consider when embedding fasten in a production service.
@@ -33,9 +33,13 @@ The runtime layout:
 
 **Trust boundary 1, process and store:** The audit store is trusted infrastructure. A compromised store (for example a shared Postgres server another tenant can write to) is outside fasten's threat model. fasten assumes the adopter controls the store.
 
-**Trust boundary 2, caller and reader endpoints:** The reader routes (`/logs/audit`, `/logs/sys`, `/logs/api`, `/logs/audit/doctor`) return raw audit data. fasten has no built-in authentication; the adopter supplies it, for example with `dependencies=[Depends(require_auth)]`. An unauthenticated mount on a network interface is a misconfiguration.
+**Trust boundary 2, caller and reader endpoints:** The reader routes (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`, `/topology` in Python and Go; `/sys`, `/api`, `/audit` in C++; all under the mount prefix) return raw audit data. fasten has no built-in authentication; the adopter supplies it (section 2.3). An unauthenticated mount on a network interface is a misconfiguration.
 
 **Trust boundary 3, emit and row content:** `fasten.emit()` accepts a `detail` dict from the adopter. The SDK redacts it before the row is written, but the adopter controls which keys and values go in. fasten does not check application-level correctness; it only removes recognisable secret shapes.
+
+**Trust boundary 4, replication senders:** Replication ingest stores each row under the `source_node_id` the row carries. It verifies the row's chain, but it does not authenticate who delivered it. Only trusted senders may deliver rows to an aggregator: authenticate the transport, and accept a node's rows only from that node.
+
+**What the hash chain covers:** Python and Go seal audit rows into a per-node hash chain when they write to a bundled audit store (SQLite or Postgres); JS, Rust, C++ and Swift write unsealed rows, which the chain does not cover. On sealed rows, verification detects an edited, removed or reordered row inside the chain. Detecting rows removed from the start or end of a chain, or a chain whose hashes were removed or rebuilt by someone who can write to the store, needs checkpoints published outside the store (`spec/chain-replication.md` §9).
 
 ---
 
@@ -65,7 +69,7 @@ The runtime layout:
 
 ### 2.2 SQL injection in filter parameters
 
-**Description:** Reader endpoints (`GET /logs/audit?actor=...&code=...`) pass caller-supplied strings into SQL queries. With string interpolation, a malicious value could alter the query.
+**Description:** Reader endpoints (`GET /audit?actor=...&code=...`) pass caller-supplied strings into SQL queries. With string interpolation, a malicious value could alter the query.
 
 **Mitigations in place:**
 
@@ -84,13 +88,15 @@ The runtime layout:
 
 **Mitigations in place:**
 
-- `fasten.reader.router()` requires a `dependencies=` argument, such as `[Depends(require_admin)]` or the bundled `fasten.reader.require_bearer()`. FastAPI applies it to every route, including `/doctor`. Calling `router()` without it raises at startup; mounting without auth takes an explicit `dependencies=[]`.
-- The router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
+- Python: `fasten.reader.router()` requires a `dependencies=` argument, such as `[Depends(require_admin)]` or the bundled `fasten.reader.require_bearer()`. FastAPI applies it to every route, including `/audit/doctor`. Calling `router()` without it raises at startup; mounting without auth takes an explicit `dependencies=[]`.
+- Go: wrap the handler, for example `fasten.RequireBearer("FASTEN_READER_TOKEN")(fasten.NewReader())`. `RequireBearer` panics at startup when the variable is unset.
+- C++: pass an auth function to `fasten::reader::simplehttp::start(port, prefix, auth)`, or check the caller in your own server before calling the `fasten::reader::handle_*` functions.
+- Python: the router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
 
 **Not mitigated:**
 
-- fasten does not enforce authentication. A router mounted with `dependencies=[]` on a public interface has no access control. This is a deployment concern rather than a library concern, but treat the `/logs/*` routes like any internal admin endpoint.
-- The `/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
+- fasten does not enforce authentication. A Python router mounted with `dependencies=[]`, a Go `NewReader()` that is not wrapped, and a C++ `simplehttp::start(port)` with no auth function all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
+- The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
 
 ---
 
@@ -177,9 +183,9 @@ The following are outside fasten's security boundary by design:
 | Scenario | Rationale |
 |----------|-----------|
 | Compromised host OS | If the host is compromised, the process memory, the SQLite file, stdout and the Postgres credentials are all readable. fasten adds no protection above the OS. |
-| Compromised audit store | An attacker who can write to the audit store directly, without going through fasten, can insert or modify rows. The hash chain (`prev_hash`) detects tampering on read but does not prevent it. |
+| Compromised audit store | An attacker who can write to the audit store directly, without going through fasten, can insert or modify rows. On rows Python or Go sealed, the hash chain detects an edited, removed or reordered row on read; it does not prevent the change, and it needs external checkpoints to detect rows removed from the start or end of a chain, or removed or rebuilt hashes (section 1). |
 | Denial of service against the adopter service | fasten is a library. Traffic against the adopter's HTTP service can saturate fasten's rings, but that is an application-level concern, not a fasten security boundary. |
-| Unauthenticated reader mount | Deploying the reader with `dependencies=[]` on a public interface is a misconfiguration. fasten documents this and provides the hook; enforcement is the deployer's responsibility. |
+| Unauthenticated reader mount | Deploying the reader without authentication on a public interface is a misconfiguration. fasten documents this and provides the hook; enforcement is the deployer's responsibility. |
 | Secrets in adopter-controlled `detail` values that match no known shape | fasten catches what it knows. Custom token formats, encoded secrets or new PII patterns need `extra_redact_keys` / `extra_value_redact_patterns` registered by the adopter. |
 | Multi-tenant row isolation without a `tenant_scope` hook or adopter-enforced `tenant_id` filtering | fasten stores `tenant_id` but does not filter on it by itself. The query API and the reader's `tenant_scope` hook support filtering; enforcement is the adopter's responsibility. |
 

@@ -307,6 +307,11 @@ re-sealing them. Re-sealing would re-hash the rows and remove the tamper
 evidence. Replicated rows keep their origin's `hash`, `prev_hash`, `origin_id`
 and `monotonic_seq`.
 
+`ingest` is a trust boundary. It verifies the chain of the rows it is given
+and stores each row under the `source_node_id` the row carries; it does not
+authenticate the sender. The transport MUST authenticate senders, and a
+deployment SHOULD accept a node's rows only from that node.
+
 - **Verified prefix, not all-or-nothing.** `ingest` verifies the incoming chain
   and inserts the longest verified prefix (the rows before the first break). It
   MUST NOT raise on a break. An unsealed row below its node's first sealed
