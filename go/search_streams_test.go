@@ -50,7 +50,7 @@ func initSearchFull(t *testing.T, withStores bool) {
 
 func TestSearchStreams_RejectsUnknown(t *testing.T) {
 	initSearchFull(t, true)
-	code := status(t, NewReader(), "/search?q=x&since="+searchSince+"&streams=sys,foo")
+	code := status(t, NewReader(WithoutAuth()), "/search?q=x&since="+searchSince+"&streams=sys,foo")
 	if code != 400 {
 		t.Fatalf("unknown stream must 400, got %d", code)
 	}
@@ -62,7 +62,7 @@ func TestSearchStreams_ApiStream(t *testing.T) {
 	tr.PushAPI(APIRow{"method": "POST", "path": "/checkout", "status": 502,
 		"message":   "gateway timeout on payment provider",
 		"timestamp": "2026-08-01T00:00:00Z", "request_id": "r-api"})
-	body, _ := getJSON(t, NewReader(),
+	body, _ := getJSON(t, NewReader(WithoutAuth()),
 		"/search?q=gateway&since="+searchSince+"&streams=api")
 	counts, _ := body["counts"].(map[string]any)
 	if counts["api"] != float64(1) {
@@ -85,7 +85,7 @@ func TestSearchStreams_AuditStream(t *testing.T) {
 		WithDetail(map[string]any{"message": "onboarding hit gateway timeout on retry"})); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(),
+	body, _ := getJSON(t, NewReader(WithoutAuth()),
 		"/search?q=gateway&since="+searchSince+"&streams=audit")
 	counts, _ := body["counts"].(map[string]any)
 	if counts["audit"] != float64(1) {
@@ -110,7 +110,7 @@ func TestSearchStreams_AllThreeFanOut(t *testing.T) {
 		Target("u"), WithDetail(map[string]any{"note": "foo did it"})); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(),
+	body, _ := getJSON(t, NewReader(WithoutAuth()),
 		"/search?q=foo&since="+searchSince+"&streams=audit,api,sys")
 	counts, _ := body["counts"].(map[string]any)
 	if counts["sys"] != float64(1) || counts["api"] != float64(1) || counts["audit"] != float64(1) {
@@ -143,7 +143,7 @@ func TestSearchStreams_MissingStorePerStreamError(t *testing.T) {
 		SearchEnabled: true, SyslogStore: sys}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(),
+	body, _ := getJSON(t, NewReader(WithoutAuth()),
 		"/search?q=x&since="+searchSince+"&streams=sys,api")
 	counts, _ := body["counts"].(map[string]any)
 	if counts["api"] != float64(0) {

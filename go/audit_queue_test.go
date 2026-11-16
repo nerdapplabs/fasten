@@ -657,7 +657,7 @@ func TestQueueDoctorReportsTheDeadLetter(t *testing.T) {
 		QueueRetryInitial: time.Millisecond, QueueRetryMax: 5 * time.Millisecond})
 	emitN(t, 1)
 	Flush(2 * time.Second)
-	body, code := getJSON(t, NewReader(), "/audit/doctor")
+	body, code := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	q, _ := body["queue"].(map[string]any)
 	if code != 200 || q["dead_lettered_total"] != float64(1) || q["drained_total"] != float64(0) {
 		t.Fatalf("doctor queue = %v (status %d)", q, code)

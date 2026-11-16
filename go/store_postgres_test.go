@@ -466,11 +466,11 @@ func TestPostgres_DoctorCountsTheCallersRows(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	if rows := body["store"].(map[string]any)["rows"]; rows != float64(2) {
 		t.Errorf("unscoped doctor must count every row; got %v", rows)
 	}
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ = getJSON(t, h, "/audit/doctor")
 	if rows := body["store"].(map[string]any)["rows"]; rows != float64(1) {
 		t.Errorf("scoped doctor must count only tenant-a's rows; got %v", rows)

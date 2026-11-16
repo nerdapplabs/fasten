@@ -144,7 +144,7 @@ func newReaderClient(t *testing.T, searchOn bool) http.Handler {
 	}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	return NewReader()
+	return NewReader(WithoutAuth())
 }
 
 func TestHandleSys_QOver1024Returns400(t *testing.T) {

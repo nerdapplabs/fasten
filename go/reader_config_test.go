@@ -17,7 +17,7 @@ func TestPerEngineReaderConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	def := httptest.NewRecorder()
-	NewReader().ServeHTTP(def, httptest.NewRequest(http.MethodGet, "/search?q=x&since=2020-01-01T00:00:00Z", nil))
+	NewReader(WithoutAuth()).ServeHTTP(def, httptest.NewRequest(http.MethodGet, "/search?q=x&since=2020-01-01T00:00:00Z", nil))
 	if body := def.Body.String(); !contains(body, "search disabled") {
 		t.Fatalf("Default reader: expected search disabled, got %s", body)
 	}
@@ -35,7 +35,7 @@ func TestPerEngineReaderConfig(t *testing.T) {
 	e2.GetTransport().PushSyslog(SyslogRow{"event": "db.timeout", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-1"})
 
 	rec := httptest.NewRecorder()
-	e2.NewReader().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/search?q=timeout&since=2020-01-01T00:00:00Z", nil))
+	e2.NewReader(WithoutAuth()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/search?q=timeout&since=2020-01-01T00:00:00Z", nil))
 	body := rec.Body.String()
 	if contains(body, "search disabled") {
 		t.Fatalf("e2 reader should have search enabled: %s", body)

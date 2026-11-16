@@ -12,7 +12,7 @@ import (
 
 // Cross-tenant isolation on reader endpoints (Go).
 //
-// Pins the enforcement contract: when NewReader(WithTenantScope(fn)) is
+// Pins the enforcement contract: when NewReader(WithoutAuth(), WithTenantScope(fn)) is
 // wired, every reader endpoint (/audit, /correlate, /search, /sys, /api,
 // /topology) IGNORES any caller-supplied ?tenant_id= and scopes the
 // result to the resolved tenant. Tenant B cannot see tenant A's rows via
@@ -73,7 +73,7 @@ func initSharedStore(t *testing.T) *SQLiteStore {
 
 func TestTenantScope_NoHookKeepsCurrentBehaviour(t *testing.T) {
 	initSharedStore(t)
-	body, _ := getJSON(t, NewReader(), "/audit?limit=10")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit?limit=10")
 	rows, _ := body["rows"].([]any)
 	seen := map[string]bool{}
 	for _, r := range rows {
@@ -96,14 +96,14 @@ func TestTenantScope_EnforceWithoutHookPanics(t *testing.T) {
 			t.Fatal("EnforceTenantIsolation() with no WithTenantScope must panic")
 		}
 	}()
-	NewReader(EnforceTenantIsolation())
+	NewReader(WithoutAuth(), EnforceTenantIsolation())
 }
 
 // ── with scope: audit endpoint filters ───────────────────────────────────
 
 func TestTenantScope_AuditScopesToResolvedTenant(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/audit?limit=10")
 	rows, _ := body["rows"].([]any)
 	if len(rows) == 0 {
@@ -119,7 +119,7 @@ func TestTenantScope_AuditScopesToResolvedTenant(t *testing.T) {
 func TestTenantScope_AuditIgnoresCallerTenantIDOverride(t *testing.T) {
 	// Attack: A caller passes ?tenant_id=tenant-b hoping to read B's rows.
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/audit?tenant_id=tenant-b&limit=10")
 	rows, _ := body["rows"].([]any)
 	for _, r := range rows {
@@ -131,7 +131,7 @@ func TestTenantScope_AuditIgnoresCallerTenantIDOverride(t *testing.T) {
 
 func TestTenantScope_401WhenScopeReturnsFalse(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "", false }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "", false }))
 	code := status(t, h, "/audit?limit=10")
 	if code != 401 {
 		t.Errorf("scope returning ok=false must 401; got %d", code)
@@ -143,7 +143,7 @@ func TestTenantScope_401WhenScopeReturnsFalse(t *testing.T) {
 func TestTenantScope_CorrelateBlocksCrossTenantRequestID(t *testing.T) {
 	initSharedStore(t)
 	// Tenant B knows A's request_id and hits /correlate.
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
 	body, _ := getJSON(t, h, "/correlate?request_id=req-tenant-a&limit=10")
 	if audit, _ := body["audit"].([]any); len(audit) != 0 {
 		t.Errorf("audit must be empty when scoped to a different tenant; got %v", audit)
@@ -163,7 +163,7 @@ func TestTenantScope_CorrelateBlocksCrossTenantRequestID(t *testing.T) {
 
 func TestTenantScope_SearchAuditBlocksCrossTenantSubstring(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
 	body, _ := getJSON(t, h,
 		"/search?q=marker-tenant-a&since=2026-01-01T00:00:00Z&streams=audit")
 	counts, _ := body["counts"].(map[string]any)
@@ -174,7 +174,7 @@ func TestTenantScope_SearchAuditBlocksCrossTenantSubstring(t *testing.T) {
 
 func TestTenantScope_SearchSysBlocksCrossTenantSubstring(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-b", true }))
 	body, _ := getJSON(t, h,
 		"/search?q=marker-tenant-a&since=2026-01-01T00:00:00Z&streams=sys")
 	counts, _ := body["counts"].(map[string]any)
@@ -187,7 +187,7 @@ func TestTenantScope_SearchSysBlocksCrossTenantSubstring(t *testing.T) {
 
 func TestTenantScope_SysPostFilters(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/sys?limit=10")
 	for _, r := range body["rows"].([]any) {
 		if r.(map[string]any)["tenant_id"] != "tenant-a" {
@@ -198,7 +198,7 @@ func TestTenantScope_SysPostFilters(t *testing.T) {
 
 func TestTenantScope_APIPostFilters(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/api?limit=10")
 	for _, r := range body["rows"].([]any) {
 		if r.(map[string]any)["tenant_id"] != "tenant-a" {
@@ -211,7 +211,7 @@ func TestTenantScope_APIPostFilters(t *testing.T) {
 
 func TestTenantScope_TopologyPostFilters(t *testing.T) {
 	initSharedStore(t)
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/topology")
 	for _, s := range body["sources"].([]any) {
 		if s.(map[string]any)["tenant_id"] != "tenant-a" {
@@ -230,7 +230,7 @@ func TestTenantScope_DoctorCountsOnlyTheCallersRows(t *testing.T) {
 	Init(Config{ServiceID: "svc", NodeID: "node", TenantID: "tenant-b",
 		AuditStore: audit, AuditStoreFailureStrategy: "raise"})
 
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	if rows := body["store"].(map[string]any)["rows"]; rows != float64(2) {
 		t.Errorf("unscoped doctor must count every row; got %v", rows)
 	}
@@ -238,7 +238,7 @@ func TestTenantScope_DoctorCountsOnlyTheCallersRows(t *testing.T) {
 		t.Errorf("unscoped doctor must report the host tenant_id; got %v", tid)
 	}
 
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ = getJSON(t, h, "/audit/doctor")
 	if rows := body["store"].(map[string]any)["rows"]; rows != float64(1) {
 		t.Errorf("scoped doctor must count only tenant-a's rows; got %v", rows)
@@ -261,13 +261,13 @@ func TestTenantScope_DoctorHidesTheBrokenRowFromAScopedCaller(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	chain := body["chain"].(map[string]any)
 	if reason, _ := chain["reason"].(string); !strings.Contains(reason, id) {
 		t.Fatalf("unscoped doctor must name the broken row; got %v", chain)
 	}
 
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ = getJSON(t, h, "/audit/doctor")
 	chain = body["chain"].(map[string]any)
 	if chain["verified"] != false || chain["breaks"] != float64(1) {

@@ -46,13 +46,13 @@ func TestAudit_ActorAndTargetFilters(t *testing.T) {
 	emitRow(t, "r1", "alice", "u-1")
 	emitRow(t, "r2", "bob", "u-2")
 
-	body, _ := getJSON(t, NewReader(), "/audit?actor=alice")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit?actor=alice")
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 || rows[0].(map[string]any)["actor"] != "alice" {
 		t.Errorf("actor filter: %v", rows)
 	}
 
-	body, _ = getJSON(t, NewReader(), "/audit?target=u-2")
+	body, _ = getJSON(t, NewReader(WithoutAuth()), "/audit?target=u-2")
 	rows, _ = body["rows"].([]any)
 	if len(rows) != 1 || rows[0].(map[string]any)["target"] != "u-2" {
 		t.Errorf("target filter: %v", rows)
@@ -64,7 +64,7 @@ func TestTopology_AggregatesSources(t *testing.T) {
 	emitRow(t, "r1", "alice", "u-1")
 	emitRow(t, "r2", "bob", "u-2")
 
-	body, _ := getJSON(t, NewReader(), "/topology")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/topology")
 	sources, _ := body["sources"].([]any)
 	if len(sources) != 1 {
 		t.Fatalf("sources=%v, want 1 (same node/service/tenant)", sources)
@@ -80,7 +80,7 @@ func TestTopology_AggregatesSources(t *testing.T) {
 
 func TestTopology_NoStore(t *testing.T) {
 	resetGlobals(t)
-	body, _ := getJSON(t, (&Engine{}).NewReader(), "/topology") // never Init'd
+	body, _ := getJSON(t, (&Engine{}).NewReader(WithoutAuth()), "/topology") // never Init'd
 	if body["error"] == nil {
 		t.Errorf("want error when no store, got %v", body)
 	}
@@ -90,7 +90,7 @@ func TestAuditDoctor_HasParityBlocks(t *testing.T) {
 	initAuditReader(t)
 	emitRow(t, "r1", "alice", "u-1")
 
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	if _, ok := body["redactor"]; !ok {
 		t.Error("doctor missing redactor block")
 	}
@@ -119,7 +119,7 @@ func TestAuditDoctor_HasParityBlocks(t *testing.T) {
 // actually verified.
 func TestAuditDoctor_EmptyStoreReportsBreaksNull(t *testing.T) {
 	initAuditReader(t) // fresh store, no rows emitted
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	chain, _ := body["chain"].(map[string]any)
 	if chain["verified"] != nil {
 		t.Errorf("empty store must not set verified; got %v", chain["verified"])
@@ -140,7 +140,7 @@ func TestAuditDoctor_NoStoreReportsBreaksNull(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	chain, _ := body["chain"].(map[string]any)
 	if chain["verified"] != nil || chain["breaks"] != nil {
 		t.Errorf("stdout-only engine must report chain nulls; got %v", chain)
@@ -157,7 +157,7 @@ func TestAuditDoctor_QueryErrorSurfacesError(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	chain, _ := body["chain"].(map[string]any)
 	if chain["error"] == nil {
 		t.Errorf("chain block must carry error when query fails; got %v", chain)
@@ -204,7 +204,7 @@ func TestReader_StoreErrorsStayOutOfResponses(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	rec := httptest.NewRecorder()
-	NewReader().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit", nil))
+	NewReader(WithoutAuth()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit", nil))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("/audit: want 500, got %d", rec.Code)
 	}
@@ -212,7 +212,7 @@ func TestReader_StoreErrorsStayOutOfResponses(t *testing.T) {
 		t.Errorf("/audit 500 body carries the store error: %q", body)
 	}
 
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	store := body["store"].(map[string]any)
 	chain := body["chain"].(map[string]any)
 	if store["last_error"] == nil || chain["reason"] == nil {
@@ -256,11 +256,11 @@ func TestAuditDoctor_CountOnlyStoreStillReportsRows(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	if rows := body["store"].(map[string]any)["rows"]; rows != float64(7) {
 		t.Errorf("unscoped doctor must use Count; got %v", rows)
 	}
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ = getJSON(t, h, "/audit/doctor")
 	store := body["store"].(map[string]any)
 	if store["rows"] != nil || store["reachable"] != true {
@@ -284,7 +284,7 @@ func TestAuditDoctor_CountPanicLogsThePanicType(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	if store := body["store"].(map[string]any); store["last_error"] == nil || store["reachable"] != false {
 		t.Fatalf("a panicking store must read as down; got %v", store)
 	}
@@ -315,7 +315,7 @@ func TestAuditDoctor_CountOnlyStoreDownReadsAsDownWhenScoped(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	h := NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
+	h := NewReader(WithoutAuth(), WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
 	body, _ := getJSON(t, h, "/audit/doctor")
 	store := body["store"].(map[string]any)
 	if store["reachable"] != false || store["last_error"] == nil || store["rows"] != nil {
@@ -346,7 +346,7 @@ func TestAuditDoctor_SamplesBySeqAfterAClockStepBack(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/audit/doctor")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit/doctor")
 	chain := body["chain"].(map[string]any)
 	if chain["verified"] != true || chain["breaks"] != float64(0) {
 		t.Errorf("clean chain must verify; got %v", chain)

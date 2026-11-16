@@ -70,14 +70,15 @@ request, and the mountable `/logs/*` reader: see
 ```bash
 pip install ./python[fastapi] uvicorn
 cd python
+export DEMO_READER_TOKEN="$(openssl rand -hex 16)"   # the reader's Bearer token
 FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=host-01 \
   FASTEN_AUDIT_DSN=sqlite:///./demo-audit.db \
   uvicorn examples.fastapi_app:app --port 8000
 
 curl -X POST http://localhost:8000/users -H 'content-type: application/json' \
      -d '{"email":"alice@example.com"}'
-# The reader requires a Bearer token (DEMO_READER_TOKEN, default demo-token):
-curl -H 'authorization: Bearer demo-token' http://localhost:8000/logs/audit
+# The reader needs the Bearer token; without DEMO_READER_TOKEN it answers 401.
+curl -H "authorization: Bearer $DEMO_READER_TOKEN" http://localhost:8000/logs/audit
 ```
 
 ## Bundled CLI and TUI

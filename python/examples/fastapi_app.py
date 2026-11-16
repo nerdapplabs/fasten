@@ -13,6 +13,7 @@ Minimal FastAPI service wired to fasten.
 Run:
 
     pip install ./python[fastapi] uvicorn
+    export DEMO_READER_TOKEN="$(openssl rand -hex 16)"   # the reader's Bearer token
     FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=host-01 \\
       FASTEN_AUDIT_DSN=sqlite:///./demo-audit.db \\
       uvicorn examples.fastapi_app:app --port 8000
@@ -21,11 +22,12 @@ Run:
          -H 'content-type: application/json' \\
          -d '{"email":"alice@example.com"}'
     curl http://localhost:8000/users/u-42
-    # Reader endpoints are gated; pass a Bearer token (default: demo-token):
-    curl -H 'authorization: Bearer demo-token' http://localhost:8000/logs/audit
+    # The reader needs the Bearer token; without DEMO_READER_TOKEN it answers 401.
+    curl -H "authorization: Bearer $DEMO_READER_TOKEN" http://localhost:8000/logs/audit
 """
 from __future__ import annotations
 
+import hmac
 import os
 
 import fasten
@@ -66,8 +68,10 @@ fasten.init(extra_redact_keys=["email"])
 # Replace require_admin with your real auth dependency.
 _bearer = HTTPBearer(auto_error=False)
 def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
-    expected = os.environ.get("DEMO_READER_TOKEN", "demo-token")
-    if creds is None or creds.credentials != expected:
+    expected = os.environ.get("DEMO_READER_TOKEN")
+    if not expected or creds is None or not hmac.compare_digest(
+        creds.credentials.encode(), expected.encode()
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="reader requires Bearer token; set DEMO_READER_TOKEN env",

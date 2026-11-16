@@ -57,7 +57,7 @@ func TestRing_NullTimestamp_WindowExcludes(t *testing.T) {
 	tr.PushSyslog(SyslogRow{"event": "ok", "request_id": "r-ok",
 		"timestamp": "2026-08-15T00:00:00Z"})
 
-	body, _ := getJSON(t, NewReader(), "/sys?since=2026-08-01T00:00:00Z")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/sys?since=2026-08-01T00:00:00Z")
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Fatalf("want 1 dated row through the window, got %d (%v)", len(rows), rows)
@@ -66,7 +66,7 @@ func TestRing_NullTimestamp_WindowExcludes(t *testing.T) {
 		t.Errorf("windowed read must exclude undated rows; got %v", rows)
 	}
 	// No window: both rows visible.
-	body2, _ := getJSON(t, NewReader(), "/sys")
+	body2, _ := getJSON(t, NewReader(WithoutAuth()), "/sys")
 	if r, _ := body2["rows"].([]any); len(r) != 2 {
 		t.Errorf("no-window read must include both rows; got %d", len(r))
 	}
@@ -89,13 +89,13 @@ func TestRing_WindowInclusiveOnBothEnds(t *testing.T) {
 	// shape the row was stored in.
 	shortForm := "2026-08-15T00:00:00Z"
 	// since == ts must include the row.
-	body, _ := getJSON(t, NewReader(), "/sys?since="+shortForm)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/sys?since="+shortForm)
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Errorf("since=ts must be inclusive; got %d rows", len(rows))
 	}
 	// until == ts must include the row too.
-	body, _ = getJSON(t, NewReader(), "/sys?until="+shortForm)
+	body, _ = getJSON(t, NewReader(WithoutAuth()), "/sys?until="+shortForm)
 	rows, _ = body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Errorf("until=ts must be inclusive; got %d rows", len(rows))
@@ -119,17 +119,17 @@ func TestStore_WindowInclusiveOnBothEnds(t *testing.T) {
 		"timestamp": boundary})
 
 	shortForm := "2026-08-15T00:00:00Z"
-	body, _ := getJSON(t, NewReader(), "/sys?since="+shortForm)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/sys?since="+shortForm)
 	if r, _ := body["rows"].([]any); len(r) != 1 {
 		t.Errorf("store since=ts must be inclusive; got %d rows", len(r))
 	}
-	body, _ = getJSON(t, NewReader(), "/sys?until="+shortForm)
+	body, _ = getJSON(t, NewReader(WithoutAuth()), "/sys?until="+shortForm)
 	if r, _ := body["rows"].([]any); len(r) != 1 {
 		t.Errorf("store until=ts must be inclusive; got %d rows", len(r))
 	}
 	// A window ending one second earlier must not match.
 	oneEarlier := "2026-08-14T23:59:59Z"
-	body, _ = getJSON(t, NewReader(), "/sys?since="+oneEarlier+"&until="+oneEarlier)
+	body, _ = getJSON(t, NewReader(WithoutAuth()), "/sys?since="+oneEarlier+"&until="+oneEarlier)
 	if r, _ := body["rows"].([]any); len(r) != 0 {
 		t.Errorf("row at boundary must not match a window ending 1s earlier; got %d", len(r))
 	}

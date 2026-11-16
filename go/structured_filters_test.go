@@ -24,7 +24,7 @@ func TestStructuredFilters_Ring(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	seedFilterRows(GetTransport())
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	body, _ := getJSON(t, h, "/sys?event=db.timeout")
 	if rows, _ := body["rows"].([]any); len(rows) != 1 || rows[0].(map[string]any)["event"] != "db.timeout" {
@@ -55,7 +55,7 @@ func TestStructuredFilters_StoreAgreesWithRing(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	seedFilterRows(GetTransport())
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	body, comp := getCompleteness(t, h, "/sys?event=cache.miss")
 	if comp["sys"] != "store" {
@@ -83,7 +83,7 @@ func TestRingStatusNumericCompare_ParityWithStore(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	seedFilterRows(GetTransport())
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	// The seed pushes status=502 (int). Query with leading-zero equivalent,
 	// exact numeric string, and plain int-form: all three must match the
@@ -116,7 +116,7 @@ func TestStructuredFilters_RingAndStoreAgree(t *testing.T) {
 		t.Fatalf("Init(ring): %v", err)
 	}
 	seedFilterRows(GetTransport())
-	ringBody, _ := getJSON(t, NewReader(), "/api?status=0502")
+	ringBody, _ := getJSON(t, NewReader(WithoutAuth()), "/api?status=0502")
 	ringRows, _ := ringBody["rows"].([]any)
 
 	// Persisted pass.
@@ -128,7 +128,7 @@ func TestStructuredFilters_RingAndStoreAgree(t *testing.T) {
 		t.Fatalf("Init(store): %v", err)
 	}
 	seedFilterRows(GetTransport())
-	storeBody, _ := getJSON(t, NewReader(), "/api?status=0502")
+	storeBody, _ := getJSON(t, NewReader(WithoutAuth()), "/api?status=0502")
 	storeRows, _ := storeBody["rows"].([]any)
 
 	if len(ringRows) != len(storeRows) {

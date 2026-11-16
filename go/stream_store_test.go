@@ -87,7 +87,7 @@ func TestStreamStore_APIPersistedReportsStoreAndServesFromStore(t *testing.T) {
 	}
 	GetTransport().PushAPI(APIRow{"method": "POST", "path": "/v1/checkout", "status": 502, "request_id": "r-1"})
 
-	body, comp := getCompleteness(t, NewReader(), "/api?request_id=r-1")
+	body, comp := getCompleteness(t, NewReader(WithoutAuth()), "/api?request_id=r-1")
 	if comp["api"] != "store" {
 		t.Errorf("completeness flipped? got %v", comp)
 	}
@@ -107,7 +107,7 @@ func TestStreamStore_SysPersistedDepthBeyondRing(t *testing.T) {
 	for i := 0; i < 3000; i++ { // > default ring maxlen (2000)
 		tr.PushSyslog(SyslogRow{"level": "error", "event": "db.timeout", "request_id": fmt.Sprintf("r-%d", i)})
 	}
-	body, comp := getCompleteness(t, NewReader(), "/sys?request_id=r-0")
+	body, comp := getCompleteness(t, NewReader(WithoutAuth()), "/sys?request_id=r-0")
 	if comp["sys"] != "store" {
 		t.Errorf("sys source: got %v, want store", comp)
 	}
@@ -122,7 +122,7 @@ func TestStreamStore_UnpersistedStaysRing(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	GetTransport().PushAPI(APIRow{"method": "GET", "path": "/x", "request_id": "r-9"})
-	body, comp := getCompleteness(t, NewReader(), "/api")
+	body, comp := getCompleteness(t, NewReader(WithoutAuth()), "/api")
 	if comp["api"] != "ring" {
 		t.Errorf("unpersisted api: got %v, want ring", comp)
 	}
@@ -201,7 +201,7 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 	}
 	tr := GetTransport()
 
-	body, _ := getJSON(t, NewReader(), "/api")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/api")
 	if comp, _ := body["completeness"].(map[string]any); comp["api"] != "store" {
 		t.Fatalf("healthy sink: completeness=%v, want store", comp["api"])
 	}

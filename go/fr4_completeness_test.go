@@ -55,7 +55,7 @@ func TestStoreDegradedStickyThroughSuccessfulWrite(t *testing.T) {
 		t.Fatalf("after recovery api=%q, want store-degraded (sticky)", got)
 	}
 	// The recovered row is present: history keeps growing, the hole stays.
-	body, _ := getJSON(t, NewReader(), "/api")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/api")
 	if rows, _ := body["rows"].([]any); len(rows) != 1 {
 		t.Fatalf("want 1 persisted row after recovery, got %d", len(rows))
 	}
@@ -89,7 +89,7 @@ func TestCorrelateMixedDurabilityClasses(t *testing.T) {
 	}
 	apiStore.NoteWriteFailure()
 
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id=r1")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id=r1")
 	comp, _ := body["completeness"].(map[string]any)
 	if comp["audit"] != "store" || comp["api"] != "store-degraded" || comp["sys"] != "ring" {
 		t.Fatalf("mixed completeness = %v, want audit=store api=store-degraded sys=ring", comp)
@@ -119,12 +119,12 @@ func TestCorrelateTruncatedFlag(t *testing.T) {
 		}
 	}
 	// limit 2 of 3 matching -> truncated.audit true.
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id=rq&limit=2")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id=rq&limit=2")
 	if tr, _ := body["truncated"].(map[string]any); tr["audit"] != true {
 		t.Fatalf("limit=2: truncated.audit=%v, want true (counts 2 < totals 3)", body["truncated"])
 	}
 	// limit 10 -> not truncated.
-	body2, _ := getJSON(t, NewReader(), "/correlate?request_id=rq&limit=10")
+	body2, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id=rq&limit=10")
 	if tr, _ := body2["truncated"].(map[string]any); tr["audit"] != false {
 		t.Fatalf("limit=10: truncated.audit=%v, want false", body2["truncated"])
 	}
@@ -156,7 +156,7 @@ func TestAdopterAuditStoreDegradeThroughEngine(t *testing.T) {
 		t.Fatal("swallow flag must be set after a swallowed insert")
 	}
 	// Reader must reflect the degrade via the engine flag, not any store hook.
-	body, _ := getJSON(t, NewReader(), "/audit?limit=1")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/audit?limit=1")
 	comp, _ := body["completeness"].(map[string]any)
 	if comp["audit"] != "store-degraded" {
 		t.Fatalf("audit completeness = %v, want store-degraded (engine flag)", comp["audit"])

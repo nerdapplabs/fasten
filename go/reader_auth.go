@@ -18,7 +18,7 @@ import (
 //	mux := http.NewServeMux()
 //	mux.Handle("/api/v1/logs/", http.StripPrefix(
 //	    "/api/v1/logs",
-//	    fasten.RequireBearer("FASTEN_READER_TOKEN")(fasten.NewReader()),
+//	    fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN"))),
 //	))
 //
 // It's meant for callers without an auth stack yet. Put anything shared or
