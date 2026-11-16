@@ -33,7 +33,7 @@ The runtime layout:
 
 **Trust boundary 1, process and store:** The audit store is trusted infrastructure. A compromised store (for example a shared Postgres server another tenant can write to) is outside fasten's threat model. fasten assumes the adopter controls the store.
 
-**Trust boundary 2, caller and reader endpoints:** The reader routes (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`, `/topology` in Python and Go; `/sys`, `/api`, `/audit` in C++; all under the mount prefix) return raw audit data. fasten has no built-in authentication; the adopter supplies it (section 2.3). An unauthenticated mount on a network interface is a misconfiguration.
+**Trust boundary 2, caller and reader endpoints:** The reader routes (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`, `/topology` in Python and Go; `/sys`, `/api`, `/audit` in C++; all under the mount prefix) return raw audit data. Each reader needs an authentication choice when it is built, and the adopter supplies the authentication (section 2.3). An unauthenticated mount on a network interface is a misconfiguration.
 
 **Trust boundary 3, emit and row content:** `fasten.emit()` accepts a `detail` dict from the adopter. The SDK redacts it before the row is written, but the adopter controls which keys and values go in. fasten does not check application-level correctness; it only removes recognisable secret shapes.
 
@@ -89,13 +89,13 @@ The runtime layout:
 **Mitigations in place:**
 
 - Python: `fasten.reader.router()` requires a `dependencies=` argument, such as `[Depends(require_admin)]` or the bundled `fasten.reader.require_bearer()`. FastAPI applies it to every route, including `/audit/doctor`. Calling `router()` without it raises at startup; mounting without auth takes an explicit `dependencies=[]`.
-- Go: wrap the handler, for example `fasten.RequireBearer("FASTEN_READER_TOKEN")(fasten.NewReader())`. `RequireBearer` panics at startup when the variable is unset.
-- C++: pass an auth function to `fasten::reader::simplehttp::start(port, prefix, auth)`, or check the caller in your own server before calling the `fasten::reader::handle_*` functions.
+- Go: `NewReader` requires `WithAuth(middleware)`, for example `fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")))`, or `WithoutAuth()`, and panics with neither. `RequireBearer` panics at startup when the variable is unset.
+- C++: `fasten::reader::simplehttp::start(port, prefix, auth)` and `mount()` require an auth function and throw on an empty one; `no_auth()` is the explicit opt-out. With another server, check the caller before calling the `fasten::reader::handle_*` functions.
 - Python: the router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
 
 **Not mitigated:**
 
-- fasten does not enforce authentication. A Python router mounted with `dependencies=[]`, a Go `NewReader()` that is not wrapped, and a C++ `simplehttp::start(port)` with no auth function all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
+- fasten does not check the authentication itself. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
 - The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
 
 ---
@@ -107,7 +107,7 @@ The runtime layout:
 **Mitigations in place:**
 
 - The `tenant_id` column is part of the row schema and is stored in the audit table. The `query()` / `count()` methods accept `tenant_id` as a filter.
-- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithTenantScope(...))` in Go) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`) refuses to build the reader without the hook.
+- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithAuth(mw), WithTenantScope(...))` in Go) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`) refuses to build the reader without the hook.
 - Adopters can also enforce per-tenant filtering in their own auth dependency by extracting the tenant from the authenticated identity and passing it explicitly to `fasten.audit_store().query(tenant_id=...)`.
 - Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`). They all run on in-memory SQLite; no test checks cross-tenant reads against Postgres in CI.
 

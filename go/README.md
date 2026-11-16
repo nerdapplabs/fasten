@@ -104,17 +104,20 @@ curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 
 ## Serving the reader
 
-`fasten.NewReader()` returns an `http.Handler` with the reader routes
+`fasten.NewReader` returns an `http.Handler` with the reader routes
 (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`,
-`/topology`). It has no authentication of its own, so wrap it:
+`/topology`). It needs an auth choice and panics without one:
+`WithAuth(middleware)` puts every route behind the middleware, and
+`WithoutAuth()` is for routes your own router or gateway authenticates.
 
 ```go
-mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs",
-    fasten.RequireBearer("FASTEN_READER_TOKEN")(fasten.NewReader())))
+reader := fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")))
+mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", reader))
 ```
 
 `RequireBearer` requires `Authorization: Bearer <token>` and panics at
-startup when the variable is unset. Use your own middleware for other schemes.
+startup when the variable is unset. Pass your own middleware to `WithAuth`
+for other schemes.
 
 ## Reading logs back: whole record or recent window?
 

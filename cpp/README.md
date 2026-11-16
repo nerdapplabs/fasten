@@ -180,11 +180,13 @@ unsealed, so all of them can be redacted. A row sealed under canonical form
 
 ## Reader authentication
 
-The reader handlers have no authentication of their own.
-`fasten::reader::simplehttp::start(port)` serves `/sys`, `/api` and `/audit`
-to any caller, so use it only on a trusted network; otherwise pass an auth
-function as its third argument, or check the caller in your own server
-before calling the `fasten::reader::handle_*` functions.
+`fasten::reader::simplehttp::start(port, prefix, auth)` and `mount()` serve
+`/sys`, `/api` and `/audit`, and need an auth function: it gets the request
+headers and returns whether the caller may read. An empty function throws
+`std::invalid_argument`; `fasten::reader::simplehttp::no_auth()` serves the
+routes to any caller, for a port only a trusted network can reach. With
+another server, check the caller before calling the
+`fasten::reader::handle_*` functions.
 
 ## Reader tenant isolation
 

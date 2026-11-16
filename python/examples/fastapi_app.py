@@ -27,6 +27,7 @@ Run:
 """
 from __future__ import annotations
 
+import hmac
 import os
 
 import fasten
@@ -68,7 +69,9 @@ fasten.init(extra_redact_keys=["email"])
 _bearer = HTTPBearer(auto_error=False)
 def require_admin(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
     expected = os.environ.get("DEMO_READER_TOKEN")
-    if not expected or creds is None or creds.credentials != expected:
+    if not expected or creds is None or not hmac.compare_digest(
+        creds.credentials.encode(), expected.encode()
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="reader requires Bearer token; set DEMO_READER_TOKEN env",
