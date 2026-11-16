@@ -179,12 +179,9 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 	if strings.HasPrefix(dsn, "sqlite:") {
 		u, err := url.Parse(dsn)
 		if err != nil {
-			// Report only the cause; the error names no part of the DSN.
-			var ue *url.Error
-			if errors.As(err, &ue) {
-				err = ue.Err
-			}
-			return "", "", fmt.Errorf("fasten StreamStore: invalid sqlite DSN: %w", err)
+			// A fixed message: url.Parse's own error, even its cause, can
+			// quote part of the DSN (a password read as a port or an escape).
+			return "", "", errors.New("fasten StreamStore: invalid sqlite DSN")
 		}
 		path = u.Path
 		// Strip the one separator slash: sqlite:///rel.db gives "rel.db",

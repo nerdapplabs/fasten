@@ -28,18 +28,55 @@ impl Inner {
     }
 }
 
+/// How a `require`-level DSN checks the server certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertCheck {
+    /// The chain and the host name: `require` and `verify-full`.
+    Full,
+    /// The chain only: `verify-ca`.
+    ChainOnly,
+}
+
+#[allow(clippy::expect_used)]
+static VERIFY_SSLMODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(sslmode\s*=\s*)(verify-ca|verify-full)\b").expect("sslmode regex is valid")
+});
+
+// The driver accepts only sslmode disable, prefer and require. libpq's
+// verify-ca and verify-full are rewritten to require, and the check they
+// ask for is returned, so one strict value (verify-full) works in every SDK.
+fn libpq_sslmode(dsn: &str) -> (std::borrow::Cow<'_, str>, CertCheck) {
+    let mut check = CertCheck::Full;
+    if let Some(c) = VERIFY_SSLMODE_RE.captures(dsn) {
+        if c[2].eq_ignore_ascii_case("verify-ca") {
+            check = CertCheck::ChainOnly;
+        }
+    }
+    (VERIFY_SSLMODE_RE.replace_all(dsn, "${1}require"), check)
+}
+
 // Parse the DSN before connecting. The error names no part of the string;
-// for a bad sslmode it names the option and the accepted values.
+// for a bad sslmode it names the option and the accepted values. A DSN with
+// only hostaddr also gets it as host, as libpq uses it: TLS needs a host
+// name to check, and the driver connects to hostaddr either way.
 fn parse_dsn(dsn: &str) -> Result<pg::Config, Error> {
-    dsn.parse::<pg::Config>().map_err(|e| {
+    let mut config = dsn.parse::<pg::Config>().map_err(|e| {
         // The Display text is generic; the cause (in Debug) names the option.
         Error::Store(if format!("{e:?}").contains("\"sslmode\"") {
-            "unsupported sslmode in the Postgres connection string: use disable, prefer or require"
+            "unsupported sslmode in the Postgres connection string: use disable, prefer, \
+             require, verify-ca or verify-full"
                 .to_owned()
         } else {
             "invalid Postgres connection string".to_owned()
         })
-    })
+    })?;
+    if config.get_hosts().is_empty() {
+        let addrs: Vec<String> = config.get_hostaddrs().iter().map(ToString::to_string).collect();
+        for a in addrs {
+            config.host(&a);
+        }
+    }
+    Ok(config)
 }
 
 /// Open a Postgres client for `dsn`.
@@ -47,18 +84,25 @@ fn parse_dsn(dsn: &str) -> Result<pg::Config, Error> {
 /// With `postgres-tls`, `sslmode` works as in libpq:
 /// - `prefer` (the default) uses TLS when the server offers it, without
 ///   checking the server certificate, and plaintext when it doesn't;
-/// - `require` uses TLS and checks the certificate and host name (the
-///   driver has no `verify-*` modes; this is the strict one);
+/// - `require` and `verify-full` use TLS and check the certificate and host
+///   name;
+/// - `verify-ca` uses TLS and checks the certificate but not the host name;
 /// - `disable` uses plaintext.
+///
+/// `verify-full` is strict in every SDK; libpq's `require` (Python, C++)
+/// does not check the certificate.
 ///
 /// Without the feature, connects with NoTls and refuses a DSN that asks for
 /// TLS instead of connecting in plaintext.
 #[cfg(feature = "postgres-tls")]
 pub fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
-    let config = parse_dsn(dsn)?;
+    let (dsn, check) = libpq_sslmode(dsn);
+    let config = parse_dsn(&dsn)?;
     let mut builder = native_tls::TlsConnector::builder();
     if !matches!(config.get_ssl_mode(), pg::config::SslMode::Require) {
         builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+    } else if check == CertCheck::ChainOnly {
+        builder.danger_accept_invalid_hostnames(true);
     }
     let tls = builder
         .build()
@@ -70,16 +114,13 @@ pub fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
 /// Open a Postgres client for `dsn`; see the `postgres-tls` variant.
 #[cfg(not(feature = "postgres-tls"))]
 pub fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
-    let config = parse_dsn(dsn)?;
+    let config = parse_dsn(&libpq_sslmode(dsn).0)?;
     if requires_tls(dsn) {
         return Err(Error::TlsUnavailable(
             "DSN requests TLS (sslmode=require|verify-ca|verify-full) but \
              fasten-core was built without the `postgres-tls` feature. \
              Rebuild with `--features postgres-tls` (on by default), or \
-             remove the sslmode param to accept plaintext explicitly. \
-             NOTE: use `sslmode=require`: the driver accepts only \
-             disable|prefer|require, and `require` with native-tls already \
-             verifies the certificate chain AND the hostname."
+             remove the sslmode param to accept plaintext explicitly."
                 .to_string(),
         ));
     }
@@ -89,12 +130,6 @@ pub fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
 // True if the DSN's sslmode requires encryption. As in libpq, those are
 // `require`, `verify-ca` and `verify-full`; `prefer` and `allow` may fall back
 // and `disable` is plaintext.
-//
-// The driver's parser accepts only `disable | prefer | require`, so
-// parse_dsn reports `verify-*` before this runs; matching it here keeps such
-// a DSN failing closed if the driver ever accepts it. `require` is the value
-// to document: with native-tls it checks the certificate chain and the host
-// name.
 //
 // Only the non-TLS connect_client calls this; tests cover it under every
 // feature set, hence allow(dead_code).
@@ -114,18 +149,45 @@ fn requires_tls(dsn: &str) -> bool {
 
 #[cfg(test)]
 mod tls_tests {
-    use super::requires_tls;
+    use super::{libpq_sslmode, parse_dsn, requires_tls, CertCheck};
 
-    /// sslmode values the driver doesn't accept get an error naming the
-    /// accepted ones.
+    /// An sslmode nobody accepts gets an error naming the accepted ones.
     #[test]
     fn unsupported_sslmode_error_names_accepted_values() {
-        let err = super::connect_client("host=db password=s3cret sslmode=verify-full")
+        let err = super::connect_client("host=db password=s3cret sslmode=bogus")
             .err()
             .expect("must fail to parse")
             .to_string();
         assert!(!err.contains("s3cret"), "{err}");
-        assert!(err.contains("use disable, prefer or require"), "{err}");
+        assert!(err.contains("use disable, prefer, require, verify-ca or verify-full"), "{err}");
+    }
+
+    /// verify-full and verify-ca parse as require; verify-ca skips only the
+    /// host name check. Other modes and the rest of the DSN are unchanged.
+    #[test]
+    fn libpq_verify_modes_map_to_require() {
+        for (dsn, want, check) in [
+            ("host=db sslmode=verify-full", "host=db sslmode=require", CertCheck::Full),
+            ("host=db sslmode = VERIFY-CA user=x", "host=db sslmode = require user=x", CertCheck::ChainOnly),
+            ("postgres://u:p@db/x?sslmode=verify-full&a=b", "postgres://u:p@db/x?sslmode=require&a=b", CertCheck::Full),
+            ("host=db sslmode=require", "host=db sslmode=require", CertCheck::Full),
+            ("host=db sslmode=prefer", "host=db sslmode=prefer", CertCheck::Full),
+        ] {
+            let (got, c) = libpq_sslmode(dsn);
+            assert_eq!(got, want);
+            assert_eq!(c, check, "{dsn}");
+        }
+        let cfg = parse_dsn(&libpq_sslmode("host=db sslmode=verify-full").0).expect("parses");
+        assert!(matches!(cfg.get_ssl_mode(), pg::config::SslMode::Require));
+    }
+
+    /// A DSN with only hostaddr gets it as host too, so TLS has a host name.
+    #[test]
+    fn hostaddr_alone_becomes_the_host() {
+        let cfg = parse_dsn("hostaddr=10.0.0.5 user=x").expect("parses");
+        assert_eq!(cfg.get_hosts(), [pg::config::Host::Tcp("10.0.0.5".into())]);
+        let cfg = parse_dsn("host=db.internal hostaddr=10.0.0.5 user=x").expect("parses");
+        assert_eq!(cfg.get_hosts(), [pg::config::Host::Tcp("db.internal".into())]);
     }
 
     /// A connection string the driver can't parse gives an error that
@@ -138,13 +200,10 @@ mod tls_tests {
             assert_eq!(err, "invalid Postgres connection string");
         }
     }
-    /// The driver accepts only disable|prefer|require and rejects
-    /// verify-ca/verify-full at connect time, so `require` is the documented
-    /// value; requires_tls() still matches verify-* so they fail closed.
+    /// Without TLS, every mode that needs encryption fails closed.
     #[test]
-    fn documented_strict_sslmode_is_require() {
+    fn strict_sslmodes_require_tls() {
         assert!(requires_tls("host=db user=x sslmode=require"));
-        // Still fail-closed on values the driver will reject:
         assert!(requires_tls("host=db user=x sslmode=verify-full"));
         // Fallback-permitting modes must NOT be treated as requiring TLS.
         assert!(!requires_tls("host=db user=x sslmode=prefer"));

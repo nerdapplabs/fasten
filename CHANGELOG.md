@@ -10,8 +10,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - `PostgresStore` connects through native-tls, with `sslmode` working as in
   libpq: the default, `prefer`, uses TLS when the server offers it without
-  checking the certificate; `sslmode=require` uses TLS and checks the
-  certificate and host name; `sslmode=disable` uses plaintext.
+  checking the certificate; `sslmode=require` and `sslmode=verify-full`
+  use TLS and check the certificate and host name; `sslmode=verify-ca`
+  checks the certificate but not the host name; `sslmode=disable` uses
+  plaintext.
 - The `store-postgres` feature needs `pkg-config` and the OpenSSL headers
   on Linux.
 
@@ -19,16 +21,19 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 - With `sslmode` unset or `prefer`, the fasten-core store
   (`fasten_store_open`) now connects to a server whose certificate it can't
-  verify, as libpq does, instead of refusing it. Use `sslmode=require` to
-  check the certificate and host name.
-- An `sslmode` the driver doesn't accept (`verify-ca`, `verify-full`) gets
-  an error naming the accepted values: `disable`, `prefer`, `require`.
+  verify, as libpq does, instead of refusing it. Use `sslmode=verify-full`
+  (or `require`) to check the certificate and host name; `verify-full` is
+  the value that is strict in every SDK.
+- `sslmode=verify-ca` and `sslmode=verify-full` are accepted, as in libpq.
+- A DSN with only `hostaddr` uses that address as the TLS host name, as
+  libpq does, instead of failing the TLS handshake.
 
 ### Changed: store DSN errors
 
 - Python, Go and C++ errors for an unsupported DSN scheme, a DSN with no
   path, or a Postgres connection string that can't be parsed name no part
-  of the DSN.
+  of the DSN. A Go sqlite DSN that can't be parsed as a URL gets a fixed
+  message.
 - The C++ fallback that calls the audit sink directly logs the first line
   of a store error.
 

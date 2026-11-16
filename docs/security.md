@@ -133,8 +133,9 @@ The runtime layout:
 
 **Postgres connections and TLS:** set `sslmode` in the DSN. Where the default is `prefer` (libpq, so Python and the C++ store; pgx; the Rust SDK and fasten-core), it uses TLS when the server offers it, without checking the server certificate, and otherwise connects in plaintext; it does not protect against an active attacker on the network.
 
-- Python (psycopg), Go (the `database/sql` driver you pass in, such as lib/pq or pgx) and the C++ Postgres store (libpq): use `sslmode=verify-full`, which encrypts and checks the server certificate and host name.
-- The Rust SDK and the fasten-core store (`fasten_store_open`): use `sslmode=require`. Their driver accepts only `disable`, `prefer` and `require`, and under `require` it checks the certificate and host name.
+- Use `sslmode=verify-full` in every SDK: it encrypts and checks the server certificate and host name in Python (psycopg), Go (the `database/sql` driver you pass in, such as lib/pq or pgx), the C++ Postgres store (libpq), the Rust SDK and the fasten-core store (`fasten_store_open`).
+- `sslmode=require` differs: libpq (Python, C++) encrypts without checking the certificate, while the Rust SDK and fasten-core check the certificate and host name. `verify-ca` checks the certificate but not the host name.
+- A DSN with only `hostaddr` uses TLS as libpq does: the Rust SDK and fasten-core check the certificate against that address.
 
 **Not mitigated:**
 
