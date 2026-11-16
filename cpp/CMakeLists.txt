@@ -90,6 +90,13 @@ if(FASTEN_BUILD_TESTS)
     endif()
     add_test(NAME row_fields_smoke COMMAND row_fields_smoke)
 
+    add_executable(shutdown_order_smoke tests/shutdown_order_smoke.cpp)
+    target_link_libraries(shutdown_order_smoke PRIVATE fasten)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(shutdown_order_smoke PRIVATE pthread)
+    endif()
+    add_test(NAME shutdown_order_smoke COMMAND shutdown_order_smoke)
+
     add_executable(reader_scope_smoke tests/reader_scope_smoke.cpp)
     target_link_libraries(reader_scope_smoke PRIVATE fasten)
     if(UNIX AND NOT APPLE)

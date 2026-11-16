@@ -4,10 +4,10 @@ use std::os::raw::c_char;
 
 use serde::Deserialize;
 
-use super::util::{read_str, set_error, write_to_buf, write_err_to_buf};
+use super::util::{read_opt, read_req, set_error, write_to_buf, write_err_to_buf};
 use super::guarded;
 use crate::{
-    error::{Error, FastenErrorCode},
+    error::FastenErrorCode,
     redact::Redactor,
 };
 
@@ -26,7 +26,7 @@ pub unsafe extern "C" fn fasten_redact(
     out_err:  *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
         crate::redact::REDACTOR.redact_json(input)
     });
     match r {
@@ -57,7 +57,7 @@ pub unsafe extern "C" fn fasten_redact_buf(
     err_buf_len: u32,
 ) -> i32 {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
         crate::redact::REDACTOR.redact_json(input)
     });
     match r {
@@ -86,17 +86,19 @@ pub unsafe extern "C" fn fasten_redact_full_buf(
     err_buf_len:               u32,
 ) -> i32 {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
 
-        let extra_keys: Vec<String> = match read_str(extra_keys_json) {
+        let extra_keys: Vec<String> = match read_opt(extra_keys_json)? {
             Some(json) if !json.is_empty() => serde_json::from_str(json)?,
             _ => vec![],
         };
         let key_refs: Vec<&str> = extra_keys.iter().map(String::as_str).collect();
 
-        let repl = read_str(replacement).unwrap_or("");
+        // A replacement that isn't UTF-8 is treated as unset (the default
+        // "***"), as the Rust SDK does, rather than failing every redaction.
+        let repl = read_opt(replacement).ok().flatten().unwrap_or("");
 
-        let extra_vp: Vec<ExtraValuePattern> = match read_str(extra_value_patterns_json) {
+        let extra_vp: Vec<ExtraValuePattern> = match read_opt(extra_value_patterns_json)? {
             Some(json) if !json.is_empty() => serde_json::from_str(json)?,
             _ => vec![],
         };
@@ -147,17 +149,19 @@ pub unsafe extern "C" fn fasten_redact_full(
     out_err:                    *mut *mut c_char,
 ) -> FastenErrorCode {
     let r = guarded(|| {
-        let input = read_str(in_json).ok_or(Error::NullArg)?;
+        let input = read_req(in_json)?;
 
-        let extra_keys: Vec<String> = match read_str(extra_keys_json) {
+        let extra_keys: Vec<String> = match read_opt(extra_keys_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => vec![],
         };
         let key_refs: Vec<&str> = extra_keys.iter().map(String::as_str).collect();
 
-        let repl = read_str(replacement).unwrap_or("");
+        // A replacement that isn't UTF-8 is treated as unset (the default
+        // "***"), as the Rust SDK does, rather than failing every redaction.
+        let repl = read_opt(replacement).ok().flatten().unwrap_or("");
 
-        let extra_vp: Vec<ExtraValuePattern> = match read_str(extra_value_patterns_json) {
+        let extra_vp: Vec<ExtraValuePattern> = match read_opt(extra_value_patterns_json)? {
             Some(json) => serde_json::from_str(json)?,
             None => vec![],
         };
@@ -178,5 +182,31 @@ pub unsafe extern "C" fn fasten_redact_full(
             set_error(out_err, &msg);
             code
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{CStr, CString};
+    use std::ptr;
+
+    use super::*;
+
+    /// A replacement that isn't UTF-8 is treated as unset: the default
+    /// "***", not a failed redaction.
+    #[test]
+    fn replacement_not_utf8_is_the_default() {
+        let input = CString::new(r#"{"password":"p","ok":"v"}"#).unwrap();
+        let repl = CString::new(vec![b'[', 0xFF, b']']).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            fasten_redact_full(input.as_ptr(), ptr::null(), repl.as_ptr(), ptr::null(), &mut out, ptr::null_mut())
+        };
+        assert_eq!(code, FastenErrorCode::Ok);
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_owned();
+        unsafe { super::super::fasten_store_free_str(out) };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["password"], "***");
+        assert_eq!(v["ok"], "v");
     }
 }
