@@ -7,7 +7,7 @@ import os from 'node:os';
 
 import {
     register, metaOf, registry, codes, _yamlCodes, _resetRegistryForReload,
-    _clearCoreRegistry,
+    _clearCoreRegistry, init, emit, piiCodes,
 } from '../src/index.js';
 import { _loadedPaths } from '../src/codes_yaml.js';
 
@@ -58,7 +58,46 @@ describe('codes_yaml', () => {
         assert.equal(m.action, 'registered');
         assert.equal(m.severity, 'info');
         assert.equal(metaOf('FLEET_DEPLOY_FAILED').severity, 'error');
-        assert.equal(metaOf('FLEET_DEPLOY_FAILED').retention_class, 'long');
+        assert.equal(metaOf('FLEET_DEPLOY_FAILED').retentionClass, 'long');
+    });
+
+    // A yaml pii_in_detail code is handled like one from register().
+    test('pii_in_detail code replaces detail and is short retention', async () => {
+        const p = await writeFile('pii.yaml',
+            `domain: user\ncodes:\n  USER_PII_SEEN:\n    pii_in_detail: true\n` +
+            `    retention_class: long\n    detail_passthrough_keys: [tenant]\n`);
+        await codes.load(p);
+        const m = metaOf('USER_PII_SEEN');
+        assert.equal(m.piiInDetail, true);
+        assert.equal(m.retentionClass, 'short');
+        assert.deepEqual(m.detailPassthroughKeys, ['tenant']);
+        assert.ok(piiCodes().includes('USER_PII_SEEN'));
+
+        init({ serviceId: 'svc', nodeId: 'node' });
+        const row = emit({ code: 'USER_PII_SEEN', target: 'u-1',
+            detail: { email: 'alice@example.com', tenant: 'acme' } });
+        assert.deepEqual(row.detail, { _redacted: '***', _pii_in_detail: true, tenant: 'acme' });
+        assert.equal(row.pii_in_detail, true);
+    });
+
+    test('detail_passthrough_keys: null, empty or non-string is an error', async () => {
+        for (const v of ['null', '', '[1, true]', 'tenant', '[tenant, 1.5]']) {
+            const p = await writeFile('badpass2.yaml',
+                `domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: ${v}\n`);
+            await assert.rejects(codes.load(p), /BAD_PASS: detail_passthrough_keys/, v);
+        }
+    });
+
+    test('detail_passthrough_keys through an anchor', async () => {
+        const p = await writeFile('alias.yaml', "domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n");
+        await codes.load(p);
+        assert.deepEqual(metaOf('USER_B').detailPassthroughKeys, ['tenant', 'region']);
+    });
+
+    test('detail_passthrough_keys must be a list of strings', async () => {
+        const p = await writeFile('badpass.yaml',
+            `domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: tenant\n`);
+        await assert.rejects(codes.load(p), /detail_passthrough_keys/);
     });
 
     test('invalid severity raises', async () => {

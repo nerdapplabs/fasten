@@ -142,6 +142,24 @@ def test_emit_pii_passthrough_redacts_secret_keys(initialized):
     assert row.detail["api_key"] == "***"
 
 
+def test_emit_pii_passthrough_cannot_replace_the_markers(initialized):
+    _clear("PII_MARKER_KEYS")
+    register("pii", {
+        "PII_MARKER_KEYS": _meta(
+            domain="pii",
+            pii_in_detail=True,
+            detail_passthrough_keys=("_redacted", "_pii_in_detail", "region"),
+        ),
+    })
+    row = fasten.emit(
+        code="PII_MARKER_KEYS",
+        target="u-42",
+        actor="admin",
+        detail={"_redacted": "no", "_pii_in_detail": False, "region": "MH"},
+    )
+    assert row.detail == {"region": "MH", "_redacted": "***", "_pii_in_detail": True}
+
+
 def test_emit_non_pii_redacts_only_secret_keys(initialized):
     """Non-PII code: detail is preserved except for secret-key matches."""
     _clear("NON_PII_BASIC")

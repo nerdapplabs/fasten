@@ -141,6 +141,24 @@ describe('emit: force-redact + passthrough', () => {
         assert.equal(row.detail.api_key, REDACT_REPLACEMENT);
     });
 
+    test('a passthrough key cannot replace the markers', () => {
+        register('pii', {
+            PII_MARKER_KEYS: {
+                domain: 'pii', category: 'p', action: 'view',
+                severity: 'info', description: 'x', emitter: 't',
+                piiInDetail: true,
+                detailPassthroughKeys: ['_redacted', '_pii_in_detail', 'region'],
+            },
+        });
+        const row = emit({
+            code: 'PII_MARKER_KEYS', target: 'u-42',
+            detail: { _redacted: 'no', _pii_in_detail: false, region: 'MH' },
+        });
+        assert.deepEqual(row.detail, {
+            region: 'MH', _redacted: REDACT_REPLACEMENT, _pii_in_detail: true,
+        });
+    });
+
     test('non-PII code keeps detail (only secret keys redacted)', () => {
         register('nonpii', {
             NON_PII_BASIC: {

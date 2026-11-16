@@ -19,6 +19,7 @@
 
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -67,6 +68,24 @@ inline Retention parse_retention(const std::string& s) {
 
 // Parse and validate every file into a new map. Throws on the first error
 // and never touches the live registry.
+namespace detail_ {
+
+// Whether a node is a string as YAML 1.2's core schema reads it (the schema
+// the Go, JS and Rust loaders use): quoted or tagged !!str, or plain text
+// that is not null, a bool or a number.
+inline bool yaml_string(const YAML::Node& n) {
+    if (!n.IsScalar()) return false;
+    const std::string& tag = n.Tag();
+    if (tag == "!" || tag == "tag:yaml.org,2002:str") return true;
+    if (tag != "?") return false;
+    static const std::regex not_a_string(
+        R"(~|null|Null|NULL|true|True|TRUE|false|False|FALSE|[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)"
+        R"(|[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN))");
+    return !n.Scalar().empty() && !std::regex_match(n.Scalar(), not_a_string);
+}
+
+}  // namespace detail_
+
 inline std::unordered_map<std::string, Meta> build_from_paths(
     const std::vector<std::string>& paths)
 {
@@ -142,9 +161,36 @@ inline std::unordered_map<std::string, Meta> build_from_paths(
                 meta.retention_class = parse_retention(raw["retention_class"].as<std::string>(""));
                 meta.high_volume     = raw["high_volume"].as<bool>(false);
                 meta.pii_in_detail   = raw["pii_in_detail"].as<bool>(false);
+                // As in register_codes(): a pii_in_detail code is always
+                // short retention.
+                if (meta.pii_in_detail && meta.retention_class != Retention::Short) {
+                    std::cerr << "fasten: code " << code
+                              << " has pii_in_detail=true; retention_class forced to short (was "
+                              << fasten::to_string(meta.retention_class) << ").\n";
+                    meta.retention_class = Retention::Short;
+                }
+                // Absent means no keys; null or an empty value is an error,
+                // as in the other SDKs.
+                const auto passthrough = raw["detail_passthrough_keys"];
+                if (passthrough.IsDefined()) {
+                    if (!passthrough.IsSequence()) {
+                        throw AuditCatalogError(
+                            "fasten: detail_passthrough_keys must be a list of strings");
+                    }
+                    for (const auto& k : passthrough) {
+                        if (!detail_::yaml_string(k)) {
+                            throw AuditCatalogError(
+                                "fasten: detail_passthrough_keys must be a list of strings");
+                        }
+                        meta.detail_passthrough_keys.push_back(k.as<std::string>());
+                    }
+                }
             } catch (const AuditCatalogError& e) {
-                throw AuditCatalogError(
-                    "fasten: " + path + ":" + code + ": " + std::string(e.what()).substr(8));
+                // AuditCatalogError adds "fasten: "; drop the copies already
+                // on the message so it reads "fasten: <path>:<code>: <why>".
+                std::string why = e.what();
+                while (why.compare(0, 8, "fasten: ") == 0) why.erase(0, 8);
+                throw AuditCatalogError(path + ":" + code + ": " + why);
             }
 
             fresh.emplace(code, std::move(meta));

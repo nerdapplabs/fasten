@@ -29,6 +29,7 @@ become unknown to emit(). Stored rows with that code are still readable.
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from pathlib import Path
@@ -41,6 +42,8 @@ from .codes import (
     Severity,
     _registry,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Same as CODE_KEY_RE in fasten-core/src/catalog.rs.
 _CODE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -109,6 +112,21 @@ def _parse_meta(
             f"file-level domain={file_domain!r}"
         )
 
+    pii = bool(raw.get("pii_in_detail", False))
+    # As in register(): a pii_in_detail code is always short retention.
+    if pii and retention is not RetentionClass.SHORT:
+        _logger.warning(
+            "fasten: code %s has pii_in_detail=True; "
+            "retention_class forced to SHORT (was %s).",
+            code, retention.value.upper(),
+        )
+        retention = RetentionClass.SHORT
+    passthrough = raw.get("detail_passthrough_keys", [])
+    if not isinstance(passthrough, list) or not all(isinstance(k, str) for k in passthrough):
+        raise AuditCatalogError(
+            f"{file_path}:{code}: detail_passthrough_keys must be a list of strings"
+        )
+
     return Meta(
         domain=file_domain,
         category=str(raw.get("category", "")),
@@ -119,7 +137,8 @@ def _parse_meta(
         id=code,
         retention_class=retention,
         high_volume=bool(raw.get("high_volume", False)),
-        pii_in_detail=bool(raw.get("pii_in_detail", False)),
+        pii_in_detail=pii,
+        detail_passthrough_keys=tuple(passthrough),
         declared_unused=bool(raw.get("declared_unused", False)),
     )
 

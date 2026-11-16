@@ -138,6 +138,16 @@ final class Engine: @unchecked Sendable {
         let rowID = _mintID()
         let (serviceID, nodeID, tenantID, redactor) =
             lock.withLock { (self.serviceID, self.nodeID, self.tenantID, self.redactor) }
+        // A PII code keeps only its passthrough keys, plus the two markers.
+        var stored = detail
+        if meta.piiInDetail {
+            let passthrough = Set(meta.detailPassthroughKeys)
+            stored = redactor.redact(detail.filter { passthrough.contains($0.key) })
+            stored["_redacted"] = "***"
+            stored["_pii_in_detail"] = true
+        } else {
+            stored = redactor.redact(detail)
+        }
         return AuditRow(
             wireVersion:  "1",
             id:           rowID,
@@ -157,7 +167,7 @@ final class Engine: @unchecked Sendable {
             domain:       meta.domain,
             method:       method.rawValue,
             requestID:    _currentRequestID() ?? _mintID(),
-            detail:       redactor.redact(detail).toAnyCodable(),
+            detail:       stored.toAnyCodable(),
             shippedAt:    nil,
             prevHash:     "",
             hash:         ""

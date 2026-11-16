@@ -87,7 +87,18 @@ public struct AnyCodable: Codable, Sendable, CustomStringConvertible {
 
     public var description: String { "\(value)" }
 
-    public init(_ value: Any) { self.value = value }
+    /// Nested dictionaries and arrays are wrapped too, so `encode` writes
+    /// them as JSON objects and arrays.
+    public init(_ value: Any) {
+        switch value {
+        case let d as [String: Any] where !(value is [String: AnyCodable]):
+            self.value = d.mapValues { AnyCodable($0) }
+        case let a as [Any] where !(value is [AnyCodable]):
+            self.value = a.map { AnyCodable($0) }
+        default:
+            self.value = value
+        }
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()

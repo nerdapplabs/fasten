@@ -29,8 +29,12 @@ public struct Meta: Sendable {
     public let description:    String
     public let emitter:        String
     public let retentionClass: RetentionClass
-    /// The row's detail may hold personal data; `Fasten.redactExpired` redacts it.
+    /// The row's detail holds personal data. `emit` replaces it with
+    /// `{"_redacted": "***", "_pii_in_detail": true}` plus the keys in
+    /// `detailPassthroughKeys`, and `Fasten.redactExpired` redacts stored rows.
     public let piiInDetail:    Bool
+    /// Detail keys kept when `piiInDetail` is set.
+    public let detailPassthroughKeys: [String]
 
     public init(
         id:             Code,
@@ -41,7 +45,8 @@ public struct Meta: Sendable {
         description:    String,
         emitter:        String,
         retentionClass: RetentionClass = .medium,
-        piiInDetail:    Bool           = false
+        piiInDetail:    Bool           = false,
+        detailPassthroughKeys: [String] = []
     ) {
         self.id             = id
         self.domain         = domain
@@ -50,8 +55,13 @@ public struct Meta: Sendable {
         self.severity       = severity
         self.description    = description
         self.emitter        = emitter
-        self.retentionClass = retentionClass
+        // As in the other SDKs, a piiInDetail code is always short retention.
+        if piiInDetail && retentionClass != .short_ {
+            fputs("fasten: code \(id) has piiInDetail=true; retentionClass forced to short (was \(retentionClass.rawValue)).\n", stderr)
+        }
+        self.retentionClass = piiInDetail ? .short_ : retentionClass
         self.piiInDetail    = piiInDetail
+        self.detailPassthroughKeys = detailPassthroughKeys
     }
 }
 

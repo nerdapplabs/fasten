@@ -83,6 +83,35 @@ def test_load_round_trip(fasten_yaml, clean_yaml_paths):
     assert reg["FLEET_DEPLOY_FAILED"].retention_class.value == "long"
 
 
+def test_load_pii_code_is_short_and_keeps_passthrough_keys(tmp_path, clean_yaml_paths):
+    p = tmp_path / "pii.codes.yaml"
+    p.write_text(textwrap.dedent("""\
+        domain: user
+        codes:
+          USER_PII_SEEN:
+            pii_in_detail: true
+            retention_class: long
+            detail_passthrough_keys: [tenant]
+    """))
+    load(str(p))
+    meta = registry()["USER_PII_SEEN"]
+    assert meta.pii_in_detail is True
+    assert meta.retention_class.value == "short"
+    assert meta.detail_passthrough_keys == ("tenant",)
+
+
+def test_load_passthrough_keys_must_be_strings(tmp_path, clean_yaml_paths):
+    p = tmp_path / "bad.codes.yaml"
+    p.write_text(textwrap.dedent("""\
+        domain: x
+        codes:
+          BAD_PASS:
+            detail_passthrough_keys: tenant
+    """))
+    with pytest.raises(AuditCatalogError, match="detail_passthrough_keys"):
+        load(str(p))
+
+
 def test_load_invalid_severity_raises(tmp_path, clean_yaml_paths):
     p = tmp_path / "bad.codes.yaml"
     p.write_text(textwrap.dedent("""\
@@ -257,3 +286,18 @@ def test_reload_preserves_programmatic_codes(fasten_yaml, clean_yaml_paths):
 def test_reload_no_op_without_load(clean_yaml_paths):
     """reload() with no prior load() is a no-op."""
     reload()  # must not raise
+
+
+@pytest.mark.parametrize("value", ["null", "", "[1, true]", "tenant", "[tenant, 1.5]"])
+def test_load_passthrough_keys_null_empty_or_non_string(tmp_path, clean_yaml_paths, value):
+    p = tmp_path / "bad.codes.yaml"
+    p.write_text(f"domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: {value}\n")
+    with pytest.raises(AuditCatalogError, match="BAD_PASS: detail_passthrough_keys"):
+        load(str(p))
+
+
+def test_load_passthrough_keys_through_an_anchor(tmp_path, clean_yaml_paths):
+    p = tmp_path / "alias.codes.yaml"
+    p.write_text("domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n")
+    load(str(p))
+    assert registry()["USER_B"].detail_passthrough_keys == ("tenant", "region")
