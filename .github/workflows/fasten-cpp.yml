@@ -7,11 +7,13 @@ on:
       - 'cpp/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-cpp.yml'
+      - 'spec/**'
   pull_request:
     paths:
       - 'cpp/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-cpp.yml'
+      - 'spec/**'
   workflow_call:
 
 permissions:

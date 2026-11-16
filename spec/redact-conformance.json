@@ -662,6 +662,72 @@
       "group": "value_shape",
       "input":    {"note": "Bearer%20sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"},
       "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_cc_narrow_nbsp_separated",
+      "group": "value_shape",
+      "input":    {"note": "carte 4111\u202f1111\u202f1111\u202f1111 exp 12/28"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_thin_space_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\u20091111\u20091111\u20091111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_ideographic_space_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\u30001111\u30001111\u30001111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_newline_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\n1111\n1111\n1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_year",
+      "group": "value_shape",
+      "input":    {"note": "ref 2024 4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_pin",
+      "group": "value_shape",
+      "input":    {"note": "PIN 1234 4111-1111-1111-1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_year_list_2015_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "fiscal years 2015 2016 2017 2018 2019"},
+      "expected": {"note": "fiscal years 2015 2016 2017 2018 2019"}
+    },
+    {
+      "name": "value_dashed_id_2020_not_cc",
+      "group": "value_shape",
+      "input":    {"ref": "2020-1000-2000-3000-4000"},
+      "expected": {"ref": "2020-1000-2000-3000-4000"}
+    },
+    {
+      "name": "value_basic_word_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic Overview of the API"},
+      "expected": {"note": "Basic Overview of the API"}
+    },
+    {
+      "name": "value_basic_only_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic Only"},
+      "expected": {"note": "Basic Only"}
+    },
+    {
+      "name": "value_basic_utf8_password",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic asO8cmdlbjpww6Rzc3fDtnJk"},
+      "expected": {"note": "***AUTH_HEADER***"}
     }
   ]
 }

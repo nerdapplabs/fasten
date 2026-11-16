@@ -96,24 +96,24 @@ public final class Redactor: @unchecked Sendable {
     }
 
     // Size of a value as JSON, as the other SDKs measure it. A value
-    // JSONSerialization can't write (a Date, say) is estimated from the
-    // UTF-8 bytes of its keys and strings.
+    // JSONSerialization can't write (a Date, say, or NaN) counts as null,
+    // which is how AnyCodable writes it.
     static func textBytes(_ value: Any) -> Int {
-        if JSONSerialization.isValidJSONObject(value),
-           let data = try? JSONSerialization.data(
-               withJSONObject: value, options: [.withoutEscapingSlashes]) {
-            return data.count
-        }
-        return estimatedBytes(value)
+        let data = try? JSONSerialization.data(
+            withJSONObject: jsonWritable(value), options: [.withoutEscapingSlashes])
+        return data?.count ?? 0
     }
 
-    private static func estimatedBytes(_ value: Any) -> Int {
-        if let s = value as? String { return s.utf8.count }
-        if let d = value as? [String: Any] {
-            return d.reduce(0) { $0 + $1.key.utf8.count + estimatedBytes($1.value) }
+    private static func jsonWritable(_ value: Any) -> Any {
+        switch value {
+        case let s as String: return s
+        case let d as [String: Any]: return d.mapValues { jsonWritable($0) }
+        case let a as [Any]: return a.map { jsonWritable($0) }
+        case let b as Bool: return b
+        case let i as Int: return i
+        case let x as Double: return x.isFinite ? x : NSNull()
+        default: return NSNull()
         }
-        if let a = value as? [Any] { return a.reduce(0) { $0 + estimatedBytes($1) } }
-        return 8
     }
 
     private func _redactDict(_ dict: [String: Any]) -> [String: Any] {
@@ -153,7 +153,8 @@ public final class Redactor: @unchecked Sendable {
 
     // An Authorization header value, as in fasten-core. Bearer: a credential
     // of 16 or more characters that holds a digit or one of + / =. Basic:
-    // base64 that decodes to printable text with a ":" in it (user:password).
+    // base64 that decodes to UTF-8 text with no control characters, a user
+    // name and a ":" (user:password).
     private static let bearer = try! NSRegularExpression(
         pattern: #"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})"#)
     private static let basic = try! NSRegularExpression(
@@ -173,14 +174,15 @@ public final class Redactor: @unchecked Sendable {
     }
 
     // Whether token is base64 for user:password: its length is a multiple
-    // of four, and it decodes to bytes that are all 0x20 or above, none
-    // 0x7F, with a ":" among them.
+    // of four, and it decodes to valid UTF-8 with no control characters
+    // (C0, DEL or C1) and a ":" after at least one character (the user
+    // name).
     static func isBasicCredential(_ token: String) -> Bool {
         let bytes = Array(token.utf8)
         if bytes.isEmpty || bytes.count % 4 != 0 { return false }
         var acc: UInt32 = 0
         var bits = 0
-        var colon = false
+        var decoded: [UInt8] = []
         for b in bytes {
             if b == 0x3D { break }  // "=": padding, only at the end
             let v: UInt32
@@ -196,16 +198,34 @@ public final class Redactor: @unchecked Sendable {
             bits += 6
             if bits >= 8 {
                 bits -= 8
-                let byte = (acc >> UInt32(bits)) & 0xFF
-                if byte < 0x20 || byte == 0x7F { return false }
-                if byte == 0x3A { colon = true }
+                decoded.append(UInt8((acc >> UInt32(bits)) & 0xFF))
             }
         }
-        return colon
+        guard let text = String(bytes: decoded, encoding: .utf8) else { return false }
+        guard let colon = text.firstIndex(of: ":"), colon != text.startIndex else { return false }
+        return !text.unicodeScalars.contains {
+            $0.value < 0x20 || (0x7F...0x9F).contains($0.value)
+        }
     }
 
-    // A run of digit groups split by spaces, tabs, no-break spaces or dashes.
-    private static let digitRun = try! NSRegularExpression(pattern: #"[0-9]+(?:[ \t\x{A0}\-]+[0-9]+)*"#)
+    // A run of digit groups split by whitespace (the Unicode White_Space
+    // set, as in fasten-core) or dashes.
+    private static let groupSeps: Set<UInt32> = Set(
+        [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F,
+         0x3000, 0x2D] + Array(0x2000...0x200A))
+    private static let digitRun = try! NSRegularExpression(
+        pattern: #"[0-9]+(?:[\t\n\x{0B}\x{0C}\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\-]+[0-9]+)*"#)
+
+    // Whether digits starts like a payment card, as in fasten-core: 3, 4, 5
+    // or 6, or 2200-2204 and 2221-2720. Years and counters starting 0 or 1
+    // do not.
+    private static func cardPrefix(_ d: [UInt8]) -> Bool {
+        guard let c = d.first else { return false }
+        if (0x33...0x36).contains(c) { return true }
+        guard c == 0x32, d.count >= 4 else { return false }
+        let p = d[0..<4].reduce(0) { $0 * 10 + Int($1 - 0x30) }
+        return (2200...2204).contains(p) || (2221...2720).contains(p)
+    }
 
     // Card layouts printed in groups, as in fasten-core.
     private static let cardLayouts: [[Int]] = [
@@ -217,24 +237,24 @@ public final class Redactor: @unchecked Sendable {
     }
 
     // Whether s holds a card number: a group of 13 to 19 digits, or groups in
-    // a card layout, that pass the Luhn check. Same rules as fasten-core:
-    // digits joined to a letter or "_" are skipped, and so is a grouped
-    // layout that starts right after another group of four digits.
+    // a card layout, that start with a card prefix and pass the Luhn check.
+    // Same rules as fasten-core: digits joined to a letter or "_" are
+    // skipped.
     static func hasCard(_ s: String) -> Bool {
         let ns = s as NSString
         for m in digitRun.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
             let start = m.range.location, end = m.range.location + m.range.length
             let openStart = start == 0 || !isWordUnit(ns.character(at: start - 1))
             let openEnd = end == ns.length || !isWordUnit(ns.character(at: end))
-            // The run is ASCII digits and the four separators.
+            // The run is ASCII digits and separators.
             let groups: [[UInt8]] = ns.substring(with: m.range).unicodeScalars
-                .split(whereSeparator: { [0x20, 0x09, 0xA0, 0x2D].contains($0.value) })
+                .split(whereSeparator: { groupSeps.contains($0.value) })
                 .map { $0.map { UInt8($0.value) } }
             func fitsEnd(_ e: Int) -> Bool { e < groups.count || openEnd }
             for i in groups.indices {
                 if i == 0 && !openStart { continue }
+                if !cardPrefix(groups[i]) { continue }
                 if (13...19).contains(groups[i].count) && fitsEnd(i + 1) && luhn(groups[i]) { return true }
-                if i > 0 && groups[i - 1].count == 4 { continue }
                 for layout in cardLayouts {
                     let e = i + layout.count
                     if e > groups.count || !fitsEnd(e) { continue }

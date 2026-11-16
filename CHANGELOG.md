@@ -19,8 +19,9 @@ be replaced now.
   tokens, `scheme://user:password@` in a URL (`***URL_CREDENTIALS***`), and
   `Bearer` / `Basic` Authorization values (`***AUTH_HEADER***`).
 - Card numbers are found anywhere in a string, unbroken or in a card layout
-  (4-4-4-4 with an optional short tail, 4-6-5, 4-6-4) with spaces, tabs,
-  no-break spaces or dashes.
+  (4-4-4-4 with an optional short tail, 4-6-5, 4-6-4) split by any
+  whitespace or dashes. A number must start like a card (3, 4, 5, 6, or
+  2200-2204 and 2221-2720), so a list of years or a dashed id is kept.
 - OpenAI keys match only when `sk-` is not part of a longer word, so an id
   such as `task-<uuid>` is kept.
 - JS and Swift: a `detail` or log line over `FASTEN_MAX_DETAIL_BYTES`

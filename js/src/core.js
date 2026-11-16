@@ -94,8 +94,22 @@ const _VALUE_SHAPE_RULES = [
 	[_hasAuthHeader, "***AUTH_HEADER***"],
 ];
 
-// A run of digit groups split by spaces, tabs, no-break spaces or dashes.
-const _DIGIT_RUN_RE = /[0-9]+(?:[ \t\u00A0-]+[0-9]+)*/g;
+// A run of digit groups split by whitespace (the Unicode White_Space set,
+// as in fasten-core) or dashes.
+const _GROUP_SEP =
+	"\\t\\n\\v\\f\\r \\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000-";
+const _DIGIT_RUN_RE = new RegExp(`[0-9]+(?:[${_GROUP_SEP}]+[0-9]+)*`, "g");
+const _GROUP_SEP_RE = new RegExp(`[${_GROUP_SEP}]+`);
+
+// Whether digits starts like a payment card, as in fasten-core: 3, 4, 5 or
+// 6, or 2200-2204 and 2221-2720. Years and counters starting 0 or 1 do not.
+function _cardPrefix(digits) {
+	const c = digits[0];
+	if (c === "3" || c === "4" || c === "5" || c === "6") return true;
+	if (c !== "2") return false;
+	const p = Number(digits.slice(0, 4));
+	return (p >= 2200 && p <= 2204) || (p >= 2221 && p <= 2720);
+}
 
 // Card layouts printed in groups, as in fasten-core.
 const _CARD_LAYOUTS = [
@@ -110,24 +124,23 @@ const _CARD_LAYOUTS = [
 const _WORD_CHAR_RE = /[A-Za-z0-9_]/;
 
 // Whether s holds a card number: a group of 13 to 19 digits, or groups in a
-// card layout, that pass the Luhn check. Same rules as fasten-core: digits
-// joined to a letter or "_" are skipped, and so is a grouped layout that
-// starts right after another group of four digits.
+// card layout, that start with a card prefix and pass the Luhn check. Same
+// rules as fasten-core: digits joined to a letter or "_" are skipped.
 function _hasCard(s) {
 	for (const m of s.matchAll(_DIGIT_RUN_RE)) {
 		const start = m.index;
 		const end = start + m[0].length;
 		const openStart = start === 0 || !_WORD_CHAR_RE.test(s[start - 1]);
 		const openEnd = end === s.length || !_WORD_CHAR_RE.test(s[end]);
-		const groups = m[0].split(/[ \t\u00A0-]+/);
+		const groups = m[0].split(_GROUP_SEP_RE);
 		const fitsEnd = (e) => e < groups.length || openEnd;
 		for (let i = 0; i < groups.length; i++) {
 			if (i === 0 && !openStart) continue;
 			const g = groups[i];
+			if (!_cardPrefix(g)) continue;
 			if (g.length >= 13 && g.length <= 19 && fitsEnd(i + 1) && _luhn(g)) {
 				return true;
 			}
-			if (i > 0 && groups[i - 1].length === 4) continue;
 			for (const layout of _CARD_LAYOUTS) {
 				const e = i + layout.length;
 				if (e > groups.length || !fitsEnd(e)) continue;
@@ -146,7 +159,8 @@ function _hasCard(s) {
 
 // An Authorization header value, as in fasten-core. Bearer: a credential of
 // 16 or more characters that holds a digit or one of + / =. Basic: base64
-// that decodes to printable text with a ":" in it (user:password).
+// that decodes to UTF-8 text with no control characters, a user name and a
+// ":" (user:password).
 const _BEARER_RE = /(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})/g;
 const _BASIC_RE = /(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})/g;
 function _hasAuthHeader(s) {
@@ -161,14 +175,24 @@ function _hasAuthHeader(s) {
 
 const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+const _UTF8 = new TextDecoder("utf-8", { fatal: true });
+// C0, DEL or C1.
+function _hasControl(text) {
+	for (const ch of text) {
+		const c = ch.codePointAt(0);
+		if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
+	}
+	return false;
+}
+
 // Whether token is base64 for user:password: its length is a multiple of
-// four, and it decodes to bytes that are all 0x20 or above, none 0x7F, with
-// a ":" among them.
+// four, and it decodes to valid UTF-8 with no control characters (C0, DEL
+// or C1) and a ":" after at least one character (the user name).
 function _isBasicCredential(token) {
 	if (token.length === 0 || token.length % 4 !== 0) return false;
 	let acc = 0;
 	let bits = 0;
-	let colon = false;
+	const bytes = [];
 	for (const ch of token.replace(/=+$/, "")) {
 		const v = _B64.indexOf(ch);
 		if (v < 0) return false;
@@ -176,12 +200,16 @@ function _isBasicCredential(token) {
 		bits += 6;
 		if (bits >= 8) {
 			bits -= 8;
-			const byte = (acc >> bits) & 0xff;
-			if (byte < 0x20 || byte === 0x7f) return false;
-			if (byte === 0x3a) colon = true;
+			bytes.push((acc >> bits) & 0xff);
 		}
 	}
-	return colon;
+	let text;
+	try {
+		text = _UTF8.decode(Uint8Array.from(bytes));
+	} catch {
+		return false;
+	}
+	return text.indexOf(":") > 0 && !_hasControl(text);
 }
 
 function _luhn(digits) {

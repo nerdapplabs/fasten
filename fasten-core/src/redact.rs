@@ -44,13 +44,38 @@ fn build_key_re(extra: &[&str]) -> Regex {
     Regex::new(&format!("(?i)({combined})")).expect("key pattern is valid regex")
 }
 
-// A run of digit groups split by spaces, tabs, no-break spaces or dashes.
-// [0-9], not \d: \d matches every Unicode digit, and luhn_valid takes ASCII
-// digits only.
+// A run of digit groups split by whitespace (the Unicode White_Space set,
+// written out so JS and Swift can match it exactly) or dashes. [0-9], not
+// \d: \d matches every Unicode digit, and luhn_valid takes ASCII digits only.
 #[allow(clippy::expect_used)]
 static DIGIT_RUN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[0-9]+(?:[ \t\x{A0}\-]+[0-9]+)*").expect("digit run regex is valid")
+    Regex::new(
+        r"[0-9]+(?:[\t\n\x0B\x0C\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\-]+[0-9]+)*",
+    )
+    .expect("digit run regex is valid")
 });
+
+fn is_group_sep(c: char) -> bool {
+    matches!(c,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{85}' | '\u{A0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' | '-')
+}
+
+/// Whether `digits` starts like a payment card: 3 (Amex, Diners, JCB),
+/// 4 (Visa), 5 (Mastercard, Maestro), 6 (Discover, Maestro and others), or
+/// 2200-2204 (Mir) and 2221-2720 (Mastercard). Years (19xx, 20xx) and
+/// counters starting 0 or 1 do not.
+fn card_prefix(digits: &str) -> bool {
+    match digits.as_bytes().first() {
+        Some(b'3' | b'4' | b'5' | b'6') => true,
+        Some(b'2') => digits
+            .get(..4)
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_some_and(|p| (2200..=2204).contains(&p) || (2221..=2720).contains(&p)),
+        _ => false,
+    }
+}
 
 // Card number layouts printed in groups: 4-4-4-4 with an optional short
 // tail, and the 4-6-5 / 4-6-4 layouts. An unbroken group of 13 to 19 digits
@@ -69,26 +94,29 @@ fn is_word_byte(b: u8) -> bool {
 }
 
 /// Whether `s` holds a card number: a group of 13 to 19 digits, or groups in
-/// a card layout, that pass the Luhn check. Digits joined to a letter or `_`
-/// are part of an id and are skipped. A grouped layout that starts right
-/// after another group of four digits is skipped too, so a list of years or
-/// a dashed id is not a card; a card followed by its expiry still is.
+/// a card layout, that start with a card prefix and pass the Luhn check.
+/// Digits joined to a letter or `_` are part of an id and are skipped. The
+/// prefix keeps a list of years or a dashed id from matching.
 fn has_card(s: &str) -> bool {
     let bytes = s.as_bytes();
     for run in DIGIT_RUN_RE.find_iter(s) {
         let open_start = run.start() == 0 || !is_word_byte(bytes[run.start() - 1]);
         let open_end = run.end() == bytes.len() || !is_word_byte(bytes[run.end()]);
         let groups: Vec<&str> =
-            run.as_str().split([' ', '\t', '\u{A0}', '-']).filter(|g| !g.is_empty()).collect();
+            run.as_str().split(is_group_sep).filter(|g| !g.is_empty()).collect();
         for i in 0..groups.len() {
             if i == 0 && !open_start {
                 continue;
             }
             let fits_end = |end: usize| end < groups.len() || open_end;
-            if (13..=19).contains(&groups[i].len()) && fits_end(i + 1) && luhn_valid(groups[i]) {
+            if (13..=19).contains(&groups[i].len())
+                && fits_end(i + 1)
+                && card_prefix(groups[i])
+                && luhn_valid(groups[i])
+            {
                 return true;
             }
-            if i > 0 && groups[i - 1].len() == 4 {
+            if !card_prefix(groups[i]) {
                 continue;
             }
             for layout in CARD_LAYOUTS {
@@ -109,8 +137,8 @@ fn has_card(s: &str) -> bool {
 
 // An Authorization header value. Bearer: a credential of 16 or more
 // characters that holds a digit or one of + / =, so a sentence that starts
-// "Bearer" is not one. Basic: base64 that decodes to printable text with a
-// ":" in it (user:password).
+// "Bearer" is not one. Basic: base64 that decodes to UTF-8 text with no
+// control characters, a user name and a ":" (user:password).
 #[allow(clippy::expect_used)]
 static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})")
@@ -131,15 +159,15 @@ fn has_auth_header(s: &str) -> bool {
 }
 
 /// Whether `token` is base64 for `user:password`: its length is a multiple
-/// of four, and it decodes to bytes that are all 0x20 or above, none 0x7F,
-/// with a ":" among them.
+/// of four, and it decodes to valid UTF-8 with no control characters (C0,
+/// DEL or C1) and a ":" after at least one character (the user name).
 fn is_basic_credential(token: &str) -> bool {
     if token.is_empty() || token.len() % 4 != 0 {
         return false;
     }
     let mut acc: u32 = 0;
     let mut bits = 0;
-    let mut colon = false;
+    let mut decoded = Vec::with_capacity(token.len() / 4 * 3);
     for b in token.trim_end_matches('=').bytes() {
         let v = match b {
             b'A'..=b'Z' => b - b'A',
@@ -153,14 +181,11 @@ fn is_basic_credential(token: &str) -> bool {
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            let byte = ((acc >> bits) & 0xFF) as u8;
-            if byte < 0x20 || byte == 0x7F {
-                return false;
-            }
-            colon |= byte == b':';
+            decoded.push(((acc >> bits) & 0xFF) as u8);
         }
     }
-    colon
+    std::str::from_utf8(&decoded)
+        .is_ok_and(|text| text.find(':').is_some_and(|i| i > 0) && !text.chars().any(char::is_control))
 }
 
 struct Vp {

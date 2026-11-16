@@ -120,4 +120,16 @@ final class RedactConformanceTests: XCTestCase {
         let kept = Redactor().redact(["note": String(repeating: "x", count: 60_000)])
         XCTAssertEqual((kept["note"] as? String)?.count, 60_000)
     }
+
+    /// The size is the JSON that gets written: 40,000 newlines are about
+    /// 80 KB once escaped, and a Date next to them (written as null) does
+    /// not change how they are measured.
+    func testSizeIsMeasuredAsWrittenJSON() {
+        let newlines = String(repeating: "\n", count: 40_000)
+        for detail: [String: Any] in [["note": newlines], ["note": newlines, "t": Date()]] {
+            XCTAssertEqual(Redactor().redact(detail)["_truncated"] as? Bool, true, "\(detail.keys.sorted())")
+        }
+        let ints = Redactor().redact(["n": Array(repeating: 7, count: 9_000), "t": Date()])
+        XCTAssertNil(ints["_truncated"], "9000 small ints are about 18 KB as JSON")
+    }
 }

@@ -7,11 +7,13 @@ on:
       - 'python/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-py.yml'
+      - 'spec/**'
   pull_request:
     paths:
       - 'python/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-py.yml'
+      - 'spec/**'
   workflow_call:
 
 permissions:
