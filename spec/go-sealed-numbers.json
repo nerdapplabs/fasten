@@ -1,0 +1,50 @@
+[
+ {
+  "wire_version": "1",
+  "id": "evt-go-numbers",
+  "origin_id": "evt-go-numbers",
+  "monotonic_seq": 1,
+  "timestamp": "2026-06-15T10:30:45.123456Z",
+  "code": "SENSOR_READ",
+  "action": "read",
+  "severity": "info",
+  "service_id": "gateway",
+  "source_node_id": "node-1",
+  "tenant_id": null,
+  "actor": "plc-7",
+  "actor_kind": "device",
+  "target": "sensor/42",
+  "category": "telemetry",
+  "domain": "plant",
+  "method": "mqtt",
+  "request_id": "req-num",
+  "detail": {
+   "big": 10000000000000000,
+   "count": 7,
+   "empty": "",
+   "frac": 12.5,
+   "huge": 1e+21,
+   "max_int": 9223372036854775807,
+   "neg_zero": -0,
+   "nested": {
+    "list": [
+     1,
+     2.5,
+     {
+      "x": 0.0001
+     }
+    ]
+   },
+   "text": "café ✓",
+   "tinier": 1e-7,
+   "tiny": 0.00005,
+   "whole": 75
+  },
+  "pii_in_detail": false,
+  "canonical_form_id": "2",
+  "prev_hash": "genesis",
+  "hash": "96f40dff4ad84f5b3aebef53ac47bbda7abee837e6588acf8b4f26d0acf5d8a9",
+  "detail_salt": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "detail_commitment": "c1422770410fc2c92e7bfa8f0a4e71c7eefcac2d2b1bd56cb62b4bfe26afd96f"
+ }
+]
