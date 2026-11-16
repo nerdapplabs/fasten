@@ -1,23 +1,23 @@
 // Every case in spec/redact-conformance.json, run through the fasten_redact()
-// C ABI directly. The cases are copied by hand to avoid a JSON parser; keep
-// them in sync with the spec file.
+// C ABI directly. The cases are read from the spec file (FASTEN_SPEC_DIR is
+// set by CMake), so a new case there is run here without a copy.
 
 #include "fasten.hpp"
 
-#include <cassert>
-#include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
-void ok_or_die(const std::string& name,
-               const std::string& in_json,
-               const std::string& want_json)
-{
+std::string redact(const std::string& name, const std::string& json) {
     char* out  = nullptr;
     char* err  = nullptr;
-    int32_t rc = fasten_redact(in_json.c_str(), &out, &err);
+    int32_t rc = fasten_redact(json.c_str(), &out, &err);
     if (rc != 0) {
         std::cerr << "FAIL [" << name << "] fasten_redact error: "
                   << (err ? err : "?") << "\n";
@@ -26,176 +26,236 @@ void ok_or_die(const std::string& name,
     }
     std::string got(out ? out : "");
     fasten_store_free_str(out);
-    if (got != want_json) {
-        std::cerr << "FAIL [" << name << "]\n"
-                  << "  got:  " << got      << "\n"
-                  << "  want: " << want_json << "\n";
-        std::exit(1);
-    }
-    std::cout << "ok  " << name << "\n";
+    return got;
 }
 
-void run_all() {
-    // key_pattern
-    ok_or_die("key_password",
-        R"({"password":"hunter2"})",
-        R"({"password":"***"})");
-    ok_or_die("key_passwd",
-        R"({"passwd":"hunter2"})",
-        R"({"passwd":"***"})");
-    ok_or_die("key_api_key_underscore",
-        R"({"api_key":"abc123"})",
-        R"({"api_key":"***"})");
-    ok_or_die("key_api_key_dash",
-        R"({"api-key":"abc123"})",
-        R"({"api-key":"***"})");
-    ok_or_die("key_apikey_no_separator",
-        R"({"apikey":"abc123"})",
-        R"({"apikey":"***"})");
-    ok_or_die("key_token",
-        R"({"token":"tok-abc"})",
-        R"({"token":"***"})");
-    ok_or_die("key_secret",
-        R"({"secret":"s3cr3t"})",
-        R"({"secret":"***"})");
-    ok_or_die("key_authorization",
-        R"({"authorization":"Bearer xxx"})",
-        R"({"authorization":"***"})");
-    ok_or_die("key_bearer",
-        R"({"bearer":"xxx"})",
-        R"({"bearer":"***"})");
-    ok_or_die("key_m2m_key_underscore",
-        R"({"m2m_key":"xxx"})",
-        R"({"m2m_key":"***"})");
-    ok_or_die("key_private_key",
-        R"({"private_key":"xxx"})",
-        R"({"private_key":"***"})");
-    ok_or_die("key_access_key",
-        R"({"access_key":"xxx"})",
-        R"({"access_key":"***"})");
-    ok_or_die("key_session_id",
-        R"({"session_id":"xxx"})",
-        R"({"session_id":"***"})");
-    ok_or_die("key_cookie",
-        R"({"cookie":"xxx"})",
-        R"({"cookie":"***"})");
-    ok_or_die("key_credential",
-        R"({"credential":"xxx"})",
-        R"({"credential":"***"})");
-    ok_or_die("key_substring_customer_token",
-        R"({"customer_token":"tok-abc"})",
-        R"({"customer_token":"***"})");
-    ok_or_die("key_substring_user_password",
-        R"({"user_password":"pw"})",
-        R"({"user_password":"***"})");
-    ok_or_die("key_substring_oauth_bearer_token",
-        R"({"oauth_bearer_token":"tok-deep"})",
-        R"({"oauth_bearer_token":"***"})");
-    ok_or_die("key_case_insensitive_upper",
-        R"({"API_KEY":"x"})",
-        R"({"API_KEY":"***"})");
-    ok_or_die("key_case_insensitive_mixed",
-        R"({"Password":"x"})",
-        R"({"Password":"***"})");
-
-    // safe
-    ok_or_die("safe_user_id",
-        R"({"user_id":"u-42"})",
-        R"({"user_id":"u-42"})");
-    ok_or_die("safe_email",
-        R"({"email":"alice@example.com"})",
-        R"({"email":"alice@example.com"})");
-    ok_or_die("safe_number",
-        R"({"count":42})",
-        R"({"count":42})");
-
-    // value_shape
-    ok_or_die("value_jwt",
-        R"({"note":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"})",
-        R"({"note":"***JWT***"})");
-    ok_or_die("value_pem_rsa",
-        "{\"note\":\"-----BEGIN RSA PRIVATE KEY-----\\nMIIEpAIBAAKCAQEA...\"}",
-        R"({"note":"***PRIVATE_KEY***"})");
-    ok_or_die("value_pem_ec",
-        "{\"note\":\"-----BEGIN EC PRIVATE KEY-----\\nMHQCAQEEIBkg...\"}",
-        R"({"note":"***PRIVATE_KEY***"})");
-    ok_or_die("value_pem_openssh",
-        "{\"note\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaC...\"}",
-        R"({"note":"***PRIVATE_KEY***"})");
-    ok_or_die("value_pem_generic",
-        "{\"note\":\"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBAD...\"}",
-        R"({"note":"***PRIVATE_KEY***"})");
-    ok_or_die("value_aws_akia",
-        R"({"note":"AKIAIOSFODNN7EXAMPLE"})",
-        R"({"note":"***AWS_KEY***"})");
-    ok_or_die("value_aws_asia",
-        R"({"note":"ASIAIOSFODNN7EXAMPLE"})",
-        R"({"note":"***AWS_KEY***"})");
-    ok_or_die("value_aws_as_substring",
-        R"({"note":"key=AKIAIOSFODNN7EXAMPLE"})",
-        R"({"note":"***AWS_KEY***"})");
-    ok_or_die("value_gh_ghp",
-        R"({"note":"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})",
-        R"({"note":"***GH_TOKEN***"})");
-    ok_or_die("value_gh_ghs",
-        R"({"note":"ghs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"})",
-        R"({"note":"***GH_TOKEN***"})");
-    ok_or_die("value_gh_gho",
-        R"({"note":"gho_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"})",
-        R"({"note":"***GH_TOKEN***"})");
-    // Built at runtime: a literal sk_live_ key trips GitHub push protection.
-    {
-        std::string key = std::string("sk") + "_live_" + std::string(24, 'A');
-        ok_or_die("value_stripe_live",
-            "{\"note\":\"" + key + "\"}",
-            R"({"note":"***STRIPE_KEY***"})");
+// The JSON value that starts at s[i] (after whitespace): a string, or an
+// object or array with balanced brackets. Leaves i just past it.
+std::string json_value(const std::string& s, std::size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r')) ++i;
+    const std::size_t start = i;
+    int  depth     = 0;
+    bool in_string = false;
+    for (; i < s.size(); ++i) {
+        const char c = s[i];
+        if (in_string) {
+            if (c == '\\') ++i;
+            else if (c == '"') {
+                in_string = false;
+                if (depth == 0) { ++i; break; }
+            }
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (--depth == 0) { ++i; break; }
+        }
     }
-    ok_or_die("value_openai_legacy",
-        R"({"note":"sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"})",
-        R"({"note":"***OPENAI_KEY***"})");
-    ok_or_die("value_openai_proj",
-        R"({"note":"sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef"})",
-        R"({"note":"***OPENAI_KEY***"})");
-    ok_or_die("value_cc_luhn_valid_visa",
-        R"({"note":"4111111111111111"})",
-        R"({"note":"***CC***"})");
-    ok_or_die("value_cc_luhn_valid_visa_test2",
-        R"({"note":"4539578763621486"})",
-        R"({"note":"***CC***"})");
-    ok_or_die("value_cc_luhn_invalid",
-        R"({"note":"4111111111111112"})",
-        R"({"note":"4111111111111112"})");
-    ok_or_die("value_order_number_not_cc",
-        R"({"note":"1234567890123456"})",
-        R"({"note":"1234567890123456"})");
+    return s.substr(start, i - start);
+}
 
-    // priority
-    ok_or_die("priority_key_wins_over_jwt",
-        R"({"api_key":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.sig"})",
-        R"({"api_key":"***"})");
-    ok_or_die("priority_key_wins_over_aws",
-        R"({"access_key":"AKIAIOSFODNN7EXAMPLE"})",
-        R"({"access_key":"***"})");
+// One JSON value in a canonical form: no whitespace, object keys sorted,
+// strings decoded and written back with only `"`, `\\` and control
+// characters escaped. Numbers, true, false and null are kept as written.
+// Comparing two canonical forms checks the values, not their spelling.
+class Canonical {
+public:
+    explicit Canonical(const std::string& s) : s_(s) {}
 
-    // nested
-    ok_or_die("nested_2level_key_pattern",
-        R"({"user":{"password":"abc","name":"Alice"}})",
-        R"({"user":{"name":"Alice","password":"***"}})");
-    ok_or_die("nested_2level_value_shape",
-        R"({"meta":{"note":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTQyIn0.abc123def456ghi789"}})",
-        R"({"meta":{"note":"***JWT***"}})");
-    ok_or_die("nested_array_of_dicts",
-        R"({"items":[{"api_key":"x"},{"name":"y"}]})",
-        R"({"items":[{"api_key":"***"},{"name":"y"}]})");
-    ok_or_die("mixed_safe_and_redacted_keys",
-        R"({"email":"a@b.com","name":"Alice","token":"tok-abc"})",
-        R"({"email":"a@b.com","name":"Alice","token":"***"})");
+    std::string value() {
+        ws();
+        if (i_ >= s_.size()) fail("unexpected end");
+        const char c = s_[i_];
+        if (c == '{') return object();
+        if (c == '[') return array();
+        if (c == '"') return quote(string());
+        const std::size_t start = i_;
+        while (i_ < s_.size() && std::string(",]} \t\r\n").find(s_[i_]) == std::string::npos) ++i_;
+        return s_.substr(start, i_ - start);
+    }
+
+private:
+    const std::string& s_;
+    std::size_t i_ = 0;
+
+    [[noreturn]] void fail(const char* why) {
+        std::cerr << "FAIL: bad JSON in the spec (" << why << ") at " << i_ << "\n";
+        std::exit(1);
+    }
+    void ws() {
+        while (i_ < s_.size() && std::string(" \t\r\n").find(s_[i_]) != std::string::npos) ++i_;
+    }
+    void expect(char c) {
+        ws();
+        if (i_ >= s_.size() || s_[i_] != c) fail("unexpected character");
+        ++i_;
+    }
+    std::string object() {
+        expect('{');
+        std::map<std::string, std::string> fields;
+        ws();
+        if (s_[i_] == '}') { ++i_; return "{}"; }
+        for (;;) {
+            ws();
+            std::string key = string();
+            expect(':');
+            fields[key] = value();
+            ws();
+            if (s_[i_] == ',') { ++i_; continue; }
+            expect('}');
+            break;
+        }
+        std::string out = "{";
+        for (const auto& f : fields) {
+            if (out.size() > 1) out += ',';
+            out += quote(f.first) + ':' + f.second;
+        }
+        return out + '}';
+    }
+    std::string array() {
+        expect('[');
+        std::vector<std::string> items;
+        ws();
+        if (s_[i_] == ']') { ++i_; return "[]"; }
+        for (;;) {
+            items.push_back(value());
+            ws();
+            if (s_[i_] == ',') { ++i_; continue; }
+            expect(']');
+            break;
+        }
+        std::string out = "[";
+        for (std::size_t k = 0; k < items.size(); ++k) out += (k ? "," : "") + items[k];
+        return out + ']';
+    }
+    unsigned hex4() {
+        if (i_ + 4 > s_.size()) fail("short \\u escape");
+        const unsigned v = static_cast<unsigned>(std::stoul(s_.substr(i_, 4), nullptr, 16));
+        i_ += 4;
+        return v;
+    }
+    static void utf8(std::string& out, unsigned cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    // The decoded bytes of the string that starts at s_[i_].
+    std::string string() {
+        expect('"');
+        std::string out;
+        while (i_ < s_.size() && s_[i_] != '"') {
+            char c = s_[i_++];
+            if (c != '\\') { out += c; continue; }
+            if (i_ >= s_.size()) fail("short escape");
+            c = s_[i_++];
+            switch (c) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    unsigned cp = hex4();
+                    if (cp >= 0xD800 && cp < 0xDC00 && i_ + 6 <= s_.size() &&
+                        s_[i_] == '\\' && s_[i_ + 1] == 'u') {
+                        i_ += 2;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (hex4() - 0xDC00);
+                    }
+                    utf8(out, cp);
+                    break;
+                }
+                default: out += c;  // " \\ /
+            }
+        }
+        expect('"');
+        return out;
+    }
+    static std::string quote(const std::string& raw) {
+        static const char* hex = "0123456789abcdef";
+        std::string out = "\"";
+        for (unsigned char c : raw) {
+            if (c == '"' || c == '\\') { out += '\\'; out += static_cast<char>(c); }
+            else if (c < 0x20) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 0xF]; }
+            else out += static_cast<char>(c);
+        }
+        return out + '"';
+    }
+};
+
+std::string canonical(const std::string& json) { return Canonical(json).value(); }
+
+// The value of the next `"key":` at or after `from`; npos-safe.
+bool next_field(const std::string& s, const std::string& key, std::size_t& from,
+                std::string& value) {
+    const std::string needle = "\"" + key + "\":";
+    const std::size_t at = s.find(needle, from);
+    if (at == std::string::npos) return false;
+    std::size_t i = at + needle.size();
+    value = json_value(s, i);
+    from = i;
+    return true;
+}
+
+int run_all() {
+    const std::string path = std::string(FASTEN_SPEC_DIR) + "/redact-conformance.json";
+    std::ifstream f(path);
+    if (!f) {
+        std::cerr << "FAIL: cannot open " << path << "\n";
+        std::exit(1);
+    }
+    std::stringstream buf;
+    buf << f.rdbuf();
+    const std::string spec = buf.str();
+
+    std::size_t pos = spec.find("\"cases\":");
+    if (pos == std::string::npos) {
+        std::cerr << "FAIL: no cases in " << path << "\n";
+        std::exit(1);
+    }
+    int n = 0;
+    std::string name, input, expected;
+    while (next_field(spec, "name", pos, name) &&
+           next_field(spec, "input", pos, input) &&
+           next_field(spec, "expected", pos, expected)) {
+        // Both sides in canonical form, so key order and escaping don't
+        // matter. The expected value is not redacted: a case the core
+        // starts masking by mistake fails here.
+        const std::string got  = canonical(redact(name, input));
+        const std::string want = canonical(expected);
+        if (got != want) {
+            std::cerr << "FAIL [" << name << "]\n"
+                      << "  got:  " << got  << "\n"
+                      << "  want: " << want << "\n";
+            std::exit(1);
+        }
+        std::cout << "ok  " << name << "\n";
+        ++n;
+    }
+    return n;
 }
 
 }  // namespace
 
 int main() {
-    run_all();
-    std::cout << "\nALL redact-conformance TESTS PASSED\n";
+    const int n = run_all();
+    // Guards against a parse that silently finds few cases.
+    if (n < 100) {
+        std::cerr << "FAIL: only " << n << " cases read from the spec file\n";
+        return 1;
+    }
+    std::cout << "\nALL redact-conformance TESTS PASSED (" << n << " cases)\n";
     return 0;
 }

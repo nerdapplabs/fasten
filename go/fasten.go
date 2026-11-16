@@ -79,10 +79,13 @@ var RedactPatterns = []string{
 	"m2m[_-]?key",
 	"cert[_-]?private",
 	"private[_-]?key",
-	"access_key",
-	"session_id",
+	"access[_-]?key",
+	"session[_-]?id",
 	"cookie",
 	"credential",
+	"[_-]pwd$",
+	"passphrase",
+	"dsn$",
 }
 
 // ── END FASTEN GENERATED ──────────────────────────────────────────────────

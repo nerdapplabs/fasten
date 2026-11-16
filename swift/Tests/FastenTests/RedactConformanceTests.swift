@@ -94,4 +94,42 @@ final class RedactConformanceTests: XCTestCase {
         default: return false
         }
     }
+
+    func testLongValuesRedactQuickly() {
+        let r = Redactor()
+        // Each just under the 64 KiB cap, so the value is scanned.
+        for note in [String(repeating: "eyJ", count: 20_000) + ".eyJ.x",
+                     String(repeating: "1 ", count: 30_000),
+                     String(repeating: "a://b:", count: 10_000),
+                     String(repeating: "Bearer ", count: 9_000)] {
+            let t0 = Date()
+            let out = r.redact(["note": note])
+            let s = Date().timeIntervalSince(t0)
+            XCTAssertLessThan(s, 2.0, "redacting \(note.count) chars took \(s) s")
+            XCTAssertNil(out["_truncated"], "the value must be under the cap")
+        }
+    }
+
+    /// A value over FASTEN_MAX_DETAIL_BYTES (64 KiB by default) is replaced
+    /// by a truncation marker, as in Python and Go.
+    func testValueOverTheCapBecomesAMarker() {
+        let out = Redactor().redact(["note": String(repeating: "x", count: 70_000)])
+        XCTAssertEqual(out["_truncated"] as? Bool, true)
+        XCTAssertEqual(out["_max_detail_bytes"] as? Int, 65_536)
+        XCTAssertNil(out["note"])
+        let kept = Redactor().redact(["note": String(repeating: "x", count: 60_000)])
+        XCTAssertEqual((kept["note"] as? String)?.count, 60_000)
+    }
+
+    /// The size is the JSON that gets written: 40,000 newlines are about
+    /// 80 KB once escaped, and a Date next to them (written as null) does
+    /// not change how they are measured.
+    func testSizeIsMeasuredAsWrittenJSON() {
+        let newlines = String(repeating: "\n", count: 40_000)
+        for detail: [String: Any] in [["note": newlines], ["note": newlines, "t": Date()]] {
+            XCTAssertEqual(Redactor().redact(detail)["_truncated"] as? Bool, true, "\(detail.keys.sorted())")
+        }
+        let ints = Redactor().redact(["n": Array(repeating: 7, count: 9_000), "t": Date()])
+        XCTAssertNil(ints["_truncated"], "9000 small ints are about 18 KB as JSON")
+    }
 }

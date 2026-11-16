@@ -26,10 +26,14 @@ static REDACT_PATTERNS: &[&str] = &[
     r"m2m[_-]?key",
     r"cert[_-]?private",
     r"private[_-]?key",
-    r"access_key",
-    r"session_id",
+    r"access[_-]?key",
+    r"session[_-]?id",
     r"cookie",
     r"credential",
+    // After a separator and at the end: db_pwd, not PWD or OLDPWD.
+    r"[_-]pwd$",
+    r"passphrase",
+    r"dsn$",
 ];
 
 #[allow(clippy::expect_used)]
@@ -40,11 +44,158 @@ fn build_key_re(extra: &[&str]) -> Regex {
     Regex::new(&format!("(?i)({combined})")).expect("key pattern is valid regex")
 }
 
-// Card numbers: 13 to 19 digits with optional space or dash separators.
+// A run of digit groups split by whitespace (the Unicode White_Space set,
+// written out so JS and Swift can match it exactly) or dashes. [0-9], not
+// \d: \d matches every Unicode digit, and luhn_valid takes ASCII digits only.
 #[allow(clippy::expect_used)]
-static CC_DIGIT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b\d[\d\s\-]{11,17}\d\b").expect("CC regex is valid")
+static DIGIT_RUN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"[0-9]+(?:[\t\n\x0B\x0C\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\-]+[0-9]+)*",
+    )
+    .expect("digit run regex is valid")
 });
+
+fn is_group_sep(c: char) -> bool {
+    matches!(c,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{85}' | '\u{A0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' | '-')
+}
+
+/// Whether the card number `digits` starts like one: 3 (Amex, Diners,
+/// JCB), 4 (Visa), 5 (Mastercard, Maestro), 6 (Discover, Maestro and
+/// others), 2200-2205 (Mir), 2221-2720 (Mastercard), 8100-8299 (India),
+/// 8600 (Uzcard), 9704 (Napas), 9792 (Troy), 9860 (Humo), 1946, or 1 with
+/// 15 digits (UATP). Other years (19xx, 20xx) and counters do not.
+fn card_prefix(digits: &str) -> bool {
+    let p = digits.get(..4).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    match digits.as_bytes().first() {
+        Some(b'3' | b'4' | b'5' | b'6') => true,
+        Some(b'1') => digits.len() == 15 || p == 1946,
+        Some(b'2') => (2200..=2205).contains(&p) || (2221..=2720).contains(&p),
+        Some(b'8') => (8100..=8299).contains(&p) || p == 8600,
+        Some(b'9') => matches!(p, 9704 | 9792 | 9860),
+        _ => false,
+    }
+}
+
+// Card number layouts printed in groups: 4-4-4-4 with an optional short
+// tail, and the 4-6-5 / 4-6-4 layouts. An unbroken group of 13 to 19 digits
+// is checked as well.
+const CARD_LAYOUTS: &[&[usize]] = &[
+    &[4, 4, 4, 4],
+    &[4, 4, 4, 4, 1],
+    &[4, 4, 4, 4, 2],
+    &[4, 4, 4, 4, 3],
+    &[4, 6, 5],
+    &[4, 6, 4],
+];
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `s` holds a card number: a group of 13 to 19 digits, or groups in
+/// a card layout, that start with a card prefix and pass the Luhn check.
+/// Digits joined to a letter or `_` are part of an id and are skipped. A
+/// layout is tried only where it starts or ends its run of digit groups,
+/// so a long list of 4-digit values is not read as cards in its middle.
+fn has_card(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for run in DIGIT_RUN_RE.find_iter(s) {
+        let open_start = run.start() == 0 || !is_word_byte(bytes[run.start() - 1]);
+        let open_end = run.end() == bytes.len() || !is_word_byte(bytes[run.end()]);
+        let groups: Vec<&str> =
+            run.as_str().split(is_group_sep).filter(|g| !g.is_empty()).collect();
+        for i in 0..groups.len() {
+            if i == 0 && !open_start {
+                continue;
+            }
+            let fits_end = |end: usize| end < groups.len() || open_end;
+            if (13..=19).contains(&groups[i].len())
+                && fits_end(i + 1)
+                && card_prefix(groups[i])
+                && luhn_valid(groups[i])
+            {
+                return true;
+            }
+            for layout in CARD_LAYOUTS {
+                let end = i + layout.len();
+                if end > groups.len() || !fits_end(end) || (i > 0 && end < groups.len()) {
+                    continue;
+                }
+                if groups[i..end].iter().zip(layout.iter()).all(|(g, &n)| g.len() == n) {
+                    let digits = groups[i..end].concat();
+                    if card_prefix(&digits) && luhn_valid(&digits) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// An Authorization header value. Bearer: a credential of 16 or more
+// characters that holds a digit or one of + / =, so a sentence that starts
+// "Bearer" is not one. Basic: base64 that decodes to UTF-8 text with no
+// control characters and a ":" (user:password).
+#[allow(clippy::expect_used)]
+static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})")
+        .expect("bearer regex is valid")
+});
+#[allow(clippy::expect_used)]
+static BASIC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})").expect("basic regex is valid")
+});
+
+fn has_auth_header(s: &str) -> bool {
+    let token = |c: regex::Captures<'_>| c.get(1).map(|m| m.as_str().to_owned());
+    BEARER_RE
+        .captures_iter(s)
+        .filter_map(token)
+        .any(|t| t.bytes().any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'/' | b'=')))
+        || BASIC_RE.captures_iter(s).filter_map(token).any(|t| is_basic_credential(&t))
+}
+
+/// Whether `token` is base64 for `user:password`: its length is a multiple
+/// of four, and it decodes to valid UTF-8 with no control characters (C0,
+/// DEL or C1) and a ":". With an empty user name (":token", as some access
+/// tokens are sent) the password needs 16 or more characters.
+fn is_basic_credential(token: &str) -> bool {
+    if token.is_empty() || token.len() % 4 != 0 {
+        return false;
+    }
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut decoded = Vec::with_capacity(token.len() / 4 * 3);
+    for b in token.trim_end_matches('=').bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return false,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    let Ok(text) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let user_or_long_password = match text.find(':') {
+        Some(0) => text[1..].chars().count() >= 16,
+        Some(_) => true,
+        None => false,
+    };
+    user_or_long_password && !text.chars().any(char::is_control)
+}
 
 struct Vp {
     re:   &'static str,
@@ -54,16 +205,27 @@ struct Vp {
 static VALUE_SPECS: &[Vp] = &[
     // JWT: three base64url segments starting with eyJ (standard header + payload)
     Vp { re: r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", repl: "***JWT***" },
-    // PEM private key block header
-    Vp { re: r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----", repl: "***PRIVATE_KEY***" },
+    // PEM private key block header, encrypted or not
+    Vp { re: r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |)PRIVATE KEY-----", repl: "***PRIVATE_KEY***" },
     // AWS access key (permanent AKIA or short-lived ASIA)
     Vp { re: r"(?:AKIA|ASIA)[A-Z0-9]{16}", repl: "***AWS_KEY***" },
     // GitHub personal / OAuth / actions token
     Vp { re: r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}", repl: "***GH_TOKEN***" },
     // Stripe live secret key
     Vp { re: r"sk_live_[A-Za-z0-9]{24,}", repl: "***STRIPE_KEY***" },
-    // OpenAI API key (sk-... legacy and sk-proj-... org format)
-    Vp { re: r"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}", repl: "***OPENAI_KEY***" },
+    // OpenAI API key (sk-... legacy and sk-proj-... org format), not part
+    // of a longer word such as task-<uuid>; a percent-encoded character
+    // before it (%3D, %20) counts as a boundary
+    Vp {
+        re:   r"(?:^|[^A-Za-z0-9_]|%[0-9A-Fa-f]{2})sk-(?:proj-)?[A-Za-z0-9_\-]{32,}",
+        repl: "***OPENAI_KEY***",
+    },
+    // GitHub fine-grained personal access token
+    Vp { re: r"github_pat_[A-Za-z0-9_]{22,}", repl: "***GH_TOKEN***" },
+    // Slack token
+    Vp { re: r"xox[abposr]-[A-Za-z0-9\-]{10,}", repl: "***SLACK_TOKEN***" },
+    // Credentials in a URL: scheme://user:password@, user may be empty
+    Vp { re: r"[A-Za-z0-9+.\-]+://[^\t\n\x0B\x0C\r /:@?#]*:[^\t\n\x0B\x0C\r /@?#]+@", repl: "***URL_CREDENTIALS***" },
 ];
 
 struct CompiledVp {
@@ -149,16 +311,16 @@ impl Redactor {
 
     fn check_value(&self, s: &str) -> Option<String> {
         // The Luhn check keeps order numbers and similar ids from matching.
-        if let Some(m) = CC_DIGIT_RE.find(s) {
-            let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
-            if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
-                return Some("***CC***".to_owned());
-            }
+        if has_card(s) {
+            return Some("***CC***".to_owned());
         }
         for vp in VALUE_PATTERNS.iter() {
             if vp.re.is_match(s) {
                 return Some(vp.repl.to_owned());
             }
+        }
+        if has_auth_header(s) {
+            return Some("***AUTH_HEADER***".to_owned());
         }
         for (re, repl) in &self.custom_vp {
             if re.is_match(s) {
@@ -325,5 +487,14 @@ mod tests {
     #[test]
     fn luhn_invalid() {
         assert!(!luhn_valid("4539578763621487"));
+    }
+
+    // Non-ASCII digits are not card digits, and must not reach luhn_valid.
+    #[test]
+    fn non_ascii_digits_are_not_a_card() {
+        let arabic_indic = "\u{0664}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\
+                            \u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}\u{0661}";
+        let out = Redactor::default().redact_value(&json!({"note": arabic_indic}));
+        assert_eq!(out["note"], arabic_indic);
     }
 }

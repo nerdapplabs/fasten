@@ -290,6 +290,588 @@
       "group": "nested",
       "input":    {"name": "Alice", "token": "tok-abc", "email": "a@b.com"},
       "expected": {"name": "Alice", "token": "***", "email": "a@b.com"}
+    },
+    {
+      "name": "key_access_key_camel",
+      "group": "key_pattern",
+      "input":    {"accessKey": "xxx"},
+      "expected": {"accessKey": "***"}
+    },
+    {
+      "name": "key_access_key_dash",
+      "group": "key_pattern",
+      "input":    {"access-key": "xxx"},
+      "expected": {"access-key": "***"}
+    },
+    {
+      "name": "key_session_id_camel",
+      "group": "key_pattern",
+      "input":    {"sessionId": "xxx"},
+      "expected": {"sessionId": "***"}
+    },
+    {
+      "name": "key_session_id_dash",
+      "group": "key_pattern",
+      "input":    {"session-id": "xxx"},
+      "expected": {"session-id": "***"}
+    },
+    {
+      "name": "key_pwd_suffix",
+      "group": "key_pattern",
+      "input":    {"db_pwd": "xxx"},
+      "expected": {"db_pwd": "***"}
+    },
+    {
+      "name": "key_passphrase",
+      "group": "key_pattern",
+      "input":    {"passphrase": "xxx"},
+      "expected": {"passphrase": "***"}
+    },
+    {
+      "name": "key_dsn",
+      "group": "key_pattern",
+      "input":    {"dsn": "postgres://db/x"},
+      "expected": {"dsn": "***"}
+    },
+    {
+      "name": "key_bare_key_not_matched",
+      "group": "safe",
+      "input":    {"key": "feature.dark_mode"},
+      "expected": {"key": "feature.dark_mode"}
+    },
+    {
+      "name": "key_bare_auth_not_matched",
+      "group": "safe",
+      "input":    {"auth": "oauth2"},
+      "expected": {"auth": "oauth2"}
+    },
+    {
+      "name": "key_primary_key_not_matched",
+      "group": "safe",
+      "input":    {"primary_key": "id-1"},
+      "expected": {"primary_key": "id-1"}
+    },
+    {
+      "name": "key_keyword_not_matched",
+      "group": "safe",
+      "input":    {"keyword": "audit"},
+      "expected": {"keyword": "audit"}
+    },
+    {
+      "name": "key_author_not_matched",
+      "group": "safe",
+      "input":    {"author": "alice"},
+      "expected": {"author": "alice"}
+    },
+    {
+      "name": "value_cc_after_timestamp",
+      "group": "value_shape",
+      "input":    {"note": "2026-11-12 08:30:00 payment failed for card 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_order_number",
+      "group": "value_shape",
+      "input":    {"note": "order 1234567890123 card 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_short_number",
+      "group": "value_shape",
+      "input":    {"note": "ref 12 4111111111111111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_punctuation",
+      "group": "value_shape",
+      "input":    {"note": "card:4111111111111111."},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped",
+      "group": "value_shape",
+      "input":    {"note": "4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_long_digit_run_not_cc",
+      "group": "safe",
+      "input":    {"note": "41111111111111110000"},
+      "expected": {"note": "41111111111111110000"}
+    },
+    {
+      "name": "value_pem_encrypted",
+      "group": "value_shape",
+      "input":    {"note": "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHz..."},
+      "expected": {"note": "***PRIVATE_KEY***"}
+    },
+    {
+      "name": "value_gh_fine_grained",
+      "group": "value_shape",
+      "input":    {"note": "github_pat_11AAAAAAA0BBBBBBBBBBBBBB"},
+      "expected": {"note": "***GH_TOKEN***"}
+    },
+    {
+      "name": "value_slack_token",
+      "group": "value_shape",
+      "input":    {"note": "xoxb-0000000000-AAAAAAAAAA"},
+      "expected": {"note": "***SLACK_TOKEN***"}
+    },
+    {
+      "name": "value_url_credentials",
+      "group": "value_shape",
+      "input":    {"conn": "postgres://app:s3cret@db.internal:5432/audit"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_url_without_password",
+      "group": "safe",
+      "input":    {"link": "https://alice@example.com/a@b"},
+      "expected": {"link": "https://alice@example.com/a@b"}
+    },
+    {
+      "name": "value_bearer_opaque",
+      "group": "value_shape",
+      "input":    {"note": "Bearer abcdefghijklmnop0123456789"},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic dXNlcjpwYXNzd29yZDEyMw=="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_plan_not_auth",
+      "group": "safe",
+      "input":    {"note": "basic plan upgrade"},
+      "expected": {"note": "basic plan upgrade"}
+    },
+    {
+      "name": "value_jwt_in_sentence",
+      "group": "value_shape",
+      "input":    {"note": "error: invalid token xeyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0.c2ln, retry"},
+      "expected": {"note": "***JWT***"}
+    },
+    {
+      "name": "value_eyj_run_not_jwt",
+      "group": "safe",
+      "input":    {"note": "eyJeyJeyJ.eyJ"},
+      "expected": {"note": "eyJeyJeyJ.eyJ"}
+    },
+    {
+      "name": "value_cc_dashes",
+      "group": "value_shape",
+      "input":    {"note": "4111-1111-1111-1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_amex_layout",
+      "group": "value_shape",
+      "input":    {"note": "3782 822463 10005"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped_after_date",
+      "group": "value_shape",
+      "input":    {"note": "2026-11-12 4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_id_digits_not_cc",
+      "group": "safe",
+      "input":    {"ref": "txn_1731400000005"},
+      "expected": {"ref": "txn_1731400000005"}
+    },
+    {
+      "name": "value_date_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "dates 2026-11-12 2026-11-13 2026-11-14"},
+      "expected": {"note": "dates 2026-11-12 2026-11-13 2026-11-14"}
+    },
+    {
+      "name": "value_count_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "counts 120 340 560 780 900 1200 1500 1800"},
+      "expected": {"note": "counts 120 340 560 780 900 1200 1500 1800"}
+    },
+    {
+      "name": "key_suffix_dsn",
+      "group": "key_pattern",
+      "input":    {"sentryDsn": "https://o1.ingest.example/1"},
+      "expected": {"sentryDsn": "***"}
+    },
+    {
+      "name": "key_dsn_inside_word_not_matched",
+      "group": "safe",
+      "input":    {"goodsName": "bolts"},
+      "expected": {"goodsName": "bolts"}
+    },
+    {
+      "name": "value_url_password_only",
+      "group": "value_shape",
+      "input":    {"conn": "redis://:s3cret@cache:6379/0"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_url_query_not_credentials",
+      "group": "safe",
+      "input":    {"link": "https://example.com?next=mailto:bob@example.org"},
+      "expected": {"link": "https://example.com?next=mailto:bob@example.org"}
+    },
+    {
+      "name": "value_basic_in_sentence_not_auth",
+      "group": "safe",
+      "input":    {"note": "Basic internationalization support"},
+      "expected": {"note": "Basic internationalization support"}
+    },
+    {
+      "name": "value_lowercase_basic_not_auth",
+      "group": "safe",
+      "input":    {"note": "Plan includes basic /etc/nginx/nginx.conf"},
+      "expected": {"note": "Plan includes basic /etc/nginx/nginx.conf"}
+    },
+    {
+      "name": "value_lowercase_bearer_not_auth",
+      "group": "safe",
+      "input":    {"note": "The bearer acknowledges-receipt-of-goods"},
+      "expected": {"note": "The bearer acknowledges-receipt-of-goods"}
+    },
+    {
+      "name": "value_cc_then_expiry",
+      "group": "value_shape",
+      "input":    {"note": "card 4111 1111 1111 1111 1227"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_amex_then_code",
+      "group": "value_shape",
+      "input":    {"note": "3782 822463 10005 1234"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_grouped_with_tail",
+      "group": "value_shape",
+      "input":    {"note": "4111 1111 1111 1112 1"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_diners_layout",
+      "group": "value_shape",
+      "input":    {"note": "3056 930902 5904"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_digits_before_underscore_not_cc",
+      "group": "safe",
+      "input":    {"ref": "4111111111111111_x"},
+      "expected": {"ref": "4111111111111111_x"}
+    },
+    {
+      "name": "value_url_password_with_colon",
+      "group": "value_shape",
+      "input":    {"conn": "postgres://app:pa:ss@db/x"},
+      "expected": {"conn": "***URL_CREDENTIALS***"}
+    },
+    {
+      "name": "value_basic_base64_letters",
+      "group": "value_shape",
+      "input":    {"note": "Basic YWxpY2U6d29uZGVybGFuZA=="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_bearer_with_plus",
+      "group": "value_shape",
+      "input":    {"note": "Bearer abcdefghij+klmnopqrst"},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_slack_user_token",
+      "group": "value_shape",
+      "input":    {"note": "xoxp-0000000000-AAAAAAAAAA"},
+      "expected": {"note": "***SLACK_TOKEN***"}
+    },
+    {
+      "name": "value_openai_after_text",
+      "group": "value_shape",
+      "input":    {"note": "key=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"},
+      "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_task_uuid_not_openai",
+      "group": "safe",
+      "input":    {"ref": "task-550e8400-e29b-41d4-a716-446655440000"},
+      "expected": {"ref": "task-550e8400-e29b-41d4-a716-446655440000"}
+    },
+    {
+      "name": "value_risk_slug_not_openai",
+      "group": "safe",
+      "input":    {"note": "risk-assessment-for-customer-account-number-42"},
+      "expected": {"note": "risk-assessment-for-customer-account-number-42"}
+    },
+    {
+      "name": "key_pwd_env_not_matched",
+      "group": "safe",
+      "input":    {"PWD": "/home/app", "OLDPWD": "/tmp"},
+      "expected": {"PWD": "/home/app", "OLDPWD": "/tmp"}
+    },
+    {
+      "name": "value_cc_tab_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\t1111\t1111\t1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_nbsp_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\u00a01111\u00a01111\u00a01111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_year_list_not_cc",
+      "group": "safe",
+      "input":    {"note": "fiscal years 2016 2017 2018 2019 2020"},
+      "expected": {"note": "fiscal years 2016 2017 2018 2019 2020"}
+    },
+    {
+      "name": "value_dashed_id_not_cc",
+      "group": "safe",
+      "input":    {"ref": "2024-1000-2000-3000-4000"},
+      "expected": {"ref": "2024-1000-2000-3000-4000"}
+    },
+    {
+      "name": "value_basic_short_credential",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic Ym9iOjEyMw=="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_path_not_auth",
+      "group": "safe",
+      "input":    {"note": "Basic /usr/local/bin/python3.12"},
+      "expected": {"note": "Basic /usr/local/bin/python3.12"}
+    },
+    {
+      "name": "value_openai_after_percent_encoding",
+      "group": "value_shape",
+      "input":    {"url": "https://example.com/?api_key%3Dsk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef"},
+      "expected": {"url": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_openai_after_encoded_space",
+      "group": "value_shape",
+      "input":    {"note": "Bearer%20sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"},
+      "expected": {"note": "***OPENAI_KEY***"}
+    },
+    {
+      "name": "value_cc_narrow_nbsp_separated",
+      "group": "value_shape",
+      "input":    {"note": "carte 4111\u202f1111\u202f1111\u202f1111 exp 12/28"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_thin_space_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\u20091111\u20091111\u20091111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_ideographic_space_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\u30001111\u30001111\u30001111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_newline_separated",
+      "group": "value_shape",
+      "input":    {"note": "4111\n1111\n1111\n1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_year",
+      "group": "value_shape",
+      "input":    {"note": "ref 2024 4111 1111 1111 1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_after_pin",
+      "group": "value_shape",
+      "input":    {"note": "PIN 1234 4111-1111-1111-1111"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_year_list_2015_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "fiscal years 2015 2016 2017 2018 2019"},
+      "expected": {"note": "fiscal years 2015 2016 2017 2018 2019"}
+    },
+    {
+      "name": "value_dashed_id_2020_not_cc",
+      "group": "value_shape",
+      "input":    {"ref": "2020-1000-2000-3000-4000"},
+      "expected": {"ref": "2020-1000-2000-3000-4000"}
+    },
+    {
+      "name": "value_basic_word_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic Overview of the API"},
+      "expected": {"note": "Basic Overview of the API"}
+    },
+    {
+      "name": "value_basic_only_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Basic Only"},
+      "expected": {"note": "Basic Only"}
+    },
+    {
+      "name": "value_basic_utf8_password",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic asO8cmdlbjpww6Rzc3fDtnJk"},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_cc_prefix_2199_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2199333333333336"},
+      "expected": {"note": "card 2199333333333336"}
+    },
+    {
+      "name": "value_cc_prefix_2200",
+      "group": "value_shape",
+      "input":    {"note": "card 2200333333333333"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2205",
+      "group": "value_shape",
+      "input":    {"note": "card 2205333333333338"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2206_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2206333333333337"},
+      "expected": {"note": "card 2206333333333337"}
+    },
+    {
+      "name": "value_cc_prefix_2220_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2220333333333339"},
+      "expected": {"note": "card 2220333333333339"}
+    },
+    {
+      "name": "value_cc_prefix_2221",
+      "group": "value_shape",
+      "input":    {"note": "card 2221333333333338"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2720",
+      "group": "value_shape",
+      "input":    {"note": "card 2720333333333334"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2721_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2721333333333333"},
+      "expected": {"note": "card 2721333333333333"}
+    },
+    {
+      "name": "value_cc_prefix_8099_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 8099333333333334"},
+      "expected": {"note": "card 8099333333333334"}
+    },
+    {
+      "name": "value_cc_prefix_8100",
+      "group": "value_shape",
+      "input":    {"note": "card 8100333333333331"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_8299",
+      "group": "value_shape",
+      "input":    {"note": "card 8299333333333332"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_8300_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 8300333333333339"},
+      "expected": {"note": "card 8300333333333339"}
+    },
+    {
+      "name": "value_cc_uzcard_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 8600 7777 7777 7772"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_humo_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9860 7777 7777 7775"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_napas_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9704 7777 7777 7775"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_troy_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9792 7777 7777 7778"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_1946_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 1946 7777 7777 7770"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_uatp_15_digits",
+      "group": "value_shape",
+      "input":    {"note": "card 155555555555552"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_uatp_4_6_5",
+      "group": "value_shape",
+      "input":    {"note": "card 1555 555555 55552"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_16_digits_starting_1_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "ref 1947555555555553"},
+      "expected": {"note": "ref 1947555555555553"}
+    },
+    {
+      "name": "value_port_list_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "ports 5432 6379 3306 8080 9200 5601"},
+      "expected": {"note": "ports 5432 6379 3306 8080 9200 5601"}
+    },
+    {
+      "name": "value_four_digit_list_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "values 4609 4703 4585 8648 8467 3407 2273 3129 6021 7697 6102 6950 7596 4279 2453 9600 8150 9090 2249 6597"},
+      "expected": {"note": "values 4609 4703 4585 8648 8467 3407 2273 3129 6021 7697 6102 6950 7596 4279 2453 9600 8150 9090 2249 6597"}
+    },
+    {
+      "name": "value_basic_empty_user_long_token",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic OmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MjM0NTY3YWJjZGVmZ2hpamtsbW5vcHFyc3Q="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_empty_user_short_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic OnRva2Vu"},
+      "expected": {"note": "Authorization: Basic OnRva2Vu"}
     }
   ]
 }

@@ -96,6 +96,7 @@
     "notes": [
       "Patterns match field keys, not values.",
       "[_-]? — separator is optional: api_key, api-key, apikey all match.",
+      "dsn$ matches only at the end of a key, so goodsName is kept. [_-]pwd$ needs a separator before it, so db_pwd matches and PWD or OLDPWD do not. A bare key or auth is not matched; add them with extra_redact_keys if needed.",
       "Adopters may add keys via init(extra_redact_keys=[...]) but never remove defaults."
     ],
     "patterns": [
@@ -109,10 +110,13 @@
       "m2m[_-]?key",
       "cert[_-]?private",
       "private[_-]?key",
-      "access_key",
-      "session_id",
+      "access[_-]?key",
+      "session[_-]?id",
       "cookie",
-      "credential"
+      "credential",
+      "[_-]pwd$",
+      "passphrase",
+      "dsn$"
     ]
   }
 }

@@ -102,6 +102,16 @@ export class AuditCatalogError extends Error {
 	}
 }
 
+// Largest serialised detail or log line that is redacted and kept; the
+// same variable and default as Python and Go.
+const MAX_DETAIL_BYTES_DEFAULT = 64 * 1024;
+function _maxDetailBytes() {
+	// Digits only, as Python's int() and Go's Atoi read it: "64k" is not 64.
+	const raw = (process.env.FASTEN_MAX_DETAIL_BYTES ?? "").trim();
+	const n = /^[0-9]+$/.test(raw) ? Number(raw) : 0;
+	return n > 0 ? n : MAX_DETAIL_BYTES_DEFAULT;
+}
+
 function _metaFromCore(rm) {
 	return {
 		id: rm.id,
@@ -680,9 +690,21 @@ export class Engine {
 		return entry;
 	}
 
+	// Redacted copy of obj. A value over FASTEN_MAX_DETAIL_BYTES (default
+	// 64 KiB) is replaced by a truncation marker, as in Python and Go.
 	_redact(obj) {
 		const { extraRedactKeys: extra, redactReplacement: repl } = this.#config;
 		const json = JSON.stringify(obj);
+		const cap = _maxDetailBytes();
+		const size = Buffer.byteLength(json, "utf8");
+		if (size > cap) {
+			return {
+				_truncated: true,
+				_truncated_bytes: size,
+				_max_detail_bytes: cap,
+				_summary: `<truncated ${size} bytes; cap ${cap}>`,
+			};
+		}
 		return JSON.parse(
 			extra.length || repl
 				? coreRedactFull(json, JSON.stringify(extra), repl)
@@ -702,7 +724,26 @@ export class Engine {
 			...(JSON.stringify(fields) === undefined ? {} : fields),
 		};
 		// The whole line, as Go and Python do: a secret can be in the event.
-		stream.write(`${JSON.stringify(this._redact(line))}\n`);
+		let out = this._redact(line);
+		if (out._truncated) {
+			// Keep the line's envelope beside the marker. The event is
+			// redacted whole, then shortened.
+			const head = this._redact({
+				shape: "sys",
+				level,
+				event: String(event),
+				request_id: line.request_id,
+				service_id: line.service_id,
+				timestamp: line.timestamp,
+			});
+			if (head._truncated) {
+				out = { shape: "sys", level, event: "<truncated>", ...out };
+			} else {
+				head.event = String(head.event).slice(0, 256);
+				out = { ...head, ...out };
+			}
+		}
+		stream.write(`${JSON.stringify(out)}\n`);
 	}
 
 	_drainerSysLog(level, event, fields) {

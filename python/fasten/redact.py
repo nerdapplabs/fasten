@@ -66,8 +66,13 @@ _STRUCTLOG_SKIP = frozenset({
 })
 
 # Only used for dicts with non-string keys.
+# The patterns use `$` for the end of the key. In Python `$` also matches
+# before a final newline, so they are compiled with `\Z`, as the core reads
+# them.
+_KEY_PATTERNS = tuple(re.sub(r"\$$", r"\\Z", p) for p in _REDACT_PATTERNS)
+
 _DEFAULT_KEY_RE: re.Pattern[str] = re.compile(
-    r"(?i)(" + "|".join(_REDACT_PATTERNS) + r")"
+    r"(?i)(" + "|".join(_KEY_PATTERNS) + r")"
 )
 
 
@@ -93,7 +98,7 @@ class Redactor:
         # Python regex for the non-string-key fallback path.
         if self._extra_keys:
             extra_esc = "|".join(re.escape(k) for k in self._extra_keys)
-            combined  = "|".join(_REDACT_PATTERNS) + "|" + extra_esc
+            combined  = "|".join(_KEY_PATTERNS) + "|" + extra_esc
             self._key_re: re.Pattern[str] = re.compile(r"(?i)(" + combined + r")")
         else:
             self._key_re = _DEFAULT_KEY_RE
