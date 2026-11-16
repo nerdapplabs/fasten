@@ -31,7 +31,7 @@ name = "fasten"
 [features]
 default = []
 async = ["tokio"]
-store-postgres = ["dep:pg"]
+store-postgres = ["dep:pg", "fasten-core/postgres-tls"]
 codes-yaml = ["serde_yaml"]
 
 [dev-dependencies]
