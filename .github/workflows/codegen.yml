@@ -1,0 +1,48 @@
+name: Spec codegen
+
+# The generated blocks in the SDKs, the hand-written redaction key lists and
+# fasten-core's replacement token must match spec/row-schema.json
+# (spec/codegen.py --check).
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'spec/**'
+      - 'python/fasten/codes.py'
+      - 'go/fasten.go'
+      - 'js/src/index.js'
+      - 'js/src/core.js'
+      - 'rust/src/lib.rs'
+      - 'cpp/include/fasten.hpp'
+      - 'fasten-core/src/redact.rs'
+      - 'swift/Sources/Fasten/Redactor.swift'
+      - '.github/workflows/codegen.yml'
+  pull_request:
+    paths:
+      - 'spec/**'
+      - 'python/fasten/codes.py'
+      - 'go/fasten.go'
+      - 'js/src/index.js'
+      - 'js/src/core.js'
+      - 'rust/src/lib.rs'
+      - 'cpp/include/fasten.hpp'
+      - 'fasten-core/src/redact.rs'
+      - 'swift/Sources/Fasten/Redactor.swift'
+      - '.github/workflows/codegen.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Generated blocks and key lists match the spec
+        run: python3 spec/codegen.py --check
+
+      - name: The key list reader
+        run: python3 -m unittest spec/test_codegen.py
