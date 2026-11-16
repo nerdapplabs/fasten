@@ -835,12 +835,13 @@ struct SinkRef {
 inline void drainer_sys_log(const std::string& level,
                             const std::string& event,
                             const std::vector<std::pair<std::string, std::string>>& fields);
-// The keys the SDK sets on every sys line. A field with one of these names
-// is left out, so each key appears once and holds the SDK's value.
+// The keys the SDK always sets on a sys line. A field with one of these
+// names is left out, so each key appears once and holds the SDK's value.
+// request_id and tenant_id are written once too, but a field can supply
+// them (see write_sys_fields_).
 inline bool sys_envelope_key_(const std::string& key) {
     return key == "shape" || key == "level" || key == "event" ||
-           key == "request_id" || key == "service_id" || key == "tenant_id" ||
-           key == "timestamp";
+           key == "service_id" || key == "timestamp";
 }
 
 // A sys line field: its key, its value as JSON, and its value as text for
@@ -1014,7 +1015,8 @@ class CFastenDrainer {
             for (auto& e : split_json_object_(event_json)) {
                 if (e.first == "level") level = json_value_text_(e.second);
                 else if (e.first == "event") event = json_value_text_(e.second);
-                else if (!sys_envelope_key_(e.first)) kv.push_back(std::move(e));
+                else if (!sys_envelope_key_(e.first) && e.first != "request_id" &&
+                         e.first != "tenant_id") kv.push_back(std::move(e));
             }
             if (event == "audit_drain_dead_letter" || event == "audit_drain_lost_at_stop") {
                 ++static_cast<CFastenDrainer*>(userdata)->unstored_;
@@ -1182,16 +1184,20 @@ inline std::string sys_request_id() {
     return mint_sentinel("orphan", g.identity().service_id);
 }
 
-// Adds a sys row to the ring with its request_id and the engine's tenant_id,
-// so a tenant-scoped reader can return it. The tenant always comes from the
-// engine, never from the row.
+// Adds a sys row to the ring with its request_id and tenant_id, so a
+// tenant-scoped reader can return it. The engine's tenant wins; with none,
+// the row keeps a tenant_id it carries, as in Go and Python.
 inline void push_sys_row(Fields row) {
     auto& g = globals();
     auto rid = row.find("request_id");
     if (rid == row.end() || rid->second.empty()) row["request_id"] = sys_request_id();
     const std::string tenant = g.identity().tenant_id;
-    if (tenant.empty()) row.erase("tenant_id");
-    else row["tenant_id"] = tenant;
+    if (!tenant.empty()) {
+        row["tenant_id"] = tenant;
+    } else {
+        auto t = row.find("tenant_id");
+        if (t != row.end() && t->second.empty()) row.erase(t);
+    }
     g.syslog_ring.push(std::move(row));
 }
 
@@ -1574,23 +1580,33 @@ namespace detail_ {
 
 // Write a {"shape":"sys"} NDJSON line to `out` and add it to the sys ring.
 // `fields` is written as given, except the envelope keys; callers redact
-// first if needed.
+// first if needed. Each key appears once. A string request_id field is the
+// line's request_id, as in the other SDKs. A string tenant_id field is its
+// tenant only when the engine has none.
 inline void write_sys_fields_(std::ostream& out,
                               const std::string& level,
                               const std::string& event,
                               const std::vector<SysField>& fields) {
     const auto id = globals().identity();
-    const std::string rid = sys_request_id();
+    std::string rid;
+    std::string tenant = id.tenant_id;
+    for (const auto& f : fields) {
+        const bool text = !f.text.empty() && !f.json.empty() && f.json[0] == '"';
+        if (f.key == "request_id" && text) rid = f.text;
+        if (f.key == "tenant_id" && text && id.tenant_id.empty()) tenant = f.text;
+    }
+    if (rid.empty()) rid = sys_request_id();
+    const std::string ts = now_iso8601();
     Fields ring_row;
     std::string js = "{\"shape\":\"sys\"";
     js += ",\"level\":"      + json_str(level);
     js += ",\"event\":"      + json_str(event);
     js += ",\"request_id\":" + json_str(rid);
     js += ",\"service_id\":" + json_str(id.service_id);
-    if (!id.tenant_id.empty()) js += ",\"tenant_id\":" + json_str(id.tenant_id);
-    js += ",\"timestamp\":"  + json_str(now_iso8601());
+    if (!tenant.empty()) js += ",\"tenant_id\":" + json_str(tenant);
+    js += ",\"timestamp\":"  + json_str(ts);
     for (const auto& f : fields) {
-        if (sys_envelope_key_(f.key)) continue;
+        if (sys_envelope_key_(f.key) || f.key == "request_id" || f.key == "tenant_id") continue;
         js += ',' + json_str(f.key) + ':' + f.json;
         ring_row[f.key] = f.text;
     }
@@ -1598,6 +1614,9 @@ inline void write_sys_fields_(std::ostream& out,
     ring_row["level"]      = level;
     ring_row["event"]      = event;
     ring_row["request_id"] = rid;
+    ring_row["service_id"] = id.service_id;
+    ring_row["timestamp"]  = ts;
+    if (!tenant.empty()) ring_row["tenant_id"] = tenant;
     push_sys_row(std::move(ring_row));
     out << js << std::flush;
 }
