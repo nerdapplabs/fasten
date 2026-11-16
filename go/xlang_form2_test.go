@@ -143,6 +143,16 @@ func TestCrossLanguage_GoAcceptsEveryPythonSealedForm(t *testing.T) {
 			if res := VerifyChain([]Row{row}); !res.OK {
 				t.Fatalf("Go rejects a Python-sealed row: %s", res.Reason)
 			}
+			// The commitment with the current encoding alone: VerifyChain
+			// also tries Go's older encodings, so the check above can pass
+			// through a fallback. Numbers here are json.Number and keep
+			// Python's text, so pyNumbers itself is checked by
+			// TestCrossLanguage_GoSealedNumbersVector and pynumber_test.go.
+			if row.CanonicalFormID == "2" && row.Detail != nil {
+				if got := detailCommitment(row.DetailSalt, row.Detail); got != row.DetailCommitment {
+					t.Errorf("detail commitment %s, want %s", got, row.DetailCommitment)
+				}
+			}
 		})
 	}
 }
