@@ -54,10 +54,12 @@ jobs:
       - name: Build libfasten_core
         working-directory: fasten-core
         run: |
-          # The version the pinned image's openssl-libs has: auditwheel
-          # copies libssl and libcrypto into the wheel, so a newer one
-          # would change the wheel's bytes. Bump it with the image.
-          dnf install -y -q openssl-devel-3.5.8-2.el9_8
+          # The repo's current OpenSSL: AlmaLinux keeps only the latest
+          # build, so a pinned version stops installing when it moves on.
+          # auditwheel copies libssl and libcrypto into the wheel; the
+          # version is printed so the log says which one went in.
+          dnf install -y -q openssl-devel
+          rpm -q openssl-libs openssl-devel
           cargo build --release --locked --features all
 
       # auditwheel copies libssl and libcrypto into the wheel, so it needs no
