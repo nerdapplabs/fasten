@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -44,6 +45,43 @@ void sys_rows_are_scoped() {
     auto all = reader::handle_sys({});
     assert(has(all.body, "marker-a") && has(all.body, "marker-b"));
     std::cout << "sys scoped: PASS\n";
+}
+
+// A log field cannot set the row's tenant or the other keys the SDK sets.
+void sys_fields_cannot_set_envelope_keys() {
+    fasten::detail_::globals().reset_for_tests();
+    init_tenant("tenant-a");
+    std::ostringstream captured;
+    auto* old = std::cout.rdbuf(captured.rdbuf());
+    fasten::log::info("marker-fields", {{"tenant_id", "tenant-b"},
+                                        {"shape", "audit"},
+                                        {"service_id", "other"},
+                                        {"note", "kept"}});
+    std::cout.rdbuf(old);
+
+    assert(!has(reader::handle_sys({}, "tenant-b").body, "marker-fields"));
+    auto mine = reader::handle_sys({}, "tenant-a");
+    assert(has(mine.body, "marker-fields") && has(mine.body, "kept"));
+
+    const std::string line = captured.str();
+    auto count = [&](const std::string& s) {
+        int n = 0;
+        for (auto at = line.find(s); at != std::string::npos; at = line.find(s, at + 1)) ++n;
+        return n;
+    };
+    assert(count("\"shape\":") == 1 && has(line, "\"shape\":\"sys\""));
+    assert(count("\"tenant_id\":") == 1 && has(line, "\"tenant_id\":\"tenant-a\""));
+    assert(count("\"service_id\":") == 1 && has(line, "\"service_id\":\"svc\""));
+    assert(has(line, "\"note\":\"kept\""));
+
+    // With no engine tenant, a field cannot give the row one.
+    fasten::detail_::globals().reset_for_tests();
+    init_tenant("");
+    old = std::cout.rdbuf(captured.rdbuf());
+    fasten::log::info("marker-untenanted", {{"tenant_id", "tenant-b"}});
+    std::cout.rdbuf(old);
+    assert(!has(reader::handle_sys({}, "tenant-b").body, "marker-untenanted"));
+    std::cout << "sys envelope keys: PASS\n";
 }
 
 void enforced_isolation_refuses_unscoped_calls() {
@@ -93,6 +131,7 @@ void audit_errors_stay_out_of_the_response() {
 
 int main() {
     sys_rows_are_scoped();
+    sys_fields_cannot_set_envelope_keys();
     enforced_isolation_refuses_unscoped_calls();
     audit_rows_are_scoped();
     audit_errors_stay_out_of_the_response();

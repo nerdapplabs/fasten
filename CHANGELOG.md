@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ sys lines keep the SDK's own keys
+
+- A log field named `shape`, `level`, `event`, `request_id`, `service_id`,
+  `tenant_id` or `timestamp` is left out of the sys line and the sys ring.
+  Each of those keys appears once and holds the SDK's value; before, the
+  line could carry the key twice.
+- A sys row's `tenant_id` always comes from the engine.
+
 ### Changed: a row the database refuses is dead-lettered at once
 
 - In queue mode, a store error that means the row itself can never be
