@@ -107,35 +107,35 @@ public:
         }
 
         int idx = 1;
-        sqlite3_bind_text (stmt_, idx++, row.id.c_str(),             -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.origin_id.c_str(),      -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.id.data(), static_cast<int>(row.id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.origin_id.data(), static_cast<int>(row.origin_id.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt_, idx++, seq);
-        sqlite3_bind_text (stmt_, idx++, row.timestamp.c_str(),      -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.code.c_str(),           -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.action.c_str(),         -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.severity.c_str(),       -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.service_id.c_str(),     -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt_, idx++, row.source_node_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.timestamp.data(), static_cast<int>(row.timestamp.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.code.data(), static_cast<int>(row.code.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.action.data(), static_cast<int>(row.action.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.severity.data(), static_cast<int>(row.severity.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.service_id.data(), static_cast<int>(row.service_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt_, idx++, row.source_node_id.data(), static_cast<int>(row.source_node_id.size()), SQLITE_TRANSIENT);
 
         if (row.tenant_id.empty())
             sqlite3_bind_null(stmt_, idx++);
         else
-            sqlite3_bind_text(stmt_, idx++, row.tenant_id.c_str(),   -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_, idx++, row.tenant_id.data(), static_cast<int>(row.tenant_id.size()), SQLITE_TRANSIENT);
 
-        sqlite3_bind_text(stmt_, idx++, row.actor.c_str(),      -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.actor_kind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.target.c_str(),     -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.category.c_str(),   -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.domain.c_str(),     -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.method.c_str(),     -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, row.request_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_, idx++, detail_json.c_str(),    -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.actor.data(), static_cast<int>(row.actor.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.actor_kind.data(), static_cast<int>(row.actor_kind.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.target.data(), static_cast<int>(row.target.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.category.data(), static_cast<int>(row.category.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.domain.data(), static_cast<int>(row.domain.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.method.data(), static_cast<int>(row.method.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, row.request_id.data(), static_cast<int>(row.request_id.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt_, idx++, detail_json.data(), static_cast<int>(detail_json.size()), SQLITE_TRANSIENT);
         sqlite3_bind_int (stmt_, idx++, pii_int);
 
         if (row.shipped_at.empty())
             sqlite3_bind_null(stmt_, idx++);
         else
-            sqlite3_bind_text(stmt_, idx++, row.shipped_at.c_str(),  -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt_, idx++, row.shipped_at.data(), static_cast<int>(row.shipped_at.size()), SQLITE_TRANSIENT);
 
         int step = sqlite3_step(stmt_);
         sqlite3_reset(stmt_);
@@ -145,6 +145,24 @@ public:
             std::string msg = sqlite3_errmsg(db_);
             if (allocate) rollback();
             throw std::runtime_error("fasten SqliteStore insert: " + msg);
+        }
+        // INSERT OR IGNORE wrote nothing. A retry of this same row is fine;
+        // otherwise the id is held by a different row, or another unique
+        // index (such as a node's seq) refused it.
+        if (sqlite3_changes(db_) == 0) {
+            int held = 0;
+            try {
+                held = stored_row_matches(row);
+            } catch (...) {
+                if (allocate) rollback();  // else the connection stays in the transaction
+                throw;
+            }
+            if (held != 1) {
+                if (allocate) rollback();
+                throw InsertRejected("fasten SqliteStore insert: row " + row.id + " not written: " +
+                    (held == 0 ? "the id is held by a different row"
+                               : "another unique index refused it (a taken node seq?)"));
+            }
         }
         if (allocate) {
             try {
@@ -279,9 +297,48 @@ private:
             throw std::runtime_error(
                 std::string("fasten SqliteStore next seq: ") + sqlite3_errmsg(db_));
         sqlite3_bind_text(q, 1, node.c_str(), -1, SQLITE_TRANSIENT);
-        int64_t seq = sqlite3_step(q) == SQLITE_ROW ? sqlite3_column_int64(q, 0) : 1;
+        if (sqlite3_step(q) != SQLITE_ROW) {
+            std::string msg = sqlite3_errmsg(db_);
+            sqlite3_finalize(q);
+            throw std::runtime_error("fasten SqliteStore next seq: " + msg);
+        }
+        int64_t seq = sqlite3_column_int64(q, 0);
         sqlite3_finalize(q);
         return seq;
+    }
+
+    // 1 when the row stored under row.id is this row (by the columns that tell
+    // two rows apart and never change on a retry), 0 when it is a different
+    // row, -1 when no row has this id.
+    int stored_row_matches(const Row& row) {
+        const std::string sql = "SELECT code, request_id, target, actor, timestamp FROM " +
+                                table_ + " WHERE id = ?";
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &q, nullptr) != SQLITE_OK)
+            throw std::runtime_error(
+                std::string("fasten SqliteStore id check: ") + sqlite3_errmsg(db_));
+        sqlite3_bind_text(q, 1, row.id.data(), static_cast<int>(row.id.size()), SQLITE_TRANSIENT);
+        auto col = [&](int i) {
+            const unsigned char* t = sqlite3_column_text(q, i);
+            return t ? std::string(reinterpret_cast<const char*>(t),
+                                   static_cast<size_t>(sqlite3_column_bytes(q, i)))
+                     : std::string();
+        };
+        // Anything but a row or the end (BUSY, an I/O error) is thrown, so
+        // the insert is retried rather than the row dead-lettered.
+        const int rc = sqlite3_step(q);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            std::string msg = sqlite3_errmsg(db_);
+            sqlite3_finalize(q);
+            throw std::runtime_error("fasten SqliteStore id check: " + msg);
+        }
+        int held = -1;
+        if (rc == SQLITE_ROW) {
+            held = col(0) == row.code && col(1) == row.request_id && col(2) == row.target &&
+                   col(3) == row.actor && col(4) == row.timestamp;
+        }
+        sqlite3_finalize(q);
+        return held;
     }
 
     static bool is_valid_identifier(const std::string& s) {

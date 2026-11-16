@@ -3,10 +3,14 @@
 #include "fasten.hpp"
 #include "fasten_store_sqlite.hpp"
 
+#include <algorithm>
 #include <cassert>
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #endif
 #include <cstdio>
 #include <iostream>
@@ -246,6 +250,133 @@ void test_two_stores_one_node_get_distinct_seqs() {
     std::cout << "  test_two_stores_one_node_get_distinct_seqs: PASS\n";
 }
 
+int count_rows(const std::string& path) {
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM audit_log", -1, &q, nullptr);
+    int n = sqlite3_step(q) == SQLITE_ROW ? sqlite3_column_int(q, 0) : -1;
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    return n;
+}
+
+// A different row with an id already stored is rejected, not dropped while
+// the insert reports success. Both insert paths: a given seq and seq 0.
+void test_id_held_by_a_different_row_is_rejected() {
+    const std::string path = "/tmp/fasten_dupid_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        auto first = make_row("evt-dup-1", "TEST_DUP");
+        store.insert(first);
+        for (int64_t seq : {int64_t(7), int64_t(0)}) {
+            auto other = make_row("evt-dup-1", "TEST_DUP");
+            other.request_id    = "req-other";
+            other.monotonic_seq = seq;
+            bool rejected = false;
+            try {
+                store.insert(other);
+            } catch (const fasten::InsertRejected&) {
+                rejected = true;
+            }
+            assert(rejected);
+        }
+        store.insert(first);  // the same row again is still fine
+        auto next = make_row("evt-dup-2", "TEST_DUP");
+        next.monotonic_seq = 0;
+        store.insert(next);   // the rolled-back transaction left the store usable
+    }
+    assert(count_rows(path) == 2);
+    std::remove(path.c_str());
+    std::cout << "  test_id_held_by_a_different_row_is_rejected: PASS\n";
+}
+
+// A table with a unique (node, seq) index, as the Go store creates: a fresh
+// id at a taken seq is refused by that index, and the error says so.
+void test_taken_seq_is_named_in_the_error() {
+    const std::string path = "/tmp/fasten_seqclash_" + fasten::mint_id() + ".db";
+    {
+        fasten::SqliteStore store(path);
+        store.insert(make_row("evt-clash-1", "TEST_CLASH"));
+    }
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_exec(db, "CREATE UNIQUE INDEX uq_audit_log_node_seq ON audit_log (source_node_id, monotonic_seq)",
+                 nullptr, nullptr, nullptr);
+    sqlite3_close(db);
+    {
+        fasten::SqliteStore store(path);
+        std::string msg;
+        try {
+            store.insert(make_row("evt-clash-2", "TEST_CLASH"));  // seq 1 again
+        } catch (const fasten::InsertRejected& e) {
+            msg = e.what();
+        }
+        assert(msg.find("another unique index") != std::string::npos);
+    }
+    assert(count_rows(path) == 1);
+    std::remove(path.c_str());
+    std::cout << "  test_taken_seq_is_named_in_the_error: PASS\n";
+}
+
+// Text with a NUL is stored whole, as in the Python, Go and fasten-core
+// SQLite stores, and a retry of the same row is not mistaken for another.
+void test_text_with_a_nul_byte_is_kept_whole() {
+    const std::string path = "/tmp/fasten_cpp_nul.db";
+    std::remove(path.c_str());
+    {
+        fasten::SqliteStore store(path);
+        auto row = make_row("evt-nul-1", "TEST_NUL");
+        row.target = std::string("a\0b", 3);
+        store.insert(row);
+        store.insert(row);
+    }
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db, "SELECT length(CAST(target AS BLOB)) FROM audit_log", -1, &q, nullptr);
+    assert(sqlite3_step(q) == SQLITE_ROW);
+    assert(sqlite3_column_int(q, 0) == 3);
+    assert(sqlite3_step(q) == SQLITE_DONE);
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    std::remove(path.c_str());
+    std::cout << "  test_text_with_a_nul_byte_is_kept_whole: PASS\n";
+}
+
+void test_minted_ids_do_not_repeat() {
+    std::vector<std::string> ids;
+    for (int i = 0; i < 20000; ++i) ids.push_back(fasten::detail_::mint_id_bytes(10));
+    std::sort(ids.begin(), ids.end());
+    assert(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+    std::cout << "  test_minted_ids_do_not_repeat: PASS\n";
+}
+
+#ifndef _WIN32
+// A child forked after ids were minted draws different ids from its parent.
+void test_forked_child_mints_different_ids() {
+    fasten::detail_::mint_id_bytes(10);
+    int fds[2];
+    assert(pipe(fds) == 0);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const std::string id = fasten::detail_::mint_id_bytes(10);
+        ssize_t n = write(fds[1], id.data(), id.size());
+        _exit(n == static_cast<ssize_t>(id.size()) ? 0 : 1);
+    }
+    close(fds[1]);
+    const std::string parent = fasten::detail_::mint_id_bytes(10);
+    char buf[32] = {};
+    ssize_t n = read(fds[0], buf, sizeof(buf));
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    assert(n == 20 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(std::string(buf, 20) != parent);
+    std::cout << "  test_forked_child_mints_different_ids: PASS\n";
+}
+#endif
+
 #ifndef _WIN32
 // Under the usual 022 umask SQLite alone would create these 0644.
 int file_mode(const std::string& path) {
@@ -399,7 +530,12 @@ int main() {
     test_next_seq_uses_index();
     test_failed_commit_does_not_wedge_the_store();
     test_two_stores_one_node_get_distinct_seqs();
+    test_id_held_by_a_different_row_is_rejected();
+    test_taken_seq_is_named_in_the_error();
+    test_text_with_a_nul_byte_is_kept_whole();
+    test_minted_ids_do_not_repeat();
 #ifndef _WIN32
+    test_forked_child_mints_different_ids();
     test_new_file_and_wal_are_0600();
     test_existing_file_keeps_its_mode();
     test_file_uri_is_0600();
