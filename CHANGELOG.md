@@ -6,6 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: C++ sys lines keep the SDK's own keys
+
+- A log field named `shape`, `level`, `event`, `service_id` or `timestamp`
+  is left out of the sys line and the sys ring, which hold the SDK's
+  values. Before, the line could carry the key twice.
+- A `request_id` field is the line's request_id, as in the other SDKs, and
+  is written once.
+- The engine's `tenant_id` wins over a `tenant_id` field; with no engine
+  tenant, the field's tenant is used, as in Go and Python.
+- Sys ring rows carry `service_id` and `timestamp`, as the line does.
+
 ### Changed: a row the database refuses is dead-lettered at once
 
 - In queue mode, a store error that means the row itself can never be
