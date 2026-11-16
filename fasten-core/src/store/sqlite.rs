@@ -415,6 +415,7 @@ impl Store for SqliteStore {
         before: &str,
         codes: &[String],
     ) -> Result<RedactionCandidates, Error> {
+        let before = purge_cutoff(before)?;
         let mut codes: Vec<&String> = codes.iter().collect();
         codes.sort();
         codes.dedup();
@@ -764,6 +765,21 @@ mod tests {
             assert!(matches!(store.purge(bad, false), Err(Error::InvalidTimestamp(_))), "{bad:?}");
         }
         assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+    }
+
+    // The redaction cutoff is checked like the purge cutoff: "tomorrow" as
+    // text sorts after every row and would pick all of them.
+    #[test]
+    fn redaction_rejects_a_cutoff_that_is_not_a_timestamp() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        store.insert(&make_row("evt-cut-002", "TEST")).unwrap();
+        let codes = vec!["TEST".to_string()];
+        for bad in ["tomorrow", "", "2026-01-01T00:00:00"] {
+            assert!(
+                matches!(store.list_redaction_candidates(bad, &codes), Err(Error::InvalidTimestamp(_))),
+                "{bad:?}"
+            );
+        }
     }
 
     // An offset, a lowercase `t` and a date all mean 2026-01-01T00:00Z: the

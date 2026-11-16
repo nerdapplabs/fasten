@@ -331,6 +331,22 @@ void test_text_with_a_nul_byte_is_rejected(const std::string& dsn) {
     std::cout << "  test_text_with_a_nul_byte_is_rejected: PASS\n";
 }
 
+// A row the server refuses (here SQLSTATE 54000, a request_id too long for
+// its index) is InsertRejected, so the drainer dead-letters it at once.
+void test_refused_row_is_rejected(const std::string& dsn) {
+    fasten::PostgresStore store(dsn, "audit_log_cpp_refused");
+    auto row = make_row("evt-cpp-pg-refused-001", "TEST_REFUSED");
+    row.request_id = fasten::detail_::mint_id_bytes(5000);  // 10000 random hex chars
+    bool rejected = false;
+    try {
+        store.insert(row);
+    } catch (const fasten::InsertRejected& e) {
+        rejected = std::string(e.what()).find("SQLSTATE 54000") != std::string::npos;
+    }
+    assert(rejected);
+    std::cout << "  test_refused_row_is_rejected: PASS\n";
+}
+
 int main() {
     std::cout << "=== postgres_store_smoke ===\n";
 
@@ -357,6 +373,7 @@ int main() {
     test_redaction(dsn);
     test_id_held_by_a_different_row_is_rejected(dsn);
     test_text_with_a_nul_byte_is_rejected(dsn);
+    test_refused_row_is_rejected(dsn);
 
     std::cout << "All PostgreSQL store smoke tests passed.\n";
     return 0;

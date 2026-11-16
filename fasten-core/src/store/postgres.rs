@@ -426,6 +426,7 @@ impl Store for PostgresStore {
         before: &str,
         codes: &[String],
     ) -> Result<RedactionCandidates, Error> {
+        let before = purge_cutoff(before)?;
         if codes.is_empty() {
             return Ok(RedactionCandidates::default());
         }

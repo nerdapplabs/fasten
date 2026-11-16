@@ -249,7 +249,17 @@ private:
         ExecStatusType status = PQresultStatus(res);
         if (status != PGRES_COMMAND_OK) {
             std::string msg = PQerrorMessage(conn_);
+            const char* state = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+            const std::string sqlstate = state ? state : "";
             PQclear(res);
+            // SQLSTATE class 22 (data exception), 23 (integrity violation)
+            // or 54 (program limit, such as a value too long for an index):
+            // the row can never be stored, so it is dead-lettered at once,
+            // as in the other SDKs. Anything else is retried.
+            const std::string cls = sqlstate.substr(0, 2);
+            if (cls == "22" || cls == "23" || cls == "54") {
+                throw InsertRejected("fasten PostgresStore insert: SQLSTATE " + sqlstate + ": " + msg);
+            }
             throw std::runtime_error("fasten PostgresStore insert: " + msg);
         }
         const bool inserted = std::string(PQcmdTuples(res)) != "0";

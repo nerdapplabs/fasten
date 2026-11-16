@@ -229,8 +229,8 @@ pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postg
     }
 }
 
-/// The purge cutoff as a canonical UTC timestamp (spec §4.3), which
-/// purge_sql compares with `timestamp` as text. Takes an RFC 3339 timestamp
+/// The purge or redaction cutoff as a canonical UTC timestamp (spec §4.3),
+/// which the stores compare with `timestamp` as text. Takes an RFC 3339 timestamp
 /// with any offset, or a date (midnight UTC); anything else is an
 /// InvalidTimestamp error. As given, an offset or a lowercase `t` sorts
 /// differently from the stored form and deletes too much, and a string

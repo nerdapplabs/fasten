@@ -48,6 +48,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 // libfasten_core C ABI, declared here so no extra header is needed.
 extern "C" {
@@ -334,21 +339,40 @@ inline std::string iso8601(std::chrono::system_clock::time_point tp) {
 
 inline std::string now_iso8601() { return iso8601(std::chrono::system_clock::now()); }
 
-// `bytes` random bytes as lowercase hex. The generator is seeded with
-// 256 bits from random_device plus the clock: one 32-bit random_device
-// value let two processes draw the same ids.
+inline long process_id_() {
+#ifdef _WIN32
+    return static_cast<long>(_getpid());
+#else
+    return static_cast<long>(getpid());
+#endif
+}
+
+// A generator seeded with 256 bits from random_device, the clock and the
+// process id: one 32-bit random_device value let two processes draw the
+// same ids.
+inline std::mt19937_64 seeded_rng_() {
+    std::random_device rd;
+    const auto now = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    std::seed_seq seed{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd(),
+                       static_cast<unsigned>(now), static_cast<unsigned>(now >> 32),
+                       static_cast<unsigned>(process_id_())};
+    return std::mt19937_64(seed);
+}
+
+// `bytes` random bytes as lowercase hex. The generator is reseeded in a
+// forked child: a prefork server that calls init() and then forks would
+// otherwise give every child the same ids.
 inline std::string mint_id_bytes(size_t bytes) {
     static std::mutex mu;
-    static std::mt19937_64 rng = [] {
-        std::random_device rd;
-        const auto now = static_cast<uint64_t>(
-            std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        std::seed_seq seed{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd(),
-                           static_cast<unsigned>(now), static_cast<unsigned>(now >> 32)};
-        return std::mt19937_64(seed);
-    }();
+    static std::mt19937_64 rng = seeded_rng_();
+    static long rng_pid = process_id_();
     static const char hex[] = "0123456789abcdef";
     std::lock_guard<std::mutex> lk(mu);
+    if (process_id_() != rng_pid) {
+        rng = seeded_rng_();
+        rng_pid = process_id_();
+    }
     std::string out;
     out.reserve(bytes * 2);
     for (size_t i = 0; i < bytes; ++i) {
@@ -697,8 +721,9 @@ struct InsertRejected : std::runtime_error {
 
 namespace detail_ {
 
-// A store binds text up to the first NUL byte, and Postgres refuses NUL in
-// text, so a row with one is rejected rather than stored cut short.
+// Postgres refuses NUL in text, so its store rejects a row with one rather
+// than store it cut short. The SQLite store binds text with its length and
+// keeps it whole.
 inline void reject_nul_text(const char* store, const Row& row, const std::string& detail_json) {
     const std::pair<const char*, const std::string*> fields[] = {
         {"id", &row.id}, {"origin_id", &row.origin_id}, {"timestamp", &row.timestamp},

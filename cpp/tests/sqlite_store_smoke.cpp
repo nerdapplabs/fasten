@@ -8,6 +8,9 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #endif
 #include <cstdio>
 #include <iostream>
@@ -316,18 +319,29 @@ void test_taken_seq_is_named_in_the_error() {
     std::cout << "  test_taken_seq_is_named_in_the_error: PASS\n";
 }
 
-void test_text_with_a_nul_byte_is_rejected() {
-    fasten::SqliteStore store(":memory:");
-    auto row = make_row("evt-nul-1", "TEST_NUL");
-    row.target = std::string("a\0b", 3);
-    bool rejected = false;
-    try {
+// Text with a NUL is stored whole, as in the Python, Go and fasten-core
+// SQLite stores, and a retry of the same row is not mistaken for another.
+void test_text_with_a_nul_byte_is_kept_whole() {
+    const std::string path = "/tmp/fasten_cpp_nul.db";
+    std::remove(path.c_str());
+    {
+        fasten::SqliteStore store(path);
+        auto row = make_row("evt-nul-1", "TEST_NUL");
+        row.target = std::string("a\0b", 3);
         store.insert(row);
-    } catch (const fasten::InsertRejected& e) {
-        rejected = std::string(e.what()).find("target") != std::string::npos;
+        store.insert(row);
     }
-    assert(rejected);
-    std::cout << "  test_text_with_a_nul_byte_is_rejected: PASS\n";
+    sqlite3* db = nullptr;
+    sqlite3_open(path.c_str(), &db);
+    sqlite3_stmt* q = nullptr;
+    sqlite3_prepare_v2(db, "SELECT length(CAST(target AS BLOB)) FROM audit_log", -1, &q, nullptr);
+    assert(sqlite3_step(q) == SQLITE_ROW);
+    assert(sqlite3_column_int(q, 0) == 3);
+    assert(sqlite3_step(q) == SQLITE_DONE);
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    std::remove(path.c_str());
+    std::cout << "  test_text_with_a_nul_byte_is_kept_whole: PASS\n";
 }
 
 void test_minted_ids_do_not_repeat() {
@@ -337,6 +351,31 @@ void test_minted_ids_do_not_repeat() {
     assert(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
     std::cout << "  test_minted_ids_do_not_repeat: PASS\n";
 }
+
+#ifndef _WIN32
+// A child forked after ids were minted draws different ids from its parent.
+void test_forked_child_mints_different_ids() {
+    fasten::detail_::mint_id_bytes(10);
+    int fds[2];
+    assert(pipe(fds) == 0);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const std::string id = fasten::detail_::mint_id_bytes(10);
+        ssize_t n = write(fds[1], id.data(), id.size());
+        _exit(n == static_cast<ssize_t>(id.size()) ? 0 : 1);
+    }
+    close(fds[1]);
+    const std::string parent = fasten::detail_::mint_id_bytes(10);
+    char buf[32] = {};
+    ssize_t n = read(fds[0], buf, sizeof(buf));
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    assert(n == 20 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(std::string(buf, 20) != parent);
+    std::cout << "  test_forked_child_mints_different_ids: PASS\n";
+}
+#endif
 
 #ifndef _WIN32
 // Under the usual 022 umask SQLite alone would create these 0644.
@@ -493,9 +532,10 @@ int main() {
     test_two_stores_one_node_get_distinct_seqs();
     test_id_held_by_a_different_row_is_rejected();
     test_taken_seq_is_named_in_the_error();
-    test_text_with_a_nul_byte_is_rejected();
+    test_text_with_a_nul_byte_is_kept_whole();
     test_minted_ids_do_not_repeat();
 #ifndef _WIN32
+    test_forked_child_mints_different_ids();
     test_new_file_and_wal_are_0600();
     test_existing_file_keeps_its_mode();
     test_file_uri_is_0600();
