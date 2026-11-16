@@ -1,0 +1,48 @@
+name: Set up Swift
+description: Install a Swift release from swift.org on Ubuntu 24.04 and check its signature.
+
+# The steps swift.org gives for installing a release tarball: import the
+# swift.org keys, check the tarball's signature, unpack it. The signature
+# must also come from the key given in key-fingerprint, not just any key in
+# the bundle.
+inputs:
+  version:
+    description: Swift release, for example 5.10.1
+    required: true
+  key-fingerprint:
+    description: Fingerprint of the swift.org key that signs this release
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Swift ${{ inputs.version }}
+      shell: bash
+      env:
+        SWIFT_VERSION: ${{ inputs.version }}
+        SWIFT_KEY_FINGERPRINT: ${{ inputs.key-fingerprint }}
+      run: |
+        set -euo pipefail
+        name="swift-${SWIFT_VERSION}-RELEASE-ubuntu24.04"
+        url="https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu2404/swift-${SWIFT_VERSION}-RELEASE/${name}.tar.gz"
+        want=$(echo "$SWIFT_KEY_FINGERPRINT" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+        cd "$RUNNER_TEMP"
+        curl -fsSL --retry 5 --retry-all-errors -o swift.tar.gz "$url"
+        curl -fsSL --retry 5 --retry-all-errors -o swift.tar.gz.sig "$url.sig"
+        curl -fsSL --compressed --retry 5 --retry-all-errors https://www.swift.org/keys/all-keys.asc | gpg --batch --quiet --import
+        gpg --batch --status-fd 3 --verify swift.tar.gz.sig swift.tar.gz 3> gpg-status
+        # gpg exits 0 for a good signature from a revoked key.
+        if grep -q '^\[GNUPG:\] REVKEYSIG ' gpg-status; then
+          echo "::error::Swift tarball is signed by a revoked key"
+          exit 1
+        fi
+        # The last field of VALIDSIG is the signing key's primary fingerprint.
+        # Every signature in the .sig must come from that key.
+        signer=$(awk '$2 == "VALIDSIG" { print $NF }' gpg-status | sort -u | paste -sd, -)
+        if [ "$signer" != "$want" ]; then
+          echo "::error::Swift tarball is signed by '${signer}', expected '${want}'"
+          exit 1
+        fi
+        tar -xzf swift.tar.gz
+        echo "$RUNNER_TEMP/$name/usr/bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/$name/usr/bin/swift" --version
