@@ -249,15 +249,16 @@ func (d *cFastenDrainer) insert(rowJSON string) C.int32_t {
 
 // rejectsRow reports whether the store refused the row itself, so retrying
 // cannot help: a Postgres error in SQLSTATE class 22 (data exception), 23
-// (integrity violation), 42 (syntax or access rule) or 54 (program limit,
-// such as a value too long for an index), from lib/pq or pgx, or a SQLite
-// constraint or datatype mismatch (modernc.org/sqlite). Same classes as
-// fasten-core's sqlstate_rejects_row.
+// (integrity violation) or 54 (program limit, such as a value too long for
+// an index), from lib/pq or pgx, or a SQLite constraint or datatype mismatch
+// (modernc.org/sqlite). Class 42 is retried: a revoked grant or a renamed
+// table is the deploy, not the row. Same classes as fasten-core's
+// sqlstate_rejects_row.
 func rejectsRow(err error) bool {
 	var pg interface{ SQLState() string }
 	if errors.As(err, &pg) {
 		s := pg.SQLState()
-		for _, class := range []string{"22", "23", "42", "54"} {
+		for _, class := range []string{"22", "23", "54"} {
 			if strings.HasPrefix(s, class) {
 				return true
 			}

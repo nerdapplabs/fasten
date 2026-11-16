@@ -252,10 +252,11 @@ class _QueueDrainer:
 
 
 # SQLSTATE classes that mean the statement can never succeed for this row:
-# 22 data exception, 23 integrity constraint violation, 42 syntax error or
-# access rule violation, 54 program limit exceeded (for example a value too
-# long for an index). Same list as fasten-core's sqlstate_rejects_row.
-_REJECTING_SQLSTATE_CLASSES = ("22", "23", "42", "54")
+# 22 data exception, 23 integrity constraint violation, 54 program limit
+# exceeded (for example a value too long for an index). Class 42 is retried:
+# a revoked grant or a renamed table is the deploy, not the row. Same list
+# as fasten-core's sqlstate_rejects_row.
+_REJECTING_SQLSTATE_CLASSES = ("22", "23", "54")
 
 
 def _rejects_row(exc: BaseException) -> bool:

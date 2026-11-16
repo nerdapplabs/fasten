@@ -15,9 +15,9 @@ class _PgError(Exception):
 
 
 def test_rejecting_sqlstate_classes():
-    for code in ("22021", "23505", "42703", "54000"):
+    for code in ("22021", "23505", "54000"):
         assert _rejects_row(_PgError(code)), code
-    for code in ("08006", "40001", "53300", "57P01", None):
+    for code in ("08006", "40001", "42501", "42P01", "53300", "57P01", None):
         assert not _rejects_row(_PgError(code)), code
 
 

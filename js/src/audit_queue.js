@@ -14,16 +14,19 @@ const DEGRADED_AFTER = 5;
 
 // Whether a store error means the row itself was refused, so retrying
 // cannot help. `pg` puts the SQLSTATE in `code`: class 22 is a data
-// exception, 23 an integrity violation, 42 a syntax or access rule error,
-// 54 a program limit (for example a value too long for an index). Same
-// classes as fasten-core's sqlstate_rejects_row.
+// exception, 23 an integrity violation, 54 a program limit (for example a
+// value too long for an index). Class 42 is retried: a revoked grant or a
+// renamed table is the deploy, not the row. SQLite drivers put
+// SQLITE_CONSTRAINT (with its extended forms such as
+// SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`. Same rules as
+// fasten-core's sqlstate_rejects_row and the Python and Go drainers.
 export function rejectsRow(err) {
 	const code = err?.code;
-	return (
-		typeof code === "string" &&
-		code.length === 5 &&
-		["22", "23", "42", "54"].includes(code.slice(0, 2))
-	);
+	if (typeof code !== "string") return false;
+	if (code.startsWith("SQLITE_CONSTRAINT") || code === "SQLITE_MISMATCH") {
+		return true;
+	}
+	return code.length === 5 && ["22", "23", "54"].includes(code.slice(0, 2));
 }
 
 export class AuditStoreError extends Error {

@@ -5,30 +5,25 @@
 """
 from __future__ import annotations
 
-import re
 import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from ..canonical_ts import canonical_now
-from ..context import _request_id, current_request_id, mint_id, _set_request_id
+from ..context import _request_id, current_request_id, mint_id, _set_request_id, usable_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 # A client's X-Request-ID is used only when it is 1 to 128 characters of
-# letters, digits, ".", "_" and "-". Anything else gets a new id: the value
-# is stored and indexed with every row of the request.
-_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
-
-
+# letters, digits, ".", "_" and "-" (see context.usable_request_id).
+# Anything else gets a new id.
 def _client_request_id(raw: bytes) -> str:
     """The header's value if it is a usable request id, else ""."""
     try:
-        rid = raw.decode("ascii")
+        return usable_request_id(raw.decode("ascii"))
     except UnicodeDecodeError:
         return ""
-    return rid if _REQUEST_ID_RE.match(rid) else ""
 
 
 class RequestIDMiddleware:

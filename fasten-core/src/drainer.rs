@@ -467,11 +467,13 @@ fn rejected(e: &Error, row: &Row) -> bool {
 }
 
 /// SQLSTATE classes that mean the statement can never succeed for this row:
-/// 22 data exception, 23 integrity constraint violation, 42 syntax error or
-/// access rule violation, 54 program limit exceeded (for example a value too
-/// long for an index). Connection and resource errors are retried.
+/// 22 data exception, 23 integrity constraint violation, 54 program limit
+/// exceeded (for example a value too long for an index). Class 42 (syntax
+/// error or access rule violation) is retried: it is usually the deploy, a
+/// revoked grant or a table renamed mid-migration, not the row. Connection
+/// and resource errors are retried too.
 pub fn sqlstate_rejects_row(sqlstate: &str) -> bool {
-    matches!(sqlstate.get(..2), Some("22" | "23" | "42" | "54"))
+    matches!(sqlstate.get(..2), Some("22" | "23" | "54"))
 }
 
 /// SQLite's constraint and datatype-mismatch errors.
@@ -788,10 +790,10 @@ mod stop_tests {
 
     #[test]
     fn sqlstate_classes_that_reject_a_row() {
-        for code in ["22021", "23505", "42703", "54000"] {
+        for code in ["22021", "23505", "54000"] {
             assert!(sqlstate_rejects_row(code), "{code}");
         }
-        for code in ["08006", "40001", "53300", "57P01", "", "2"] {
+        for code in ["08006", "40001", "42501", "42P01", "53300", "57P01", "", "2"] {
             assert!(!sqlstate_rejects_row(code), "{code}");
         }
     }

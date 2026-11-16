@@ -167,8 +167,10 @@ test('a rejected row is dead-lettered at once', async () => {
 });
 
 test('rejectsRow reads the SQLSTATE class', () => {
-    for (const code of ['22021', '23505', '42703', '54000']) assert.equal(rejectsRow({ code }), true, code);
-    for (const code of ['08006', '40001', '53300', '57P01', 'ECONNRESET', undefined, 54000]) {
+    for (const code of ['22021', '23505', '54000', 'SQLITE_CONSTRAINT', 'SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_MISMATCH']) {
+        assert.equal(rejectsRow({ code }), true, code);
+    }
+    for (const code of ['08006', '40001', '42501', '42P01', '53300', '57P01', 'SQLITE_BUSY', 'ECONNRESET', undefined, 54000]) {
         assert.equal(rejectsRow({ code }), false, String(code));
     }
 });
