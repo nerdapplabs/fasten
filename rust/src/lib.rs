@@ -267,6 +267,11 @@ pub enum Error {
     InvalidStrategy(String),
     #[error("audit store: {0}")]
     AuditStoreInsert(String),
+    /// The store refused the row itself (bad data, a constraint, a size
+    /// limit), so retrying cannot help. In queue mode the row is
+    /// dead-lettered at once. A custom [`AuditStore`] can return it too.
+    #[error("audit store rejected the row: {0}")]
+    AuditStoreRejected(String),
     #[error("not supported: {0}")]
     Unsupported(String),
     #[error("{0}")]

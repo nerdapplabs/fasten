@@ -251,9 +251,22 @@ class _QueueDrainer:
             self.settle(call, result)
 
 
+# SQLSTATE classes that mean the statement can never succeed for this row:
+# 22 data exception, 23 integrity constraint violation, 54 program limit
+# exceeded (for example a value too long for an index). Class 42 is retried:
+# a revoked grant or a renamed table is the deploy, not the row. Same list
+# as fasten-core's sqlstate_rejects_row.
+_REJECTING_SQLSTATE_CLASSES = ("22", "23", "54")
+
+
 def _rejects_row(exc: BaseException) -> bool:
     """The store refused the row itself, so retrying cannot help. sqlite3 and
-    psycopg raise the DB-API DataError / IntegrityError for that."""
+    psycopg raise the DB-API DataError / IntegrityError for that; psycopg
+    also gives the SQLSTATE, which covers errors it files under
+    OperationalError, such as a value too long for an index."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str) and sqlstate[:2] in _REJECTING_SQLSTATE_CLASSES:
+        return True
     return any(c.__name__ in ("DataError", "IntegrityError") for c in type(exc).__mro__)
 
 

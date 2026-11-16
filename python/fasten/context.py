@@ -1,6 +1,7 @@
 """The ambient ``request_id``, held in a contextvar so async tasks inherit it."""
 from __future__ import annotations
 
+import re
 import contextvars
 import uuid
 from contextlib import contextmanager
@@ -60,6 +61,19 @@ def current_request_id() -> Optional[str]:
 def _set_request_id(request_id: str) -> contextvars.Token:
     """Low-level: set request_id and return a reset token. Prefer with_request_id()."""
     return _request_id.set(request_id)
+
+
+# A request id from outside (an HTTP header, an MQTT payload) is used only
+# when it is 1 to 128 characters of letters, digits, ".", "_" and "-": the
+# value is stored and indexed with every row of the request.
+_USABLE_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+
+
+def usable_request_id(value: object) -> str:
+    """``value`` if it is a usable request id from outside, else ""."""
+    if isinstance(value, str) and _USABLE_REQUEST_ID_RE.match(value):
+        return value
+    return ""
 
 
 @contextmanager

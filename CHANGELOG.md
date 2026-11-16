@@ -6,6 +6,26 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: a row the database refuses is dead-lettered at once
+
+- In queue mode, a store error that means the row itself can never be
+  stored is no longer retried: Postgres SQLSTATE classes 22 (data
+  exception), 23 (integrity violation) and 54 (program limit, such as a
+  value too long for an index), and SQLite constraint and datatype-mismatch
+  errors. The row is dead-lettered after one attempt, with the usual
+  dead-letter event, and the rows behind it are stored. This applies to the
+  fasten-core stores and to the Python, Go, JS and Rust SDKs; other errors,
+  including class 42 (a revoked grant, a renamed table), are retried as
+  before. C++ and Swift still retry a refused row.
+- Rust: a custom `AuditStore` can return the new
+  `Error::AuditStoreRejected` to say the same.
+- Python: the Postgres stores reconnect only when the connection was lost,
+  not on every `OperationalError`.
+- Python and Go: `RequestIDMiddleware` / `RequestID` use a client's
+  `X-Request-ID` only when it is 1 to 128 characters of letters, digits,
+  `.`, `_` and `-`; otherwise the request gets a new id. The Python MQTT
+  shim applies the same rule to `_req`.
+
 ### Changed: the Go and C++ readers need an auth choice
 
 - Go: `NewReader` takes `WithAuth(middleware)`, which puts every reader

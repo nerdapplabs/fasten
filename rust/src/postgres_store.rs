@@ -43,6 +43,10 @@ fn pg_err(e: pg::Error) -> crate::Error {
         Some(db) => format!("{e}: {}", db.message()),
         None => e.to_string(),
     };
+    // Bad data, a constraint or a size limit: the row can never be stored.
+    if e.code().is_some_and(|c| fasten_core::drainer::sqlstate_rejects_row(c.code())) {
+        return crate::Error::AuditStoreRejected(msg);
+    }
     crate::Error::AuditStoreInsert(msg)
 }
 

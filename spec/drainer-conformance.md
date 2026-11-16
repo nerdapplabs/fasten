@@ -95,12 +95,23 @@ successful insert, so the next failure burst can emit
 **Rejected rows.** When the store rejects the row itself (bad content,
 a constraint it can never meet), retrying cannot help, and the row would
 hold up every row behind it for the whole retry budget. Such a failure
-SHOULD dead-letter the row on that attempt. Over the shared C ABI, an insert
-callback signals it by returning a negative code (`FASTEN_INSERT_REJECTED`);
-any positive code is retried as usual. Only insert callbacks can signal
-this for now: the native stores, the Rust SDK's store adapter and the JS
-and Swift drainers cannot tell a rejected row from a failed write yet, so
-they retry it.
+SHOULD dead-letter the row on that attempt. These are rejected rows:
+
+- a Postgres error in SQLSTATE class 22 (data exception), 23 (integrity
+  constraint violation) or 54 (program limit exceeded, such as a value too
+  long for an index);
+- a SQLite constraint or datatype-mismatch error.
+
+Class 42 (syntax error or access rule violation) is retried: it usually
+means the deploy, such as a revoked grant or a table renamed mid-migration,
+which a retry can outlast. Connection and resource errors are retried too.
+
+Over the shared C ABI, an insert callback signals a rejected row by
+returning a negative code (`FASTEN_INSERT_REJECTED`); any positive code is
+retried as usual. fasten-core's native stores, the Rust SDK's Postgres
+store and store adapter, and the Python, Go and JS drainers apply these
+rules. The C++ and Swift SDKs do not read a SQLSTATE yet, so they retry a
+rejected row until `max_attempts`.
 
 ---
 

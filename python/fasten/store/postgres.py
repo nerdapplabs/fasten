@@ -19,6 +19,15 @@ from ..redact import describe_error
 
 logger = logging.getLogger(__name__)
 
+
+def _connection_lost(exc: BaseException) -> bool:
+    """Whether a psycopg error means the connection is gone, so a reconnect
+    can help. An error the server answered with a SQLSTATE outside class 08
+    (connection exception) and 57 (operator intervention, such as a
+    shutdown) came over a working connection."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    return not isinstance(sqlstate, str) or sqlstate[:2] in ("08", "57")
+
 if TYPE_CHECKING:
     from .repo import IngestResult
 
@@ -197,6 +206,8 @@ class PostgresStore:
         try:
             return _call(self._connect())
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            if not _connection_lost(exc):
+                raise
             logger.warning(
                 "fasten audit store connection lost (%s); reconnecting and retrying once",
                 describe_error(exc),

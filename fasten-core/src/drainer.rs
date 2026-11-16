@@ -448,15 +448,41 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
 }
 
 /// The store refused the row itself, so retrying cannot help: an insert
-/// callback returned a negative code (`FASTEN_INSERT_REJECTED`), or a row
-/// with an explicit seq clashed. A seq-0 row gets a fresh seq on the next
-/// attempt, so its clash is retried.
+/// callback returned a negative code (`FASTEN_INSERT_REJECTED`), a store
+/// reported `RowRejected`, the database refused the data (see
+/// `sqlstate_rejects_row` and `sqlite_rejects_row`), or a row with an
+/// explicit seq clashed. A seq-0 row gets a fresh seq on the next attempt,
+/// so its clash is retried.
 fn rejected(e: &Error, row: &Row) -> bool {
     match e {
         Error::CallbackFailed(rc) => *rc < 0,
+        Error::RowRejected(_) => true,
         Error::SeqClash(_) => row.monotonic_seq != 0,
+        #[cfg(feature = "postgres")]
+        Error::Postgres(pg) => pg.code().is_some_and(|c| sqlstate_rejects_row(c.code())),
+        #[cfg(feature = "sqlite")]
+        Error::Sqlite(e) => sqlite_rejects_row(e),
         _ => false,
     }
+}
+
+/// SQLSTATE classes that mean the statement can never succeed for this row:
+/// 22 data exception, 23 integrity constraint violation, 54 program limit
+/// exceeded (for example a value too long for an index). Class 42 (syntax
+/// error or access rule violation) is retried: it is usually the deploy, a
+/// revoked grant or a table renamed mid-migration, not the row. Connection
+/// and resource errors are retried too.
+pub fn sqlstate_rejects_row(sqlstate: &str) -> bool {
+    matches!(sqlstate.get(..2), Some("22" | "23" | "54"))
+}
+
+/// SQLite's constraint and datatype-mismatch errors.
+#[cfg(feature = "sqlite")]
+fn sqlite_rejects_row(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation | rusqlite::ErrorCode::TypeMismatch)
+    )
 }
 
 /// The variant name, e.g. `CallbackFailed`, or the type a `Store` error carries.
@@ -720,6 +746,56 @@ mod stop_tests {
         fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
         fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
         fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    struct RejectingStore(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Store for RejectingStore {
+        fn insert(&self, row: &Row) -> Result<(), crate::error::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if row.id == "bad" {
+                return Err(crate::error::Error::RowRejected("DataError".into()));
+            }
+            Ok(())
+        }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// A row the store rejects is dead-lettered after one attempt, and the
+    /// rows behind it are stored.
+    #[test]
+    fn rejected_row_is_dead_lettered_at_once() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = Drainer::new(Box::new(RejectingStore(attempts.clone())), DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_secs(60),
+            retry_max: Duration::from_secs(60),
+            retry_jitter: false,
+            max_attempts: 50,
+        });
+        assert!(d.enqueue(Row { id: "bad".into(), ..Row::default() }));
+        assert!(d.enqueue(Row { id: "good".into(), ..Row::default() }));
+        assert!(d.flush(Duration::from_secs(5)), "the queue did not drain");
+        let stats = d.stats();
+        assert_eq!(stats.dead_lettered_total, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "one attempt per row");
+        d.stop(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn sqlstate_classes_that_reject_a_row() {
+        for code in ["22021", "23505", "54000"] {
+            assert!(sqlstate_rejects_row(code), "{code}");
+        }
+        for code in ["08006", "40001", "42501", "42P01", "53300", "57P01", "", "2"] {
+            assert!(!sqlstate_rejects_row(code), "{code}");
+        }
     }
 
     /// A `Store` error is retried and reported by the type it carries.

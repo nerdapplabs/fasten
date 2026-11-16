@@ -9,10 +9,21 @@ import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from ..canonical_ts import canonical_now
-from ..context import _request_id, current_request_id, mint_id, _set_request_id
+from ..context import _request_id, current_request_id, mint_id, _set_request_id, usable_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+# A client's X-Request-ID is used only when it is 1 to 128 characters of
+# letters, digits, ".", "_" and "-" (see context.usable_request_id).
+# Anything else gets a new id.
+def _client_request_id(raw: bytes) -> str:
+    """The header's value if it is a usable request id, else ""."""
+    try:
+        return usable_request_id(raw.decode("ascii"))
+    except UnicodeDecodeError:
+        return ""
 
 
 class RequestIDMiddleware:
@@ -30,7 +41,7 @@ class RequestIDMiddleware:
             return
 
         headers = dict(scope.get("headers", []))
-        rid = headers.get(self.HEADER, b"").decode() or mint_id()
+        rid = _client_request_id(headers.get(self.HEADER, b"")) or mint_id()
         token = _set_request_id(rid)
 
         async def send_wrapper(msg: dict[str, Any]) -> None:
