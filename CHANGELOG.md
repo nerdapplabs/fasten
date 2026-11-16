@@ -6,6 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Docs: security scope and reader authentication
+
+- `docs/security.md` and the README say which SDKs seal audit rows (Python
+  and Go, with a bundled audit store), what verification detects, and what
+  needs external checkpoints. Replication ingest is listed as a trust
+  boundary, here and in `spec/chain-replication.md` §4.
+- Reader authentication is documented for Go (`RequireBearer`) and C++ (the
+  `simplehttp::start` auth function), with the routes each SDK serves.
+- `SECURITY.md` says which dependency scans run in CI and which are run by
+  hand.
+
 ### Changed: `pii_in_detail` codes behave the same in every SDK
 
 - Swift: `emit` on a code with `piiInDetail` stores

@@ -102,6 +102,20 @@ FASTEN_SERVICE_ID=demo FASTEN_NODE_ID=host-01 go run server.go
 curl -X POST http://localhost:8080/users -d '{"email":"alice@example.com"}'
 ```
 
+## Serving the reader
+
+`fasten.NewReader()` returns an `http.Handler` with the reader routes
+(`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`,
+`/topology`). It has no authentication of its own, so wrap it:
+
+```go
+mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs",
+    fasten.RequireBearer("FASTEN_READER_TOKEN")(fasten.NewReader())))
+```
+
+`RequireBearer` requires `Authorization: Bearer <token>` and panics at
+startup when the variable is unset. Use your own middleware for other schemes.
+
 ## Reading logs back: whole record or recent window?
 
 Every reader response carries a per-stream `completeness` flag that answers

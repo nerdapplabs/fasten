@@ -27,6 +27,11 @@ One `request_id` ties them together. Every audit row carries 7 anchors (the
 and scheduler-fired jobs are included, along with a mountable HTTP reader
 API for querying the record back.
 
+Python and Go seal audit rows into a per-node hash chain when they write to
+a bundled audit store (SQLite or Postgres); JS, Rust, C++ and Swift write
+unsealed rows. [docs/security.md](docs/security.md) says what the chain
+detects, what it needs checkpoints for, and what is outside its scope.
+
 **Status: v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++ and
 Swift are beta. Nothing is published to PyPI, npm or crates.io yet; install
 from source.
