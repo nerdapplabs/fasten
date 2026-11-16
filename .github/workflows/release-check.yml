@@ -13,6 +13,8 @@ on:
       - 'fasten-core/**'
       - 'go/**'
       - 'rust-toolchain.toml'
+      - 'js/**'
+      - 'tests/integration/**'
       - 'LICENSE'
       - 'NOTICE'
   pull_request:
@@ -26,6 +28,8 @@ on:
       - 'fasten-core/**'
       - 'go/**'
       - 'rust-toolchain.toml'
+      - 'js/**'
+      - 'tests/integration/**'
       - 'LICENSE'
       - 'NOTICE'
 
@@ -36,7 +40,7 @@ jobs:
   reproducible:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Build twice and compare
         run: scripts/release/check-reproducible.sh
@@ -58,3 +62,27 @@ jobs:
 
       - name: GitHub release upload
         run: scripts/release/test-gh-release.sh
+
+  # The release workflow's install check: the npm tarball and the packaged
+  # crates, installed outside the repo, run the integration smoke.
+  install-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: node
+            image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
+          - package: rust
+            image: rust:1.90
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install bash and python3
+        if: ${{ matrix.package == 'node' }}
+        run: apk add --no-cache bash python3
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install the package and run the smoke
+        run: scripts/release/install-check.sh ${{ matrix.package }}

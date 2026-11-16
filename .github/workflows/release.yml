@@ -180,11 +180,12 @@ jobs:
       # Checked here so a release stops before anything is built or
       # published: fasten-core's version is new, or it is on crates.io with
       # the same files. The crates-io job checks again before it publishes.
-      # A dry run reports a difference as a warning.
+      # A tag that publishes nothing (a dry run, or a prerelease with
+      # PUBLISH_PRERELEASES unset) reports a difference as a warning.
       - name: fasten-core version can be released
         env:
           CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
-          RELEASE_CHECK_LEVEL: ${{ github.event_name == 'push' && 'error' || 'warning' }}
+          RELEASE_CHECK_LEVEL: ${{ needs.tag.outputs.publish == 'true' && 'error' || 'warning' }}
         run: |
           scripts/release/core-published.sh fasten-core || {
             [ $? -eq 3 ] && [ "$RELEASE_CHECK_LEVEL" = warning ]
@@ -594,7 +595,7 @@ jobs:
   # After the registries, so a failed publish leaves no GitHub release. The
   # publish jobs are skipped for go/ and prerelease tags.
   github-release:
-    needs: [verify, crates-io, pypi, npm]
+    needs: [verify, wheels, install-check, crates-io, pypi, npm]
     if: ${{ !cancelled() && needs.verify.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
