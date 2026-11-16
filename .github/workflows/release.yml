@@ -190,10 +190,37 @@ jobs:
             [ $? -eq 3 ] && [ "$RELEASE_CHECK_LEVEL" = warning ]
           }
 
+  # Installs the npm tarball and the packaged crates the way a user gets
+  # them, in a clean container outside the repo, and runs the integration
+  # smoke against the install. The wheels job does the same for Python.
+  install-check:
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: node
+            image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
+          - package: rust
+            image: rust:1.90
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install bash and python3
+        if: ${{ matrix.package == 'node' }}
+        run: apk add --no-cache bash python3
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install the package and run the smoke
+        run: scripts/release/install-check.sh ${{ matrix.package }}
+
   # crates.io goes first: it is the job most likely to fail, and PyPI and npm
   # wait for it so a failure there publishes nothing else.
   crates-io:
-    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, versions, wheels]
+    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, versions, wheels, install-check]
     if: ${{ needs.tag.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
