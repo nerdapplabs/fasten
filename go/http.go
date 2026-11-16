@@ -84,13 +84,15 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //	GET /correlate         audit, api and sys rows for one request_id
 //	GET /topology          emitting nodes, services and tenants
 //
-// SECURITY: these endpoints expose internal state (queue stats, init config,
-// raw audit rows, full log payloads). Mount them behind authentication
-// middleware or restrict them to internal network interfaces before exposing
-// to untrusted callers.
+// Authentication: these endpoints return audit rows, log payloads, queue
+// stats and init config, so NewReader needs one of two options and panics
+// with neither:
 //
-// Mount with chi: r.Mount("/api/v1/logs", fasten.NewReader())
-// Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", fasten.NewReader()))
+//	fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("")))  // every route goes through the middleware
+//	fasten.NewReader(fasten.WithoutAuth())                       // you authenticate the routes yourself
+//
+// Mount with chi: r.Mount("/api/v1/logs", reader)
+// Mount with stdlib mux: mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", reader))
 //
 // For a reader with different stores or settings from Default, create a
 // separate Engine and call its NewReader:
@@ -98,11 +100,11 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 //	e2 := &fasten.Engine{}
 //	_ = e2.Init(fasten.Config{ServiceID: "svc", NodeID: "n", SearchEnabled: true,
 //	    AuditStore: replica, APIStore: apiStore}) // read-replica / multi-store
-//	mux.Handle("/logs/", http.StripPrefix("/logs", e2.NewReader()))
+//	mux.Handle("/logs/", http.StripPrefix("/logs", e2.NewReader(fasten.WithAuth(mw))))
 //
 // Tenant isolation: on shared-store multi-tenant deployments wire
 //
-//	fasten.NewReader(fasten.WithTenantScope(fn), fasten.EnforceTenantIsolation())
+//	fasten.NewReader(fasten.WithAuth(mw), fasten.WithTenantScope(fn), fasten.EnforceTenantIsolation())
 //
 // where `fn func(*http.Request) (tenant string, ok bool)` returns the
 // resolved tenant from the (already-authenticated) request. Every reader
@@ -121,6 +123,14 @@ func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
 	scratch := &Engine{}
 	for _, opt := range opts {
 		opt(scratch)
+	}
+	if scratch.readerAuth == nil && !scratch.readerNoAuth {
+		panic("fasten.NewReader requires WithAuth(middleware), for example " +
+			"WithAuth(fasten.RequireBearer(\"\")), or WithoutAuth() when the " +
+			"routes are authenticated outside the reader.")
+	}
+	if scratch.readerAuth != nil && scratch.readerNoAuth {
+		panic("fasten.NewReader: pass WithAuth or WithoutAuth, not both.")
 	}
 	rc := readerConfig{
 		tenantScope:            scratch.tenantScope,
@@ -142,10 +152,14 @@ func (e *Engine) NewReader(opts ...ReaderOption) http.Handler {
 
 	// Carry this reader's config on the request, so handlers stay *Engine
 	// methods and resolveTenant reads per-reader scope instead of engine state.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(w, r.WithContext(
 			context.WithValue(r.Context(), readerConfigKey{}, rc)))
 	})
+	if scratch.readerAuth != nil {
+		h = scratch.readerAuth(h)
+	}
+	return h
 }
 
 // readerConfig is the per-reader scope policy. It lives on the request rather
@@ -176,6 +190,23 @@ func NewReader(opts ...ReaderOption) http.Handler { return Default.NewReader(opt
 
 // ReaderOption configures a reader constructed by NewReader.
 type ReaderOption func(*Engine)
+
+// WithAuth puts every reader route behind mw, for example
+// RequireBearer("") or your own authentication middleware. mw must not be
+// nil. NewReader needs this option or WithoutAuth.
+func WithAuth(mw func(http.Handler) http.Handler) ReaderOption {
+	if mw == nil {
+		panic("fasten.WithAuth: middleware is nil; use WithoutAuth() to mount without it.")
+	}
+	return func(e *Engine) { e.readerAuth = mw }
+}
+
+// WithoutAuth builds the reader with no authentication of its own. Use it
+// when the routes are authenticated outside the reader (your router's
+// middleware, a gateway) or are reachable only from a trusted network.
+func WithoutAuth() ReaderOption {
+	return func(e *Engine) { e.readerNoAuth = true }
+}
 
 // WithTenantScope wires a tenant-resolution hook. See NewReader's doc.
 // The hook returns (tenant, ok) — ok=false signals unauthenticated, and

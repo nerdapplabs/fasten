@@ -51,7 +51,7 @@ func errStr(body map[string]any) string {
 func TestSearch_DisabledByDefault(t *testing.T) {
 	initSearch(t, false, true)
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/search?q=reset&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=reset&since="+searchSince)
 	if !strings.Contains(errStr(body), "disabled") {
 		t.Fatalf("want disabled error, got %v", body)
 	}
@@ -60,7 +60,7 @@ func TestSearch_DisabledByDefault(t *testing.T) {
 func TestSearch_FindsRequestID(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/search?q=reset+by+peer&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=reset+by+peer&since="+searchSince)
 	counts, _ := body["counts"].(map[string]any)
 	if counts["sys"] != float64(1) {
 		t.Fatalf("counts=%v, want sys=1 (%v)", counts, body)
@@ -74,7 +74,7 @@ func TestSearch_FindsRequestID(t *testing.T) {
 func TestSearch_CaseInsensitive(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/search?q=RESET&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=RESET&since="+searchSince)
 	if body["counts"].(map[string]any)["sys"] != float64(1) {
 		t.Errorf("case-insensitive match failed: %v", body["counts"])
 	}
@@ -83,7 +83,7 @@ func TestSearch_CaseInsensitive(t *testing.T) {
 func TestSearch_SinceMandatory(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/search?q=reset")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=reset")
 	if !strings.Contains(errStr(body), "since") {
 		t.Fatalf("want since-required error, got %v", body)
 	}
@@ -92,7 +92,7 @@ func TestSearch_SinceMandatory(t *testing.T) {
 func TestSearch_RequiresPersistence(t *testing.T) {
 	initSearch(t, true, false) // ring-only sys, no durable history
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/search?q=reset&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=reset&since="+searchSince)
 	// The top-level "error" key is only for policy failures (search disabled,
 	// since missing); a ring-only stream reports errors.sys.
 	perStream, _ := body["errors"].(map[string]any)
@@ -110,7 +110,7 @@ func TestSearch_ResultCap(t *testing.T) {
 			"timestamp":  "2026-08-01T00:00:0" + string(rune('0'+i)) + "Z",
 			"request_id": "r"})
 	}
-	body, _ := getJSON(t, NewReader(), "/search?q=boom&since="+searchSince+"&limit=3")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=boom&since="+searchSince+"&limit=3")
 	if body["counts"].(map[string]any)["sys"] != float64(3) {
 		t.Errorf("want capped to 3, got %v", body["counts"])
 	}
@@ -121,7 +121,7 @@ func TestSearch_WildcardEscaped(t *testing.T) {
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{"event": "100%done", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-w"})
 	tr.PushSyslog(SyslogRow{"event": "100XYZdone", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
-	body, _ := getJSON(t, NewReader(), "/search?q=100%25done&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=100%25done&since="+searchSince)
 	if body["counts"].(map[string]any)["sys"] != float64(1) {
 		t.Fatalf("literal %% should match only r-w, got %v", body["counts"])
 	}
@@ -136,7 +136,7 @@ func TestSearch_WildcardEscapedUnderscore(t *testing.T) {
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{"event": "ab_cd", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-u"})
 	tr.PushSyslog(SyslogRow{"event": "abXcd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-x"})
-	body, _ := getJSON(t, NewReader(), "/search?q=ab_cd&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=ab_cd&since="+searchSince)
 	if body["counts"].(map[string]any)["sys"] != float64(1) {
 		t.Fatalf("literal _ should match only r-u (not abXcd), got %v", body["counts"])
 	}
@@ -153,7 +153,7 @@ func TestSearch_BackslashEscaped(t *testing.T) {
 	tr := GetTransport()
 	tr.PushSyslog(SyslogRow{"event": "c\\d", "timestamp": "2026-08-01T00:00:00Z", "request_id": "r-bs"})
 	tr.PushSyslog(SyslogRow{"event": "cXd", "timestamp": "2026-08-01T00:00:02Z", "request_id": "r-dec"})
-	body, _ := getJSON(t, NewReader(), "/search?q=c%5C%5Cd&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/search?q=c%5C%5Cd&since="+searchSince)
 	if body["counts"].(map[string]any)["sys"] != float64(1) {
 		t.Fatalf("backslashes matched literally should give only r-bs, got %v", body["counts"])
 	}
@@ -165,12 +165,12 @@ func TestSearch_BackslashEscaped(t *testing.T) {
 func TestSysQParamGatedAndBounded(t *testing.T) {
 	initSearch(t, true, true)
 	seedSearch()
-	body, _ := getJSON(t, NewReader(), "/sys?q=timeout&since="+searchSince)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/sys?q=timeout&since="+searchSince)
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d (%v)", len(rows), body)
 	}
-	noSince, _ := getJSON(t, NewReader(), "/sys?q=timeout")
+	noSince, _ := getJSON(t, NewReader(WithoutAuth()), "/sys?q=timeout")
 	if !strings.Contains(errStr(noSince), "since") {
 		t.Errorf("want since error on /sys?q= without since, got %v", noSince)
 	}
@@ -184,7 +184,7 @@ func TestSysQParamRejectsStructuredFilterCombination(t *testing.T) {
 	seedSearch()
 	for _, param := range []string{"level=error", "request_id=r-1", "service_id=svc", "event=db.timeout"} {
 		url := "/sys?q=timeout&since=" + searchSince + "&" + param
-		body, code := getJSON(t, NewReader(), url)
+		body, code := getJSON(t, NewReader(WithoutAuth()), url)
 		if code != 400 {
 			t.Errorf("%s: want 400, got %d (%v)", url, code, body)
 		}

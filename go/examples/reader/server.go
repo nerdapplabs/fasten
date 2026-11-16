@@ -59,15 +59,13 @@ func main() {
 	}
 
 	reader := fasten.NewReader(
+		fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")),
 		fasten.WithTenantScope(tenantFromHeader),
 		fasten.EnforceTenantIsolation(),
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/v1/logs/", http.StripPrefix(
-		"/api/v1/logs",
-		fasten.RequireBearer("FASTEN_READER_TOKEN")(reader),
-	))
+	mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", reader))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(`{"ok":true}`))
 	})

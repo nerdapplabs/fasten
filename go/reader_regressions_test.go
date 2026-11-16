@@ -29,7 +29,7 @@ func TestLimitRejectedWith422(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store, AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatal(err)
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 	for _, ep := range []string{"/audit", "/sys", "/api"} {
 		for _, bad := range []string{"0", "-5", "abc", "5000"} {
 			if code := status(t, h, ep+"?limit="+bad); code != 422 {
@@ -62,7 +62,7 @@ func TestAuditStrictParamRejects(t *testing.T) {
 		AuditStoreFailureStrategy: "raise"}); err != nil {
 		t.Fatal(err)
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	cases := []struct{ url, param string }{
 		{"/audit?offset=12a3", "offset"},
@@ -99,7 +99,7 @@ func TestSearchLimitStrict(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", SearchEnabled: true, SyslogStore: ss}); err != nil {
 		t.Fatal(err)
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	base := "/search?q=x&since=2026-01-01T00:00:00Z"
 	for _, bad := range []string{"abc", "0", "-1", "500"} {
@@ -126,7 +126,7 @@ func TestApiQParamRejected(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
 		t.Fatal(err)
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 	if code := status(t, h, "/api?q=foo"); code != 400 {
 		t.Errorf("/api?q=foo -> %d, want 400", code)
 	}
@@ -223,7 +223,7 @@ func TestAuditDualPaginationRegression(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 	get := func(url string) map[string]any {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, url, nil))

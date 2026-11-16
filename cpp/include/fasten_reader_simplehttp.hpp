@@ -11,16 +11,21 @@
  *   target_include_directories(mytarget PRIVATE path/to/Simple-Web-Server)
  *   target_link_libraries(mytarget PRIVATE fasten pthread)
  *
- * No auth (trusted network only):
- *   auto t = fasten::reader::simplehttp::start(9000);
- *   t.detach();
+ * mount() and start() need an auth function: the routes return audit rows
+ * and log payloads. It gets the request headers and returns whether the
+ * caller may read. An empty function throws std::invalid_argument.
  *
  * API key auth:
  *   auto t = fasten::reader::simplehttp::start(9000, "/api/v1/logs",
  *       [](const SimpleWeb::CaseInsensitiveMultimap& h) {
  *           auto it = h.find("x-api-key");
- *           return it != h.end() && it->second == "secret";
+ *           return it != h.end() && it->second == api_key_from_my_config();
  *       });
+ *   t.detach();
+ *
+ * No auth, for a port only a trusted network can reach:
+ *   auto t = fasten::reader::simplehttp::start(9000, "/api/v1/logs",
+ *       fasten::reader::simplehttp::no_auth());
  *   t.detach();
  *
  * Tenant isolation on a shared multi-tenant store: return the caller's
@@ -42,6 +47,7 @@
 #include "server_http.hpp"
 
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace fasten {
@@ -69,24 +75,33 @@ inline void send(std::shared_ptr<HttpServer::Response> response,
     response->write(static_cast<SimpleWeb::StatusCode>(r.status), r.body, headers);
 }
 
-inline bool check_auth(const SimpleWeb::CaseInsensitiveMultimap& h, const AuthFn& auth) {
-    return !auth || auth(h);
-}
-
 inline void unauthorized(std::shared_ptr<HttpServer::Response> response) {
     send(response, {401, "{\"error\":\"unauthorized\"}"});
 }
 
 } // namespace detail_
 
+// An auth function that lets every request through. Pass it to mount() or
+// start() only when the port is reachable from a trusted network alone.
+inline AuthFn no_auth() {
+    return [](const SimpleWeb::CaseInsensitiveMultimap&) { return true; };
+}
+
 // Mount /sys, /api, /audit under `prefix` on an existing server.
+// `auth` decides each request; a request it refuses gets 401. It is
+// required: an empty function throws std::invalid_argument (see no_auth()).
 // With `tenant`, each request is scoped to the tenant it returns.
 // Call this before server.start().
 inline void mount(HttpServer& server,
-                  const std::string& prefix = "/api/v1/logs",
-                  AuthFn auth = {},
+                  const std::string& prefix,
+                  AuthFn auth,
                   TenantFn tenant = {})
 {
+    if (!auth) {
+        throw std::invalid_argument(
+            "fasten::reader::simplehttp: an auth function is required; "
+            "pass no_auth() to serve the routes without one");
+    }
     // Routes are regexes and `prefix` is not escaped.
     auto route = [&prefix](const std::string& s) {
         return "^" + prefix + s + "$";
@@ -96,7 +111,7 @@ inline void mount(HttpServer& server,
                                                   const std::string&);
     auto handler = [auth, tenant](Unscoped unscoped, Scoped scoped) {
         return [auth, tenant, unscoped, scoped](auto resp, auto req) {
-            if (!detail_::check_auth(req->header, auth)) {
+            if (!auth(req->header)) {
                 return detail_::unauthorized(resp);
             }
             auto params = detail_::to_params(req->parse_query_string());
@@ -113,11 +128,12 @@ inline void mount(HttpServer& server,
         handler(&fasten::reader::handle_audit, &fasten::reader::handle_audit);
 }
 
-// Start a dedicated HTTP server on `port` in a new thread.
+// Start a dedicated HTTP server on `port` in a new thread, with the
+// routes mount() adds. `auth` is required, as in mount().
 // Returns the thread; detach() it or join() it.
-inline std::thread start(unsigned short     port   = 9000,
-                          const std::string& prefix = "/api/v1/logs",
-                          AuthFn             auth   = {},
+inline std::thread start(unsigned short     port,
+                          const std::string& prefix,
+                          AuthFn             auth,
                           TenantFn           tenant = {})
 {
     auto srv = std::make_shared<HttpServer>();

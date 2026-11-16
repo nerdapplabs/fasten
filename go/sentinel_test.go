@@ -118,7 +118,7 @@ func TestSentinel_BootRowsAreCorrelatable(t *testing.T) {
 		t.Fatalf("expected boot id, got %q", bootID)
 	}
 
-	body, code := getJSON(t, NewReader(), "/correlate?request_id="+bootID)
+	body, code := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+bootID)
 	if code != 200 {
 		t.Fatalf("status %d", code)
 	}

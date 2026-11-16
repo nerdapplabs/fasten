@@ -97,3 +97,44 @@ func TestRequireBearer_EmptyArgUsesDefaultEnvName(t *testing.T) {
 		t.Fatalf("default env name: got %d, want 200", rr.Code)
 	}
 }
+
+// NewReader needs WithAuth or WithoutAuth.
+func TestNewReader_PanicsWithoutAnAuthChoice(t *testing.T) {
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: expected a panic", name)
+			}
+		}()
+		fn()
+	}
+	pass := func(next http.Handler) http.Handler { return next }
+	mustPanic("no option", func() { NewReader() })
+	mustPanic("tenant scope only", func() {
+		NewReader(WithTenantScope(func(*http.Request) (string, bool) { return "t", true }))
+	})
+	mustPanic("both", func() { NewReader(WithAuth(pass), WithoutAuth()) })
+	mustPanic("nil middleware", func() { WithAuth(nil) })
+}
+
+// WithAuth puts every reader route behind the middleware.
+func TestNewReader_WithAuthGuardsEveryRoute(t *testing.T) {
+	t.Setenv("FASTEN_READER_TOKEN", "s3cret")
+	e := &Engine{}
+	h := e.NewReader(WithAuth(RequireBearer("")))
+	for _, path := range []string{"/sys", "/api", "/search?q=x", "/correlate", "/topology", "/audit/doctor", "/audit"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s without a token: status %d, want 401", path, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/topology", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Errorf("/topology with the token: status 401")
+	}
+}

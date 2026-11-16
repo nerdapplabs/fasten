@@ -6,6 +6,21 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: the Go and C++ readers need an auth choice
+
+- Go: `NewReader` takes `WithAuth(middleware)`, which puts every reader
+  route behind the middleware (for example `WithAuth(RequireBearer(""))`),
+  or `WithoutAuth()` when the routes are authenticated outside the reader.
+  With neither it panics. Code that calls `NewReader()` needs one of the
+  two options.
+- C++: `simplehttp::mount()` and `simplehttp::start()` no longer default
+  the prefix and the auth function, and an empty auth function throws
+  `std::invalid_argument`. `simplehttp::no_auth()` serves the routes
+  without one.
+- Python already requires `dependencies=` on the reader router.
+- The Python FastAPI example has no default reader token: set
+  `DEMO_READER_TOKEN`, or the reader answers 401.
+
 ### Docs: security scope and reader authentication
 
 - `docs/security.md` and the README say which SDKs seal audit rows (Python

@@ -22,16 +22,17 @@
 // #include "fasten_reader_simplehttp.hpp"
 //
 // void start_simplehttp() {
-//     // No auth: trusted network only.
-//     auto t = fasten::reader::simplehttp::start(9000);
+//     // API key auth. The auth function is required.
+//     auto t = fasten::reader::simplehttp::start(9000, "/api/v1/logs",
+//         [](const SimpleWeb::CaseInsensitiveMultimap& h) {
+//             auto it = h.find("x-api-key");
+//             return it != h.end() && it->second == api_key_from_my_config();
+//         });
 //     t.detach();
 //
-//     // With API key auth:
+//     // No auth, for a port only a trusted network can reach:
 //     // auto t = fasten::reader::simplehttp::start(9000, "/api/v1/logs",
-//     //     [](const SimpleWeb::CaseInsensitiveMultimap& h) {
-//     //         auto it = h.find("x-api-key");
-//     //         return it != h.end() && it->second == "secret-key";
-//     //     });
+//     //     fasten::reader::simplehttp::no_auth());
 //     // t.detach();
 // }
 

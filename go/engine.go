@@ -78,6 +78,10 @@ type Engine struct {
 	// (no scope enforced, ?tenant_id= honoured as-is).
 	tenantScope            func(*http.Request) (string, bool)
 	enforceTenantIsolation bool
+
+	// Set only on the scratch Engine NewReader collects its options into.
+	readerAuth   func(http.Handler) http.Handler
+	readerNoAuth bool
 }
 
 // Default is the package-level Engine used by all free-function API calls.

@@ -96,7 +96,7 @@ func TestScopeRows_NeverMarshalsNull(t *testing.T) {
 // impossible.
 func TestNewReader_OptionsDoNotMutateTheEngine(t *testing.T) {
 	e := &Engine{}
-	_ = e.NewReader(WithTenantScope(
+	_ = e.NewReader(WithoutAuth(), WithTenantScope(
 		func(*http.Request) (string, bool) { return "tenant-a", true }))
 
 	if e.tenantScope != nil {
@@ -113,10 +113,10 @@ func TestNewReader_TwoReadersKeepSeparateScopes(t *testing.T) {
 	// Reader A resolves a real tenant. Reader B resolves BLANK, which must 401
 	// under enforcement. If options still mutated the shared engine, whichever
 	// reader was constructed last would decide for both.
-	a := e.NewReader(
+	a := e.NewReader(WithoutAuth(),
 		EnforceTenantIsolation(),
 		WithTenantScope(func(*http.Request) (string, bool) { return "tenant-a", true }))
-	b := e.NewReader(
+	b := e.NewReader(WithoutAuth(),
 		EnforceTenantIsolation(),
 		WithTenantScope(func(*http.Request) (string, bool) { return "", true }))
 

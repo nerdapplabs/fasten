@@ -52,7 +52,7 @@ func TestCompleteness_DefaultStoreVsRing(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	h := NewReader()
+	h := NewReader(WithoutAuth())
 
 	cases := []struct {
 		path, stream, want string
@@ -103,7 +103,7 @@ func TestCompleteness_StdoutOnlyAuditIsRing(t *testing.T) {
 	if got := Default.streamSource("audit"); got != "ring" {
 		t.Errorf("stdout-only audit: got %q, want ring", got)
 	}
-	_, comp := getCompleteness(t, NewReader(), "/audit")
+	_, comp := getCompleteness(t, NewReader(WithoutAuth()), "/audit")
 	if comp["audit"] != "ring" {
 		t.Errorf("stdout-only /audit completeness: got %q, want ring", comp["audit"])
 	}
@@ -113,7 +113,7 @@ func TestCompleteness_StdoutOnlyAuditIsRing(t *testing.T) {
 // flag (plus an error) on every endpoint, so consumers parse one shape. With
 // no audit store, audit is "ring". Also covers persistedStreams == nil.
 func TestCompleteness_ErrorPathsCarryFlag(t *testing.T) {
-	h := (&Engine{}).NewReader() // never Init'd: xport, auditStore, persistedStreams all nil
+	h := (&Engine{}).NewReader(WithoutAuth()) // never Init'd: xport, auditStore, persistedStreams all nil
 
 	cases := []struct {
 		path, stream, want string
@@ -156,7 +156,7 @@ func TestCompleteness_RequestIDFilterCoexists(t *testing.T) {
 	tr.PushAPI(APIRow{"method": "GET", "path": "/a", "request_id": "req-A"})
 	tr.PushAPI(APIRow{"method": "GET", "path": "/b", "request_id": "req-B"})
 
-	body, comp := getCompleteness(t, NewReader(), "/api?request_id=req-A")
+	body, comp := getCompleteness(t, NewReader(WithoutAuth()), "/api?request_id=req-A")
 	rows, _ := body["rows"].([]any)
 	if len(rows) != 1 {
 		t.Fatalf("request_id filter: got %d rows, want 1 (%v)", len(rows), body["rows"])

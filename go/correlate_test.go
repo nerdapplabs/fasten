@@ -56,7 +56,7 @@ func TestCorrelate_AssemblesAllThreeStreams(t *testing.T) {
 	tr.PushSyslog(SyslogRow{"level": "error", "event": "db.timeout", "request_id": rid})
 	tr.PushAPI(APIRow{"method": "GET", "path": "/health", "status": 200, "request_id": "other"})
 
-	body, code := getJSON(t, NewReader(), "/correlate?request_id="+rid)
+	body, code := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+rid)
 	if code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
@@ -85,7 +85,7 @@ func TestCorrelate_EmptyForUnknownRequestID(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node", AuditStore: store}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, code := getJSON(t, NewReader(), "/correlate?request_id=nope")
+	body, code := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id=nope")
 	if code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
@@ -100,7 +100,7 @@ func TestCorrelate_RequiresRequestID(t *testing.T) {
 	if err := Init(Config{ServiceID: "svc", NodeID: "node"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	_, code := getJSON(t, NewReader(), "/correlate")
+	_, code := getJSON(t, NewReader(WithoutAuth()), "/correlate")
 	if code != http.StatusBadRequest {
 		t.Fatalf("missing request_id: got status %d, want 400", code)
 	}
@@ -122,7 +122,7 @@ func TestCorrelate_ReportsStoreWhenPersisted(t *testing.T) {
 	for i := 0; i < 2500; i++ { // bury past ring capacity
 		tr.PushAPI(APIRow{"method": "GET", "path": "/n", "request_id": "n"})
 	}
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id="+rid)
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+rid)
 	comp, _ := body["completeness"].(map[string]any)
 	if comp["api"] != "store" {
 		t.Errorf("api completeness: got %v, want store", comp["api"])
@@ -146,7 +146,7 @@ func TestCorrelate_TotalsExposeTruncationRingOnly(t *testing.T) {
 		tr.PushSyslog(SyslogRow{"level": "info", "event": fmt.Sprintf("step.%d", i), "request_id": rid})
 	}
 
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=3")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+rid+"&limit=3")
 	counts, _ := body["counts"].(map[string]any)
 	totals, _ := body["totals"].(map[string]any)
 	if counts["sys"] != float64(3) {
@@ -157,7 +157,7 @@ func TestCorrelate_TotalsExposeTruncationRingOnly(t *testing.T) {
 	}
 
 	// untruncated read: counts == totals
-	body, _ = getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=100")
+	body, _ = getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+rid+"&limit=100")
 	counts, _ = body["counts"].(map[string]any)
 	totals, _ = body["totals"].(map[string]any)
 	if counts["sys"] != float64(7) || totals["sys"] != float64(7) {
@@ -190,7 +190,7 @@ func TestCorrelate_TotalsCountStoreHistoryAndAudit(t *testing.T) {
 		t.Fatalf("Emit: %v", err)
 	}
 
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id="+rid+"&limit=2")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id="+rid+"&limit=2")
 	counts, _ := body["counts"].(map[string]any)
 	totals, _ := body["totals"].(map[string]any)
 	if counts["audit"] != float64(2) || counts["api"] != float64(2) || counts["sys"] != float64(0) {
@@ -219,7 +219,7 @@ func TestCorrelate_AuditTotalNullOnCountUnavailable(t *testing.T) {
 		AuditStoreFailureStrategy: "queue"}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	body, _ := getJSON(t, NewReader(), "/correlate?request_id=r-x")
+	body, _ := getJSON(t, NewReader(WithoutAuth()), "/correlate?request_id=r-x")
 	totals, _ := body["totals"].(map[string]any)
 	if totals["audit"] != nil {
 		t.Errorf("totals.audit: got %v, want null (adopter store has no filterCounter)", totals["audit"])
