@@ -739,7 +739,10 @@ func TestRejectsRow(t *testing.T) {
 	}{
 		{sqlStateErr("22021"), true},  // NUL byte / bad encoding
 		{sqlStateErr("23505"), true},  // unique violation
+		{sqlStateErr("42703"), true},  // undefined column
+		{sqlStateErr("54000"), true},  // program limit, e.g. index row too long
 		{sqlStateErr("08006"), false}, // connection failure
+		{sqlStateErr("53300"), false}, // too many connections
 		{sqlStateErr("40001"), false}, // serialization failure
 		{fmt.Errorf("insert: %w", sqlStateErr("23502")), true},
 		{sqliteErr(2067), true}, // SQLITE_CONSTRAINT_UNIQUE

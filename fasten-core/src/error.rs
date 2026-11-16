@@ -102,6 +102,12 @@ pub enum Error {
     /// quote row values. The drainer retries the row.
     #[error("{0}")]
     Store(String),
+
+    /// The store refused the row itself (bad data, a constraint, a size
+    /// limit). Carries only the error type. Retrying cannot help, so the
+    /// drainer dead-letters the row at once.
+    #[error("{0}")]
+    RowRejected(String),
 }
 
 // Without the sqlite or postgres feature the backend variants are absent and
@@ -149,6 +155,7 @@ impl From<&Error> for FastenErrorCode {
             Error::Unsupported(_)      => FastenErrorCode::ErrBackend,
             Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
             Error::Store(_)            => FastenErrorCode::ErrBackend,
+            Error::RowRejected(_)      => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

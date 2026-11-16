@@ -52,6 +52,27 @@ def test_request_id_middleware_mints_when_absent(initialized):
     assert len(rid_headers[0][1].decode()) == 12
 
 
+def _response_request_id(headers: list) -> str:
+    app = RequestIDMiddleware(_Echo())
+    sent, send = _send_recorder()
+    scope = {**_scope(), "headers": headers}
+    asyncio.run(app(scope, _noop_receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return next(h[1] for h in start["headers"] if h[0] == b"x-request-id").decode()
+
+
+def test_request_id_middleware_keeps_a_valid_client_id(initialized):
+    for rid in (b"req-A1.b2_c3", b"550e8400-e29b-41d4-a716-446655440000", b"x" * 128):
+        assert _response_request_id([(b"x-request-id", rid)]) == rid.decode()
+
+
+def test_request_id_middleware_replaces_an_unusable_client_id(initialized):
+    for rid in (b"x" * 129, b"x" * 6000, b"has space", b"semi;colon", b"nul\x00byte",
+                b"\xff\xfe", "caf\u00e9".encode()):
+        got = _response_request_id([(b"x-request-id", rid)])
+        assert len(got) == 12 and got.isalnum(), (rid, got)
+
+
 # APILogger
 
 def test_api_logger_writes_row_to_transport(initialized):

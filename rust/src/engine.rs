@@ -102,9 +102,14 @@ impl fasten_core::store::Store for SdkStoreAdapter {
     fn insert(&self, row: &fasten_core::Row) -> Result<(), fasten_core::Error> {
         let sdk_row = core_to_sdk_row(row);
         // Type only: a store error message can quote row values. The
-        // drainer retries the row.
-        self.0.insert(&sdk_row)
-            .map_err(|e| fasten_core::Error::Store(crate::retention::error_type(&e).into()))
+        // drainer retries the row, unless the store rejected it.
+        self.0.insert(&sdk_row).map_err(|e| {
+            let kind = crate::retention::error_type(&e).into();
+            match e {
+                crate::Error::AuditStoreRejected(_) => fasten_core::Error::RowRejected(kind),
+                _ => fasten_core::Error::Store(kind),
+            }
+        })
     }
     fn ping(&self) -> Result<(), fasten_core::Error> { Ok(()) }
     fn query(&self, _: &fasten_core::store::Filter)
@@ -367,5 +372,34 @@ mod tests {
         let row = sdk_row_to_core(&row);
         let err = SdkStoreAdapter(Arc::new(FailStore)).insert(&row).unwrap_err();
         assert!(matches!(&err, fasten_core::Error::Store(t) if t == "AuditStoreInsert"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use fasten_core::store::Store as _;
+
+    struct Refusing(bool);
+
+    impl AuditStore for Refusing {
+        fn insert(&self, _: &crate::Row) -> Result<(), crate::Error> {
+            Err(if self.0 {
+                crate::Error::AuditStoreRejected("value too long".into())
+            } else {
+                crate::Error::AuditStoreInsert("down".into())
+            })
+        }
+    }
+
+    /// A store's AuditStoreRejected reaches the drainer as RowRejected, which
+    /// it dead-letters at once; any other error is retried.
+    #[test]
+    fn rejected_reaches_the_drainer_as_row_rejected() {
+        let row = fasten_core::Row::default();
+        let err = SdkStoreAdapter(Arc::new(Refusing(true))).insert(&row).unwrap_err();
+        assert!(matches!(err, fasten_core::Error::RowRejected(ref t) if t == "AuditStoreRejected"), "{err:?}");
+        let err = SdkStoreAdapter(Arc::new(Refusing(false))).insert(&row).unwrap_err();
+        assert!(matches!(err, fasten_core::Error::Store(ref t) if t == "AuditStoreInsert"), "{err:?}");
     }
 }

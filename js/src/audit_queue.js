@@ -12,6 +12,20 @@ const HW_WARN_PCT = 0.5;
 const HW_ERR_PCT = 0.8;
 const DEGRADED_AFTER = 5;
 
+// Whether a store error means the row itself was refused, so retrying
+// cannot help. `pg` puts the SQLSTATE in `code`: class 22 is a data
+// exception, 23 an integrity violation, 42 a syntax or access rule error,
+// 54 a program limit (for example a value too long for an index). Same
+// classes as fasten-core's sqlstate_rejects_row.
+export function rejectsRow(err) {
+	const code = err?.code;
+	return (
+		typeof code === "string" &&
+		code.length === 5 &&
+		["22", "23", "42", "54"].includes(code.slice(0, 2))
+	);
+}
+
 export class AuditStoreError extends Error {
 	constructor(cause) {
 		super(`fasten audit store: ${cause?.message ?? cause}`);
@@ -199,7 +213,7 @@ class AuditQueueDrainer {
 					if (this._current === row) this._onLostAtStop(row, err);
 					return;
 				}
-				if (attempt >= this._maxAttempts) {
+				if (attempt >= this._maxAttempts || rejectsRow(err)) {
 					this._onDeadLetter(row, attempt, err);
 					return;
 				}

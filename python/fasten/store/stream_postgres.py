@@ -14,6 +14,8 @@ import threading
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from .postgres import _connection_lost
+
 # Bare name ("syslog") or schema-qualified ("fasten.syslog").
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
@@ -127,7 +129,9 @@ class PostgresStreamStore:
 
         try:
             return _call(self._connect())
-        except (psycopg.OperationalError, psycopg.InterfaceError):
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+            if not _connection_lost(exc):
+                raise
             return _call(self._connect_fresh())
 
     def close(self) -> None:

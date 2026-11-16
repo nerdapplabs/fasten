@@ -6,7 +6,7 @@ import {
     init, emit, register, registry as _reg,
     AuditStoreError, queueStats, flush, close, _clearCoreRegistry, defaultEngine,
 } from '../src/index.js';
-import { uninstallDrainer, activeDrainer } from '../src/audit_queue.js';
+import { uninstallDrainer, activeDrainer, rejectsRow } from '../src/audit_queue.js';
 
 // Stub stores
 
@@ -139,6 +139,38 @@ test('outage then recovery drains pending rows', async () => {
     assert.equal(await flush(2000), true, 'drainer should retry past 2 failures');
     assert.equal(store.success, 1);
     assert.ok(store.attempts >= 3, `want >=3 attempts (2 fail + 1 success); got ${store.attempts}`);
+});
+
+// A row the database refuses is dead-lettered after one attempt, and the
+// rows behind it are stored.
+test('a rejected row is dead-lettered at once', async () => {
+    const store = {
+        attempts: 0,
+        stored: [],
+        insert(row) {
+            this.attempts++;
+            if (row.target === 'bad') {
+                const err = new Error('index row size exceeds maximum');
+                err.code = '54000';
+                throw err;
+            }
+            this.stored.push(row.target);
+        },
+    };
+    _initQueue(store, { queueRetryInitialMs: 60000, queueRetryMaxMs: 60000, queueRetryJitter: false });
+    emit({ code: 'USER_CREATED', target: 'bad' });
+    emit({ code: 'USER_CREATED', target: 'good' });
+    await flush(2000);
+    assert.deepEqual(store.stored, ['good']);
+    assert.equal(store.attempts, 2, 'one attempt per row');
+    assert.equal(queueStats().dead_lettered_total, 1);
+});
+
+test('rejectsRow reads the SQLSTATE class', () => {
+    for (const code of ['22021', '23505', '42703', '54000']) assert.equal(rejectsRow({ code }), true, code);
+    for (const code of ['08006', '40001', '53300', '57P01', 'ECONNRESET', undefined, 54000]) {
+        assert.equal(rejectsRow({ code }), false, String(code));
+    }
 });
 
 // Sys self-report

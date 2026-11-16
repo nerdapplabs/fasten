@@ -12,12 +12,32 @@ import (
 	"unicode/utf8"
 )
 
-// RequestID is middleware that reads X-Request-ID, or mints one, and puts it
-// in the request context and the response header.
+// validRequestID reports whether a client's X-Request-ID can be used: 1 to
+// 128 characters of letters, digits, ".", "_" and "-". The value is stored
+// and indexed with every row of the request.
+func validRequestID(id string) bool {
+	if len(id) == 0 || len(id) > 128 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// RequestID is middleware that reads X-Request-ID, or mints one when it is
+// missing or not a valid id (see validRequestID), and puts it in the request
+// context and the response header.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
-		if id == "" {
+		if !validRequestID(id) {
 			id = MintID()
 		}
 		w.Header().Set("X-Request-ID", id)
