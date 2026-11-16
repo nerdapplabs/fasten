@@ -45,7 +45,7 @@ jobs:
         working-directory: rust
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Toolchain declarations agree
         # Both files are read from the repo root, not the job default
@@ -89,7 +89,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@c2e5d2ce8920c881761c4cabb41434daa1f95687 # cargo-llvm-cov
 
       - name: Coverage
         run: cargo llvm-cov --locked --lcov --output-path coverage.lcov
@@ -98,7 +98,7 @@ jobs:
         run: apt-get update -qq && apt-get install -y --no-install-recommends gpg
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           files: rust/coverage.lcov
           flags: rust
@@ -126,7 +126,7 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Read toolchain from rust-toolchain.toml
         id: rust-toolchain-file
@@ -136,7 +136,7 @@ jobs:
           echo "channel=$ch" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.rust-toolchain-file.outputs.channel }}
 
@@ -145,7 +145,7 @@ jobs:
         run: cargo build --release --locked --features all
 
       - name: Set up Swift 5.10
-        uses: swift-actions/setup-swift@v2
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: "5.10"
 
