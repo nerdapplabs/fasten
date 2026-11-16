@@ -14,8 +14,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   from `FASTEN_READER_KEY` / `--key`, and every request got a 401.
 - A 401 says to set the token, instead of "reader unreachable" (tail) or an
   empty "(no rows)" table (TUI, which now shows fetch errors in its footer).
+- The TUI draws its frame again: the key hints in its footer were read as
+  markup and every frame failed to render. Its header and footer show their
+  text instead of only a top border.
 - `fasten dump --catalog PATH` loads a codes YAML file first. With no codes
-  registered it exits 1 instead of printing nothing.
+  registered it exits 1 instead of printing nothing. A catalog that can't be
+  read, isn't valid YAML or isn't UTF-8 is reported on one line.
 
 ### Fixed: C++ build and README
 
@@ -33,6 +37,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Audit rows on stdout carry `"severity": "info"`, lowercase like the store
   and `spec/row-schema.json`, not `"Info"`. Reading accepts either case.
 - An empty `FASTEN_TENANT_ID` is treated as unset (null), as in Python.
+  JS does the same.
 - Removed the `store-sqlite` and `shim-tracing` features: they added
   dependencies (`sqlx`, `tracing`) but no code used them.
 

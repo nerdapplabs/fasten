@@ -70,8 +70,13 @@ def main(argv: list[str] | None = None) -> int:
         for path in args.catalog:
             try:
                 load_catalog(path)
-            except (OSError, RuntimeError, AuditCatalogError) as e:
-                sys.stderr.write(f"fasten dump: {path}: {e}\n")
+            # ValueError covers a YAML syntax error and a file that isn't
+            # UTF-8. The message goes on one line, without the path twice.
+            except (OSError, RuntimeError, ValueError, AuditCatalogError) as e:
+                msg = " ".join(str(e).split())
+                if msg.startswith(f"{path}:"):
+                    msg = msg[len(path) + 1:].lstrip()
+                sys.stderr.write(f"fasten dump: {path}: {msg}\n")
                 return 1
         out = dump_codes()
         if not out:

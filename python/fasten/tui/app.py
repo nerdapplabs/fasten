@@ -281,9 +281,11 @@ def _build_view(
 
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=1),
+        Layout(name="header", size=3),
         Layout(name="body"),
-        Layout(name="footer", size=1),
+        # Header and footer are bordered panels: 3 rows each, the top
+        # border, the text and the bottom border.
+        Layout(name="footer", size=3),
     )
     layout["header"].update(Panel.fit(title, border_style="blue"))
 
@@ -317,15 +319,17 @@ def _build_view(
 
     live_icon  = "[bold green]●[/] live" if live else "[dim]○ paused[/]"
     rid_hint   = request_id or "all"
+    # Key hints are escaped with a backslash: unescaped, Rich reads [L], [/], [tab] and
+    # [q] as markup tags and fails to render the frame.
+    from rich.markup import escape
     footer_txt = (
-        f"[L] {live_icon}  [/] [dim]·[/]  "
-        f"[bold][/][/] filter=[bold]{rid_hint}[/]  [dim]·[/]  "
-        f"[dim][tab] pane={primary} · [q] quit · "
+        f"\\[L] {live_icon}  [dim]·[/]  "
+        f"[bold]\\[/][/] filter=[bold]{escape(rid_hint)}[/]  [dim]·[/]  "
+        f"[dim]\\[tab] pane={primary} · \\[q] quit · "
         f"audit:{len(audit_rows)} sys:{len(sys_rows)} api:{len(api_rows)} "
         f"· Δ{interval:.1f}s[/]"
     )
     if _errors:
-        from rich.markup import escape
         footer_txt += "  [bold red]" + escape("; ".join(sorted(set(_errors.values())))) + "[/]"
     layout["footer"].update(Panel.fit(footer_txt, border_style="dim"))
     return layout

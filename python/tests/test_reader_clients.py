@@ -82,6 +82,20 @@ def test_tui_sends_the_token_and_reports_401(monkeypatch):
     assert tui._errors == {}
 
 
+def test_tui_frame_shows_the_title_keys_and_an_error(monkeypatch):
+    pytest.importorskip("rich")
+    from rich.console import Console
+
+    monkeypatch.setattr(tui, "_errors", {"audit": "HTTP 401 from the reader"})
+    view = tui._build_view("http://r/logs", "audit", None, 2.0, True, [], [], [])
+    console = Console(width=140, height=30, record=True, color_system=None)
+    console.print(view)
+    text = console.export_text()
+    assert "fasten tui" in text
+    assert "[L]" in text and "[q] quit" in text and "[/] filter=all" in text
+    assert "HTTP 401 from the reader" in text
+
+
 @pytest.fixture
 def catalog(tmp_path, monkeypatch):
     """A catalog file, with the registry and yaml state restored after."""
@@ -119,6 +133,18 @@ def test_dump_reports_a_bad_catalog_in_one_line(tmp_path, capsys):
     assert cli.main(["dump", "--catalog", str(missing)]) == 1
     err = capsys.readouterr().err
     assert err.startswith(f"fasten dump: {missing}: ")
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("content", [b"domain: x\ncodes: {X_Y: {category: a\n", b"domain: \xff\xfe\n"])
+def test_dump_reports_bad_yaml_or_bytes_in_one_line(tmp_path, capsys, content):
+    pytest.importorskip("yaml")
+    p = tmp_path / "bad.codes.yaml"
+    p.write_bytes(content)
+    assert cli.main(["dump", "--catalog", str(p)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"fasten dump: {p}: ")
+    assert err.count("\n") == 1 and err.count(str(p)) == 1, err
     assert "Traceback" not in err
 
 
