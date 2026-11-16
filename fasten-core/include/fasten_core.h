@@ -28,8 +28,11 @@
  * A single FastenStore handle may be shared across threads. Store operations
  * are serialised per handle; drainer calls (enqueue, flush, stats) may run
  * at the same time. fasten_store_close() waits for calls already running on
- * other threads, and calls that start after it has begun return
- * FASTEN_ERR_NULL_ARG; a call must not start after close has returned.
+ * other threads before it frees the handle. The caller must call it once and
+ * start no call on the handle once it has begun: a call that starts at the
+ * same moment can still reach the freed handle, and a second close can
+ * return while the first is still waiting. A call that starts later usually
+ * gets FASTEN_ERR_NULL_ARG, but that is not guaranteed.
  * Don't call fasten_store_close() or fasten_drainer_close() from an insert
  * or sys_log callback on the same handle: they wait for that callback.
  *

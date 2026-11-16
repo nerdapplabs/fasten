@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // Engine holds all runtime state for one fasten deployment context.
@@ -128,9 +129,11 @@ func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
 		}
 	}
 	replacement = firstNonEmpty(replacement, envOr("FASTEN_REDACT_REPLACEMENT", ""))
-	// The core refuses a replacement that isn't UTF-8, which would turn
-	// every redacted value into the unredactable marker.
-	replacement = strings.ToValidUTF8(replacement, "\uFFFD")
+	// A replacement that isn't UTF-8 is treated as unset (the default
+	// "***"), as in the other SDKs.
+	if !utf8.ValidString(replacement) {
+		replacement = ""
+	}
 
 	e.redactMu.Lock()
 	e.redactExtraKeysJSON = extraJSON

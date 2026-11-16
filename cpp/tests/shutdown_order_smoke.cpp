@@ -83,6 +83,31 @@ int main() {
         t.join();
     }
 
+    // Two shutdown() calls at once: neither returns while the drainer the
+    // other is stopping can still call the sink.
+    {
+        std::atomic<bool> returned{false};
+        std::atomic<int>  calls_after{0};
+        std::atomic<int>  calls{0};
+        fasten::set_audit_sink([&](const fasten::Row&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            ++calls;
+            if (returned) ++calls_after;
+        });
+        fasten::init("svc", "node");
+        for (int i = 0; i < 40; ++i) {
+            fasten::emit("USER_CREATED", fasten::target("u-c" + std::to_string(i)));
+        }
+        std::thread first([] { fasten::shutdown(std::chrono::milliseconds(0)); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        fasten::shutdown(std::chrono::milliseconds(0));
+        returned = true;
+        first.join();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(calls > 0);
+        assert(calls_after == 0);
+    }
+
     std::printf("shutdown_order_smoke: ok\n");
     return 0;
 }

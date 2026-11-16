@@ -86,8 +86,8 @@ func TestRedactEnginesAreIsolated(t *testing.T) {
 	}
 }
 
-// A replacement that isn't UTF-8 still redacts matching keys, instead of
-// turning the whole detail into the unredactable marker.
+// A replacement that isn't UTF-8 is treated as unset: matching keys get the
+// default "***", as in the other SDKs.
 func TestRedactReplacementNotUTF8(t *testing.T) {
 	registerTestCodes(t)
 
@@ -98,7 +98,7 @@ func TestRedactReplacementNotUTF8(t *testing.T) {
 	t.Cleanup(func() { e.ResetForTests() })
 
 	got := e.redactDetail(map[string]any{"password": "p", "ok": "v"})
-	if got["password"] != "[�]" || got["ok"] != "v" {
+	if got["password"] != "***" || got["ok"] != "v" {
 		t.Fatalf("want password redacted and ok kept; got %v", got)
 	}
 }

@@ -1807,7 +1807,9 @@ inline bool flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(
 }
 
 // Stop the drainer; rows still queued get one last attempt without retries.
-// Afterwards emit() calls the sink directly.
+// Afterwards emit() calls the sink directly. The drainer is in
+// retiring_drainers while it stops, so a shutdown() on another thread waits
+// for it too.
 inline void uninstall_drainer() {
     auto& g = detail_::globals();
     std::shared_ptr<detail_::CFastenDrainer> old;
@@ -1815,9 +1817,14 @@ inline void uninstall_drainer() {
         std::lock_guard<std::mutex> lk(g.drainer_mu);
         old = g.drainer;
         g.drainer.reset();
+        if (old) g.retiring_drainers.push_back(old);
     }
     if (old) {
         old->shutdown(std::chrono::seconds(2));
+        old->wait_closed();
+        std::lock_guard<std::mutex> lk(g.drainer_mu);
+        auto& r = g.retiring_drainers;
+        r.erase(std::remove(r.begin(), r.end(), old), r.end());
     }
 }
 
