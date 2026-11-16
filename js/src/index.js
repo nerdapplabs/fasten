@@ -442,10 +442,12 @@ export class Engine {
 			for (const [k, v] of Object.entries(detail)) {
 				if (passthrough.has(k)) kept[k] = v;
 			}
+			// The markers last, so a passthrough key with a marker's name
+			// can't replace it.
 			outDetail = {
+				...this._redact(kept),
 				_redacted: REDACT_REPLACEMENT,
 				_pii_in_detail: true,
-				...this._redact(kept),
 			};
 		} else {
 			outDetail = this._redact(detail);

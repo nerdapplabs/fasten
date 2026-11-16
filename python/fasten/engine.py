@@ -674,10 +674,12 @@ class Engine:
         if meta.pii_in_detail:
             passthrough = set(meta.detail_passthrough_keys)
             kept = {k: v for k, v in detail.items() if k in passthrough}
+            # The markers last, so a passthrough key with a marker's name
+            # can't replace it.
             detail = {
+                **self._redactor.redact(kept),
                 "_redacted": "***",
                 "_pii_in_detail": True,
-                **self._redactor.redact(kept),
             }
         else:
             detail = self._redactor.redact(detail)

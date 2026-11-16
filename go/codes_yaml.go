@@ -191,9 +191,16 @@ func buildFromYAMLPaths(paths []string) (map[Code]Meta, error) {
 				rc = RetShort
 			}
 			var passthrough []string
-			if keys := raw.DetailPassthroughKeys; keys.Kind != 0 {
+			keys := &raw.DetailPassthroughKeys
+			if keys.Kind == yaml.AliasNode && keys.Alias != nil {
+				keys = keys.Alias
+			}
+			if keys.Kind != 0 {
 				ok := keys.Kind == yaml.SequenceNode
 				for _, n := range keys.Content {
+					if n.Kind == yaml.AliasNode && n.Alias != nil {
+						n = n.Alias
+					}
 					if n.Kind != yaml.ScalarNode || n.Tag != "!!str" {
 						ok = false
 						break

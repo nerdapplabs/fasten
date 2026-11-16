@@ -18,7 +18,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::{
     registry, Domain, Error, Meta, RetentionClass, Severity,
@@ -65,9 +65,30 @@ struct YamlCodeEntry {
     high_volume: bool,
     #[serde(default)]
     pii_in_detail: bool,
-    /// Detail keys kept when `pii_in_detail` is set.
-    #[serde(default)]
-    detail_passthrough_keys: Vec<String>,
+    /// Detail keys kept when `pii_in_detail` is set. `None` when the key is
+    /// absent; a null value is `Some(Null)`, so it can be refused.
+    #[serde(default, deserialize_with = "present")]
+    detail_passthrough_keys: Option<serde_yaml::Value>,
+}
+
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<serde_yaml::Value>, D::Error> {
+    serde_yaml::Value::deserialize(d).map(Some)
+}
+
+/// The passthrough keys: none when absent, else a list of strings. Null, an
+/// empty value or a non-string item is `None`, as in the other SDKs.
+fn passthrough_keys(v: Option<serde_yaml::Value>) -> Option<Vec<String>> {
+    match v {
+        None => Some(Vec::new()),
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .into_iter()
+            .map(|i| match i {
+                serde_yaml::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => None,
+    }
 }
 
 fn parse_severity(s: &str) -> Result<Severity, Error> {
@@ -133,6 +154,13 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
             let mut rc = parse_retention(&raw.retention_class).map_err(|e| {
                 Error::YamlInvalid(format!("{}:{code}: {e}", path.display()))
             })?;
+            let passthrough =
+                passthrough_keys(raw.detail_passthrough_keys.clone()).ok_or_else(|| {
+                    Error::YamlInvalid(format!(
+                        "{}:{code}: detail_passthrough_keys must be a list of strings",
+                        path.display()
+                    ))
+                })?;
             // As in register(): a pii_in_detail code is always short retention.
             if raw.pii_in_detail && rc != crate::RetentionClass::Short {
                 eprintln!(
@@ -167,7 +195,7 @@ fn build_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, Meta>, Error> {
                     retention_class: rc,
                     high_volume: raw.high_volume,
                     pii_in_detail: raw.pii_in_detail,
-                    detail_passthrough_keys: raw.detail_passthrough_keys,
+                    detail_passthrough_keys: passthrough,
                     declared_unused: false,
                 },
             );
@@ -342,6 +370,26 @@ codes:
         assert!(m.pii_in_detail);
         assert_eq!(m.retention_class, RetentionClass::Short);
         assert_eq!(m.detail_passthrough_keys, vec!["tenant".to_string()]);
+    }
+
+    /// Null, an empty value or a non-string item is an error, as in the
+    /// other loaders; a list shared through an anchor is followed.
+    #[test]
+    fn load_passthrough_keys_rule() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["null", "", "[1, true]", "tenant", "[tenant, 1.5]"] {
+            reset_yaml_state();
+            let f = write_yaml(&format!(
+                "domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: {v}\n"
+            ));
+            let err = load(f.path()).expect_err(v).to_string();
+            assert!(err.contains("BAD_PASS: detail_passthrough_keys"), "{v}: {err}");
+        }
+        reset_yaml_state();
+        let f = write_yaml("domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n");
+        load(f.path()).expect("load");
+        let m = super::super::meta_of("USER_B").unwrap();
+        assert_eq!(m.detail_passthrough_keys, vec!["tenant".to_string(), "region".to_string()]);
     }
 
     #[test]

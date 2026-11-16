@@ -86,6 +86,31 @@ void test_load_pii_code() {
     } catch (const fasten::AuditCatalogError& e) {
         assert(std::string(e.what()).find("detail_passthrough_keys") != std::string::npos);
     }
+    // Null, an empty value or a non-string item is an error, as in the
+    // other loaders.
+    for (const char* v : {"null", "", "[1, true]", "[tenant, 1.5]", "[tenant, ~]"}) {
+        auto p = write_yaml(
+            std::string("domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: ") + v + "\n",
+            "badpass2.yaml");
+        try {
+            fasten::codes::load(p);
+            std::cerr << "expected a throw for: " << v << "\n";
+            assert(false);
+        } catch (const fasten::AuditCatalogError& e) {
+            assert(std::string(e.what()).find("BAD_PASS: detail_passthrough_keys") != std::string::npos);
+        }
+    }
+    // Quoted values are strings; a list shared through an anchor is followed.
+    reset_state();
+    fasten::codes::load(write_yaml(
+        "domain: user\ncodes:\n  USER_Q:\n    detail_passthrough_keys: [\"1\", 'true', tenant]\n",
+        "quoted.yaml"));
+    assert((fasten::registry()["USER_Q"].detail_passthrough_keys ==
+            std::vector<std::string>{"1", "true", "tenant"}));
+    reset_state();
+    fasten::codes::load(write_yaml("domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n", "alias.yaml"));
+    assert((fasten::registry()["USER_B"].detail_passthrough_keys ==
+            std::vector<std::string>{"tenant", "region"}));
     std::cout << "load_pii_code: PASS\n";
 }
 

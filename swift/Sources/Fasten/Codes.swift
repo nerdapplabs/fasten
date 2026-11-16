@@ -55,7 +55,11 @@ public struct Meta: Sendable {
         self.severity       = severity
         self.description    = description
         self.emitter        = emitter
-        self.retentionClass = retentionClass
+        // As in the other SDKs, a piiInDetail code is always short retention.
+        if piiInDetail && retentionClass != .short_ {
+            fputs("fasten: code \(id) has piiInDetail=true; retentionClass forced to short (was \(retentionClass.rawValue)).\n", stderr)
+        }
+        self.retentionClass = piiInDetail ? .short_ : retentionClass
         self.piiInDetail    = piiInDetail
         self.detailPassthroughKeys = detailPassthroughKeys
     }

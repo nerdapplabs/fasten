@@ -228,11 +228,24 @@ codes:
 // detail_passthrough_keys items that aren't strings are a load error.
 func TestPII_YAMLPassthroughKeysMustBeStrings(t *testing.T) {
 	resetYAMLState(t)
-	for _, v := range []string{"[1, true]", "tenant"} {
+	for _, v := range []string{"[1, true]", "tenant", "null", "", "[tenant, 1.5]"} {
 		path := writeYAML(t, "domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: "+v+"\n")
 		err := Load(path)
 		if err == nil || !strings.Contains(err.Error(), "BAD_PASS: detail_passthrough_keys must be a list of strings") {
 			t.Fatalf("%s: want a load error naming the code, got %v", v, err)
 		}
+	}
+}
+
+// A list shared through an anchor is followed, as in the other loaders.
+func TestPII_YAMLPassthroughKeysThroughAnAnchor(t *testing.T) {
+	resetYAMLState(t)
+	path := writeYAML(t, "domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n")
+	if err := Load(path); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	m, ok := metaOf("USER_B")
+	if !ok || strings.Join(m.DetailPassthroughKeys, ",") != "tenant,region" {
+		t.Fatalf("USER_B passthrough = %v, want [tenant region]", m.DetailPassthroughKeys)
 	}
 }

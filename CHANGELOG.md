@@ -15,7 +15,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   like one from `Register` / `register()`.
 - YAML codes in every SDK that loads them (Python, Go, JS, Rust, C++) accept
   `detail_passthrough_keys`, a list of strings, and a `pii_in_detail` code
-  is always short retention.
+  is always short retention. Null, an empty value or a non-string item is a
+  load error in all five.
+- A passthrough key named `_redacted` or `_pii_in_detail` no longer replaces
+  the marker.
+- Swift: a `Meta` with `piiInDetail` is short retention, and a nested
+  dictionary or array in `detail` is written as JSON instead of `null`.
 - JS: `metaOf()` returns the same camelCase fields for a YAML code as for a
   registered one (`retentionClass`, `piiInDetail`, `highVolume`,
   `declaredUnused`, `detailPassthroughKeys`). Code that read

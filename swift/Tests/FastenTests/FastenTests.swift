@@ -542,6 +542,21 @@ final class RedactionTests: XCTestCase {
         ])
     }
 
+    /// A piiInDetail Meta is short retention, as in the other SDKs.
+    func testPiiMetaIsShortRetention() {
+        let m = Meta(id: "USER_PII_LONG", domain: "user", category: "account", action: "read",
+                     description: "PII", emitter: "test", retentionClass: .long_, piiInDetail: true)
+        XCTAssertEqual(m.retentionClass, .short_)
+    }
+
+    /// A nested dictionary or array in detail is written as JSON, not null.
+    func testNestedDetailIsWritten() throws {
+        let detail = AnyCodable(["tenant": ["id": "acme", "tags": ["a", 1]] as [String: Any]] as [String: Any])
+        let json = String(decoding: try JSONEncoder().encode(detail), as: UTF8.self)
+        XCTAssertTrue(json.contains(#""id":"acme""#), json)
+        XCTAssertTrue(json.contains(#""tags":["a",1]"#), json)
+    }
+
     /// emit() on a PII code stores the two markers and the passthrough keys.
     func testEmitReplacesDetailForPiiCodes() throws {
         Fasten.register("user", codes: [

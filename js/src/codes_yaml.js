@@ -103,7 +103,12 @@ async function _buildFromPaths(paths) {
 						`file-level domain='${fileDomain}'`,
 				);
 			}
-			const passthrough = raw?.detail_passthrough_keys ?? [];
+			// Absent means no keys; null or an empty value is an error, as in
+			// the other SDKs.
+			const passthrough =
+				raw != null && Object.hasOwn(raw, "detail_passthrough_keys")
+					? raw.detail_passthrough_keys
+					: [];
 			if (
 				!Array.isArray(passthrough) ||
 				passthrough.some((k) => typeof k !== "string")

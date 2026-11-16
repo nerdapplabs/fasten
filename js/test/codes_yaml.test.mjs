@@ -80,6 +80,20 @@ describe('codes_yaml', () => {
         assert.equal(row.pii_in_detail, true);
     });
 
+    test('detail_passthrough_keys: null, empty or non-string is an error', async () => {
+        for (const v of ['null', '', '[1, true]', 'tenant', '[tenant, 1.5]']) {
+            const p = await writeFile('badpass2.yaml',
+                `domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: ${v}\n`);
+            await assert.rejects(codes.load(p), /BAD_PASS: detail_passthrough_keys/, v);
+        }
+    });
+
+    test('detail_passthrough_keys through an anchor', async () => {
+        const p = await writeFile('alias.yaml', "domain: user\ncodes:\n  USER_A:\n    pii_in_detail: true\n    detail_passthrough_keys: &pt [tenant, region]\n  USER_B:\n    pii_in_detail: true\n    detail_passthrough_keys: *pt\n");
+        await codes.load(p);
+        assert.deepEqual(metaOf('USER_B').detailPassthroughKeys, ['tenant', 'region']);
+    });
+
     test('detail_passthrough_keys must be a list of strings', async () => {
         const p = await writeFile('badpass.yaml',
             `domain: x\ncodes:\n  BAD_PASS:\n    detail_passthrough_keys: tenant\n`);
