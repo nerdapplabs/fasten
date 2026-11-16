@@ -12,6 +12,7 @@ on:
       - 'swift/**'
       - 'spec/**'
       - '.github/workflows/fasten-swift.yml'
+  workflow_call:
 
 permissions:
   contents: read

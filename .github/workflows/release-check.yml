@@ -47,3 +47,12 @@ jobs:
 
       - name: Published fasten-core matches the tree
         run: scripts/release/test-core-published.sh
+
+      - name: Files on PyPI match the build
+        run: scripts/release/test-pypi-check.sh
+
+      - name: Tarball on npm matches the build
+        run: scripts/release/test-npm-check.sh
+
+      - name: GitHub release upload
+        run: scripts/release/test-gh-release.sh

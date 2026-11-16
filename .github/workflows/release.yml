@@ -1,11 +1,24 @@
 name: Release
 
-# vX.Y.Z tags: run the Python, JS and Rust test suites and check the tag
-# against every package version, then publish to PyPI, npm and crates.io and
-# build, attest and upload the GitHub release files. Nothing is published
-# unless every test job and the version check pass.
-# go/vX.Y.Z tags: the Go module zip on the GitHub release (release-go.yml
-# runs the Go tests).
+# vX.Y.Z tags: run every SDK test suite and the integration smokes, check the
+# tag against every package version, publish to crates.io, then PyPI and npm,
+# then build, attest and upload the GitHub release files.
+# go/vX.Y.Z tags: run the Go tests, then the Go module zip on the GitHub
+# release.
+# Tags must point at a commit on main. Prerelease tags (vX.Y.Z-beta.N) get a
+# GitHub prerelease only; set the repository variable PUBLISH_PRERELEASES to
+# true to also publish them to the registries.
+# A version that is already published is skipped only when the published
+# files match this build; otherwise the job fails. The wheel records the
+# hatchling version and the npm tarball's gzip bytes depend on the npm
+# version, so both are pinned (python/pyproject.toml, and the node image in
+# the npm jobs) and a re-run builds the same bytes. Bump them between
+# releases, not while one is partly published. A skip also checks that
+# the package is owned by one of the repository variables CRATES_OWNERS or
+# NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
+# covers it). Set both before the first release tag: a re-run after a
+# partial publish, and any SDK release that reuses the published
+# fasten-core, takes the skip path.
 # Dry run: start it from the Actions tab (Release, Run workflow) or with
 # `gh workflow run release.yml --ref <branch>`. It runs the tests, the
 # version check and every build, and publishes, attests and releases nothing.
@@ -19,30 +32,115 @@ on:
 permissions:
   contents: read
 
+# One run per tag at a time: a re-pushed tag waits for the run in progress,
+# so two builds never upload to the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.tag.outputs.kind }}
+      publish: ${{ steps.tag.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag kind
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          PUBLISH_PRERELEASES: ${{ vars.PUBLISH_PRERELEASES }}
+        run: |
+          if [ "$EVENT" != push ]; then
+            echo "kind=dry" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          semver='v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+          if echo "$REF_NAME" | grep -Eqx "go/$semver"; then
+            kind=go
+          elif echo "$REF_NAME" | grep -Eqx "$semver"; then
+            kind=v
+          else
+            echo "::error::tag $REF_NAME is not vX.Y.Z[-pre] or go/vX.Y.Z[-pre]"
+            exit 1
+          fi
+          publish=false
+          if [ "$kind" = v ]; then
+            case $REF_NAME in
+              *-*) [ "$PUBLISH_PRERELEASES" = true ] && publish=true ;;
+              *) publish=true ;;
+            esac
+          fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "$REF_NAME: kind=$kind publish=$publish"
+
+      - name: Tag is on main
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::$GITHUB_SHA is not on main; release tags must point at a commit on main"
+            exit 1
+          }
+
   test-python:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-py.yml
     uses: ./.github/workflows/fasten-py.yml
 
   test-js:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-js.yml
     uses: ./.github/workflows/fasten-js.yml
 
   test-rust:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
     permissions:
       contents: read
       id-token: write   # Codecov OIDC upload in fasten-rust.yml
     uses: ./.github/workflows/fasten-rust.yml
 
+  # The C++ and Swift sources and libfasten_core go into the release files.
+  test-cpp:
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
+    uses: ./.github/workflows/fasten-cpp.yml
+
+  test-swift:
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
+    uses: ./.github/workflows/fasten-swift.yml
+
+  test-integration:
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
+    uses: ./.github/workflows/integration.yml
+
+  test-go:
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'v' }}
+    permissions:
+      contents: read
+      id-token: write   # Codecov OIDC upload in fasten-go.yml
+    uses: ./.github/workflows/fasten-go.yml
+
   versions:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: tag
+    if: ${{ needs.tag.outputs.kind != 'go' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -70,95 +168,11 @@ jobs:
           scripts/release/check-version.sh js "$TAG"
           scripts/release/check-version.sh rust "$TAG"
 
-  pypi:
-    needs: [test-python, test-js, test-rust, versions]
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write  # required for Trusted Publishing OIDC exchange
-    container:
-      image: python:3.10-slim
-
-    environment:
-      name: pypi
-      url: https://pypi.org/p/fasten-sdk
-
-    defaults:
-      run:
-        working-directory: python
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
-
-      # Wheel only: an sdist has no libfasten_core and fails at first use.
-      - name: Build wheel
-        run: uv build --wheel
-
-      - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: python/dist/
-          # PEP 740 attestations, signed with the Trusted Publishing identity.
-          attestations: true
-          # A re-run after another publish job failed.
-          skip-existing: true
-
-  npm:
-    needs: [test-python, test-js, test-rust, versions]
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write  # required for npm --provenance
-    container:
-      image: node:24-alpine
-
-    environment:
-      name: npm
-      url: https://www.npmjs.com/package/@nerdapplabs/fasten
-
-    defaults:
-      run:
-        working-directory: js
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Configure npm registry
-        run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      # npm refuses a prerelease version without --tag, so 1.0.0-beta.0
-      # goes out under the beta dist-tag. A plain version goes out under
-      # latest only when it is above every version on npm; a backport gets
-      # release-X.Y. A re-run skips a version that is already on npm.
-      - name: Publish to npm (with provenance)
-        run: |
-          name=$(node -p 'require("./package.json").name')
-          version=$(node -p 'require("./package.json").version')
-          if [ -n "$(npm view "$name@$version" version 2>/dev/null)" ]; then
-            echo "$name $version is already on npm"
-            exit 0
-          fi
-          if ! npm view "$name" versions --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/view.err"; then
-            grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
-            echo '[]' > "$RUNNER_TEMP/versions.json"
-          fi
-          tag=$(node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
-            | ../scripts/release/npm-dist-tag.sh "$version")
-          npm publish --provenance --access public --tag "$tag"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
+  # crates.io goes first: it is the job most likely to fail, and PyPI and npm
+  # wait for it so a failure there publishes nothing else.
   crates-io:
-    needs: [test-python, test-js, test-rust, versions]
-    if: ${{ github.event_name == 'push' }}
+    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, versions]
+    if: ${{ needs.tag.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -180,6 +194,7 @@ jobs:
         working-directory: fasten-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
@@ -196,7 +211,7 @@ jobs:
       - name: Wait for fasten-core in the index
         run: |
           for _ in $(seq 60); do
-            if curl -fsS https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
+            if curl -fsS --max-time 30 https://index.crates.io/fa/st/fasten-core | grep -q "\"vers\":\"$version\""; then
               exit 0
             fi
             sleep 10
@@ -210,7 +225,115 @@ jobs:
         working-directory: rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
+        run: |
+          state=$(../scripts/release/core-published.sh .)
+          if [ "$state" = skip ]; then
+            echo "fasten-sdk is already on crates.io with the same files"
+          else
+            cargo publish
+          fi
+
+  pypi:
+    needs: [tag, crates-io]
+    if: ${{ needs.tag.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for Trusted Publishing OIDC exchange
+    container:
+      image: python:3.10-slim
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fasten-sdk
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: false
+
+      # Wheel only: an sdist has no libfasten_core and fails at first use.
+      - name: Build wheel
+        run: uv build --wheel
+
+      # No skip-existing on the upload: PyPI accepts a file it already has
+      # with the same bytes and rejects one with different bytes, so a
+      # rebuilt wheel fails the upload too if this check missed it.
+      - name: Files already on PyPI match this build
+        run: python3 ../scripts/release/pypi-check.py dist
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist/
+          # PEP 740 attestations, signed with the Trusted Publishing identity.
+          attestations: true
+
+  npm:
+    needs: [tag, crates-io]
+    if: ${{ needs.tag.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for npm --provenance
+    container:
+      image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
+
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@nerdapplabs/fasten
+
+    defaults:
+      run:
+        working-directory: js
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure npm registry
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # npm-check.sh is a bash script; the alpine image has only sh.
+      - name: Install bash
+        run: apk add --no-cache bash
+
+      # npm refuses a prerelease version without --tag, so 1.0.0-beta.0
+      # goes out under the beta dist-tag. A plain version goes out under
+      # latest only when it is above every version on npm; a backport gets
+      # release-X.Y. A re-run skips a version that is already on npm with
+      # the same tarball, and fails if the tarball differs.
+      - name: Publish to npm (with provenance)
+        run: |
+          state=$(../scripts/release/npm-check.sh .)
+          case $state in
+            publish) ;;
+            skip) exit 0 ;;
+            *) echo "::error::npm-check.sh printed '$state'"; exit 1 ;;
+          esac
+          name=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          if ! npm view "$name" versions --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/view.err"; then
+            grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
+            echo '[]' > "$RUNNER_TEMP/versions.json"
+          fi
+          node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
+            > "$RUNNER_TEMP/versions.txt"
+          tag=$(../scripts/release/npm-dist-tag.sh "$version" < "$RUNNER_TEMP/versions.txt")
+          npm publish --provenance --access public --tag "$tag"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_OWNERS: ${{ vars.NPM_OWNERS }}
 
   # Dry run of the three publish jobs: same images and builds, no
   # environment (so no approval), no registry token, nothing uploaded.
@@ -239,17 +362,37 @@ jobs:
       - name: Check metadata
         run: uvx twine check dist/*
 
+      # Between releases the version in the tree is usually already on
+      # PyPI with other bytes, so that (exit 3) is a warning here; any
+      # other failure, such as PyPI not answering, fails the dry run.
+      - name: Files already on PyPI
+        env:
+          RELEASE_CHECK_LEVEL: warning
+        run: python3 ../scripts/release/pypi-check.py dist || [ $? -eq 3 ]
+
   npm-dry-run:
     needs: [test-python, test-js, test-rust, versions]
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     container:
-      image: node:24-alpine
+      image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5  # node:24-alpine, pinned by digest
     defaults:
       run:
         working-directory: js
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install bash
+        run: apk add --no-cache bash
+
+      # The same check the npm job runs, in the same image. Exit 3 is a
+      # warning here: between releases js/package.json holds the published
+      # version and the tarball differs, or NPM_OWNERS is not set.
+      - name: Already on npm
+        env:
+          RELEASE_CHECK_LEVEL: warning
+          NPM_OWNERS: ${{ vars.NPM_OWNERS }}
+        run: ../scripts/release/npm-check.sh . || [ $? -eq 3 ]
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
@@ -268,17 +411,37 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Exit 3 is a warning here; the crates-io job would fail on it:
+      # fasten-core changed since its version was published, or it is
+      # published with the same files but CRATES_OWNERS is not set.
       - name: cargo publish --dry-run fasten-core
         working-directory: fasten-core
+        env:
+          RELEASE_CHECK_LEVEL: warning
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev
-          state=$(../scripts/release/core-published.sh .)
-          if [ "$state" = skip ]; then
-            echo "fasten-core is already on crates.io with the same files"
-          else
-            cargo publish --dry-run --locked
-          fi
+          state=$(../scripts/release/core-published.sh .) || [ $? -eq 3 ]
+          echo "core_state=$state" >> "$GITHUB_ENV"
+          case $state in
+            skip) echo "fasten-core is already on crates.io with the same files" ;;
+            publish) cargo publish --dry-run --locked ;;
+            # Exit 3 (changed, or owner not checked): still check it packages.
+            *) cargo package --locked ;;
+          esac
+
+      # The check the crates-io job runs before publishing the SDK. It
+      # packages the SDK against fasten-core from crates.io, so it runs
+      # only when the tree's fasten-core is published with the same files
+      # and an owner in CRATES_OWNERS; otherwise the step above warned.
+      - name: SDK already on crates.io
+        if: ${{ env.core_state == 'skip' }}
+        working-directory: rust
+        env:
+          RELEASE_CHECK_LEVEL: warning
+          CRATES_OWNERS: ${{ vars.CRATES_OWNERS }}
+        run: ../scripts/release/core-published.sh . || [ $? -eq 3 ]
 
       # fasten-core may not be on crates.io yet, so the SDK is packaged and
       # built against the fasten-core in the tree.
@@ -286,10 +449,10 @@ jobs:
         working-directory: rust
         run: cargo publish --dry-run --config 'patch.crates-io.fasten-core.path="../fasten-core"'
 
-  # GitHub release files. On go/ tags the test and version jobs are
+  # GitHub release files. Test jobs that do not apply to the tag are
   # skipped, so this runs unless one of them failed.
   build:
-    needs: [test-python, test-js, test-rust, versions]
+    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, test-go, versions]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
@@ -357,9 +520,19 @@ jobs:
           name: release-files
           path: dist
 
+      # Every file is checked, and every file is listed: one missing from
+      # SHA256SUMS would go out with no published checksum.
       - name: Verify checksums
         working-directory: dist
-        run: sha256sum -c SHA256SUMS
+        run: |
+          sha256sum -c SHA256SUMS
+          listed=$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort)
+          present=$(ls -A | grep -vx SHA256SUMS | sort)
+          if [ "$listed" != "$present" ]; then
+            echo "::error::the files in dist and in SHA256SUMS differ"
+            diff <(echo "$listed") <(echo "$present") || true
+            exit 1
+          fi
 
       - name: Verify attestations
         if: ${{ github.event_name == 'push' }}
@@ -374,9 +547,11 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done
 
+  # After the registries, so a failed publish leaves no GitHub release. The
+  # publish jobs are skipped for go/ and prerelease tags.
   github-release:
-    needs: verify
-    if: ${{ !cancelled() && needs.verify.result == 'success' && github.event_name == 'push' }}
+    needs: [verify, crates-io, pypi, npm]
+    if: ${{ !cancelled() && needs.verify.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the release and upload its files
@@ -391,18 +566,14 @@ jobs:
           name: release-files
           path: dist
 
+      # gh-release.sh creates the release as a draft, uploads what is
+      # missing, checks every file's digest and only then publishes it.
       - name: Upload to the GitHub release
+        shell: bash   # adds pipefail, for the git tag | latest-flag.sh pipe
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            pre=()
-            case $TAG in *-*) pre=(--prerelease) ;; esac
-            # Only the highest vX.Y.Z tag becomes the repo's latest release.
-            latest=$(git tag -l 'v*' | scripts/release/latest-flag.sh "$TAG")
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "$TAG" "${pre[@]}" --latest="$latest" \
-              --notes "Verify these files with the steps in SECURITY.md (Verifying a release)."
-          fi
-          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          # Only the highest vX.Y.Z tag becomes the repo's latest release.
+          latest=$(git tag -l 'v*' | scripts/release/latest-flag.sh "$TAG")
+          scripts/release/gh-release.sh "$TAG" "$latest" dist

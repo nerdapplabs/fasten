@@ -49,31 +49,41 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 ### Fixed: release workflows check before they publish
 
 - One `release.yml` replaces `release-python.yml`, `release-js.yml` and
-  `release-provenance.yml`. A `v*` tag runs the Python, JS and Rust test
-  suites (`fasten-py.yml`, `fasten-js.yml`, `fasten-rust.yml`, called through
-  `workflow_call`) and checks the tag against every package version; the
-  PyPI, npm, crates.io and GitHub release jobs start only when all of them
-  pass. `go/v*` tags and the `workflow_dispatch` dry run still build the
-  GitHub release files.
+  `release-provenance.yml`. A `v*` tag runs every SDK's test suite and the
+  integration smokes (called through `workflow_call`) and checks the tag
+  against every package version; the crates.io, PyPI, npm and GitHub
+  release jobs start only when all of them pass. A `go/v*` tag runs the Go
+  tests before the Go module zip is uploaded. The `workflow_dispatch` dry
+  run builds everything and publishes nothing.
+- A release tag must point at a commit on `main`; any other tag fails
+  before the tests run.
+- A prerelease tag such as `v1.0.0-beta.0` gets a GitHub prerelease only.
+  Set the repository variable `PUBLISH_PRERELEASES` to `true` to publish
+  prereleases to the registries as well.
 - The version check is `scripts/release/check-version.sh`. Python versions
   are compared after PEP 440 normalisation, so `v1.0.0-beta.0` matches
   `1.0.0b0`, and `__version__` in `fasten/__init__.py` must match
   `pyproject.toml`.
-- npm: a prerelease version is published under its first prerelease
-  identifier as the dist-tag (`1.0.0-beta.0` under `beta`, `1.0.0-0` under
-  `next`). npm refuses a prerelease publish without `--tag`. A plain version
+- npm: when prereleases are published, a prerelease version goes under its
+  first prerelease identifier as the dist-tag (`1.0.0-beta.0` under `beta`,
+  `1.0.0-0` under `next`). npm refuses a prerelease publish without `--tag`. A plain version
   goes under `latest` only when it is above every version on npm; a backport
   such as 1.0.1 after 1.1.0 goes under `release-1.0`, so `latest` stays on
   1.1.0. `scripts/release/npm-dist-tag.sh` picks the tag with the same check
   as the GitHub release (`latest-flag.sh`).
-- crates.io: fasten-core is published first, then the SDK once the index
-  has it. When that fasten-core version is already on crates.io,
+- crates.io publishes before PyPI and npm: fasten-core first, then the SDK
+  once the index has it. When that fasten-core version is already on crates.io,
   `scripts/release/core-published.sh` compares the published `.crate` with
   `cargo package` of the tree: the same files skip the publish, any change
   fails the job, since fasten-core then needs a new version. The SDK's
   fasten-core dependency now carries `version = "0.1.0"`, which crates.io
   needs.
-- A re-run skips a version that is already on PyPI or npm.
+- A re-run skips a version that is already on PyPI or npm only when the
+  published files match this build; otherwise the job fails. On npm and
+  crates.io the skip also needs the package to belong to an owner listed in
+  the repository variables `NPM_OWNERS` / `CRATES_OWNERS`.
+- The GitHub release is created as a draft and published once its files
+  match the build.
 - `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
   requires.
 

@@ -10,10 +10,13 @@ export LC_ALL=C
 [ $# -eq 1 ] || { echo "usage: $0 <tag>" >&2; exit 2; }
 tag=$1
 release='^v[0-9]+\.[0-9]+\.[0-9]+$'
+# Read all of stdin before deciding: exiting early would kill the writer
+# (git tag -l) with SIGPIPE and fail a pipefail caller.
+tags=$(cat)
 
 if ! printf '%s\n' "$tag" | grep -Eq "$release"; then
   echo false
   exit 0
 fi
-highest=$({ cat; printf '%s\n' "$tag"; } | grep -E "$release" | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -n 1)
+highest=$(printf '%s\n%s\n' "$tags" "$tag" | grep -E "$release" | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -n 1)
 if [ "$highest" = "$tag" ]; then echo true; else echo false; fi

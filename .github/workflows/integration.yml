@@ -25,6 +25,7 @@ on:
       - 'fasten-core/**'
       - 'tests/integration/**'
       - '.github/workflows/integration.yml'
+  workflow_call:
 
 permissions:
   contents: read

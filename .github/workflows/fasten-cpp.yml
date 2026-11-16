@@ -12,6 +12,7 @@ on:
       - 'cpp/**'
       - 'fasten-core/**'
       - '.github/workflows/fasten-cpp.yml'
+  workflow_call:
 
 permissions:
   contents: read
