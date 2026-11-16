@@ -323,7 +323,8 @@ export class Engine {
 		this.#config = {
 			serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? "",
 			nodeId: opts.nodeId ?? process.env.FASTEN_NODE_ID ?? "",
-			tenantId: opts.tenantId ?? process.env.FASTEN_TENANT_ID ?? null,
+			// An empty FASTEN_TENANT_ID is no tenant, as in the other SDKs.
+			tenantId: opts.tenantId ?? (process.env.FASTEN_TENANT_ID || null),
 			auditStore: opts.auditStore ?? null,
 			apiStore: opts.apiStore ?? null,
 			extraRedactKeys: extraKeys ?? [],

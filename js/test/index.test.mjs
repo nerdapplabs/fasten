@@ -63,6 +63,17 @@ describe('init', () => {
         delete process.env.FASTEN_SERVICE_ID;
         delete process.env.FASTEN_NODE_ID;
     });
+
+    test('an empty FASTEN_TENANT_ID is no tenant', () => {
+        process.env.FASTEN_TENANT_ID = '';
+        try {
+            init({ serviceId: 'svc', nodeId: 'node', auditStoreFailureStrategy: 'raise' });
+            const row = emit({ code: 'USER_CREATED', target: 'u-1' });
+            assert.equal(row.tenant_id, null);
+        } finally {
+            delete process.env.FASTEN_TENANT_ID;
+        }
+    });
 });
 
 // Register

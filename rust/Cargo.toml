@@ -19,10 +19,8 @@ thiserror   = "1"
 chrono      = { version = "0.4", features = ["serde"] }
 uuid        = { version = "1", features = ["v4"] }
 tokio       = { version = "1", features = ["rt", "macros", "sync"], optional = true }
-tracing     = { version = "0.1", optional = true }
-sqlx        = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"], optional = true }
 # `store-postgres` uses the sync `postgres` client because `AuditStore` is a
-# sync trait; sqlx is async-only and block_on() panics inside a tokio runtime.
+# sync trait.
 pg          = { package = "postgres", version = "0.19", optional = true }
 serde_yaml  = { version = "0.9", optional = true }
 
@@ -33,9 +31,7 @@ name = "fasten"
 [features]
 default = []
 async = ["tokio"]
-store-sqlite = ["sqlx"]
 store-postgres = ["dep:pg"]
-shim-tracing = ["tracing"]
 codes-yaml = ["serde_yaml"]
 
 [dev-dependencies]
