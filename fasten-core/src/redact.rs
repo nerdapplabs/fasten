@@ -62,17 +62,19 @@ fn is_group_sep(c: char) -> bool {
         | '\u{3000}' | '-')
 }
 
-/// Whether `digits` starts like a payment card: 3 (Amex, Diners, JCB),
-/// 4 (Visa), 5 (Mastercard, Maestro), 6 (Discover, Maestro and others), or
-/// 2200-2204 (Mir) and 2221-2720 (Mastercard). Years (19xx, 20xx) and
-/// counters starting 0 or 1 do not.
+/// Whether the card number `digits` starts like one: 3 (Amex, Diners,
+/// JCB), 4 (Visa), 5 (Mastercard, Maestro), 6 (Discover, Maestro and
+/// others), 2200-2205 (Mir), 2221-2720 (Mastercard), 8100-8299 (India),
+/// 8600 (Uzcard), 9704 (Napas), 9792 (Troy), 9860 (Humo), 1946, or 1 with
+/// 15 digits (UATP). Other years (19xx, 20xx) and counters do not.
 fn card_prefix(digits: &str) -> bool {
+    let p = digits.get(..4).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
     match digits.as_bytes().first() {
         Some(b'3' | b'4' | b'5' | b'6') => true,
-        Some(b'2') => digits
-            .get(..4)
-            .and_then(|p| p.parse::<u32>().ok())
-            .is_some_and(|p| (2200..=2204).contains(&p) || (2221..=2720).contains(&p)),
+        Some(b'1') => digits.len() == 15 || p == 1946,
+        Some(b'2') => (2200..=2205).contains(&p) || (2221..=2720).contains(&p),
+        Some(b'8') => (8100..=8299).contains(&p) || p == 8600,
+        Some(b'9') => matches!(p, 9704 | 9792 | 9860),
         _ => false,
     }
 }
@@ -95,8 +97,9 @@ fn is_word_byte(b: u8) -> bool {
 
 /// Whether `s` holds a card number: a group of 13 to 19 digits, or groups in
 /// a card layout, that start with a card prefix and pass the Luhn check.
-/// Digits joined to a letter or `_` are part of an id and are skipped. The
-/// prefix keeps a list of years or a dashed id from matching.
+/// Digits joined to a letter or `_` are part of an id and are skipped. A
+/// layout is tried only where it starts or ends its run of digit groups,
+/// so a long list of 4-digit values is not read as cards in its middle.
 fn has_card(s: &str) -> bool {
     let bytes = s.as_bytes();
     for run in DIGIT_RUN_RE.find_iter(s) {
@@ -116,18 +119,16 @@ fn has_card(s: &str) -> bool {
             {
                 return true;
             }
-            if !card_prefix(groups[i]) {
-                continue;
-            }
             for layout in CARD_LAYOUTS {
                 let end = i + layout.len();
-                if end > groups.len() || !fits_end(end) {
+                if end > groups.len() || !fits_end(end) || (i > 0 && end < groups.len()) {
                     continue;
                 }
-                if groups[i..end].iter().zip(layout.iter()).all(|(g, &n)| g.len() == n)
-                    && luhn_valid(&groups[i..end].concat())
-                {
-                    return true;
+                if groups[i..end].iter().zip(layout.iter()).all(|(g, &n)| g.len() == n) {
+                    let digits = groups[i..end].concat();
+                    if card_prefix(&digits) && luhn_valid(&digits) {
+                        return true;
+                    }
                 }
             }
         }
@@ -138,7 +139,7 @@ fn has_card(s: &str) -> bool {
 // An Authorization header value. Bearer: a credential of 16 or more
 // characters that holds a digit or one of + / =, so a sentence that starts
 // "Bearer" is not one. Basic: base64 that decodes to UTF-8 text with no
-// control characters, a user name and a ":" (user:password).
+// control characters and a ":" (user:password).
 #[allow(clippy::expect_used)]
 static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})")
@@ -160,7 +161,8 @@ fn has_auth_header(s: &str) -> bool {
 
 /// Whether `token` is base64 for `user:password`: its length is a multiple
 /// of four, and it decodes to valid UTF-8 with no control characters (C0,
-/// DEL or C1) and a ":" after at least one character (the user name).
+/// DEL or C1) and a ":". With an empty user name (":token", as some access
+/// tokens are sent) the password needs 16 or more characters.
 fn is_basic_credential(token: &str) -> bool {
     if token.is_empty() || token.len() % 4 != 0 {
         return false;
@@ -184,8 +186,15 @@ fn is_basic_credential(token: &str) -> bool {
             decoded.push(((acc >> bits) & 0xFF) as u8);
         }
     }
-    std::str::from_utf8(&decoded)
-        .is_ok_and(|text| text.find(':').is_some_and(|i| i > 0) && !text.chars().any(char::is_control))
+    let Ok(text) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let user_or_long_password = match text.find(':') {
+        Some(0) => text[1..].chars().count() >= 16,
+        Some(_) => true,
+        None => false,
+    };
+    user_or_long_password && !text.chars().any(char::is_control)
 }
 
 struct Vp {

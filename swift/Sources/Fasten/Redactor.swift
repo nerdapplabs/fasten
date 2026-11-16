@@ -153,8 +153,8 @@ public final class Redactor: @unchecked Sendable {
 
     // An Authorization header value, as in fasten-core. Bearer: a credential
     // of 16 or more characters that holds a digit or one of + / =. Basic:
-    // base64 that decodes to UTF-8 text with no control characters, a user
-    // name and a ":" (user:password).
+    // base64 that decodes to UTF-8 text with no control characters and a
+    // ":" (user:password).
     private static let bearer = try! NSRegularExpression(
         pattern: #"(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=\-]{16,})"#)
     private static let basic = try! NSRegularExpression(
@@ -175,8 +175,8 @@ public final class Redactor: @unchecked Sendable {
 
     // Whether token is base64 for user:password: its length is a multiple
     // of four, and it decodes to valid UTF-8 with no control characters
-    // (C0, DEL or C1) and a ":" after at least one character (the user
-    // name).
+    // (C0, DEL or C1) and a ":". With an empty user name (":token") the
+    // password needs 16 or more characters.
     static func isBasicCredential(_ token: String) -> Bool {
         let bytes = Array(token.utf8)
         if bytes.isEmpty || bytes.count % 4 != 0 { return false }
@@ -202,7 +202,8 @@ public final class Redactor: @unchecked Sendable {
             }
         }
         guard let text = String(bytes: decoded, encoding: .utf8) else { return false }
-        guard let colon = text.firstIndex(of: ":"), colon != text.startIndex else { return false }
+        guard let colon = text.firstIndex(of: ":") else { return false }
+        if colon == text.startIndex && text.unicodeScalars.count - 1 < 16 { return false }
         return !text.unicodeScalars.contains {
             $0.value < 0x20 || (0x7F...0x9F).contains($0.value)
         }
@@ -216,15 +217,20 @@ public final class Redactor: @unchecked Sendable {
     private static let digitRun = try! NSRegularExpression(
         pattern: #"[0-9]+(?:[\t\n\x{0B}\x{0C}\r \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\-]+[0-9]+)*"#)
 
-    // Whether digits starts like a payment card, as in fasten-core: 3, 4, 5
-    // or 6, or 2200-2204 and 2221-2720. Years and counters starting 0 or 1
-    // do not.
+    // Whether the card number d starts like one, as in fasten-core: 3, 4, 5
+    // or 6; 2200-2205, 2221-2720, 8100-8299, 8600, 9704, 9792, 9860, 1946;
+    // or 1 with 15 digits. Other years and counters do not.
     private static func cardPrefix(_ d: [UInt8]) -> Bool {
-        guard let c = d.first else { return false }
-        if (0x33...0x36).contains(c) { return true }
-        guard c == 0x32, d.count >= 4 else { return false }
+        guard let c = d.first, d.count >= 4 else { return false }
         let p = d[0..<4].reduce(0) { $0 * 10 + Int($1 - 0x30) }
-        return (2200...2204).contains(p) || (2221...2720).contains(p)
+        switch c {
+        case 0x33...0x36: return true
+        case 0x31: return d.count == 15 || p == 1946
+        case 0x32: return (2200...2205).contains(p) || (2221...2720).contains(p)
+        case 0x38: return (8100...8299).contains(p) || p == 8600
+        case 0x39: return [9704, 9792, 9860].contains(p)
+        default: return false
+        }
     }
 
     // Card layouts printed in groups, as in fasten-core.
@@ -239,7 +245,8 @@ public final class Redactor: @unchecked Sendable {
     // Whether s holds a card number: a group of 13 to 19 digits, or groups in
     // a card layout, that start with a card prefix and pass the Luhn check.
     // Same rules as fasten-core: digits joined to a letter or "_" are
-    // skipped.
+    // skipped, and a layout is tried only where it starts or ends its run of
+    // digit groups.
     static func hasCard(_ s: String) -> Bool {
         let ns = s as NSString
         for m in digitRun.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
@@ -253,15 +260,14 @@ public final class Redactor: @unchecked Sendable {
             func fitsEnd(_ e: Int) -> Bool { e < groups.count || openEnd }
             for i in groups.indices {
                 if i == 0 && !openStart { continue }
-                if !cardPrefix(groups[i]) { continue }
-                if (13...19).contains(groups[i].count) && fitsEnd(i + 1) && luhn(groups[i]) { return true }
+                if (13...19).contains(groups[i].count) && fitsEnd(i + 1)
+                    && cardPrefix(groups[i]) && luhn(groups[i]) { return true }
                 for layout in cardLayouts {
                     let e = i + layout.count
-                    if e > groups.count || !fitsEnd(e) { continue }
-                    if zip(groups[i..<e], layout).allSatisfy({ $0.count == $1 })
-                        && luhn(Array(groups[i..<e].joined())) {
-                        return true
-                    }
+                    if e > groups.count || !fitsEnd(e) || (i > 0 && e < groups.count) { continue }
+                    guard zip(groups[i..<e], layout).allSatisfy({ $0.count == $1 }) else { continue }
+                    let digits = Array(groups[i..<e].joined())
+                    if cardPrefix(digits) && luhn(digits) { return true }
                 }
             }
         }

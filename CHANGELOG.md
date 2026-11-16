@@ -20,8 +20,10 @@ be replaced now.
   `Bearer` / `Basic` Authorization values (`***AUTH_HEADER***`).
 - Card numbers are found anywhere in a string, unbroken or in a card layout
   (4-4-4-4 with an optional short tail, 4-6-5, 4-6-4) split by any
-  whitespace or dashes. A number must start like a card (3, 4, 5, 6, or
-  2200-2204 and 2221-2720), so a list of years or a dashed id is kept.
+  whitespace or dashes. A number must start like a card (for example 3,
+  4, 5 or 6, 2221-2720, 8600 or 9860), so a list of years or a dashed id
+  is kept. A layout is tried only at the start or end of a run of digit
+  groups, so a list of 4-digit values such as ports is kept.
 - OpenAI keys match only when `sk-` is not part of a longer word, so an id
   such as `task-<uuid>` is kept.
 - JS and Swift: a `detail` or log line over `FASTEN_MAX_DETAIL_BYTES`

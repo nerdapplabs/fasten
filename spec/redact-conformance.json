@@ -728,6 +728,150 @@
       "group": "value_shape",
       "input":    {"note": "Authorization: Basic asO8cmdlbjpww6Rzc3fDtnJk"},
       "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_cc_prefix_2199_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2199333333333336"},
+      "expected": {"note": "card 2199333333333336"}
+    },
+    {
+      "name": "value_cc_prefix_2200",
+      "group": "value_shape",
+      "input":    {"note": "card 2200333333333333"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2205",
+      "group": "value_shape",
+      "input":    {"note": "card 2205333333333338"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2206_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2206333333333337"},
+      "expected": {"note": "card 2206333333333337"}
+    },
+    {
+      "name": "value_cc_prefix_2220_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2220333333333339"},
+      "expected": {"note": "card 2220333333333339"}
+    },
+    {
+      "name": "value_cc_prefix_2221",
+      "group": "value_shape",
+      "input":    {"note": "card 2221333333333338"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2720",
+      "group": "value_shape",
+      "input":    {"note": "card 2720333333333334"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_2721_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 2721333333333333"},
+      "expected": {"note": "card 2721333333333333"}
+    },
+    {
+      "name": "value_cc_prefix_8099_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 8099333333333334"},
+      "expected": {"note": "card 8099333333333334"}
+    },
+    {
+      "name": "value_cc_prefix_8100",
+      "group": "value_shape",
+      "input":    {"note": "card 8100333333333331"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_8299",
+      "group": "value_shape",
+      "input":    {"note": "card 8299333333333332"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_prefix_8300_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "card 8300333333333339"},
+      "expected": {"note": "card 8300333333333339"}
+    },
+    {
+      "name": "value_cc_uzcard_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 8600 7777 7777 7772"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_humo_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9860 7777 7777 7775"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_napas_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9704 7777 7777 7775"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_troy_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 9792 7777 7777 7778"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_1946_grouped",
+      "group": "value_shape",
+      "input":    {"note": "card 1946 7777 7777 7770"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_uatp_15_digits",
+      "group": "value_shape",
+      "input":    {"note": "card 155555555555552"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_cc_uatp_4_6_5",
+      "group": "value_shape",
+      "input":    {"note": "card 1555 555555 55552"},
+      "expected": {"note": "***CC***"}
+    },
+    {
+      "name": "value_16_digits_starting_1_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "ref 1947555555555553"},
+      "expected": {"note": "ref 1947555555555553"}
+    },
+    {
+      "name": "value_port_list_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "ports 5432 6379 3306 8080 9200 5601"},
+      "expected": {"note": "ports 5432 6379 3306 8080 9200 5601"}
+    },
+    {
+      "name": "value_four_digit_list_not_cc",
+      "group": "value_shape",
+      "input":    {"note": "values 4609 4703 4585 8648 8467 3407 2273 3129 6021 7697 6102 6950 7596 4279 2453 9600 8150 9090 2249 6597"},
+      "expected": {"note": "values 4609 4703 4585 8648 8467 3407 2273 3129 6021 7697 6102 6950 7596 4279 2453 9600 8150 9090 2249 6597"}
+    },
+    {
+      "name": "value_basic_empty_user_long_token",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic OmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MjM0NTY3YWJjZGVmZ2hpamtsbW5vcHFyc3Q="},
+      "expected": {"note": "***AUTH_HEADER***"}
+    },
+    {
+      "name": "value_basic_empty_user_short_not_auth",
+      "group": "value_shape",
+      "input":    {"note": "Authorization: Basic OnRva2Vu"},
+      "expected": {"note": "Authorization: Basic OnRva2Vu"}
     }
   ]
 }

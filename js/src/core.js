@@ -101,14 +101,18 @@ const _GROUP_SEP =
 const _DIGIT_RUN_RE = new RegExp(`[0-9]+(?:[${_GROUP_SEP}]+[0-9]+)*`, "g");
 const _GROUP_SEP_RE = new RegExp(`[${_GROUP_SEP}]+`);
 
-// Whether digits starts like a payment card, as in fasten-core: 3, 4, 5 or
-// 6, or 2200-2204 and 2221-2720. Years and counters starting 0 or 1 do not.
+// Whether the card number digits starts like one, as in fasten-core: 3, 4,
+// 5 or 6; 2200-2205, 2221-2720, 8100-8299, 8600, 9704, 9792, 9860, 1946; or
+// 1 with 15 digits. Other years and counters do not.
 function _cardPrefix(digits) {
 	const c = digits[0];
-	if (c === "3" || c === "4" || c === "5" || c === "6") return true;
-	if (c !== "2") return false;
 	const p = Number(digits.slice(0, 4));
-	return (p >= 2200 && p <= 2204) || (p >= 2221 && p <= 2720);
+	if (c === "3" || c === "4" || c === "5" || c === "6") return true;
+	if (c === "1") return digits.length === 15 || p === 1946;
+	if (c === "2") return (p >= 2200 && p <= 2205) || (p >= 2221 && p <= 2720);
+	if (c === "8") return (p >= 8100 && p <= 8299) || p === 8600;
+	if (c === "9") return p === 9704 || p === 9792 || p === 9860;
+	return false;
 }
 
 // Card layouts printed in groups, as in fasten-core.
@@ -125,7 +129,8 @@ const _WORD_CHAR_RE = /[A-Za-z0-9_]/;
 
 // Whether s holds a card number: a group of 13 to 19 digits, or groups in a
 // card layout, that start with a card prefix and pass the Luhn check. Same
-// rules as fasten-core: digits joined to a letter or "_" are skipped.
+// rules as fasten-core: digits joined to a letter or "_" are skipped, and a
+// layout is tried only where it starts or ends its run of digit groups.
 function _hasCard(s) {
 	for (const m of s.matchAll(_DIGIT_RUN_RE)) {
 		const start = m.index;
@@ -137,20 +142,23 @@ function _hasCard(s) {
 		for (let i = 0; i < groups.length; i++) {
 			if (i === 0 && !openStart) continue;
 			const g = groups[i];
-			if (!_cardPrefix(g)) continue;
-			if (g.length >= 13 && g.length <= 19 && fitsEnd(i + 1) && _luhn(g)) {
+			if (
+				g.length >= 13 &&
+				g.length <= 19 &&
+				fitsEnd(i + 1) &&
+				_cardPrefix(g) &&
+				_luhn(g)
+			) {
 				return true;
 			}
 			for (const layout of _CARD_LAYOUTS) {
 				const e = i + layout.length;
 				if (e > groups.length || !fitsEnd(e)) continue;
+				if (i > 0 && e < groups.length) continue;
 				const window = groups.slice(i, e);
-				if (
-					window.every((w, k) => w.length === layout[k]) &&
-					_luhn(window.join(""))
-				) {
-					return true;
-				}
+				if (!window.every((w, k) => w.length === layout[k])) continue;
+				const digits = window.join("");
+				if (_cardPrefix(digits) && _luhn(digits)) return true;
 			}
 		}
 	}
@@ -159,8 +167,8 @@ function _hasCard(s) {
 
 // An Authorization header value, as in fasten-core. Bearer: a credential of
 // 16 or more characters that holds a digit or one of + / =. Basic: base64
-// that decodes to UTF-8 text with no control characters, a user name and a
-// ":" (user:password).
+// that decodes to UTF-8 text with no control characters and a ":"
+// (user:password).
 const _BEARER_RE = /(?:^|[^A-Za-z0-9_])Bearer[ \t]+([A-Za-z0-9._~+/=-]{16,})/g;
 const _BASIC_RE = /(?:^|[^A-Za-z0-9_])Basic[ \t]+([A-Za-z0-9+/]+={0,2})/g;
 function _hasAuthHeader(s) {
@@ -187,7 +195,8 @@ function _hasControl(text) {
 
 // Whether token is base64 for user:password: its length is a multiple of
 // four, and it decodes to valid UTF-8 with no control characters (C0, DEL
-// or C1) and a ":" after at least one character (the user name).
+// or C1) and a ":". With an empty user name (":token") the password needs 16
+// or more characters.
 function _isBasicCredential(token) {
 	if (token.length === 0 || token.length % 4 !== 0) return false;
 	let acc = 0;
@@ -209,7 +218,9 @@ function _isBasicCredential(token) {
 	} catch {
 		return false;
 	}
-	return text.indexOf(":") > 0 && !_hasControl(text);
+	const colon = text.indexOf(":");
+	if (colon < 0 || _hasControl(text)) return false;
+	return colon > 0 || [...text.slice(1)].length >= 16;
 }
 
 function _luhn(digits) {
