@@ -232,12 +232,13 @@ LD_LIBRARY_PATH=$PWD/../fasten-core/target/release \
   ctest --test-dir build --output-on-failure
 ```
 
-ctest suites: `pii_in_detail_smoke`, `redact_substring_smoke`,
-`redact_env_keys_smoke`, `redact_conformance_smoke`, `shim_spdlog_smoke`,
-`shim_glog_smoke`, `drainer_conformance_smoke`, `row_fields_smoke`,
-`reader_scope_smoke`, and, when their dependencies are found,
-`sqlite_store_smoke`, `postgres_store_smoke`, `codes_yaml_smoke` and
-`shim_boost_log_smoke`.
+ctest suites: `pii_in_detail_smoke`, `queue_row_columns_smoke`,
+`drainer_conformance_smoke`, `row_fields_smoke`, `shutdown_order_smoke`,
+`reader_scope_smoke`, `redact_substring_smoke`, `redact_env_keys_smoke`,
+`redact_invalid_utf8_smoke`, `redact_conformance_smoke`,
+`shim_spdlog_smoke`, `shim_glog_smoke`, and, when their dependencies are
+found, `sqlite_store_smoke`, `pii_redaction_smoke`, `postgres_store_smoke`,
+`codes_yaml_smoke` and `shim_boost_log_smoke`.
 
 ## Docs and design
 

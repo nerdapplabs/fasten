@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "Audit + correlation SDK: 5 Ws + H anchors, one request_id across every transport"
 repository = "https://github.com/nerdapplabs/fasten"
 homepage = "https://fasten.sh"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["audit", "logging", "correlation", "observability", "compliance"]
 categories = ["development-tools::debugging", "asynchronous"]
 

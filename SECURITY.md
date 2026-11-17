@@ -75,11 +75,12 @@ variable.
 
 Replace `1.0.0` / `v1.0.0` with the release you install.
 
-Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestations):
+Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestations).
+Name the wheel for your platform; there is one per platform and no sdist:
 
 ```bash
 uvx pypi-attestations verify pypi --repository https://github.com/nerdapplabs/fasten \
-  pypi:fasten_sdk-1.0.0-py3-none-any.whl
+  pypi:fasten_sdk-1.0.0-py3-none-manylinux_2_34_x86_64.whl
 ```
 
 JavaScript (npm), in the project that installed `@nerdapplabs/fasten`:

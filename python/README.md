@@ -97,7 +97,7 @@ a Bearer token, and default to `http://localhost:9000/api/v1/logs`. For the
 example above:
 
 ```bash
-fasten tail --url http://localhost:8000/logs --token demo-token --stream audit
+fasten tail --url http://localhost:8000/logs --token "$DEMO_READER_TOKEN" --stream audit
 ```
 
 ## Reading logs back: whole record or recent window?
@@ -141,8 +141,9 @@ queue, drained by a background thread with exponential backoff (100 ms to
 when the queue is full `emit()` blocks until a slot frees, so in a long
 outage it waits on the drainer's retries; size `queue_capacity` and the
 retry settings for that. A row the store rejects outright (a DB-API
-`DataError` or `IntegrityError`) is dead-lettered at once rather than
-retried. `emit()` returns the row before it is stored, so its
+`DataError` or `IntegrityError`, or a Postgres SQLSTATE class 22, 23 or 54
+error such as a value too long for an index) is dead-lettered at once
+rather than retried. `emit()` returns the row before it is stored, so its
 `monotonic_seq` and `hash` are not set yet; the store seals it. Pass
 `audit_store_failure_strategy="raise"` for synchronous writes that raise
 `AuditStoreError` and return the sealed row. `fasten.queue_stats()` and

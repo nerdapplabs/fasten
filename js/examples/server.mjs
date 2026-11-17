@@ -45,11 +45,14 @@ register('user', {
 // any object with .insert(row).
 const rows = [];
 const auditStore = { insert(row) { rows.push(row); } };
+let nextUserId = 1;
 
+// "email" isn't in the default redact keys, so name it here.
 fasten.init({
     serviceId: process.env.FASTEN_SERVICE_ID,
     nodeId:    process.env.FASTEN_NODE_ID,
     auditStore,
+    extraRedactKeys: ['email'],
 });
 
 async function readBody(req) {
@@ -71,7 +74,7 @@ const server = http.createServer((req, res) => {
 
         if (req.method === 'POST' && req.url === '/users') {
             const body = await readBody(req);
-            const userId = 'u-' + (body.email ?? '').slice(0, 4);
+            const userId = 'u-' + nextUserId++;
             fasten.emit({
                 code: 'USER_CREATED', target: userId,
                 actor: 'admin',

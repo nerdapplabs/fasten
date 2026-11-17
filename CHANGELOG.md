@@ -175,7 +175,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   dead-letter event, and the rows behind it are stored. This applies to the
   fasten-core stores and to the Python, Go, JS and Rust SDKs; other errors,
   including class 42 (a revoked grant, a renamed table), are retried as
-  before. C++ and Swift still retry a refused row.
+  before. The C++ PostgreSQL store rejects the same classes (see "C++
+  stores no longer drop rows" above); Swift still retries a refused row.
 - Rust: a custom `AuditStore` can return the new
   `Error::AuditStoreRejected` to say the same.
 - Python: the Postgres stores reconnect only when the connection was lost,
@@ -256,11 +257,13 @@ be replaced now.
 
 ### Added: Python wheels with libfasten_core inside
 
-- PyPI gets one wheel per platform, each with `libfasten_core` in the
-  package: Linux x86_64 and aarch64 (`manylinux_2_34`, glibc 2.34 or later,
-  OpenSSL bundled by auditwheel) and macOS arm64 and x86_64 (11.0 or later).
-  `pip install fasten-sdk` then needs no Rust build and no `FASTEN_CORE_LIB`.
-  Other platforms get no wheel, so pip reports no matching distribution.
+- When fasten is published to PyPI (from the 1.0 release), PyPI gets one
+  wheel per platform, each with `libfasten_core` in the package: Linux
+  x86_64 and aarch64 (`manylinux_2_34`, glibc 2.34 or later, OpenSSL
+  bundled by auditwheel) and macOS arm64 and x86_64 (11.0 or later).
+  `pip install fasten-sdk` then needs no Rust build and no
+  `FASTEN_CORE_LIB`. Other platforms get no wheel, so pip reports no
+  matching distribution.
 
 ### Fixed: the Apache-2.0 licence ships with every package
 
@@ -296,22 +299,10 @@ be replaced now.
 
 ### Changed: PyPI gets wheels only, no sdist
 
-- The `pypi` job runs `uv build --wheel`. The sdist held only the Python
-  files: it installed, then the first `register()` or `emit()` failed with
-  `libfasten_core not found` and pointed at `fasten-core/`, which is not in
-  the sdist. Without an sdist, pip on a platform with no wheel says there
-  is no matching distribution.
-
-### Added: manual dry run of the release workflow
-
-- Running `release.yml` by hand (Actions tab or
-  `gh workflow run release.yml`) runs the test suites, checks that the
-  Python, JS and Rust package versions agree, and builds everything a tag
-  would: `uv build --wheel` and `twine check`, `npm publish --dry-run`,
-  `cargo publish --dry-run` for fasten-core and the SDK, and the GitHub
-  release files.
-- A dry run publishes, attests and releases nothing, and enters no
-  deployment environment, so it needs no approval.
+- An sdist would hold only the Python files: it installed, then the first
+  `register()` or `emit()` failed with `libfasten_core not found`. Without
+  one, pip on a platform with no wheel says there is no matching
+  distribution.
 
 ### Docs: Go and Swift install steps
 
@@ -321,51 +312,25 @@ be replaced now.
 - New `swift/README.md`: requirements, install as a local package
   (`.package(path: "../fasten/swift")`), and a quickstart.
 
-### Fixed: release workflows check before they publish
+### Changed: how releases ship
 
-- One `release.yml` replaces `release-python.yml`, `release-js.yml` and
-  `release-provenance.yml`. A `v*` tag runs every SDK's test suite and the
-  integration smokes (called through `workflow_call`) and checks the tag
-  against every package version; the crates.io, PyPI, npm and GitHub
-  release jobs start only when all of them pass. A `go/v*` tag runs the Go
-  tests before the Go module zip is uploaded. The `workflow_dispatch` dry
-  run builds everything and publishes nothing.
-- A release tag must point at a commit on `main`; any other tag fails
-  before the tests run.
-- A prerelease tag such as `v1.0.0-beta.0` gets a GitHub prerelease only.
-  Set the repository variable `PUBLISH_PRERELEASES` to `true` to publish
-  prereleases to the registries as well.
-- The version check is `scripts/release/check-version.sh`. Python versions
-  are compared after PEP 440 normalisation, so `v1.0.0-beta.0` matches
-  `1.0.0b0`, and `__version__` in `fasten/__init__.py` must match
-  `pyproject.toml`.
-- npm: when prereleases are published, a prerelease version goes under its
-  first prerelease identifier as the dist-tag (`1.0.0-beta.0` under `beta`,
-  `1.0.0-0` under `next`). npm refuses a prerelease publish without `--tag`. A plain version
-  goes under `latest` only when it is above every version on npm; a backport
-  such as 1.0.1 after 1.1.0 goes under `release-1.0`, so `latest` stays on
-  1.1.0. `scripts/release/npm-dist-tag.sh` picks the tag with the same check
-  as the GitHub release (`latest-flag.sh`).
-- crates.io publishes before PyPI and npm: fasten-core first, then the SDK
-  once the index has it. When that fasten-core version is already on crates.io,
-  `scripts/release/core-published.sh` compares the published `.crate` with
-  `cargo package` of the tree: the same files skip the publish, any change
-  fails the job, since fasten-core then needs a new version. The SDK's
-  fasten-core dependency now carries `version = "0.1.0"`, which crates.io
-  needs.
-- A re-run skips a version that is already on PyPI or npm only when the
-  published files match this build; otherwise the job fails. On npm and
-  crates.io the skip also needs the package to belong to an owner listed in
-  the repository variables `NPM_OWNERS` / `CRATES_OWNERS`.
-- The GitHub release is created as a draft and published once its files
-  match the build.
-- `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
-  requires.
+- A `vX.Y.Z` tag runs the Python, JS, Rust, C++ and Swift tests and the
+  integration smokes, and a `go/vX.Y.Z` tag runs the Go tests, before
+  anything is released.
+- A beta tag such as `v1.0.0-beta.0` is a GitHub prerelease, with the
+  release files below; PyPI, npm and crates.io get fasten from the 1.0
+  release.
+- Python versions follow PEP 440, so `v1.0.0-beta.0` is `1.0.0b0` in
+  Python.
+- On npm, a release goes under the `latest` dist-tag only when it is above
+  every published release; a backport such as 1.0.1 after 1.1.0 goes under
+  `release-1.0`.
+- The Rust SDK needs Rust 1.90 (`rust-version`), as fasten-core does.
 
 ### Changed: Python and Rust packages are named `fasten-sdk`
 
 - `fasten` is taken on PyPI and crates.io by unrelated projects, so the
-  Python and Rust packages are published as `fasten-sdk`:
+  Python and Rust packages will be published as `fasten-sdk`:
   `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
 - Code does not change: Python still imports `fasten`, Rust still uses
   `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
@@ -456,21 +421,16 @@ be replaced now.
 
 ### Added: release provenance
 
-- `release.yml` runs on `vX.Y.Z` and `go/vX.Y.Z` tags. It builds
-  Swift, C++ and Rust source archives and the fasten-core library for linux
-  x86_64 (or the Go module zip for `go/` tags) with
-  `scripts/release/build-artifacts.sh`, writes `SHA256SUMS`, attests every
-  file with GitHub artifact attestations, runs `gh attestation verify` on each
-  one and then uploads them to the tag's GitHub release. Only the highest
+- Each `vX.Y.Z` GitHub release carries Swift, C++ and Rust source archives
+  and the fasten-core library for Linux x86_64; each `go/vX.Y.Z` release
+  carries the Go module zip. Every file is listed in `SHA256SUMS` and has a
+  GitHub artifact attestation. Only the highest
   `vX.Y.Z` tag is marked as the repo's latest release; `go/` tags,
   prereleases and backports are not.
-- The source archives are reproducible with GNU tar, GNU gzip and the stock
-  Python zlib. `release-check.yml` builds them twice from separate clones and
-  fails if the bytes differ. It runs on changes to any file the archives hold.
-- fasten-core is built with the checkout mounted read-only and its target
-  directory outside the checkout. `build-artifacts.sh` stops with an error
-  when a tracked file differs from HEAD.
-- The PyPI release sets `attestations: true` (PEP 740) explicitly.
+- The source archives and the Go module zip are reproducible: rebuilding
+  them from the tag with GNU tar, GNU gzip and the stock Python zlib gives
+  the same bytes.
+- PyPI uploads (from the 1.0 release) carry PEP 740 attestations.
 - SECURITY.md lists the commands to verify a release for each SDK, including
   how to match the Go zip's `h1:` hash with `go.sum`.
 
@@ -588,7 +548,6 @@ be replaced now.
 - Rows Go sealed earlier with DEL left raw still verify, in Go and Python:
   when the commitment or hash misses, the check is retried with DEL raw
   (spec §1.2).
-- The Go workflow also runs when `spec/` changes, since Go tests read it.
 
 ### Fixed: redact values when the core can't parse the input (C++)
 
@@ -743,8 +702,7 @@ be replaced now.
 - New `Config::queue_drain_max_attempts` (spec §2, default 50).
 - Tests cover drainer vectors V-1 to V-12. `sqlite_store_smoke` is built
   again: CMake looked for `SQLite3::SQLite3`, but FindSQLite3 names the
-  target `SQLite::SQLite3`, so it was always skipped. CI runs
-  `postgres_store_smoke` against a Postgres service; it used to skip.
+  target `SQLite::SQLite3`, so it was always skipped.
 
 ### Fixed: JS async store errors, drainer stop and `PostgresStore` (#137)
 
@@ -787,8 +745,6 @@ be replaced now.
   (Go reads them as strings). A table an older JS store created keeps its old
   column order, with `pii_in_detail` before `shipped_at`; Postgres can't move
   a column, so recreate it before pointing a Python store at it.
-- JS CI runs the `PostgresStore` tests against Postgres; they were always
-  skipped. Two purge tests that failed against a real database are fixed.
 
 ### Fixed: JS PII redaction (#124)
 
@@ -1385,7 +1341,8 @@ stub headers (no install required); `shim_boost_log_smoke` is guarded by
 
 ### Added: Go `/logs/audit/doctor` health endpoint (parity with Python)
 
-- `GET /api/v1/logs/audit/doctor` is now available in Go via `NewReader()`.
+- `GET /api/v1/logs/audit/doctor` is now available in the Go reader
+  (`NewReader`).
   It returns the same `store` / `queue` / `transport` / `init` JSON shape
   as Python's reader, so k8s liveness probes and compliance health checks
   work without a Python dependency.
@@ -1524,56 +1481,4 @@ stub headers (no install required); `shim_boost_log_smoke` is guarded by
   `router(store=, transport=)` keyword arguments. Remove the call;
   the router fetches from `fasten.init()` by default.
 
-## [1.0.0-beta.0] — 2026-05-01
-
-Promotion to 1.0.0-beta. Python, Go, and Node.js SDKs back the API
-contract — emit + log + redaction + correlation, all driven by
-`spec/row-schema.json`. C++14 single-header and Rust ship at beta
-status alongside; Java remains a placeholder pending its own beta.
-
-### Changed
-- Version bumped from `0.1.0-alpha` to `1.0.0-beta.0` across Python,
-  JS (`@nerdapplabs/fasten`), and Rust manifests
-- Python `pyproject.toml` Development Status: Alpha → Beta
-- JS `package.json` `exports` block — dropped non-existent
-  `./shim/*`, `./store/*`, and `./reader` entries (deferred to
-  follow-on releases). Core `.` export is unchanged.
-- CI: `astral-sh/setup-uv` upgraded to `v8.1.0`. Note: GitHub action
-  version tags are mutable and can be re-pointed by the action owner;
-  SHA-pinning every `uses:` reference is tracked as a follow-up.
-
-### Added (since 0.1.0-alpha)
-- Go: built-in `LogInfo/Warn/Error/Debug` for the sys stream + deep
-  `RedactDetail` (was missing) — Go consumers no longer need slog
-  to get `shape:"sys"` lines
-- Rust: `fasten::log::info/warn/error/debug` writing `shape:"sys"`
-  NDJSON (was previously absent)
-- Per-language Docker integration tests (`tests/integration/`)
-
-### Notes
-- Java SDK still pre-beta; `emit()` throws `UnsupportedOperationException`.
-  Marketing + docs label it "coming soon."
-
-## [0.1.0-alpha] — 2026-04-30
-
-Initial public release of the fasten audit + correlation SDK.
-
-### Added
-- **Python** reference implementation — `emit()`, `log.*`, `init()`, SQLite store,
-  HTTP / MQTT / scheduler shims, structlog shim, mountable reader, CLI (`doctor`, `tail`), TUI
-- **Go** SDK — `Register`, `Init`, `Emit`, `LogInfo/Warn/Error/Debug`, `RedactDetail`,
-  SQLiteStore, slog handler, HTTP shim, ring-buffer transport
-- **Node.js / TypeScript** SDK — `init`, `emit`, `log.*`, deep redaction,
-  AsyncLocalStorage correlation, HTTP / MQTT / scheduler shims
-- **Rust** SDK (beta) — typed `Row`, `Severity`, `RetentionClass`, `with_request_id`,
-  `AuditRepository` + `AuditOutboxRepository` traits, `EmitBuilder`
-- **C++14** single-header SDK — `fasten::emit()`, `RedactConfig`, `RequestIDMiddleware`,
-  `FastenReader`, transport shims
-- **Java** placeholder (emit throws — coming in v0.1.1)
-- `spec/row-schema.json` — JSON Schema as single source of truth for enums + redact rules
-- `spec/codegen.py` — generates enum/constant blocks into all 6 adapters (`--write` / `--check`)
-- Per-language Docker integration smokes + `tests/integration/verify.py` contract checker
-
-[1.0.0-beta.0]: https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0
-[0.1.0-alpha]: https://github.com/nerdapplabs/fasten/releases/tag/v0.1.0-alpha
-[Unreleased]: https://github.com/nerdapplabs/fasten/compare/v1.0.0-beta.0...HEAD
+[Unreleased]: https://github.com/nerdapplabs/fasten/commits/main
