@@ -1481,4 +1481,24 @@ stub headers (no install required); `shim_boost_log_smoke` is guarded by
   `router(store=, transport=)` keyword arguments. Remove the call;
   the router fetches from `fasten.init()` by default.
 
+### Added: the SDKs
+
+The API each SDK has had since before this changelog's first entry:
+
+- **Python**: `init`, `emit`, `log.*`, `register`; SQLite and Postgres
+  stores; the mountable reader; the `fasten` CLI and `fasten-tui`.
+- **Go**: `Register`, `Init`, `Emit`, `LogInfo`/`LogWarn`/`LogError`/
+  `LogDebug`, `RedactDetail`; SQLite and Postgres stores; the slog handler
+  and the HTTP reader.
+- **Node / TypeScript**: `init`, `emit`, `log.*`, `register`,
+  `withRequestID`.
+- **Rust**: `init`, `register`, `EmitBuilder`, `with_request_id`,
+  `fasten::log::info`/`warn`/`error`/`debug`.
+- **C++14**: `fasten::init`, `emit`, `log::*`, `RequestScope`; SQLite and
+  Postgres stores; the reader.
+- **Swift**: `Fasten.configure`, `emit`, `log.*`, `withRequestID`; the
+  SQLite store.
+- **Java**: a placeholder. The types compile; `emit` throws
+  `UnsupportedOperationException`.
+
 [Unreleased]: https://github.com/nerdapplabs/fasten/commits/main
