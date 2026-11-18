@@ -31,6 +31,17 @@ func maxDetailBytes() int {
 // serde_json's 128-depth limit) gives an unredactable marker. Neither path
 // returns the original map.
 func (e *Engine) redactDetail(d map[string]any) map[string]any {
+	return e.redact(d, false)
+}
+
+// redactAuditDetail is redactDetail for an audit row's detail. Numbers come
+// back as json.Number, so the row is sealed and stored with the digits the
+// caller passed: a float64 would round an integer above 2^53.
+func (e *Engine) redactAuditDetail(d map[string]any) map[string]any {
+	return e.redact(d, true)
+}
+
+func (e *Engine) redact(d map[string]any, exactNumbers bool) map[string]any {
 	if d == nil {
 		return nil
 	}
@@ -57,7 +68,12 @@ func (e *Engine) redactDetail(d map[string]any) map[string]any {
 		return unredactableMarker()
 	}
 	var result map[string]any
-	if err := json.Unmarshal([]byte(out), &result); err != nil {
+	if exactNumbers {
+		result, err = decodeDetail([]byte(out))
+	} else {
+		err = json.Unmarshal([]byte(out), &result)
+	}
+	if err != nil {
 		return unredactableMarker()
 	}
 	return result

@@ -783,7 +783,7 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		r.Code = Code(code)
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
-		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+		if r.Detail, err = decodeDetail([]byte(detail)); err != nil {
 			return nil, fmt.Errorf("scanRows: row %q detail: %w", r.ID, err)
 		}
 		r.PiiInDetail = piiFlag != 0

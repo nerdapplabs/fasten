@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -163,14 +164,28 @@ func (r *Row) UnmarshalJSON(data []byte) error {
 	if len(aux.Detail) == 0 || string(aux.Detail) == "null" {
 		return nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(aux.Detail))
-	dec.UseNumber()
-	var detail map[string]any
-	if err := dec.Decode(&detail); err != nil {
+	detail, err := decodeDetail(aux.Detail)
+	if err != nil {
 		return err
 	}
 	r.Detail = detail
 	return nil
+}
+
+// decodeDetail decodes a detail object with its numbers as json.Number, so
+// each keeps the token it was written with. A float64 would turn "75.0"
+// into 75 and round an integer above 2^53.
+func decodeDetail(data []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var detail map[string]any
+	if err := dec.Decode(&detail); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("detail: data after the JSON value")
+	}
+	return detail, nil
 }
 
 type Code string
