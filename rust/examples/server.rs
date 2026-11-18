@@ -19,7 +19,7 @@ use fasten::{
     RetentionClass, Severity,
 };
 use std::collections::HashMap;
-use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tiny_http::{Header, Response, Server};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -27,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init(Config {
         service_id: std::env::var("FASTEN_SERVICE_ID")?,
         node_id:    std::env::var("FASTEN_NODE_ID")?,
+        // "email" isn't in the default redact keys, so name it here.
+        extra_redact_keys: Some(vec!["email".to_string()]),
         ..Default::default()
     })?;
 
@@ -92,10 +94,12 @@ fn register_codes() -> Result<(), fasten::Error> {
     ])
 }
 
+static NEXT_USER_ID: AtomicU64 = AtomicU64::new(1);
+
 fn handle(method: &str, url: &str, body: &str) -> (u16, String) {
     if method == "POST" && url == "/users" {
         let email = parse_email(body);
-        let user_id = format!("u-{}", &email.chars().take(4).collect::<String>());
+        let user_id = format!("u-{}", NEXT_USER_ID.fetch_add(1, Ordering::Relaxed));
         let mut detail = HashMap::new();
         detail.insert("email".to_string(), serde_json::Value::String(email));
         let _ = EmitBuilder::new("USER_CREATED", &user_id)
