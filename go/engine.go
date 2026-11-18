@@ -508,12 +508,12 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 				kept[k] = v
 			}
 		}
-		kept = e.redactDetail(kept)
+		kept = e.redactAuditDetail(kept)
 		kept["_redacted"] = "***"
 		kept["_pii_in_detail"] = true
 		row.Detail = kept
 	} else {
-		row.Detail = e.redactDetail(row.Detail)
+		row.Detail = e.redactAuditDetail(row.Detail)
 	}
 
 	// monotonic_seq, prev_hash and hash are not set here. The store

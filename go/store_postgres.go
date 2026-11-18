@@ -625,7 +625,8 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		r.Severity = Severity(sev)
 		r.Domain = Domain(domain)
 		// A malformed detail column is an error, not an empty map.
-		if err := json.Unmarshal([]byte(detail), &r.Detail); err != nil {
+		var err error
+		if r.Detail, err = decodeDetail([]byte(detail)); err != nil {
 			return nil, fmt.Errorf("scanRowsPg: row %q detail: %w", r.ID, err)
 		}
 		r.PiiInDetail = piiFlag != 0

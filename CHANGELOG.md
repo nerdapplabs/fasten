@@ -6,6 +6,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Go keeps detail numbers exact
+
+- A row read from the Go SQLite or Postgres store keeps each detail number
+  as it was written. Before, `75.0` came back as `75`, so `VerifyChain`
+  reported "detail does not match its commitment" on an unaltered row that
+  Python had sealed, and an integer above 2^53 came back rounded.
+- `Emit` stores and seals an integer above 2^53 with every digit. Before,
+  `1234567890123456789` was sealed as `1234567890123456800`.
+- Numbers in `Row.Detail` are now `json.Number` on rows returned by `Emit`
+  and by the stores, as they already were on rows decoded from JSON. Code
+  that asserts `float64` on a detail value needs `.Float64()` or `.Int64()`.
+
 ### Added: Rust request_id follows tokio tasks
 
 - With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the

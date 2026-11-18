@@ -3,6 +3,7 @@ package fasten
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -143,7 +144,7 @@ func TestRetention_ConfiguredHorizonRedactsAndRecords(t *testing.T) {
 	if len(redactions) != 1 {
 		t.Fatalf("AUDIT_ROW_REDACTED rows = %d want 1 — the §7.2 event was not written", len(redactions))
 	}
-	if got := redactions[0].Detail["redacted_seq"]; got != float64(pii.MonotonicSeq) && got != pii.MonotonicSeq {
+	if got := redactions[0].Detail["redacted_seq"]; fmt.Sprint(got) != fmt.Sprint(pii.MonotonicSeq) {
 		t.Errorf("redacted_seq = %v (%T) want %d", got, got, pii.MonotonicSeq)
 	}
 	if res := VerifyChain(rows); !res.OK {
