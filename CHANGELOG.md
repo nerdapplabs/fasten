@@ -6,6 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Python `Redactor` reports a missing `libfasten_core`
+
+- `Redactor.redact()` raises `OSError` when `libfasten_core` can't be
+  loaded. Before, it returned `{"_redact_failed": true}`, the marker for a
+  value that can't be redacted, so a missing library looked like a
+  redaction. `fasten.init()` already failed in this case; this covers a
+  `Redactor` used on its own.
+- Log calls still don't raise: the structlog processor and `fasten.log`
+  before `init()` replace the values with `<unredactable>` as before, and
+  now write one warning to stderr saying the library didn't load.
+
 ### Added: Rust request_id follows tokio tasks
 
 - With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the
