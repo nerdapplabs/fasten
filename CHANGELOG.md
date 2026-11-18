@@ -362,15 +362,18 @@ be replaced now.
 - `rust/Cargo.toml` `rust-version` is 1.90, the version fasten-core already
   requires.
 
-### Changed: Python and Rust packages are named `fasten-sdk`
+### Changed: Python, Rust and npm packages are named `fasten-sdk`
 
-- `fasten` is taken on PyPI and crates.io by unrelated projects, so the
-  Python and Rust packages are published as `fasten-sdk`:
-  `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
-- Code does not change: Python still imports `fasten`, Rust still uses
-  `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
-- Go (`github.com/nerdapplabs/fasten/go`), npm (`@nerdapplabs/fasten`) and
-  `fasten-core` keep their names.
+- `fasten` is taken on PyPI, crates.io and npm by unrelated projects, so
+  the package has one name on all three: `pip install fasten-sdk`,
+  `fasten-sdk = "..."` in `Cargo.toml`, `npm install fasten-sdk`.
+- Python still imports `fasten`, Rust still uses `fasten::`, and the
+  `fasten` and `fasten-tui` commands keep their names.
+- JS imports change from `'@nerdapplabs/fasten'` to `'fasten-sdk'`, and
+  the Postgres store from `'@nerdapplabs/fasten/store/postgres'` to
+  `'fasten-sdk/store/postgres'`.
+- Go (`github.com/nerdapplabs/fasten/go`) and `fasten-core` keep their
+  names.
 
 ### Fixed: remaining log lines go through the redactor (Python, C++)
 
@@ -1533,7 +1536,7 @@ status alongside; Java remains a placeholder pending its own beta.
 
 ### Changed
 - Version bumped from `0.1.0-alpha` to `1.0.0-beta.0` across Python,
-  JS (`@nerdapplabs/fasten`), and Rust manifests
+  JS, and Rust manifests
 - Python `pyproject.toml` Development Status: Alpha → Beta
 - JS `package.json` `exports` block — dropped non-existent
   `./shim/*`, `./store/*`, and `./reader` entries (deferred to

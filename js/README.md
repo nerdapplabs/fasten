@@ -10,7 +10,7 @@ v1.0 GA tag.
 ```bash
 npm install ./js
 # or, once published:
-npm install @nerdapplabs/fasten
+npm install fasten-sdk
 ```
 
 Requires Node 24 or later (uses `AsyncLocalStorage`, `node:test`, ESM).
@@ -20,7 +20,7 @@ Requires Node 24 or later (uses `AsyncLocalStorage`, `node:test`, ESM).
 Verified to run as-is on Node 24+:
 
 ```js
-import fasten, { register, withRequestID, Severity, RetentionClass } from '@nerdapplabs/fasten';
+import fasten, { register, withRequestID, Severity, RetentionClass } from 'fasten-sdk';
 
 register('user', {
     USER_CREATED: {
