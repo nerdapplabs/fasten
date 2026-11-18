@@ -431,9 +431,22 @@ PATTERN_LISTS = [
      "let specs = [", "]", _SWIFT_STR, _swift_pattern),
 ]
 
-# fasten-core's replacement token, which the Rust SDK re-exports.
-_CORE_REDACT = ROOT / "fasten-core" / "src" / "redact.rs"
-_CORE_REPLACEMENT = re.compile(r'pub const DEFAULT_REPLACEMENT: &str = "([^"]*)";')
+# The hand-written replacement tokens: fasten-core's, which the Rust SDK
+# re-exports and Python, Go and C++ redact with, and the JS and Swift
+# redactors' own. Each pattern must match exactly once in its file.
+_SWIFT_SRC = ROOT / "swift" / "Sources" / "Fasten"
+REPLACEMENTS: list[tuple[str, pathlib.Path, re.Pattern[str]]] = [
+    ("fasten-core", ROOT / "fasten-core" / "src" / "redact.rs",
+     re.compile(r'pub const DEFAULT_REPLACEMENT: &str = "([^"]*)";')),
+    ("js", ROOT / "js" / "src" / "core.js",
+     re.compile(r'const REDACT_REPLACEMENT = "([^"]*)";')),
+    ("swift Redactor", _SWIFT_SRC / "Redactor.swift",
+     re.compile(r'\breplacement:\s+String\s+= "([^"]*)"')),
+    ("swift Engine", _SWIFT_SRC / "Engine.swift",
+     re.compile(r'\bredactReplacement:\s+String\s+= "([^"]*)"')),
+    ("swift env default", _SWIFT_SRC / "Fasten.swift",
+     re.compile(r's\.isEmpty \? "([^"]*)" : s')),
+]
 
 
 def without_comments(lines: list[str]) -> list[str]:
@@ -485,8 +498,8 @@ def read_pattern_list(path: pathlib.Path, opens: str, closes: str,
 
 
 def check_pattern_lists(spec: dict) -> int:
-    """Compare the hand-written key lists and fasten-core's replacement with
-    the spec. Returns how many differ or can't be read."""
+    """Compare the hand-written key lists and replacement tokens with the
+    spec. Returns how many differ or can't be read."""
     want = redact(spec)["patterns"]
     drift = 0
     for name, path, opens, closes, token, convert in PATTERN_LISTS:
@@ -506,17 +519,21 @@ def check_pattern_lists(spec: dict) -> int:
             fromfile=f"{name} (current)", tofile="spec"))
         drift += 1
 
-    try:
-        core = "\n".join(without_comments(_CORE_REDACT.read_text().splitlines()))
-    except OSError as exc:
-        print(f"  ✗ fasten-core replacement ({_CORE_REDACT.relative_to(ROOT)}): {exc}")
-        return drift + 1
-    found = _CORE_REPLACEMENT.findall(core)
-    if found == [redact(spec)["replacement"]]:
-        print("  ✓ fasten-core replacement")
-    else:
-        print("  ✗ fasten-core DEFAULT_REPLACEMENT differs from x-fasten-redact.replacement")
-        drift += 1
+    for name, path, pattern in REPLACEMENTS:
+        rel = path.relative_to(ROOT)
+        try:
+            text = "\n".join(without_comments(path.read_text().splitlines()))
+        except OSError as exc:
+            print(f"  ✗ {name} replacement ({rel}): {exc}")
+            drift += 1
+            continue
+        found = pattern.findall(text)
+        if found == [redact(spec)["replacement"]]:
+            print(f"  ✓ {name} replacement")
+        else:
+            print(f"  ✗ {name} replacement ({rel}) is {found}, "
+                  f"x-fasten-redact.replacement is {redact(spec)['replacement']!r}; edit it by hand")
+            drift += 1
     return drift
 
 
