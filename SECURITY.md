@@ -82,7 +82,7 @@ uvx pypi-attestations verify pypi --repository https://github.com/nerdapplabs/fa
   pypi:fasten_sdk-1.0.0-py3-none-any.whl
 ```
 
-JavaScript (npm), in the project that installed `@nerdapplabs/fasten`:
+JavaScript (npm), in the project that installed `fasten-sdk`:
 
 ```bash
 npm audit signatures

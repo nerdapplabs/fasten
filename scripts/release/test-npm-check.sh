@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp"' EXIT
 fail=0
 
 mkdir -p "$tmp/pkg"
-printf '{"name":"@nerdapplabs/fasten","version":"1.0.0"}\n' > "$tmp/pkg/package.json"
+printf '{"name":"fasten-sdk","version":"1.0.0"}\n' > "$tmp/pkg/package.json"
 
 # The stand-in answers `npm view <name>@<version> dist.integrity` from
 # VIEW_OUT, VIEW_ERR and VIEW_RC, and `npm pack --dry-run --json` with
@@ -18,7 +18,7 @@ printf '{"name":"@nerdapplabs/fasten","version":"1.0.0"}\n' > "$tmp/pkg/package.
 cat > "$tmp/npm" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-  'view @nerdapplabs/fasten@1.0.0 dist.integrity')
+  'view fasten-sdk@1.0.0 dist.integrity')
     printf '%s' "${VIEW_OUT:-}"; printf '%s' "${VIEW_ERR:-}" >&2; exit "${VIEW_RC:-0}" ;;
   'pack --dry-run --json')
     if [ -n "${PACK_OUT:-}" ]; then
@@ -27,7 +27,7 @@ case "$*" in
       printf '[{"integrity":"%s"}]\n' "$PACK"
     fi
     exit "${PACK_RC:-0}" ;;
-  'owner ls @nerdapplabs/fasten')
+  'owner ls fasten-sdk')
     printf '%s\n' "${OWNERS_OUT:-}"; exit "${OWNERS_RC:-0}" ;;
   *) echo "unexpected: npm $*" >&2; exit 99 ;;
 esac

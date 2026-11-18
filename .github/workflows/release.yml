@@ -335,7 +335,7 @@ jobs:
 
     environment:
       name: npm
-      url: https://www.npmjs.com/package/@nerdapplabs/fasten
+      url: https://www.npmjs.com/package/fasten-sdk
 
     defaults:
       run:
