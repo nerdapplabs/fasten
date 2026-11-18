@@ -31,10 +31,10 @@ How far that record is tamper-evident depends on the SDK:
 
 - **Python and Go** seal audit rows into a per-node hash chain when they
   write to a bundled audit store (SQLite or Postgres). Verifying the chain
-  shows a row that was edited, removed or reordered.
-- A chain whose hashes were removed or rebuilt by someone who can write to
-  the store still verifies. Catching that needs checkpoints published
-  outside the store.
+  shows a row that was edited, reordered, or removed from inside the chain.
+- Rows cut from the start or end of a chain still verify, and so does a
+  chain whose hashes were removed or rebuilt by someone who can write to
+  the store. Catching those needs checkpoints published outside the store.
 - **JS, Rust, C++ and Swift** write unsealed rows, which the chain does not
   cover.
 
