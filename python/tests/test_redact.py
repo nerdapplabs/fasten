@@ -1,4 +1,6 @@
 """Redactor: default patterns, deep dicts, lists, extra keys, replacement."""
+import sys
+
 import pytest
 from fasten.redact import Redactor
 
@@ -311,3 +313,22 @@ def test_bad_input_is_still_the_marker_not_an_error(r):
         cur["k"] = {}
         cur = cur["k"]
     assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_log_redaction_does_not_raise_without_stderr(no_core, monkeypatch):
+    """sys.stderr is None under pythonw and some service managers."""
+    monkeypatch.setattr(sys, "stderr", None)
+    out = Redactor()._redact_for_log({"password": "hunter2"})
+    assert out == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys):
+    from fasten.transport.stdout import StdoutTransport
+
+    transport = StdoutTransport(service_id="svc")
+    transport.push_syslog({"event": "login", "password": "hunter2"})
+    transport.write_api({"path": "/login", "password": "hunter2"})
+    captured = capsys.readouterr()
+    assert "hunter2" not in captured.out
+    assert "_redact_failed" in captured.out
+    assert captured.err.count("libfasten_core not found") == 1

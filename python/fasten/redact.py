@@ -63,13 +63,17 @@ _warned_no_core = False
 
 
 def _warn_no_core(exc: OSError) -> None:
-    """One line on stderr, once per process."""
+    """One line on stderr, once per process. A log call must not raise, so
+    a closed or missing stderr is ignored."""
     global _warned_no_core
     if _warned_no_core:
         return
     _warned_no_core = True
-    sys.stderr.write(
-        f"fasten: {exc}; log values are replaced by <unredactable> until it loads\n")
+    try:
+        sys.stderr.write(
+            f"fasten: {exc}; log values are replaced by <unredactable> until it loads\n")
+    except Exception:  # noqa: BLE001  stderr is None under pythonw, or closed
+        pass
 
 
 # Structlog internals that are never redacted regardless of key name. Not
