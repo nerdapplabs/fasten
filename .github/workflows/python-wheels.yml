@@ -22,8 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Images pinned by digest, so a re-run of a release builds the same
-        # OpenSSL and auditwheel into the wheel. Bump them between releases.
+        # Images pinned by digest, so a re-run of a release builds with the
+        # same toolchain and auditwheel. OpenSSL is the newest build in the
+        # image's package repository (see Build libfasten_core). Bump the
+        # images between releases.
         include:
           - arch: x86_64
             runner: ubuntu-latest

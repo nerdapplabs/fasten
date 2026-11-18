@@ -42,8 +42,9 @@ GitHub acts as a CNA; advisories are published to the NVD automatically on relea
 ## Supply-chain attestation
 
 **No releases have been published to PyPI, npm or crates.io yet.**
-v1.0.0-beta is source-only: clone the repo and build from a pinned
-commit SHA. The first published release will be the v1.0.0 GA tag.
+v1.0.0-beta is not on the registries: take the files from its GitHub
+prerelease, or clone the repo and build from a pinned commit SHA. The first
+release on the registries will be the v1.0.0 GA tag.
 Release tags must point at a commit on `main`, and prerelease tags
 (`vX.Y.Z-beta.N`) get a GitHub prerelease but are not published to the
 registries unless the maintainers set the `PUBLISH_PRERELEASES` repository
@@ -75,14 +76,15 @@ variable.
 
 Replace `1.0.0` / `v1.0.0` with the release you install.
 
-Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestations):
+Python (PyPI), with [`pypi-attestations`](https://github.com/pypi/pypi-attestations).
+Name the wheel for your platform; there is one per platform and no sdist:
 
 ```bash
 uvx pypi-attestations verify pypi --repository https://github.com/nerdapplabs/fasten \
-  pypi:fasten_sdk-1.0.0-py3-none-any.whl
+  pypi:fasten_sdk-1.0.0-py3-none-manylinux_2_34_x86_64.whl
 ```
 
-JavaScript (npm), in the project that installed `@nerdapplabs/fasten`:
+JavaScript (npm), in the project that installed `fasten-sdk`:
 
 ```bash
 npm audit signatures

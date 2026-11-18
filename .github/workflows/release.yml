@@ -13,10 +13,13 @@ name: Release
 # hatchling version and the npm tarball's gzip bytes depend on the npm
 # version, so both are pinned (python/pyproject.toml, and the node image in
 # the npm jobs) and a re-run builds the same bytes. The platform wheels come
-# from python-wheels.yml, which pins its build images and OpenSSL and stamps
-# files with the commit time for the same reason. Bump the pins between
-# releases, not while one is partly published. After a partial publish,
-# "Re-run failed jobs" keeps the wheels the first attempt built. A skip also checks that
+# from python-wheels.yml, which pins its build images and stamps files with
+# the commit time for the same reason; OpenSSL comes from the image's package
+# repository, which keeps only its latest build. Bump the pins between
+# releases, not while one is partly published. After a partial publish, use
+# only "Re-run failed jobs": it keeps the wheels the first attempt built. A
+# full re-run rebuilds them, and if OpenSSL or a macOS runner image moved
+# in between, the new wheels differ and the PyPI check fails. A skip also checks that
 # the package is owned by one of the repository variables CRATES_OWNERS or
 # NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
 # covers it). Set both before the first release tag: a re-run after a
@@ -92,6 +95,11 @@ jobs:
             echo "::error::$GITHUB_SHA is not on main; release tags must point at a commit on main"
             exit 1
           }
+
+      # In this job so that v and go/ tags both run it: every other job
+      # needs this one.
+      - name: SDK constants and redaction key lists match the spec
+        run: python3 spec/codegen.py --check
 
   test-python:
     needs: tag
@@ -177,8 +185,9 @@ jobs:
           scripts/release/check-version.sh js "$TAG"
           scripts/release/check-version.sh rust "$TAG"
 
-      # Checked here so a release stops before anything is built or
-      # published: fasten-core's version is new, or it is on crates.io with
+      # Checked here so a release stops before anything is published (the
+      # publish, dry-run and build jobs wait for this job): fasten-core's
+      # version is new, or it is on crates.io with
       # the same files. The crates-io job checks again before it publishes.
       # A tag that publishes nothing (a dry run, or a prerelease with
       # PUBLISH_PRERELEASES unset) reports a difference as a warning.
@@ -335,7 +344,7 @@ jobs:
 
     environment:
       name: npm
-      url: https://www.npmjs.com/package/@nerdapplabs/fasten
+      url: https://www.npmjs.com/package/fasten-sdk
 
     defaults:
       run:

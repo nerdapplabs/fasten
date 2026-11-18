@@ -251,15 +251,15 @@ impl PostgresStore {
     /// statement.
     ///
     /// `dsn`:   libpq-style connection string or `postgresql://` URI.
-    ///           For TLS use `sslmode=require`; the driver rejects
-    ///           `verify-ca`/`verify-full`, and `require` with native-tls
-    ///           already verifies the chain and the hostname. TLS needs the
-    ///           `postgres-tls` feature (on by default); without it a DSN
-    ///           that asks for TLS fails to connect.
+    ///           For TLS use `sslmode=verify-full`, which checks the
+    ///           certificate and host name (`require` does the same here;
+    ///           `verify-ca` skips the host name). See [`connect_client`].
+    ///           TLS needs the `postgres-tls` feature (on by default);
+    ///           without it a DSN that asks for TLS fails to connect.
     ///           Add `target_session_attrs=read-write` to have the driver
     ///           reject read-only replica endpoints.
     ///           Example: `"host=db.prod.example.com user=audit dbname=audit
-    ///                      sslmode=require application_name=fasten_core"`
+    ///                      sslmode=verify-full application_name=fasten_core"`
     ///
     /// `table`: plain name (`"audit_log"`) or schema-qualified
     ///           (`"audit.audit_log"`).  Both parts must match

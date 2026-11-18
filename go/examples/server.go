@@ -22,17 +22,22 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	fasten "github.com/nerdapplabs/fasten/go"
 	_ "modernc.org/sqlite"
 )
+
+// User ids are a counter, so none is derived from the email.
+var nextUserID atomic.Int64
 
 func main() {
 	fasten.MustRegister("user", map[fasten.Code]fasten.Meta{
@@ -56,8 +61,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// "email" isn't in the default redact keys, so name it here.
 	if err := fasten.Init(fasten.Config{
-		AuditStore: store,
+		AuditStore:      store,
+		ExtraRedactKeys: []string{"email"},
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -97,7 +104,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		Email string `json:"email"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	userID := "u-" + body.Email[:min(4, len(body.Email))]
+	userID := fmt.Sprintf("u-%d", nextUserID.Add(1))
 	fasten.Emit(r.Context(), "USER_CREATED",
 		fasten.Target(userID),
 		fasten.Actor("admin", "user"),

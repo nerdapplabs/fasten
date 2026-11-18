@@ -23,6 +23,9 @@ jobs:
   test:
     # .github/actions/setup-swift installs the Ubuntu 24.04 build of Swift.
     runs-on: ubuntu-24.04
+    # The job takes about a minute. The tests have hung on Linux arm64
+    # (#160); without a limit a hang here would hold a release for 6 hours.
+    timeout-minutes: 15
 
     defaults:
       run:

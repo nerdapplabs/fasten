@@ -188,10 +188,14 @@ fn inspect_columns(
 /// the Python, Go and JS stores (spec §2.1). Rows are not sealed: `hash` and
 /// `prev_hash` are empty.
 ///
-/// `sslmode` in the DSN works as in libpq. The default, `prefer`, uses TLS
+/// `sslmode` in the DSN works as in libpq, except that `require` also checks
+/// the certificate and host name, like `verify-full`. The default, `prefer`,
+/// uses TLS
 /// when the server offers it, without checking the certificate, and
-/// plaintext when it doesn't. `sslmode=require` uses TLS and checks the
-/// certificate and host name; `sslmode=disable` uses plaintext.
+/// plaintext when it doesn't. `sslmode=verify-full` and `sslmode=require`
+/// use TLS and check the certificate and host name; `sslmode=verify-ca`
+/// checks the certificate but not the host name; `sslmode=disable` uses
+/// plaintext.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -235,7 +239,7 @@ impl PostgresStore {
         };
 
         // fasten-core's connect, for its sslmode handling (TLS by default,
-        // checked under sslmode=require).
+        // checked under require, verify-ca and verify-full).
         let mut client = fasten_core::store::postgres::connect_client(dsn).map_err(|e| match e {
             fasten_core::error::Error::Postgres(e) => pg_err(e),
             other => crate::Error::AuditStoreInsert(other.to_string()),

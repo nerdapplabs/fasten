@@ -161,8 +161,9 @@ fasten-core queue, drained by a background thread with exponential backoff
 when the queue is full `Emit()` blocks until a slot frees, so in a long
 outage it waits on the drainer's retries; size `QueueCapacity` and the
 retry settings for that. A row the store rejects outright (a Postgres
-class 22/23 error, a SQLite constraint) is dead-lettered at once rather
-than retried. `Emit()` returns the row before it is stored, so its
+class 22, 23 or 54 error, a SQLite constraint or datatype mismatch) is
+dead-lettered at once
+rather than retried. `Emit()` returns the row before it is stored, so its
 `MonotonicSeq` and `Hash` are zero; the store seals it. Set
 `Config.AuditStoreFailureStrategy = "raise"` for synchronous writes that
 return `*fasten.AuditStoreError` and the sealed row.

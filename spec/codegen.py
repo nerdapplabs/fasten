@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate the enum constants and redact patterns in each SDK from
-spec/row-schema.json, between the FASTEN GENERATED markers.
+Generate the enum constants in each SDK, and the redact patterns in the
+Python, Go and Rust SDKs, from spec/row-schema.json, between the FASTEN
+GENERATED markers.
 
 Usage:
     python spec/codegen.py --write   update adapter files in place
@@ -9,6 +10,16 @@ Usage:
 
 Covers the Python, Go, JS, Rust and C++ SDKs. gen_java is not in ADAPTERS, so
 the generated block in java/ is not checked.
+
+The output matches what the formatters leave (gofmt for Go, Biome for JS), so
+a formatted file passes --check.
+
+--check also compares the redaction key lists that are written by hand with
+the spec: fasten-core's reference list (used by Python, Go and C++ over the
+C ABI, and by Rust as a crate), and the lists in the JS and Swift redactors,
+which run on their own. Those keep comments and regex syntax of their own,
+so they are read and compared, not generated. --write checks them too and
+exits 1 when one differs, since it can't change them.
 """
 from __future__ import annotations
 
@@ -16,6 +27,7 @@ import argparse
 import difflib
 import json
 import pathlib
+import re
 import sys
 from typing import Callable
 
@@ -114,11 +126,12 @@ def gen_go(spec: dict) -> str:
         L.append("")
         L.append("const (")
         pad = max(len(prefix + go_pascal(v)) for v, _ in vs)
+        vpad = max(len(dquote(v)) for v, _ in vs)
         for v, dv in vs:
             const = (prefix + go_pascal(v)).ljust(pad)
             doc = f"{dv} (default)" if (dv and v == dflt) else dv if dv else ("(default)" if v == dflt else "")
-            suffix = f"  // {doc}" if doc else ""
-            L.append(f'\t{const} {type_name} = {dquote(v)}{suffix}')
+            value = f"{dquote(v).ljust(vpad)} // {doc}" if doc else dquote(v)
+            L.append(f'\t{const} {type_name} = {value}')
         L.append(")")
         L.append("")
 
@@ -127,11 +140,12 @@ def gen_go(spec: dict) -> str:
     dflt = d.get("default", "")
     L.append("const (")
     pad = max(len("Method" + go_pascal(v)) for v, _ in vs)
+    vpad = max(len(dquote(v)) for v, _ in vs)
     for v, dv in vs:
         const = ("Method" + go_pascal(v)).ljust(pad)
         doc = f"{dv} (default)" if (dv and v == dflt) else dv if dv else ("(default)" if v == dflt else "")
-        suffix = f"  // {doc}" if doc else ""
-        L.append(f'\t{const} = {dquote(v)}{suffix}')
+        value = f"{dquote(v).ljust(vpad)} // {doc}" if doc else dquote(v)
+        L.append(f'\t{const} = {value}')
     L.append(")")
     L.append("")
 
@@ -143,6 +157,7 @@ def gen_go(spec: dict) -> str:
     for p in r["patterns"]:
         L.append(f'\t{dquote(p)},')
     L.append("}")
+    L.append("")
     return "\n".join(L)
 
 
@@ -156,16 +171,10 @@ def gen_js(spec: dict) -> str:
         ("method",          "Method"),
     ]:
         d = enum_def(spec, field)
-        items = ", ".join(f"{upper(v)}: {dquote(v)}" for v, _ in vals(d))
-        L.append(f"export const {name} = Object.freeze({{ {items} }});")
-
-    L.append("")
-    r = redact(spec)
-    L.append(f"export const REDACT_REPLACEMENT = {dquote(r['replacement'])};")
-    L.append("export const REDACT_PATTERNS = [")
-    for p in r["patterns"]:
-        L.append(f"  {dquote(p)},")
-    L.append("];")
+        L.append(f"export const {name} = Object.freeze({{")
+        for v, _ in vals(d):
+            L.append(f"\t{upper(v)}: {dquote(v)},")
+        L.append("});")
     return "\n".join(L)
 
 
@@ -204,7 +213,7 @@ def gen_rust(spec: dict) -> str:
         L.append("")
 
     r = redact(spec)
-    L.append(f'pub const REDACT_REPLACEMENT: &str = {dquote(r["replacement"])};')
+    L.append("pub use fasten_core::redact::DEFAULT_REPLACEMENT as REDACT_REPLACEMENT;")
     L.append("pub const REDACT_PATTERNS: &[&str] = &[")
     for p in r["patterns"]:
         L.append(f'    {dquote(p)},')
@@ -294,15 +303,6 @@ def gen_cpp(spec: dict) -> str:
 
     r = redact(spec)
     L.append(f'constexpr const char* kRedactReplacement = {json.dumps(r["replacement"])};')
-    L.append("")
-    L.append("// Default PII field key patterns (case-insensitive regex on keys).")
-    L.append("inline const std::vector<std::string>& redact_patterns() {")
-    L.append("    static const std::vector<std::string> kPatterns = {")
-    for p in r["patterns"]:
-        L.append(f'        {json.dumps(p)},')
-    L.append("    };")
-    L.append("    return kPatterns;")
-    L.append("}")
     return "\n".join(L)
 
 
@@ -390,6 +390,153 @@ def process(adapter: Adapter, spec: dict, check: bool) -> bool:
     return False
 
 
+# Hand-written redaction key lists, checked against the spec. Each entry:
+# name, file, the line that opens the list, the line that closes it, the
+# regex that finds one pattern (comments are removed first), and how to turn
+# a match into the spec's form. A form the language must not use raises
+# ValueError.
+_RUST_STR  = re.compile(r'r"((?:[^"\\]|\\.)*)"')
+_JS_REGEX  = re.compile(r'/((?:[^/\\\n]|\\.)+)/([A-Za-z]*)')
+_SWIFT_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _plain(m: re.Match[str]) -> str:
+    return m.group(1)
+
+
+def _js_pattern(m: re.Match[str]) -> str:
+    # Exactly the i flag: with g, .test() keeps its position between keys
+    # and misses every other match; m changes what $ means.
+    if m.group(2) != "i":
+        raise ValueError(f"/{m.group(1)}/{m.group(2)} must have exactly the i flag")
+    return m.group(1)
+
+
+def _swift_pattern(m: re.Match[str]) -> str:
+    # The string literal escapes its backslash, and Swift writes \z where the
+    # spec has $: ICU's $ also matches before a final newline.
+    p = m.group(1).replace("\\\\", "\\")
+    if "$" in p:
+        raise ValueError(f"{p!r} uses $; write \\z, since ICU's $ also matches "
+                         "before a final newline")
+    return re.sub(r"\\z$", "$", p)
+
+
+PATTERN_LISTS = [
+    ("fasten-core", ROOT / "fasten-core" / "src" / "redact.rs",
+     "static REDACT_PATTERNS: &[&str] = &[", "];", _RUST_STR, _plain),
+    ("js",          ROOT / "js" / "src" / "core.js",
+     "const _DEFAULT_PATTERNS = [", "];", _JS_REGEX, _js_pattern),
+    ("swift",       ROOT / "swift" / "Sources" / "Fasten" / "Redactor.swift",
+     "let specs = [", "]", _SWIFT_STR, _swift_pattern),
+]
+
+# The hand-written replacement tokens: fasten-core's, which the Rust SDK
+# re-exports and Python, Go and C++ redact with, and the JS and Swift
+# redactors' own. Each pattern must match exactly once in its file.
+_SWIFT_SRC = ROOT / "swift" / "Sources" / "Fasten"
+REPLACEMENTS: list[tuple[str, pathlib.Path, re.Pattern[str]]] = [
+    ("fasten-core", ROOT / "fasten-core" / "src" / "redact.rs",
+     re.compile(r'pub const DEFAULT_REPLACEMENT: &str = "([^"]*)";')),
+    ("js", ROOT / "js" / "src" / "core.js",
+     re.compile(r'const REDACT_REPLACEMENT = "([^"]*)";')),
+    ("swift Redactor", _SWIFT_SRC / "Redactor.swift",
+     re.compile(r'\breplacement:\s+String\s+= "([^"]*)"')),
+    ("swift Engine", _SWIFT_SRC / "Engine.swift",
+     re.compile(r'\bredactReplacement:\s+String\s+= "([^"]*)"')),
+    ("swift env default", _SWIFT_SRC / "Fasten.swift",
+     re.compile(r's\.isEmpty \? "([^"]*)" : s')),
+]
+
+
+def without_comments(lines: list[str]) -> list[str]:
+    """The lines with // and /* */ comments removed, so a pattern that is
+    only in a comment doesn't count. None of the key patterns contain // or
+    /*."""
+    out: list[str] = []
+    in_block = False
+    for line in lines:
+        kept = ""
+        rest = line
+        while rest:
+            if in_block:
+                end = rest.find("*/")
+                if end < 0:
+                    rest = ""
+                    break
+                rest = rest[end + 2:]
+                in_block = False
+                continue
+            starts = [i for i in (rest.find("//"), rest.find("/*")) if i >= 0]
+            if not starts:
+                kept += rest
+                break
+            cut = min(starts)
+            kept += rest[:cut]
+            if rest.startswith("//", cut):
+                break
+            rest = rest[cut + 2:]
+            in_block = True
+        out.append(kept)
+    return out
+
+
+def read_pattern_list(path: pathlib.Path, opens: str, closes: str,
+                      token: re.Pattern[str],
+                      convert: Callable[[re.Match[str]], str]) -> list[str]:
+    lines = without_comments(path.read_text().splitlines())
+    starts = [i for i, line in enumerate(lines) if line.strip() == opens.strip()]
+    if len(starts) != 1:
+        raise ValueError(f"expected one line {opens!r}, found {len(starts)}")
+    out: list[str] = []
+    for line in lines[starts[0] + 1:]:
+        text = line.strip()
+        if text == closes:
+            return out
+        out.extend(convert(m) for m in token.finditer(text))
+    raise ValueError(f"no closing {closes!r} after {opens!r}")
+
+
+def check_pattern_lists(spec: dict) -> int:
+    """Compare the hand-written key lists and replacement tokens with the
+    spec. Returns how many differ or can't be read."""
+    want = redact(spec)["patterns"]
+    drift = 0
+    for name, path, opens, closes, token, convert in PATTERN_LISTS:
+        rel = path.relative_to(ROOT)
+        try:
+            got = read_pattern_list(path, opens, closes, token, convert)
+        except (OSError, ValueError) as exc:
+            print(f"  ✗ {name} key list ({rel}): {exc}")
+            drift += 1
+            continue
+        if got == want:
+            print(f"  ✓ {name} key list")
+            continue
+        print(f"  ✗ {name} key list ({rel}) differs from x-fasten-redact.patterns; edit it by hand:")
+        sys.stdout.writelines(difflib.unified_diff(
+            [p + "\n" for p in got], [p + "\n" for p in want],
+            fromfile=f"{name} (current)", tofile="spec"))
+        drift += 1
+
+    for name, path, pattern in REPLACEMENTS:
+        rel = path.relative_to(ROOT)
+        try:
+            text = "\n".join(without_comments(path.read_text().splitlines()))
+        except OSError as exc:
+            print(f"  ✗ {name} replacement ({rel}): {exc}")
+            drift += 1
+            continue
+        found = pattern.findall(text)
+        if found == [redact(spec)["replacement"]]:
+            print(f"  ✓ {name} replacement")
+        else:
+            print(f"  ✗ {name} replacement ({rel}) is {found}, "
+                  f"x-fasten-redact.replacement is {redact(spec)['replacement']!r}; edit it by hand")
+            drift += 1
+    return drift
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -410,7 +557,12 @@ def main() -> None:
             print(f"  ✗ {adapter.lang}: {exc}")
             drift += 1
 
+    lists = check_pattern_lists(spec)
+
     print()
+    if lists:
+        print(f"{lists} hand-written key list(s) differ from the spec; edit them by hand.")
+        sys.exit(1)
     if drift == 0:
         print("All adapters up to date.")
     elif args.check:
