@@ -6,6 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Python `Redactor` reports a missing `libfasten_core`
+
+- `Redactor.redact()` raises `OSError` when `libfasten_core` can't be
+  loaded. Before, it returned `{"_redact_failed": true}`, the marker for a
+  value that can't be redacted, so a missing library looked like a
+  redaction. `fasten.init()` already failed in this case; this covers a
+  `Redactor` used on its own.
+- Log calls still don't raise: the structlog processor and `fasten.log`
+  before `init()` replace the values with `<unredactable>` as before, and
+  now write one warning to stderr saying the library didn't load.
+
 ### Added: Rust request_id follows tokio tasks
 
 - With the `async` feature, `fasten::scope_request_id(rid, fut)` keeps the
@@ -327,15 +338,18 @@ be replaced now.
   `release-1.0`.
 - The Rust SDK needs Rust 1.90 (`rust-version`), as fasten-core does.
 
-### Changed: Python and Rust packages are named `fasten-sdk`
+### Changed: Python, Rust and npm packages are named `fasten-sdk`
 
-- `fasten` is taken on PyPI and crates.io by unrelated projects, so the
-  Python and Rust packages will be published as `fasten-sdk`:
-  `pip install fasten-sdk`, `fasten-sdk = "..."` in `Cargo.toml`.
-- Code does not change: Python still imports `fasten`, Rust still uses
-  `fasten::`, and the `fasten` and `fasten-tui` commands keep their names.
-- Go (`github.com/nerdapplabs/fasten/go`), npm (`@nerdapplabs/fasten`) and
-  `fasten-core` keep their names.
+- `fasten` is taken on PyPI, crates.io and npm by unrelated projects, so
+  the package has one name on all three: `pip install fasten-sdk`,
+  `fasten-sdk = "..."` in `Cargo.toml`, `npm install fasten-sdk`.
+- Python still imports `fasten`, Rust still uses `fasten::`, and the
+  `fasten` and `fasten-tui` commands keep their names.
+- JS imports change from `'@nerdapplabs/fasten'` to `'fasten-sdk'`, and
+  the Postgres store from `'@nerdapplabs/fasten/store/postgres'` to
+  `'fasten-sdk/store/postgres'`.
+- Go (`github.com/nerdapplabs/fasten/go`) and `fasten-core` keep their
+  names.
 
 ### Fixed: remaining log lines go through the redactor (Python, C++)
 

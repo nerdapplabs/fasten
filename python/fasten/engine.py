@@ -1472,12 +1472,13 @@ class _Logger:
             eng._stdout.write_syslog({"level": logging.getLevelName(level).lower(), **payload})
         else:
             # No transport before init(), so redact here. If the core can't
-            # load, the redactor drops the values. The event is redacted on
-            # its own, so an oversize field doesn't drop it.
+            # load, the redactor drops the values and warns once on stderr.
+            # The event is redacted on its own, so an oversize field doesn't
+            # drop it.
             rest = {k: v for k, v in payload.items() if k != "event"}
-            ev = eng._redactor.redact([event])
+            ev = eng._redactor._redact_for_log([event])
             line = {"event": ev[0] if isinstance(ev, list) else ev,
-                    **eng._redactor.redact(json.loads(json.dumps(rest, default=str)))}
+                    **eng._redactor._redact_for_log(json.loads(json.dumps(rest, default=str)))}
             eng._stdlib_logger.log(
                 level,
                 json.dumps(line, default=str),

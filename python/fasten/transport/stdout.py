@@ -75,7 +75,8 @@ class StdoutTransport:
     def _redact(self, row: dict[str, Any]) -> dict[str, Any]:
         """Redacted copy of a sys or api row. Audit rows are redacted in
         Engine.emit()."""
-        return self._redactor.redact(row)
+        redacted: dict[str, Any] = self._redactor._redact_for_log(row)
+        return redacted
 
     def _stream_store(self, stream: str) -> StreamStore | None:
         if stream == "api":

@@ -5,7 +5,7 @@
  * Peer dep: pg >= 8  (install separately: npm install pg)
  *
  * Usage:
- *   import { PostgresStore } from '@nerdapplabs/fasten/store/postgres';
+ *   import { PostgresStore } from 'fasten-sdk/store/postgres';
  *   const store = new PostgresStore(process.env.DATABASE_URL);
  *   await store.init();          // run DDL once
  *   fasten.init({ auditStore: store });

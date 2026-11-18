@@ -14,7 +14,7 @@ repo() {
   printf '[build-system]\nversion = "9"\n\n[project]\nname = "fasten"\nversion = "%s"\n' "$1" \
     > "$tmp/r/python/pyproject.toml"
   printf '"""fasten."""\n\n__version__ = "%s"\n' "$2" > "$tmp/r/python/fasten/__init__.py"
-  printf '{\n  "name": "@nerdapplabs/fasten",\n  "version": "%s",\n  "dependencies": {\n    "x": {\n      "version": "0.0.1"\n    }\n  }\n}\n' "$3" \
+  printf '{\n  "name": "fasten-sdk",\n  "version": "%s",\n  "dependencies": {\n    "x": {\n      "version": "0.0.1"\n    }\n  }\n}\n' "$3" \
     > "$tmp/r/js/package.json"
   printf '[package]\nname = "fasten"\nversion = "%s"\n\n[dependencies]\nfasten-core = { path = "../fasten-core", version = "%s", default-features = false }\nserde = { version = "1" }\n' "$4" "$5" \
     > "$tmp/r/rust/Cargo.toml"

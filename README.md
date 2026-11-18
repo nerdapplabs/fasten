@@ -18,8 +18,8 @@ evidence: verify before, govern during, prove after.
 
 A software system is more than its AI agents. Logs, metrics and traces tell
 you what is happening. fasten is a fourth pillar next to them: it connects AI
-and non-AI components with a tamper-evident record of what happened, who
-changed it, and who can prove it.
+and non-AI components with a record of what happened, who changed it, and
+who can prove it.
 
 It writes three streams: logs, an HTTP access trail, and typed audit rows.
 One `request_id` ties them together. Every audit row carries 7 anchors (the
@@ -27,10 +27,19 @@ One `request_id` ties them together. Every audit row carries 7 anchors (the
 and scheduler-fired jobs are included, along with a mountable HTTP reader
 API for querying the record back.
 
-Python and Go seal audit rows into a per-node hash chain when they write to
-a bundled audit store (SQLite or Postgres); JS, Rust, C++ and Swift write
-unsealed rows. [docs/security.md](docs/security.md) says what the chain
-detects, what it needs checkpoints for, and what is outside its scope.
+How far that record is tamper-evident depends on the SDK:
+
+- **Python and Go** seal audit rows into a per-node hash chain when they
+  write to a bundled audit store (SQLite or Postgres). Verifying the chain
+  shows a row that was edited, reordered, or removed from inside the chain.
+- Rows cut from the start or end of a chain still verify, and so does a
+  chain whose hashes were removed or rebuilt by someone who can write to
+  the store. Catching those needs checkpoints published outside the store.
+- **JS, Rust, C++ and Swift** write unsealed rows, which the chain does not
+  cover.
+
+[docs/security.md](docs/security.md) has the details and what is outside
+the chain's scope.
 
 **Status: v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++ and
 Swift are beta. Nothing is published to PyPI, npm or crates.io yet; install

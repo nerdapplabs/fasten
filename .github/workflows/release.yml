@@ -96,6 +96,11 @@ jobs:
             exit 1
           }
 
+      # In this job so that v and go/ tags both run it: every other job
+      # needs this one.
+      - name: SDK constants and redaction key lists match the spec
+        run: python3 spec/codegen.py --check
+
   test-python:
     needs: tag
     if: ${{ needs.tag.outputs.kind != 'go' }}
@@ -180,8 +185,9 @@ jobs:
           scripts/release/check-version.sh js "$TAG"
           scripts/release/check-version.sh rust "$TAG"
 
-      # Checked here so a release stops before anything is built or
-      # published: fasten-core's version is new, or it is on crates.io with
+      # Checked here so a release stops before anything is published (the
+      # publish, dry-run and build jobs wait for this job): fasten-core's
+      # version is new, or it is on crates.io with
       # the same files. The crates-io job checks again before it publishes.
       # A tag that publishes nothing (a dry run, or a prerelease with
       # PUBLISH_PRERELEASES unset) reports a difference as a warning.
@@ -338,7 +344,7 @@ jobs:
 
     environment:
       name: npm
-      url: https://www.npmjs.com/package/@nerdapplabs/fasten
+      url: https://www.npmjs.com/package/fasten-sdk
 
     defaults:
       run:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import traceback
 from typing import Any, Callable, Optional
 
@@ -56,6 +57,23 @@ def _unredactable_marker(value: Any) -> Any:
     if isinstance(value, dict):
         return marker
     return marker["_summary"]
+
+
+_warned_no_core = False
+
+
+def _warn_no_core(exc: OSError) -> None:
+    """One line on stderr, once per process. A log call must not raise, so
+    a closed or missing stderr is ignored."""
+    global _warned_no_core
+    if _warned_no_core:
+        return
+    _warned_no_core = True
+    try:
+        sys.stderr.write(
+            f"fasten: {exc}; log values are replaced by <unredactable> until it loads\n")
+    except Exception:  # noqa: BLE001  stderr is None under pythonw, or closed
+        pass
 
 
 # Structlog internals that are never redacted regardless of key name. Not
@@ -144,6 +162,8 @@ class Redactor:
         truncation marker, and values the core fails on (e.g. nesting deeper
         than 128) by an ``<unredactable>`` marker, so emit() does not raise.
         The original value is never returned in either case.
+
+        Raises OSError when libfasten_core can't be loaded.
         """
         # json.dumps cannot handle non-string keys.
         if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
@@ -158,7 +178,19 @@ class Redactor:
             return _truncated_marker(value, raw_bytes, cap)
         try:
             return json.loads(self._fast_redact_json(in_json))
-        except Exception:  # noqa: BLE001  deep nesting, invalid utf-8, or core failure
+        except OSError:  # libfasten_core didn't load
+            raise
+        except Exception:  # noqa: BLE001  deep nesting or invalid utf-8
+            return _unredactable_marker(value)
+
+    def _redact_for_log(self, value: Any) -> Any:
+        """redact() for a log line, which must not raise: when
+        libfasten_core can't be loaded, the value becomes the unredactable
+        marker and stderr gets one warning."""
+        try:
+            return self.redact(value)
+        except OSError as exc:
+            _warn_no_core(exc)
             return _unredactable_marker(value)
 
     def with_extra_keys(self, keys: Optional[list[str]]) -> "Redactor":
@@ -182,9 +214,9 @@ class Redactor:
                          if k not in _STRUCTLOG_SKIP and k != "event"}
             if "event" in event_dict:
                 # A list has no keys, so only value shapes apply.
-                ev = self.redact([event_dict["event"]])
+                ev = self._redact_for_log([event_dict["event"]])
                 internals["event"] = ev[0] if isinstance(ev, list) else ev
-            redacted  = self.redact(payload)
+            redacted  = self._redact_for_log(payload)
             return {**internals, **redacted}
         return _processor
 

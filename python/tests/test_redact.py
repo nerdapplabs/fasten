@@ -1,4 +1,6 @@
 """Redactor: default patterns, deep dicts, lists, extra keys, replacement."""
+import sys
+
 import pytest
 from fasten.redact import Redactor
 
@@ -263,3 +265,70 @@ def test_structlog_event_survives_an_oversize_payload():
     assert "blob" not in out
     out = proc(None, "info", {"event": f"bearer {jwt}"})
     assert out["event"] == "***JWT***"
+
+
+# ---- libfasten_core can't be loaded ----
+
+@pytest.fixture
+def no_core(monkeypatch):
+    from fasten import core_ffi, redact
+
+    def _no_core(*_a, **_k):
+        raise OSError("libfasten_core not found")
+
+    monkeypatch.setattr(core_ffi, "get_lib", _no_core)
+    monkeypatch.setattr(redact, "_warned_no_core", False)
+
+
+@pytest.mark.parametrize("redactor", [Redactor(), Redactor(extra_keys=["email"])],
+                         ids=["default", "extra-keys"])
+@pytest.mark.parametrize("value", [{"note": "hello"}, ["hello"], "hello", {1: "hello"}],
+                         ids=["dict", "list", "str", "non-string-key"])
+def test_redact_raises_without_the_core(no_core, redactor, value):
+    """It used to return the unredactable marker, as it does for bad input,
+    so a missing library looked like a redaction."""
+    with pytest.raises(OSError, match="libfasten_core not found"):
+        redactor.redact(value)
+
+
+def test_structlog_processor_warns_once_without_the_core(no_core, capsys):
+    """A log call must not raise, so the values are dropped and stderr says
+    why, once."""
+    proc = Redactor().as_structlog_processor()
+    for _ in range(2):
+        out = proc(None, "info", {"event": "login", "password": "hunter2", "level": "info"})
+        assert out["event"] == "<unredactable>"
+        assert out["_redact_failed"] is True
+        assert out["level"] == "info"
+        assert "hunter2" not in str(out)
+    err = capsys.readouterr().err
+    assert err.count("libfasten_core not found") == 1
+    assert "<unredactable>" in err
+
+
+def test_bad_input_is_still_the_marker_not_an_error(r):
+    deep: dict = {}
+    cur = deep
+    for _ in range(200):
+        cur["k"] = {}
+        cur = cur["k"]
+    assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_log_redaction_does_not_raise_without_stderr(no_core, monkeypatch):
+    """sys.stderr is None under pythonw and some service managers."""
+    monkeypatch.setattr(sys, "stderr", None)
+    out = Redactor()._redact_for_log({"password": "hunter2"})
+    assert out == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys):
+    from fasten.transport.stdout import StdoutTransport
+
+    transport = StdoutTransport(service_id="svc")
+    transport.push_syslog({"event": "login", "password": "hunter2"})
+    transport.write_api({"path": "/login", "password": "hunter2"})
+    captured = capsys.readouterr()
+    assert "hunter2" not in captured.out
+    assert "_redact_failed" in captured.out
+    assert captured.err.count("libfasten_core not found") == 1
