@@ -506,7 +506,7 @@ jobs:
   # GitHub release files. Test jobs that do not apply to the tag are
   # skipped, so this runs unless one of them failed.
   build:
-    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, test-go, versions]
+    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, test-go, versions, wheels]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
@@ -540,13 +540,23 @@ jobs:
             cargo build --release --locked --features all
             cp /tmp/target/release/libfasten_core.so /tmp/target/release/libfasten_core.a /out/'
 
+      # The wheels the pypi job publishes, so the release page has the same
+      # files. A beta tag publishes nothing to PyPI, and its wheels are only
+      # here.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ !startsWith(steps.tag.outputs.tag, 'go/') }}
+        with:
+          pattern: wheel-*
+          path: ${{ runner.temp }}/wheels
+          merge-multiple: true
+
       - name: Build release files
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           case $TAG in
             go/*) scripts/release/build-artifacts.sh "$TAG" dist ;;
-            *) scripts/release/build-artifacts.sh "$TAG" dist "$RUNNER_TEMP/core-lib" ;;
+            *) scripts/release/build-artifacts.sh "$TAG" dist "$RUNNER_TEMP/core-lib" "$RUNNER_TEMP/wheels" ;;
           esac
 
       - name: Attest build provenance

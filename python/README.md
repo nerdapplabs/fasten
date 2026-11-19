@@ -13,6 +13,15 @@ pip install ./python[fastapi]       # + ASGI router for the /logs/* reader
 pip install ./python[postgres]      # + Postgres store
 ```
 
+Each `vX.Y.Z` [GitHub release](https://github.com/nerdapplabs/fasten/releases)
+also has wheels, for Linux (glibc 2.34 or later, x86-64 and arm64) and macOS
+(Intel and Apple silicon). A wheel bundles `libfasten_core`, so it needs no
+Rust build. Download the one for your platform and install the file:
+
+```bash
+pip install ./fasten_sdk-1.0.0b0-py3-none-manylinux_2_34_x86_64.whl
+```
+
 Redaction, the code catalog and the audit queue run in `libfasten_core`
 (the Rust library in [`fasten-core/`](https://github.com/nerdapplabs/fasten/tree/main/fasten-core)), loaded through
 ctypes. Build it first:
