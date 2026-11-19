@@ -6,6 +6,35 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: the JS SDK seals and verifies rows
+
+- The JS `PostgresStore` seals each row into the node's hash chain when it
+  stores it, as Python, Go and Rust do. Writers in any of them share one
+  chain per node on one table, and each verifies the others' rows.
+- The engine writes a stored row to stdout twice, unsealed and then
+  sealed. In raise mode `emit()` returns the sealed row.
+  `audit_chain_unavailable` is logged only with no store, or a store whose
+  `seals()` does not return true. A failed write of the sealed line is
+  logged as `audit_stdout_failed`, not thrown.
+- `verifyChain(rows, {checkpoints, partial})` checks a chain and reports
+  `sealedRows` and the node of the first break. `seal`, `rowHash`,
+  `detailCommitment`, `canonicalJSON` and `parseJson` give the same bytes
+  as the other SDKs; `parseJson` keeps each number as written.
+- Checkpoints: `publishCheckpoints`, `FileCheckpointSink`,
+  `HttpCheckpointSink`, `loadCheckpoints` and `checkpointsSince`, with the
+  other SDKs' file format and failure reasons. `loadCheckpoints` throws
+  `PartialLastLineError`, carrying the checkpoints read so far, when the
+  last line was cut short.
+- `PostgresStore` gains `chainRows`, `allChainRows`, `chainTips` and
+  `insertSealed`, and adds a `wire_version` column to its table.
+  `insert()` returns the row as stored.
+- A `BigInt` in `detail` keeps its digits.
+- A row with `monotonic_seq` 0 must have `origin_id` equal to `id`, and a
+  different row under a stored id is rejected with
+  `AuditRowRejectedError`.
+- `spec/js-sealed-form2.json` holds rows sealed by the JS SDK; the Python
+  and Go test suites verify it.
+
 ### Fixed: JS keeps a detail key named `__proto__`
 
 - A `__proto__` key in a detail parsed from JSON is kept and redacted like
