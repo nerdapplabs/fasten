@@ -12,6 +12,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `detail_commitment` is NULL as empty. Before, one such row made the whole
   query fail. Tables created by another SDK allow NULL there, and the Rust
   SDK writes it when it redacts a row.
+- `NewPostgresStore` opens a table the Python SDK created. Before, it
+  failed with `column "pii_in_detail" does not exist`, because it built an
+  index on that column before adding the column.
 
 ### Added: Python wheels on the GitHub release
 
