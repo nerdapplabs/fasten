@@ -6,6 +6,43 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.0] - 2026-11-19
+
+The first beta. It is a GitHub prerelease, and nothing is on PyPI, npm or
+crates.io until 1.0. The
+[release page](https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0)
+has the Python wheels, source archives for Rust, C++ and Swift, and a
+prebuilt `libfasten_core` for Linux x86-64. Go and JS install from a clone
+of the repository.
+
+### SDKs in this beta
+
+- **Python and Go** are complete. They seal audit rows into a hash chain,
+  verify a chain, publish and check checkpoints, and include the SQLite and
+  Postgres stores and the HTTP reader. A chain sealed by one verifies in
+  the other.
+- **JS, Rust, C++ and Swift** are previews. They emit, redact and store
+  rows, and allocate sequence numbers, but their rows are not sealed, so
+  they can't be verified for tampering.
+
+### Known issues
+
+- Rows written by the JS, Rust, C++ and Swift SDKs are not sealed.
+- Only Python and Go can share one audit table. Swift writes timestamps in
+  whole seconds, which the Python and Go readers reject (#227).
+- With several workers and personal-data retention on, each worker writes
+  its own `AUDIT_ROW_REDACTED` row for the same redacted row. The chain
+  still verifies (#134).
+- Go fails to read a table that holds a row redacted by the Rust SDK
+  (#131).
+- JS drops a detail key named `__proto__` (#146).
+- The Rust SDK's `PostgresStore` does not reconnect after its connection
+  drops; later rows are dead-lettered until the process restarts (#139).
+- The Python wheels are for Linux with glibc 2.34 or later and for macOS.
+  There is no Windows wheel.
+- The Swift tests hang on Linux arm64 (#160).
+- Some dependency versions are behind (#153).
+
 ### Fixed: Go keeps detail numbers exact
 
 - A row read from the Go SQLite or Postgres store keeps each detail number
@@ -1527,4 +1564,5 @@ The API each SDK has had since before this changelog's first entry:
 - **Java**: a placeholder. The types compile; `emit` throws
   `UnsupportedOperationException`.
 
-[Unreleased]: https://github.com/nerdapplabs/fasten/commits/main
+[Unreleased]: https://github.com/nerdapplabs/fasten/compare/v1.0.0-beta.0...HEAD
+[1.0.0-beta.0]: https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0

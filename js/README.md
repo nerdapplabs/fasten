@@ -2,6 +2,10 @@
 
 Audit and correlation SDK for Node services. v1.0.0-beta.
 
+> **Preview in this beta.** This SDK emits, redacts and stores audit rows,
+> but does not seal them into the hash chain, so its rows can't be verified
+> for tampering. The Python and Go SDKs do.
+
 ## Install
 
 Install from source for now; the npm package will be published with the
