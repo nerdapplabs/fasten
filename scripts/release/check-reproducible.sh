@@ -59,6 +59,20 @@ expect "$work/out-a/main" "fasten-swift-$tag.tar.gz" "fasten-cpp-$tag.tar.gz" \
   "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz"
 expect "$work/out-a/go" "fasten-go-v0.0.0-check.zip"
 
+# Wheels are copied in unchanged and listed in SHA256SUMS.
+mkdir -p "$work/wheels"
+printf 'wheel\n' > "$work/wheels/fasten_sdk-0.0.0-py3-none-any.whl"
+(cd "$work/a" && scripts/release/build-artifacts.sh "$tag" "$work/out-w" "$work/lib" "$work/wheels" >/dev/null)
+expect "$work/out-w" "fasten-swift-$tag.tar.gz" "fasten-cpp-$tag.tar.gz" \
+  "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz" \
+  "fasten_sdk-0.0.0-py3-none-any.whl"
+(cd "$work/out-w" && sha256sum --quiet -c SHA256SUMS) || fail=1
+cmp -s "$work/wheels/fasten_sdk-0.0.0-py3-none-any.whl" "$work/out-w/fasten_sdk-0.0.0-py3-none-any.whl" \
+  || { echo "FAIL: the wheel changed when it was copied"; fail=1; }
+if (cd "$work/a" && scripts/release/build-artifacts.sh "$gotag" "$work/out-gw" "" "$work/wheels" >/dev/null 2>&1); then
+  echo "FAIL: a go/ tag accepted wheels"; fail=1
+fi
+
 has() { # has <listing> <entry>...
   local listing=$1; shift
   for e in "$@"; do

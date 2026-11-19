@@ -1,13 +1,18 @@
 name: Release
 
 # vX.Y.Z tags: run every SDK test suite and the integration smokes, check the
-# tag against every package version, publish to crates.io, then PyPI and npm,
-# then build, attest and upload the GitHub release files.
+# tag against every package version, publish to crates.io and PyPI and stage
+# the npm package, then build, attest and upload the GitHub release files.
 # go/vX.Y.Z tags: run the Go tests, then the Go module zip on the GitHub
 # release.
 # Tags must point at a commit on main. Prerelease tags (vX.Y.Z-beta.N) get a
 # GitHub prerelease only; set the repository variable PUBLISH_PRERELEASES to
 # true to also publish them to the registries.
+# npm is staged, not published: the npm job runs `npm stage publish`, and
+# the version is installable only after a maintainer approves it on npm
+# with 2FA (`npm stage approve <stage-id>`, or Staged Packages on
+# npmjs.com). NPM_TOKEN is a stage-only token, which npm refuses for a
+# direct publish. Staging needs npm 11.15.0 or later.
 # A version that is already published is skipped only when the published
 # files match this build; otherwise the job fails. The wheel records the
 # hatchling version and the npm tarball's gzip bytes depend on the npm
@@ -16,10 +21,12 @@ name: Release
 # from python-wheels.yml, which pins its build images and stamps files with
 # the commit time for the same reason; OpenSSL comes from the image's package
 # repository, which keeps only its latest build. Bump the pins between
-# releases, not while one is partly published. After a partial publish, use
-# only "Re-run failed jobs": it keeps the wheels the first attempt built. A
-# full re-run rebuilds them, and if OpenSSL or a macOS runner image moved
-# in between, the new wheels differ and the PyPI check fails. A skip also checks that
+# releases, not while one is partly published. After a partial publish, or
+# once a release (a beta included) has its GitHub release, use only "Re-run
+# failed jobs": it keeps the wheels the first attempt built. A full re-run
+# rebuilds them, and if OpenSSL or a macOS runner image moved in between,
+# the new wheels differ: the PyPI check fails, and gh-release.sh stops on
+# the digest of a wheel already on the GitHub release. A skip also checks that
 # the package is owned by one of the repository variables CRATES_OWNERS or
 # NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
 # covers it). Set both before the first release tag: a re-run after a
@@ -367,8 +374,10 @@ jobs:
       # goes out under the beta dist-tag. A plain version goes out under
       # latest only when it is above every version on npm; a backport gets
       # release-X.Y. A re-run skips a version that is already on npm with
-      # the same tarball, and fails if the tarball differs.
-      - name: Publish to npm (with provenance)
+      # the same tarball, and fails if the tarball differs. A version that
+      # is staged but not approved is not on npm yet: approve or reject it
+      # before a re-run. The list below shows what is waiting.
+      - name: Stage on npm (with provenance)
         run: |
           state=$(../scripts/release/npm-check.sh .)
           case $state in
@@ -382,10 +391,42 @@ jobs:
             grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
             echo '[]' > "$RUNNER_TEMP/versions.json"
           fi
-          node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
-            > "$RUNNER_TEMP/versions.txt"
+          # Staged versions count too: a staged version keeps the dist-tag it
+          # was staged with, so a backport staged while a higher version
+          # waits for approval must not go under latest.
+          if ! npm stage list "$name" --json > "$RUNNER_TEMP/staged.json" 2> "$RUNNER_TEMP/staged.err"; then
+            grep -q E404 "$RUNNER_TEMP/staged.json" "$RUNNER_TEMP/staged.err" \
+              || { cat "$RUNNER_TEMP/staged.json" "$RUNNER_TEMP/staged.err"; exit 1; }
+            echo '[]' > "$RUNNER_TEMP/staged.json"
+          fi
+          node -e '
+            const out = [].concat(require(process.argv[1]));
+            const seen = (x) => {
+              if (Array.isArray(x)) return x.forEach(seen);
+              if (x && typeof x === "object") {
+                if (typeof x.version === "string") out.push(x.version);
+                Object.values(x).forEach(seen);
+              }
+            };
+            seen(require(process.argv[2]));
+            for (const v of new Set(out)) console.log("v" + v);
+          ' "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/staged.json" > "$RUNNER_TEMP/versions.txt"
+          echo "versions on npm or staged:"; cat "$RUNNER_TEMP/versions.txt"
           tag=$(../scripts/release/npm-dist-tag.sh "$version" < "$RUNNER_TEMP/versions.txt")
-          npm publish --provenance --access public --tag "$tag"
+          npm --version
+          npm stage publish . --provenance --access public --tag "$tag"
+          {
+            echo "### npm: $name $version is staged, not published"
+            echo
+            echo "It is installable only after a maintainer approves it with 2FA:"
+            echo
+            echo '```'
+            echo "npm stage list $name"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+            echo
+            echo "Or approve it under Staged Packages on npmjs.com."
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_OWNERS: ${{ vars.NPM_OWNERS }}
@@ -450,11 +491,12 @@ jobs:
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
-      - name: npm publish --dry-run
+      - name: npm stage publish --dry-run
         run: |
           version=$(node -p 'require("./package.json").version')
           tag=$(../scripts/release/npm-dist-tag.sh "$version" < /dev/null)
-          npm publish --dry-run --access public --tag "$tag"
+          npm --version
+          npm stage publish . --dry-run --access public --tag "$tag"
 
   crates-io-dry-run:
     needs: [test-python, test-js, test-rust, versions]
@@ -506,7 +548,7 @@ jobs:
   # GitHub release files. Test jobs that do not apply to the tag are
   # skipped, so this runs unless one of them failed.
   build:
-    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, test-go, versions]
+    needs: [tag, test-python, test-js, test-rust, test-cpp, test-swift, test-integration, test-go, versions, wheels]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     permissions:
@@ -540,13 +582,23 @@ jobs:
             cargo build --release --locked --features all
             cp /tmp/target/release/libfasten_core.so /tmp/target/release/libfasten_core.a /out/'
 
+      # The wheels the pypi job publishes, so the release page has the same
+      # files. A beta tag publishes nothing to PyPI, and its wheels are only
+      # here.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ !startsWith(steps.tag.outputs.tag, 'go/') }}
+        with:
+          pattern: wheel-*
+          path: ${{ runner.temp }}/wheels
+          merge-multiple: true
+
       - name: Build release files
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           case $TAG in
             go/*) scripts/release/build-artifacts.sh "$TAG" dist ;;
-            *) scripts/release/build-artifacts.sh "$TAG" dist "$RUNNER_TEMP/core-lib" ;;
+            *) scripts/release/build-artifacts.sh "$TAG" dist "$RUNNER_TEMP/core-lib" "$RUNNER_TEMP/wheels" ;;
           esac
 
       - name: Attest build provenance
@@ -601,7 +653,10 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done
 
-  # After the registries, so a failed publish leaves no GitHub release. The
+  # After the registries, so a failed publish leaves no GitHub release. npm
+  # is the exception: its job ends when the version is staged, so the GitHub
+  # release can be out before a maintainer approves the version on npm, and
+  # nothing here waits for that. Approve it straight after the run. The
   # publish jobs are skipped for go/ and prerelease tags.
   github-release:
     needs: [verify, wheels, install-check, crates-io, pypi, npm]
