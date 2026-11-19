@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: `spec/row-schema.json` accepts the rows the SDKs write
+
+- The schema now lists `canonical_form_id`, `detail_salt`,
+  `detail_commitment` and `pii_in_detail`, allows a `null` `detail` (a
+  redacted row), and takes any `request_id` of 1 to 128 letters, digits,
+  `.`, `_` and `-`. Before, it rejected every sealed row and any row with a
+  caller's `X-Request-ID`.
+- The `timestamp` description says microseconds, as the SDKs write.
+
 ### Fixed: Go keeps detail numbers exact
 
 - A row read from the Go SQLite or Postgres store keeps each detail number
