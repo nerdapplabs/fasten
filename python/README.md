@@ -15,7 +15,7 @@ pip install ./python[postgres]      # + Postgres store
 
 Each `vX.Y.Z` [GitHub release](https://github.com/nerdapplabs/fasten/releases)
 also has wheels, for Linux (glibc 2.34 or later, x86-64 and arm64) and macOS
-(Intel and Apple silicon). A wheel bundles `libfasten_core`, so it needs no
+11 or later (Intel and Apple silicon). A wheel bundles `libfasten_core`, so it needs no
 Rust build. Download the one for your platform and install the file:
 
 ```bash

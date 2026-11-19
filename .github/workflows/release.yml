@@ -16,10 +16,12 @@ name: Release
 # from python-wheels.yml, which pins its build images and stamps files with
 # the commit time for the same reason; OpenSSL comes from the image's package
 # repository, which keeps only its latest build. Bump the pins between
-# releases, not while one is partly published. After a partial publish, use
-# only "Re-run failed jobs": it keeps the wheels the first attempt built. A
-# full re-run rebuilds them, and if OpenSSL or a macOS runner image moved
-# in between, the new wheels differ and the PyPI check fails. A skip also checks that
+# releases, not while one is partly published. After a partial publish, or
+# once a release (a beta included) has its GitHub release, use only "Re-run
+# failed jobs": it keeps the wheels the first attempt built. A full re-run
+# rebuilds them, and if OpenSSL or a macOS runner image moved in between,
+# the new wheels differ: the PyPI check fails, and gh-release.sh stops on
+# the digest of a wheel already on the GitHub release. A skip also checks that
 # the package is owned by one of the repository variables CRATES_OWNERS or
 # NPM_OWNERS (PyPI refuses an upload from anyone else, so the upload step
 # covers it). Set both before the first release tag: a re-run after a

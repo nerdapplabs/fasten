@@ -9,7 +9,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 ### Added: Python wheels on the GitHub release
 
 - Each `vX.Y.Z` GitHub release carries the Python wheels, for Linux (glibc
-  2.34 or later, x86-64 and arm64) and macOS. They are listed in
+  2.34 or later, x86-64 and arm64) and macOS 11 or later. They are listed in
   `SHA256SUMS` and attested like the other release files. A beta is not on
   PyPI, so this is where its wheels are: download one and
   `pip install` the file. A wheel bundles `libfasten_core`.
