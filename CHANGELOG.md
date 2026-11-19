@@ -8,9 +8,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [1.0.0-beta.0] - 2026-11-19
 
-The first beta. It is a GitHub prerelease: the release files are on the
-[release page](https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0),
-and nothing is on PyPI, npm or crates.io until 1.0.
+The first beta. It is a GitHub prerelease, and nothing is on PyPI, npm or
+crates.io until 1.0. The
+[release page](https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0)
+has source archives for Rust, C++ and Swift and a prebuilt `libfasten_core`
+for Linux x86-64. Python, Go and JS install from a clone of the repository.
 
 ### SDKs in this beta
 
@@ -36,9 +38,9 @@ and nothing is on PyPI, npm or crates.io until 1.0.
 - The Rust SDK's `PostgresStore` does not reconnect after its connection
   drops; later rows are dead-lettered until the process restarts (#139).
 - The Swift tests hang on Linux arm64. They pass on Linux x86-64 and on
-  macOS (#160).
-- The Python wheel is for Linux with glibc 2.34 or later and for macOS.
-  There is no Windows wheel.
+  macOS.
+- There is no Python wheel in this beta; build `libfasten_core` from source
+  as the Python README describes.
 - Some dependency versions are behind (#153).
 
 ### Fixed: Go keeps detail numbers exact

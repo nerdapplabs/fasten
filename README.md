@@ -44,8 +44,10 @@ the chain's scope.
 **Status: v1.0.0-beta.** Python and Go are the complete SDKs; Python is the
 reference. JS, Rust, C++ and Swift are previews: they emit, redact and store
 rows, but don't seal them. Nothing is published to PyPI, npm or crates.io
-yet; install from source or from the
-[GitHub release](https://github.com/nerdapplabs/fasten/releases).
+yet; install from source. The
+[GitHub release](https://github.com/nerdapplabs/fasten/releases) has source
+archives for Rust, C++ and Swift and a prebuilt `libfasten_core` for Linux
+x86-64; Python, Go and JS install from a clone.
 
 [Website](https://fasten.sh)
 
