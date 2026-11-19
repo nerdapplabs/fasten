@@ -1091,18 +1091,35 @@ test('an insert that fails after sealing takes no seq and writes no sealed line'
     });
 });
 
-test('four stores writing at once interleave in one unbroken chain', { skip }, async () => {
-    await _withTable(async ({ mk }) => {
+test('four stores waiting on the node lock at once write one unbroken chain', { skip }, async () => {
+    await _withTable(async ({ admin, mk }) => {
         const stores = [mk(), mk(), mk(), mk()];
         await Promise.all(stores.map((x) => x.init()));
         const PER = 10;
-        await Promise.all(stores.map((x, w) => Promise.all(Array.from({ length: PER }, (_, i) =>
-            x.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-four', target: `w${w}-${i}` }))))));
+        // Hold the node lock until every store has inserts waiting on it, so
+        // the writers really overlap instead of taking turns by chance.
+        const holder = await admin.connect();
+        let pending;
+        try {
+            await holder.query('BEGIN');
+            await holder.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', ['n-four']);
+            pending = Promise.all(stores.map((x, w) => Promise.all(Array.from({ length: PER }, (_, i) =>
+                x.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-four', target: `w${w}-${i}` }))))));
+            const waiting = async () => (await admin.query(
+                "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).rows[0].n;
+            const deadline = Date.now() + 10_000;
+            while ((await waiting()) < stores.length) {
+                assert.ok(Date.now() < deadline, 'the stores never queued on the node lock together');
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            await holder.query('COMMIT');
+        } finally {
+            holder.release();
+        }
+        await pending;
         const rows = await stores[0].chainRows('n-four');
         assert.deepEqual(rows.map((r) => r.monotonic_seq), Array.from({ length: 4 * PER }, (_, i) => i + 1));
-        const writers = rows.map((r) => r.target.split('-')[0]);
-        const switches = writers.filter((w, i) => i > 0 && w !== writers[i - 1]).length;
-        assert.ok(switches > 3, `writers did not interleave: ${writers.join(' ')}`);
+        assert.deepEqual(new Set(rows.map((r) => r.target.split('-')[0])), new Set(['w0', 'w1', 'w2', 'w3']));
         const res = verifyChain(rows);
         assert.ok(res.ok, res.reason);
         assert.equal(res.sealedRows, 4 * PER);

@@ -96,8 +96,8 @@ keep the process alive.
 transaction, under the same per-node lock as the Python, Go and Rust
 stores: the node's next seq, `prev_hash` from the node's latest sealed row,
 a detail salt and commitment, and the hash (canonical form "2",
-[spec §1.4](../spec/chain-replication.md)). Python, Go and JS writers can
-share a node in one table: `PostgresStore` writes into a table the Python
+[spec §1.4](../spec/chain-replication.md)). Python, Go, Rust and JS writers
+can share a node in one table: `PostgresStore` writes into a table the Python
 or Go store created, and adds the columns it lacks.
 
 What `insert()` returns decides the rest. When it returns (or resolves to)

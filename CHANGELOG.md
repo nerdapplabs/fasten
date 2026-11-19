@@ -6,34 +6,126 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: JS (breaking for existing callers)
+
+- `PostgresStore.query()` and `listUnshipped()` return rows with the wire's
+  snake_case keys (`origin_id`, `monotonic_seq`, `source_node_id`,
+  `tenant_id`, `pii_in_detail`, `shipped_at`, `prev_hash`, ...), the shape of
+  `Row` and of what `insert()` returns, instead of camelCase. They also carry
+  `wire_version`, `canonical_form_id`, `detail_salt` and
+  `detail_commitment`, and `verifyChain` reads them.
+- An integer in `detail` that a number cannot hold exactly reads back from
+  `query()` as a `BigInt`. `JSON.stringify` throws on it without a replacer.
+- `emit()` throws `ChainError` when `target` is not a string, or a row field
+  is not a string or holds an unpaired surrogate, in both modes and before
+  anything is written.
+- A string `detail` given to `PostgresStore.insert()` must be JSON text of
+  an object; other text is rejected with `AuditRowRejectedError`.
+- `PostgresStore.insert()` and `insertSealed()` reject a row with its own
+  `monotonic_seq` when another row holds that seq on its node.
+- `AuditRepository.purge` is typed `purge({ before, respectUnshipped })`, as
+  `PostgresStore` implements it.
+- A failed write of the first stdout line is logged as
+  `audit_stdout_failed`, not thrown.
+
 ### Added: the JS SDK seals and verifies rows
 
 - The JS `PostgresStore` seals each row into the node's hash chain when it
   stores it, as Python, Go and Rust do. Writers in any of them share one
   chain per node on one table, and each verifies the others' rows.
-- The engine writes a stored row to stdout twice, unsealed and then
-  sealed. In raise mode `emit()` returns the sealed row.
-  `audit_chain_unavailable` is logged only with no store, or a store whose
-  `seals()` does not return true. A failed write of the sealed line is
-  logged as `audit_stdout_failed`, not thrown.
-- `verifyChain(rows, {checkpoints, partial})` checks a chain and reports
-  `sealedRows` and the node of the first break. `seal`, `rowHash`,
+- When the store returns a row with a hash, the engine writes it to stdout
+  a second time, sealed; in raise mode `emit()` returns it. A retry of a
+  stored id returns the stored row. A store whose `seals()` is true but
+  that returns no hashed row is logged once as `audit_chain_row_unsealed`.
+  `audit_chain_unavailable` is logged with no store, or a store whose
+  `seals()` does not return true. A failed stdout write, or an `error`
+  event on stdout, is logged as `audit_stdout_failed` with `error_code`.
+- A row a store cannot seal as given is rejected with
+  `AuditRowRejectedError` and dead-lettered at once; `AuditSealError`
+  (retried) is left for other seal failures. When a COMMIT fails the store
+  reads the row back once; `AuditOutcomeUnknownError` says it could not.
+- `verifyChain(rows, {checkpoints, partial})` reports `sealedRows`,
+  `checkpointsChecked` and the node of the first break. `seal`,
   `detailCommitment`, `canonicalJSON` and `parseJson` give the same bytes
   as the other SDKs; `parseJson` keeps each number as written.
 - Checkpoints: `publishCheckpoints`, `FileCheckpointSink`,
   `HttpCheckpointSink`, `loadCheckpoints` and `checkpointsSince`, with the
-  other SDKs' file format and failure reasons. `loadCheckpoints` throws
-  `PartialLastLineError`, carrying the checkpoints read so far, when the
-  last line was cut short.
+  other SDKs' file format. `loadCheckpoints` throws `PartialLastLineError`,
+  carrying the checkpoints read so far, when the last line was cut short.
 - `PostgresStore` gains `chainRows`, `allChainRows`, `chainTips` and
-  `insertSealed`, and adds a `wire_version` column to its table.
-  `insert()` returns the row as stored.
+  `insertSealed`, adds the columns a Python or Go table lacks, and has
+  TypeScript types (`fasten-sdk/store/postgres`).
 - A `BigInt` in `detail` keeps its digits.
-- A row with `monotonic_seq` 0 must have `origin_id` equal to `id`, and a
-  different row under a stored id is rejected with
-  `AuditRowRejectedError`.
-- `spec/js-sealed-form2.json` holds rows sealed by the JS SDK; the Python
-  and Go test suites verify it.
+- `spec/js-sealed-form2.json` and `spec/js-sealed-stdout.jsonl`, written by
+  `scripts/gen_js_vectors.mjs` from the JS engine and store, hold sealed
+  rows and the stdout lines for them; the Python and Go suites verify both.
+
+### Added: the Rust SDK and fasten-core seal and verify rows
+
+- The Rust SDK's `PostgresStore`, and a new `SqliteStore` behind the
+  `store-sqlite` feature, seal each row into the node's hash chain when
+  they store it, as Python and Go do. Rust, Python and Go writers on one
+  table share one chain per node, and each verifies the others' rows.
+- `fasten::verify_chain` checks a chain. Its result has `sealed_rows`, so
+  a result with nothing sealed is visible, and the node and seq of the
+  first break. The stores' `chain_rows` and `all_chain_rows` read rows
+  with their detail exactly as stored; both load every row into memory.
+- Chain checkpoints: `publish_checkpoints`, `FileCheckpointSink`,
+  `load_checkpoints`, `checkpoints_since` and
+  `verify_chain_with_checkpoints` (`CheckpointOptions::whole()` or
+  `partial()`), with Python's and Go's file format and failure reasons.
+  `load_checkpoints` returns `CheckpointFileError::PartialLastLine`, with
+  the checkpoints read so far, when the last line was cut short. There is
+  no HTTP sink yet; implement `CheckpointSink` for one.
+- A stored row is written to stdout twice, unsealed and then sealed, and a
+  synchronous `submit()` returns the sealed row. If the sealed line can't
+  be written, `audit_stdout_failed` is logged and the row is still
+  returned.
+- A row with `monotonic_seq` 0 must have `origin_id` equal to `id`. A
+  different row under an id that is already stored is rejected.
+- `insert_sealed` stores a row sealed elsewhere with its detail text
+  unchanged, so it keeps its hash. `seal_row` and `GENESIS` let an adopter
+  store seal rows; such a store overrides both `AuditStore::seals` and
+  `AuditStore::allocate_and_insert_originated`.
+- New `Error` variants: `Seal`, `AuditStoreRead`, `Chain`,
+  `CheckpointFile` and `Custom` (for a sink or store implementer's own
+  errors). Read failures are no longer reported as insert failures.
+- `PostgresStore::redact_rows` clears the salt to an empty string, where
+  it wrote NULL before, as Python and Go do.
+- Breaking: the Rust `Row` has three new public fields,
+  `canonical_form_id`, `detail_salt` and `detail_commitment`. `Row` now
+  implements `Default`, so a struct literal can end in
+  `..Default::default()`.
+- fasten-core: the `chain` and `checkpoint` modules give the same hashes
+  as Python and Go, including detail holding lone surrogates, `NaN` or
+  `Infinity`. `SqliteStore` and `PostgresStore` seal a row inserted with
+  `monotonic_seq` 0, which also applies to `fasten_store_insert`; a row
+  with its own sequence number is stored as given and stays unsealed
+  unless it already carries a hash. New: `Store::insert_sealed`,
+  `Store::chain_rows`, `Store::chain_tips` (returning `ChainTip`),
+  `ChainRow::from_row` and `Error::Seal`.
+- `spec/rust-sealed-form2.json` holds rows sealed by the Rust SDK; the
+  Python, Go and Rust test suites verify it.
+- A float exactly halfway between two shortest decimal forms, such as
+  `1000000000000000.25`, is written with the even last digit, as CPython
+  and Go write it.
+- The core SQLite and Postgres stores open a table the Python SDK created,
+  adding the `wire_version` and `pii_in_detail` columns it lacks.
+- A row with its own seq at a node and seq another row already holds is
+  rejected, also on tables without a unique `(source_node_id,
+  monotonic_seq)` index such as those Python creates.
+
+### Fixed: `spec/row-schema.json` accepts the rows five SDKs write
+
+- The schema now lists `canonical_form_id`, `detail_salt`,
+  `detail_commitment` and `pii_in_detail`, allows a `null` `detail` (a
+  redacted row), and takes any non-empty `request_id`. Before, it rejected
+  every sealed row and any row whose `request_id` was not 12 hex
+  characters.
+- Rows from the Python, Go, JS, Rust and C++ SDKs now pass. Swift rows
+  still fail: Swift writes ids of `evt-` plus 16 hex characters where the
+  schema has 20.
+- The `timestamp` description says microseconds, as those five SDKs write.
 
 ### Fixed: JS keeps a detail key named `__proto__`
 

@@ -270,3 +270,51 @@ func TestCrossLanguage_GoAcceptsEveryPythonSealedForm(t *testing.T) {
 		})
 	}
 }
+
+// spec/rust-sealed-form2.json is the Rust->Go direction: four rows the Rust
+// SDK sealed through its SQLite store, with float, large-integer, non-ASCII,
+// DEL and nested detail, and one row redacted after sealing.
+func TestCrossLanguage_GoVerifiesARustSealedChain(t *testing.T) {
+	raw, err := os.ReadFile("../spec/rust-sealed-form2.json")
+	if err != nil {
+		t.Fatalf("read vector: %v", err)
+	}
+	var rows []Row
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("parse vector: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows = %d want 4", len(rows))
+	}
+	redacted := 0
+	for _, r := range rows {
+		if r.CanonicalFormID != "2" || r.Hash == "" {
+			t.Errorf("%s: form = %q hash = %q, want a sealed form-2 row", r.ID, r.CanonicalFormID, r.Hash)
+		}
+		if r.Detail == nil {
+			redacted++
+			if r.DetailSalt != "" || r.DetailCommitment == "" {
+				t.Errorf("%s: a redacted row keeps its commitment and loses its salt", r.ID)
+			}
+			continue
+		}
+		if got := detailCommitment(r.DetailSalt, r.Detail); got != r.DetailCommitment {
+			t.Errorf("%s: commitment disagrees with Rust:\n got %s\nwant %s", r.ID, got, r.DetailCommitment)
+		}
+		if got := hashFnByForm[r.CanonicalFormID](r, canonicalJSON); got != r.Hash {
+			t.Errorf("%s: hash disagrees with Rust:\n got %s\nwant %s", r.ID, got, r.Hash)
+		}
+	}
+	if redacted != 1 {
+		t.Errorf("redacted rows = %d want 1", redacted)
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("Go rejects a Rust-sealed chain: %s", res.Reason)
+	}
+
+	// A changed detail on a Rust-sealed row is caught.
+	rows[0].Detail = map[string]any{"setpoint": json.Number("76.0")}
+	if res := VerifyChain(rows); res.OK {
+		t.Fatal("Go accepted a tampered detail on a Rust-sealed row")
+	}
+}

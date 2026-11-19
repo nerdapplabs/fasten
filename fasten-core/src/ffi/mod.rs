@@ -190,7 +190,8 @@ pub unsafe extern "C" fn fasten_store_open(
 
 /// Insert a JSON-encoded audit row.
 ///
-/// `monotonic_seq` 0 means the store allocates the next seq for the node.
+/// `monotonic_seq` 0 means the store allocates the next seq for the node and
+/// seals the row into the node's hash chain.
 ///
 /// `handle`:    handle returned by `fasten_store_open`; must be non-null.
 /// `row_json`:  UTF-8 JSON object matching the fasten wire schema.

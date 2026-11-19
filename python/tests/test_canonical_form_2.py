@@ -528,6 +528,51 @@ def test_the_js_number_fixture_is_what_cpython_writes():
         assert json.dumps(json.loads(tok)) == want, tok
 
 
+# Cross-SDK: Rust seals, Python verifies.
+#
+# spec/rust-sealed-form2.json is four rows the Rust SDK sealed through its
+# SQLite store: float, large-integer, non-ASCII, DEL and nested detail, and
+# one row redacted after sealing.
+
+RUST_VECTOR = GO_VECTOR.with_name("rust-sealed-form2.json")
+
+
+def _rows_from_rust_vector() -> list[AuditRow]:
+    return _rows_from_dicts(json.loads(RUST_VECTOR.read_text()))
+
+
+def test_python_verifies_a_rust_sealed_form_2_chain():
+    rows = _rows_from_rust_vector()
+    assert len(rows) == 4
+    assert all(r.canonical_form_id == "2" and r.hash for r in rows)
+    assert [r.monotonic_seq for r in rows] == [1, 2, 3, 4]
+    redacted = [r for r in rows if r.detail is None]
+    assert len(redacted) == 1
+    assert not redacted[0].detail_salt and redacted[0].detail_commitment
+    result = verify_chain(rows)
+    assert result.ok, f"Python rejects a Rust-sealed form-2 chain: {result.reason}"
+
+
+def test_rust_sealed_commitment_recomputes_under_python():
+    for row in _rows_from_rust_vector():
+        if row.detail is None:
+            continue
+        assert row.detail_salt is not None
+        assert detail_commitment(row.detail_salt, row.detail) == \
+            row.detail_commitment, \
+            f"commitment disagrees across SDKs for {row.id}"
+
+
+def test_rust_sealed_row_detail_tampering_is_caught_by_python():
+    rows = _rows_from_rust_vector()
+    assert rows[0].detail["setpoint"] == 75.0
+    attacked = [dataclasses.replace(
+        rows[0], detail={**rows[0].detail, "setpoint": 76.0})] + rows[1:]
+    result = verify_chain(attacked)
+    assert not result.ok and result.first_break_at == 1, \
+        "Python accepted tampered detail on a Rust-sealed row"
+
+
 def test_committed_cross_sdk_vector_matches_current_sealing():
     """spec/python-sealed-forms.json, which Go verifies, must match what
     Python seals today.

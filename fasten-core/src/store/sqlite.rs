@@ -1,16 +1,27 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
+    chain::ChainRow,
+    checkpoint::ChainTip,
     error::Error,
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{
+    at_seq_sql, chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql,
+    sealed_at, sealed_columns, seq_taken, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS,
+    SELECT_COLUMNS,
+};
+
+/// Row columns a table the Python store created lacks. `migrate` adds them
+/// with the chain columns.
+const ROW_COLUMNS: [(&str, &str); 2] =
+    [("wire_version", "TEXT NOT NULL DEFAULT '1'"), ("pii_in_detail", "INTEGER NOT NULL DEFAULT 0")];
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -228,11 +239,117 @@ impl SqliteStore {
         let have: Vec<String> = stmt
             .query_map([bare, schema], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let columns = CHAIN_COLUMNS
+        let columns = ROW_COLUMNS
             .into_iter()
+            .chain(CHAIN_COLUMNS)
             .filter(|(name, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(name)))
             .collect();
         Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
+    }
+
+    /// The rows matching `filter`, ordered by `order`, each mapped by `map`.
+    fn select<T>(
+        &self,
+        filter: &Filter,
+        order: &str,
+        map: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, Error> {
+        let (where_clause, params_owned) = build_filter_where(filter);
+        // LIMIT and OFFSET are integers, so interpolating them is safe.
+        let mut sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY {order}",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            sql.push_str(&format!(" LIMIT {}", filter.limit));
+            if filter.offset > 0 {
+                sql.push_str(&format!(" OFFSET {}", filter.offset));
+            }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_owned.iter().map(|p| p.as_ref()).collect();
+
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |r| map(r))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Insert `row` as [`Store::insert`] does and return it as stored: with
+    /// the seq and chain fields the store gave it. A row with a seq of its
+    /// own is returned as given.
+    ///
+    /// When a row with this id is already stored, nothing is written. If
+    /// the stored row is the same event (and, for a row with its own seq,
+    /// at that seq with that hash), `row` comes back with the stored seq
+    /// and chain fields; otherwise the error is `RowRejected`.
+    pub fn insert_stored(&self, row: &Row) -> Result<Row, Error> {
+        self.put(row, None)?.stored(row)
+    }
+
+    /// Write `row`, with `detail` as the text of its detail column or, when
+    /// `None`, `row.detail` as `serde_json` renders it. A stored id is left
+    /// as it is.
+    fn put(&self, row: &Row, detail: Option<&str>) -> Result<Outcome, Error> {
+        let rendered;
+        let detail = match detail {
+            Some(text) => text,
+            None => {
+                rendered = serde_json::to_string(&row.detail)?;
+                &rendered
+            }
+        };
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // BEGIN IMMEDIATE takes the write lock before the reads, so two
+        // handles on one file cannot both read the same tip (spec §2.1).
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held = tx
+            .query_row(
+                &format!("SELECT {SELECT_COLUMNS} FROM {} WHERE id = ?1", self.table),
+                rusqlite::params![row.id],
+                |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)),
+            )
+            .optional()?;
+        let outcome = if let Some((held, text)) = held {
+            Outcome::Held(held, text)
+        } else if row.monotonic_seq != 0 {
+            let seq = column_seq(row)?;
+            // A table the Python store created, or one from before the
+            // UNIQUE constraint, does not stop a second row at this seq.
+            let at_seq = at_seq_sql(&self.table, "?1", "?2");
+            let other: Option<String> =
+                tx.query_row(&at_seq, rusqlite::params![row.source_node_id, seq], |r| r.get(0)).optional()?;
+            if let Some(other) = other {
+                return Err(seq_taken(row, &other));
+            }
+            insert_row(&tx, &self.insert_sql, row, seq, detail)?;
+            Outcome::Inserted(row.clone())
+        } else {
+            check_originated(row)?;
+            let seq: i64 = tx.query_row(
+                &format!(
+                    "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
+                     WHERE source_node_id = ?1",
+                    self.table
+                ),
+                rusqlite::params![row.source_node_id],
+                |r| r.get(0),
+            )?;
+            // The seq counts every row on the node; the tip is its last
+            // sealed one.
+            let tip: Option<String> = tx
+                .query_row(&tip_sql(&self.table, "?1"), rusqlite::params![row.source_node_id], |r| r.get(0))
+                .optional()?;
+            let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
+            let sealed = sealed_at(row, seq, prev_hash)?;
+            insert_row(&tx, &self.insert_sql, &sealed, seq, detail)?;
+            Outcome::Inserted(sealed)
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
@@ -269,34 +386,12 @@ fn placeholders(from: usize, n: usize) -> String {
 
 impl Store for SqliteStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if row.monotonic_seq != 0 {
-            return insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64);
-        }
-        let row = &unsealed(row);
+        self.put(row, None).map(|_| ())
+    }
 
-        // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
-        // handles on one file cannot both read the same tip (spec §2.1).
-        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)", self.table),
-            rusqlite::params![row.id],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            let seq: i64 = tx.query_row(
-                &format!(
-                    "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
-                     WHERE source_node_id = ?1",
-                    self.table
-                ),
-                rusqlite::params![row.source_node_id],
-                |r| r.get(0),
-            )?;
-            insert_row(&tx, &self.insert_sql, row, seq)?;
-        }
-        tx.commit()?;
-        Ok(())
+    fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), Error> {
+        let (columns, detail) = sealed_columns(row, pii_in_detail)?;
+        self.put(&columns, Some(&detail))?.sealed(row)
     }
 
     fn ping(&self) -> Result<(), Error> {
@@ -306,28 +401,29 @@ impl Store for SqliteStore {
     }
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
-        let (where_clause, params_owned) = build_filter_where(filter);
-        // LIMIT and OFFSET are integers, so interpolating them is safe.
-        let mut sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
-            self.table, where_clause
-        );
-        if filter.limit > 0 {
-            sql.push_str(&format!(" LIMIT {}", filter.limit));
-            if filter.offset > 0 {
-                sql.push_str(&format!(" OFFSET {}", filter.offset));
-            }
-        }
+        self.select(filter, "monotonic_seq ASC", row_from_sqlite)
+    }
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_owned.iter().map(|p| p.as_ref()).collect();
+    fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
+        self.select(filter, "source_node_id, monotonic_seq", |r| {
+            Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?))
+        })?
+        .iter()
+        .map(|(row, detail)| chain_row(row, detail))
+        .collect()
+    }
 
+    fn chain_tips(&self) -> Result<Vec<ChainTip>, Error> {
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = guard.prepare(&sql)?;
-        let rows: Vec<Row> = stmt
-            .query_map(params_refs.as_slice(), row_from_sqlite)?
+        let mut stmt = guard.prepare(&chain_tips_sql(&self.table))?;
+        let tips = stmt
+            .query_map([], |r| {
+                let node: String = r.get(0)?;
+                let monotonic_seq = seq_column(r, 1, &format!("node '{node}'"))?;
+                Ok(ChainTip { source_node_id: node, monotonic_seq, hash: r.get(2)? })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(tips)
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {
@@ -441,7 +537,9 @@ impl Store for SqliteStore {
             let allowed = gate.allowed();
             let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{allowed}"))?;
             let rows = stmt.query_map(params.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
+                let id: String = r.get(0)?;
+                let seq = seq_column(r, 1, &format!("row {id}"))?;
+                Ok((id, seq))
             })?;
             for r in rows {
                 out.rows.push(r?);
@@ -484,8 +582,8 @@ impl Store for SqliteStore {
     }
 }
 
-fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Result<(), Error> {
-    let detail_str = serde_json::to_string(&row.detail)?;
+/// Insert `row` at `seq`, with `detail` as the text of its detail column.
+fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<(), Error> {
     let pii: i64 = row.pii_in_detail as i64;
     let mut stmt = conn.prepare_cached(insert_sql)?;
     stmt.execute(rusqlite::params![
@@ -507,7 +605,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         row.domain,
         row.method,
         row.request_id,
-        detail_str,
+        detail,
         pii,
         row.shipped_at,     // None is stored as NULL
         row.prev_hash.as_deref().unwrap_or(""),
@@ -590,17 +688,31 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     (clause, params)
 }
 
+/// The seq in column `idx` of the row or node `owner` names. A negative
+/// value is an error that names the owner and the value.
+fn seq_column(r: &rusqlite::Row, idx: usize, owner: &str) -> rusqlite::Result<u64> {
+    let seq: i64 = r.get(idx)?;
+    u64::try_from(seq).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Integer,
+            format!("{owner}: monotonic_seq {seq} is negative").into(),
+        )
+    })
+}
+
 /// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.
 fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let detail_str: String = r.get(18)?;
     let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
     let pii: i64 = r.get(19)?;
-    let seq: i64 = r.get(3)?;
+    let id: String = r.get(0)?;
+    let seq = seq_column(r, 3, &format!("row {id}"))?;
     Ok(Row {
-        id:             r.get(0)?,
+        id,
         wire_version:   r.get(1)?,
         origin_id:      r.get(2)?,
-        monotonic_seq:  seq.unsigned_abs(),
+        monotonic_seq:  seq,
         timestamp:      r.get(4)?,
         code:           r.get(5)?,
         action:         r.get(6)?,
@@ -1087,9 +1199,12 @@ mod tests {
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            // Explicit seqs, so the rows are stored as given.
             if id == "evt-sealed" {
                 r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
+            } else {
+                r.monotonic_seq = 2;
             }
             store.insert(&r).unwrap();
         }
@@ -1119,9 +1234,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch(
-                "UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-form1';
-                 UPDATE audit_log SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
-                 WHERE id = 'evt-form2';",
+                "UPDATE audit_log SET hash = 'abc', canonical_form_id = '1' WHERE id = 'evt-form1';
+                 UPDATE audit_log SET hash = '' WHERE id = 'evt-unsealed';",
             )
             .unwrap();
 
@@ -1207,22 +1321,33 @@ mod tests {
         assert_eq!(chain_of(&store.list_unshipped(0).unwrap()[0]), chain_of(&row));
     }
 
-    /// The store picks the seq, so a hash sealed over another one is dropped.
+    /// The store picks the seq, so a hash sealed over another one is
+    /// replaced by the store's own seal.
     #[test]
-    fn allocating_insert_drops_chain_fields() {
+    fn allocating_insert_replaces_chain_fields() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let mut row = sealed("evt-alloc");
         row.monotonic_seq = 0;
+        row.prev_hash = Some("elsewhere".into());
         store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(got.monotonic_seq, 1);
-        assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
+        assert_eq!(got.prev_hash.as_deref(), Some("genesis"));
+        assert_eq!(got.canonical_form_id.as_deref(), Some("2"));
+        assert_eq!(got.hash.as_deref().map(str::len), Some(64));
+        assert_ne!(got.detail_salt.as_deref(), Some("salt"));
+        assert_ne!(got.detail_commitment.as_deref(), Some("commit"));
+        let rows = store.chain_rows(&Filter::default()).unwrap();
+        assert!(crate::chain::verify_chain(&rows).ok);
     }
 
+    /// A row with its own seq and no hash is stored as given.
     #[test]
     fn unsealed_row_reads_back_with_empty_hash_and_no_salt() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
-        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let mut row = make_row("evt-plain", "TEST");
+        row.monotonic_seq = 1;
+        store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
     }
@@ -1295,7 +1420,9 @@ mod tests {
             )
             .unwrap();
         let store = SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
-        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let mut plain = make_row("evt-plain", "TEST");
+        plain.monotonic_seq = 1;
+        store.insert(&plain).unwrap();
         let mut row = sealed("evt-sealed");
         row.monotonic_seq = 2;
         store.insert(&row).unwrap();
