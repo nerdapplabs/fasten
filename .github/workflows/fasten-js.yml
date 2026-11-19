@@ -58,6 +58,8 @@ jobs:
       - name: Unit tests with coverage
         env:
           FASTEN_TEST_POSTGRES_DSN: postgresql://fasten:fasten@localhost:5432/fasten_test
+          # Fail, rather than skip, the Postgres tests if the DSN goes missing.
+          FASTEN_REQUIRE_POSTGRES: '1'
         run: npx c8 --reporter=lcov --reporter=text node --test 'test/**/*.test.mjs'
 
       - name: Upload coverage to Codecov

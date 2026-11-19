@@ -3,6 +3,34 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { canonicalTS } from "./canonical_ts.js";
 import {
+	AuditSealError,
+	bigintReplacer,
+	bigintReviver,
+	ChainError,
+	CURRENT_CANONICAL_FORM_ID,
+	canonicalJSON,
+	compareCodePoints,
+	detailCommitment,
+	detailText,
+	GENESIS,
+	JsonNumber,
+	parseJson,
+	rowHash,
+	seal,
+	toChainRow,
+	verifyChain,
+} from "./chain.js";
+import {
+	Checkpoint,
+	checkpointsSince,
+	FileCheckpointSink,
+	HttpCheckpointSink,
+	loadCheckpoints,
+	PartialLastLineError,
+	publishCheckpoints,
+	takeCheckpoints,
+} from "./checkpoints.js";
+import {
 	coreMetaOf,
 	coreRedact,
 	coreRedactFull,
@@ -279,10 +307,50 @@ const RETENTION_CHECK_MS = 3_600_000;
 import {
 	_setDefaultEngine,
 	AuditQueueDrainer,
+	AuditRowRejectedError,
 	AuditStoreError,
 } from "./audit_queue.js";
 
-export { AuditStoreError };
+export {
+	AuditRowRejectedError,
+	AuditSealError,
+	AuditStoreError,
+	ChainError,
+	Checkpoint,
+	CURRENT_CANONICAL_FORM_ID,
+	canonicalJSON,
+	checkpointsSince,
+	compareCodePoints,
+	detailCommitment,
+	FileCheckpointSink,
+	GENESIS,
+	HttpCheckpointSink,
+	JsonNumber,
+	loadCheckpoints,
+	PartialLastLineError,
+	parseJson,
+	publishCheckpoints,
+	rowHash,
+	seal,
+	takeCheckpoints,
+	toChainRow,
+	verifyChain,
+};
+
+// Whether `store` seals the rows it stores (spec §2.1). A store opts in
+// with a seals() method that returns true.
+function _seals(store) {
+	return typeof store?.seals === "function" && store.seals() === true;
+}
+
+// The second stdout line for a row, once the store sealed it (spec §8).
+// The detail is the text the store wrote and hashed, so the line verifies
+// as it is.
+function _sealedLine(row) {
+	const { detail, ...rest } = row;
+	const head = JSON.stringify({ shape: "audit", ...rest }, bigintReplacer);
+	return `${head.slice(0, -1)},"detail":${detailText(detail === undefined ? {} : detail)}}\n`;
+}
 
 export class Engine {
 	#config = {
@@ -353,16 +421,25 @@ export class Engine {
 			);
 		}
 
-		// Spec §8.1: say once per init that rows are not chained.
-		this._drainerSysLog("error", "audit_chain_unavailable", {
-			store: this.#config.auditStore?.constructor?.name ?? null,
-			reason:
-				"the JS SDK does not seal rows (spec 2.1); rows are written unsealed",
-		});
+		// Say once per init that rows are not chained: there is no store to
+		// allocate against (spec §8.1), or the store does not seal (§8.2).
+		if (!store) {
+			this._drainerSysLog("error", "audit_chain_unavailable", {
+				store: null,
+				reason:
+					"no audit store configured (spec 8.1); rows are written to stdout unsealed",
+			});
+		} else if (!_seals(store)) {
+			this._drainerSysLog("error", "audit_chain_unavailable", {
+				store: store.constructor?.name ?? null,
+				reason:
+					"the audit store does not seal rows (spec 2.1); rows are written unsealed",
+			});
+		}
 
-		if (strategy === "queue" && this.#config.auditStore) {
+		if (strategy === "queue" && store) {
 			this._installDrainer({
-				store: this.#config.auditStore,
+				store: { insert: (row) => this._storeRow(store, row) },
 				sysLog: (l, e, f) => this._drainerSysLog(l, e, f),
 				capacity: opts.queueCapacity ?? 100,
 				retryInitialMs: opts.queueRetryInitialMs ?? 100,
@@ -391,7 +468,7 @@ export class Engine {
 							row_id: row?.id ?? null,
 						});
 					try {
-						const p = cfg.auditStore.insert(row);
+						const p = this._storeRow(cfg.auditStore, row);
 						if (typeof p?.then === "function") p.then(undefined, failed);
 					} catch (err) {
 						failed(err);
@@ -400,23 +477,57 @@ export class Engine {
 			} else {
 				let p;
 				try {
-					p = cfg.auditStore.insert(row);
+					p = this._storeRow(cfg.auditStore, row);
 				} catch (err) {
 					throw new AuditStoreError(err);
 				}
 				// An async store fails after emit() returns, so hand the caller a
-				// promise for the row that rejects with AuditStoreError.
+				// promise for the stored row that rejects with AuditStoreError.
 				if (typeof p?.then === "function") {
 					return p.then(
-						() => row,
+						(stored) => stored,
 						(err) => {
 							throw new AuditStoreError(err);
 						},
 					);
 				}
+				return p;
 			}
 		}
 		return row;
+	}
+
+	// Insert `row` through `store` and return the row as stored: the sealed
+	// row when the store seals, else `row`. A sealed row is written to
+	// stdout again after the insert (spec §8); a failed write is logged as
+	// audit_stdout_failed, not thrown, since the row is stored.
+	_storeRow(store, row) {
+		const done = (stored) => {
+			const out =
+				stored && typeof stored === "object" && stored.id === row.id
+					? stored
+					: row;
+			if (out.hash) this._writeSealed(out);
+			return out;
+		};
+		const p = store.insert(row);
+		return typeof p?.then === "function" ? p.then(done) : done(p);
+	}
+
+	_writeSealed(row) {
+		const failed = (err) =>
+			this._drainerSysLog("error", "audit_stdout_failed", {
+				error_type: err?.name ?? "Error",
+				row_id: row.id,
+				sealed: true,
+			});
+		try {
+			process.stdout.write(_sealedLine(row), (err) => {
+				if (err) failed(err);
+			});
+		} catch (err) {
+			failed(err);
+		}
 	}
 
 	// Builds the row and writes it to stdout (spec §8 phase 1).
@@ -458,8 +569,7 @@ export class Engine {
 			wire_version: "1",
 			id,
 			origin_id: id,
-			// Spec §8: JS does not allocate seq or seal, so the row goes out
-			// with seq 0, as phase-1 stdout lines do; a store allocates it.
+			// Spec §8: the store allocates the seq and seals the row on insert.
 			monotonic_seq: 0,
 			timestamp: canonicalTS(),
 			code,
@@ -478,9 +588,10 @@ export class Engine {
 			detail: outDetail,
 			pii_in_detail: !!meta.piiInDetail,
 		};
-		// JS doesn't seal rows (spec §8), so this line's hashes are empty.
+		// Not sealed yet (spec §8), so the hashes are empty. The
+		// store seals the row on insert and it is written again then.
 		process.stdout.write(
-			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" })}\n`,
+			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" }, bigintReplacer)}\n`,
 		);
 
 		return row;
@@ -531,7 +642,7 @@ export class Engine {
 				},
 			});
 			try {
-				await store.insert(record);
+				await this._storeRow(store, record);
 			} catch (err) {
 				throw new AuditStoreError(err);
 			}
@@ -697,7 +808,7 @@ export class Engine {
 	// 64 KiB) is replaced by a truncation marker, as in Python and Go.
 	_redact(obj) {
 		const { extraRedactKeys: extra, redactReplacement: repl } = this.#config;
-		const json = JSON.stringify(obj);
+		const json = JSON.stringify(obj, bigintReplacer);
 		const cap = _maxDetailBytes();
 		const size = Buffer.byteLength(json, "utf8");
 		if (size > cap) {
@@ -712,6 +823,7 @@ export class Engine {
 			extra.length || repl
 				? coreRedactFull(json, JSON.stringify(extra), repl)
 				: coreRedact(json),
+			bigintReviver,
 		);
 	}
 
@@ -724,7 +836,7 @@ export class Engine {
 			service_id: this.#config.serviceId || undefined,
 			timestamp: new Date().toISOString(),
 			// Fields that aren't JSON (none, or a function) log as {}.
-			...(JSON.stringify(fields) === undefined ? {} : fields),
+			...(JSON.stringify(fields, bigintReplacer) === undefined ? {} : fields),
 		};
 		// The whole line, as Go and Python do: a secret can be in the event.
 		let out = this._redact(line);
@@ -746,7 +858,7 @@ export class Engine {
 				out = { ...head, ...out };
 			}
 		}
-		stream.write(`${JSON.stringify(out)}\n`);
+		stream.write(`${JSON.stringify(out, bigintReplacer)}\n`);
 	}
 
 	_drainerSysLog(level, event, fields) {
@@ -842,4 +954,26 @@ export default {
 	Method,
 	AuditCatalogError,
 	CATALOG_ERR,
+	AuditRowRejectedError,
+	AuditSealError,
+	ChainError,
+	CURRENT_CANONICAL_FORM_ID,
+	GENESIS,
+	JsonNumber,
+	canonicalJSON,
+	compareCodePoints,
+	detailCommitment,
+	parseJson,
+	rowHash,
+	seal,
+	toChainRow,
+	verifyChain,
+	Checkpoint,
+	PartialLastLineError,
+	FileCheckpointSink,
+	HttpCheckpointSink,
+	takeCheckpoints,
+	publishCheckpoints,
+	loadCheckpoints,
+	checkpointsSince,
 };

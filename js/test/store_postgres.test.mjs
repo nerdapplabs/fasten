@@ -6,16 +6,25 @@
  *   FASTEN_TEST_POSTGRES_DSN=postgresql://fasten:fasten@localhost:5432/fasten_test \
  *     node --test test/store_postgres.test.mjs
  *
- * All tests are skipped when the env-var is absent.
+ * All tests are skipped when the env-var is absent, unless
+ * FASTEN_REQUIRE_POSTGRES=1 says they must run.
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PostgresStore } from '../src/store/postgres.js';
-import { Engine, register as registerCodes } from '../src/index.js';
+import {
+    AuditRowRejectedError, Engine, register as registerCodes, takeCheckpoints, verifyChain,
+} from '../src/index.js';
+import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
 const skip = !DSN;
+
+test('Postgres is configured when it is required', () => {
+    assert.ok(!skip || process.env.FASTEN_REQUIRE_POSTGRES !== '1',
+        'FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set');
+});
 
 // One table for the whole run, dropped in `after`.
 const TABLE = `t_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -31,9 +40,10 @@ function _id() {
 let _seq = 0;
 function makeRow(overrides = {}) {
     _seq++;
+    const id = _id();
     return {
-        id: _id(),
-        origin_id: _id(),
+        id,
+        origin_id: id,
         monotonic_seq: _seq,
         timestamp: new Date().toISOString().replace(/Z$/, '000Z'),
         code: 'USER_CREATED',
@@ -316,14 +326,21 @@ for (const [name, ddl] of [['Python', PY_DDL], ['Go', GO_DDL]]) {
             assert.deepEqual(await _seqsOf(s, node), [1, 2]);
 
             const raw = await admin.query(
-                `SELECT prev_hash, hash FROM ${t} WHERE id = $1`, [first.id]);
-            assert.deepEqual(raw.rows[0], { prev_hash: '', hash: '' });
+                `SELECT prev_hash, hash, canonical_form_id FROM ${t} WHERE id = $1`, [first.id]);
+            assert.equal(raw.rows[0].prev_hash, 'genesis');
+            assert.match(raw.rows[0].hash, /^[0-9a-f]{64}$/);
+            assert.equal(raw.rows[0].canonical_form_id, '2');
+            const res = verifyChain(await s.chainRows(node));
+            assert.ok(res.ok, res.reason);
+            assert.equal(res.sealedRows, 2);
 
             await s.markShipped([first.id]);
             const [got] = await s.query({ requestId: first.request_id });
             assert.match(got.timestamp, CANONICAL);
             assert.match(got.shippedAt, CANONICAL);
             assert.equal(got.piiInDetail, true);
+            // shipped_at is hashed as null, so marking a row shipped keeps the chain.
+            assert.ok(verifyChain(await s.chainRows(node)).ok);
         } finally {
             await s.close().catch(() => {});
             await admin.query(`DROP TABLE IF EXISTS ${t}`);
@@ -332,15 +349,17 @@ for (const [name, ddl] of [['Python', PY_DDL], ['Go', GO_DDL]]) {
     });
 }
 
-// The Python store reads SELECT * by position, and the Go store scans
-// detail_salt / detail_commitment into strings, so a table the JS store
-// creates must have Python's column order and no NULLs in those two.
+// The Go store scans detail_salt / detail_commitment into strings, so a
+// table the JS store creates must have no NULLs in those two; its columns
+// are in the order of the Python and Rust stores' tables.
 test('a table the JS store creates can be read by Python and Go', { skip }, async () => {
     const { default: pg } = await import('pg');
     const admin = new pg.Pool({ connectionString: DSN });
     try {
         const row = makeRow({ monotonic_seq: 0 });
-        await store.insert(row);
+        const sealed = await store.insert(row);
+        const unsealed = makeRow({ source_node_id: `own-seq-${randomUUID()}` });
+        await store.insert(unsealed);
         const cols = await admin.query(
             `SELECT column_name FROM information_schema.columns
              WHERE table_name = $1 ORDER BY ordinal_position`, [TABLE]);
@@ -349,11 +368,17 @@ test('a table the JS store creates can be read by Python and Go', { skip }, asyn
             'severity', 'service_id', 'source_node_id', 'tenant_id', 'actor',
             'actor_kind', 'target', 'category', 'domain', 'method', 'request_id',
             'detail', 'shipped_at', 'prev_hash', 'hash', 'canonical_form_id',
-            'detail_salt', 'detail_commitment', 'pii_in_detail',
+            'detail_salt', 'detail_commitment', 'pii_in_detail', 'wire_version',
         ]);
         const raw = await admin.query(
             `SELECT detail_salt, detail_commitment FROM ${TABLE} WHERE id = $1`, [row.id]);
-        assert.deepEqual(raw.rows[0], { detail_salt: '', detail_commitment: '' });
+        assert.deepEqual(raw.rows[0], {
+            detail_salt: sealed.detail_salt, detail_commitment: sealed.detail_commitment,
+        });
+        assert.match(sealed.detail_salt, /^[0-9a-f]{64}$/);
+        const plain = await admin.query(
+            `SELECT detail_salt, detail_commitment FROM ${TABLE} WHERE id = $1`, [unsealed.id]);
+        assert.deepEqual(plain.rows[0], { detail_salt: '', detail_commitment: '' });
     } finally {
         await admin.end();
     }
@@ -426,7 +451,7 @@ async function _withTable(fn) {
     }
 }
 
-test('two engines on one node get seqs 1..N with no chain fields (#92)', { skip }, async () => {
+test('two engines on one node get seqs 1..N in one chain (#92)', { skip }, async () => {
     await _withTable(async ({ admin, t, mk }) => {
         const engines = [new Engine(), new Engine()];
         engines.forEach((e) => e.init({ serviceId: 'svc', nodeId: 'node-92', auditStore: mk() }));
@@ -439,7 +464,9 @@ test('two engines on one node get seqs 1..N with no chain fields (#92)', { skip 
                 `SELECT monotonic_seq, prev_hash, hash FROM ${t} WHERE source_node_id = 'node-92' ORDER BY monotonic_seq`);
             assert.deepEqual(r.rows.map((x) => Number(x.monotonic_seq)),
                 Array.from({ length: 20 }, (_, i) => i + 1));
-            for (const x of r.rows) assert.deepEqual([x.prev_hash, x.hash], ['', '']);
+            const res = verifyChain(await mk().chainRows('node-92'));
+            assert.ok(res.ok, res.reason);
+            assert.equal(res.sealedRows, 20);
         } finally {
             engines.forEach((e) => e.resetForTests());
         }
@@ -467,7 +494,12 @@ test('redactExpired clears old PII rows and records each one (#90)', { skip }, a
 
             const byId = async (id) => (await admin.query(
                 `SELECT detail, detail_salt, hash FROM ${t} WHERE id = $1`, [id])).rows[0];
-            assert.deepEqual(await byId(pii.id), { detail: 'null', detail_salt: '', hash: '' });
+            const redacted = await byId(pii.id);
+            assert.deepEqual([redacted.detail, redacted.detail_salt], ['null', '']);
+            assert.match(redacted.hash, /^[0-9a-f]{64}$/);
+            // The rows sealed here still verify with the detail gone.
+            const mine = (await s.chainRows('node-90')).filter((r) => r.monotonic_seq <= 3);
+            assert.ok(verifyChain(mine).ok);
             assert.equal(JSON.parse((await byId(plain.id)).detail).email, 'a@b.com');
             assert.notEqual((await byId(fresh.id)).detail, 'null');
             assert.notEqual((await byId(sealed.id)).detail, 'null');
@@ -521,6 +553,247 @@ test('retentionPii runs the redaction on init', { skip }, async () => {
             assert.equal(await s.count({ code: 'AUDIT_ROW_REDACTED' }), 1);
         } finally {
             e.resetForTests();
+        }
+    });
+});
+
+// ── Sealing into the hash chain (spec §2.1) ────────────────────────────────
+
+const VECTORS = new URL('../../', import.meta.url);
+const loadVector = async (path) => {
+    const { readFile } = await import('node:fs/promises');
+    return parseJson(await readFile(new URL(path, VECTORS), 'utf8'));
+};
+
+test('a row with seq 0 is sealed, and the detail column holds the hashed text', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const detail = {
+            whole: 75, half: 75.5, tiny: 1e-7, safe: Number.MAX_SAFE_INTEGER,
+            exact: 123456789012345678901234567890n, text: 'café ✓ 日本', del: 'a\x7fb',
+            nested: { list: [1, 2.5, { x: 0.0001 }], none: null, ok: true },
+        };
+        const first = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-seal', detail }));
+        const second = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-seal' }));
+        assert.equal(first.monotonic_seq, 1);
+        assert.equal(first.prev_hash, 'genesis');
+        assert.equal(second.prev_hash, first.hash);
+        assert.equal(first.canonical_form_id, '2');
+        assert.equal(first.detail, detail);
+
+        const raw = (await admin.query(`SELECT detail, detail_commitment FROM ${t} WHERE id = $1`, [first.id])).rows[0];
+        assert.equal(raw.detail, canonicalJSON(detail));
+        assert.equal(raw.detail,
+            '{"del":"a\\u007fb","exact":123456789012345678901234567890,"half":75.5,'
+            + '"nested":{"list":[1,2.5,{"x":0.0001}],"none":null,"ok":true},"safe":9007199254740991,'
+            + '"text":"caf\\u00e9 \\u2713 \\u65e5\\u672c","tiny":1e-07,"whole":75}');
+        assert.equal(raw.detail_commitment, detailCommitment(first.detail_salt, parseJson(raw.detail)));
+
+        const rows = await s.chainRows('n-seal');
+        const res = verifyChain(rows);
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 2);
+        assert.equal(rows[0].hash, first.hash);
+        // query() keeps an integer past 2^53 as a BigInt.
+        const [back] = await s.query({ requestId: first.request_id });
+        assert.equal(back.detail.exact, 123456789012345678901234567890n);
+    });
+});
+
+test('two stores on one node writing at once give one unbroken chain', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const a = mk();
+        const b = mk();
+        await Promise.all([a.init(), b.init()]);
+        let go;
+        const start = new Promise((r) => { go = r; });
+        const PER = 25;
+        const write = async (store, tag) => {
+            await start;
+            for (let i = 0; i < PER; i++) {
+                await store.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-race', target: `${tag}-${i}` }));
+            }
+        };
+        const both = [write(a, 'a'), write(b, 'b')];
+        go();
+        await Promise.all(both);
+        const seqs = (await admin.query(
+            `SELECT monotonic_seq FROM ${t} WHERE source_node_id = 'n-race' ORDER BY monotonic_seq`)).rows;
+        assert.deepEqual(seqs.map((r) => Number(r.monotonic_seq)), Array.from({ length: 2 * PER }, (_, i) => i + 1));
+        const res = verifyChain(await a.chainRows('n-race'));
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 2 * PER);
+    });
+});
+
+test('a new store continues the chain from the stored tip', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const before = mk();
+        await before.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-restart' }));
+        const tip = await before.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-restart' }));
+        await before.close();
+        const after = mk();
+        const next = await after.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-restart' }));
+        assert.equal(next.monotonic_seq, 3);
+        assert.equal(next.prev_hash, tip.hash);
+        assert.ok(verifyChain(await after.chainRows('n-restart')).ok);
+    });
+});
+
+test('a retried row returns the stored row; a different row under its id is rejected', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const row = makeRow({ monotonic_seq: 0, source_node_id: 'n-retry', detail: { n: 1.5 } });
+        const first = await s.insert(row);
+        const again = await s.insert(row);
+        assert.deepEqual(
+            [again.monotonic_seq, again.hash, again.prev_hash, again.detail_salt],
+            [first.monotonic_seq, first.hash, first.prev_hash, first.detail_salt]);
+        assert.equal(Number((await admin.query(`SELECT COUNT(*) FROM ${t}`)).rows[0].count), 1);
+
+        for (const other of [{ target: 'u-2' }, { detail: { n: 2.5 } }, { code: 'USER_DELETED' }]) {
+            await assert.rejects(s.insert({ ...row, ...other }), (err) =>
+                err instanceof AuditRowRejectedError && /differs from the stored row/.test(err.message));
+        }
+        // A row with its own seq must match the stored seq and hash too.
+        await assert.rejects(s.insert({ ...row, monotonic_seq: 5 }), AuditRowRejectedError);
+        // Redacted since: the detail is not compared.
+        await s.redactRows({ ids: [row.id] });
+        assert.equal((await s.insert(row)).hash, first.hash);
+    });
+});
+
+test('a seq-0 row needs origin_id === id', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        const row = makeRow({ monotonic_seq: 0, origin_id: 'evt-elsewhere' });
+        await assert.rejects(s.insert(row), (err) =>
+            err instanceof AuditRowRejectedError && /origin_id/.test(err.message));
+        assert.equal(await s.count(), 0);
+    });
+});
+
+// Inserts a sealed row by plain SQL, the way another SDK's store writes it.
+async function _sqlInsert(admin, t, row, detail) {
+    const cols = ['id', 'origin_id', 'monotonic_seq', 'timestamp', 'code', 'action', 'severity',
+        'service_id', 'source_node_id', 'tenant_id', 'actor', 'actor_kind', 'target', 'category',
+        'domain', 'method', 'request_id', 'detail', 'prev_hash', 'hash', 'canonical_form_id',
+        'detail_salt', 'detail_commitment'];
+    const vals = cols.map((c) => {
+        if (c === 'detail') return detail;
+        if (c === 'monotonic_seq') return Number(row[c]);
+        return row[c] ?? (c === 'detail_salt' || c === 'detail_commitment' ? '' : null);
+    });
+    await admin.query(
+        `INSERT INTO ${t} (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')})`, vals);
+}
+
+for (const [name, ddl, path, pick] of [
+    ['Go', GO_DDL, 'spec/go-sealed-form2.json', (v) => v],
+    ['Python', PY_DDL, 'spec/checkpoint-vectors.json', (v) => v.cases[0].rows.filter((r) => r.source_node_id === 'node-1')],
+]) {
+    test(`appends to a ${name}-sealed chain inserted by SQL`, { skip }, async () => {
+        await _withTable(async ({ admin, t, mk }) => {
+            await admin.query(ddl(t));
+            const rows = pick(await loadVector(path));
+            assert.ok(rows.length >= 2);
+            for (const r of rows) {
+                // The detail as Python's json.dumps writes it: ", " and ": ".
+                const text = detailText(r.detail).replaceAll(',"', ', "').replaceAll('":', '": ');
+                await _sqlInsert(admin, t, r, text);
+            }
+            const s = mk();
+            const node = rows[0].source_node_id;
+            const next = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: node, detail: { after: 1.25 } }));
+            assert.equal(next.monotonic_seq, rows.length + 1);
+            assert.equal(next.prev_hash, rows.at(-1).hash);
+            const back = await s.chainRows(node);
+            const res = verifyChain(back);
+            assert.ok(res.ok, res.reason);
+            assert.equal(res.sealedRows, rows.length + 1);
+            back.slice(0, rows.length).forEach((r, i) => assert.equal(r.hash, rows[i].hash));
+        });
+    });
+}
+
+test('insertSealed stores a row from elsewhere with its number tokens', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const [row] = await loadVector('spec/go-sealed-numbers.json');
+        await s.insertSealed(row);
+        await s.insertSealed(row);
+        const back = await s.chainRows(row.source_node_id);
+        assert.equal(back.length, 1);
+        assert.ok(verifyChain(back).ok);
+        const raw = (await admin.query(`SELECT detail FROM ${t} WHERE id = $1`, [row.id])).rows[0].detail;
+        assert.equal(raw, detailText(row.detail));
+        await assert.rejects(s.insertSealed({ ...row, hash: 'f'.repeat(64) }), AuditRowRejectedError);
+        await assert.rejects(s.insertSealed({ ...row, id: 'evt-unsealed', hash: '' }), AuditRowRejectedError);
+
+        // With detailText, the column holds that text byte for byte.
+        const [py] = (await loadVector('go/xlang_form2.json')).map((c) => c.row);
+        const text = '{"sku": "WIDGET", "qty": 3}';
+        await s.insertSealed({ ...py, source_node_id: 'n-py' }, { detailText: text });
+        assert.equal((await admin.query(`SELECT detail FROM ${t} WHERE id = $1`, [py.id])).rows[0].detail, text);
+    });
+});
+
+test('chain tips give checkpoints that the stored chain verifies against', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        for (const node of ['n-a', 'n-b', 'n-b']) {
+            await s.insert(makeRow({ monotonic_seq: 0, source_node_id: node }));
+        }
+        // An unsealed row above is not the tip.
+        await s.insert(makeRow({ monotonic_seq: 9, source_node_id: 'n-c' }));
+        const tips = await s.chainTips();
+        assert.deepEqual(tips.map((x) => [x.source_node_id, x.monotonic_seq]), [['n-a', 1], ['n-b', 2]]);
+        const checkpoints = await takeCheckpoints(s);
+        const rows = await s.allChainRows();
+        assert.ok(verifyChain(rows, { checkpoints }).ok);
+        // Cut the tail of n-b: a whole-chain verify finds it.
+        await admin.query(`DELETE FROM ${t} WHERE source_node_id = 'n-b' AND monotonic_seq = 2`);
+        const res = verifyChain(await s.allChainRows(), { checkpoints });
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "node 'n-b': chain ends at seq 1 before checkpoint at seq 2");
+        assert.ok(verifyChain(await s.chainRows('n-b'), { checkpoints, partial: true }).ok);
+    });
+});
+
+test('an engine writes the sealed row to stdout after the insert, and the lines verify', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        for (const strategy of ['queue', 'raise']) {
+            const node = `n-stdout-${strategy}`;
+            const e = new Engine();
+            const lines = [];
+            const orig = process.stdout.write;
+            // fasten's lines are taken; the test runner's own output goes through.
+            process.stdout.write = (chunk, ...rest) => {
+                if (typeof chunk !== 'string' || !chunk.startsWith('{"shape":')) return orig.call(process.stdout, chunk, ...rest);
+                lines.push(chunk);
+                rest.find((x) => typeof x === 'function')?.();
+                return true;
+            };
+            try {
+                e.init({ serviceId: 'svc', nodeId: node, auditStore: mk(), auditStoreFailureStrategy: strategy });
+                const out = e.emit({ code: 'T124_EVENT', target: 'x', detail: { v: 75.5, big: 2n ** 64n } });
+                const stored = strategy === 'raise' ? await out : out;
+                if (strategy === 'queue') assert.equal(await e.flush(10_000), true);
+                else assert.match(stored.hash, /^[0-9a-f]{64}$/);
+            } finally {
+                process.stdout.write = orig;
+                await e.resetForTests();
+            }
+            const audit = lines.filter((l) => l.includes('"shape":"audit"'));
+            assert.equal(audit.length, 2, strategy);
+            const [unsealed, sealed] = audit.map((l) => parseJson(l));
+            assert.equal(unsealed.hash, '');
+            assert.match(sealed.hash, /^[0-9a-f]{64}$/);
+            assert.equal(sealed.id, unsealed.id);
+            assert.ok(audit[1].includes('"big":18446744073709551616'));
+            const res = verifyChain(audit);
+            assert.ok(res.ok, res.reason);
+            assert.equal(res.sealedRows, 1);
         }
     });
 });

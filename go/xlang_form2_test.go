@@ -107,6 +107,54 @@ func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
 	}
 }
 
+// spec/js-sealed-form2.json is the JS->Go direction: four rows from the JS
+// SDK's sealed stdout lines (Postgres store), with float, large-integer,
+// non-ASCII, DEL and nested detail, and one row redacted after sealing.
+func TestCrossLanguage_GoVerifiesAJSSealedChain(t *testing.T) {
+	raw, err := os.ReadFile("../spec/js-sealed-form2.json")
+	if err != nil {
+		t.Fatalf("read vector: %v", err)
+	}
+	var rows []Row
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("parse vector: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows = %d want 4", len(rows))
+	}
+	redacted := 0
+	for _, r := range rows {
+		if r.CanonicalFormID != "2" || r.Hash == "" {
+			t.Errorf("%s: form = %q hash = %q, want a sealed form-2 row", r.ID, r.CanonicalFormID, r.Hash)
+		}
+		if r.Detail == nil {
+			redacted++
+			if r.DetailSalt != "" || r.DetailCommitment == "" {
+				t.Errorf("%s: a redacted row keeps its commitment and loses its salt", r.ID)
+			}
+			continue
+		}
+		if got := detailCommitment(r.DetailSalt, r.Detail); got != r.DetailCommitment {
+			t.Errorf("%s: commitment disagrees with JS:\n got %s\nwant %s", r.ID, got, r.DetailCommitment)
+		}
+		if got := hashFnByForm[r.CanonicalFormID](r, canonicalJSON); got != r.Hash {
+			t.Errorf("%s: hash disagrees with JS:\n got %s\nwant %s", r.ID, got, r.Hash)
+		}
+	}
+	if redacted != 1 {
+		t.Errorf("redacted rows = %d want 1", redacted)
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("Go rejects a JS-sealed chain: %s", res.Reason)
+	}
+
+	// A changed detail on a JS-sealed row is caught.
+	rows[0].Detail = map[string]any{"setpoint": json.Number("76.5")}
+	if res := VerifyChain(rows); res.OK {
+		t.Fatal("Go accepted a tampered detail on a JS-sealed row")
+	}
+}
+
 // spec/python-sealed-forms.json is produced by the Python SDK's own sealing
 // path across both canonical forms and both timestamp shapes. Go must accept
 // every case, including the legacy always-"Z" form-"1" hashes that

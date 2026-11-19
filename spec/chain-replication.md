@@ -299,9 +299,10 @@ break. A prefix leaves a purged head, which verifies (§3).
 
 ## §3 Verification
 
-The SDKs that verify name it `verify_chain(rows)` (Python) and
-`VerifyChain(rows)` (Go); this spec uses the Python name. Both follow
-these steps and give the same result for the same rows.
+The SDKs that verify name it `verify_chain(rows)` (Python),
+`VerifyChain(rows)` (Go) and `verifyChain(rows)` (JS); this spec uses the
+Python name. All follow these steps and give the same result for the same
+rows.
 
 `verify_chain(rows)`:
 
@@ -403,6 +404,9 @@ The float vector guards §1.3: it fails for any SDK that renders `75.0` as `75`.
 `form2_numbers` case in `spec/python-sealed-forms.json` (sealed by Python,
 verified by Go) cover small, large and negative-zero floats, big ints,
 non-ASCII text and nested detail in both directions.
+`spec/js-sealed-form2.json` (sealed by JS, verified by Python and Go) is a
+four-row chain with the same kinds of detail and one row redacted after
+sealing.
 
 ---
 
@@ -488,7 +492,7 @@ keep an in-memory sequence in this mode; that is exactly what §2.1 forbids.
 ### §8.2 Allocation without sealing
 
 A store MAY allocate `monotonic_seq` (§2.1) for a writer that cannot seal, for
-example one writing through fasten-core. Such rows have an empty `hash`;
+example the Rust, C++ or Swift SDK. Such rows have an empty `hash`;
 `verify_chain` treats them as unsealed (§2). The writer MUST log
 `audit_chain_unavailable` once per init, as in §8.1.
 
@@ -523,9 +527,9 @@ object (another key, a key in other case, a missing key or a value of
 another type), with one exception: when the file does not end in a newline
 and its last line is not valid JSON, as a crash part way through an append
 leaves it, that line is skipped and the reader reports it to the caller (Go
-returns `ErrPartialLastLine` with the checkpoints before it; Python logs a
-warning). Before appending, a file sink MUST truncate such an unfinished
-last line, so that it never ends up before a later line, and MUST add the
+returns `ErrPartialLastLine` and JS throws `PartialLastLineError`, each
+with the checkpoints before it; Python logs a warning). Before appending,
+a file sink MUST truncate such an unfinished last line, so that it never ends up before a later line, and MUST add the
 missing newline after a complete last line. A file has one publisher at a
 time; concurrent appends to one file are not supported. An HTTP sink receives a JSON array of them in one `POST`. Any
 status other than 2xx, a 3xx included, is a failed publish: a redirect is
@@ -546,7 +550,7 @@ nothing about that operator.
 
 ### §9.3 Verifying against checkpoints
 
-SDKs that verify chains (Python, Go) MUST be able to verify a batch of rows
+SDKs that verify chains (Python, Go, JS) MUST be able to verify a batch of rows
 against checkpoints, in two modes:
 
 - **Whole chain** (the default): the batch is taken to be every row the
@@ -595,7 +599,8 @@ before it is below the purged rows and fails the verify by rule 3, and a
 node whose rows have all been purged fails as a node with no rows. A cutoff of the retention period alone
 is not enough, since a node's last checkpoint can be taken just before the
 purge that removes its rows. Python's `checkpoints_since(checkpoints,
-cutoff)` and Go's `CheckpointsSince(checkpoints, cutoff)` keep the
+cutoff)`, Go's `CheckpointsSince(checkpoints, cutoff)` and JS's
+`checkpointsSince(checkpoints, cutoff)` keep the
 checkpoints whose `anchored_at` is at or after the cutoff, and reject an
 `anchored_at` that is not in the canonical form. Publish again after each
 purge, so that every node still in the store has a checkpoint after it.

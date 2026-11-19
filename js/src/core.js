@@ -1,5 +1,6 @@
 // Redaction and code-catalog validation in plain JS (no native library).
 // Error codes match fasten-core's C ABI.
+import { bigintReplacer, bigintReviver } from "./chain.js";
 
 // --- Redaction -------------------------------------------------------------
 
@@ -270,11 +271,15 @@ function _redactObj(val, patterns, replacement) {
 
 /**
  * Redact a JSON string using the default key-pattern list.
- * Returns a JSON string with matching key values replaced by "***".
+ * Returns a JSON string with matching key values replaced by "***". An
+ * integer a number cannot hold exactly keeps its digits.
  */
 export function coreRedact(inJson) {
-	const obj = JSON.parse(inJson);
-	return JSON.stringify(_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT));
+	const obj = JSON.parse(inJson, bigintReviver);
+	return JSON.stringify(
+		_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT),
+		bigintReplacer,
+	);
 }
 
 function _escapeRe(s) {
@@ -292,8 +297,8 @@ export function coreRedactFull(inJson, extraKeysJson, replacement) {
 		? JSON.parse(extraKeysJson).map((k) => new RegExp(_escapeRe(k), "i"))
 		: [];
 	const patterns = [..._DEFAULT_PATTERNS, ...extra];
-	const obj = JSON.parse(inJson);
-	return JSON.stringify(_redactObj(obj, patterns, rep));
+	const obj = JSON.parse(inJson, bigintReviver);
+	return JSON.stringify(_redactObj(obj, patterns, rep), bigintReplacer);
 }
 
 // --- Catalog ---------------------------------------------------------------

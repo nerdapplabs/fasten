@@ -20,13 +20,27 @@ const DEGRADED_AFTER = 5;
 // SQLITE_CONSTRAINT (with its extended forms such as
 // SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`. Same rules as
 // fasten-core's sqlstate_rejects_row and the Python and Go drainers.
+// An AuditRowRejectedError is the store refusing the row itself.
 export function rejectsRow(err) {
+	if (err instanceof AuditRowRejectedError) return true;
 	const code = err?.code;
 	if (typeof code !== "string") return false;
 	if (code.startsWith("SQLITE_CONSTRAINT") || code === "SQLITE_MISMATCH") {
 		return true;
 	}
 	return code.length === 5 && ["22", "23", "54"].includes(code.slice(0, 2));
+}
+
+/**
+ * The store refused the row itself, so retrying cannot help: a different row
+ * under an id already stored, or a row it cannot seal as given. The drainer
+ * dead-letters it.
+ */
+export class AuditRowRejectedError extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "AuditRowRejectedError";
+	}
 }
 
 export class AuditStoreError extends Error {

@@ -33,6 +33,7 @@ register('user', {
 });
 
 // Optional: a sync audit-store sink. Without one, rows print to stdout only.
+// A store of your own writes rows unsealed; PostgresStore seals them.
 const auditStore = {
     insert(row) { /* persist row to your DB / queue / file */ },
 };
@@ -89,11 +90,27 @@ way, also when the new config is raise mode or has no store. `flush()` and
 it lost rows. An idle drainer does not
 keep the process alive.
 
-**Chain.** The JS SDK does not seal rows. `emit()` returns the row with
-`monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the
-insert transaction, under the same per-node lock as the Python and Go
-stores; `hash` and `prev_hash` stay empty. `PostgresStore` writes into a
-table the Python or Go store created, and adds the columns it lacks.
+**Chain.** `emit()` returns the row with `monotonic_seq: 0`.
+`PostgresStore` seals it into its node's hash chain in the insert
+transaction, under the same per-node lock as the Python, Go and Rust
+stores: the node's next seq, `prev_hash` from the node's latest sealed row,
+a detail salt and commitment, and the hash (canonical form "2",
+[spec §1.4](../spec/chain-replication.md)). Each stored row is then written
+to stdout a second time, sealed (spec §8); in raise mode `emit()` returns,
+or resolves to, the sealed row. Python, Go and JS writers can share a node
+in one table: `PostgresStore` writes into a table the Python or Go store
+created, and adds the columns it lacks. A store of your own seals only if
+it does so itself and has a `seals()` method that returns true; otherwise
+`init()` logs `audit_chain_unavailable` and rows are stored unsealed.
+
+**Numbers in `detail`.** The hash covers numbers as CPython writes them
+([spec §1.3](../spec/chain-replication.md)). A JS number is taken as the
+text `String(n)` gives (what `JSON.stringify` writes) and hashed as CPython
+renders the value that text reads back as: `75` as `75`, `75.5` as `75.5`,
+`1e-7` as `1e-07`. JS has no float `75.0`; send it as `75`, an int. A
+`BigInt` is an exact integer, so pass one for an integer above 2^53.
+`PostgresStore` writes `detail` as the same canonical text, so what is
+stored is what was hashed.
 
 **PII retention.** `redactExpired({ before })` clears `detail` (to `null`)
 on rows of the PII codes older than `before`: codes with `piiInDetail` or
@@ -108,6 +125,75 @@ block on a counting semaphore the way Python, Go, Rust and C++ do.
 `queueCapacity` is a warning threshold (it drives the
 `audit_queue_high_water` / `audit_queue_near_full` sys events), not a hard
 cap.
+
+## Verifying the chain
+
+`verifyChain` checks the hash chain over a set of rows and reports the
+first break: an edited, inserted, deleted or reordered row
+([spec §3](../spec/chain-replication.md)). Chains sealed by the Python, Go
+and JS SDKs verify in each of them. Read stored rows with `chainRows(node)`
+or `allChainRows()`: they keep each detail number as the text that was
+hashed, which `query()` does not (`JSON.parse` turns `75.0` into `75`).
+Captured stdout lines can be passed as they are, one string per line.
+
+```js
+import { verifyChain } from 'fasten-sdk';
+
+const result = verifyChain(await store.chainRows('host-01'));
+if (!result.ok) {
+    console.log(result.firstBreakAt, result.firstBreakNode, result.reason);
+}
+```
+
+`ok` is also true when nothing was sealed; `sealedRows` says how many rows
+were checked.
+
+## Chain checkpoints
+
+`verifyChain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later ([spec §9](../spec/chain-replication.md)):
+
+```js
+import {
+    FileCheckpointSink, loadCheckpoints, publishCheckpoints, verifyChain,
+} from 'fasten-sdk';
+
+await publishCheckpoints(store, new FileCheckpointSink('/var/lib/fasten/checkpoints.jsonl'));
+// new HttpCheckpointSink(url) POSTs them instead.
+
+const checkpoints = await loadCheckpoints('/var/lib/fasten/checkpoints.jsonl');
+const result = verifyChain(await store.allChainRows(), { checkpoints });
+```
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, pass `partial: true`; checkpoints
+below or above its rows, or for nodes not in them, are then skipped, so only
+a whole-chain verify detects a cut-off tail. If the file's last line was
+cut short by a crash, `loadCheckpoints` throws `PartialLastLineError`,
+whose `checkpoints` are the whole lines before it, and the next publish
+drops that line with a `checkpoint_unfinished_line_dropped` warning. The
+file sink reads and may truncate the file, so it does not work on a path
+that only accepts appends. Use one publisher per file. The file lines are
+the bytes the Python sink writes, and each SDK reads the others' files.
+
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. Pass only the checkpoints taken since the latest purge finished,
+and publish again after each purge:
+
+```js
+import { checkpointsSince } from 'fasten-sdk';
+
+const since = checkpointsSince(await loadCheckpoints(path), purgedAt);
+const result = verifyChain(await store.allChainRows(), { checkpoints: since });
+```
+
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
 
 ## Tests
 
