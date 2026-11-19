@@ -103,7 +103,7 @@ const (
 	Correlation Anchor = "correlation"
 )
 
-// Row is an audit row. It converts to CloudEvent or OTel without loss.
+// Row is an audit row.
 type Row struct {
 	WireVersion  string    `json:"wire_version"`
 	ID           string    `json:"id"`
