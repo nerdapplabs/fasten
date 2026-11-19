@@ -1,0 +1,321 @@
+// Stored sys and api logs: persistStreams, the write-through to a stream
+// store, redaction before it, failures, and the SQLite stream store.
+import { test, describe, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Engine, apiLogger, currentRequestID, isSentinel, mintSentinel, withRequestID } from '../src/index.js';
+import { SqliteStreamStore } from '../src/store/stream_sqlite.js';
+import { Ring } from '../src/streams.js';
+import { MemoryStreamStore, captureLines } from './reader_fixtures.mjs';
+
+delete process.env.FASTEN_PERSIST_STREAMS;
+delete process.env.FASTEN_REDACT_KEYS;
+delete process.env.FASTEN_REDACT_REPLACEMENT;
+
+const base = { serviceId: 'svc', nodeId: 'n1' };
+const engines = [];
+function engine() {
+    const e = new Engine();
+    engines.push(e);
+    return e;
+}
+afterEach(async () => {
+    for (const e of engines.splice(0)) await e.resetForTests();
+});
+
+describe('persistStreams', () => {
+    test('unset leaves the attached stores to decide', async () => {
+        const e = engine();
+        await captureLines(() => e.init({ ...base, apiStore: new MemoryStreamStore() }));
+        assert.deepEqual([...e.persistedStreams()].sort(), ['api']);
+    });
+
+    test('matches the attached stores', async () => {
+        const e = engine();
+        await captureLines(() => e.init({
+            ...base, apiStore: new MemoryStreamStore(), syslogStore: new MemoryStreamStore(),
+            persistStreams: ['api', 'sys'],
+        }));
+        assert.deepEqual([...e.persistedStreams()].sort(), ['api', 'sys']);
+    });
+
+    test('empty with no stores is fine', async () => {
+        const e = engine();
+        await captureLines(() => e.init({ ...base, persistStreams: [] }));
+        assert.equal(e.persistedStreams().size, 0);
+    });
+
+    test('a named stream without a store is an error', () => {
+        assert.throws(() => engine().init({ ...base, persistStreams: ['sys'] }),
+            /named in persistStreams but no store attached: \["sys"\]/);
+    });
+
+    test('a store not named is an error', () => {
+        assert.throws(() => engine().init({ ...base, apiStore: new MemoryStreamStore(), persistStreams: [] }),
+            /store attached but not in persistStreams: \["api"\]/);
+    });
+
+    test('both mismatches are reported together', () => {
+        assert.throws(() => engine().init({ ...base, apiStore: new MemoryStreamStore(), persistStreams: ['sys'] }),
+            /no store attached: \["sys"\]; store attached but not in persistStreams: \["api"\]/);
+    });
+
+    test('unknown names are refused, audit included', () => {
+        assert.throws(() => engine().init({ ...base, persistStreams: ['audit', 'sys'] }),
+            /unknown stream\(s\) \["audit"\]/);
+    });
+
+    test('is read from FASTEN_PERSIST_STREAMS', () => {
+        process.env.FASTEN_PERSIST_STREAMS = 'api, sys';
+        try {
+            assert.throws(() => engine().init({ ...base, apiStore: new MemoryStreamStore() }),
+                /no store attached: \["sys"\]/);
+        } finally {
+            delete process.env.FASTEN_PERSIST_STREAMS;
+        }
+    });
+
+    test('a failed check leaves the engine as it was', async () => {
+        const e = engine();
+        await captureLines(() => e.init({ ...base, syslogStore: new MemoryStreamStore() }));
+        assert.throws(() => e.init({ ...base, persistStreams: ['api'] }));
+        assert.deepEqual([...e.persistedStreams()], ['sys']);
+    });
+});
+
+describe('write-through', () => {
+    test('sys rows reach the store, redacted, with a request_id', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            e.log.info('login', { password: 'hunter2', user: 'a' });
+            await e.flush();
+        });
+        const row = store.rows.find((r) => r.event === 'login');
+        assert.ok(row);
+        assert.equal(row.password, '***');
+        assert.equal(row.user, 'a');
+        assert.equal(row.shape, undefined);
+        assert.equal(row.level, 'info');
+        assert.equal(row.service_id, 'svc');
+        assert.ok(row.request_id.startsWith('boot-svc-'));
+    });
+
+    test('the boot id gives way to orphan ids after the first real request', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            e.log.info('before');
+            withRequestID('req-1', () => e.log.info('during'));
+            e.log.info('after');
+            await e.flush();
+        });
+        const by = (ev) => store.rows.find((r) => r.event === ev).request_id;
+        assert.match(by('before'), /^boot-svc-/);
+        assert.equal(by('during'), 'req-1');
+        assert.match(by('after'), /^orphan-svc-/);
+    });
+
+    test('a failed store write keeps the stdout line and marks the store degraded', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore({ fail: true });
+        const { out, err } = await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            e.log.info('secret_event', { card: '4111' });
+            await e.flush();
+        });
+        assert.ok(out.some((l) => l.includes('secret_event')));
+        assert.ok(store.degraded);
+        const failures = err.filter((l) => l.startsWith('fasten: syslog persist failed'));
+        assert.ok(failures.length >= 1);
+        assert.equal(failures[0], 'fasten: syslog persist failed: NotNullViolation\n');
+        assert.ok(!err.some((l) => l.startsWith('fasten:') && l.includes('4111')));
+    });
+
+    test('a store that throws synchronously is handled the same way', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        store.insert = () => { throw new TypeError('boom'); };
+        const { err } = await captureLines(async () => {
+            e.init({ ...base, apiStore: store });
+            e.pushApi({ method: 'GET', path: '/x', status: 200 });
+        });
+        assert.ok(store.degraded);
+        assert.ok(err.includes('fasten: api persist failed: TypeError\n'));
+    });
+
+    test('writeApi redacts, stores and writes an api line', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        const { out } = await captureLines(async () => {
+            e.init({ ...base, apiStore: store });
+            e.writeApi({ method: 'POST', path: '/login', status: 201, token: 'abc', request_id: 'r-1' });
+            await e.flush();
+        });
+        assert.equal(store.rows[0].token, '***');
+        assert.equal(store.rows[0].status, 201);
+        const line = JSON.parse(out.find((l) => l.includes('"shape":"api"')));
+        assert.equal(line.token, '***');
+        assert.equal(line.request_id, 'r-1');
+    });
+
+    test('pushSyslog stores without a stdout line', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        const { out } = await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            e.pushSyslog({ level: 'warn', event: 'from_pino', api_key: 'k' });
+            await e.flush();
+        });
+        assert.equal(store.rows[0].event, 'from_pino');
+        assert.equal(store.rows[0].api_key, '***');
+        assert.ok(!out.some((l) => l.includes('from_pino')));
+    });
+
+    test('rows wait until init', () => {
+        const e = engine();
+        e.pushApi({ method: 'GET' });
+        e.pushSyslog({ event: 'x' });
+    });
+
+    test('inserts keep their order', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            for (let i = 0; i < 20; i++) e.pushSyslog({ event: `e${i}` });
+            await e.flush();
+        });
+        assert.deepEqual(store.rows.map((r) => r.event).reverse().filter((x) => x.startsWith('e')),
+            Array.from({ length: 20 }, (_, i) => `e${i}`));
+    });
+
+    test('a retention for a store without purge() is an init error', () => {
+        const store = new MemoryStreamStore();
+        store.purge = undefined;
+        assert.throws(() => engine().init({ ...base, apiStore: store, retentionApi: '7d' }), /retentionApi.*purge\(\)/);
+    });
+
+    test('retention purges on init', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        store.rows.push({ event: 'old', timestamp: '2000-01-01T00:00:00.000000Z' });
+        await captureLines(async () => {
+            e.init({ ...base, syslogStore: store, retentionSyslog: '1d' });
+            await new Promise((r) => setImmediate(r));
+            await new Promise((r) => setImmediate(r));
+        });
+        assert.ok(!store.rows.some((r) => r.event === 'old'));
+    });
+});
+
+describe('apiLogger', () => {
+    test('records method, path, status and the request id', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, apiStore: store });
+            const { EventEmitter } = await import('node:events');
+            const res = Object.assign(new EventEmitter(), {
+                statusCode: 404, headersSent: false, headers: {},
+                setHeader(k, v) { this.headers[k] = v; },
+            });
+            const req = { method: 'GET', url: '/items/7?x=1', headers: { 'x-request-id': 'abc-123' } };
+            let seen;
+            apiLogger({ engine: e })(req, res, () => {
+                seen = currentRequestID();
+            });
+            res.emit('finish');
+            res.emit('close');
+            await e.flush();
+            assert.equal(seen, 'abc-123');
+            assert.equal(res.headers['X-Request-ID'], 'abc-123');
+        });
+        assert.equal(store.rows.length, 1);
+        const row = store.rows[0];
+        assert.deepEqual(
+            { method: row.method, path: row.path, status: row.status, request_id: row.request_id },
+            { method: 'GET', path: '/items/7', status: 404, request_id: 'abc-123' });
+        assert.equal(typeof row.duration_ms, 'number');
+        assert.match(row.timestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/);
+    });
+
+    test('an unusable header gets a new id', async () => {
+        const e = engine();
+        const store = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, apiStore: store });
+            const { EventEmitter } = await import('node:events');
+            const res = Object.assign(new EventEmitter(), { statusCode: 200, setHeader() {} });
+            apiLogger({ engine: e })({ method: 'GET', url: '/', headers: { 'x-request-id': 'bad id!' } }, res, () => {});
+            res.emit('finish');
+            await e.flush();
+        });
+        assert.match(store.rows[0].request_id, /^[0-9a-f]{12}$/);
+    });
+});
+
+describe('sentinels and the ring', () => {
+    test('mintSentinel and isSentinel', () => {
+        const id = mintSentinel('bg', 'svc');
+        assert.match(id, /^bg-svc-[0-9a-f]{12}$/);
+        assert.ok(isSentinel(id));
+        assert.ok(!isSentinel('abc123'));
+        assert.throws(() => mintSentinel('nope'));
+    });
+
+    test('ring filters are exact and newest first', () => {
+        const r = new Ring(3);
+        for (let i = 0; i < 5; i++) r.push({ event: `e${i}`, level: i % 2 ? 'info' : 'INFO', status: 200 + i });
+        assert.equal(r.length, 3);
+        assert.deepEqual(r.query().map((x) => x.event), ['e4', 'e3', 'e2']);
+        assert.deepEqual(r.query({ level: 'info' }).map((x) => x.event), ['e3']);
+        assert.equal(r.countMatching({ status: '204' }), 1);
+    });
+});
+
+describe('SqliteStreamStore', () => {
+    let dir;
+    afterEach(() => {
+        if (dir) rmSync(dir, { recursive: true, force: true });
+        dir = null;
+    });
+
+    test('rejects a missing or unsafe table name', () => {
+        assert.throws(() => new SqliteStreamStore(':memory:', {}), /table name is required/);
+        assert.throws(() => new SqliteStreamStore(':memory:', { table: 'x; drop' }), /not a valid SQL identifier/);
+    });
+
+    test('creates the file owner-only', () => {
+        dir = mkdtempSync(join(tmpdir(), 'fasten-stream-'));
+        const path = join(dir, 's.db');
+        const s = new SqliteStreamStore(path, { table: 'syslog' });
+        s.close();
+        assert.equal(statSync(path).mode & 0o777, 0o600);
+    });
+
+    test('query, count, search and purge', () => {
+        const s = new SqliteStreamStore(':memory:', { table: 'api_log' });
+        s.insert({ method: 'GET', path: '/a', status: 200, request_id: 'r1', timestamp: '2026-01-01T00:00:00.000000Z', note: 'Grüße 100%' });
+        s.insert({ method: 'POST', path: '/b', status: '500', request_id: 'r2', timestamp: '2026-01-02T00:00:00.000000Z', big: 2n ** 60n });
+        s.insert({ method: 'GET', path: '/c', status: 'n/a', request_id: 'r3' });
+        assert.deepEqual(s.query().map((r) => r.path), ['/c', '/b', '/a']);
+        assert.deepEqual(s.query({ status: 500 }).map((r) => r.path), ['/b']);
+        assert.deepEqual(s.query({ method: 'get' }), []);
+        assert.equal(s.countMatching({ method: 'GET' }), 2);
+        assert.deepEqual(s.query({ since: '2026-01-02T00:00:00.000000Z' }).map((r) => r.path), ['/b']);
+        assert.deepEqual(s.search({ q: '100%', since: '2026' }).map((r) => r.path), ['/a']);
+        assert.deepEqual(s.search({ q: 'x_y', since: '' }), []);
+        assert.equal(s.query({ path: '/b' })[0].big, 2n ** 60n);
+        assert.deepEqual(s.search({ q: 'grüße', since: '' }).map((r) => r.path), ['/a']);
+        assert.equal(s.count(), 3);
+        assert.equal(s.purge({ before: '2026-01-02T00:00:00.000000Z' }), 1);
+        assert.equal(s.count(), 2);
+        assert.equal(s._db.prepare('SELECT payload FROM api_log WHERE path = ?').get('/b').payload.includes('1152921504606846976'), true);
+        s.close();
+    });
+});

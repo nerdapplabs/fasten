@@ -339,6 +339,130 @@ A whole-chain verify shows rows deleted from the start of a chain when one
 of the given checkpoints falls among them. Rows deleted below every given
 checkpoint look the same as a purge.
 
+## Stored sys and api logs
+
+`log.info(...)` lines (and fasten's own events) are the `sys` stream; one
+row per HTTP request is the `api` stream. Both are kept in an in-memory
+ring of 2000 rows, cleared on restart. Attach a stream store to keep them
+([spec](../spec/persistent-streams.md)):
+
+```js
+import fasten, { apiLogger } from 'fasten-sdk';
+import { PostgresStreamStore } from 'fasten-sdk/store/stream_postgres';
+
+fasten.init({
+    serviceId: 'auth-service', nodeId: 'host-01',
+    apiStore:    new PostgresStreamStore(process.env.DATABASE_URL, { table: 'api_log' }),
+    syslogStore: new PostgresStreamStore(process.env.DATABASE_URL, { table: 'syslog' }),
+    persistStreams: ['api', 'sys'],   // or FASTEN_PERSIST_STREAMS=api,sys
+    retentionApi: '7d', retentionSyslog: '30d',
+});
+
+app.use(apiLogger({ skip: ['/healthz'] }));   // Express; see below for node:http
+```
+
+- The tables are the Python and Go stream tables (`seq`, the lifted
+  `request_id`, `timestamp`, `level`, `service_id`, `event`, `method`,
+  `path`, `status` columns, and the whole row as JSON in `payload`), so any
+  SDK reads what another wrote. `table` is required, so api rows cannot land
+  in the syslog table. `SqliteStreamStore` from `fasten-sdk/store/stream_sqlite`
+  is the same on `node:sqlite` (synchronous, WAL, file created 0600).
+- `persistStreams` (or `FASTEN_PERSIST_STREAMS`) is optional. When set,
+  `init()` throws unless it names exactly the streams with a store: a named
+  stream without one, or a store not named, is an error.
+- Rows are redacted before they are kept, stored or written. A row without
+  a `request_id` gets a `boot-<service>-<id>` id until the first row with a
+  real one, then an `orphan-` id. Rows reach the store in the order they
+  were logged; `flush()` and `close()` wait for writes still running.
+- A failed store write does not lose the stdout line. The store is marked
+  degraded (`store-degraded` in every read from then on) and stderr gets
+  `fasten: syslog persist failed: <ErrorType>`, without the row's values.
+- `apiLogger()` records `method`, `path`, `status`, `duration_ms`,
+  `request_id` and `timestamp`, writes the row to stdout with shape `api`,
+  sets `X-Request-ID` (a usable incoming one, else a new id) and makes that
+  id current for the request. With `node:http`:
+  `apiLogger()(req, res, () => handler(req, res))`.
+- `pushSyslog(row)` records a row from your own logger, and `pushApi(row)`
+  an api row, without a stdout line. `writeApi(row)` writes one too.
+
+With no stream store, reads come from the ring and say `ring`; search needs
+a store.
+
+## Serving the reader
+
+`fasten-sdk/reader` serves the audit, api and sys rows over HTTP, with the
+routes, parameters and responses of Python's `fasten.reader.router()` and
+Go's `NewReader`. It returns raw audit data, so it has no default auth:
+
+```js
+import http from 'node:http';
+import { reader, requireBearer } from 'fasten-sdk/reader';
+
+const logs = reader({ auth: requireBearer() });   // FASTEN_READER_TOKEN
+http.createServer((req, res) => logs(req, res)).listen(9000);
+
+// Express: app.use('/api/v1/logs', logs);
+// Fastify: fastify.get('/api/v1/logs/*', (req, reply) => logs(req.raw, reply.raw));
+// Or strip a prefix yourself: reader({ auth, prefix: '/api/v1/logs' }).
+```
+
+`auth` is `{ bearer: token }`, `{ verify: (req) => boolean | Promise<boolean> }`,
+or `"none"` when something in front of the reader authenticates every
+request. Anything else throws when the reader is built. A missing or wrong
+token gets `401 {"detail":"unauthenticated"}`; tokens are compared in
+constant time.
+
+| Route | Parameters |
+|---|---|
+| `GET /audit` | `request_id code domain source_node_id tenant_id actor target since until limit offset after` |
+| `GET /audit/doctor` | none: store, queue, rings, init, and a chain check of this node's latest 50 rows |
+| `GET /correlate` | `request_id` (required) `limit`: audit, api and sys rows with `counts`, `totals`, `truncated` |
+| `GET /search` | `q since` (both required) `until limit streams` (`audit,api,sys`, default `sys`) |
+| `GET /sys` | `level request_id service_id event since until limit`, or `q` with `since` |
+| `GET /api` | `method path request_id status since until limit` |
+| `GET /topology` | `since until`: rows per node, service and tenant |
+
+- `limit` is 1 to 1000 (default 100; `/search` 1 to 200, default 50). A bad
+  value is a 422 with `{"detail": "..."}`.
+- `/audit` returns `total`, `limit`, `offset` and `next_after`, the lowest
+  `monotonic_seq` on the page: pass it back as `after=` for the next page.
+- `since` and `until` take RFC 3339 in any offset and are compared in the
+  canonical form.
+- Search is off unless `init({ searchEnabled: true })` or
+  `FASTEN_SEARCH_ENABLED=true`. It needs `since`, matches case-insensitive
+  substrings of the stored JSON, and a stream without a store gets an entry
+  in `errors`. `q=` on `/sys` cannot be combined with filters (400), and
+  `/api` refuses `q=` (400).
+- Each response has `completeness` per stream: `store`, `store-degraded`
+  or `ring`, as in the Python and Go readers.
+- Rows are the snake_case rows `PostgresStore.query()` returns. A `BigInt`
+  is written as its digits, a JSON number (no precision lost).
+- The doctor verifies the chain from `chainTail()`, which reads the detail
+  text as stored, so rows sealed by any SDK verify. It reports `verified`,
+  `breaks`, `first_break_at`, `reason` and `chain_unavailable`.
+- A store error is a 500 `{"detail":"internal error"}`; the service log
+  gets `reader_query_failed` with the error type only.
+
+`store` and `streams` read other stores than the engine's, for example a
+reader process over tables other services write:
+
+```js
+reader({
+    auth: { bearer: process.env.FASTEN_READER_TOKEN },
+    store: new PostgresStore(dsn),
+    streams: { api: new PostgresStreamStore(dsn, { table: 'api_log' }),
+               sys: new PostgresStreamStore(dsn, { table: 'syslog' }) },
+    nodeId: 'host-01',   // the node the doctor checks
+});
+```
+
+On a shared multi-tenant store, pass `tenantScope: (req) => tenant` and
+`enforceTenantIsolation: true`. Every route is then limited to the caller's
+tenant and ignores `?tenant_id=`; a caller without a tenant gets a 401. sys
+and api rows are matched on their `tenant_id` field, and rows without one
+are left out. The doctor counts only the caller's rows, leaves out the host
+`tenant_id`, and reports a chain break without the row it is on.
+
 ## Tests
 
 ```bash

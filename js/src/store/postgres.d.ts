@@ -63,7 +63,33 @@ export class PostgresStore
 	 * JSON.parse: 75.0 reads as 75, and an integer past 2^53 is a BigInt.
 	 */
 	query(filter?: Filter): Promise<Row[]>;
-	count(filter?: Omit<Filter, "limit" | "offset">): Promise<number>;
+	count(
+		filter?: Omit<Filter, "limit" | "offset" | "afterSeq">,
+	): Promise<number>;
+	/**
+	 * Case-insensitive substring search of the detail JSON within
+	 * [since, until], newest first, optionally for one tenant.
+	 */
+	search(opts: {
+		q: string;
+		since: string;
+		until?: string | null;
+		limit?: number;
+		tenantId?: string | null;
+	}): Promise<Row[]>;
+	/** Row count and first and last timestamp per node, service and tenant. */
+	sources(opts?: { since?: string; until?: string }): Promise<
+		{
+			source_node_id: string;
+			service_id: string;
+			tenant_id: string | null;
+			rows: number;
+			first_seen: string;
+			last_seen: string;
+		}[]
+	>;
+	/** The node's newest `limit` rows by seq, oldest first, as chainRows reads them. */
+	chainTail(sourceNodeId: string, limit: number): Promise<ChainRow[]>;
 	/**
 	 * Unshipped rows, oldest seq first, in the shape query() returns; with
 	 * exact, as chainRows reads them.

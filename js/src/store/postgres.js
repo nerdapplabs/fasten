@@ -745,8 +745,10 @@ export class PostgresStore {
 	 *   requestId?: string, code?: string, domain?: string,
 	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string,
-	 *   limit?: number, offset?: number
+	 *   limit?: number, offset?: number, afterSeq?: number
 	 * }} [opts]
+	 * `afterSeq` keeps rows with a lower `monotonic_seq`, for paging on from
+	 * the last row of a page.
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
 	async query({
@@ -761,9 +763,10 @@ export class PostgresStore {
 		until,
 		limit = 100,
 		offset = 0,
+		afterSeq = 0,
 	} = {}) {
 		await this._ensureReady();
-		const { where, params } = _buildWhere({
+		const { where: base, params } = _buildWhere({
 			requestId,
 			code,
 			domain,
@@ -774,6 +777,12 @@ export class PostgresStore {
 			since,
 			until,
 		});
+		let where = base;
+		if (afterSeq > 0) {
+			params.push(afterSeq);
+			const cond = `monotonic_seq < $${params.length}`;
+			where = where ? `${where} AND ${cond}` : `WHERE ${cond}`;
+		}
 		const n = params.length;
 		params.push(limit, offset);
 		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
@@ -817,6 +826,77 @@ export class PostgresStore {
 		const sql = `SELECT COUNT(*) FROM ${this._table} ${where}`;
 		const res = await this._pool.query(sql, params);
 		return Number(res.rows[0].count);
+	}
+
+	/**
+	 * Case-insensitive substring search (ILIKE) of the detail JSON within
+	 * [since, until], newest first, in the shape `query()` returns. `%`, `_`
+	 * and `\` in q match literally. `tenantId` limits it to one tenant.
+	 *
+	 * @param {{ q: string, since: string, until?: string | null, limit?: number, tenantId?: string | null }} opts
+	 * @returns {Promise<Record<string,unknown>[]>}
+	 */
+	async search({ q, since, until = null, limit = 50, tenantId = null }) {
+		await this._ensureReady();
+		const esc = q.replace(/[\\%_]/g, (c) => `\\${c}`);
+		// E'\\' is one backslash whatever standard_conforming_strings says.
+		const conds = ["timestamp >= $1", "detail::text ILIKE $2 ESCAPE E'\\\\'"];
+		const params = [since, `%${esc}%`];
+		if (until) {
+			params.push(until);
+			conds.push(`timestamp <= $${params.length}`);
+		}
+		if (tenantId != null) {
+			params.push(tenantId);
+			conds.push(`tenant_id = $${params.length}`);
+		}
+		params.push(limit);
+		const res = await this._pool.query(
+			`SELECT * FROM ${this._table} WHERE ${conds.join(" AND ")} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${params.length}`,
+			params,
+		);
+		return res.rows.map(mapRow);
+	}
+
+	/**
+	 * Row count and first and last timestamp per (source_node_id,
+	 * service_id, tenant_id), busiest first.
+	 *
+	 * @param {{ since?: string, until?: string }} [opts]
+	 * @returns {Promise<{ source_node_id: string, service_id: string, tenant_id: string | null, rows: number, first_seen: string, last_seen: string }[]>}
+	 */
+	async sources({ since, until } = {}) {
+		await this._ensureReady();
+		const { where, params } = _buildWhere({ since, until });
+		const res = await this._pool.query(
+			`SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen FROM ${this._table} ${where} GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC`,
+			params,
+		);
+		return res.rows.map((r) => ({
+			source_node_id: r.source_node_id,
+			service_id: r.service_id,
+			tenant_id: r.tenant_id ?? null,
+			rows: Number(r.n),
+			first_seen: r.first_seen,
+			last_seen: r.last_seen,
+		}));
+	}
+
+	/**
+	 * The node's newest `limit` rows by `monotonic_seq`, oldest first, read
+	 * as `chainRows` reads them, for verifyChain.
+	 *
+	 * @param {string} sourceNodeId
+	 * @param {number} limit
+	 * @returns {Promise<Record<string,unknown>[]>}
+	 */
+	async chainTail(sourceNodeId, limit) {
+		await this._ensureReady();
+		const res = await this._pool.query(
+			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = $1 ORDER BY monotonic_seq DESC LIMIT $2`,
+			[sourceNodeId, limit],
+		);
+		return res.rows.reverse().map(_chainRow);
 	}
 
 	/**

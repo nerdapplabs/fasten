@@ -102,7 +102,22 @@ export interface InitOptions {
 	nodeId?: string;
 	tenantId?: string | null;
 	auditStore?: AuditRepository | null;
-	apiStore?: AuditRepository | null;
+	/** Persists the api stream (spec persistent-streams.md). */
+	apiStore?: StreamStore | null;
+	/** Persists the sys stream. */
+	syslogStore?: StreamStore | null;
+	/**
+	 * The streams expected to have a store ("api", "sys"). When set (or
+	 * FASTEN_PERSIST_STREAMS, comma-separated), init() throws unless it
+	 * matches the attached stores both ways.
+	 */
+	persistStreams?: Iterable<"api" | "sys"> | null;
+	/** Free-text search (q=, /search). Also FASTEN_SEARCH_ENABLED. */
+	searchEnabled?: boolean;
+	/** Purge api rows older than this ("7d"). Also FASTEN_RETENTION_API. */
+	retentionApi?: string;
+	/** Purge sys rows older than this. Also FASTEN_RETENTION_SYSLOG. */
+	retentionSyslog?: string;
 	extraRedactKeys?: string[];
 	/** Replaces redacted values. Also read from FASTEN_REDACT_REPLACEMENT. */
 	redactReplacement?: string | null;
@@ -153,6 +168,102 @@ export interface Logger {
 }
 
 export const log: Logger;
+
+// --- api and sys streams (spec persistent-streams.md) --------------------
+
+/** An api or sys row: any JSON object. */
+export type StreamRow = Record<string, unknown>;
+
+/** Equality filters (exact match) and an inclusive timestamp window. */
+export interface StreamFilter {
+	level?: string | null;
+	requestId?: string | null;
+	serviceId?: string | null;
+	event?: string | null;
+	method?: string | null;
+	path?: string | null;
+	status?: number | string | null;
+	since?: string | null;
+	until?: string | null;
+}
+
+/**
+ * A store for one stream: PostgresStreamStore, SqliteStreamStore, or your
+ * own on the same table layout. Methods may return values or promises.
+ */
+export interface StreamStore {
+	insert(row: StreamRow): void | Promise<void>;
+	noteWriteFailure(): void;
+	readonly degraded: boolean;
+	query(
+		opts?: StreamFilter & { limit?: number },
+	): StreamRow[] | Promise<StreamRow[]>;
+	countMatching(filters?: StreamFilter): number | Promise<number>;
+	search(opts: {
+		q: string;
+		since: string;
+		until?: string | null;
+		limit?: number;
+	}): StreamRow[] | Promise<StreamRow[]>;
+	purge?(opts: { before: Date | string }): number | Promise<number>;
+}
+
+/**
+ * Record a sys row from the app's own logger: redacted, kept in memory and
+ * stored if a syslog store is attached. No stdout line.
+ */
+export function pushSyslog(row: StreamRow): void;
+/**
+ * Record an api row: redacted, kept, stored if an api store is attached,
+ * and written to stdout with shape "api".
+ */
+export function writeApi(row: StreamRow): void;
+/** writeApi() without the stdout line. */
+export function pushApi(row: StreamRow): void;
+
+export interface ApiLoggerOptions {
+	/** Paths not recorded, e.g. "/healthz". */
+	skip?: Iterable<string>;
+	engine?: Engine;
+}
+
+/**
+ * Middleware recording one api row per request (method, path, status,
+ * duration_ms, request_id, timestamp), for Express/Connect or
+ * http.createServer. Sets X-Request-ID and makes the id current for the
+ * request.
+ */
+export function apiLogger(
+	opts?: ApiLoggerOptions,
+): (
+	req: import("node:http").IncomingMessage,
+	res: import("node:http").ServerResponse,
+	next: () => unknown,
+) => unknown;
+
+export type SentinelKind = "boot" | "sched" | "bg" | "lib" | "orphan";
+/** A sentinel request_id such as "bg-svc-ab12cd34ef56". */
+export function mintSentinel(kind: SentinelKind, serviceId?: string): string;
+export function isSentinel(requestId: unknown): boolean;
+
+export class Engine {
+	init(opts?: InitOptions): void;
+	emit(input: EmitInput): Row | Promise<Row>;
+	readonly log: Logger;
+	queueStats(): QueueStats | null;
+	flush(timeoutMs?: number): Promise<boolean>;
+	close(timeoutMs?: number): Promise<boolean>;
+	redactExpired(opts: RedactExpiredOptions): Promise<string[]>;
+	pushSyslog(row: StreamRow): void;
+	writeApi(row: StreamRow): void;
+	pushApi(row: StreamRow): void;
+	/** Streams with a store attached. */
+	persistedStreams(): Set<"audit" | "api" | "sys">;
+	searchEnabled(): boolean;
+	auditStore(): AuditRepository | null;
+}
+
+export const defaultEngine: Engine;
 
 // --- Store failure handling ----------------------------------------------
 
@@ -261,6 +372,8 @@ export interface Filter {
 	until?: string;
 	limit?: number;
 	offset?: number;
+	/** Rows with a lower monotonic_seq only, for cursor paging. */
+	afterSeq?: number;
 }
 
 export interface AuditRepository {
@@ -636,5 +749,11 @@ declare const _default: {
 	publishCheckpoints: typeof publishCheckpoints;
 	loadCheckpoints: typeof loadCheckpoints;
 	checkpointsSince: typeof checkpointsSince;
+	pushSyslog: typeof pushSyslog;
+	writeApi: typeof writeApi;
+	pushApi: typeof pushApi;
+	apiLogger: typeof apiLogger;
+	mintSentinel: typeof mintSentinel;
+	isSentinel: typeof isSentinel;
 };
 export default _default;
