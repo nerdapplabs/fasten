@@ -1,8 +1,8 @@
 name: Release
 
 # vX.Y.Z tags: run every SDK test suite and the integration smokes, check the
-# tag against every package version, publish to crates.io, then PyPI and npm,
-# then build, attest and upload the GitHub release files.
+# tag against every package version, publish to crates.io and PyPI and stage
+# the npm package, then build, attest and upload the GitHub release files.
 # go/vX.Y.Z tags: run the Go tests, then the Go module zip on the GitHub
 # release.
 # Tags must point at a commit on main. Prerelease tags (vX.Y.Z-beta.N) get a
@@ -623,7 +623,10 @@ jobs:
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done
 
-  # After the registries, so a failed publish leaves no GitHub release. The
+  # After the registries, so a failed publish leaves no GitHub release. npm
+  # is the exception: its job ends when the version is staged, so the GitHub
+  # release can be out before a maintainer approves the version on npm, and
+  # nothing here waits for that. Approve it straight after the run. The
   # publish jobs are skipped for go/ and prerelease tags.
   github-release:
     needs: [verify, wheels, install-check, crates-io, pypi, npm]
