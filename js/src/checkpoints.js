@@ -27,10 +27,23 @@ import {
 
 const _FIELDS = ["anchored_at", "hash", "monotonic_seq", "source_node_id"];
 const _CANONICAL_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const _HEX64 = /^[0-9a-f]{64}$/;
 
-/** A node's latest sealed row at `anchored_at` (canonical UTC time). */
+// Passed by Checkpoint.parse, which checks only the types.
+const _UNCHECKED = Symbol("unchecked");
+
+// The longest unfinished last line FileCheckpointSink truncates. A
+// checkpoint line is under 200 bytes plus the node id, so a longer tail is
+// not one cut short, and the sink refuses to append rather than drop it.
+const MAX_UNFINISHED_LINE = 4096;
+
+/**
+ * A node's latest sealed row at `anchored_at`. The constructor needs a
+ * `hash` of 64 lowercase hex digits and an `anchored_at` in the canonical
+ * form, YYYY-MM-DDTHH:MM:SS.ffffffZ, and throws TypeError otherwise.
+ */
 export class Checkpoint {
-	constructor({ source_node_id, monotonic_seq, hash, anchored_at }) {
+	constructor({ source_node_id, monotonic_seq, hash, anchored_at }, mode) {
 		if (
 			typeof source_node_id !== "string" ||
 			typeof hash !== "string" ||
@@ -42,6 +55,18 @@ export class Checkpoint {
 				"Checkpoint: source_node_id, hash and anchored_at must be strings and monotonic_seq a non-negative integer",
 			);
 		}
+		if (mode !== _UNCHECKED) {
+			if (!_HEX64.test(hash)) {
+				throw new TypeError(
+					`Checkpoint of node ${JSON.stringify(source_node_id)} at seq ${monotonic_seq}: hash is not 64 lowercase hex digits`,
+				);
+			}
+			if (!_isCanonical(anchored_at)) {
+				throw new TypeError(
+					`Checkpoint of node ${JSON.stringify(source_node_id)} at seq ${monotonic_seq}: anchored_at is not the canonical timestamp form: ${JSON.stringify(anchored_at)}`,
+				);
+			}
+		}
 		this.source_node_id = source_node_id;
 		this.monotonic_seq = monotonic_seq;
 		this.hash = hash;
@@ -51,8 +76,9 @@ export class Checkpoint {
 
 	/**
 	 * Parse one line of a checkpoint file: an object with exactly the four
-	 * fields, each of its type. A repeated key keeps its last value. The
-	 * values are not checked further. Throws TypeError.
+	 * fields, each of its type. A repeated key keeps its last value. Unlike
+	 * the constructor, the hash and anchored_at are not checked further.
+	 * Throws TypeError.
 	 */
 	static parse(line) {
 		const bad = () => new TypeError(`not a checkpoint: ${line.trim()}`);
@@ -74,7 +100,10 @@ export class Checkpoint {
 			throw bad();
 		}
 		try {
-			return new Checkpoint({ ...v, monotonic_seq: Number(seq.token) });
+			return new Checkpoint(
+				{ ...v, monotonic_seq: Number(seq.token) },
+				_UNCHECKED,
+			);
 		} catch {
 			throw bad();
 		}
@@ -140,10 +169,12 @@ async function _sysLog(level, event, fields) {
  * If the file ends in an unfinished line, as a crash mid-append leaves it,
  * that line is dropped before the append, with a
  * `checkpoint_unfinished_line_dropped` warning on stderr giving the path and
- * the bytes dropped; a complete last line without a newline gets one. The
- * file is opened for reading and writing and may be truncated, so a path
- * that only accepts appends does not work. One publisher per file:
- * concurrent publishes to the same file are not supported.
+ * the bytes dropped; a complete last line without a newline gets one. An
+ * unfinished last line longer than 4 KiB is not a checkpoint line cut
+ * short: the publish throws and leaves the file as it is. The file is
+ * opened for reading and writing and may be truncated, so a path that only
+ * accepts appends does not work. One publisher per file: concurrent
+ * publishes to the same file are not supported.
  */
 export class FileCheckpointSink {
 	constructor(path) {
@@ -154,13 +185,21 @@ export class FileCheckpointSink {
 		if (!checkpoints.length) return;
 		const lines = checkpoints.map((cp) => `${_asCheckpoint(cp).toLine()}\n`);
 		const f = await open(this.path, "a+");
+		let failure = null;
 		try {
 			const lead = await this._endLastLine(f);
 			await f.appendFile(lead + lines.join(""));
 			await f.sync();
-		} finally {
-			await f.close();
+		} catch (err) {
+			failure = err;
 		}
+		// A failed close after a failed write reports the write.
+		try {
+			await f.close();
+		} catch (err) {
+			failure ??= err;
+		}
+		if (failure) throw failure;
 	}
 
 	// Make the file end at a line break, as loadCheckpoints reads it:
@@ -185,6 +224,11 @@ export class FileCheckpointSink {
 		const last = Buffer.alloc(end - start);
 		await f.read(last, 0, last.length, start);
 		if (_isJson(last.toString("utf8"))) return "\n";
+		if (last.length > MAX_UNFINISHED_LINE) {
+			throw new Error(
+				`checkpoint file ${this.path}: the last line has no newline, is not JSON and is ${last.length} bytes, longer than a checkpoint line; not truncating it`,
+			);
+		}
 		await _sysLog("warn", "checkpoint_unfinished_line_dropped", {
 			path: String(this.path),
 			bytes_dropped: last.length,
@@ -204,7 +248,7 @@ function _redactURL(u) {
  * Userinfo in the url (`https://user:pass@host/path`) is sent as Basic auth
  * and left out of the request url. Anything but a 2xx response is an error,
  * and redirects are not followed. Errors name the url without userinfo or
- * query.
+ * query; a failed request's error has the fetch error as its `cause`.
  */
 export class HttpCheckpointSink {
 	constructor(url, { timeoutMs = 10_000 } = {}) {
@@ -246,7 +290,9 @@ export class HttpCheckpointSink {
 		} catch (err) {
 			// The cause names the failure (ECONNREFUSED, a timeout), not the url.
 			const why = err?.cause?.code ?? err?.name ?? "Error";
-			throw new Error(`checkpoint sink ${this._where}: ${why}`);
+			throw new Error(`checkpoint sink ${this._where}: ${why}`, {
+				cause: err,
+			});
 		}
 		await res.body?.cancel().catch(() => {});
 		if (res.status < 200 || res.status >= 300) {
@@ -272,16 +318,18 @@ export async function takeCheckpoints(store) {
 	const latest = new Map();
 	for (const tip of tips) {
 		if (!tip.hash) continue;
+		// A pg BIGINT can come back as a string.
+		const seq = Number(tip.monotonic_seq);
 		const kept = latest.get(tip.source_node_id);
-		if (!kept || tip.monotonic_seq > kept.monotonic_seq) {
-			latest.set(tip.source_node_id, tip);
+		if (!kept || seq > kept.seq) {
+			latest.set(tip.source_node_id, { seq, hash: tip.hash });
 		}
 	}
 	return [...latest.keys()].sort(compareCodePoints).map((node) => {
 		const tip = latest.get(node);
 		return new Checkpoint({
 			source_node_id: node,
-			monotonic_seq: Number(tip.monotonic_seq),
+			monotonic_seq: tip.seq,
 			hash: tip.hash,
 			anchored_at: anchoredAt,
 		});
@@ -290,10 +338,17 @@ export async function takeCheckpoints(store) {
 
 /**
  * Take checkpoints of `store`, publish them to `sink` and return them. When
- * reading the tips fails nothing is published.
+ * reading the tips fails nothing is published. A store with no sealed row
+ * publishes nothing and logs a `checkpoint_no_sealed_rows` warning on
+ * stderr.
  */
 export async function publishCheckpoints(store, sink) {
 	const checkpoints = await takeCheckpoints(store);
+	if (!checkpoints.length) {
+		await _sysLog("warn", "checkpoint_no_sealed_rows", {
+			reason: "the store has no sealed rows, so there is nothing to checkpoint",
+		});
+	}
 	await sink.publish(checkpoints);
 	return checkpoints;
 }

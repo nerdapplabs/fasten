@@ -404,9 +404,13 @@ The float vector guards §1.3: it fails for any SDK that renders `75.0` as `75`.
 `form2_numbers` case in `spec/python-sealed-forms.json` (sealed by Python,
 verified by Go) cover small, large and negative-zero floats, big ints,
 non-ASCII text and nested detail in both directions.
-`spec/js-sealed-form2.json` (sealed by JS, verified by Python and Go) is a
-four-row chain with the same kinds of detail and one row redacted after
-sealing.
+`spec/js-sealed-form2.json` (sealed by JS, verified by Python and Go) holds
+the rows the JS engine and Postgres store wrote, with the same kinds of
+detail, numbers whose JS text differs from CPython's repr, and one row
+redacted after sealing; `spec/js-sealed-stdout.jsonl` is every audit line
+the engine wrote for them, two per row. Go's `encoding/json` reads an
+unpaired surrogate as U+FFFD, so Go verifies these files without the node
+whose detail holds one.
 
 ---
 
@@ -526,9 +530,10 @@ each ending in a newline. A reader MUST reject a line that is not such an
 object (another key, a key in other case, a missing key or a value of
 another type), with one exception: when the file does not end in a newline
 and its last line is not valid JSON, as a crash part way through an append
-leaves it, that line is skipped and the reader reports it to the caller (Go
-returns `ErrPartialLastLine` and JS throws `PartialLastLineError`, each
-with the checkpoints before it; Python logs a warning). Before appending,
+leaves it, the reader reports it to the caller: Python skips that line and
+logs a warning, and Go and JS fail with an error that carries the
+checkpoints read before the cut line (Go's `ErrPartialLastLine`, JS's
+`PartialLastLineError`). Before appending,
 a file sink MUST truncate such an unfinished last line, so that it never ends up before a later line, and MUST add the
 missing newline after a complete last line. A file has one publisher at a
 time; concurrent appends to one file are not supported. An HTTP sink receives a JSON array of them in one `POST`. Any

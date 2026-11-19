@@ -3,6 +3,7 @@ package fasten
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -107,24 +108,45 @@ func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
 	}
 }
 
-// spec/js-sealed-form2.json is the JS->Go direction: four rows from the JS
-// SDK's sealed stdout lines (Postgres store), with float, large-integer,
-// non-ASCII, DEL and nested detail, and one row redacted after sealing.
+// spec/js-sealed-form2.json and spec/js-sealed-stdout.jsonl are the JS->Go
+// direction, written by scripts/gen_js_vectors.mjs from the JS engine and
+// Postgres store: the rows as stored (one redacted after sealing) and every
+// audit line the engine wrote. node-js-u16 holds a row with unpaired
+// surrogates in its detail. encoding/json reads those as U+FFFD, so its
+// commitment cannot match here; Python and JS verify that node.
+const jsSurrogateNode = "node-js-u16"
+
+func jsRowsByNode(t *testing.T, rows []Row) (main, u16 []Row) {
+	t.Helper()
+	for _, r := range rows {
+		if r.SourceNodeID == jsSurrogateNode {
+			u16 = append(u16, r)
+		} else {
+			main = append(main, r)
+		}
+	}
+	if len(u16) == 0 {
+		t.Fatalf("no %s rows", jsSurrogateNode)
+	}
+	return main, u16
+}
+
 func TestCrossLanguage_GoVerifiesAJSSealedChain(t *testing.T) {
 	raw, err := os.ReadFile("../spec/js-sealed-form2.json")
 	if err != nil {
 		t.Fatalf("read vector: %v", err)
 	}
-	var rows []Row
-	if err := json.Unmarshal(raw, &rows); err != nil {
+	var all []Row
+	if err := json.Unmarshal(raw, &all); err != nil {
 		t.Fatalf("parse vector: %v", err)
 	}
-	if len(rows) != 4 {
-		t.Fatalf("rows = %d want 4", len(rows))
+	if len(all) != 6 {
+		t.Fatalf("rows = %d want 6", len(all))
 	}
+	rows, _ := jsRowsByNode(t, all)
 	redacted := 0
 	for _, r := range rows {
-		if r.CanonicalFormID != "2" || r.Hash == "" {
+		if r.CanonicalFormID != "2" || len(r.Hash) != 64 {
 			t.Errorf("%s: form = %q hash = %q, want a sealed form-2 row", r.ID, r.CanonicalFormID, r.Hash)
 		}
 		if r.Detail == nil {
@@ -144,14 +166,58 @@ func TestCrossLanguage_GoVerifiesAJSSealedChain(t *testing.T) {
 	if redacted != 1 {
 		t.Errorf("redacted rows = %d want 1", redacted)
 	}
+	if rows[1].Actor != "op\u00e9\x7f\U0001f600" || rows[1].Target != "sensor/op\u00e9\x7f\U0001f600" {
+		t.Errorf("actor %q target %q", rows[1].Actor, rows[1].Target)
+	}
 	if res := VerifyChain(rows); !res.OK {
 		t.Fatalf("Go rejects a JS-sealed chain: %s", res.Reason)
 	}
 
 	// A changed detail on a JS-sealed row is caught.
-	rows[0].Detail = map[string]any{"setpoint": json.Number("76.5")}
+	rows[0].Detail = map[string]any{"half": json.Number("76.5")}
 	if res := VerifyChain(rows); res.OK {
 		t.Fatal("Go accepted a tampered detail on a JS-sealed row")
+	}
+}
+
+// The stdout lines as an ingester reads them: two per row, unsealed then
+// sealed, each with a "shape" key.
+func TestCrossLanguage_GoVerifiesTheJSStdoutLines(t *testing.T) {
+	raw, err := os.ReadFile("../spec/js-sealed-stdout.jsonl")
+	if err != nil {
+		t.Fatalf("read vector: %v", err)
+	}
+	var rows []Row
+	seen := map[string][]bool{}
+	var order []string
+	for _, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		var shape struct {
+			Shape string `json:"shape"`
+		}
+		if err := json.Unmarshal([]byte(line), &shape); err != nil || shape.Shape != "audit" {
+			t.Fatalf("not an audit line (%v): %s", err, line)
+		}
+		var r Row
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("parse line: %v", err)
+		}
+		if seen[r.ID] == nil {
+			order = append(order, r.ID)
+		}
+		seen[r.ID] = append(seen[r.ID], r.Hash != "")
+		rows = append(rows, r)
+	}
+	if len(order) != 6 {
+		t.Fatalf("rows = %d want 6", len(order))
+	}
+	for _, id := range order {
+		if got := seen[id]; len(got) != 2 || got[0] || !got[1] {
+			t.Errorf("%s: lines sealed = %v, want [false true]", id, got)
+		}
+	}
+	main, _ := jsRowsByNode(t, rows)
+	if res := VerifyChain(main); !res.OK {
+		t.Fatalf("Go rejects the JS stdout lines: %s", res.Reason)
 	}
 }
 

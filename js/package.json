@@ -16,6 +16,7 @@
       "default": "./src/index.js"
     },
     "./store/postgres": {
+      "types": "./src/store/postgres.d.ts",
       "default": "./src/store/postgres.js"
     }
   },

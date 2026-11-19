@@ -37,7 +37,13 @@ export const GENESIS = "genesis";
 // Nesting allowed in parsed JSON, as in the Rust parser.
 const MAX_DEPTH = 128;
 
-/** Text that is not JSON, or a row field of the wrong type. */
+/**
+ * What the chain functions throw for input they cannot read: text that is
+ * not JSON (or nested deeper than 128), a row that is not an object, a row
+ * field that is not a string or holds an unpaired surrogate, a missing or
+ * bad `monotonic_seq`, a circular value, a value JSON cannot hold, a bad
+ * `prevHash` given to `seal`, and a stored row a store cannot read back.
+ */
 export class ChainError extends Error {
 	constructor(message) {
 		super(message);
@@ -631,30 +637,42 @@ export function rowHash(row) {
 	return shape ? _hashWith(r, shape, PY) : null;
 }
 
+const _HEX64 = /^[0-9a-f]{64}$/;
+
 /**
- * A copy of `row` sealed after `prevHash`. Sets `canonical_form_id` (the
- * current form), `prev_hash`, `detail_commitment` and `hash`. A non-empty
+ * A copy of `row` sealed after `prevHash`, which must be "genesis" or a
+ * row hash (64 lowercase hex digits). Sets `canonical_form_id` (the current
+ * form), `prev_hash`, `detail_commitment` and `hash`. A non-empty
  * `detail_salt` is kept, so a row can be sealed again to the same hash;
  * otherwise a new one is drawn. `monotonic_seq` is hashed as the row carries
- * it: set it first, to one more than the highest seq on the node. Other
- * fields, `detail` included, are copied as they are.
+ * it: set it first, to one more than the highest seq on the node.
+ *
+ * The copy carries every hashed field as it was hashed, defaults filled in
+ * as `toChainRow` fills them (a missing `wire_version` is "1", a missing
+ * `detail` {}) and the timestamp in the wire form. `shipped_at`,
+ * `pii_in_detail` and fields the hash does not cover are copied as they
+ * are. Throws ChainError for a row `toChainRow` cannot read.
  */
 export function seal(prevHash, row) {
+	if (prevHash !== GENESIS && !_HEX64.test(prevHash)) {
+		throw new ChainError(
+			`prev_hash must be "genesis" or 64 lowercase hex digits (got ${JSON.stringify(prevHash)})`,
+		);
+	}
 	const salt = row.detail_salt
 		? row.detail_salt
 		: randomBytes(32).toString("hex");
-	const sealed = {
+	const r = toChainRow({
 		...row,
 		canonical_form_id: CURRENT_CANONICAL_FORM_ID,
 		prev_hash: prevHash,
 		detail_salt: salt,
-		detail_commitment: detailCommitment(
-			salt,
-			row.detail === undefined ? {} : row.detail,
-		),
-	};
-	sealed.hash = _hashWith(toChainRow(sealed), FORM_2, PY);
-	return sealed;
+		detail_commitment: null,
+	});
+	r.detail_commitment = detailCommitment(salt, r.detail);
+	r.timestamp = canonicalTimestamp(r.timestamp);
+	const { pii_in_detail: _pii, shipped_at: _shipped, ...hashed } = r;
+	return { ...row, ...hashed, hash: _hashWith(r, FORM_2, PY) };
 }
 
 // --- Rows ----------------------------------------------------------------
@@ -896,10 +914,12 @@ function _firstBreak(sorted) {
 	return null;
 }
 
-// Check each node's rows against the checkpoints (spec 9.3) and return the
-// break at the lowest seq, as { seq, node, reason }. Checkpoints are taken by
-// node, then seq, so every SDK reports the same break.
+// Check each node's rows against the checkpoints (spec 9.3). Returns the
+// break at the lowest seq, as { seq, node, reason }, or null, and how many
+// checkpoints had a row at their seq to compare with. Checkpoints are taken
+// by node, then seq, so every SDK reports the same break.
 function _checkpointBreak(byNode, checkpoints, partial) {
+	let checked = 0;
 	const newest = new Map();
 	for (const cp of checkpoints) {
 		const n = newest.get(cp.source_node_id);
@@ -947,6 +967,7 @@ function _checkpointBreak(byNode, checkpoints, partial) {
 		} else {
 			const at = ix.bySeq.get(seq);
 			if (at) {
+				checked++;
 				if (!at.some((r) => r.hash === cp.hash)) {
 					const id = at.map((r) => r.id).sort(compareCodePoints)[0];
 					found = [
@@ -978,7 +999,7 @@ function _checkpointBreak(byNode, checkpoints, partial) {
 			first = { seq: found[0], node, reason: found[1] };
 		}
 	}
-	return first;
+	return { first, checked };
 }
 
 /**
@@ -997,8 +1018,9 @@ function _checkpointBreak(byNode, checkpoints, partial) {
  * - A row with an unknown `canonical_form_id` breaks the chain.
  * - `firstBreakAt` is the lowest seq at which any node breaks, and
  *   `firstBreakNode` the node it is on.
- * - `ok` is true when there is nothing to check; `sealedRows` says how many
- *   rows were.
+ * - `ok` says no break was found in what was checked: `sealedRows` rows,
+ *   and `checkpointsChecked` checkpoints that had a row at their seq. It
+ *   is also true when nothing was checked.
  *
  * With `checkpoints` (spec 9.3), each checkpoint within a node's rows must
  * match the row at its seq. Unless `partial` is set, `rows` are taken as the
@@ -1007,7 +1029,11 @@ function _checkpointBreak(byNode, checkpoints, partial) {
  * only the checkpoints taken since the latest purge (`checkpointsSince`).
  * Rows after a node's newest checkpoint are not covered by it.
  *
- * Throws ChainError for a row that cannot be read.
+ * Without checkpoints it cannot tell that rows were deleted from the end of
+ * a node's chain, that the start of a chain was deleted (it looks like a
+ * purge), or that a whole chain was sealed again from genesis.
+ *
+ * Throws ChainError for a row `toChainRow` cannot read, naming its index.
  */
 export function verifyChain(rows, { checkpoints = [], partial = false } = {}) {
 	const list = [...rows].map((r, i) => {
@@ -1059,12 +1085,14 @@ export function verifyChain(rows, { checkpoints = [], partial = false } = {}) {
 		if (found) lower({ seq: found[0], node: name, reason: found[1] });
 	}
 	lower(dup);
-	lower(_checkpointBreak(sortedNodes, [...checkpoints], partial));
+	const cps = _checkpointBreak(sortedNodes, [...checkpoints], partial);
+	lower(cps.first);
 
 	return {
 		ok: first === null,
 		totalRows: list.length,
 		sealedRows,
+		checkpointsChecked: cps.checked,
 		firstBreakAt: first ? first.seq : null,
 		firstBreakNode: first ? first.node : null,
 		reason: first ? first.reason : null,

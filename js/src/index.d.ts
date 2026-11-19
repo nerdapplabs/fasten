@@ -69,7 +69,11 @@ export interface Row {
 	domain: Domain;
 	method: Method;
 	request_id: string; // 12-char hex
-	/** null once redacted. A BigInt is an integer past 2^53. */
+	/**
+	 * null once redacted. An integer a number cannot hold exactly is a
+	 * BigInt, in what emit() returns and in rows PostgresStore.query()
+	 * reads; JSON.stringify throws on a BigInt unless given a replacer.
+	 */
 	detail: Record<string, unknown> | null;
 	pii_in_detail?: boolean;
 	shipped_at?: string | null;
@@ -129,10 +133,15 @@ export interface EmitInput {
 }
 
 /**
- * Returns the row. In raise mode it returns the row as the store returned it
- * (sealed, when the store seals), and with a store whose `insert` returns a
- * promise, a promise for that row that rejects with AuditStoreError. In
- * queue mode it returns the unsealed row at once.
+ * Returns the row. In raise mode it returns what the store's insert()
+ * returned when that is a row with the same id (the sealed row, when the
+ * store seals), else the row as built; with a store whose `insert` returns a
+ * promise, a promise for it that rejects with AuditStoreError. In queue mode
+ * it returns the unsealed row at once.
+ *
+ * Throws ChainError, in both modes and before anything is written, for a
+ * `target` that is not a string, or a row field that is not a string or
+ * holds an unpaired surrogate.
  */
 export function emit(input: EmitInput): Row | Promise<Row>;
 
@@ -154,15 +163,29 @@ export class AuditStoreError extends Error {
 
 /**
  * The store refused the row itself (a different row under a stored id, a
- * seq-0 row whose origin_id is not its id). The drainer dead-letters it.
+ * seq-0 row whose origin_id is not its id, a seq another row holds, a row
+ * field it cannot seal). The drainer dead-letters it.
  */
 export class AuditRowRejectedError extends Error {
 	constructor(message: string);
 }
 
-/** A row could not be sealed. The stores throw it with the cause. */
+/**
+ * A row could not be sealed for a reason other than its content (the random
+ * source, a malformed stored prev hash). The drainer retries it.
+ */
 export class AuditSealError extends Error {
 	constructor(cause: unknown);
+	cause: unknown;
+}
+
+/**
+ * The store's COMMIT failed and the row could not be read back, so whether
+ * it is stored is unknown. Storing it again under the same id is safe; a
+ * new emit() could store it twice. The drainer retries it.
+ */
+export class AuditOutcomeUnknownError extends Error {
+	constructor(id: string, cause: unknown);
 	cause: unknown;
 }
 
@@ -215,27 +238,37 @@ export interface Filter {
 	domain?: Domain;
 	sourceNodeId?: string;
 	tenantId?: string;
+	actor?: string;
+	target?: string;
 	since?: string;
 	until?: string;
 	limit?: number;
+	offset?: number;
 }
 
 export interface AuditRepository {
 	/**
-	 * Store the row, synchronously or with a promise. A store that seals
-	 * returns (or resolves to) the sealed row, which the engine writes to
-	 * stdout a second time (spec §8); anything else is ignored.
+	 * Store the row, synchronously or with a promise. The engine uses the
+	 * returned row only when it has the same `id` as the row given: emit()
+	 * in raise mode returns it, and when it has a non-empty `hash` the
+	 * engine writes it to stdout a second time (spec §8). Anything else
+	 * (undefined, another id) is ignored and the row given is used.
 	 */
-	insert(row: Row): unknown;
-	/** True when insert() seals rows into the chain (spec §2.1). */
+	// biome-ignore lint/suspicious/noConfusingVoidType: insert() may return nothing
+	insert(row: Row): Row | void | Promise<Row | void>;
+	/**
+	 * True when insert() seals rows into the chain (spec §2.1). Such a store
+	 * returns the sealed row; if it does not, the engine logs
+	 * audit_chain_row_unsealed once.
+	 */
 	seals?(): boolean;
 	query(filter: Filter): Promise<Row[]> | Row[];
 	listUnshipped(limit: number): Promise<Row[]> | Row[];
 	markShipped(ids: string[]): Promise<void> | void;
-	purge(
-		before: Date | string,
-		respectUnshipped: boolean,
-	): Promise<number> | number;
+	purge(opts: {
+		before: string;
+		respectUnshipped?: boolean;
+	}): Promise<number> | number;
 	// Spec §7.1; needed by redactExpired and retentionPii.
 	listRedactionCandidates?(opts: {
 		before: Date | string;
@@ -258,12 +291,21 @@ export interface AuditOutboxRepository {
 /** What PostgresStore adds for the hash chain. */
 export interface ChainStore {
 	seals(): boolean;
-	/** One node's rows by seq, with detail numbers exact, for verifyChain. */
+	/**
+	 * One node's rows by seq, with detail numbers exact, for verifyChain.
+	 * Throws ChainError naming a row it cannot read.
+	 */
 	chainRows(sourceNodeId: string): Promise<ChainRow[]>;
 	/** Every row, by node and seq: the whole chain. */
 	allChainRows(): Promise<ChainRow[]>;
 	chainTips(): Promise<ChainTip[]>;
-	/** Store a row sealed elsewhere as it was sealed. */
+	/**
+	 * Store a row sealed elsewhere as it was sealed. Throws
+	 * AuditRowRejectedError for a row it cannot read, an unsealed row, a
+	 * different row under a stored id or a seq another row holds;
+	 * AuditOutcomeUnknownError when the COMMIT failed and the row could not
+	 * be read back; an Error when the row was neither inserted nor found.
+	 */
 	insertSealed(
 		row: ChainRowInput,
 		opts?: { detailText?: string },
@@ -272,12 +314,18 @@ export interface ChainStore {
 
 // --- Hash chain (spec/chain-replication.md) ------------------------------
 
-/** Form stamped by seal(): "2". */
-export const CURRENT_CANONICAL_FORM_ID: "2";
+/** Form stamped by seal(), "2" in this release. */
+export const CURRENT_CANONICAL_FORM_ID: string;
 /** prev_hash of a node's first sealed row. */
 export const GENESIS: "genesis";
 
-/** Text that is not JSON, or a row field of the wrong type. */
+/**
+ * Input the chain functions cannot read: text that is not JSON (or nested
+ * deeper than 128), a row that is not an object, a row field that is not a
+ * string or holds an unpaired surrogate, a missing or bad monotonic_seq, a
+ * circular value or one JSON cannot hold, a bad prevHash given to seal(), a
+ * stored row a store cannot read back, and a row emit() cannot build.
+ */
 export class ChainError extends Error {
 	constructor(message: string);
 }
@@ -339,26 +387,25 @@ export interface ChainRow {
 export type ChainRowInput = Partial<ChainRow> | Row | string;
 
 export interface ChainVerifyResult {
-	/** No break found. Also true when nothing was sealed; see sealedRows. */
+	/**
+	 * No break found in what was checked: sealedRows rows and
+	 * checkpointsChecked checkpoints. Also true when nothing was checked.
+	 */
 	ok: boolean;
 	/** Rows passed in, repeats and unsealed rows included. */
 	totalRows: number;
 	/** Sealed rows checked, each (node, id) once. */
 	sealedRows: number;
+	/** Checkpoints that had a row at their seq to compare with. */
+	checkpointsChecked: number;
 	firstBreakAt: number | null;
 	firstBreakNode: string | null;
 	reason: string | null;
 }
 
-export interface CheckpointLike {
-	source_node_id: string;
-	monotonic_seq: number;
-	hash: string;
-}
-
 export interface VerifyOptions {
 	/** Checkpoints to check the rows against (spec §9.3). */
-	checkpoints?: Iterable<CheckpointLike>;
+	checkpoints?: Iterable<ChainTip>;
 	/** The rows are a page, one node or a sample, not the whole chain. */
 	partial?: boolean;
 }
@@ -367,18 +414,20 @@ export interface VerifyOptions {
 export function parseJson(text: string): JsonValue;
 /** CPython's json.dumps(v, sort_keys=True, separators=(",", ":")). */
 export function canonicalJSON(value: unknown): string;
-/** Compare two strings by code point, the order Python sorts them in. */
-export function compareCodePoints(a: string, b: string): number;
 /** sha256(salt + canonical JSON of detail) as hex (spec §1.4). */
 export function detailCommitment(salt: string, detail: unknown): string;
-/** The row's hash under its canonical_form_id; null for an unknown form. */
-export function rowHash(row: ChainRowInput): string | null;
-/** A copy of row sealed after prevHash, at the monotonic_seq it carries. */
-export function seal<T extends object>(
+/**
+ * A copy of row sealed after prevHash ("genesis" or 64 lowercase hex), at
+ * the monotonic_seq it carries. The copy carries every hashed field as it
+ * was hashed. Throws ChainError for a bad prevHash or a row toChainRow
+ * cannot read.
+ */
+export function seal<T extends { monotonic_seq: number | bigint }>(
 	prevHash: string,
 	row: T,
 ): T & {
-	canonical_form_id: "2";
+	wire_version: string;
+	canonical_form_id: string;
 	prev_hash: string;
 	hash: string;
 	detail_salt: string;
@@ -386,7 +435,15 @@ export function seal<T extends object>(
 };
 /** Read a wire-format row or JSON line. Throws ChainError. */
 export function toChainRow(input: ChainRowInput): ChainRow;
-/** Walk each node's chain and report the first break (spec §3, §9.3). */
+/**
+ * Walk each node's chain and report the first break (spec §3, §9.3).
+ *
+ * Without checkpoints it cannot detect rows deleted from the end of a
+ * node's chain, the start of a chain deleted (it looks like a purge), or a
+ * whole chain sealed again from genesis.
+ *
+ * Throws ChainError for a row toChainRow cannot read, naming its index.
+ */
 export function verifyChain(
 	rows: Iterable<ChainRowInput>,
 	opts?: VerifyOptions,
@@ -394,19 +451,22 @@ export function verifyChain(
 
 // --- Checkpoints (spec §9) -----------------------------------------------
 
-export class Checkpoint implements CheckpointLike {
-	constructor(fields: {
-		source_node_id: string;
-		monotonic_seq: number;
-		hash: string;
-		anchored_at: string;
-	});
+/** A node's latest sealed row at anchored_at. */
+export class Checkpoint implements ChainTip {
+	/**
+	 * Throws TypeError unless hash is 64 lowercase hex digits and
+	 * anchored_at is in the canonical form.
+	 */
+	constructor(fields: CheckpointFields);
 	readonly source_node_id: string;
 	readonly monotonic_seq: number;
 	readonly hash: string;
 	/** Canonical UTC time, YYYY-MM-DDTHH:MM:SS.ffffffZ. */
 	readonly anchored_at: string;
-	/** Parse one line of a checkpoint file. Throws TypeError. */
+	/**
+	 * Parse one line of a checkpoint file. Checks the fields' types only,
+	 * not the hash or anchored_at form. Throws TypeError.
+	 */
 	static parse(line: string): Checkpoint;
 	/** The file line Python's sink writes, without the newline. */
 	toLine(): string;
@@ -415,6 +475,7 @@ export class Checkpoint implements CheckpointLike {
 
 /** A checkpoint file's last line is cut short. */
 export class PartialLastLineError extends Error {
+	constructor(path: string, line: number, checkpoints: Checkpoint[]);
 	path: string;
 	/** Line number of the cut-short line, from 1. */
 	line: number;
@@ -426,15 +487,21 @@ export interface CheckpointSink {
 	publish(checkpoints: Checkpoint[]): Promise<void> | void;
 }
 
+/**
+ * Appends one line per checkpoint and fsyncs. Truncates an unfinished last
+ * line of up to 4 KiB first; throws, leaving the file as it is, on a longer
+ * one.
+ */
 export class FileCheckpointSink implements CheckpointSink {
 	constructor(path: string);
 	path: string;
-	publish(checkpoints: (Checkpoint | CheckpointLike)[]): Promise<void>;
+	publish(checkpoints: (Checkpoint | CheckpointFields)[]): Promise<void>;
 }
 
+/** POSTs the checkpoints as one JSON array. */
 export class HttpCheckpointSink implements CheckpointSink {
 	constructor(url: string, opts?: { timeoutMs?: number });
-	publish(checkpoints: (Checkpoint | CheckpointLike)[]): Promise<void>;
+	publish(checkpoints: (Checkpoint | CheckpointFields)[]): Promise<void>;
 }
 
 /** A node's latest sealed row. */
@@ -444,11 +511,18 @@ export interface ChainTip {
 	hash: string;
 }
 
+/** The fields of a checkpoint: a tip and when it was taken. */
+export interface CheckpointFields extends ChainTip {
+	/** Canonical UTC time, YYYY-MM-DDTHH:MM:SS.ffffffZ. */
+	anchored_at: string;
+}
+
 export interface CheckpointStore {
 	chainTips(): Promise<ChainTip[]> | ChainTip[];
 }
 
 export function takeCheckpoints(store: CheckpointStore): Promise<Checkpoint[]>;
+/** Logs checkpoint_no_sealed_rows when there is nothing to publish. */
 export function publishCheckpoints(
 	store: CheckpointStore,
 	sink: CheckpointSink,
@@ -479,6 +553,7 @@ declare const _default: {
 	piiCodes: typeof piiCodes;
 	parseDuration: typeof parseDuration;
 	AuditStoreError: typeof AuditStoreError;
+	AuditOutcomeUnknownError: typeof AuditOutcomeUnknownError;
 	AuditRowRejectedError: typeof AuditRowRejectedError;
 	AuditSealError: typeof AuditSealError;
 	ChainError: typeof ChainError;
@@ -486,10 +561,8 @@ declare const _default: {
 	GENESIS: typeof GENESIS;
 	JsonNumber: typeof JsonNumber;
 	canonicalJSON: typeof canonicalJSON;
-	compareCodePoints: typeof compareCodePoints;
 	detailCommitment: typeof detailCommitment;
 	parseJson: typeof parseJson;
-	rowHash: typeof rowHash;
 	seal: typeof seal;
 	toChainRow: typeof toChainRow;
 	verifyChain: typeof verifyChain;

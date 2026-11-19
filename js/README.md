@@ -33,7 +33,8 @@ register('user', {
 });
 
 // Optional: a sync audit-store sink. Without one, rows print to stdout only.
-// A store of your own writes rows unsealed; PostgresStore seals them.
+// A store of your own writes rows unsealed unless it seals them (see
+// "A store of your own" below); PostgresStore seals them.
 const auditStore = {
     insert(row) { /* persist row to your DB / queue / file */ },
 };
@@ -95,13 +96,48 @@ keep the process alive.
 transaction, under the same per-node lock as the Python, Go and Rust
 stores: the node's next seq, `prev_hash` from the node's latest sealed row,
 a detail salt and commitment, and the hash (canonical form "2",
-[spec §1.4](../spec/chain-replication.md)). Each stored row is then written
-to stdout a second time, sealed (spec §8); in raise mode `emit()` returns,
-or resolves to, the sealed row. Python, Go and JS writers can share a node
-in one table: `PostgresStore` writes into a table the Python or Go store
-created, and adds the columns it lacks. A store of your own seals only if
-it does so itself and has a `seals()` method that returns true; otherwise
-`init()` logs `audit_chain_unavailable` and rows are stored unsealed.
+[spec §1.4](../spec/chain-replication.md)). Python, Go and JS writers can
+share a node in one table: `PostgresStore` writes into a table the Python
+or Go store created, and adds the columns it lacks.
+
+What `insert()` returns decides the rest. When it returns (or resolves to)
+a row with the same `id` as the row given, raise-mode `emit()` returns that
+row, and if it has a non-empty `hash` the engine writes it to stdout a
+second time (spec §8). Otherwise `emit()` returns the row as built and
+there is no second line. Queue-mode `emit()` always returns the unsealed
+row at once. A retry of a row whose id is already stored returns the
+stored row.
+
+`emit()` throws `ChainError` at once, in both modes, for a `target` that is
+not a string or a row field that is not a string or holds an unpaired
+surrogate: no store could seal such a row. A store that refuses a row
+throws `AuditRowRejectedError`, and the drainer dead-letters it without
+retrying.
+
+**One allocator per node.** A row with a `monotonic_seq` of its own is
+stored as given, unsealed unless it carries a hash, and its seq must be
+free on its node. An unsealed row at or above a node's first sealed seq
+breaks `verifyChain` for that node, so do not write rows with their own
+seqs on a node id that a sealing store writes for. Use `insertSealed` for a
+row sealed elsewhere.
+
+**A store of your own.** A store seals only if it does so itself and has a
+`seals()` method that returns true; otherwise `init()` logs
+`audit_chain_unavailable` and rows are stored unsealed. To seal, do what
+`PostgresStore.insert` does, in one transaction per row:
+
+1. Take a lock per `source_node_id` that every writer on the node shares.
+2. If the row's `id` is stored, return the stored row.
+3. Set `monotonic_seq` to the node's highest seq plus one, counting
+   unsealed rows.
+4. `seal(prev, row)`, with `prev` the hash of the node's latest sealed
+   row, or `GENESIS`.
+5. Store `detail` as the text `canonicalJSON(detail)`, and read it back
+   with `parseJson`, so the numbers stay the ones that were hashed.
+6. Return the sealed row from `insert()`.
+
+A store whose `seals()` returns true but whose `insert()` returns no row
+with a hash gets one `audit_chain_row_unsealed` error on stderr.
 
 **Numbers in `detail`.** The hash covers numbers as CPython writes them
 ([spec §1.3](../spec/chain-replication.md)). A JS number is taken as the
@@ -110,7 +146,15 @@ renders the value that text reads back as: `75` as `75`, `75.5` as `75.5`,
 `1e-7` as `1e-07`. JS has no float `75.0`; send it as `75`, an int. A
 `BigInt` is an exact integer, so pass one for an integer above 2^53.
 `PostgresStore` writes `detail` as the same canonical text, so what is
-stored is what was hashed.
+stored is what was hashed. A string `detail` given to
+`PostgresStore.insert` is read as JSON text and must be an object.
+
+**Reading rows.** `PostgresStore.query()` and `listUnshipped()` return rows
+with the wire's snake_case keys, the shape of `Row` and of what `insert()`
+returns. Their `detail` is parsed with `JSON.parse`, and an integer a
+number cannot hold exactly is a `BigInt`. `JSON.stringify` throws on a
+`BigInt`; pass a replacer such as
+`(k, v) => typeof v === 'bigint' ? JSON.rawJSON(String(v)) : v`.
 
 **PII retention.** `redactExpired({ before })` clears `detail` (to `null`)
 on rows of the PII codes older than `before`: codes with `piiInDetail` or
@@ -145,8 +189,13 @@ if (!result.ok) {
 }
 ```
 
-`ok` is also true when nothing was sealed; `sealedRows` says how many rows
-were checked.
+`ok` covers only what was checked: `sealedRows` rows, and with checkpoints
+`checkpointsChecked` of them that had a row at their seq. It is also true
+when nothing was checked. `verifyChain` throws `ChainError` for a row it
+cannot read. On its own it cannot tell that rows were deleted from the end
+of a chain, that the start of a chain was deleted (that looks like a
+purge), or that a whole chain was sealed again; checkpoints catch the
+first and the last.
 
 ## Chain checkpoints
 
@@ -171,10 +220,14 @@ By default the rows are taken as the whole chain: every checkpointed node
 must have rows, and no checkpoint may be below its oldest row or above its
 newest. To check a page or one node, pass `partial: true`; checkpoints
 below or above its rows, or for nodes not in them, are then skipped, so only
-a whole-chain verify detects a cut-off tail. If the file's last line was
+a whole-chain verify detects a cut-off tail: a deleted tail needs
+checkpoints. If the file's last line was
 cut short by a crash, `loadCheckpoints` throws `PartialLastLineError`,
 whose `checkpoints` are the whole lines before it, and the next publish
-drops that line with a `checkpoint_unfinished_line_dropped` warning. The
+drops that line with a `checkpoint_unfinished_line_dropped` warning. An
+unfinished last line longer than 4 KiB is not a cut-short checkpoint, and
+the publish throws instead of dropping it. A store with no sealed rows
+publishes nothing and logs `checkpoint_no_sealed_rows`. The
 file sink reads and may truncate the file, so it does not work on a path
 that only accepts appends. Use one publisher per file. The file lines are
 the bytes the Python sink writes, and each SDK reads the others' files.

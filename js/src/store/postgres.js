@@ -10,11 +10,16 @@
  *   await store.init();          // run DDL once
  *   fasten.init({ auditStore: store });
  */
-import { AuditRowRejectedError } from "../audit_queue.js";
+import {
+	AuditOutcomeUnknownError,
+	AuditRowRejectedError,
+} from "../audit_queue.js";
 import { canonicalTS } from "../canonical_ts.js";
 import {
 	AuditSealError,
 	bigintReviver,
+	ChainError,
+	canonicalJSON,
 	canonicalTimestamp,
 	detailText,
 	GENESIS,
@@ -123,41 +128,44 @@ function _ddlStatements(table, idx) {
 }
 
 /**
- * Map a pg result row (array or object) to a plain JS object with camelCase
- * keys, parsing the `detail` JSON string and normalising `piiInDetail`.
+ * A pg result row as a row object with the wire's snake_case keys: `detail`
+ * parsed from its JSON text (an integer a number cannot hold exactly is a
+ * BigInt, null once redacted), `pii_in_detail` a boolean, an empty salt or
+ * commitment null.
  * @param {Record<string,unknown>} r
  * @returns {Record<string,unknown>}
  */
 function _mapRow(r) {
 	return {
+		wire_version: r.wire_version || "1",
 		id: r.id,
-		originId: r.origin_id,
-		monotonicSeq: Number(r.monotonic_seq),
+		origin_id: r.origin_id,
+		monotonic_seq: Number(r.monotonic_seq),
 		timestamp: r.timestamp,
 		code: r.code,
 		action: r.action,
 		severity: r.severity,
-		serviceId: r.service_id,
-		sourceNodeId: r.source_node_id,
-		tenantId: r.tenant_id ?? null,
+		service_id: r.service_id,
+		source_node_id: r.source_node_id,
+		tenant_id: r.tenant_id ?? null,
 		actor: r.actor,
-		actorKind: r.actor_kind,
+		actor_kind: r.actor_kind,
 		target: r.target,
 		category: r.category,
 		domain: r.domain,
 		method: r.method,
-		requestId: r.request_id,
+		request_id: r.request_id,
 		detail:
 			typeof r.detail === "string"
 				? JSON.parse(r.detail, bigintReviver)
 				: r.detail,
-		piiInDetail: Number(r.pii_in_detail) === 1,
-		shippedAt: r.shipped_at ?? null,
-		prevHash: r.prev_hash ?? "",
+		pii_in_detail: Number(r.pii_in_detail) === 1,
+		shipped_at: r.shipped_at ?? null,
+		canonical_form_id: r.canonical_form_id || "1",
+		prev_hash: r.prev_hash ?? "",
 		hash: r.hash ?? "",
-		canonicalFormId: r.canonical_form_id ?? "1",
-		detailSalt: r.detail_salt || null,
-		detailCommitment: r.detail_commitment || null,
+		detail_salt: r.detail_salt || null,
+		detail_commitment: r.detail_commitment || null,
 	};
 }
 
@@ -168,22 +176,19 @@ const _CHAIN_COLUMNS =
 	"id, wire_version, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, shipped_at, canonical_form_id, prev_hash, hash, detail_salt, detail_commitment, pii_in_detail";
 
 // A row selected as _CHAIN_COLUMNS, with detail parsed from the column
-// text, so its numbers are the tokens that were hashed.
+// text, so its numbers are the tokens that were hashed. Throws ChainError
+// naming the row when it cannot be read.
 function _chainRow(r) {
-	let detail;
 	try {
-		detail = parseJson(r.detail);
+		return toChainRow({
+			...r,
+			monotonic_seq: Number(r.monotonic_seq),
+			detail: parseJson(r.detail),
+			pii_in_detail: Number(r.pii_in_detail) === 1,
+		});
 	} catch (err) {
-		throw new Error(
-			`fasten PostgresStore: row ${r.id}: detail: ${err.message}`,
-		);
+		throw new ChainError(`fasten PostgresStore: row ${r.id}: ${err.message}`);
 	}
-	return toChainRow({
-		...r,
-		monotonic_seq: Number(r.monotonic_seq),
-		detail,
-		pii_in_detail: Number(r.pii_in_detail) === 1,
-	});
 }
 
 // Each node's latest sealed row, one walk of the (source_node_id,
@@ -204,6 +209,38 @@ function _chainTipsSQL(t) {
 }
 
 const _NODE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+
+// A failed COMMIT, after which the row may or may not be stored.
+class _CommitError extends Error {
+	constructor(cause) {
+		super(cause?.message ?? String(cause));
+		this.cause = cause;
+	}
+}
+
+// A row's detail: an object as it is, a string read as JSON text (it must
+// be an object), a missing one {}.
+function _detail(row) {
+	const d = row.detail;
+	if (typeof d !== "string") return d ?? {};
+	let v;
+	try {
+		v = parseJson(d);
+	} catch (err) {
+		throw new AuditRowRejectedError(`row ${row.id}: detail: ${err.message}`);
+	}
+	// parseJson gives objects no prototype; a number is a JsonNumber.
+	if (
+		v === null ||
+		typeof v !== "object" ||
+		Object.getPrototypeOf(v) !== null
+	) {
+		throw new AuditRowRejectedError(
+			`row ${row.id}: detail text is not a JSON object`,
+		);
+	}
+	return v;
+}
 
 // A row from emit() (snake_case) or with camelCase keys, as snake_case.
 function _snake(row) {
@@ -227,7 +264,7 @@ function _snake(row) {
 		domain: row.domain,
 		method: row.method,
 		request_id: row.request_id ?? row.requestId,
-		detail: row.detail ?? {},
+		detail: _detail(row),
 		pii_in_detail: !!(row.pii_in_detail || row.piiInDetail),
 		shipped_at: row.shipped_at ?? row.shippedAt ?? null,
 		canonical_form_id: row.canonical_form_id ?? row.canonicalFormId ?? "",
@@ -379,21 +416,30 @@ export class PostgresStore {
 	 * A row with `monotonic_seq` 0 (what `emit()` returns) is sealed into its
 	 * node's hash chain inside the insert transaction, under the per-node
 	 * advisory lock every SDK takes (spec §2.1): it gets the node's next seq,
-	 * `prev_hash` from the node's latest sealed row (or "genesis"), a detail
-	 * salt and commitment, and its hash. The detail column holds the
+	 * `prev_hash` from the node's latest sealed row (or "genesis"), a new
+	 * detail salt and commitment, and its hash. The detail column holds the
 	 * canonical JSON that was hashed. Such a row must have
 	 * `origin_id === id`.
 	 *
 	 * A row with a seq of its own is stored as given: unsealed unless it
-	 * carries a hash. An unsealed row at or above a node's sealed rows makes
-	 * verifyChain fail for that node, so do not write rows with their own
-	 * seqs on a node id this store seals for. Use `insertSealed` for a
-	 * sealed row from elsewhere.
+	 * carries a hash. Its seq must be free on its node. An unsealed row at or
+	 * above a node's first sealed row makes verifyChain fail for that node,
+	 * so do not write rows with their own seqs on a node id this store seals
+	 * for. Use `insertSealed` for a sealed row from elsewhere.
 	 *
-	 * Storing a row whose id is already stored returns the stored row's seq
-	 * and chain fields, so a retry does not take a new seq. A different row
-	 * under that id throws AuditRowRejectedError, and so does a seq-0 row
-	 * whose origin_id is not its id. A failure to seal throws AuditSealError.
+	 * A string `detail` is read as JSON text and must be an object.
+	 *
+	 * A row whose id is already stored returns the stored row, so a retry
+	 * does not take a new seq. When the COMMIT fails the row is read back
+	 * once: if it is stored, it is returned.
+	 *
+	 * Throws AuditRowRejectedError for a row it refuses: a different row
+	 * under a stored id, a seq-0 row whose origin_id is not its id, a seq
+	 * another row holds, a row field that is not a string or holds an
+	 * unpaired surrogate, a detail that is not JSON. Throws AuditSealError
+	 * when sealing fails for another reason (the random source, a malformed
+	 * stored prev hash), and AuditOutcomeUnknownError when the COMMIT failed
+	 * and the row could not be read back. Other errors are pg's.
 	 *
 	 * @param {Record<string,unknown>} row  Raw row object from `fasten.emit()`.
 	 * @returns {Promise<Record<string,unknown>>}
@@ -401,70 +447,77 @@ export class PostgresStore {
 	async insert(row) {
 		await this._ensureReady();
 		const r = _snake(row);
-		// The row as given, with the seq and chain fields of the row stored
-		// under its id, once that is checked to be the same event (and, for a
-		// row with its own seq, at that seq with that hash).
+		// A row that no retry can store is refused before anything is taken.
+		try {
+			toChainRow(r);
+			canonicalJSON(r.detail);
+		} catch (err) {
+			throw new AuditRowRejectedError(`row ${r.id}: ${err.message}`);
+		}
+		if (r.monotonic_seq === 0 && r.origin_id !== r.id) {
+			// Sealed here, so it must be a row this node originated, as the
+			// Python and Go stores require.
+			throw new AuditRowRejectedError(
+				`row ${r.id}: a row with seq 0 needs origin_id === id (got origin_id ${JSON.stringify(r.origin_id)})`,
+			);
+		}
+		// The row stored under its id, once that is checked to be the same
+		// event (and, for a row with its own seq, at that seq with that hash).
 		const asHeld = (held) => {
 			const same =
 				sameEvent(held, r) &&
 				(r.monotonic_seq === 0 ||
 					(r.monotonic_seq === held.monotonic_seq && r.hash === held.hash));
 			if (!same) throw _differs(r.id);
-			return {
-				...r,
-				monotonic_seq: held.monotonic_seq,
-				canonical_form_id: held.canonical_form_id,
-				prev_hash: held.prev_hash,
-				hash: held.hash,
-				detail_salt: held.detail_salt,
-				detail_commitment: held.detail_commitment,
-			};
+			return held;
 		};
-		return this._transaction(async (client) => {
-			// A row with its own seq takes the lock too, or it could take the
-			// seq a seq-0 insert has just picked.
-			await client.query(_NODE_LOCK, [r.source_node_id]);
-			// A retry of a row that already landed must not take a new seq.
-			const held = await this._held(client, r.id);
-			if (held) return asHeld(held);
-			let stored = r;
-			if (r.monotonic_seq === 0) {
-				// Sealed here, so it must be a row this node originated, as
-				// the Python and Go stores require.
-				if (r.origin_id !== r.id) {
-					throw new AuditRowRejectedError(
-						`row ${r.id}: a row with seq 0 needs origin_id === id (got origin_id ${JSON.stringify(r.origin_id)})`,
+		try {
+			return await this._transaction(async (client) => {
+				// A row with its own seq takes the lock too, or it could take
+				// the seq a seq-0 insert has just picked.
+				await client.query(_NODE_LOCK, [r.source_node_id]);
+				// A retry of a row that already landed must not take a new seq.
+				const held = await this._held(client, r.id);
+				if (held) return asHeld(held);
+				let stored = r;
+				let text;
+				if (r.monotonic_seq === 0) {
+					// The seq counts every row on the node, sealed or not;
+					// prev_hash comes from the node's last sealed row.
+					const next = await client.query(
+						`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
+						[r.source_node_id],
 					);
+					const tip = await client.query(
+						`SELECT hash FROM ${this._table} WHERE source_node_id = $1 AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1`,
+						[r.source_node_id],
+					);
+					try {
+						stored = seal(tip.rows[0]?.hash ?? GENESIS, {
+							...r,
+							monotonic_seq: Number(next.rows[0].seq),
+							detail_salt: null,
+						});
+					} catch (err) {
+						throw new AuditSealError(err);
+					}
+					text = canonicalJSON(stored.detail);
+				} else {
+					await this._checkSeqFree(client, r);
+					text = detailText(r.detail);
 				}
-				// The seq counts every row on the node, sealed or not;
-				// prev_hash comes from the node's last sealed row.
-				const next = await client.query(
-					`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
-					[r.source_node_id],
-				);
-				const tip = await client.query(
-					`SELECT hash FROM ${this._table} WHERE source_node_id = $1 AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1`,
-					[r.source_node_id],
-				);
-				try {
-					stored = seal(tip.rows[0]?.hash ?? GENESIS, {
-						...r,
-						monotonic_seq: Number(next.rows[0].seq),
-					});
-				} catch (err) {
-					throw new AuditSealError(err);
+				if ((await this._insertRow(client, stored, text)) === 0) {
+					// The id was stored under another node's lock meanwhile.
+					const now = await this._held(client, r.id);
+					if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
+					return asHeld(now);
 				}
-			}
-			if (
-				(await this._insertRow(client, stored, detailText(stored.detail))) === 0
-			) {
-				// The id was stored under another node's lock meanwhile.
-				const now = await this._held(client, r.id);
-				if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
-				return asHeld(now);
-			}
-			return stored;
-		});
+				return stored;
+			});
+		} catch (err) {
+			if (!(err instanceof _CommitError)) throw err;
+			return this._afterFailedCommit(r.id, err.cause, asHeld);
+		}
 	}
 
 	/**
@@ -476,8 +529,13 @@ export class PostgresStore {
 	 *
 	 * The row must have a hash and a non-zero `monotonic_seq`. Its hash is
 	 * not checked here: run verifyChain over the batch first. Storing the
-	 * same row again is a no-op; a different row under a stored id throws
-	 * AuditRowRejectedError.
+	 * same row again is a no-op.
+	 *
+	 * Throws AuditRowRejectedError for a row it cannot read, an unsealed row,
+	 * a different row (another hash) under a stored id, or a seq another row
+	 * holds on the node; AuditOutcomeUnknownError when the COMMIT failed and
+	 * the row could not be read back; an Error when the row was neither
+	 * inserted nor found. Other errors are pg's.
 	 *
 	 * @param {Record<string,unknown>|string} row
 	 * @param {{ detailText?: string }} [opts]
@@ -497,18 +555,26 @@ export class PostgresStore {
 			);
 		}
 		await this._ensureReady();
-		const held = await this._transaction(async (client) => {
-			await client.query(_NODE_LOCK, [r.source_node_id]);
-			const before = await this._held(client, r.id);
-			if (before) return before;
-			if (
-				(await this._insertRow(client, r, text ?? detailText(r.detail))) === 0
-			) {
-				return this._held(client, r.id);
-			}
-			return null;
-		});
-		if (held && held.hash !== r.hash) throw _differs(r.id);
+		const check = (held) => {
+			if (held.hash !== r.hash) throw _differs(r.id);
+		};
+		try {
+			await this._transaction(async (client) => {
+				await client.query(_NODE_LOCK, [r.source_node_id]);
+				const before = await this._held(client, r.id);
+				if (before) return check(before);
+				await this._checkSeqFree(client, r);
+				const detail = text ?? detailText(r.detail);
+				if ((await this._insertRow(client, r, detail)) === 0) {
+					const now = await this._held(client, r.id);
+					if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
+					check(now);
+				}
+			});
+		} catch (err) {
+			if (!(err instanceof _CommitError)) throw err;
+			await this._afterFailedCommit(r.id, err.cause, check);
+		}
 	}
 
 	/** The store seals rows with seq 0 (spec §2.1); the engine checks this. */
@@ -566,19 +632,65 @@ export class PostgresStore {
 		}));
 	}
 
-	// Run fn(client) in a transaction and return what it returns.
+	// Run fn(client) in a transaction and return what it returns. A failed
+	// COMMIT throws _CommitError. A client whose COMMIT or ROLLBACK failed
+	// is released with the error, so the pool discards it.
 	async _transaction(fn) {
 		const client = await this._pool.connect();
+		let broken;
 		try {
 			await client.query("BEGIN");
 			const out = await fn(client);
-			await client.query("COMMIT");
+			try {
+				await client.query("COMMIT");
+			} catch (err) {
+				broken = err;
+				throw new _CommitError(err);
+			}
 			return out;
 		} catch (err) {
-			await client.query("ROLLBACK").catch(() => {});
+			if (!broken) {
+				try {
+					await client.query("ROLLBACK");
+				} catch (rollbackErr) {
+					broken = rollbackErr;
+				}
+			}
 			throw err;
 		} finally {
-			client.release();
+			client.release(broken);
+		}
+	}
+
+	// After a failed COMMIT, read the row stored under `id` once. Returns
+	// check(row) when it is stored; throws `err` when it is not, and
+	// AuditOutcomeUnknownError when it cannot be read.
+	async _afterFailedCommit(id, err, check) {
+		let res;
+		try {
+			res = await this._pool.query(
+				`SELECT ${_CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
+				[id],
+			);
+		} catch (readErr) {
+			throw new AuditOutcomeUnknownError(id, err ?? readErr);
+		}
+		if (res.rows.length === 0) throw err;
+		return check(_chainRow(res.rows[0]));
+	}
+
+	// A row with its own seq: no other row may hold that seq on its node.
+	// The (node, seq) index is not unique on every table, so this is checked
+	// here, under the node lock.
+	async _checkSeqFree(client, r) {
+		const res = await client.query(
+			`SELECT id FROM ${this._table} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1`,
+			[r.source_node_id, r.monotonic_seq],
+		);
+		if (res.rows.length) {
+			throw new AuditRowRejectedError(
+				`row ${r.id}: seq ${r.monotonic_seq} on node ${JSON.stringify(r.source_node_id)} is held by row ${res.rows[0].id}`,
+			);
 		}
 	}
 
@@ -631,7 +743,12 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Query rows with optional filters, ordered newest-first.
+	 * Query rows with optional filters, ordered newest-first. Rows have the
+	 * wire's snake_case keys, as `insert()` returns them. Their detail is
+	 * parsed with JSON.parse, so `75.0` reads as 75 (read rows for
+	 * verifyChain with `chainRows`), and an integer a number cannot hold
+	 * exactly is a BigInt, which JSON.stringify refuses without a replacer
+	 * such as `(k, v) => typeof v === "bigint" ? JSON.rawJSON(String(v)) : v`.
 	 *
 	 * @param {{
 	 *   requestId?: string, code?: string, domain?: string,
@@ -713,7 +830,8 @@ export class PostgresStore {
 
 	/**
 	 * List rows that have not been shipped yet (shipped_at IS NULL),
-	 * ordered oldest-first (monotonic_seq ASC).
+	 * ordered oldest-first (monotonic_seq ASC), in the shape `query()`
+	 * returns.
 	 *
 	 * @param {number} [limit]
 	 * @returns {Promise<Record<string,unknown>[]>}
@@ -834,6 +952,6 @@ export class PostgresStore {
 	 * @returns {Promise<void>}
 	 */
 	async close() {
-		await this._pool.end();
+		await this._pool?.end();
 	}
 }

@@ -14,7 +14,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PostgresStore } from '../src/store/postgres.js';
 import {
-    AuditRowRejectedError, Engine, register as registerCodes, takeCheckpoints, verifyChain,
+    AuditOutcomeUnknownError, AuditRowRejectedError, AuditStoreError, ChainError, Engine,
+    register as registerCodes, takeCheckpoints, verifyChain,
 } from '../src/index.js';
 import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
@@ -114,7 +115,7 @@ test('listUnshipped returns rows with no shipped_at', { skip }, async () => {
     const ids = unshipped.map((r) => r.id);
     assert.ok(ids.includes(row.id), `expected ${row.id} in unshipped list`);
     for (const r of unshipped) {
-        assert.equal(r.shippedAt, null, `row ${r.id} should have shippedAt=null`);
+        assert.equal(r.shipped_at, null, `row ${r.id} should have shipped_at=null`);
     }
 });
 
@@ -135,7 +136,7 @@ test('markShipped removes row from listUnshipped', { skip }, async () => {
 
     // shipped_at should now be set.
     const [back] = await store.query({ requestId: row.request_id });
-    assert.ok(back.shippedAt !== null, 'shippedAt should be set after markShipped');
+    assert.ok(back.shipped_at !== null, 'shipped_at should be set after markShipped');
 });
 
 // 5. purge respects unshipped
@@ -183,7 +184,7 @@ test('purge deletes only a seq prefix of each node', { skip }, async () => {
     }
     await store.purge({ before: _daysAgo(30), respectUnshipped: false });
     const left = await store.query({ sourceNodeId: node });
-    assert.deepEqual(left.map((r) => r.monotonicSeq).sort((a, b) => a - b), [2, 3, 4]);
+    assert.deepEqual(left.map((r) => r.monotonic_seq).sort((a, b) => a - b), [2, 3, 4]);
 });
 
 // 7. count filtered
@@ -212,12 +213,12 @@ test('round-trip detail JSON', { skip }, async () => {
     assert.deepEqual(back.detail, detail);
 });
 
-// 9. piiInDetail round-trips
-test('piiInDetail round-trips as boolean', { skip }, async () => {
+// 9. pii_in_detail round-trips
+test('pii_in_detail round-trips as boolean', { skip }, async () => {
     const row = makeRow({ pii_in_detail: true });
     await store.insert(row);
     const [back] = await store.query({ requestId: row.request_id });
-    assert.equal(back.piiInDetail, true);
+    assert.equal(back.pii_in_detail, true);
 });
 
 // 10. schema-qualified table
@@ -252,7 +253,7 @@ const CANONICAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 
 async function _seqsOf(s, node) {
     const rows = await s.query({ sourceNodeId: node, limit: 100 });
-    return rows.map(r => r.monotonicSeq).sort((a, b) => a - b);
+    return rows.map(r => r.monotonic_seq).sort((a, b) => a - b);
 }
 
 test('a row with seq 0 gets the node\'s next seq', { skip }, async () => {
@@ -268,6 +269,9 @@ test('concurrent inserts on one node get distinct seqs', { skip }, async () => {
     await Promise.all(Array.from({ length: 10 }, () =>
         store.insert(makeRow({ monotonic_seq: 0, source_node_id: node }))));
     assert.deepEqual(await _seqsOf(store, node), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    const res = verifyChain(await store.chainRows(node));
+    assert.ok(res.ok, res.reason);
+    assert.equal(res.sealedRows, 10);
 });
 
 test('query and count filter by tenantId', { skip }, async () => {
@@ -275,7 +279,7 @@ test('query and count filter by tenantId', { skip }, async () => {
     await store.insert(makeRow({ request_id: rid, tenant_id: 'tenant-a' }));
     await store.insert(makeRow({ request_id: rid, tenant_id: 'tenant-b' }));
     const rows = await store.query({ requestId: rid, tenantId: 'tenant-a' });
-    assert.deepEqual(rows.map(r => r.tenantId), ['tenant-a']);
+    assert.deepEqual(rows.map(r => r.tenant_id), ['tenant-a']);
     assert.equal(await store.count({ requestId: rid, tenantId: 'tenant-a' }), 1);
 });
 
@@ -284,8 +288,13 @@ test('markShipped writes a canonical timestamp', { skip }, async () => {
     await store.insert(row);
     await store.markShipped([row.id]);
     const [got] = await store.query({ requestId: row.request_id });
-    assert.match(got.shippedAt, CANONICAL);
+    assert.match(got.shipped_at, CANONICAL);
 });
+
+const CHAIN_COLUMNS = ['id', 'wire_version', 'origin_id', 'monotonic_seq', 'timestamp', 'code', 'action',
+    'severity', 'service_id', 'source_node_id', 'tenant_id', 'actor', 'actor_kind', 'target', 'category',
+    'domain', 'method', 'request_id', 'detail', 'shipped_at', 'canonical_form_id', 'prev_hash', 'hash',
+    'detail_salt', 'detail_commitment', 'pii_in_detail'];
 
 // Shapes of the tables the Python and Go stores create.
 const PY_DDL = (t) => `CREATE TABLE ${t} (
@@ -334,11 +343,16 @@ for (const [name, ddl] of [['Python', PY_DDL], ['Go', GO_DDL]]) {
             assert.ok(res.ok, res.reason);
             assert.equal(res.sealedRows, 2);
 
+            // Every column the store reads exists, added where the table lacked it.
+            const cols = (await admin.query(
+                'SELECT column_name FROM information_schema.columns WHERE table_name = $1', [t])).rows.map((r) => r.column_name);
+            for (const c of CHAIN_COLUMNS) assert.ok(cols.includes(c), `${name} table lacks ${c}`);
+
             await s.markShipped([first.id]);
             const [got] = await s.query({ requestId: first.request_id });
             assert.match(got.timestamp, CANONICAL);
-            assert.match(got.shippedAt, CANONICAL);
-            assert.equal(got.piiInDetail, true);
+            assert.match(got.shipped_at, CANONICAL);
+            assert.equal(got.pii_in_detail, true);
             // shipped_at is hashed as null, so marking a row shipped keeps the chain.
             assert.ok(verifyChain(await s.chainRows(node)).ok);
         } finally {
@@ -487,7 +501,7 @@ test('redactExpired clears old PII rows and records each one (#90)', { skip }, a
             // A form-"1" row sealed by another SDK: its detail is hashed, so it stays.
             const sealed = makeRow({ monotonic_seq: 99, source_node_id: 'node-90', code: 'T124_PII', timestamp: old });
             await s.insert(sealed);
-            await admin.query(`UPDATE ${t} SET hash = 'abc', prev_hash = 'genesis' WHERE id = $1`, [sealed.id]);
+            await admin.query(`UPDATE ${t} SET hash = '${'c'.repeat(64)}', prev_hash = 'genesis' WHERE id = $1`, [sealed.id]);
 
             const cutoff = new Date(Date.now() - 30 * 86_400_000);
             assert.deepEqual(await e.redactExpired({ before: cutoff }), [pii.id]);
@@ -795,5 +809,376 @@ test('an engine writes the sealed row to stdout after the insert, and the lines 
             assert.ok(res.ok, res.reason);
             assert.equal(res.sealedRows, 1);
         }
+    });
+});
+
+// ── Failures, retries and the node lock ────────────────────────────────────
+
+// Runs fn with fasten's lines captured: the audit lines on stdout, and the
+// sys lines on stderr parsed.
+async function _captured(fn) {
+    const out = [];
+    const err = [];
+    const [ow, ew] = [process.stdout.write, process.stderr.write];
+    const ours = (chunk) => typeof chunk === 'string' && chunk.startsWith('{"shape":');
+    process.stdout.write = (chunk, ...rest) => {
+        if (!ours(chunk)) return ow.call(process.stdout, chunk, ...rest);
+        out.push(...chunk.split('\n').filter(Boolean));
+        rest.find((x) => typeof x === 'function')?.();
+        return true;
+    };
+    process.stderr.write = (chunk, ...rest) => {
+        if (!ours(chunk)) return ew.call(process.stderr, chunk, ...rest);
+        err.push(JSON.parse(chunk));
+        return true;
+    };
+    try {
+        await fn();
+    } finally {
+        process.stdout.write = ow;
+        process.stderr.write = ew;
+    }
+    return { out: out.filter((l) => l.includes('"shape":"audit"')), err };
+}
+
+// Wraps the clients the store's pool hands out: on(sql, run) returns a
+// promise to answer a query in place of run(), or undefined to let it
+// through. `released` collects what each checkout was released with.
+async function _hook(s, on) {
+    await s._ensureReady();
+    const pool = s._pool;
+    const connect = pool.connect.bind(pool);
+    const released = [];
+    const wrap = (c) => {
+        if (!c._fastenHooked) {
+            c._fastenHooked = true;
+            const query = c.query.bind(c);
+            c.query = (sql, ...rest) => on(sql, () => query(sql, ...rest)) ?? query(sql, ...rest);
+        }
+        const release = c.release;
+        c.release = (e) => {
+            released.push(e);
+            return release.call(c, e);
+        };
+        return c;
+    };
+    // pool.query() calls connect with a callback.
+    pool.connect = (cb) => {
+        const p = connect().then(wrap);
+        if (!cb) return p;
+        p.then((c) => cb(undefined, c, c.release), (e) => cb(e));
+        return undefined;
+    };
+    return { released };
+}
+
+const LONE = `doc/${'\u{1f600}'.slice(0, 1)}`;
+
+test('a row the store cannot seal is dead-lettered at once, and the next row is stored', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        for (const bad of [{ target: LONE }, { actor: 42 }]) {
+            await assert.rejects(s.insert(makeRow({ monotonic_seq: 0, ...bad })), AuditRowRejectedError);
+        }
+        const e = new Engine();
+        const { err } = await _captured(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n-dead', auditStore: s, queueRetryInitialMs: 1, queueRetryJitter: false });
+            // emit() refuses such a row itself, so it is queued directly.
+            e._drainer.put(makeRow({ monotonic_seq: 0, source_node_id: 'n-dead', target: LONE }));
+            e.emit({ code: 'T124_EVENT', target: 'next' });
+            assert.equal(await e.flush(10_000), true);
+            await e.resetForTests();
+        });
+        const dead = err.filter((l) => l.event === 'audit_drain_dead_letter');
+        assert.equal(dead.length, 1);
+        assert.equal(dead[0].attempt_count, 1);
+        assert.match(dead[0].last_error, /^AuditRowRejectedError: /);
+        assert.equal(err.filter((l) => l.event === 'audit_drain_failed').length, 0);
+        const rows = await s.chainRows('n-dead');
+        assert.deepEqual(rows.map((r) => [r.target, r.monotonic_seq]), [['next', 1]]);
+        assert.equal(await s.count(), 1);
+    });
+});
+
+test('a string detail is read as JSON text and must be an object', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const row = makeRow({
+            monotonic_seq: 0, source_node_id: 'n-text',
+            detail: '{"qty": 3, "price": 75.0, "tiny": 1e-7, "big": 123456789012345678901234567890}',
+        });
+        const stored = await s.insert(row);
+        const raw = (await admin.query(`SELECT detail FROM ${t} WHERE id = $1`, [row.id])).rows[0].detail;
+        assert.equal(raw, '{"big":123456789012345678901234567890,"price":75.0,"qty":3,"tiny":1e-07}');
+        assert.ok(verifyChain(await s.chainRows('n-text')).ok);
+        const [back] = await s.query({ requestId: row.request_id });
+        assert.deepEqual(back.detail, { big: 123456789012345678901234567890n, price: 75, qty: 3, tiny: 1e-7 });
+        assert.equal((await s.insert(row)).hash, stored.hash);
+        for (const bad of ['[1]', 'null', '"x"', '7', 'not json', '{"a":']) {
+            await assert.rejects(s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-text', detail: bad })),
+                AuditRowRejectedError, bad);
+        }
+        assert.equal(await s.count(), 1);
+    });
+});
+
+test('a retry returns the stored row, and its stdout line verifies', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        const e = new Engine();
+        let first;
+        const { out } = await _captured(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n-again', auditStore: s, auditStoreFailureStrategy: 'raise' });
+            const row = makeRow({ monotonic_seq: 0, source_node_id: 'n-again', detail: { email: 'a@b.com', n: 1.5 } });
+            first = await e._storeRow(s, row);
+            await s.redactRows({ ids: [row.id] });
+            const again = await e._storeRow(s, row);
+            assert.deepEqual([again.detail, again.detail_salt, again.monotonic_seq, again.hash],
+                [null, null, first.monotonic_seq, first.hash]);
+            await e.resetForTests();
+        });
+        assert.equal(out.length, 2);
+        const line = parseJson(out[1]);
+        assert.deepEqual([line.detail, line.detail_salt, line.hash], [null, null, first.hash]);
+        const res = verifyChain([out[1]]);
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 1);
+    });
+});
+
+test('a seq-0 row gets a new salt even when it carries one', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        const stored = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-salt', detail_salt: 'ab'.repeat(32) }));
+        assert.match(stored.detail_salt, /^[0-9a-f]{64}$/);
+        assert.notEqual(stored.detail_salt, 'ab'.repeat(32));
+        assert.ok(verifyChain(await s.chainRows('n-salt')).ok);
+    });
+});
+
+test('after a failed COMMIT the row is read back once', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        let mode = null;
+        const hook = await _hook(s, (sql, run) => {
+            if (sql !== 'COMMIT' || !mode) return undefined;
+            const landed = mode === 'landed';
+            mode = null;
+            const lost = new Error('Connection terminated unexpectedly');
+            return landed ? run().then(() => { throw lost; }) : Promise.reject(lost);
+        });
+        const e = new Engine();
+        const { out } = await _captured(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n-commit', auditStore: s, auditStoreFailureStrategy: 'raise' });
+            // Stored, though COMMIT reported an error: emit() gets the row.
+            mode = 'landed';
+            const row = await e.emit({ code: 'T124_EVENT', target: 'landed' });
+            assert.deepEqual([row.monotonic_seq, /^[0-9a-f]{64}$/.test(row.hash)], [1, true]);
+            // Not stored: the COMMIT's error.
+            mode = 'lost';
+            await assert.rejects(e.emit({ code: 'T124_EVENT', target: 'lost' }),
+                (err) => err instanceof AuditStoreError && /Connection terminated/.test(err.message)
+                    && !(err.cause instanceof AuditOutcomeUnknownError));
+            // The read fails too: the outcome is unknown.
+            mode = 'lost';
+            const query = s._pool.query;
+            s._pool.query = async () => { throw new Error('read failed'); };
+            try {
+                await assert.rejects(e.emit({ code: 'T124_EVENT', target: 'unknown' }),
+                    (err) => err.cause instanceof AuditOutcomeUnknownError && /is unknown/.test(err.message));
+            } finally {
+                s._pool.query = query;
+            }
+            await e.resetForTests();
+        });
+        // Each client whose COMMIT failed was discarded.
+        assert.equal(hook.released.filter(Boolean).length, 3);
+        assert.deepEqual((await s.chainRows('n-commit')).map((r) => r.target), ['landed']);
+        // The stored row's sealed line was written; the others have only their first line.
+        assert.equal(out.length, 4);
+        assert.deepEqual(out.map((l) => parseJson(l)).filter((r) => r.hash).map((r) => r.target), ['landed']);
+    });
+});
+
+test('a client whose ROLLBACK fails is discarded', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        await s._ensureReady();
+        await admin.query(`ALTER TABLE ${t} ADD CONSTRAINT no_marker CHECK (target <> 'reject-me')`);
+        const hook = await _hook(s, (sql) => (sql === 'ROLLBACK' ? Promise.reject(new Error('rollback failed')) : undefined));
+        await assert.rejects(s.insert(makeRow({ monotonic_seq: 0, target: 'reject-me' })), { code: '23514' });
+        assert.equal(hook.released.length, 1);
+        assert.match(hook.released[0]?.message ?? '', /rollback failed/);
+    });
+});
+
+test('insertSealed throws when the row was neither inserted nor found', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        const [row] = await loadVector('spec/go-sealed-numbers.json');
+        s._insertRow = async () => 0;
+        await assert.rejects(s.insertSealed(row), /not inserted and not stored/);
+    });
+});
+
+test('a row with its own seq is refused when another row holds that seq', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        // Python's table: its (node, seq) index is not unique.
+        await admin.query(PY_DDL(t));
+        const s = mk();
+        const first = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-own' }));
+        const held = (err) => err instanceof AuditRowRejectedError && /seq 1 on node "n-own" is held by row /.test(err.message);
+        await assert.rejects(s.insert(makeRow({ monotonic_seq: 1, source_node_id: 'n-own' })), held);
+        await assert.rejects(s.insertSealed({ ...first, id: 'evt-other', origin_id: 'evt-other' }), held);
+        // The same row again is still a no-op.
+        const own = makeRow({ monotonic_seq: 7, source_node_id: 'n-own' });
+        await s.insert(own);
+        await s.insert(own);
+        await s.insertSealed(first);
+        assert.equal(await s.count({ sourceNodeId: 'n-own' }), 2);
+    });
+});
+
+test('an insert waits for the node lock every SDK takes', { skip }, async () => {
+    await _withTable(async ({ admin, mk }) => {
+        const s = mk();
+        await s.init();
+        const holder = await admin.connect();
+        try {
+            await holder.query('BEGIN');
+            await holder.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', ['n-lock']);
+            let done = 0;
+            const pending = [1, 2, 3].map(() =>
+                s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-lock' })).then((r) => { done++; return r; }));
+            // Another node is not held up.
+            assert.equal((await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-free' }))).monotonic_seq, 1);
+            await new Promise((r) => setTimeout(r, 300));
+            assert.equal(done, 0);
+            await holder.query('COMMIT');
+            const rows = await Promise.all(pending);
+            assert.deepEqual(rows.map((r) => r.monotonic_seq).sort(), [1, 2, 3]);
+            const res = verifyChain(await s.chainRows('n-lock'));
+            assert.ok(res.ok, res.reason);
+        } finally {
+            holder.release();
+        }
+    });
+});
+
+test('an insert that fails after sealing takes no seq and writes no sealed line', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        await s.init();
+        await admin.query(`ALTER TABLE ${t} ADD CONSTRAINT no_marker CHECK (target <> 'reject-me')`);
+        const e = new Engine();
+        let ok1;
+        let ok2;
+        const { out } = await _captured(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n-check', auditStore: s, auditStoreFailureStrategy: 'raise' });
+            ok1 = await e.emit({ code: 'T124_EVENT', target: 'ok-1' });
+            await assert.rejects(e.emit({ code: 'T124_EVENT', target: 'reject-me' }),
+                (err) => err instanceof AuditStoreError && err.cause?.code === '23514');
+            ok2 = await e.emit({ code: 'T124_EVENT', target: 'ok-2' });
+            await e.resetForTests();
+        });
+        assert.deepEqual([ok1.monotonic_seq, ok2.monotonic_seq], [1, 2]);
+        assert.equal(ok2.prev_hash, ok1.hash);
+        const res = verifyChain(await s.chainRows('n-check'));
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 2);
+        const rejected = out.map((l) => parseJson(l)).filter((r) => r.target === 'reject-me');
+        assert.deepEqual(rejected.map((r) => r.hash), ['']);
+    });
+});
+
+test('four stores writing at once interleave in one unbroken chain', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const stores = [mk(), mk(), mk(), mk()];
+        await Promise.all(stores.map((x) => x.init()));
+        const PER = 10;
+        await Promise.all(stores.map((x, w) => Promise.all(Array.from({ length: PER }, (_, i) =>
+            x.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-four', target: `w${w}-${i}` }))))));
+        const rows = await stores[0].chainRows('n-four');
+        assert.deepEqual(rows.map((r) => r.monotonic_seq), Array.from({ length: 4 * PER }, (_, i) => i + 1));
+        const writers = rows.map((r) => r.target.split('-')[0]);
+        const switches = writers.filter((w, i) => i > 0 && w !== writers[i - 1]).length;
+        assert.ok(switches > 3, `writers did not interleave: ${writers.join(' ')}`);
+        const res = verifyChain(rows);
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 4 * PER);
+    });
+});
+
+test('a seq-0 row after an unsealed row with its own seq takes the next seq and links to the sealed tip', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        const sealed = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-gap' }));
+        await s.insert(makeRow({ monotonic_seq: 500, source_node_id: 'n-gap' }));
+        const next = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-gap' }));
+        assert.deepEqual([next.monotonic_seq, next.prev_hash], [501, sealed.hash]);
+        // The unsealed row above the node's first sealed seq breaks verifyChain there.
+        const res = verifyChain(await s.chainRows('n-gap'));
+        assert.deepEqual([res.ok, res.firstBreakAt], [false, 500]);
+        assert.match(res.reason, /no hash after the node's chain started/);
+    });
+});
+
+test('a row changed in SQL breaks the chain at its seq, and an unreadable row is named', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        for (let i = 0; i < 4; i++) {
+            await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-tamper', detail: { i } }));
+        }
+        assert.ok(verifyChain(await s.chainRows('n-tamper')).ok);
+        const at = (seq) => `source_node_id = 'n-tamper' AND monotonic_seq = ${seq}`;
+        await admin.query(`UPDATE ${t} SET target = 'elsewhere' WHERE ${at(3)}`);
+        let res = verifyChain(await s.chainRows('n-tamper'));
+        assert.equal(res.firstBreakAt, 3);
+        assert.match(res.reason, /hash mismatch/);
+        await admin.query(`UPDATE ${t} SET detail = '{"i":99}' WHERE ${at(2)}`);
+        res = verifyChain(await s.chainRows('n-tamper'));
+        assert.equal(res.firstBreakAt, 2);
+        assert.match(res.reason, /detail does not match its commitment/);
+        const { rows: [{ id }] } = await admin.query(`UPDATE ${t} SET detail = 'not json' WHERE ${at(1)} RETURNING id`);
+        await assert.rejects(s.chainRows('n-tamper'), (err) => err instanceof ChainError && err.message.includes(`row ${id}: `));
+    });
+});
+
+test('a __proto__ key, an unpaired surrogate and big integers go through emit, Postgres and verifyChain', { skip }, async () => {
+    await _withTable(async ({ admin, t, mk }) => {
+        const s = mk();
+        const e = new Engine();
+        const detail = JSON.parse('{"__proto__": {"x": 1}, "name": "\\udcff.txt"}');
+        Object.assign(detail, { over: 2n ** 53n + 1n, neg: -(2n ** 64n), list: [2n ** 60n], password: 2n ** 70n });
+        let row;
+        const { out } = await _captured(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n-e2e', auditStore: s, auditStoreFailureStrategy: 'raise' });
+            row = await e.emit({ code: 'T124_EVENT', target: 'x', detail });
+            await e.resetForTests();
+        });
+        assert.deepEqual(Object.getOwnPropertyDescriptor(row.detail, '__proto__').value, { x: 1 });
+        const want = '{"__proto__":{"x":1},"list":[1152921504606846976],"name":"\\udcff.txt",'
+            + '"neg":-18446744073709551616,"over":9007199254740993,"password":"***"}';
+        const raw = (await admin.query(`SELECT detail FROM ${t} WHERE id = $1`, [row.id])).rows[0].detail;
+        assert.equal(raw, want);
+        const res = verifyChain(await s.chainRows('n-e2e'));
+        assert.ok(res.ok, res.reason);
+        assert.equal(res.sealedRows, 1);
+        assert.equal(out.length, 2);
+        assert.ok(out[1].endsWith(`"detail":${want}}`), out[1]);
+        assert.ok(verifyChain(out).ok);
+        const [back] = await s.query({ requestId: row.request_id });
+        assert.deepEqual([back.detail.over, back.detail.neg, back.detail.list[0]], [2n ** 53n + 1n, -(2n ** 64n), 2n ** 60n]);
+    });
+});
+
+test('query() rows are snake_case like Row, and verifyChain reads them', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        for (let i = 0; i < 2; i++) await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-q', detail: { i, s: 'x' } }));
+        const rows = await s.query({ sourceNodeId: 'n-q' });
+        assert.deepEqual(Object.keys(rows[0]).sort(), [...CHAIN_COLUMNS].sort());
+        assert.ok(verifyChain(rows).ok);
+        assert.deepEqual((await s.listUnshipped(10)).map((r) => r.monotonic_seq), [1, 2]);
     });
 });

@@ -1,10 +1,12 @@
 // The engine with a store that seals: the two stdout lines per row (spec §8),
 // audit_chain_unavailable, and how failures after and during sealing show.
 import { test, describe, before } from 'node:test';
+import { EventEmitter } from 'node:events';
 import assert from 'node:assert/strict';
+import * as fasten from '../src/index.js';
 import {
     Engine, register, verifyChain, seal, GENESIS, parseJson,
-    AuditSealError, AuditRowRejectedError,
+    AuditSealError, AuditRowRejectedError, ChainError,
 } from '../src/index.js';
 
 delete process.env.FASTEN_REDACT_KEYS;
@@ -35,8 +37,10 @@ class SealingStore {
     }
 }
 
-// Runs fn with stdout and stderr captured; returns their lines.
-async function capture(fn, { failSealed = false } = {}) {
+// Runs fn with stdout and stderr captured; returns their lines. failSealed
+// makes a sealed line's write throw; asyncError hands each sealed line's
+// write callback that error on the next tick.
+async function capture(fn, { failSealed = false, asyncError = null } = {}) {
     const out = [];
     const err = [];
     const [ow, ew] = [process.stdout.write, process.stderr.write];
@@ -47,7 +51,8 @@ async function capture(fn, { failSealed = false } = {}) {
         if (failSealed && /"hash":"[0-9a-f]{64}"/.test(chunk)) throw Object.assign(new Error('EPIPE'), { name: 'BrokenPipe' });
         out.push(chunk);
         const cb = rest.find((x) => typeof x === 'function');
-        if (cb) cb();
+        if (asyncError && /"hash":"[0-9a-f]{64}"/.test(chunk)) process.nextTick(() => cb?.(asyncError));
+        else if (cb) cb();
         return true;
     };
     process.stderr.write = (chunk, ...rest) => {
@@ -188,7 +193,7 @@ describe('failures', () => {
         }
     });
 
-    test('a seal failure is retried and named as one', async () => {
+    test('a seal failure the row did not cause is retried and named as one', async () => {
         let calls = 0;
         const store = {
             seals: () => true,
@@ -209,6 +214,125 @@ describe('failures', () => {
         assert.match(failed.error, /^AuditSealError: seal failed: random source unavailable/);
         assert.equal(calls, 2);
         assert.equal(auditLines(out).length, 2);
+    });
+
+    test('a row field no store can seal fails emit() at once, in both modes', async () => {
+        for (const strategy of ['queue', 'raise']) {
+            const store = new SealingStore();
+            const e = new Engine();
+            const { out } = await capture(async () => {
+                e.init({ serviceId: 'svc', nodeId: 'node-v', auditStore: store, auditStoreFailureStrategy: strategy });
+                for (const input of [
+                    { target: `doc/${'\u{1f600}'.slice(0, 1)}` }, { target: 'x', actor: 42 },
+                    { target: 7 }, { target: 'x', actorKind: '\udc00' },
+                ]) {
+                    assert.throws(() => e.emit({ code: 'CHAIN_EVENT', ...input }),
+                        (err) => err instanceof ChainError && /^emit: /.test(err.message), JSON.stringify(input));
+                }
+                await e.emit({ code: 'CHAIN_EVENT', target: 'ok' });
+                if (strategy === 'queue') assert.equal(await e.flush(5000), true);
+                await e.resetForTests();
+            });
+            assert.equal(store.rows.length, 1, strategy);
+            assert.equal(auditLines(out).length, 2, strategy);
+        }
+    });
+
+    test('a store that says it seals but returns no hashed row writes no sealed line, and says so once', async () => {
+        const returns = [undefined, (row) => ({ ...row, id: 'evt-other', hash: 'f'.repeat(64) }), (row) => ({ ...row })];
+        for (const give of returns) {
+            for (const strategy of ['raise', 'queue']) {
+                const store = { seals: () => true, insert: (row) => (typeof give === 'function' ? give(row) : give) };
+                const e = new Engine();
+                const results = [];
+                const { out, err } = await capture(async () => {
+                    e.init({ serviceId: 'svc', nodeId: 'node-n', auditStore: store, auditStoreFailureStrategy: strategy });
+                    results.push(e.emit({ code: 'CHAIN_EVENT', target: 'a' }), e.emit({ code: 'CHAIN_EVENT', target: 'b' }));
+                    if (strategy === 'queue') assert.equal(await e.flush(5000), true);
+                    await e.resetForTests();
+                });
+                assert.equal(auditLines(out).length, 2, strategy);
+                const said = err.filter((l) => l.event === 'audit_chain_row_unsealed');
+                assert.equal(said.length, 1, strategy);
+                assert.equal(said[0].row_id, results[0].id);
+                // emit() returns the row as built when insert() gave another id.
+                for (const r of results) assert.equal(r.hash ?? '', '');
+            }
+        }
+    });
+
+    test('a write callback error is logged with its code, not thrown', async () => {
+        const store = new SealingStore({ async: true });
+        const e = new Engine();
+        const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+        const { out, err } = await capture(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'node-p', auditStore: store, auditStoreFailureStrategy: 'raise' });
+            const row = await e.emit({ code: 'CHAIN_EVENT', target: 'x' });
+            assert.match(row.hash, /^[0-9a-f]{64}$/);
+            await new Promise((r) => setImmediate(r));
+            await e.resetForTests();
+        }, { asyncError: epipe });
+        assert.equal(auditLines(out).length, 2);
+        const failed = err.filter((l) => l.event === 'audit_stdout_failed');
+        assert.equal(failed.length, 1);
+        assert.deepEqual([failed[0].error_code, failed[0].sealed, failed[0].row_id], ['EPIPE', true, store.rows[0].id]);
+    });
+
+    test('an error event on the stream stdout writes to is logged, not thrown', async () => {
+        // A stand-in for process.stdout, so the test runner's own stdout is
+        // left alone.
+        const stub = new EventEmitter();
+        stub.write = (chunk, cb) => { cb?.(); return true; };
+        const real = Object.getOwnPropertyDescriptor(process, 'stdout');
+        const e = new Engine();
+        const { err } = await capture(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'node-q', auditStore: new SealingStore(), auditStoreFailureStrategy: 'raise' });
+            Object.defineProperty(process, 'stdout', { value: stub, configurable: true, writable: true });
+            try {
+                e.emit({ code: 'CHAIN_EVENT', target: 'x' });
+                assert.equal(stub.listenerCount('error'), 1);
+                e.emit({ code: 'CHAIN_EVENT', target: 'y' });
+                assert.equal(stub.listenerCount('error'), 1);
+                // With no listener this would end the process.
+                stub.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+            } finally {
+                Object.defineProperty(process, 'stdout', real);
+            }
+            await e.resetForTests();
+        });
+        const failed = err.filter((l) => l.event === 'audit_stdout_failed');
+        assert.equal(failed.length, 1);
+        assert.deepEqual([failed[0].error_code, failed[0].error_type], ['EPIPE', 'Error']);
+    });
+
+    test('a BigInt keeps its digits at the edges, in arrays and under a redacted key', async () => {
+        const store = new SealingStore();
+        const e = new Engine();
+        let row;
+        const { out } = await capture(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'node-bi', auditStore: store, auditStoreFailureStrategy: 'raise' });
+            row = e.emit({
+                code: 'CHAIN_EVENT', target: 'x',
+                detail: { over: 2n ** 53n + 1n, neg: -(2n ** 64n), list: [1n, 2n ** 60n], password: 2n ** 70n },
+            });
+            await e.resetForTests();
+        });
+        assert.deepEqual([row.detail.over, row.detail.neg, row.detail.list, row.detail.password],
+            [2n ** 53n + 1n, -(2n ** 64n), [1, 2n ** 60n], '***']);
+        const lines = auditLines(out);
+        for (const l of lines) {
+            for (const tok of ['"over":9007199254740993', '"neg":-18446744073709551616', '[1,1152921504606846976]', '"password":"***"']) {
+                assert.ok(l.includes(tok), `${tok} not in ${l}`);
+            }
+        }
+        assert.ok(verifyChain(lines).ok);
+    });
+
+    test('the public surface has no compareCodePoints or rowHash', () => {
+        assert.equal(fasten.compareCodePoints, undefined);
+        assert.equal(fasten.rowHash, undefined);
+        assert.equal(fasten.default.compareCodePoints, undefined);
+        assert.equal(fasten.default.rowHash, undefined);
     });
 
     test('a row the store rejects is dead-lettered at once', async () => {

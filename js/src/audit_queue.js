@@ -43,6 +43,22 @@ export class AuditRowRejectedError extends Error {
 	}
 }
 
+/**
+ * The store cannot tell whether a row was stored: its commit failed and the
+ * row could not be read back. Storing it again under the same id is safe,
+ * since the stores take a stored id as stored; a new emit() would store it a
+ * second time under a new id. The drainer retries it.
+ */
+export class AuditOutcomeUnknownError extends Error {
+	constructor(id, cause) {
+		super(
+			`row ${id}: the commit failed and the row could not be read back, so whether it is stored is unknown`,
+		);
+		this.name = "AuditOutcomeUnknownError";
+		this.cause = cause;
+	}
+}
+
 export class AuditStoreError extends Error {
 	constructor(cause) {
 		super(`fasten audit store: ${cause?.message ?? cause}`);

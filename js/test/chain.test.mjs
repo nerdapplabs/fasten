@@ -7,8 +7,9 @@ import { readFileSync } from 'node:fs';
 import {
     canonicalJSON, detailCommitment, detailText, JsonNumber, parseJson,
     pyFloatRepr, rowHash, sameEvent, seal, toChainRow, verifyChain,
-    canonicalTimestamp, compareCodePoints, CURRENT_CANONICAL_FORM_ID, GENESIS,
+    canonicalTimestamp, compareCodePoints, CURRENT_CANONICAL_FORM_ID, GENESIS, ChainError,
 } from '../src/chain.js';
+import { Checkpoint } from '../src/checkpoints.js';
 
 const ROOT = new URL('../../', import.meta.url);
 const load = (path) => parseJson(readFileSync(new URL(path, ROOT), 'utf8'));
@@ -29,6 +30,11 @@ function assertBreaksAt(rows, seq, reason, opts) {
     assert.equal(res.firstBreakAt, seq, res.reason);
     assert.ok(res.reason.includes(reason), `reason ${JSON.stringify(res.reason)} lacks ${JSON.stringify(reason)}`);
     return res;
+}
+
+// A vector row's hash is a hash before it is checked against one.
+function assertSealed(label, row) {
+    assert.match(row.hash, /^[0-9a-f]{64}$/, `${label}: hash`);
 }
 
 function assertCommitment(label, row) {
@@ -85,6 +91,13 @@ describe('canonical JSON', () => {
 
     const fixture = JSON.parse(readFileSync(new URL('fixtures/cpython-numbers.json', import.meta.url), 'utf8'));
 
+    // python/tests/test_canonical_form_2.py checks the fixture against
+    // CPython; scripts/gen_cpython_numbers.py rewrites it.
+    test('the CPython fixture has all its entries', () => {
+        assert.equal(fixture.tokens.length, 207);
+        assert.equal(fixture.js_numbers.length, 222);
+    });
+
     test('number tokens render as CPython renders json.loads of them', () => {
         for (const [tok, want] of fixture.tokens) {
             assert.equal(canonicalJSON(new JsonNumber(tok)), want, `token ${tok}`);
@@ -133,8 +146,8 @@ describe('canonical JSON', () => {
     });
 
     test('keys sort by code point', () => {
-        const keys = ['', '\u{1f600}', 'z', '\ud800', ''];
-        assert.deepEqual(keys.sort(compareCodePoints), ['', 'z', '\ud800', '', '\u{1f600}']);
+        const keys = ['\ue000', '\u{1f600}', 'z', '\ud800', ''];
+        assert.deepEqual(keys.sort(compareCodePoints), ['', 'z', '\ud800', '\ue000', '\u{1f600}']);
     });
 
     test('parse rejects what is not JSON', () => {
@@ -215,6 +228,7 @@ describe('vectors sealed by Python and Go', () => {
         assert.equal(file.current_form, CURRENT_CANONICAL_FORM_ID);
         assert.equal(file.cases.length, 11);
         for (const { label, row } of file.cases) {
+            assertSealed(label, row);
             assertVerifies(label, [row]);
             assertCommitment(label, row);
             // Form "1" rows sealed over the "Z" timestamp match only through
@@ -229,7 +243,7 @@ describe('vectors sealed by Python and Go', () => {
             const rows = load(path);
             assert.equal(rows.length, n);
             for (const row of rows) {
-                assert.equal(row.hash.length, 64);
+                assertSealed(row.id, row);
                 assert.equal(row.canonical_form_id, '2');
                 assertCommitment(row.id, row);
                 assert.equal(rowHash(row), row.hash, row.id);
@@ -242,7 +256,7 @@ describe('vectors sealed by Python and Go', () => {
         const cases = load('go/xlang_form2.json');
         assert.equal(cases.length, 4);
         for (const { label, row } of cases) {
-            assert.equal(row.hash.length, 64);
+            assertSealed(label, row);
             assertCommitment(label, row);
             assert.equal(rowHash(row), row.hash, label);
             assertVerifies(label, [row]);
@@ -282,16 +296,18 @@ describe('vectors sealed by Python and Go', () => {
         assertVerifies('cross-sdk row', [sealed]);
     });
 
+    // Written by scripts/gen_js_vectors.mjs from the engine and PostgresStore.
     test('spec/js-sealed-form2.json', () => {
         const rows = load('spec/js-sealed-form2.json');
-        assert.equal(rows.length, 4);
-        let prev = GENESIS;
-        rows.forEach((row, i) => {
-            assert.equal(row.hash.length, 64);
+        assert.equal(rows.length, 6);
+        const prev = new Map();
+        rows.forEach((row) => {
+            assertSealed(row.id, row);
             assert.equal(row.canonical_form_id, '2');
-            assert.equal(row.monotonic_seq.token, String(i + 1));
-            assert.equal(row.prev_hash, prev);
-            prev = row.hash;
+            const node = row.source_node_id;
+            assert.equal(row.monotonic_seq.token, String((prev.get(node)?.seq ?? 0) + 1));
+            assert.equal(row.prev_hash, prev.get(node)?.hash ?? GENESIS);
+            prev.set(node, { seq: Number(row.monotonic_seq.token), hash: row.hash });
             assert.equal(rowHash(row), row.hash, `${row.id}: hash drifted`);
             if (row.detail === null) {
                 assert.equal(row.detail_salt, null);
@@ -302,13 +318,57 @@ describe('vectors sealed by Python and Go', () => {
             assert.equal(again.detail_commitment, row.detail_commitment, `${row.id}: commitment drifted`);
             assert.equal(again.hash, row.hash);
         });
+        assert.deepEqual([...prev.keys()], ['node-js', 'node-js-u16']);
         assert.equal(rows.filter((r) => r.detail === null).length, 1);
-        assert.equal(assertVerifies('js-sealed-form2', rows).sealedRows, 4);
+        assert.equal(assertVerifies('js-sealed-form2', rows).sealedRows, 6);
         const details = rows.map((r) => detailText(r.detail)).join('');
-        for (const token of ['75.5', '1e-07', '9007199254740991', '123456789012345678901234567890', '\\u00e9', '\\u007f', '{"list":[']) {
+        for (const token of ['"tiny":5e-05', '"micro":1e-06', '"e16":10000000000000000', '"p60":1152921504606847000',
+            '"e21":1e+21', '"neg0":0', '"sum":0.30000000000000004', '"big":1180591620717411303424',
+            '18446744073709551616', '-9007199254740993', '\\u00e9', '\\u007f', '"\\ue000":2', '"\\ud83d\\ude00":1',
+            '"\\udcff.txt"', '{"list":[']) {
             assert.ok(details.includes(token), `${token} not in ${details}`);
         }
-        assertBreaksAt([{ ...rows[0], detail: { setpoint: 76.5 } }, ...rows.slice(1)], 1, 'detail does not match its commitment');
+        assert.equal(rows[1].actor, 'op\u00e9\x7f\u{1f600}');
+        assert.equal(rows[1].target, 'sensor/op\u00e9\x7f\u{1f600}');
+        assert.equal(rows[0].tenant_id, 't\u00e9nant-\x7f-\u{1f600}');
+        assertBreaksAt([{ ...rows[0], detail: { half: 76.5 } }, ...rows.slice(1)], 1, 'detail does not match its commitment');
+    });
+
+    test('spec/js-sealed-stdout.jsonl, as an ingester reads it', () => {
+        const text = readFileSync(new URL('spec/js-sealed-stdout.jsonl', ROOT), 'utf8');
+        const lines = text.split('\n');
+        assert.equal(lines.pop(), '');
+        const byId = new Map();
+        for (const line of lines) {
+            const row = parseJson(line);
+            assert.equal(row.shape, 'audit');
+            byId.set(row.id, [...(byId.get(row.id) ?? []), row]);
+        }
+        assert.equal(byId.size, 6);
+        for (const [id, pair] of byId) {
+            assert.deepEqual(pair.map((r) => r.hash !== ''), [false, true], id);
+        }
+        const stored = load('spec/js-sealed-form2.json');
+        assert.deepEqual([...byId.keys()], stored.map((r) => r.id));
+        assert.equal(assertVerifies('stdout', lines).sealedRows, 6);
+    });
+});
+
+describe('checkpointsChecked', () => {
+    test('counts the checkpoints that had a row at their seq', () => {
+        const rows = chain(3);
+        const checkpoints = [
+            { source_node_id: 'node-1', monotonic_seq: 2, hash: rows[1].hash },
+            { source_node_id: 'node-1', monotonic_seq: 3, hash: rows[2].hash },
+            { source_node_id: 'node-1', monotonic_seq: 9, hash: rows[2].hash },
+            { source_node_id: 'node-2', monotonic_seq: 1, hash: rows[0].hash },
+        ];
+        const res = verifyChain(rows, { checkpoints, partial: true });
+        assert.deepEqual([res.ok, res.checkpointsChecked], [true, 2]);
+        assert.equal(verifyChain(rows).checkpointsChecked, 0);
+        // A mismatch was still checked.
+        const bad = verifyChain(rows, { checkpoints: [{ ...checkpoints[0], hash: rows[0].hash }], partial: true });
+        assert.deepEqual([bad.ok, bad.checkpointsChecked], [false, 1]);
     });
 });
 
@@ -317,7 +377,7 @@ describe('checkpoint vectors', () => {
     test('there are cases', () => assert.ok(cases.length >= 19));
     for (const c of cases) {
         test(c.label, () => {
-            const checkpoints = c.checkpoints.map((cp) => ({ ...cp, monotonic_seq: Number(cp.monotonic_seq) }));
+            const checkpoints = c.checkpoints.map((cp) => Checkpoint.parse(canonicalJSON(cp)));
             const res = verifyChain(c.rows, { checkpoints, partial: c.partial });
             const want = c.expected;
             assert.equal(res.ok, want.ok);
@@ -362,6 +422,27 @@ describe('sealing', () => {
         assert.equal(canonicalTimestamp('not a time'), 'not a time');
     });
 
+    test('the sealed copy carries every hashed field as it was hashed', () => {
+        const sealed = seal(GENESIS, { id: 'evt-min', monotonic_seq: 1, timestamp: '2026-06-15T12:30:41+02:00', extra: 'kept' });
+        assert.deepEqual(
+            [sealed.wire_version, sealed.prev_hash, sealed.timestamp, sealed.tenant_id, sealed.origin_id, sealed.extra],
+            ['1', GENESIS, '2026-06-15T10:30:41.000000Z', null, '', 'kept']);
+        assert.deepEqual(sealed.detail, {});
+        const r = toChainRow(sealed);
+        for (const k of Object.keys(r)) {
+            if (k !== 'pii_in_detail' && k !== 'shipped_at') assert.deepEqual(sealed[k], r[k], k);
+        }
+        assertVerifies('minimal', [sealed]);
+    });
+
+    test('seal refuses a prevHash that is not genesis or a row hash, and a row it cannot read', () => {
+        for (const bad of ['', 'GENESIS', 'ab', 'A'.repeat(64), `${'a'.repeat(63)}g`, undefined, null]) {
+            assert.throws(() => seal(bad, baseRow(1)), ChainError, String(bad));
+        }
+        assert.throws(() => seal(GENESIS, { ...baseRow(1), actor: 42 }), ChainError);
+        assert.throws(() => seal(GENESIS, { ...baseRow(1), target: 'doc/\ud83d' }), /unpaired surrogate/);
+    });
+
     test('a row of JS values seals, and its line verifies with exact numbers', () => {
         const row = baseRow(1, { detail: { a: 75, b: 75.5, c: 1e-7, d: 12345678901234567890n, e: 'é\x7f' } });
         const sealed = seal(GENESIS, row);
@@ -376,7 +457,7 @@ describe('sealing', () => {
 describe('tamper detection', () => {
     test('an empty chain verifies, with nothing sealed', () => {
         assert.deepEqual(verifyChain([]), {
-            ok: true, totalRows: 0, sealedRows: 0, firstBreakAt: null, firstBreakNode: null, reason: null,
+            ok: true, totalRows: 0, sealedRows: 0, checkpointsChecked: 0, firstBreakAt: null, firstBreakNode: null, reason: null,
         });
         const res = verifyChain([baseRow(1), baseRow(2)]);
         assert.equal(res.ok, true);
@@ -458,7 +539,7 @@ describe('tamper detection', () => {
         const second = seal(GENESIS, baseRow(2));
         const third = seal(second.hash, baseRow(3));
         assertVerifies('unsealed head', [early, second, third]);
-        assertBreaksAt([early, seal('somewhere', baseRow(2))], 2, 'first sealed row does not link to genesis');
+        assertBreaksAt([early, seal('f'.repeat(64), baseRow(2))], 2, 'first sealed row does not link to genesis');
         assertVerifies('purged head', chain(4).slice(2));
         assertBreaksAt([second, third, { ...baseRow(4), id: 'evt-late' }], 4, "row evt-late: no hash after the node's chain started");
         const tie = { ...baseRow(1), id: 'evt-tie' };

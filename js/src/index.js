@@ -9,13 +9,11 @@ import {
 	ChainError,
 	CURRENT_CANONICAL_FORM_ID,
 	canonicalJSON,
-	compareCodePoints,
 	detailCommitment,
 	detailText,
 	GENESIS,
 	JsonNumber,
 	parseJson,
-	rowHash,
 	seal,
 	toChainRow,
 	verifyChain,
@@ -306,12 +304,14 @@ const RETENTION_CHECK_MS = 3_600_000;
 
 import {
 	_setDefaultEngine,
+	AuditOutcomeUnknownError,
 	AuditQueueDrainer,
 	AuditRowRejectedError,
 	AuditStoreError,
 } from "./audit_queue.js";
 
 export {
+	AuditOutcomeUnknownError,
 	AuditRowRejectedError,
 	AuditSealError,
 	AuditStoreError,
@@ -320,7 +320,6 @@ export {
 	CURRENT_CANONICAL_FORM_ID,
 	canonicalJSON,
 	checkpointsSince,
-	compareCodePoints,
 	detailCommitment,
 	FileCheckpointSink,
 	GENESIS,
@@ -330,12 +329,15 @@ export {
 	PartialLastLineError,
 	parseJson,
 	publishCheckpoints,
-	rowHash,
 	seal,
 	takeCheckpoints,
 	toChainRow,
 	verifyChain,
 };
+
+// Streams the engine has put an 'error' listener on, so a failed write
+// such as EPIPE is logged rather than crashing the process.
+const _watched = new WeakSet();
 
 // Whether `store` seals the rows it stores (spec §2.1). A store opts in
 // with a seals() method that returns true.
@@ -368,6 +370,7 @@ export class Engine {
 	#closing = null;
 	_retentionTimer = null;
 	_retentionFirst = null;
+	#unsealedReported = false;
 
 	init(opts = {}) {
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
@@ -497,17 +500,28 @@ export class Engine {
 		return row;
 	}
 
-	// Insert `row` through `store` and return the row as stored: the sealed
-	// row when the store seals, else `row`. A sealed row is written to
-	// stdout again after the insert (spec §8); a failed write is logged as
-	// audit_stdout_failed, not thrown, since the row is stored.
+	// Insert `row` through `store` and return the row as stored: what
+	// insert() returned when it is a row with the same id, else `row`. A
+	// returned row with a hash is written to stdout again (spec §8); a failed
+	// write is logged as audit_stdout_failed, not thrown, since the row is
+	// stored. A store that says it seals but returns no hash is logged once.
 	_storeRow(store, row) {
 		const done = (stored) => {
 			const out =
 				stored && typeof stored === "object" && stored.id === row.id
 					? stored
 					: row;
-			if (out.hash) this._writeSealed(out);
+			if (out.hash) {
+				this._writeSealed(out);
+			} else if (!this.#unsealedReported && _seals(store)) {
+				this.#unsealedReported = true;
+				this._drainerSysLog("error", "audit_chain_row_unsealed", {
+					row_id: row.id,
+					store: store.constructor?.name ?? null,
+					reason:
+						"the audit store reports seals() but insert() did not return the row with a hash",
+				});
+			}
 			return out;
 		};
 		const p = store.insert(row);
@@ -515,19 +529,32 @@ export class Engine {
 	}
 
 	_writeSealed(row) {
-		const failed = (err) =>
-			this._drainerSysLog("error", "audit_stdout_failed", {
-				error_type: err?.name ?? "Error",
-				row_id: row.id,
-				sealed: true,
-			});
+		this._writeStdout(_sealedLine(row), { row_id: row.id, sealed: true });
+	}
+
+	// Write one line to stdout. A failed write is logged as
+	// audit_stdout_failed with `fields`, never thrown.
+	_writeStdout(line, fields) {
+		const stream = process.stdout;
+		if (!_watched.has(stream)) {
+			_watched.add(stream);
+			stream.on("error", (err) => this._stdoutFailed(err, {}));
+		}
 		try {
-			process.stdout.write(_sealedLine(row), (err) => {
-				if (err) failed(err);
+			stream.write(line, (err) => {
+				if (err) this._stdoutFailed(err, fields);
 			});
 		} catch (err) {
-			failed(err);
+			this._stdoutFailed(err, fields);
 		}
+	}
+
+	_stdoutFailed(err, fields) {
+		this._drainerSysLog("error", "audit_stdout_failed", {
+			error_type: err?.name ?? "Error",
+			error_code: typeof err?.code === "string" ? err.code : null,
+			...fields,
+		});
 	}
 
 	// Builds the row and writes it to stdout (spec §8 phase 1).
@@ -545,6 +572,11 @@ export class Engine {
 			throw new Error("fasten.init() must be called before emit()");
 		const meta = _registry.get(code);
 		if (!meta) throw new Error(`unknown audit code: ${code}`);
+		if (typeof target !== "string") {
+			throw new ChainError(
+				`emit: target must be a string (got ${typeof target})`,
+			);
+		}
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 		let outDetail;
@@ -588,10 +620,18 @@ export class Engine {
 			detail: outDetail,
 			pii_in_detail: !!meta.piiInDetail,
 		};
+		// A row field no store can seal (not a string, or an unpaired
+		// surrogate) fails here, before the row is written anywhere.
+		try {
+			toChainRow(row);
+		} catch (err) {
+			throw new ChainError(`emit: ${err.message}`);
+		}
 		// Not sealed yet (spec §8), so the hashes are empty. The
 		// store seals the row on insert and it is written again then.
-		process.stdout.write(
+		this._writeStdout(
 			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" }, bigintReplacer)}\n`,
+			{ row_id: id, sealed: false },
 		);
 
 		return row;
@@ -954,6 +994,7 @@ export default {
 	Method,
 	AuditCatalogError,
 	CATALOG_ERR,
+	AuditOutcomeUnknownError,
 	AuditRowRejectedError,
 	AuditSealError,
 	ChainError,
@@ -961,10 +1002,8 @@ export default {
 	GENESIS,
 	JsonNumber,
 	canonicalJSON,
-	compareCodePoints,
 	detailCommitment,
 	parseJson,
-	rowHash,
 	seal,
 	toChainRow,
 	verifyChain,
