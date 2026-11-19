@@ -19,7 +19,7 @@
     "id":             { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "evt-<20 hex chars>" },
     "origin_id":      { "type": "string", "pattern": "^evt-[0-9a-f]{20}$", "description": "Dedup key for replication; equals id on first emission." },
     "monotonic_seq":  { "type": "integer", "description": "Per-node counter, allocated by the audit store; orders rows whose timestamps tie. 0 on a row no store has allocated." },
-    "timestamp":      { "type": "string", "format": "date-time", "description": "UTC ISO-8601 with microsecond precision and a Z suffix, e.g. 2026-06-15T10:30:45.123456Z." },
+    "timestamp":      { "type": "string", "format": "date-time", "description": "UTC ISO-8601 with a Z suffix and microsecond precision, e.g. 2026-06-15T10:30:45.123456Z. The Swift SDK writes whole seconds." },
     "code":           { "type": "string", "description": "SCREAMING_SNAKE registered code." },
     "action":         { "type": "string", "description": "Denormalised from code.Meta." },
     "severity": {
@@ -69,7 +69,7 @@
         "sdk":        "Direct SDK call, no transport shim active. Default."
       }
     },
-    "request_id":     { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$", "description": "Correlation id: 1 to 128 characters of letters, digits, '.', '_' and '-'. The SDKs mint 12 hex characters; a caller's X-Request-ID is kept when it fits." },
+    "request_id":     { "type": "string", "minLength": 1, "description": "Correlation id, never empty. Most SDKs mint 12 hex characters. An HTTP shim keeps a caller's X-Request-ID when it is 1 to 128 characters of letters, digits, '.', '_' and '-'. Background work gets <kind>-<service_id>-<12 hex>, and a caller can set any id in code, so the schema sets no pattern." },
     "detail":         { "type": ["object", "null"], "description": "Arbitrary key-value pairs; secret keys are redacted. null once retention has redacted the row (spec §7.1)." },
     "pii_in_detail":  { "type": "boolean", "description": "True when the row's code is registered with pii_in_detail, so retention redacts its detail." },
     "shipped_at":     { "type": ["string", "null"], "format": "date-time", "description": "Set when row has been relayed upstream." },

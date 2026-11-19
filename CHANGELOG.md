@@ -6,14 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed: `spec/row-schema.json` accepts the rows the SDKs write
+### Fixed: `spec/row-schema.json` accepts the rows five SDKs write
 
 - The schema now lists `canonical_form_id`, `detail_salt`,
   `detail_commitment` and `pii_in_detail`, allows a `null` `detail` (a
-  redacted row), and takes any `request_id` of 1 to 128 letters, digits,
-  `.`, `_` and `-`. Before, it rejected every sealed row and any row with a
-  caller's `X-Request-ID`.
-- The `timestamp` description says microseconds, as the SDKs write.
+  redacted row), and takes any non-empty `request_id`. Before, it rejected
+  every sealed row and any row whose `request_id` was not 12 hex
+  characters.
+- Rows from the Python, Go, JS, Rust and C++ SDKs now pass. Swift rows
+  still fail: Swift writes ids of `evt-` plus 16 hex characters where the
+  schema has 20.
+- The `timestamp` description says microseconds, as those five SDKs write.
 
 ### Fixed: Go keeps detail numbers exact
 
