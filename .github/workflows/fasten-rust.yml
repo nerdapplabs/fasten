@@ -9,6 +9,8 @@ on:
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
       - 'spec/**'
+      # fasten-core/tests/chain.rs reads this Python-sealed vector.
+      - 'go/xlang_form2.json'
       - '.github/actions/setup-swift/**'
   pull_request:
     paths:
@@ -17,6 +19,7 @@ on:
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
       - 'spec/**'
+      - 'go/xlang_form2.json'
       - '.github/actions/setup-swift/**'
   workflow_call:
 
@@ -67,12 +70,14 @@ jobs:
       - name: Lint (clippy)
         # --locked builds with the committed Cargo.lock instead of resolving
         # newer transitive versions.
-        run: cargo clippy --locked --features store-postgres,codes-yaml,async -- -D warnings
+        run: cargo clippy --locked --features store-postgres,store-sqlite,codes-yaml,async -- -D warnings
 
       - name: Unit tests
         env:
           FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
-        run: cargo test --locked --quiet --features store-postgres,codes-yaml,async
+          # The Postgres tests fail, instead of returning early, without a DSN.
+          FASTEN_REQUIRE_POSTGRES: "1"
+        run: cargo test --locked --quiet --features store-postgres,store-sqlite,codes-yaml,async
 
       # rust/ depends on fasten-core with default-features = false, so its
       # tests never compile store/postgres.rs. Run the core's own tests here
@@ -81,9 +86,11 @@ jobs:
         working-directory: fasten-core
         # native-tls needs pkg-config and the OpenSSL headers. The rust
         # container runs as root and has no sudo.
-        # Without the DSN the Postgres store tests return early and pass.
+        # Without the DSN the Postgres store tests return early and pass;
+        # FASTEN_REQUIRE_POSTGRES makes them fail instead.
         env:
           FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test?sslmode=disable
+          FASTEN_REQUIRE_POSTGRES: "1"
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev

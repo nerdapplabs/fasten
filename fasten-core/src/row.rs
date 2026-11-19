@@ -57,11 +57,12 @@ pub struct Row {
     #[serde(default)]
     pub shipped_at: Option<String>,  // ISO-8601 UTC; None = not yet shipped
 
-    // Chain fields (spec §1, §2), set by an SDK that seals the row; the
-    // stores persist them as given. Parsing and re-serializing a row keeps an
-    // absent field absent. A row read back from a store has prev_hash and
-    // hash ("" when unsealed) and canonical_form_id ("1" by default); salt
-    // and commitment only on a form "2" row (spec §8.2).
+    // Chain fields (spec §1, §2). The stores set them when they allocate
+    // the seq, and persist them as given on a row that brings its own seq.
+    // Parsing and re-serializing a row keeps an absent field absent. A row
+    // read back from a store has prev_hash and hash ("" when unsealed) and
+    // canonical_form_id ("1" by default); salt and commitment only on a
+    // form "2" row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

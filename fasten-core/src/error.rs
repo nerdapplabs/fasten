@@ -112,10 +112,16 @@ pub enum Error {
     Store(String),
 
     /// The store refused the row itself (bad data, a constraint, a size
-    /// limit). Carries only the error type. Retrying cannot help, so the
-    /// drainer dead-letters the row at once.
+    /// limit, or another row already stored under its id). Carries the
+    /// error type, or a message that names the row by id only. Retrying
+    /// cannot help, so the drainer dead-letters the row at once.
     #[error("{0}")]
     RowRejected(String),
+
+    /// The row could not be sealed: no detail salt could be drawn. Nothing
+    /// was stored. The drainer retries the row.
+    #[error("seal: {0}")]
+    Seal(String),
 }
 
 // Without the sqlite or postgres feature the backend variants are absent and
@@ -167,6 +173,7 @@ impl From<&Error> for FastenErrorCode {
             Error::InvalidTimestamp(_) => FastenErrorCode::ErrNullArg,
             Error::Store(_)            => FastenErrorCode::ErrBackend,
             Error::RowRejected(_)      => FastenErrorCode::ErrBackend,
+            Error::Seal(_)             => FastenErrorCode::ErrBackend,
             #[cfg(feature = "sqlite")]
             Error::Sqlite(_)           => FastenErrorCode::ErrBackend,
             #[cfg(feature = "postgres")]

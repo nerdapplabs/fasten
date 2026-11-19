@@ -6,6 +6,61 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: the Rust SDK and fasten-core seal and verify rows
+
+- The Rust SDK's `PostgresStore`, and a new `SqliteStore` behind the
+  `store-sqlite` feature, seal each row into the node's hash chain when
+  they store it, as Python and Go do. Rust, Python and Go writers on one
+  table share one chain per node, and each verifies the others' rows.
+- `fasten::verify_chain` checks a chain. Its result has `sealed_rows`, so
+  a result with nothing sealed is visible, and the node and seq of the
+  first break. The stores' `chain_rows` and `all_chain_rows` read rows
+  with their detail exactly as stored; both load every row into memory.
+- Chain checkpoints: `publish_checkpoints`, `FileCheckpointSink`,
+  `load_checkpoints`, `checkpoints_since` and
+  `verify_chain_with_checkpoints` (`CheckpointOptions::whole()` or
+  `partial()`), with Python's and Go's file format and failure reasons.
+  `load_checkpoints` returns `CheckpointFileError::PartialLastLine`, with
+  the checkpoints read so far, when the last line was cut short. There is
+  no HTTP sink yet; implement `CheckpointSink` for one.
+- A stored row is written to stdout twice, unsealed and then sealed, and a
+  synchronous `submit()` returns the sealed row. If the sealed line can't
+  be written, `audit_stdout_failed` is logged and the row is still
+  returned.
+- A row with `monotonic_seq` 0 must have `origin_id` equal to `id`. A
+  different row under an id that is already stored is rejected.
+- `insert_sealed` stores a row sealed elsewhere with its detail text
+  unchanged, so it keeps its hash. `seal_row` and `GENESIS` let an adopter
+  store seal rows; such a store overrides both `AuditStore::seals` and
+  `AuditStore::allocate_and_insert_originated`.
+- New `Error` variants: `Seal`, `AuditStoreRead`, `Chain`,
+  `CheckpointFile` and `Custom` (for a sink or store implementer's own
+  errors). Read failures are no longer reported as insert failures.
+- `PostgresStore::redact_rows` clears the salt to an empty string, where
+  it wrote NULL before, as Python and Go do.
+- Breaking: the Rust `Row` has three new public fields,
+  `canonical_form_id`, `detail_salt` and `detail_commitment`. `Row` now
+  implements `Default`, so a struct literal can end in
+  `..Default::default()`.
+- fasten-core: the `chain` and `checkpoint` modules give the same hashes
+  as Python and Go, including detail holding lone surrogates, `NaN` or
+  `Infinity`. `SqliteStore` and `PostgresStore` seal a row inserted with
+  `monotonic_seq` 0, which also applies to `fasten_store_insert`; a row
+  with its own sequence number is stored as given and stays unsealed
+  unless it already carries a hash. New: `Store::insert_sealed`,
+  `Store::chain_rows`, `Store::chain_tips` (returning `ChainTip`),
+  `ChainRow::from_row` and `Error::Seal`.
+- `spec/rust-sealed-form2.json` holds rows sealed by the Rust SDK; the
+  Python, Go and Rust test suites verify it.
+- A float exactly halfway between two shortest decimal forms, such as
+  `1000000000000000.25`, is written with the even last digit, as CPython
+  and Go write it.
+- The core SQLite and Postgres stores open a table the Python SDK created,
+  adding the `wire_version` and `pii_in_detail` columns it lacks.
+- A row with its own seq at a node and seq another row already holds is
+  rejected, also on tables without a unique `(source_node_id,
+  monotonic_seq)` index such as those Python creates.
+
 ### Fixed: `spec/row-schema.json` accepts the rows five SDKs write
 
 - The schema now lists `canonical_form_id`, `detail_salt`,

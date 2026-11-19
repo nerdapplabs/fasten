@@ -3,13 +3,19 @@ use std::sync::Mutex;
 use pg::types::ToSql;
 
 use crate::{
+    chain::ChainRow,
+    checkpoint::ChainTip,
     error::Error,
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{
+    at_seq_sql, chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql,
+    sealed_at, sealed_columns, seq_taken, stored_seq, tip_sql, Outcome, RedactGate, RedactionCandidates, Store,
+    CHAIN_COLUMNS, SELECT_COLUMNS,
+};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -299,92 +305,107 @@ impl PostgresStore {
         }
     }
 
-    fn insert_with_reconnect(&self, row: &Row) -> Result<(), Error> {
-        let cleared;
-        let row = if row.monotonic_seq == 0 {
-            cleared = unsealed(row);
-            &cleared
-        } else {
-            row
+    /// Insert `row` as [`Store::insert`] does and return it as stored: with
+    /// the seq and chain fields the store gave it. A row with a seq of its
+    /// own is returned as given.
+    ///
+    /// When a row with this id is already stored, nothing is written. If
+    /// the stored row is the same event (and, for a row with its own seq,
+    /// at that seq with that hash), `row` comes back with the stored seq
+    /// and chain fields; otherwise the error is `RowRejected`.
+    pub fn insert_stored(&self, row: &Row) -> Result<Row, Error> {
+        self.put(row, None)?.stored(row)
+    }
+
+    /// Write `row`, with `detail` as the text of its detail column or, when
+    /// `None`, `row.detail` as `serde_json` renders it. A stored id is left
+    /// as it is.
+    fn put(&self, row: &Row, detail: Option<&str>) -> Result<Outcome, Error> {
+        let rendered;
+        let detail = match detail {
+            Some(text) => text,
+            None => {
+                rendered = serde_json::to_string(&row.detail)?;
+                &rendered
+            }
         };
-        let detail_str = serde_json::to_string(&row.detail)?;
-        let seq: i64 = row.monotonic_seq as i64;
-        let pii: i16 = row.pii_in_detail as i16;
-        let tenant: Option<&str> = row.tenant_id.as_deref();
-        let shipped: Option<&str> = row.shipped_at.as_deref();
-        let prev_hash = row.prev_hash.as_deref().unwrap_or("");
-        let hash = row.hash.as_deref().unwrap_or("");
-        let form = row.canonical_form_id.as_deref().unwrap_or("1");
-        let salt = row.detail_salt.as_deref().unwrap_or("");
-        let commitment = row.detail_commitment.as_deref().unwrap_or("");
-
-        let params: &[&(dyn ToSql + Sync)] = &[
-            &row.id,             // $1  id
-            &row.wire_version,   // $2  wire_version
-            &row.origin_id,      // $3  origin_id
-            &seq,                // $4  monotonic_seq (BIGINT)
-            &row.timestamp,      // $5  timestamp
-            &row.code,           // $6  code
-            &row.action,         // $7  action
-            &row.severity,       // $8  severity
-            &row.service_id,     // $9  service_id
-            &row.source_node_id, // $10 source_node_id
-            &tenant,             // $11 tenant_id     (NULL when None)
-            &row.actor,          // $12 actor
-            &row.actor_kind,     // $13 actor_kind
-            &row.target,         // $14 target
-            &row.category,       // $15 category
-            &row.domain,         // $16 domain
-            &row.method,         // $17 method
-            &row.request_id,     // $18 request_id
-            &detail_str,         // $19 detail
-            &pii,                // $20 pii_in_detail (SMALLINT)
-            &shipped,            // $21 shipped_at    (NULL when None)
-            &prev_hash,          // $22 prev_hash
-            &hash,               // $23 hash
-            &form,               // $24 canonical_form_id
-            &salt,               // $25 detail_salt
-            &commitment,         // $26 detail_commitment
-        ];
-
         let bare = self.bare.as_str();
         // Same lock key as the Python and Go stores, so every writer for
         // this node serialises here. An advisory lock rather than
-        // FOR UPDATE: an empty node has no tip row to lock.
+        // FOR UPDATE: an empty node has no tip row to lock. A row with its
+        // own seq takes it too, or it could take the seq a seq-0 insert
+        // has just picked and make that insert fail.
         let node_lock = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
-        if row.monotonic_seq != 0 {
-            // Locked too, or this row could take the seq a seq-0 insert
-            // has just picked and make that insert fail.
-            return self.with_reconnect(|inner| {
-                let Inner { client, stmt } = inner;
-                let mut tx = client.transaction()?;
-                tx.execute(node_lock, &[&row.source_node_id])?;
-                tx.execute(&*stmt, params).map_err(|e| seq_clash(e, bare))?;
-                tx.commit()?;
-                Ok(())
-            });
-        }
-
-        let exists_sql = format!("SELECT 1 FROM {} WHERE id = $1", self.table);
+        let held_sql = format!("SELECT {SELECT_COLUMNS} FROM {} WHERE id = $1", self.table);
         let seq_sql = format!(
             "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} WHERE source_node_id = $1",
             self.table
         );
+        let tip_sql = tip_sql(&self.table, "$1");
+        let at_seq_sql = at_seq_sql(&self.table, "$1", "$2");
         self.with_reconnect(|inner| {
             let Inner { client, stmt } = inner;
             let mut tx = client.transaction()?;
-            // A retry after a lost commit ack must not take a new seq.
-            if tx.query_opt(exists_sql.as_str(), &[&row.id])?.is_some() {
-                tx.commit()?;
-                return Ok(());
-            }
             tx.execute(node_lock, &[&row.source_node_id])?;
-            let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.get(0);
-            let mut p = params.to_vec();
-            p[3] = &seq; // $4 monotonic_seq
-            tx.execute(&*stmt, &p).map_err(|e| seq_clash(e, bare))?;
+            // A retry after a lost commit ack must not take a new seq.
+            if let Some(held) = held_row(&mut tx, &held_sql, &row.id)? {
+                tx.commit()?;
+                return Ok(held);
+            }
+            let stored = if row.monotonic_seq == 0 {
+                check_originated(row)?;
+                let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.try_get(0)?;
+                // The seq counts every row on the node; the tip is its last
+                // sealed one.
+                let tip: Option<String> = match tx.query_opt(tip_sql.as_str(), &[&row.source_node_id])? {
+                    Some(r) => Some(r.try_get(0)?),
+                    None => None,
+                };
+                sealed_at(row, seq, tip.as_deref().unwrap_or(crate::chain::GENESIS))?
+            } else {
+                // A table the Python store created, or one from before the
+                // UNIQUE constraint, does not stop a second row at this seq.
+                let at = tx.query_opt(at_seq_sql.as_str(), &[&row.source_node_id, &column_seq(row)?])?;
+                if let Some(r) = at {
+                    return Err(seq_taken(row, &r.try_get::<_, String>(0)?));
+                }
+                row.clone()
+            };
+            let written = execute_insert(&mut tx, stmt, &stored, column_seq(&stored)?, detail, bare)?;
+            if written == 0 {
+                // The id was stored under another node's lock meanwhile.
+                let held = held_row(&mut tx, &held_sql, &row.id)?
+                    .ok_or_else(|| Error::Store(format!("row {}: not inserted and not stored", row.id)))?;
+                tx.commit()?;
+                return Ok(held);
+            }
             tx.commit()?;
-            Ok(())
+            Ok(Outcome::Inserted(stored))
+        })
+    }
+
+    /// The rows matching `filter`, ordered by `order`.
+    fn select(&self, filter: &Filter, order: &str) -> Result<Vec<pg::Row>, Error> {
+        let (where_clause, mut all_params) = build_filter_where(filter);
+        let mut sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY {order}",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            let n = all_params.len() + 1;
+            sql.push_str(&format!(" LIMIT ${n}"));
+            all_params.push(Box::new(i64::from(filter.limit)));
+            if filter.offset > 0 {
+                let n = all_params.len() + 1;
+                sql.push_str(&format!(" OFFSET ${n}"));
+                all_params.push(Box::new(i64::from(filter.offset)));
+            }
+        }
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+
+        self.with_reconnect(|inner| {
+            inner.client.query(sql.as_str(), &params_refs).map_err(Error::Postgres)
         })
     }
 
@@ -408,7 +429,12 @@ impl PostgresStore {
 
 impl Store for PostgresStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
-        self.insert_with_reconnect(row)
+        self.put(row, None).map(|_| ())
+    }
+
+    fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), Error> {
+        let (columns, detail) = sealed_columns(row, pii_in_detail)?;
+        self.put(&columns, Some(&detail))?.sealed(row)
     }
 
     fn ping(&self) -> Result<(), Error> {
@@ -422,31 +448,27 @@ impl Store for PostgresStore {
     }
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
-        let (where_clause, mut all_params) = build_filter_where(filter);
-        let mut sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY monotonic_seq ASC",
-            self.table, where_clause
-        );
-        if filter.limit > 0 {
-            let n = all_params.len() + 1;
-            sql.push_str(&format!(" LIMIT ${n}"));
-            all_params.push(Box::new(i64::from(filter.limit)));
-            if filter.offset > 0 {
-                let n = all_params.len() + 1;
-                sql.push_str(&format!(" OFFSET ${n}"));
-                all_params.push(Box::new(i64::from(filter.offset)));
-            }
-        }
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        self.select(filter, "monotonic_seq ASC")?.iter().map(row_from_pg).collect()
+    }
 
-        self.with_reconnect(|inner| {
-            let rows = inner
-                .client
-                .query(sql.as_str(), &params_refs)
-                .map_err(Error::Postgres)?;
-            Ok(rows.iter().map(row_from_pg).collect())
-        })
+    fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
+        self.select(filter, "source_node_id, monotonic_seq")?.iter().map(chain_row_from_pg).collect()
+    }
+
+    fn chain_tips(&self) -> Result<Vec<ChainTip>, Error> {
+        let sql = chain_tips_sql(&self.table);
+        self.with_reconnect(|inner| inner.client.query(sql.as_str(), &[]).map_err(Error::Postgres))?
+            .iter()
+            .map(|r| {
+                let node: String = column(r, 0, "chain tip")?;
+                let owner = format!("node '{node}'");
+                let seq: i64 = column(r, 1, &owner)?;
+                let seq = u64::try_from(seq)
+                    .map_err(|_| Error::Store(format!("{owner}: monotonic_seq {seq} is negative")))?;
+                let hash = column(r, 2, &owner)?;
+                Ok(ChainTip { source_node_id: node, monotonic_seq: seq, hash })
+            })
+            .collect()
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {
@@ -477,7 +499,7 @@ impl Store for PostgresStore {
                 .client
                 .query(sql.as_str(), &[&effective as &(dyn ToSql + Sync)])
                 .map_err(Error::Postgres)?;
-            Ok(rows.iter().map(row_from_pg).collect())
+            rows.iter().map(row_from_pg).collect()
         })
     }
 
@@ -567,13 +589,15 @@ impl Store for PostgresStore {
                 0
             };
             tx.commit()?;
-            Ok(RedactionCandidates {
-                rows: rows
-                    .iter()
-                    .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1).unsigned_abs()))
-                    .collect(),
-                skipped: skipped.unsigned_abs(),
-            })
+            let rows = rows
+                .iter()
+                .map(|r| {
+                    let id: String = column(r, 0, "redaction candidate")?;
+                    let seq = stored_seq(&id, column(r, 1, &format!("row {id}"))?)?;
+                    Ok((id, seq))
+                })
+                .collect::<Result<_, Error>>()?;
+            Ok(RedactionCandidates { rows, skipped: skipped.unsigned_abs() })
         })
     }
 
@@ -609,6 +633,65 @@ fn seq_clash(e: pg::Error, bare: &str) -> Error {
     } else {
         Error::Postgres(e)
     }
+}
+
+/// The row stored under `id`, if there is one.
+fn held_row(tx: &mut pg::Transaction<'_>, held_sql: &str, id: &str) -> Result<Option<Outcome>, Error> {
+    match tx.query_opt(held_sql, &[&id])? {
+        Some(r) => Ok(Some(Outcome::Held(row_from_pg(&r)?, column(&r, 18, &format!("row {id}"))?))),
+        None => Ok(None),
+    }
+}
+
+/// Run the prepared INSERT for `row` on `tx`, at `seq` and with `detail` as
+/// the text of its detail column. Returns the rows written: 0 when the id
+/// was already stored.
+fn execute_insert(
+    tx: &mut pg::Transaction<'_>,
+    stmt: &pg::Statement,
+    row: &Row,
+    seq: i64,
+    detail_str: &str,
+    bare: &str,
+) -> Result<u64, Error> {
+    let pii: i16 = row.pii_in_detail as i16;
+    let tenant: Option<&str> = row.tenant_id.as_deref();
+    let shipped: Option<&str> = row.shipped_at.as_deref();
+    let prev_hash = row.prev_hash.as_deref().unwrap_or("");
+    let hash = row.hash.as_deref().unwrap_or("");
+    let form = row.canonical_form_id.as_deref().unwrap_or("1");
+    let salt = row.detail_salt.as_deref().unwrap_or("");
+    let commitment = row.detail_commitment.as_deref().unwrap_or("");
+
+    let params: &[&(dyn ToSql + Sync)] = &[
+        &row.id,             // $1  id
+        &row.wire_version,   // $2  wire_version
+        &row.origin_id,      // $3  origin_id
+        &seq,                // $4  monotonic_seq (BIGINT)
+        &row.timestamp,      // $5  timestamp
+        &row.code,           // $6  code
+        &row.action,         // $7  action
+        &row.severity,       // $8  severity
+        &row.service_id,     // $9  service_id
+        &row.source_node_id, // $10 source_node_id
+        &tenant,             // $11 tenant_id     (NULL when None)
+        &row.actor,          // $12 actor
+        &row.actor_kind,     // $13 actor_kind
+        &row.target,         // $14 target
+        &row.category,       // $15 category
+        &row.domain,         // $16 domain
+        &row.method,         // $17 method
+        &row.request_id,     // $18 request_id
+        &detail_str,         // $19 detail
+        &pii,                // $20 pii_in_detail (SMALLINT)
+        &shipped,            // $21 shipped_at    (NULL when None)
+        &prev_hash,          // $22 prev_hash
+        &hash,               // $23 hash
+        &form,               // $24 canonical_form_id
+        &salt,               // $25 detail_salt
+        &commitment,         // $26 detail_commitment
+    ];
+    tx.execute(stmt, params).map_err(|e| seq_clash(e, bare))
 }
 
 fn pg_exec(client: &mut pg::Transaction<'_>, sql: &str) -> Result<(), Error> {
@@ -678,7 +761,8 @@ fn migrate(
     )?;
 
     let missing = schema_missing(client, bare, schema)?;
-    // A table an older fasten-core created has no chain columns. IF NOT
+    // A table an older fasten-core created has no chain columns, and one the
+    // Python store created has no wire_version or pii_in_detail. IF NOT
     // EXISTS: an opener that names the table differently (`t`, `public.t`)
     // takes a different bootstrap lock and may have just added them.
     for (name, def) in missing.columns {
@@ -709,6 +793,11 @@ fn migrate(
     tx.commit()?;
     Ok(())
 }
+
+/// Row columns a table the Python store created lacks. `migrate` adds them
+/// with the chain columns.
+const ROW_COLUMNS: [(&str, &str); 2] =
+    [("wire_version", "TEXT NOT NULL DEFAULT '1'"), ("pii_in_detail", "SMALLINT NOT NULL DEFAULT 0")];
 
 struct Missing {
     indexes: bool,
@@ -754,8 +843,9 @@ fn schema_missing(
     Ok(Missing {
         indexes: !["req", "code", "ts", "svc"].iter().all(|s| has(format!("idx_{bare}_{s}"))),
         node_seq_index: !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")),
-        columns: CHAIN_COLUMNS
+        columns: ROW_COLUMNS
             .into_iter()
+            .chain(CHAIN_COLUMNS)
             .filter(|(name, _)| !have.iter().any(|h| h == name))
             .collect(),
     })
@@ -823,48 +913,75 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<(dyn ToSql + Sync)>>) {
     (clause, params)
 }
 
-fn row_from_pg(r: &pg::Row) -> Row {
-    let detail_str: String = r.get(18);
+/// Column `idx` of `r`, which belongs to the row or node `owner` names. A
+/// NULL or a value of another type is an error that names both.
+fn column<'a, T: pg::types::FromSql<'a>>(r: &'a pg::Row, idx: usize, owner: &str) -> Result<T, Error> {
+    r.try_get(idx).map_err(|e| {
+        let name = r.columns().get(idx).map_or("?", pg::Column::name);
+        Error::Store(format!("{owner}: column {name}: {e}"))
+    })
+}
+
+fn row_from_pg(r: &pg::Row) -> Result<Row, Error> {
+    let id: String = column(r, 0, "row")?;
+    let owner = format!("row {id}");
+    let col_str = |idx: usize| column::<String>(r, idx, &owner);
+    let col_opt = |idx: usize| column::<Option<String>>(r, idx, &owner);
+    let detail_str = col_str(18)?;
     let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
-    let pii: i16 = r.get(19);
-    let seq: i64 = r.get(3);
-    Row {
-        id:             r.get(0),
-        wire_version:   r.get(1),
-        origin_id:      r.get(2),
-        monotonic_seq:  seq.unsigned_abs(),
-        timestamp:      r.get(4),
-        code:           r.get(5),
-        action:         r.get(6),
-        severity:       r.get(7),
-        service_id:     r.get(8),
-        source_node_id: r.get(9),
-        tenant_id:      r.get(10),
-        actor:          r.get(11),
-        actor_kind:     r.get(12),
-        target:         r.get(13),
-        category:       r.get(14),
-        domain:         r.get(15),
-        method:         r.get(16),
-        request_id:     r.get(17),
+    let pii: i16 = column(r, 19, &owner)?;
+    let seq = stored_seq(&id, column(r, 3, &owner)?)?;
+    Ok(Row {
+        wire_version:   col_str(1)?,
+        origin_id:      col_str(2)?,
+        monotonic_seq:  seq,
+        timestamp:      col_str(4)?,
+        code:           col_str(5)?,
+        action:         col_str(6)?,
+        severity:       col_str(7)?,
+        service_id:     col_str(8)?,
+        source_node_id: col_str(9)?,
+        tenant_id:      col_opt(10)?,
+        actor:          col_str(11)?,
+        actor_kind:     col_str(12)?,
+        target:         col_str(13)?,
+        category:       col_str(14)?,
+        domain:         col_str(15)?,
+        method:         col_str(16)?,
+        request_id:     col_str(17)?,
         detail,
         pii_in_detail:  pii != 0,
-        shipped_at:     r.get(20),
-        prev_hash:         r.get(21),
-        hash:              r.get(22),
-        canonical_form_id: r.get(23),
-        detail_salt:       non_empty(r.get(24)),
-        detail_commitment: non_empty(r.get(25)),
+        shipped_at:     col_opt(20)?,
+        prev_hash:         col_opt(21)?,
+        hash:              col_opt(22)?,
+        canonical_form_id: col_opt(23)?,
+        detail_salt:       non_empty(col_opt(24)?),
+        detail_commitment: non_empty(col_opt(25)?),
+        id,
         ..Default::default()
-    }
+    })
+}
+
+/// A selected row for verification, its `detail` parsed from the column text.
+fn chain_row_from_pg(r: &pg::Row) -> Result<ChainRow, Error> {
+    let row = row_from_pg(r)?;
+    let detail: String = column(r, 18, &format!("row {}", row.id))?;
+    chain_row(&row, &detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The DSN of the test database. Without one the Postgres tests return
+    // early, unless FASTEN_REQUIRE_POSTGRES=1 says they must run.
     fn dsn() -> Option<String> {
-        std::env::var("FASTEN_TEST_POSTGRES_DSN").ok()
+        let dsn = std::env::var("FASTEN_TEST_POSTGRES_DSN").ok();
+        assert!(
+            dsn.is_some() || std::env::var("FASTEN_REQUIRE_POSTGRES").as_deref() != Ok("1"),
+            "FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set"
+        );
+        dsn
     }
 
     fn make_row(id: &str, code: &str) -> Row {
@@ -1289,9 +1406,12 @@ mod tests {
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            // Explicit seqs, so the rows are stored as given.
             if id == "evt-sealed" {
                 r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
+            } else {
+                r.monotonic_seq = 2;
             }
             store.insert(&r).unwrap();
         }
@@ -1307,13 +1427,14 @@ mod tests {
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
     }
 
-    /// The store picks the seq, so a hash sealed over another one is dropped.
+    /// The store picks the seq, so a hash sealed over another one is
+    /// replaced by the store's own seal.
     #[test]
-    fn allocating_insert_drops_chain_fields() {
+    fn allocating_insert_replaces_chain_fields() {
         let Some(dsn) = dsn() else { return };
         let store = fresh(&dsn, "fasten_sc_pg_alloc_chain");
         let mut row = make_row("evt-alloc", "TEST");
-        row.prev_hash = Some("genesis".into());
+        row.prev_hash = Some("elsewhere".into());
         row.hash = Some("h1".into());
         row.canonical_form_id = Some("2".into());
         row.detail_salt = Some("salt".into());
@@ -1321,11 +1442,13 @@ mod tests {
         store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(got.monotonic_seq, 1);
-        assert_eq!(
-            [got.prev_hash.as_deref(), got.hash.as_deref(), got.canonical_form_id.as_deref()],
-            [Some(""), Some(""), Some("1")]
-        );
-        assert_eq!((got.detail_salt.as_deref(), got.detail_commitment.as_deref()), (None, None));
+        assert_eq!(got.prev_hash.as_deref(), Some("genesis"));
+        assert_eq!(got.canonical_form_id.as_deref(), Some("2"));
+        assert_eq!(got.hash.as_deref().map(str::len), Some(64));
+        assert_ne!(got.detail_salt.as_deref(), Some("salt"));
+        assert_ne!(got.detail_commitment.as_deref(), Some("commit"));
+        let rows = store.chain_rows(&Filter::default()).unwrap();
+        assert!(crate::chain::verify_chain(&rows).ok);
     }
 
     /// #139: a sealed row came back without its hash.
@@ -1353,8 +1476,9 @@ mod tests {
             ]
         };
         assert_eq!(chain(&got[0]), chain(&row));
-        let s = |v: &str| Some(v.to_string());
-        assert_eq!(chain(&got[1]), [s(""), s(""), s("1"), None, None]);
+        // The allocated row links to the stored one.
+        assert_eq!(got[1].prev_hash.as_deref(), Some("h1"));
+        assert_eq!(got[1].canonical_form_id.as_deref(), Some("2"));
     }
 
     /// A table the Go store created declares salt and commitment NOT NULL.
@@ -1383,9 +1507,10 @@ mod tests {
         .unwrap();
         let store = PostgresStore::connect(&dsn, table).unwrap();
         store.insert(&make_row("evt-go", "TEST")).unwrap();
-        let got = store.query(&Filter::default()).unwrap();
-        assert_eq!(got[0].detail_salt, None);
-        assert_eq!(got[0].hash.as_deref(), Some(""));
+        let got = store.chain_rows(&Filter::default()).unwrap();
+        assert_eq!(got[0].prev_hash, "genesis");
+        assert!(got[0].detail_salt.is_some());
+        assert!(crate::chain::verify_chain(&got).ok);
     }
 
     /// A table an older fasten-core created gets the chain columns on connect.
@@ -1474,7 +1599,7 @@ mod tests {
         let mut r = make_row("evt-mixed-sealed", "USER_LOGIN");
         r.timestamp = days_ago(40);
         store.insert(&r).unwrap();
-        c.batch_execute(&format!("UPDATE {table} SET hash = 'abc'")).unwrap();
+        c.batch_execute(&format!("UPDATE {table} SET hash = 'abc', canonical_form_id = '1'")).unwrap();
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
@@ -1504,9 +1629,8 @@ mod tests {
             store.insert(&r).unwrap();
         }
         c.batch_execute(&format!(
-            "UPDATE {table} SET hash = 'abc' WHERE id = 'evt-form1';
-             UPDATE {table} SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
-             WHERE id = 'evt-form2';"
+            "UPDATE {table} SET hash = 'abc', canonical_form_id = '1' WHERE id = 'evt-form1';
+             UPDATE {table} SET hash = '' WHERE id = 'evt-unsealed';"
         ))
         .unwrap();
 
