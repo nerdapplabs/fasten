@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Build the files attached to a GitHub release.
 #
-# Usage: scripts/release/build-artifacts.sh <tag> <out-dir> [core-lib-dir]
+# Usage: scripts/release/build-artifacts.sh <tag> <out-dir> [core-lib-dir [wheel-dir]]
 #
 #   vX.Y.Z     Swift, C++ and Rust source archives, plus the fasten-core
-#              library when core-lib-dir holds a release build of it.
+#              library when core-lib-dir holds a release build of it, plus
+#              the Python wheels in wheel-dir, copied as they are.
 #   go/vX.Y.Z  The Go module zip, laid out as the module proxy serves it.
 #
 # Archives hold only tracked files at HEAD, and the script stops if any
@@ -15,15 +16,21 @@
 set -euo pipefail
 export LC_ALL=C
 
-usage() { echo "usage: $0 <tag> <out-dir> [core-lib-dir]" >&2; exit 2; }
-if [ $# -lt 2 ] || [ $# -gt 3 ]; then usage; fi
+usage() { echo "usage: $0 <tag> <out-dir> [core-lib-dir [wheel-dir]]" >&2; exit 2; }
+if [ $# -lt 2 ] || [ $# -gt 4 ]; then usage; fi
 tag=$1
 out=$2
 core_lib=${3:-}
+wheels=${4:-}
 
 [[ $tag =~ ^(go/)?v[0-9][0-9A-Za-z.+-]*$ ]] || { echo "bad tag: $tag" >&2; exit 2; }
 tar --version 2>/dev/null | grep -q 'GNU tar' || { echo "GNU tar is required" >&2; exit 1; }
 [ -z "$core_lib" ] || core_lib=$(cd "$core_lib" && pwd)
+if [ -n "$wheels" ]; then
+  case $tag in go/*) echo "a go/ tag takes no wheels" >&2; exit 2 ;; esac
+  wheels=$(cd "$wheels" && pwd)
+  ls "$wheels"/*.whl >/dev/null 2>&1 || { echo "no .whl files in $wheels" >&2; exit 1; }
+fi
 
 cd "$(git rev-parse --show-toplevel)"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -102,6 +109,9 @@ case $tag in
     pack "fasten-rust-$tag" rust fasten-core rust-toolchain.toml
     if [ -n "$core_lib" ]; then
       pack_core_lib "fasten-core-$tag-linux-$(uname -m)"
+    fi
+    if [ -n "$wheels" ]; then
+      cp "$wheels"/*.whl "$out/"
     fi
     ;;
 esac
