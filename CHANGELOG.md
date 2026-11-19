@@ -18,6 +18,29 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   schema has 20.
 - The `timestamp` description says microseconds, as those five SDKs write.
 
+### Fixed: JS keeps a detail key named `__proto__`
+
+- A `__proto__` key in a detail parsed from JSON is kept and redacted like
+  any other key. Before, redaction dropped it and its value.
+
+### Fixed: Go reads rows with a NULL salt or commitment
+
+- The Go SQLite and Postgres stores read a row whose `detail_salt` or
+  `detail_commitment` is NULL as empty. Before, one such row made the whole
+  query fail. Tables created by another SDK allow NULL there, and the Rust
+  SDK writes it when it redacts a row.
+- `NewPostgresStore` opens a table the Python SDK created. Before, it
+  failed with `column "pii_in_detail" does not exist`, because it built an
+  index on that column before adding the column.
+
+### Added: Python wheels on the GitHub release
+
+- Each `vX.Y.Z` GitHub release carries the Python wheels, for Linux (glibc
+  2.34 or later, x86-64 and arm64) and macOS 11 or later. They are listed in
+  `SHA256SUMS` and attested like the other release files. A beta is not on
+  PyPI, so this is where its wheels are: download one and
+  `pip install` the file. A wheel bundles `libfasten_core`.
+
 ### Fixed: Go keeps detail numbers exact
 
 - A row read from the Go SQLite or Postgres store keeps each detail number
@@ -360,6 +383,8 @@ be replaced now.
 - On npm, a release goes under the `latest` dist-tag only when it is above
   every published release; a backport such as 1.0.1 after 1.1.0 goes under
   `release-1.0`.
+- On npm, a release is staged by the workflow and becomes installable when
+  a maintainer approves it with two-factor authentication.
 - The Rust SDK needs Rust 1.90 (`rust-version`), as fasten-core does.
 
 ### Changed: Python, Rust and npm packages are named `fasten-sdk`

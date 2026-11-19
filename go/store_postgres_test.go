@@ -510,3 +510,44 @@ func TestPostgres_ChainTailKeepsTheNewestRowsInSeqOrder(t *testing.T) {
 		t.Errorf("want [3 4 5], got %v", seqs)
 	}
 }
+
+// A table the Python SDK created has no pii_in_detail or wire_version
+// column, and nullable salt and commitment. NewPostgresStore adds the
+// missing columns, and a row with a NULL salt reads back.
+func TestPostgres_OpensATablePythonCreated(t *testing.T) {
+	db := pgDB(t)
+	table := uniqueTable("audit_py_table")
+	t.Cleanup(func() { dropTable(t, db, table) })
+	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE %s (
+    id TEXT PRIMARY KEY, origin_id TEXT NOT NULL, monotonic_seq BIGINT NOT NULL,
+    timestamp TEXT NOT NULL, code TEXT NOT NULL, action TEXT NOT NULL,
+    severity TEXT NOT NULL, service_id TEXT NOT NULL, source_node_id TEXT NOT NULL,
+    tenant_id TEXT, actor TEXT NOT NULL, actor_kind TEXT NOT NULL,
+    target TEXT NOT NULL, category TEXT NOT NULL, domain TEXT NOT NULL,
+    method TEXT NOT NULL, request_id TEXT NOT NULL, detail TEXT NOT NULL,
+    shipped_at TEXT, prev_hash TEXT NOT NULL DEFAULT 'genesis',
+    hash TEXT NOT NULL DEFAULT '', canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt TEXT, detail_commitment TEXT)`, table)); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`INSERT INTO %s (id, origin_id, monotonic_seq,
+    timestamp, code, action, severity, service_id, source_node_id, actor, actor_kind,
+    target, category, domain, method, request_id, detail, detail_salt, detail_commitment)
+    VALUES ('evt-py-1', 'evt-py-1', 1, '2026-11-19T10:00:00.000000Z', 'USER_CREATED',
+    'create', 'info', 'svc-py', 'node-py', 'alice', 'user', 'u-1', 'account', 'user',
+    'sdk', 'req-1', '{}', NULL, NULL)`, table)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	store, err := NewPostgresStore(db, table)
+	if err != nil {
+		t.Fatalf("NewPostgresStore on a table Python created: %v", err)
+	}
+	rows, err := store.Query(context.Background(), Filter{Limit: 10})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "evt-py-1" || rows[0].DetailSalt != "" {
+		t.Fatalf("rows = %+v; want evt-py-1 with an empty salt", rows)
+	}
+}

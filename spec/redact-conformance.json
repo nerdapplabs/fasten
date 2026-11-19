@@ -610,6 +610,12 @@
       "expected": {"note": "risk-assessment-for-customer-account-number-42"}
     },
     {
+      "name": "key_proto_kept",
+      "group": "key_pattern",
+      "input":    {"__proto__": {"password": "hunter2", "n": 1}, "ok": 1},
+      "expected": {"__proto__": {"password": "***", "n": 1}, "ok": 1}
+    },
+    {
       "name": "key_pwd_env_not_matched",
       "group": "safe",
       "input":    {"PWD": "/home/app", "OLDPWD": "/tmp"},

@@ -761,6 +761,9 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 		var piiFlag int
 		var shippedAt *string
 		var wv, hash, prevHash, formID string
+		// NULL in tables another SDK created with nullable columns: older
+		// Python rows, and rows the Rust SDK redacted.
+		var salt, commitment sql.NullString
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&ts, &code, &r.Action, &sev,
@@ -769,10 +772,11 @@ func scanRows(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
-			&r.DetailSalt, &r.DetailCommitment,
+			&salt, &commitment,
 		); err != nil {
 			return nil, err
 		}
+		r.DetailSalt, r.DetailCommitment = salt.String, commitment.String
 		// A timestamp or detail that doesn't parse is an error. A zero time
 		// would sort to the top of every newest-first query.
 		parsedTs, err := parseCanonicalTS(ts)
