@@ -259,6 +259,23 @@ pub(crate) fn differs(id: &str) -> Error {
     Error::RowRejected(format!("row {id}: differs from the stored row with that id"))
 }
 
+/// Selects the id of a row at node `node` and seq `seq` (placeholders).
+/// For the SDK's stores; not a stable API.
+#[doc(hidden)]
+pub fn at_seq_sql(table: &str, node: &str, seq: &str) -> String {
+    format!("SELECT id FROM {table} WHERE source_node_id = {node} AND monotonic_seq = {seq} LIMIT 1")
+}
+
+/// Another row, `other_id`, is stored at `row`'s node and seq. For the
+/// SDK's stores; not a stable API.
+#[doc(hidden)]
+pub fn seq_taken(row: &Row, other_id: &str) -> Error {
+    Error::SeqClash(format!(
+        "row {}: seq {} on node {:?} is stored as row {other_id}",
+        row.id, row.monotonic_seq, row.source_node_id
+    ))
+}
+
 /// What an insert found.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) enum Outcome {

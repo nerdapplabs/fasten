@@ -52,6 +52,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `ChainRow::from_row` and `Error::Seal`.
 - `spec/rust-sealed-form2.json` holds rows sealed by the Rust SDK; the
   Python, Go and Rust test suites verify it.
+- A float exactly halfway between two shortest decimal forms, such as
+  `1000000000000000.25`, is written with the even last digit, as CPython
+  and Go write it.
+- The core SQLite and Postgres stores open a table the Python SDK created,
+  adding the `wire_version` and `pii_in_detail` columns it lacks.
+- A row with its own seq at a node and seq another row already holds is
+  rejected, also on tables without a unique `(source_node_id,
+  monotonic_seq)` index such as those Python creates.
 
 ### Fixed: `spec/row-schema.json` accepts the rows five SDKs write
 

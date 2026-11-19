@@ -559,10 +559,7 @@ fn py_number_token(tok: &str) -> String {
 // a whole number), otherwise scientific with a signed exponent of at least
 // two digits (5e-05, 1e+16).
 fn py_float_repr(f: f64) -> String {
-    let sci = format!("{:e}", f.abs()); // "1.25e-5"
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    let digits = mantissa.replace('.', "");
+    let (digits, exp) = shortest_digits(f.abs());
     let mut out = String::new();
     if f.is_sign_negative() {
         out.push('-');
@@ -597,6 +594,44 @@ fn py_float_repr(f: f64) -> String {
         let _ = write!(out, "e{sign}{:02}", exp.unsigned_abs());
     }
     out
+}
+
+// The shortest digits that round-trip to `f` (finite, not negative) and the
+// decimal exponent of the first, as CPython picks them. Rust's `{:e}` gives
+// the closest such digits but takes the upper one when `f` lies exactly
+// halfway between two; CPython takes the one with the even last digit.
+fn shortest_digits(f: f64) -> (String, i32) {
+    let split = |sci: &str| -> (String, i32) {
+        let (mantissa, exp) = sci.split_once('e').unwrap_or((sci, "0"));
+        (mantissa.replace('.', ""), exp.parse().unwrap_or(0))
+    };
+    let (digits, exp) = split(&format!("{f:e}")); // "1.25e-5"
+    let n = digits.len();
+    if digits.as_bytes()[n - 1] % 2 == 0 {
+        return (digits, exp);
+    }
+    // f's exact decimal value: a double has at most 767 significant digits.
+    let (exact, exact_exp) = split(&format!("{f:.800e}"));
+    let exact = exact.trim_end_matches('0');
+    // Halfway between the two n-digit numbers sharing exact's first n digits.
+    if exact_exp != exp || exact.len() != n + 1 || !exact.ends_with('5') {
+        return (digits, exp);
+    }
+    let lower = &exact[..n];
+    let other = if lower != digits {
+        lower.to_string()
+    } else if !lower.ends_with('9') {
+        let last = lower.as_bytes()[n - 1] + 1;
+        format!("{}{}", &lower[..n - 1], char::from(last))
+    } else {
+        return (digits, exp);
+    };
+    // The even one is CPython's only if it round-trips too.
+    let scale = exp - i32::try_from(n - 1).unwrap_or(0);
+    if format!("{other}e{scale}").parse::<f64>() == Ok(f) {
+        return (other, exp);
+    }
+    (digits, exp)
 }
 
 fn sha256_hex(parts: &[&[u8]]) -> String {
@@ -1264,6 +1299,53 @@ mod tests {
     fn matches_canonical(row: &ChainRow) -> bool {
         let commitment = row.detail_salt.as_deref().map(|salt| detail_commitment(salt, &row.detail));
         row_hash(row).as_deref() == Some(row.hash.as_str()) && commitment == row.detail_commitment
+    }
+
+    // Each double's bits and CPython 3.12's repr of it, printed with
+    // `f"{bits:016x} {struct.unpack('<d', struct.pack('<Q', bits))[0]!r}"`.
+    // The first ten lie exactly halfway between two shortest candidates;
+    // CPython takes the even last digit.
+    const CPYTHON_REPR: &[(u64, &str)] = &[
+        (0x430c6bf526340002, "1000000000000000.2"),
+        (0x430c6bf526340006, "1000000000000000.8"),
+        (0x42d3f292a31941e8, "87730252702983.62"),
+        (0xc2d3f292a31941e8, "-87730252702983.62"),
+        (0x42a86a668af80ba0, "13422632991749.812"),
+        (0x42dc36870333d348, "124082075782989.12"),
+        (0x431d0274b2786179, "2041368639576158.2"),
+        (0x43106b764d501263, "1155438868694168.8"),
+        (0x42b9bcc1d507c4f0, "28298496509892.938"),
+        (0x42d1443d4aafcb78, "75939135012653.88"),
+        (0x3fd3333333333334, "0.30000000000000004"),
+        (0x0000000000000001, "5e-324"),
+        (0x8000000000000001, "-5e-324"),
+        (0x0000000000000002, "1e-323"),
+        (0x0010000000000000, "2.2250738585072014e-308"),
+        (0x000fffffffffffff, "2.225073858507201e-308"),
+        (0x7fefffffffffffff, "1.7976931348623157e+308"),
+        (0x4341c37937e08000, "1e+16"),
+        (0x4341c37937e07fff, "9999999999999998.0"),
+        (0x4341c37937e08001, "1.0000000000000002e+16"),
+        (0x3f1a36e2eb1c432d, "0.0001"),
+        (0x3f1a36e2eb1c432c, "9.999999999999999e-05"),
+        (0x3f1a36e2eb1c432e, "0.00010000000000000002"),
+        (0x4480f0cf064dd592, "1e+22"),
+        (0x0000000000000000, "0.0"),
+        (0x8000000000000000, "-0.0"),
+        (0x430214321dc6eb33, "636094382660966.4"),
+        (0x777e09a725896d75, "3.874208051802725e+267"),
+        (0x3fdcf11fca32218e, "0.452217051941738"),
+        (0x3fb6cf4d92ea59cf, "0.0891006931"),
+        (0x203b60000846d4ee, "2.0417208119602115e-153"),
+    ];
+
+    #[test]
+    fn floats_render_as_cpython_repr() {
+        for &(bits, want) in CPYTHON_REPR {
+            let f = f64::from_bits(bits);
+            assert_eq!(py_float_repr(f), want, "{bits:016x}");
+            assert_eq!(py_number_token(&format!("{f:e}")), want, "{bits:016x}");
+        }
     }
 
     #[test]

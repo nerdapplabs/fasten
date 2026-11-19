@@ -372,7 +372,8 @@ impl PostgresStore {
     /// The row must have a hash and a non-zero `monotonic_seq`. Its hash is
     /// not verified here: run [`crate::verify_chain`] over the batch first.
     /// Storing the same row again is a no-op; a different row under a stored
-    /// id is [`crate::Error::AuditStoreRejected`].
+    /// id, or another row at its node and seq, is
+    /// [`crate::Error::AuditStoreRejected`].
     pub fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), crate::Error> {
         let (columns, detail) = fasten_core::store::sealed_columns(row, pii_in_detail)
             .map_err(|e| crate::Error::AuditStoreRejected(e.to_string()))?;
@@ -380,8 +381,11 @@ impl PostgresStore {
         let mut tx = guard.transaction().map_err(pg_err)?;
         tx.execute(NODE_LOCK, &[&row.source_node_id]).map_err(pg_err)?;
         let mut held = self.held(&mut tx, &row.id)?;
-        if held.is_none() && self.insert_row(&mut tx, &columns, &detail)? == 0 {
-            held = self.held(&mut tx, &row.id)?;
+        if held.is_none() {
+            self.check_seq_free(&mut tx, &columns)?;
+            if self.insert_row(&mut tx, &columns, &detail)? == 0 {
+                held = self.held(&mut tx, &row.id)?;
+            }
         }
         tx.commit().map_err(pg_err)?;
         match held {
@@ -410,6 +414,27 @@ impl PostgresStore {
     fn held(&self, tx: &mut pg::Transaction<'_>, id: &str) -> Result<Option<ChainRow>, crate::Error> {
         let sql = format!("SELECT {} FROM {} WHERE id = $1", self.chain_columns(), self.table);
         tx.query_opt(&sql as &str, &[&id]).map_err(pg_err)?.as_ref().map(chain_row).transpose()
+    }
+
+    /// Rejects `row` when another row is stored at its node and seq. The
+    /// (source_node_id, monotonic_seq) index is not unique, as a table
+    /// Python created may already repeat a seq, so the check is made here,
+    /// under the node's lock.
+    fn check_seq_free(&self, tx: &mut pg::Transaction<'_>, row: &fasten_core::Row) -> Result<(), crate::Error> {
+        let seq = i64::try_from(row.monotonic_seq).map_err(|_| {
+            crate::Error::AuditStoreRejected(format!(
+                "row {}: monotonic_seq {} is out of range",
+                row.id, row.monotonic_seq
+            ))
+        })?;
+        let sql = fasten_core::store::at_seq_sql(&self.table, "$1", "$2");
+        match tx.query_opt(&sql as &str, &[&row.source_node_id, &seq]).map_err(pg_err)? {
+            Some(r) => {
+                let other: String = column(&r, 0, &format!("row {}", row.id))?;
+                Err(crate::Error::AuditStoreRejected(fasten_core::store::seq_taken(row, &other).to_string()))
+            }
+            None => Ok(()),
+        }
     }
 
     /// Insert `row` as it is on `tx`, with `detail` as the text of its detail
@@ -622,6 +647,7 @@ impl crate::AuditStore for PostgresStore {
             let tip: Option<String> = tip.as_ref().map(|r| column(r, 0, &owner)).transpose()?;
             crate::seal_row(tip.as_deref().unwrap_or(GENESIS), row, seq)?
         } else {
+            self.check_seq_free(&mut tx, &crate::engine::sdk_row_to_core(row))?;
             row.clone()
         };
         let detail = serde_json::to_string(&stored.detail)?;
@@ -744,7 +770,9 @@ mod tests {
             action: "test_action".into(),
             severity: crate::Severity::Info,
             service_id: "test-svc".into(),
-            source_node_id: "node-1".into(),
+            // A node of its own: the shared tables keep rows at seq 1 from
+            // other tests and earlier runs, and a second row there is refused.
+            source_node_id: uniq("node"),
             tenant_id: None,
             actor: "test-user".into(),
             actor_kind: "user".into(),
@@ -1110,6 +1138,33 @@ mod tests {
         let chain = store.chain_rows(&node).expect("chain_rows");
         assert_eq!(chain.iter().map(|r| r.monotonic_seq).collect::<Vec<_>>(), [1, 9]);
         assert_eq!(chain[0].hash, first.hash);
+    }
+
+    // A replicated row with a new id at a stored node and seq is refused,
+    // with its own seq or through insert_sealed, and nothing is written. The
+    // stored row again is accepted.
+    #[test]
+    fn test_a_different_row_at_a_taken_seq_is_refused() {
+        use crate::AuditStore;
+        let Some(dsn) = dsn() else { return };
+        let store = fresh_store(&dsn, "fasten_pg_chain_seq_taken");
+        let node = uniq("node");
+        let first = store.allocate_and_insert_originated(&emit_row(&node, "TEST_CHAIN")).expect("insert");
+        let other = crate::seal_row(GENESIS, &emit_row(&node, "TEST_CHAIN"), 1).expect("seal");
+        let want = format!("row {}: seq 1 on node \"{node}\" is stored as row {}", other.id, first.id);
+        let err = store.allocate_and_insert_originated(&other).unwrap_err();
+        assert!(matches!(&err, crate::Error::AuditStoreRejected(m) if m.contains(&want)), "{err:?}");
+        let as_chain = |r: &crate::Row| ChainRow::from_json(&serde_json::to_string(r).expect("json")).expect("row");
+        let err = store.insert_sealed(&as_chain(&other), false).unwrap_err();
+        assert!(matches!(&err, crate::Error::AuditStoreRejected(m) if m.contains(&want)), "{err:?}");
+
+        let again = store.allocate_and_insert_originated(&first).expect("the stored row again");
+        assert_eq!(again.hash, first.hash);
+        store.insert_sealed(&as_chain(&first), false).expect("the stored row again");
+        let chain = store.chain_rows(&node).expect("chain_rows");
+        assert_eq!(chain.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), [first.id.as_str()]);
+        let result = crate::verify_chain(&chain);
+        assert!(result.ok && result.sealed_rows == 1, "{result:?}");
     }
 
     // A row sealed here must be one this node originated, as in the Python

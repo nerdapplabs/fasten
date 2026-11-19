@@ -496,6 +496,8 @@ mod tests {
         let result = crate::verify_chain(&chain);
         assert!(result.ok && result.sealed_rows == 4, "{result:?}");
         assert_eq!(chain.iter().filter(|r| r.detail == crate::Json::Null && r.detail_salt.is_none()).count(), 1);
+        let ties = fasten_core::chain::canonical_json(&chain[3].detail);
+        assert!(ties.contains(r#""tie":1000000000000000.2,"tie_frac":87730252702983.62"#), "{ties}");
     }
 
     // Writes spec/rust-sealed-form2.json from a real engine and store:
@@ -525,7 +527,14 @@ mod tests {
                 ("nested".to_string(), nested),
             ]),
             HashMap::from([("note".to_string(), serde_json::json!("to be redacted"))]),
-            HashMap::from([("neg".to_string(), serde_json::json!(-1.5)), ("count".to_string(), serde_json::json!(7))]),
+            HashMap::from([
+                ("neg".to_string(), serde_json::json!(-1.5)),
+                ("count".to_string(), serde_json::json!(7)),
+                // Halfway between two shortest forms: Python writes the even
+                // one, 1000000000000000.2 and 87730252702983.62.
+                ("tie".to_string(), serde_json::json!(1_000_000_000_000_000.25_f64)),
+                ("tie_frac".to_string(), serde_json::json!(87_730_252_702_983.625_f64)),
+            ]),
         ];
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for (i, detail) in details.into_iter().enumerate() {

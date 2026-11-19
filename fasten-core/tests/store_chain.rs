@@ -130,6 +130,114 @@ impl Drop for TempDb {
     }
 }
 
+/// The table Python's SQLiteStore creates (python/fasten/store/sqlite.py):
+/// no wire_version or pii_in_detail, and a node-seq index that is not
+/// unique.
+const PYTHON_SQLITE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS {table} (
+    id               TEXT PRIMARY KEY,
+    origin_id        TEXT NOT NULL,
+    monotonic_seq    INTEGER NOT NULL,
+    timestamp        TEXT NOT NULL,
+    code             TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    severity         TEXT NOT NULL,
+    service_id       TEXT NOT NULL,
+    source_node_id   TEXT NOT NULL,
+    tenant_id        TEXT,
+    actor            TEXT NOT NULL,
+    actor_kind       TEXT NOT NULL,
+    target           TEXT NOT NULL,
+    category         TEXT NOT NULL,
+    domain           TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    detail           TEXT NOT NULL,
+    shipped_at       TEXT,
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT,
+    detail_commitment TEXT,
+    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
+    hash             TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_{table}_req  ON {table}(request_id);
+CREATE INDEX IF NOT EXISTS idx_{table}_code ON {table}(code);
+CREATE INDEX IF NOT EXISTS idx_{table}_ts   ON {table}(timestamp);
+CREATE INDEX IF NOT EXISTS idx_{table}_unshipped ON {table}(shipped_at) WHERE shipped_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monotonic_seq);
+";
+
+/// `VECTOR_COLUMNS` and a vector row's values without wire_version, as the
+/// Python store writes them; the seq is at index 2.
+fn python_columns_and_values(r: &ChainRow) -> (String, Vec<Option<String>>, i64) {
+    let (mut values, seq) = vector_values(r);
+    values.remove(1);
+    (VECTOR_COLUMNS.replacen("wire_version, ", "", 1), values, seq)
+}
+
+/// Python's form-"2" row with numeric detail, sealed for node-1 seq 1.
+fn python_numbers_row() -> ChainRow {
+    let rows: Vec<ChainRow> =
+        vector_rows("spec/python-sealed-forms.json").into_iter().filter(|r| r.id == python_numbers_id()).collect();
+    assert_eq!(rows.len(), 1);
+    rows[0].clone()
+}
+
+/// On a table with no UNIQUE (source_node_id, monotonic_seq), another row
+/// at a stored node and seq is still a clash and nothing is written; the
+/// stored row again is a no-op.
+fn assert_taken_seq_refused(store: &dyn Store) {
+    let sealed_at_1 = |id: &str| {
+        let mut r = row(id, "node-s");
+        r.monotonic_seq = 1;
+        seal("genesis", &ChainRow::from(&r)).unwrap().stamp(&mut r);
+        r
+    };
+    let first = sealed_at_1("evt-s1");
+    store.insert(&first).unwrap();
+    let other = sealed_at_1("evt-s2");
+    let want = r#"seq clash: row evt-s2: seq 1 on node "node-s" is stored as row evt-s1"#;
+    let err = store.insert(&other).unwrap_err();
+    assert!(matches!(&err, Error::SeqClash(_)) && err.to_string() == want, "{err:?}");
+    let err = store.insert_sealed(&ChainRow::from(&other), false).unwrap_err();
+    assert!(matches!(&err, Error::SeqClash(_)) && err.to_string() == want, "{err:?}");
+
+    store.insert(&first).unwrap();
+    store.insert_sealed(&ChainRow::from(&first), false).unwrap();
+    let (rows, result) = verify(store, "node-s");
+    assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["evt-s1"]);
+    assert!(result.ok && result.sealed_rows == 1, "{result:?}");
+}
+
+/// Opening a table Python's SQLiteStore created adds wire_version and
+/// pii_in_detail, and the next row links to the Python-sealed tip.
+#[test]
+fn sqlite_extends_a_chain_in_a_table_python_created() {
+    let db = TempDb::new("py-table");
+    db.sql(&PYTHON_SQLITE_DDL.replace("{table}", "audit_log"));
+    let python = python_numbers_row();
+    let (columns, values, seq) = python_columns_and_values(&python);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let marks: Vec<String> = (1..=values.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!("INSERT INTO audit_log ({columns}) VALUES ({})", marks.join(", "));
+    let params: Vec<&dyn rusqlite::ToSql> =
+        values.iter().enumerate().map(|(i, v)| if i == 2 { &seq as &dyn rusqlite::ToSql } else { v }).collect();
+    conn.execute(&sql, params.as_slice()).unwrap();
+    drop(conn);
+
+    let store = db.open();
+    let mine = store.insert_stored(&row("evt-rust-1", "node-1")).unwrap();
+    assert_eq!((mine.monotonic_seq, mine.prev_hash.as_deref()), (2, Some(python.hash.as_str())));
+    let (rows, result) = verify(&store, "node-1");
+    assert!(result.ok, "{result:?}");
+    assert_eq!((rows.len(), result.sealed_rows), (2, 2));
+    assert_eq!(rows[0], python);
+    let stored = store.query(&node("node-1")).unwrap();
+    assert_eq!((stored[0].wire_version.as_str(), stored[0].pii_in_detail), ("1", false));
+
+    assert_taken_seq_refused(&store);
+}
+
 #[test]
 fn sqlite_rows_are_sealed_per_node() {
     let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
@@ -662,6 +770,72 @@ mod postgres {
         .unwrap();
         let err = store.chain_rows(&node("node-1")).unwrap_err().to_string();
         assert!(err.contains("row evt-1: column timestamp"), "{err}");
+    }
+
+    /// The table Python's PostgresStore creates (python/fasten/store/postgres.py),
+    /// with its index on (source_node_id, monotonic_seq), which is not unique.
+    const PYTHON_PG_DDL: &str = "
+CREATE TABLE IF NOT EXISTS {table} (
+    id               TEXT PRIMARY KEY,
+    origin_id        TEXT NOT NULL,
+    monotonic_seq    BIGINT NOT NULL,
+    timestamp        TEXT NOT NULL,
+    code             TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    severity         TEXT NOT NULL,
+    service_id       TEXT NOT NULL,
+    source_node_id   TEXT NOT NULL,
+    tenant_id        TEXT,
+    actor            TEXT NOT NULL,
+    actor_kind       TEXT NOT NULL,
+    target           TEXT NOT NULL,
+    category         TEXT NOT NULL,
+    domain           TEXT NOT NULL,
+    method           TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    detail           TEXT NOT NULL,
+    shipped_at       TEXT,
+    prev_hash        TEXT NOT NULL DEFAULT 'genesis',
+    hash             TEXT NOT NULL DEFAULT '',
+    canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt       TEXT,
+    detail_commitment TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_{table}_node_seq ON {table}(source_node_id, monotonic_seq);
+";
+
+    /// Opening a table Python's PostgresStore created adds wire_version and
+    /// pii_in_detail, the next row links to the Python-sealed tip, and a
+    /// second row at a stored seq is refused.
+    #[test]
+    fn extends_a_chain_in_a_table_python_created() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_chain_pg_python";
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {table}; {}", PYTHON_PG_DDL.replace("{table}", table)))
+            .unwrap();
+        let python = python_numbers_row();
+        let (columns, values, seq) = python_columns_and_values(&python);
+        let marks: Vec<String> = (1..=values.len()).map(|i| format!("${i}")).collect();
+        let sql = format!("INSERT INTO {table} ({columns}) VALUES ({})", marks.join(", "));
+        let params: Vec<&(dyn pg::types::ToSql + Sync)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i == 2 { &seq as &(dyn pg::types::ToSql + Sync) } else { v })
+            .collect();
+        c.execute(sql.as_str(), &params).unwrap();
+
+        let store = PostgresStore::connect(&dsn, table).unwrap();
+        let mine = store.insert_stored(&row("evt-rust-1", "node-1")).unwrap();
+        assert_eq!((mine.monotonic_seq, mine.prev_hash.as_deref()), (2, Some(python.hash.as_str())));
+        let (rows, result) = verify(&store, "node-1");
+        assert!(result.ok, "{result:?}");
+        assert_eq!((rows.len(), result.sealed_rows), (2, 2));
+        assert_eq!(rows[0], python);
+        let stored = store.query(&node("node-1")).unwrap();
+        assert_eq!((stored[0].wire_version.as_str(), stored[0].pii_in_detail), ("1", false));
+
+        assert_taken_seq_refused(&store);
     }
 
     fn fresh(dsn: &str, table: &str) -> PostgresStore {

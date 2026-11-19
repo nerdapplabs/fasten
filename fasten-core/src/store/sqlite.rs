@@ -13,9 +13,15 @@ use crate::{
 };
 
 use super::{
-    chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql, sealed_at,
-    sealed_columns, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS,
+    at_seq_sql, chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql,
+    sealed_at, sealed_columns, seq_taken, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS,
+    SELECT_COLUMNS,
 };
+
+/// Row columns a table the Python store created lacks. `migrate` adds them
+/// with the chain columns.
+const ROW_COLUMNS: [(&str, &str); 2] =
+    [("wire_version", "TEXT NOT NULL DEFAULT '1'"), ("pii_in_detail", "INTEGER NOT NULL DEFAULT 0")];
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -233,8 +239,9 @@ impl SqliteStore {
         let have: Vec<String> = stmt
             .query_map([bare, schema], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let columns = CHAIN_COLUMNS
+        let columns = ROW_COLUMNS
             .into_iter()
+            .chain(CHAIN_COLUMNS)
             .filter(|(name, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(name)))
             .collect();
         Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
@@ -309,7 +316,16 @@ impl SqliteStore {
         let outcome = if let Some((held, text)) = held {
             Outcome::Held(held, text)
         } else if row.monotonic_seq != 0 {
-            insert_row(&tx, &self.insert_sql, row, column_seq(row)?, detail)?;
+            let seq = column_seq(row)?;
+            // A table the Python store created, or one from before the
+            // UNIQUE constraint, does not stop a second row at this seq.
+            let at_seq = at_seq_sql(&self.table, "?1", "?2");
+            let other: Option<String> =
+                tx.query_row(&at_seq, rusqlite::params![row.source_node_id, seq], |r| r.get(0)).optional()?;
+            if let Some(other) = other {
+                return Err(seq_taken(row, &other));
+            }
+            insert_row(&tx, &self.insert_sql, row, seq, detail)?;
             Outcome::Inserted(row.clone())
         } else {
             check_originated(row)?;

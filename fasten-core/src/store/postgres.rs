@@ -12,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql, sealed_at,
-    sealed_columns, stored_seq, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS,
-    SELECT_COLUMNS,
+    at_seq_sql, chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql,
+    sealed_at, sealed_columns, seq_taken, stored_seq, tip_sql, Outcome, RedactGate, RedactionCandidates, Store,
+    CHAIN_COLUMNS, SELECT_COLUMNS,
 };
 
 // The live connection and its prepared INSERT. When the connection is lost,
@@ -342,6 +342,7 @@ impl PostgresStore {
             self.table
         );
         let tip_sql = tip_sql(&self.table, "$1");
+        let at_seq_sql = at_seq_sql(&self.table, "$1", "$2");
         self.with_reconnect(|inner| {
             let Inner { client, stmt } = inner;
             let mut tx = client.transaction()?;
@@ -362,6 +363,12 @@ impl PostgresStore {
                 };
                 sealed_at(row, seq, tip.as_deref().unwrap_or(crate::chain::GENESIS))?
             } else {
+                // A table the Python store created, or one from before the
+                // UNIQUE constraint, does not stop a second row at this seq.
+                let at = tx.query_opt(at_seq_sql.as_str(), &[&row.source_node_id, &column_seq(row)?])?;
+                if let Some(r) = at {
+                    return Err(seq_taken(row, &r.try_get::<_, String>(0)?));
+                }
                 row.clone()
             };
             let written = execute_insert(&mut tx, stmt, &stored, column_seq(&stored)?, detail, bare)?;
@@ -754,7 +761,8 @@ fn migrate(
     )?;
 
     let missing = schema_missing(client, bare, schema)?;
-    // A table an older fasten-core created has no chain columns. IF NOT
+    // A table an older fasten-core created has no chain columns, and one the
+    // Python store created has no wire_version or pii_in_detail. IF NOT
     // EXISTS: an opener that names the table differently (`t`, `public.t`)
     // takes a different bootstrap lock and may have just added them.
     for (name, def) in missing.columns {
@@ -785,6 +793,11 @@ fn migrate(
     tx.commit()?;
     Ok(())
 }
+
+/// Row columns a table the Python store created lacks. `migrate` adds them
+/// with the chain columns.
+const ROW_COLUMNS: [(&str, &str); 2] =
+    [("wire_version", "TEXT NOT NULL DEFAULT '1'"), ("pii_in_detail", "SMALLINT NOT NULL DEFAULT 0")];
 
 struct Missing {
     indexes: bool,
@@ -830,8 +843,9 @@ fn schema_missing(
     Ok(Missing {
         indexes: !["req", "code", "ts", "svc"].iter().all(|s| has(format!("idx_{bare}_{s}"))),
         node_seq_index: !has(format!("uq_{bare}_node_seq")) && !has(format!("idx_{bare}_node_seq")),
-        columns: CHAIN_COLUMNS
+        columns: ROW_COLUMNS
             .into_iter()
+            .chain(CHAIN_COLUMNS)
             .filter(|(name, _)| !have.iter().any(|h| h == name))
             .collect(),
     })
