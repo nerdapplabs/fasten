@@ -2,16 +2,19 @@
 //! in spec/checkpoint-vectors.json, the line format, and the cases a chain
 //! alone cannot show.
 //!
-//! The Postgres test needs `FASTEN_TEST_POSTGRES_DSN` and passes without it.
+//! The Postgres test needs `FASTEN_TEST_POSTGRES_DSN`. Without it the test
+//! returns early, unless `FASTEN_REQUIRE_POSTGRES=1`, which makes it fail.
 
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use fasten_core::chain::{seal, verify_chain, verify_chain_with_checkpoints, ChainRow, ChainVerifyResult, Json};
-use fasten_core::checkpoint::{checkpoints_of, checkpoints_since, Checkpoint, CheckpointError, CheckpointOptions};
+use fasten_core::checkpoint::{
+    checkpoints_of, checkpoints_since, ChainTip, Checkpoint, CheckpointError, CheckpointOptions,
+};
 
-const WHOLE: CheckpointOptions = CheckpointOptions { partial: false };
-const PARTIAL: CheckpointOptions = CheckpointOptions { partial: true };
+const WHOLE: CheckpointOptions = CheckpointOptions::whole();
+const PARTIAL: CheckpointOptions = CheckpointOptions::partial();
 
 fn base_row(node: &str, seq: u64, qty: u64) -> ChainRow {
     ChainRow::from_json(&format!(
@@ -44,12 +47,20 @@ fn at(ts: &str) -> DateTime<Utc> {
     ts.parse().unwrap()
 }
 
+// Built as a file line is read, so `anchored_at` can be any text.
 fn cp_at(row: &ChainRow, anchored_at: &str) -> Checkpoint {
-    Checkpoint {
+    Checkpoint::from_json(&format!(
+        r#"{{"source_node_id": "{}", "monotonic_seq": {}, "hash": "{}", "anchored_at": "{anchored_at}"}}"#,
+        row.source_node_id, row.monotonic_seq, row.hash
+    ))
+    .unwrap()
+}
+
+fn tip(row: &ChainRow) -> ChainTip {
+    ChainTip {
         source_node_id: row.source_node_id.clone(),
         monotonic_seq: row.monotonic_seq,
         hash: row.hash.clone(),
-        anchored_at: anchored_at.to_string(),
     }
 }
 
@@ -90,7 +101,8 @@ fn checkpoint_vectors_give_the_recorded_results() {
         };
         let want_reason = expected.get("reason").and_then(Json::as_str);
 
-        let got = verify_chain_with_checkpoints(&rows, &checkpoints, CheckpointOptions { partial });
+        let opts = if partial { PARTIAL } else { WHOLE };
+        let got = verify_chain_with_checkpoints(&rows, &checkpoints, opts);
         assert_eq!(
             (got.ok, got.first_break_at, got.reason.as_deref()),
             (want_ok, want_at, want_reason),
@@ -104,19 +116,24 @@ fn checkpoint_vectors_give_the_recorded_results() {
 
 #[test]
 fn a_line_is_what_python_writes() {
-    let cp = Checkpoint {
-        source_node_id: "nœud-1".into(),
-        monotonic_seq: 6,
-        hash: "c68f".into(),
-        anchored_at: "2026-06-15T11:00:00.000000Z".into(),
-    };
+    let hash = "c68f".repeat(16);
+    let cp = Checkpoint::new("nœud-1", 6, hash.as_str(), "2026-06-15T11:00:00.000000Z").unwrap();
     // json.dumps(cp.to_dict(), sort_keys=True)
-    let line = r#"{"anchored_at": "2026-06-15T11:00:00.000000Z", "hash": "c68f", "monotonic_seq": 6, "source_node_id": "n\u0153ud-1"}"#;
+    let line = format!(
+        r#"{{"anchored_at": "2026-06-15T11:00:00.000000Z", "hash": "{hash}", "monotonic_seq": 6, "source_node_id": "n\u0153ud-1"}}"#
+    );
     assert_eq!(cp.to_json(), line);
-    assert_eq!(Checkpoint::from_json(line).unwrap(), cp);
+    assert_eq!(Checkpoint::from_json(&line).unwrap(), cp);
     // Go writes the same object compact, in struct order.
-    let go = r#"{"source_node_id":"nœud-1","monotonic_seq":6,"hash":"c68f","anchored_at":"2026-06-15T11:00:00.000000Z"}"#;
-    assert_eq!(Checkpoint::from_json(go).unwrap(), cp);
+    let go = format!(
+        r#"{{"source_node_id":"nœud-1","monotonic_seq":6,"hash":"{hash}","anchored_at":"2026-06-15T11:00:00.000000Z"}}"#
+    );
+    assert_eq!(Checkpoint::from_json(&go).unwrap(), cp);
+    // serde reads and writes the same keys, but not the bytes of a file line.
+    let serde = serde_json::to_string(&cp).unwrap();
+    assert_ne!(serde, line);
+    assert_eq!(serde_json::from_str::<Checkpoint>(&serde).unwrap(), cp);
+    assert_eq!(Checkpoint::from_json(&serde).unwrap(), cp);
 }
 
 #[test]
@@ -151,7 +168,9 @@ fn a_line_that_is_not_a_checkpoint_is_rejected() {
 fn a_checkpoint_at_the_tip_verifies() {
     let rows = chain(6);
     let res = verify_chain_with_checkpoints(&rows, &[cp(&rows[1]), cp(&rows[5])], WHOLE);
-    assert_eq!(res, ChainVerifyResult { ok: true, total_rows: 6, first_break_at: None, reason: None });
+    assert!(res.ok, "{res:?}");
+    assert_eq!((res.total_rows, res.sealed_rows), (6, 6));
+    assert_eq!((res.first_break_at, res.first_break_node, res.reason), (None, None, None));
 }
 
 #[test]
@@ -284,11 +303,59 @@ fn a_purged_chain_verifies_with_the_checkpoints_since_the_purge() {
 fn checkpoints_of_takes_one_per_node() {
     let a = chain_with("node-a", 3, 1);
     let b = chain_with("node-b", 2, 1);
-    let mut twin = b[1].clone();
-    twin.id = "evt-node-b-twin".into();
-    let tips = [a[2].clone(), b[1].clone(), twin];
+    // A second row at node-b's tip seq, as a table without the unique
+    // index can hold: the first one given is kept.
+    let twin = ChainTip { hash: "ab".repeat(32), ..tip(&b[1]) };
+    let tips = [tip(&a[2]), tip(&b[1]), twin];
     let cps = checkpoints_of(&tips, at("2026-06-15T11:00:00.5+00:00"));
     assert_eq!(cps, [cp_at(&a[2], "2026-06-15T11:00:00.500000Z"), cp_at(&b[1], "2026-06-15T11:00:00.500000Z")]);
+}
+
+// An implementer's tips in any order, with a stale one and an unsealed one,
+// still give one checkpoint per node at its highest seq, ordered by node.
+#[test]
+fn checkpoints_of_orders_and_reduces_the_tips() {
+    let a = chain_with("node-a", 3, 1);
+    let b = chain_with("node-b", 2, 1);
+    let unsealed = ChainTip { source_node_id: "node-c".into(), monotonic_seq: 9, hash: String::new() };
+    let tips = [tip(&b[0]), unsealed, tip(&a[2]), tip(&b[1]), tip(&a[0])];
+    let cps = checkpoints_of(&tips, at("2026-06-15T11:00:00Z"));
+    assert_eq!(cps, [cp_at(&a[2], "2026-06-15T11:00:00.000000Z"), cp_at(&b[1], "2026-06-15T11:00:00.000000Z")]);
+}
+
+#[test]
+fn a_new_checkpoint_is_checked() {
+    let hash = "ab".repeat(32);
+    let at = "2026-06-15T11:00:00.000000Z";
+    assert!(Checkpoint::new("node-a", 3, hash.as_str(), at).is_ok());
+    for bad in ["", "abc", &"AB".repeat(32), &"g".repeat(64)] {
+        assert!(matches!(Checkpoint::new("node-a", 3, bad, at), Err(CheckpointError::Hash { .. })), "{bad:?}");
+    }
+    for bad in ["2026-06-15T11:00:00Z", "2026-06-15T11:00:00.000000+00:00", ""] {
+        assert!(
+            matches!(Checkpoint::new("node-a", 3, hash.as_str(), bad), Err(CheckpointError::AnchoredAt { .. })),
+            "{bad:?}"
+        );
+    }
+}
+
+// A node whose rows are all gone still has its recent checkpoint, and the
+// whole-chain verify reports it.
+#[test]
+fn checkpoints_since_keeps_a_recent_checkpoint_of_a_node_with_no_rows() {
+    let rows = chain(5);
+    let gone = chain_with("node-2", 3, 1);
+    let cps = [
+        cp_at(&rows[1], "2026-06-15T11:00:00.000000Z"),
+        cp_at(&rows[4], "2026-06-15T13:00:00.000000Z"),
+        cp_at(&gone[2], "2026-06-15T13:00:00.000000Z"),
+    ];
+    let since = checkpoints_since(&cps, at("2026-06-15T12:00:00Z")).unwrap();
+    assert_eq!(since, cps[1..]);
+    let res = verify_chain_with_checkpoints(&rows, &since, WHOLE);
+    assert_breaks(&res, 3, "node 'node-2': no rows, but checkpointed at seq 3");
+    assert_eq!(res.first_break_node.as_deref(), Some("node-2"));
+    assert!(verify_chain_with_checkpoints(&rows, &since, PARTIAL).ok);
 }
 
 // --- chain tips from the stores ---
@@ -336,7 +403,7 @@ mod stores {
     }
 
     fn assert_tips(store: &dyn Store, prefix: &str) {
-        let tips: Vec<ChainRow> = store
+        let tips: Vec<ChainTip> = store
             .chain_tips()
             .unwrap()
             .into_iter()
@@ -397,9 +464,12 @@ mod stores {
     #[cfg(feature = "postgres")]
     #[test]
     fn postgres_chain_tips_are_each_nodes_last_sealed_row() {
-        let Ok(dsn) = std::env::var("FASTEN_TEST_POSTGRES_DSN") else {
-            return;
-        };
+        let dsn = std::env::var("FASTEN_TEST_POSTGRES_DSN").ok();
+        assert!(
+            dsn.is_some() || std::env::var("FASTEN_REQUIRE_POSTGRES").as_deref() != Ok("1"),
+            "FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set"
+        );
+        let Some(dsn) = dsn else { return };
         let store = fasten_core::PostgresStore::connect(&dsn, "fasten_core_chain_tips").unwrap();
         let prefix = format!("t{}", std::process::id());
         fill(&store, &prefix);

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use fasten_core::chain::{
-    canonical_json, detail_commitment, row_hash, seal, verify_chain, ChainRow, Json,
+    canonical_json, detail_commitment, row_hash, seal, verify_chain, ChainRow, Json, JsonString,
     CURRENT_CANONICAL_FORM_ID,
 };
 use fasten_core::row::Row;
@@ -36,7 +36,12 @@ fn assert_verifies(label: &str, rows: &[ChainRow]) {
     let res = verify_chain(rows);
     assert!(res.ok, "{label}: {:?}", res.reason);
     assert_eq!(res.total_rows, rows.len());
-    assert_eq!(res.first_break_at, None);
+    assert_eq!((res.first_break_at, res.first_break_node), (None, None));
+}
+
+// A vector row with no hash would verify as an unsealed row and prove nothing.
+fn assert_sealed(label: &str, row: &ChainRow) {
+    assert_eq!(row.hash.len(), 64, "{label}: no hash");
 }
 
 fn assert_commitment(label: &str, row: &ChainRow) {
@@ -163,17 +168,20 @@ fn go_sealed_form2_chain_verifies() {
     let rows = rows(&load("spec/go-sealed-form2.json"));
     assert_eq!(rows.len(), 2);
     for row in &rows {
+        assert_sealed(&row.id, row);
         assert_eq!(row.canonical_form_id, "2");
         assert_commitment(&row.id, row);
         assert_eq!(row_hash(row).as_deref(), Some(row.hash.as_str()), "{}", row.id);
     }
     assert_verifies("go-sealed-form2", &rows);
+    assert_eq!(verify_chain(&rows).sealed_rows, 2);
 }
 
 #[test]
 fn go_sealed_numbers_verify() {
     let rows = rows(&load("spec/go-sealed-numbers.json"));
     assert_eq!(rows.len(), 1);
+    assert_sealed("go-sealed-numbers", &rows[0]);
     assert_commitment("go-sealed-numbers", &rows[0]);
     assert_eq!(row_hash(&rows[0]).as_deref(), Some(rows[0].hash.as_str()));
     assert_verifies("go-sealed-numbers", &rows);
@@ -184,6 +192,7 @@ fn python_sealed_form2_and_redacted_rows_verify() {
     let cases = cases(&load("go/xlang_form2.json"));
     assert_eq!(cases.len(), 4);
     for (label, row) in &cases {
+        assert_sealed(label, row);
         assert_eq!(row.canonical_form_id, "2");
         assert_commitment(label, row);
         assert_eq!(row_hash(row).as_deref(), Some(row.hash.as_str()), "{label}");
@@ -309,9 +318,9 @@ fn rust_sealed_row_has_the_hash_python_gives() {
 }
 
 fn wire_json(row: &ChainRow) -> Json {
-    let s = |v: &str| Json::String(v.to_string());
+    let s = |v: &str| Json::String(v.into());
     let o = |v: &Option<String>| v.as_deref().map_or(Json::Null, s);
-    let fields: BTreeMap<String, Json> = [
+    let fields: BTreeMap<JsonString, Json> = [
         ("wire_version", s(&row.wire_version)), ("id", s(&row.id)), ("origin_id", s(&row.origin_id)),
         ("monotonic_seq", Json::Number(row.monotonic_seq.to_string())),
         ("timestamp", s(&row.timestamp)), ("code", s(&row.code)), ("action", s(&row.action)),
@@ -325,7 +334,7 @@ fn wire_json(row: &ChainRow) -> Json {
         ("detail_salt", o(&row.detail_salt)), ("detail_commitment", o(&row.detail_commitment)),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
+    .map(|(k, v)| (k.into(), v))
     .collect();
     Json::Object(fields)
 }
@@ -580,4 +589,214 @@ fn from_value_reports_bad_fields() {
     assert_eq!(row.monotonic_seq, u64::MAX);
     assert_eq!((row.wire_version.as_str(), row.prev_hash.as_str()), ("1", "genesis"));
     assert_eq!(canonical_json(&row.detail), "{}");
+}
+
+// --- the Rust-sealed vector (spec/rust-sealed-form2.json) ---
+//
+// Written by the SDK's own sealing path (rust/src/sqlite_store.rs,
+// `writes_the_rust_sealed_vector`); Python and Go verify the same file.
+
+#[test]
+fn rust_sealed_vector_is_stable() {
+    let rows = rows(&load("spec/rust-sealed-form2.json"));
+    assert_eq!(rows.len(), 4);
+    let mut prev = "genesis".to_string();
+    for (i, row) in rows.iter().enumerate() {
+        assert_sealed(&row.id, row);
+        assert_eq!((row.canonical_form_id.as_str(), row.monotonic_seq), ("2", i as u64 + 1));
+        assert_eq!(row.prev_hash, prev, "{}", row.id);
+        prev.clone_from(&row.hash);
+        assert_eq!(row_hash(row).as_deref(), Some(row.hash.as_str()), "{}: hash drifted", row.id);
+        if row.detail == Json::Null {
+            // Redacted: the detail and the salt are gone, the commitment stays.
+            assert_eq!(row.detail_salt, None);
+            assert_eq!(row.detail_commitment.as_deref().map(str::len), Some(64));
+            continue;
+        }
+        // Sealing again with the recorded salt gives the recorded row.
+        let again = seal(&row.prev_hash, row).unwrap();
+        assert_eq!(again.detail_commitment, row.detail_commitment, "{}: commitment drifted", row.id);
+        assert_eq!(again.hash, row.hash, "{}: hash drifted", row.id);
+    }
+    assert_eq!(rows.iter().filter(|r| r.detail == Json::Null).count(), 1);
+    assert_verifies("rust-sealed-form2", &rows);
+    assert_eq!(verify_chain(&rows).sealed_rows, 4);
+
+    // The details are the ones the vector is for.
+    let details: String = rows.iter().map(|r| r.detail.to_string()).collect();
+    for token in ["75.0", "1e-7", "18446744073709551615", "1.2345678901234568e+29", "\\u00e9", "\\u007f", "{\"list\":["] {
+        assert!(details.contains(token), "{token} not in {details}");
+    }
+
+    let mut changed = rows.clone();
+    changed[0].detail = Json::parse(r#"{"setpoint": 76.0}"#).unwrap();
+    assert_breaks_at(&changed, 1, "detail does not match its commitment");
+}
+
+// --- strings and numbers Python stores that plain JSON parsers refuse ---
+
+// Expected text and hashes are CPython 3.12's, from python/fasten/chain.py:
+// json.loads of the detail text, sealed with the salt shown.
+const PY_SURROGATE_DETAIL: &str = r#"{"name": "\udcff.txt", "\ud800": 1, "": 2, "\ue000": 3, "\ud83d\ude00": 4, "pair": "\ud83d\ude00", "tail": "a\udfffb"}"#;
+const PY_SURROGATE_CANONICAL: &str = r#"{"":2,"name":"\udcff.txt","pair":"\ud83d\ude00","tail":"a\udfffb","\ud800":1,"\ue000":3,"\ud83d\ude00":4}"#;
+const PY_SURROGATE_COMMITMENT: &str = "d65606d442d772bd4fdf71642e7854181587978af7c27cbf22dafe9aca1ff5ce";
+const PY_SURROGATE_HASH: &str = "8a76f4a637269afe76df1686e0b533c1fe7b948b264a253e179ec2634cb07461";
+const PY_NAN_DETAIL: &str = r#"{"nan": NaN, "inf": Infinity, "ninf": -Infinity, "list": [NaN, 1.5]}"#;
+const PY_NAN_CANONICAL: &str = r#"{"inf":Infinity,"list":[NaN,1.5],"nan":NaN,"ninf":-Infinity}"#;
+const PY_NAN_COMMITMENT: &str = "595df41153437098fa85880c9820a81c52bb6063b15d628ee0b6dd708e618c8b";
+const PY_NAN_HASH: &str = "de157b8f434d3a7495bae23bdc9b1d8f7985f4e96e2d35a2654c5e138022389c";
+
+fn py_row(seq: u64, detail: &str, salt: &str) -> ChainRow {
+    let mut row = ChainRow::from_json(&format!(
+        r#"{{"wire_version": "1", "id": "evt-py-{seq}", "origin_id": "evt-py-{seq}", "monotonic_seq": {seq},
+            "timestamp": "2026-06-15T10:30:45.123456Z", "code": "SENSOR_READ", "action": "read",
+            "severity": "info", "service_id": "gateway", "source_node_id": "node-py", "actor": "plc-7",
+            "actor_kind": "device", "target": "sensor/42", "category": "telemetry", "domain": "plant",
+            "method": "mqtt", "request_id": "req-1", "detail": {detail}}}"#
+    ))
+    .unwrap();
+    row.detail_salt = Some(salt.to_string());
+    row
+}
+
+#[test]
+fn unpaired_surrogates_round_trip_as_cpython_writes_them() {
+    for (text, canonical) in [
+        (r#""\udcff""#, r#""\udcff""#),
+        (r#""\ud83d\ude00""#, r#""\ud83d\ude00""#),
+        (r#""\ude00\ud83d""#, r#""\ude00\ud83d""#),
+        // Keys sort by code point: a lone surrogate after U+D7FF, before U+E000.
+        (r#"{"\ud800":1,"":2,"\ue000":3,"\ud83d\ude00":4}"#, r#"{"":2,"\ud800":1,"\ue000":3,"\ud83d\ude00":4}"#),
+        (PY_SURROGATE_DETAIL, PY_SURROGATE_CANONICAL),
+    ] {
+        let parsed = Json::parse(text).unwrap();
+        assert_eq!(canonical_json(&parsed), canonical, "{text}");
+        // The text a store writes reads back as the same value.
+        assert_eq!(Json::parse(&parsed.to_string()).unwrap(), parsed, "{text}");
+    }
+    // A pair is one character; a lone surrogate is not text.
+    assert_eq!(Json::parse(r#""\ud83d\ude00""#).unwrap().as_str(), Some("\u{1f600}"));
+    let lone = Json::parse(r#""a\udcffb""#).unwrap();
+    assert_eq!(lone.as_str(), None);
+    let Json::String(lone) = lone else { panic!() };
+    assert_eq!(lone.to_string_lossy(), "a\u{fffd}b");
+    assert_eq!(lone.code_points().collect::<Vec<_>>(), [0x61, 0xdcff, 0x62]);
+    assert_ne!(JsonString::from("a\u{fffd}b"), lone);
+}
+
+#[test]
+fn python_sealed_row_with_unpaired_surrogates_verifies() {
+    let salt = "a0".repeat(32);
+    let sealed = seal("genesis", &py_row(1, PY_SURROGATE_DETAIL, &salt)).unwrap();
+    assert_eq!(sealed.detail_commitment.as_deref(), Some(PY_SURROGATE_COMMITMENT));
+    assert_eq!(sealed.hash, PY_SURROGATE_HASH);
+    assert_verifies("surrogates", std::slice::from_ref(&sealed));
+
+    let mut changed = sealed;
+    changed.detail = Json::parse(&PY_SURROGATE_DETAIL.replace("udcff", "udcfe")).unwrap();
+    assert_breaks_at(&[changed], 1, "detail does not match its commitment");
+}
+
+#[test]
+fn nan_and_infinity_are_numbers_as_in_python() {
+    let parsed = Json::parse("[NaN, Infinity, -Infinity]").unwrap();
+    assert_eq!(canonical_json(&parsed), "[NaN,Infinity,-Infinity]");
+    assert_eq!(parsed.to_string(), "[NaN,Infinity,-Infinity]");
+    assert_eq!(canonical_json(&Json::parse(PY_NAN_DETAIL).unwrap()), PY_NAN_CANONICAL);
+    for bad in ["-NaN", "nan", "Inf", "-Inf", "+Infinity", "Infinit", "NaNx", "infinity"] {
+        assert!(Json::parse(bad).is_err(), "{bad}");
+    }
+
+    let first = seal("genesis", &py_row(1, PY_SURROGATE_DETAIL, &"a0".repeat(32))).unwrap();
+    let second = seal(&first.hash, &py_row(2, PY_NAN_DETAIL, &"a1".repeat(32))).unwrap();
+    assert_eq!(second.detail_commitment.as_deref(), Some(PY_NAN_COMMITMENT));
+    assert_eq!(second.hash, PY_NAN_HASH);
+    assert_verifies("nan", &[first, second]);
+}
+
+// --- what the result says ---
+
+#[test]
+fn an_all_unsealed_stream_verifies_with_no_sealed_rows() {
+    let rows = vec![base_row(1), base_row(2)];
+    let res = verify_chain(&rows);
+    assert!(res.ok);
+    assert_eq!((res.total_rows, res.sealed_rows), (2, 0));
+    let res = verify_chain(&[]);
+    assert!(res.ok);
+    assert_eq!((res.total_rows, res.sealed_rows), (0, 0));
+
+    // Copies of a row count once; unsealed rows not at all.
+    let mut rows = chain(3);
+    rows.push(rows[0].clone());
+    rows.insert(0, { let mut r = base_row(9); r.source_node_id = "node-2".into(); r });
+    let res = verify_chain(&rows);
+    assert!(res.ok, "{res:?}");
+    assert_eq!((res.total_rows, res.sealed_rows), (5, 3));
+}
+
+#[test]
+fn a_break_names_its_node() {
+    let mut a = chain(3);
+    let mut b = chain(4);
+    for row in &mut b {
+        row.source_node_id = "node-b".into();
+    }
+    // Sealed for node-1, so every node-b row fails its hash; the edit on
+    // node-1 is at a higher seq.
+    a[2].target = "order/999".into();
+    let res = verify_chain(&[a.clone(), b].concat());
+    assert_eq!((res.first_break_at, res.first_break_node.as_deref()), (Some(1), Some("node-b")));
+    let res = verify_chain(&a);
+    assert_eq!((res.first_break_at, res.first_break_node.as_deref()), (Some(3), Some("node-1")));
+}
+
+#[test]
+fn an_unsealed_row_tied_with_the_first_sealed_seq_breaks_in_any_order() {
+    let sealed = chain(2);
+    let mut tie = base_row(1);
+    tie.id = "evt-tie".into();
+    for rows in [[vec![tie.clone()], sealed.clone()].concat(), [sealed.clone(), vec![tie.clone()]].concat()] {
+        assert_breaks_at(&rows, 1, "no hash after the node's chain started");
+    }
+}
+
+#[test]
+fn an_edit_below_a_duplicate_seq_is_the_first_break() {
+    let mut rows = chain(4);
+    let mut twin = rows[2].clone();
+    twin.id = "evt-twin".into();
+    rows.push(twin);
+    assert_breaks_at(&rows, 3, "duplicate monotonic_seq 3");
+    rows[1].target = "order/999".into();
+    assert_breaks_at(&rows, 2, "hash mismatch");
+}
+
+#[test]
+fn an_empty_salt_or_commitment_reads_as_none() {
+    let text = r#"{"id": "evt-1", "monotonic_seq": 1, "detail_salt": "", "detail_commitment": ""}"#;
+    let row = ChainRow::from_json(text).unwrap();
+    assert_eq!((row.detail_salt.as_deref(), row.detail_commitment.as_deref()), (None, None));
+    assert_eq!((row.wire_version.as_str(), row.prev_hash.as_str(), row.hash.as_str()), ("1", "genesis", ""));
+
+    let mut core = Row::default();
+    let odd = ChainRow { detail_salt: Some(String::new()), detail_commitment: Some(String::new()), ..row };
+    odd.stamp(&mut core);
+    assert_eq!((core.detail_salt, core.detail_commitment), (None, None));
+
+    // A row field cannot hold an unpaired surrogate.
+    let bad = ChainRow::from_json(r#"{"id": "evt-\udcff", "monotonic_seq": 1}"#);
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[test]
+fn from_row_takes_the_detail_from_its_text() {
+    let mut core = Row { id: "evt-1".into(), monotonic_seq: 1, ..Default::default() };
+    core.detail = serde_json::json!({"n": 1.0e2});
+    let text = r#"{"n": 1.0E+2, "big": 123456789012345678901234567890, "z": -0}"#;
+    let row = ChainRow::from_row(&core, text).unwrap();
+    assert_eq!(row.detail, Json::parse(text).unwrap());
+    assert_eq!(row.detail.to_string(), r#"{"big":123456789012345678901234567890,"n":1.0E+2,"z":-0}"#);
+    assert_ne!(row.detail, ChainRow::from(&core).detail);
+    assert!(ChainRow::from_row(&core, "{").is_err());
 }

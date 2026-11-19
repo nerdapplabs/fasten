@@ -24,14 +24,18 @@ pub use fasten_core::drainer::QueueStats;
 
 /// Hash-chain verification (spec/chain-replication.md §3), re-exported from
 /// fasten-core. Build [`ChainRow`]s with a bundled store's `chain_rows`, or
-/// from captured stdout lines with [`ChainRow::from_json`].
-pub use fasten_core::chain::{verify_chain, ChainRow, ChainVerifyResult};
+/// from captured stdout lines with [`ChainRow::from_json`]. [`Json`] is the
+/// type of a `ChainRow`'s `detail`, and [`GENESIS`] the `prev_hash` of a
+/// node's first sealed row.
+pub use fasten_core::chain::{
+    verify_chain, ChainError, ChainRow, ChainVerifyResult, Json, JsonString, GENESIS,
+};
 
 pub mod checkpoints;
 pub use checkpoints::{
     checkpoints_since, load_checkpoints, publish_checkpoints, take_checkpoints,
-    verify_chain_with_checkpoints, Checkpoint, CheckpointError, CheckpointOptions, CheckpointSink,
-    CheckpointStore, FileCheckpointSink,
+    verify_chain_with_checkpoints, ChainTip, Checkpoint, CheckpointError, CheckpointFileError,
+    CheckpointOptions, CheckpointSink, CheckpointStore, FileCheckpointSink,
 };
 
 /// Raised by `EmitBuilder::submit()` in `raise` mode when the store insert fails.
@@ -161,7 +165,10 @@ pub enum Anchor {
 }
 
 /// Audit row; the wire shape is spec/row-schema.json.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Row::default()` is an empty row at the Unix epoch, for struct-update
+/// syntax: `Row { id, code, ..Default::default() }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Row {
     pub wire_version: String,
 
@@ -315,8 +322,18 @@ pub enum Error {
     NotInitialised,
     #[error("audit_store_failure_strategy must be \"queue\" or \"raise\" (got {0:?})")]
     InvalidStrategy(String),
+    /// A store insert failed in a way a retry may fix, such as a lost
+    /// connection. In queue mode the row is retried.
     #[error("audit store: {0}")]
     AuditStoreInsert(String),
+    /// Reading from the store failed: `chain_rows`, `chain_tips`, or a
+    /// stored row that cannot be read back.
+    #[error("audit store read: {0}")]
+    AuditStoreRead(String),
+    /// The row could not be sealed, so nothing was stored. The database was
+    /// not the cause. In queue mode the row is retried.
+    #[error("seal: {0}")]
+    Seal(String),
     /// The store refused the row itself (bad data, a constraint, a size
     /// limit), so retrying cannot help. In queue mode the row is
     /// dead-lettered at once. A custom [`AuditStore`] can return it too.
@@ -328,10 +345,54 @@ pub enum Error {
     InvalidRetention(String),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
+    /// A checkpoint file could not be read or written. Names the path.
+    #[error(transparent)]
+    CheckpointFile(#[from] CheckpointFileError),
+    /// A row or its detail is not what the chain can read, for example a
+    /// stdout line that is not a row.
+    #[error(transparent)]
+    Chain(#[from] ChainError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// An error of the adopter's own, for a custom [`AuditStore`] or
+    /// [`CheckpointSink`] to return what none of the variants above fits.
+    /// Build it with [`Error::custom`].
+    #[error(transparent)]
+    Custom(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Error {
+    /// Wrap an adopter's own error as [`Error::Custom`].
+    pub fn custom(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Error::Custom(e.into())
+    }
+}
+
+/// A copy of `row` at `monotonic_seq`, sealed after `prev_hash`: the hash of
+/// the node's last sealed row, or [`GENESIS`] when it has none. Chain fields
+/// `row` came with are replaced, the salt included.
+///
+/// For a custom [`AuditStore`] that seals: call it inside the insert
+/// transaction, after taking the per-node lock and reading the node's
+/// highest seq and its tip, and store the row it returns. The hash covers
+/// the timestamp at microsecond precision and `detail` as `serde_json`
+/// renders it, so store both that way.
+pub fn seal_row(prev_hash: &str, row: &Row, monotonic_seq: u64) -> Result<Row, Error> {
+    let mut core = engine::sdk_row_to_core(row);
+    core.monotonic_seq = monotonic_seq;
+    core.detail_salt = None;
+    let sealed = fasten_core::chain::seal_row(prev_hash, &core).map_err(|e| Error::Seal(e.to_string()))?;
+    Ok(Row {
+        monotonic_seq,
+        prev_hash: sealed.prev_hash.unwrap_or_default(),
+        hash: sealed.hash.unwrap_or_default(),
+        canonical_form_id: sealed.canonical_form_id.unwrap_or_default(),
+        detail_salt: sealed.detail_salt,
+        detail_commitment: sealed.detail_commitment,
+        ..row.clone()
+    })
 }
 
 pub(crate) fn registry() -> &'static RwLock<HashMap<String, Meta>> {
@@ -614,19 +675,46 @@ fn redact_detail(
 }
 
 /// Adopter-supplied store. Sync trait so the core compiles without tokio.
+///
+/// A store that only keeps rows implements `insert`. A store that seals
+/// them overrides `seals` and `allocate_and_insert_originated` together:
+/// one without the other either reports rows as chained that are not, or
+/// seals them while `init` logs that the chain is unavailable.
 pub trait AuditStore: Send + Sync {
+    /// Store `row` as it is. The engine does not call this itself: `submit`,
+    /// the drainer and redaction all go through
+    /// `allocate_and_insert_originated`, whose default calls it. It is the
+    /// whole write path of a store that does not seal, and on one that does
+    /// it is for callers that hold a store and want no row back.
     fn insert(&self, row: &Row) -> Result<(), Error>;
 
     /// Whether `allocate_and_insert_originated` seals rows into the node's
-    /// hash chain. When false, `init` logs `audit_chain_unavailable`.
+    /// hash chain. It controls only what the engine reports: when false,
+    /// `init` logs `audit_chain_unavailable`; when true, a seq-0 row that
+    /// comes back from the store without a hash is logged as
+    /// `audit_chain_row_unsealed`. It does not make the engine seal
+    /// anything.
     fn seals(&self) -> bool {
         false
     }
 
-    /// Insert a row this node originated and return it as stored. A store
-    /// that seals allocates `monotonic_seq`, reads the node's chain tip and
-    /// seals the row in one transaction (spec §2.1), and returns the sealed
-    /// row. The default calls `insert` and returns the row unchanged.
+    /// Insert a row this node originated and return it as stored. This is
+    /// the method the engine writes through, and what decides whether a row
+    /// is sealed.
+    ///
+    /// A store that seals does this for a row with `monotonic_seq` 0, in one
+    /// transaction (spec §2.1): takes the node's lock, allocates the seq,
+    /// reads the node's chain tip, seals the row (see [`seal_row`]) and
+    /// stores it. It returns the sealed row, which the engine then writes to
+    /// stdout as the row's second line. It must also return `true` from
+    /// `seals`.
+    ///
+    /// A row that arrives with a seq of its own is stored as given: unsealed
+    /// unless it already carries a hash. An unsealed row at or above a
+    /// node's sealed rows makes `verify_chain` fail for that node, so do not
+    /// mix the two on one node id.
+    ///
+    /// The default calls `insert` and returns the row unchanged.
     fn allocate_and_insert_originated(&self, row: &Row) -> Result<Row, Error> {
         self.insert(row)?;
         Ok(row.clone())
@@ -672,8 +760,9 @@ pub struct Config {
     /// `EmitBuilder::submit()` puts rows on a bounded in-memory queue that is
     /// drained in the background.
     pub audit_store: Option<Arc<dyn AuditStore>>,
-    /// "queue" (default) or "raise". `raise` makes `submit()` call
-    /// `insert` synchronously and wrap errors in `AuditStoreError`.
+    /// "queue" (default) or "raise". `raise` makes `submit()` call the
+    /// store's `allocate_and_insert_originated` synchronously and wrap
+    /// errors in `AuditStoreError`.
     /// Empty / None falls back to `FASTEN_AUDIT_STORE_FAILURE_STRATEGY`.
     pub audit_store_failure_strategy: Option<String>,
     /// Queue capacity (queued + in-flight retry). Default: 100.
@@ -903,17 +992,40 @@ impl EmitBuilder {
         Ok(row)
     }
 
+    /// Write `row` to stdout as an audit line. A row that cannot be
+    /// serialised or written is reported as `audit_stdout_failed` on stderr
+    /// and the caller carries on: by then the row may already be stored.
     pub(crate) fn write_audit_stdout(row: &Row) {
-        if let Ok(mut payload) = serde_json::to_value(row) {
-            if let serde_json::Value::Object(map) = &mut payload {
-                map.insert("shape".into(), serde_json::Value::String("audit".into()));
+        #[cfg(test)]
+        if crate::engine::stdout_closed_for(&row.service_id) {
+            return Self::write_audit_line(row, &mut crate::engine::ClosedPipe);
+        }
+        Self::write_audit_line(row, &mut std::io::stdout().lock());
+    }
+
+    pub(crate) fn write_audit_line(row: &Row, out: &mut dyn std::io::Write) {
+        let written = match serde_json::to_value(row) {
+            Ok(mut payload) => {
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert("shape".into(), serde_json::Value::String("audit".into()));
+                }
+                let written = writeln!(out, "{payload}").map_err(|_| "Io");
+                #[cfg(test)]
+                if written.is_ok() {
+                    crate::engine::AUDIT_STDOUT.lock().unwrap_or_else(|e| e.into_inner()).push(payload);
+                }
+                written
             }
-            #[cfg(test)]
-            crate::engine::AUDIT_STDOUT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(payload.clone());
-            println!("{}", payload);
+            Err(_) => Err("Json"),
+        };
+        if let Err(error_type) = written {
+            // Type only, and no cfg at hand: service_id comes from the row.
+            crate::engine::sys_line(None, "error", "audit_stdout_failed", serde_json::json!({
+                "error_type": error_type,
+                "row_id": row.id,
+                "service_id": row.service_id,
+                "sealed": !row.hash.is_empty(),
+            }));
         }
     }
 
@@ -1334,19 +1446,9 @@ mod tests {
             if let Some(stored) = rows.iter().find(|r| r.id == row.id) {
                 return Ok(stored.clone());
             }
-            let prev = rows.last().map_or("genesis".to_string(), |r| r.hash.clone());
-            let mut core = engine::sdk_row_to_core(row);
-            core.monotonic_seq = rows.len() as u64 + 1;
-            let sealed = fasten_core::chain::seal_row(&prev, &core).unwrap();
-            let sealed = Row {
-                monotonic_seq: sealed.monotonic_seq,
-                prev_hash: sealed.prev_hash.unwrap(),
-                hash: sealed.hash.unwrap(),
-                canonical_form_id: sealed.canonical_form_id.unwrap(),
-                detail_salt: sealed.detail_salt,
-                detail_commitment: sealed.detail_commitment,
-                ..row.clone()
-            };
+            // What the crate exports is enough to seal.
+            let prev = rows.last().map_or(GENESIS.to_string(), |r| r.hash.clone());
+            let sealed = seal_row(&prev, row, rows.len() as u64 + 1)?;
             rows.push(sealed.clone());
             Ok(sealed)
         }
@@ -1458,6 +1560,188 @@ mod tests {
         assert_eq!((row.monotonic_seq, row.hash.as_str()), (0, ""));
         assert_eq!(audit_lines(&row.id).len(), 1);
         e.reset_for_tests();
+    }
+
+    /// A sealing store whose first `fail` inserts fail as a lost connection
+    /// does.
+    struct Flaky {
+        store: SealingStore,
+        fail: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Flaky {
+        fn failing(times: usize) -> Self {
+            Self { store: SealingStore::default(), fail: times.into() }
+        }
+    }
+
+    impl AuditStore for Flaky {
+        fn insert(&self, row: &Row) -> Result<(), Error> {
+            self.allocate_and_insert_originated(row).map(|_| ())
+        }
+        fn seals(&self) -> bool {
+            true
+        }
+        fn allocate_and_insert_originated(&self, row: &Row) -> Result<Row, Error> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.fail.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
+                return Err(Error::AuditStoreInsert("down".into()));
+            }
+            self.store.allocate_and_insert_originated(row)
+        }
+    }
+
+    fn service_lines(service_id: &str) -> Vec<serde_json::Value> {
+        engine::AUDIT_STDOUT.lock().unwrap().iter().filter(|v| v["service_id"] == service_id).cloned().collect()
+    }
+
+    // Raise mode: a failed insert is an error, the row has its one unsealed
+    // line and nothing more, and the failure took no seq.
+    #[test]
+    fn raise_mode_failed_insert_leaves_one_line_and_no_gap() {
+        register("seal_fail".into(), [("SEAL_FAIL".into(), plain_meta("seal_fail"))]).unwrap();
+        let store = Arc::new(Flaky::failing(1));
+        let e = Engine::new();
+        e.init(chain_config("svc-seal-fail", store.clone(), "raise")).unwrap();
+        let err = EmitBuilder::new("SEAL_FAIL", "t").submit_to(&e).expect_err("insert fails");
+        assert!(matches!(err.source, Error::AuditStoreInsert(_)), "{err:?}");
+        let lines = service_lines("svc-seal-fail");
+        assert_eq!(lines.len(), 1);
+        assert_eq!((&lines[0]["monotonic_seq"], &lines[0]["hash"]), (&0.into(), &"".into()));
+
+        let next = EmitBuilder::new("SEAL_FAIL", "t").submit_to(&e).expect("submit");
+        assert_eq!((next.monotonic_seq, next.prev_hash.as_str()), (1, GENESIS));
+        assert_eq!(service_lines("svc-seal-fail").len(), 3);
+        assert!(verify_chain(&store.store.chain()).ok);
+        e.reset_for_tests();
+    }
+
+    // Queue mode: the drainer retries the failed insert, and the row ends
+    // with exactly two lines, the second sealed at seq 1.
+    #[test]
+    fn queue_mode_retried_insert_writes_two_lines() {
+        register("seal_retry".into(), [("SEAL_RETRY".into(), plain_meta("seal_retry"))]).unwrap();
+        let store = Arc::new(Flaky::failing(1));
+        let e = Engine::new();
+        e.init(Config {
+            queue_retry_initial: Some(Duration::from_millis(5)),
+            disable_queue_jitter: true,
+            ..chain_config("svc-seal-retry", store.clone(), "queue")
+        })
+        .unwrap();
+        let row = EmitBuilder::new("SEAL_RETRY", "t").submit_to(&e).expect("submit");
+        assert!(e.flush(Duration::from_secs(10)));
+
+        let lines = audit_lines(&row.id);
+        assert_eq!(lines.len(), 2);
+        assert_eq!((&lines[0]["monotonic_seq"], &lines[0]["hash"]), (&0.into(), &"".into()));
+        assert_eq!(lines[1]["monotonic_seq"], 1);
+        assert_eq!(lines[1]["hash"].as_str().map(str::len), Some(64));
+        let chain = store.store.chain();
+        assert_eq!(chain.len(), 1);
+        let result = verify_chain(&chain);
+        assert!(result.ok && result.sealed_rows == 1, "{result:?}");
+        e.reset_for_tests();
+    }
+
+    // A retry of a row that is already stored (its first insert landed but
+    // the caller never heard) gets the stored row back and writes the sealed
+    // line again: the same line, so a capture still verifies.
+    #[test]
+    fn a_retry_of_a_stored_row_prints_the_sealed_line_again() {
+        register("seal_again".into(), [("SEAL_AGAIN".into(), plain_meta("seal_again"))]).unwrap();
+        let store = SealingStore::default();
+        let cfg = chain_config("svc-seal-again", Arc::new(SealingStore::default()), "raise");
+        let row = EmitBuilder::new("SEAL_AGAIN", "t").build_row(&cfg).unwrap();
+        let first = engine::store_row(&store, &row).unwrap();
+        let again = engine::store_row(&store, &row).unwrap();
+        assert_eq!((again.monotonic_seq, &again.hash), (1, &first.hash));
+        let lines = audit_lines(&row.id);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], lines[1]);
+        assert_eq!(lines[0]["hash"], serde_json::json!(first.hash));
+        let captured: Vec<ChainRow> =
+            lines.iter().map(|l| ChainRow::from_json(&l.to_string()).unwrap()).collect();
+        let result = verify_chain(&captured);
+        assert!(result.ok && result.sealed_rows == 1, "{result:?}");
+    }
+
+    // The row is stored before its sealed line is written, so a stdout that
+    // fails then must not turn a stored row into an error or a panic.
+    #[test]
+    fn a_failed_stdout_write_after_the_insert_is_reported_not_raised() {
+        register("seal_pipe".into(), [("SEAL_PIPE".into(), plain_meta("seal_pipe"))]).unwrap();
+        let store = Arc::new(SealingStore::default());
+        let e = Engine::new();
+        e.init(chain_config("svc-seal-pipe", store.clone(), "raise")).unwrap();
+        engine::close_stdout_for("svc-seal-pipe");
+        let row = EmitBuilder::new("SEAL_PIPE", "t").submit_to(&e).expect("the row is stored");
+        assert_eq!((row.monotonic_seq, row.hash.len()), (1, 64));
+        assert_eq!(store.rows.lock().unwrap().len(), 1);
+        assert!(audit_lines(&row.id).is_empty());
+        // One event for the unsealed line and one for the sealed one.
+        let failed = sys_lines("svc-seal-pipe", "audit_stdout_failed");
+        assert_eq!(failed.len(), 2);
+        assert!(failed.iter().all(|l| l["row_id"] == row.id.as_str() && l["error_type"] == "Io"));
+        assert_eq!((&failed[0]["sealed"], &failed[1]["sealed"]), (&false.into(), &true.into()));
+
+        // In queue mode the drainer must count the row as stored.
+        e.init(chain_config("svc-seal-pipe", store.clone(), "queue")).unwrap();
+        let queued = EmitBuilder::new("SEAL_PIPE", "t").submit_to(&e).expect("submit");
+        assert!(e.flush(Duration::from_secs(5)));
+        let stats = e.queue_stats().unwrap();
+        assert_eq!((stats.dead_lettered_total, store.rows.lock().unwrap().len()), (0, 2));
+        assert!(sys_lines("svc-seal-pipe", "audit_stdout_failed").iter().any(|l| l["row_id"] == queued.id.as_str()));
+        e.reset_for_tests();
+    }
+
+    // A store that says it seals but hands rows back unsealed is reported
+    // once, with the first such row.
+    #[test]
+    fn a_store_that_claims_to_seal_but_does_not_is_reported_once() {
+        struct Claims;
+        impl AuditStore for Claims {
+            fn insert(&self, _: &Row) -> Result<(), Error> { Ok(()) }
+            fn seals(&self) -> bool { true }
+        }
+        register("seal_claim".into(), [("SEAL_CLAIM".into(), plain_meta("seal_claim"))]).unwrap();
+        let e = Engine::new();
+        e.init(chain_config("svc-seal-claim", Arc::new(Claims), "raise")).unwrap();
+        // init trusts seals(), so it says nothing.
+        assert!(sys_lines("svc-seal-claim", "audit_chain_unavailable").is_empty());
+        let first = EmitBuilder::new("SEAL_CLAIM", "t").submit_to(&e).expect("submit");
+        EmitBuilder::new("SEAL_CLAIM", "t").submit_to(&e).expect("submit");
+        let lines = sys_lines("svc-seal-claim", "audit_chain_row_unsealed");
+        assert_eq!(lines.len(), 1);
+        assert_eq!((&lines[0]["row_id"], &lines[0]["level"]), (&first.id.as_str().into(), &"error".into()));
+        e.reset_for_tests();
+    }
+
+    // What a custom sealing store and its errors need is exported.
+    #[test]
+    fn row_default_and_chain_errors() {
+        let row = Row { id: "evt-1".into(), code: "X".into(), ..Default::default() };
+        assert_eq!((row.monotonic_seq, row.hash.as_str(), row.detail_salt.as_deref()), (0, "", None));
+        let sealed = seal_row(GENESIS, &row, 1).unwrap();
+        assert_eq!((sealed.prev_hash.as_str(), sealed.canonical_form_id.as_str()), ("genesis", "2"));
+        // Sealing replaces the chain fields the row came with, the salt too.
+        let again = seal_row(&sealed.hash, &Row { id: "evt-2".into(), ..sealed.clone() }, 2).unwrap();
+        assert_ne!(again.detail_salt, sealed.detail_salt);
+        let chain: Vec<ChainRow> = [&sealed, &again]
+            .iter()
+            .map(|r| ChainRow::from_json(&serde_json::to_string(r).unwrap()).unwrap())
+            .collect();
+        assert!(verify_chain(&chain).ok);
+        assert_eq!(chain[0].detail, Json::parse("{}").unwrap());
+
+        let parse: ChainError = ChainRow::from_json("{").unwrap_err();
+        let err: Error = parse.into();
+        assert!(matches!(err, Error::Chain(_)), "{err:?}");
+        assert_eq!(retention::error_type(&err), "Chain");
+        assert_eq!(retention::error_type(&Error::Seal("no entropy".into())), "Seal");
+        assert_eq!(retention::error_type(&Error::AuditStoreRead("x".into())), "AuditStoreRead");
+        let custom = Error::custom(std::io::Error::other("vault sealed"));
+        assert_eq!((custom.to_string().as_str(), retention::error_type(&custom)), ("vault sealed", "Custom"));
     }
 
     #[test]

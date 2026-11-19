@@ -82,7 +82,11 @@ impl Store for ArcStoreShim {
     fn insert(&self, row: &Row) -> Result<(), Error> { self.0.insert(row) }
     fn ping(&self) -> Result<(), Error> { self.0.ping() }
     fn query(&self, f: &Filter) -> Result<Vec<Row>, Error> { self.0.query(f) }
+    fn insert_sealed(&self, row: &crate::chain::ChainRow, pii_in_detail: bool) -> Result<(), Error> {
+        self.0.insert_sealed(row, pii_in_detail)
+    }
     fn chain_rows(&self, f: &Filter) -> Result<Vec<crate::chain::ChainRow>, Error> { self.0.chain_rows(f) }
+    fn chain_tips(&self) -> Result<Vec<crate::checkpoint::ChainTip>, Error> { self.0.chain_tips() }
     fn count(&self, f: &Filter) -> Result<u64, Error> { self.0.count(f) }
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error> { self.0.list_unshipped(limit) }
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> { self.0.mark_shipped(ids) }

@@ -5,13 +5,17 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     chain::ChainRow,
+    checkpoint::ChainTip,
     error::Error,
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
 };
 
-use super::{chain_row, chain_tips_sql, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{
+    chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql, sealed_at,
+    sealed_columns, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS,
+};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -236,17 +240,17 @@ impl SqliteStore {
         Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
     }
 
-    /// The rows matching `filter`, ordered by `monotonic_seq`, each mapped
-    /// by `map`.
+    /// The rows matching `filter`, ordered by `order`, each mapped by `map`.
     fn select<T>(
         &self,
         filter: &Filter,
+        order: &str,
         map: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>, Error> {
         let (where_clause, params_owned) = build_filter_where(filter);
         // LIMIT and OFFSET are integers, so interpolating them is safe.
         let mut sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY {order}",
             self.table, where_clause
         );
         if filter.limit > 0 {
@@ -268,37 +272,47 @@ impl SqliteStore {
     }
 
     /// Insert `row` as [`Store::insert`] does and return it as stored: with
-    /// the seq and chain fields the store gave it, or, when its id was
-    /// already stored, the ones that row has. A row with a seq of its own is
-    /// returned as given.
+    /// the seq and chain fields the store gave it. A row with a seq of its
+    /// own is returned as given.
+    ///
+    /// When a row with this id is already stored, nothing is written. If
+    /// the stored row is the same event (and, for a row with its own seq,
+    /// at that seq with that hash), `row` comes back with the stored seq
+    /// and chain fields; otherwise the error is `RowRejected`.
     pub fn insert_stored(&self, row: &Row) -> Result<Row, Error> {
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if row.monotonic_seq != 0 {
-            insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64)?;
-            return Ok(row.clone());
-        }
+        self.put(row, None)?.stored(row)
+    }
 
-        // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
+    /// Write `row`, with `detail` as the text of its detail column or, when
+    /// `None`, `row.detail` as `serde_json` renders it. A stored id is left
+    /// as it is.
+    fn put(&self, row: &Row, detail: Option<&str>) -> Result<Outcome, Error> {
+        let rendered;
+        let detail = match detail {
+            Some(text) => text,
+            None => {
+                rendered = serde_json::to_string(&row.detail)?;
+                &rendered
+            }
+        };
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // BEGIN IMMEDIATE takes the write lock before the reads, so two
         // handles on one file cannot both read the same tip (spec §2.1).
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = tx
+        let held = tx
             .query_row(
                 &format!("SELECT {SELECT_COLUMNS} FROM {} WHERE id = ?1", self.table),
                 rusqlite::params![row.id],
-                row_from_sqlite,
+                |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)),
             )
             .optional()?;
-        let stored = if let Some(old) = existing {
-            Row {
-                monotonic_seq: old.monotonic_seq,
-                prev_hash: old.prev_hash,
-                hash: old.hash,
-                canonical_form_id: old.canonical_form_id,
-                detail_salt: old.detail_salt,
-                detail_commitment: old.detail_commitment,
-                ..row.clone()
-            }
+        let outcome = if let Some((held, text)) = held {
+            Outcome::Held(held, text)
+        } else if row.monotonic_seq != 0 {
+            insert_row(&tx, &self.insert_sql, row, column_seq(row)?, detail)?;
+            Outcome::Inserted(row.clone())
         } else {
+            check_originated(row)?;
             let seq: i64 = tx.query_row(
                 &format!(
                     "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
@@ -314,12 +328,12 @@ impl SqliteStore {
                 .query_row(&tip_sql(&self.table, "?1"), rusqlite::params![row.source_node_id], |r| r.get(0))
                 .optional()?;
             let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
-            let sealed = sealed_at(row, seq.unsigned_abs(), prev_hash)?;
-            insert_row(&tx, &self.insert_sql, &sealed, seq)?;
-            sealed
+            let sealed = sealed_at(row, seq, prev_hash)?;
+            insert_row(&tx, &self.insert_sql, &sealed, seq, detail)?;
+            Outcome::Inserted(sealed)
         };
         tx.commit()?;
-        Ok(stored)
+        Ok(outcome)
     }
 
     fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
@@ -356,7 +370,12 @@ fn placeholders(from: usize, n: usize) -> String {
 
 impl Store for SqliteStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
-        self.insert_stored(row).map(|_| ())
+        self.put(row, None).map(|_| ())
+    }
+
+    fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), Error> {
+        let (columns, detail) = sealed_columns(row, pii_in_detail)?;
+        self.put(&columns, Some(&detail))?.sealed(row)
     }
 
     fn ping(&self) -> Result<(), Error> {
@@ -366,23 +385,29 @@ impl Store for SqliteStore {
     }
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
-        self.select(filter, row_from_sqlite)
+        self.select(filter, "monotonic_seq ASC", row_from_sqlite)
     }
 
     fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
-        self.select(filter, |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
-            .iter()
-            .map(|(row, detail)| chain_row(row, detail))
-            .collect()
+        self.select(filter, "source_node_id, monotonic_seq", |r| {
+            Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?))
+        })?
+        .iter()
+        .map(|(row, detail)| chain_row(row, detail))
+        .collect()
     }
 
-    fn chain_tips(&self) -> Result<Vec<ChainRow>, Error> {
+    fn chain_tips(&self) -> Result<Vec<ChainTip>, Error> {
         let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = guard.prepare(&chain_tips_sql(&self.table, SELECT_COLUMNS))?;
+        let mut stmt = guard.prepare(&chain_tips_sql(&self.table))?;
         let tips = stmt
-            .query_map([], |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
+            .query_map([], |r| {
+                let node: String = r.get(0)?;
+                let monotonic_seq = seq_column(r, 1, &format!("node '{node}'"))?;
+                Ok(ChainTip { source_node_id: node, monotonic_seq, hash: r.get(2)? })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        tips.iter().map(|(row, detail)| chain_row(row, detail)).collect()
+        Ok(tips)
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {
@@ -496,7 +521,9 @@ impl Store for SqliteStore {
             let allowed = gate.allowed();
             let mut stmt = tx.prepare(&format!("SELECT id, monotonic_seq {base}{allowed}"))?;
             let rows = stmt.query_map(params.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.unsigned_abs()))
+                let id: String = r.get(0)?;
+                let seq = seq_column(r, 1, &format!("row {id}"))?;
+                Ok((id, seq))
             })?;
             for r in rows {
                 out.rows.push(r?);
@@ -539,8 +566,8 @@ impl Store for SqliteStore {
     }
 }
 
-fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Result<(), Error> {
-    let detail_str = serde_json::to_string(&row.detail)?;
+/// Insert `row` at `seq`, with `detail` as the text of its detail column.
+fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<(), Error> {
     let pii: i64 = row.pii_in_detail as i64;
     let mut stmt = conn.prepare_cached(insert_sql)?;
     stmt.execute(rusqlite::params![
@@ -562,7 +589,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64) -> Resul
         row.domain,
         row.method,
         row.request_id,
-        detail_str,
+        detail,
         pii,
         row.shipped_at,     // None is stored as NULL
         row.prev_hash.as_deref().unwrap_or(""),
@@ -645,17 +672,31 @@ fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     (clause, params)
 }
 
+/// The seq in column `idx` of the row or node `owner` names. A negative
+/// value is an error that names the owner and the value.
+fn seq_column(r: &rusqlite::Row, idx: usize, owner: &str) -> rusqlite::Result<u64> {
+    let seq: i64 = r.get(idx)?;
+    u64::try_from(seq).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Integer,
+            format!("{owner}: monotonic_seq {seq} is negative").into(),
+        )
+    })
+}
+
 /// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.
 fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Row> {
     let detail_str: String = r.get(18)?;
     let detail = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
     let pii: i64 = r.get(19)?;
-    let seq: i64 = r.get(3)?;
+    let id: String = r.get(0)?;
+    let seq = seq_column(r, 3, &format!("row {id}"))?;
     Ok(Row {
-        id:             r.get(0)?,
+        id,
         wire_version:   r.get(1)?,
         origin_id:      r.get(2)?,
-        monotonic_seq:  seq.unsigned_abs(),
+        monotonic_seq:  seq,
         timestamp:      r.get(4)?,
         code:           r.get(5)?,
         action:         r.get(6)?,

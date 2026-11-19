@@ -9,6 +9,8 @@ on:
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
       - 'spec/**'
+      # fasten-core/tests/chain.rs reads this Python-sealed vector.
+      - 'go/xlang_form2.json'
       - '.github/actions/setup-swift/**'
   pull_request:
     paths:
@@ -17,6 +19,7 @@ on:
       - 'fasten-core/**'
       - '.github/workflows/fasten-rust.yml'
       - 'spec/**'
+      - 'go/xlang_form2.json'
       - '.github/actions/setup-swift/**'
   workflow_call:
 
@@ -72,6 +75,8 @@ jobs:
       - name: Unit tests
         env:
           FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test
+          # The Postgres tests fail, instead of returning early, without a DSN.
+          FASTEN_REQUIRE_POSTGRES: "1"
         run: cargo test --locked --quiet --features store-postgres,store-sqlite,codes-yaml,async
 
       # rust/ depends on fasten-core with default-features = false, so its
@@ -81,9 +86,11 @@ jobs:
         working-directory: fasten-core
         # native-tls needs pkg-config and the OpenSSL headers. The rust
         # container runs as root and has no sudo.
-        # Without the DSN the Postgres store tests return early and pass.
+        # Without the DSN the Postgres store tests return early and pass;
+        # FASTEN_REQUIRE_POSTGRES makes them fail instead.
         env:
           FASTEN_TEST_POSTGRES_DSN: postgres://fasten:fasten@postgres:5432/fasten_test?sslmode=disable
+          FASTEN_REQUIRE_POSTGRES: "1"
         run: |
           apt-get update -qq
           apt-get install -y -qq pkg-config libssl-dev

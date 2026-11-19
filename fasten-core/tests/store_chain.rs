@@ -1,12 +1,15 @@
 //! The stores seal rows on insert (spec/chain-replication.md §2.1), and
 //! `chain_rows` reads them back for `verify_chain`.
 //!
-//! The Postgres tests need `FASTEN_TEST_POSTGRES_DSN` and pass without it.
+//! The Postgres tests need `FASTEN_TEST_POSTGRES_DSN`. Without it they
+//! return early, unless `FASTEN_REQUIRE_POSTGRES=1`, which makes them fail.
 
 #![cfg(feature = "sqlite")]
 
-use fasten_core::chain::{seal, verify_chain, ChainRow, ChainVerifyResult};
-use fasten_core::{Filter, Row, SqliteStore, Store};
+use std::sync::{Arc, Barrier};
+
+use fasten_core::chain::{seal, verify_chain, ChainRow, ChainVerifyResult, Json};
+use fasten_core::{Error, Filter, Row, SqliteStore, Store};
 
 fn row(id: &str, node: &str) -> Row {
     Row {
@@ -76,6 +79,51 @@ impl TempDb {
     }
 }
 
+/// The rows of a vector file, as another SDK sealed them.
+fn vector_rows(path: &str) -> Vec<ChainRow> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
+    let file = Json::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let rows = match file.get("cases") {
+        Some(cases) => cases.as_array().unwrap().iter().map(|c| c.get("row").unwrap().clone()).collect(),
+        None => file.as_array().unwrap().to_vec(),
+    };
+    rows.iter().map(|r| ChainRow::from_value(r).unwrap()).collect()
+}
+
+const VECTOR_COLUMNS: &str = "id, wire_version, origin_id, monotonic_seq, timestamp, code, action, \
+     severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, \
+     method, request_id, detail, shipped_at, prev_hash, hash, canonical_form_id, detail_salt, \
+     detail_commitment";
+
+/// A vector row as the values of `VECTOR_COLUMNS`, the seq apart: what the
+/// SDK that sealed it writes, with `detail` as the text in the file.
+fn vector_values(r: &ChainRow) -> (Vec<Option<String>>, i64) {
+    let some = |s: &str| Some(s.to_string());
+    let values = vec![
+        some(&r.id), some(&r.wire_version), some(&r.origin_id), None, some(&r.timestamp), some(&r.code),
+        some(&r.action), some(&r.severity), some(&r.service_id), some(&r.source_node_id),
+        r.tenant_id.clone(), some(&r.actor), some(&r.actor_kind), some(&r.target), some(&r.category),
+        some(&r.domain), some(&r.method), some(&r.request_id), Some(r.detail.to_string()),
+        r.shipped_at.clone(), some(&r.prev_hash), some(&r.hash), some(&r.canonical_form_id),
+        Some(r.detail_salt.clone().unwrap_or_default()), Some(r.detail_commitment.clone().unwrap_or_default()),
+    ];
+    (values, i64::try_from(r.monotonic_seq).unwrap())
+}
+
+/// Insert vector rows into the SQLite table with plain SQL, as another SDK
+/// on the same file would.
+fn sql_insert(db: &TempDb, rows: &[ChainRow]) {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let marks: Vec<String> = (1..=25).map(|i| format!("?{i}")).collect();
+    let sql = format!("INSERT INTO audit_log ({VECTOR_COLUMNS}) VALUES ({})", marks.join(", "));
+    for r in rows {
+        let (values, seq) = vector_values(r);
+        let params: Vec<&dyn rusqlite::ToSql> =
+            values.iter().enumerate().map(|(i, v)| if i == 3 { &seq as &dyn rusqlite::ToSql } else { v }).collect();
+        conn.execute(&sql, params.as_slice()).unwrap();
+    }
+}
+
 impl Drop for TempDb {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -95,7 +143,9 @@ fn sqlite_rows_are_sealed_per_node() {
         assert_unbroken(&rows, 5);
     }
     let all = store.chain_rows(&Filter::default()).unwrap();
-    assert_eq!(verify_chain(&all), ChainVerifyResult { ok: true, total_rows: 10, first_break_at: None, reason: None });
+    let res = verify_chain(&all);
+    assert!(res.ok, "{res:?}");
+    assert_eq!((res.total_rows, res.sealed_rows), (10, 10));
 }
 
 /// A repeated id is stored once and takes no seq.
@@ -115,10 +165,14 @@ fn sqlite_repeated_id_keeps_the_chain() {
 fn sqlite_two_handles_write_one_chain() {
     let db = TempDb::new("conc");
     drop(db.open());
+    // Every thread starts inserting at once.
+    let start = Arc::new(Barrier::new(4));
     let handles: Vec<_> = (0..4)
         .map(|t| {
             let store = db.open();
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
+                start.wait();
                 for i in 0..50 {
                     store.insert(&row(&format!("evt-{t}-{i}"), "node-1")).unwrap();
                 }
@@ -269,6 +323,239 @@ fn sqlite_chain_rows_keep_stored_number_tokens() {
     assert!(!verify_chain(&lossy).ok);
 }
 
+fn python_numbers_id() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec/python-sealed-forms.json");
+    let file = Json::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let cases = file.get("cases").unwrap().as_array().unwrap();
+    let case = cases.iter().find(|c| c.get("label").and_then(Json::as_str) == Some("form2_numbers")).unwrap();
+    case.get("row").unwrap().get("id").and_then(Json::as_str).unwrap().to_string()
+}
+
+/// Another SDK's sealed rows, put in the table with plain SQL: the next row
+/// this store seals takes the next seq and links to their tip.
+#[test]
+fn sqlite_extends_a_go_chain() {
+    let db = TempDb::new("go-chain");
+    let store = db.open();
+    let go = vector_rows("spec/go-sealed-form2.json");
+    assert_eq!(go.len(), 2);
+    sql_insert(&db, &go);
+
+    let mine = store.insert_stored(&row("evt-rust-1", "node-1")).unwrap();
+    assert_eq!((mine.monotonic_seq, mine.prev_hash.as_deref()), (3, Some(go[1].hash.as_str())));
+    let (rows, result) = verify(&store, "node-1");
+    assert!(result.ok, "{result:?}");
+    assert_eq!((rows.len(), result.sealed_rows), (3, 3));
+    // The Go rows read back as Go sealed them.
+    assert_eq!(rows[..2], go[..]);
+}
+
+#[test]
+fn sqlite_extends_a_python_chain_with_numeric_detail() {
+    let db = TempDb::new("py-chain");
+    let store = db.open();
+    let python: Vec<ChainRow> =
+        vector_rows("spec/python-sealed-forms.json").into_iter().filter(|r| r.id == python_numbers_id()).collect();
+    assert_eq!(python.len(), 1);
+    assert!(python[0].detail.to_string().contains("12345678901234567890"));
+    sql_insert(&db, &python);
+
+    let mine = store.insert_stored(&row("evt-rust-1", "node-1")).unwrap();
+    assert_eq!((mine.monotonic_seq, mine.prev_hash.as_deref()), (2, Some(python[0].hash.as_str())));
+    let (rows, result) = verify(&store, "node-1");
+    assert!(result.ok, "{result:?}");
+    assert_eq!((rows.len(), result.sealed_rows), (2, 2));
+    assert_eq!(rows[0], python[0]);
+}
+
+/// A row sealed elsewhere over number tokens a `Row` cannot hold.
+fn sealed_elsewhere(id: &str, seq: u64, prev: &str, detail: &str) -> ChainRow {
+    let mut core = row(id, "node-x");
+    core.monotonic_seq = seq;
+    seal(prev, &ChainRow::from_row(&core, detail).unwrap()).unwrap()
+}
+
+const EXACT_DETAILS: [&str; 4] = [
+    r#"{"n":123456789012345678901234567890}"#,
+    r#"{"n":-0}"#,
+    r#"{"f":1.0E+2,"nan":NaN,"name":"\udcff.txt"}"#,
+    r#"{"plain":75.0}"#,
+];
+
+/// `insert_sealed` stores each detail as it was sealed, so the chain
+/// verifies; `insert` of the same rows as `Row`s does not keep them all.
+fn assert_exact_details(store: &dyn Store) {
+    let mut rows: Vec<ChainRow> = Vec::new();
+    for (i, detail) in EXACT_DETAILS.iter().enumerate() {
+        let prev = rows.last().map_or("genesis".to_string(), |r| r.hash.clone());
+        rows.push(sealed_elsewhere(&format!("evt-x{i}"), i as u64 + 1, &prev, detail));
+    }
+    assert!(verify_chain(&rows).ok);
+    for r in &rows {
+        store.insert_sealed(r, true).unwrap();
+    }
+    let (stored, result) = verify(store, "node-x");
+    assert!(result.ok, "{result:?}");
+    assert_eq!(stored, rows);
+    assert_eq!(result.sealed_rows, 4);
+    assert!(store.query(&node("node-x")).unwrap().iter().all(|r| r.pii_in_detail));
+
+    // The same row again is a no-op; another row under its id is refused,
+    // and so is a row that is not sealed.
+    store.insert_sealed(&rows[1], true).unwrap();
+    let other = sealed_elsewhere("evt-x1", 9, "genesis", r#"{"n":1}"#);
+    assert!(matches!(store.insert_sealed(&other, false), Err(Error::RowRejected(_))));
+    let clash = sealed_elsewhere("evt-x-clash", 2, "genesis", r#"{"n":1}"#);
+    assert!(matches!(store.insert_sealed(&clash, false), Err(Error::SeqClash(_))));
+    let unsealed = ChainRow { hash: String::new(), ..sealed_elsewhere("evt-x8", 8, "genesis", "{}") };
+    assert!(matches!(store.insert_sealed(&unsealed, false), Err(Error::RowRejected(_))));
+    let no_seq = sealed_elsewhere("evt-x0", 0, "genesis", "{}");
+    assert!(matches!(store.insert_sealed(&no_seq, false), Err(Error::RowRejected(_))));
+    assert_eq!(verify(store, "node-x").0, rows);
+
+    // What `insert` writes for the first two: the text serde_json renders.
+    for (i, r) in rows.iter().take(2).enumerate() {
+        let mut core = row(&format!("evt-y{i}"), "node-y");
+        core.monotonic_seq = r.monotonic_seq;
+        core.detail = serde_json::from_str(EXACT_DETAILS[i]).unwrap();
+        let mut again = r.clone();
+        again.id.clone_from(&core.id);
+        again.origin_id.clone_from(&core.id);
+        again.source_node_id = "node-y".into();
+        let prev = if i == 0 { "genesis".to_string() } else { verify(store, "node-y").0[0].hash.clone() };
+        seal(&prev, &again).unwrap().stamp(&mut core);
+        store.insert(&core).unwrap();
+    }
+    let (_, lossy) = verify(store, "node-y");
+    assert!(!lossy.ok, "a Row kept a 30-digit integer and -0");
+    assert!(lossy.reason.unwrap_or_default().contains("does not match its commitment"));
+}
+
+#[test]
+fn sqlite_row_sealed_elsewhere_keeps_its_detail_text() {
+    assert_exact_details(&SqliteStore::open(":memory:", "audit_log", false).unwrap());
+}
+
+/// A stored id: the same row comes back as stored, another row is refused.
+fn assert_stored_ids(store: &dyn Store, insert_stored: &dyn Fn(&Row) -> Result<Row, Error>) {
+    let first = insert_stored(&row("evt-1", "node-1")).unwrap();
+    // A retry of the same row gets the stored seq and chain fields.
+    let again = insert_stored(&row("evt-1", "node-1")).unwrap();
+    let wire = |r: &Row| serde_json::to_value(r).unwrap();
+    assert_eq!(wire(&again), wire(&first));
+    // The same id with other content is not the stored row.
+    let other = Row { target: "res-2".into(), ..row("evt-1", "node-1") };
+    let err = insert_stored(&other).unwrap_err();
+    assert!(matches!(&err, Error::RowRejected(m) if m.contains("row evt-1: differs")), "{err:?}");
+    // `insert` keeps its contract: a stored id is left alone.
+    store.insert(&other).unwrap();
+
+    // A row with its own seq: stored once, the same row again is returned,
+    // and the id at another seq or with another hash is refused.
+    let own = Row { monotonic_seq: 7, ..row("evt-7", "node-1") };
+    assert_eq!(wire(&insert_stored(&own).unwrap()), wire(&own));
+    let stored = insert_stored(&own).unwrap();
+    assert_eq!((stored.monotonic_seq, stored.hash.as_deref().unwrap_or("")), (7, ""));
+    let moved = Row { monotonic_seq: 8, ..own.clone() };
+    assert!(matches!(insert_stored(&moved), Err(Error::RowRejected(_))));
+    let sealed = Row { hash: Some("ab".repeat(32)), ..own.clone() };
+    assert!(matches!(insert_stored(&sealed), Err(Error::RowRejected(_))));
+    // A stored id is not a new row for seq 0 either.
+    let as_new = Row { monotonic_seq: 0, target: "res-9".into(), ..own };
+    assert!(matches!(insert_stored(&as_new), Err(Error::RowRejected(_))));
+
+    let seqs: Vec<u64> = store.query(&node("node-1")).unwrap().iter().map(|r| r.monotonic_seq).collect();
+    assert_eq!(seqs, [1, 7]);
+}
+
+#[test]
+fn sqlite_stored_id_is_returned_or_refused() {
+    let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+    assert_stored_ids(&store, &|r: &Row| store.insert_stored(r));
+}
+
+/// A seq-0 row is sealed here, so it must be one this node originated.
+fn assert_foreign_origin_refused(store: &dyn Store) {
+    store.insert(&row("evt-1", "node-1")).unwrap();
+    let foreign = Row { origin_id: "evt-somewhere-else".into(), ..row("evt-2", "node-1") };
+    let err = store.insert(&foreign).unwrap_err();
+    assert!(matches!(&err, Error::RowRejected(m) if m.contains("origin_id == id")), "{err:?}");
+    // The refused row took no seq.
+    store.insert(&row("evt-3", "node-1")).unwrap();
+    let (rows, result) = verify(store, "node-1");
+    assert!(result.ok, "{result:?}");
+    assert_unbroken(&rows, 2);
+    // With its own seq it is a replicated row and is stored as given.
+    store.insert(&Row { monotonic_seq: 9, ..foreign }).unwrap();
+}
+
+#[test]
+fn sqlite_foreign_origin_is_refused_and_takes_no_seq() {
+    assert_foreign_origin_refused(&SqliteStore::open(":memory:", "audit_log", false).unwrap());
+}
+
+/// An insert that fails inside the transaction takes no seq: the next row
+/// gets it and the chain has no gap.
+#[test]
+fn sqlite_failed_sealing_insert_takes_no_seq() {
+    let db = TempDb::new("abort");
+    let store = db.open();
+    db.sql(
+        "CREATE TRIGGER refuse_one BEFORE INSERT ON audit_log WHEN NEW.id = 'evt-refused'
+         BEGIN SELECT RAISE(ABORT, 'refused by trigger'); END",
+    );
+    store.insert(&row("evt-0", "node-1")).unwrap();
+    let err = store.insert(&row("evt-refused", "node-1")).unwrap_err();
+    assert!(err.to_string().contains("refused by trigger"), "{err}");
+    assert!(store.insert_stored(&row("evt-refused", "node-1")).is_err());
+    let next = store.insert_stored(&row("evt-1", "node-1")).unwrap();
+    assert_eq!(next.monotonic_seq, 2);
+
+    let (rows, result) = verify(&store, "node-1");
+    assert!(result.ok, "{result:?}");
+    assert_unbroken(&rows, 2);
+    assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["evt-0", "evt-1"]);
+}
+
+/// A negative seq is not read as its absolute value.
+#[test]
+fn sqlite_negative_seq_is_an_error() {
+    let db = TempDb::new("negative");
+    let store = db.open();
+    store.insert(&row("evt-1", "node-1")).unwrap();
+    db.sql("UPDATE audit_log SET monotonic_seq = -5");
+    for err in [
+        store.chain_rows(&node("node-1")).unwrap_err(),
+        store.query(&node("node-1")).unwrap_err(),
+        store.chain_tips().unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("monotonic_seq -5 is negative"), "{err}");
+    }
+    let err = store.chain_rows(&node("node-1")).unwrap_err().to_string();
+    assert!(err.contains("row evt-1"), "{err}");
+    // The next seq would be -4: nothing is sealed over it.
+    let err = store.insert(&row("evt-2", "node-1")).unwrap_err();
+    assert!(err.to_string().contains("next monotonic_seq -4 is negative"), "{err}");
+    assert_eq!(store.count(&Filter::default()).unwrap(), 1);
+}
+
+/// `chain_rows` returns the table node by node, each in seq order.
+#[test]
+fn sqlite_chain_rows_are_ordered_by_node_then_seq() {
+    let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+    for (id, n) in [("b1", "node-b"), ("a1", "node-a"), ("b2", "node-b"), ("a2", "node-a")] {
+        store.insert(&row(id, n)).unwrap();
+    }
+    let order: Vec<(String, u64)> = store
+        .chain_rows(&Filter::default())
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.source_node_id, r.monotonic_seq))
+        .collect();
+    let want = [("node-a", 1), ("node-a", 2), ("node-b", 1), ("node-b", 2)];
+    assert_eq!(order, want.map(|(n, s)| (n.to_string(), s)));
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -276,7 +563,105 @@ mod postgres {
     use fasten_core::PostgresStore;
 
     fn dsn() -> Option<String> {
-        std::env::var("FASTEN_TEST_POSTGRES_DSN").ok()
+        let dsn = std::env::var("FASTEN_TEST_POSTGRES_DSN").ok();
+        assert!(
+            dsn.is_some() || std::env::var("FASTEN_REQUIRE_POSTGRES").as_deref() != Ok("1"),
+            "FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set"
+        );
+        dsn
+    }
+
+    /// Insert vector rows with plain SQL, as another SDK on the table would.
+    fn sql_insert(dsn: &str, table: &str, rows: &[ChainRow]) {
+        let mut c = connect_client(dsn).unwrap();
+        let marks: Vec<String> = (1..=25).map(|i| format!("${i}")).collect();
+        let sql = format!("INSERT INTO {table} ({VECTOR_COLUMNS}) VALUES ({})", marks.join(", "));
+        for r in rows {
+            let (values, seq) = vector_values(r);
+            let params: Vec<&(dyn pg::types::ToSql + Sync)> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| if i == 3 { &seq as &(dyn pg::types::ToSql + Sync) } else { v })
+                .collect();
+            c.execute(sql.as_str(), &params).unwrap();
+        }
+    }
+
+    #[test]
+    fn extends_a_go_chain_and_a_python_chain() {
+        let Some(dsn) = dsn() else { return };
+        let go = vector_rows("spec/go-sealed-form2.json");
+        let python: Vec<ChainRow> = vector_rows("spec/python-sealed-forms.json")
+            .into_iter()
+            .filter(|r| r.id == python_numbers_id())
+            .map(|r| ChainRow { source_node_id: "node-py".into(), ..r })
+            .collect();
+        let store = fresh(&dsn, "fasten_chain_pg_extend");
+        sql_insert(&dsn, "fasten_chain_pg_extend", &go);
+        let mine = store.insert_stored(&row("evt-rust-1", "node-1")).unwrap();
+        assert_eq!((mine.monotonic_seq, mine.prev_hash.as_deref()), (3, Some(go[1].hash.as_str())));
+        let (rows, result) = verify(&store, "node-1");
+        assert!(result.ok, "{result:?}");
+        assert_eq!((rows.len(), result.sealed_rows), (3, 3));
+        assert_eq!(rows[..2], go[..]);
+
+        // The Python row is sealed for node-1; stored under another node it
+        // is the tip a new row links to, and fails only its own hash.
+        sql_insert(&dsn, "fasten_chain_pg_extend", &python);
+        let next = store.insert_stored(&row("evt-rust-2", "node-py")).unwrap();
+        assert_eq!((next.monotonic_seq, next.prev_hash.as_deref()), (2, Some(python[0].hash.as_str())));
+    }
+
+    #[test]
+    fn a_row_sealed_elsewhere_keeps_its_detail_text() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_chain_pg_exact");
+        assert_exact_details(&store);
+    }
+
+    #[test]
+    fn a_stored_id_is_returned_or_refused() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_chain_pg_held");
+        let insert = |r: &Row| store.insert_stored(r);
+        assert_stored_ids(&store, &insert);
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused_and_takes_no_seq() {
+        let Some(dsn) = dsn() else { return };
+        let store = fresh(&dsn, "fasten_chain_pg_origin");
+        assert_foreign_origin_refused(&store);
+    }
+
+    // A column of another type, or a negative seq, is an error that names
+    // the row, not a panic.
+    #[test]
+    fn unreadable_rows_are_errors() {
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_chain_pg_unreadable";
+        let store = fresh(&dsn, table);
+        store.insert(&row("evt-1", "node-1")).unwrap();
+        let mut c = connect_client(&dsn).unwrap();
+        c.batch_execute(&format!("UPDATE {table} SET monotonic_seq = -5")).unwrap();
+        for err in [
+            store.chain_rows(&node("node-1")).unwrap_err(),
+            store.query(&node("node-1")).unwrap_err(),
+            store.chain_tips().unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("monotonic_seq -5 is negative"), "{err}");
+        }
+        // The next seq would be negative too: nothing is sealed over it.
+        let err = store.insert(&row("evt-2", "node-1")).unwrap_err();
+        assert!(err.to_string().contains("is negative"), "{err}");
+
+        c.batch_execute(&format!(
+            "UPDATE {table} SET monotonic_seq = 1;
+             ALTER TABLE {table} ALTER COLUMN timestamp TYPE TIMESTAMPTZ USING timestamp::timestamptz"
+        ))
+        .unwrap();
+        let err = store.chain_rows(&node("node-1")).unwrap_err().to_string();
+        assert!(err.contains("row evt-1: column timestamp"), "{err}");
     }
 
     fn fresh(dsn: &str, table: &str) -> PostgresStore {
@@ -307,11 +692,15 @@ mod postgres {
         let Some(dsn) = dsn() else { return };
         let table = "fasten_chain_pg_conc";
         drop(fresh(&dsn, table));
+        // Every connection is open before any thread inserts.
+        let start = Arc::new(Barrier::new(4));
         let handles: Vec<_> = (0..4)
             .map(|t| {
                 let dsn = dsn.clone();
+                let start = Arc::clone(&start);
                 std::thread::spawn(move || {
                     let store = PostgresStore::connect(&dsn, table).unwrap();
+                    start.wait();
                     for i in 0..50 {
                         store.insert(&row(&format!("evt-{t}-{i}"), "node-1")).unwrap();
                     }
@@ -352,6 +741,8 @@ mod postgres {
             ("UPDATE {t} SET actor = 'mallory' WHERE monotonic_seq = 2", 2, "hash mismatch"),
             ("UPDATE {t} SET detail = '{\"n\":8}' WHERE monotonic_seq = 3", 3, "does not match its commitment"),
             ("DELETE FROM {t} WHERE monotonic_seq = 2", 3, "prev_hash does not match"),
+            // An edited row with its hash cleared is not read as unsealed.
+            ("UPDATE {t} SET hash = '', prev_hash = '', actor = 'mallory' WHERE monotonic_seq = 4", 4, "no hash after"),
         ] {
             let store = fresh(&dsn, table);
             for i in 0..5 {

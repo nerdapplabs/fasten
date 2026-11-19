@@ -122,7 +122,13 @@ void fasten_store_close(FastenStore* store);
 /**
  * Insert a single audit row.
  *
- * A row whose `id` already exists is ignored, so inserts are idempotent.
+ * A row whose `id` already exists is ignored, so inserts are idempotent:
+ * nothing is written and FASTEN_OK is returned, whatever the new row holds.
+ * A repeated id with monotonic_seq 0 keeps the first row's seq and chain
+ * fields. The caller gets only a status, never the row as stored, so it
+ * cannot see the seq or hash the store gave a row; read them back with the
+ * query functions. A row with monotonic_seq 0 must have origin_id equal to
+ * id; any other is refused.
  *
  * monotonic_seq 0 means "allocate": the store assigns the next seq for the
  * row's source_node_id and seals the row into the node's hash chain, inside

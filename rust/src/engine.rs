@@ -4,6 +4,7 @@
 //! `EmitBuilder::submit()` all use [`DEFAULT`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,14 +100,25 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
 
 /// Insert `row` through the store's allocating insert and return it as
 /// stored. When the store sealed it, the sealed row is written to stdout,
-/// after the unsealed line `submit` wrote (spec §8).
+/// after the unsealed line `submit` wrote (spec §8). A failed write of that
+/// line is reported, not returned: the row is stored.
 pub(crate) fn store_row(store: &dyn AuditStore, row: &crate::Row) -> Result<crate::Row, Error> {
     let stored = store.allocate_and_insert_originated(row)?;
     if !stored.hash.is_empty() {
         crate::EmitBuilder::write_audit_stdout(&stored);
+    } else if row.monotonic_seq == 0 && store.seals() && !UNSEALED_REPORTED.swap(true, Ordering::Relaxed) {
+        // The store says it seals but gave back an unsealed row. Said once
+        // per process, with the first such row.
+        sys_line(None, "error", "audit_chain_row_unsealed", serde_json::json!({
+            "row_id": stored.id,
+            "service_id": stored.service_id,
+            "reason": "the audit store reports seals() but returned the row without a hash",
+        }));
     }
     Ok(stored)
 }
+
+static UNSEALED_REPORTED: AtomicBool = AtomicBool::new(false);
 
 // Lets the fasten-core drainer write through an SDK `AuditStore`.
 
@@ -360,7 +372,10 @@ fn write_sys(
     if stdout {
         println!("{payload}");
     } else {
-        eprintln!("{payload}");
+        // Not eprintln: a closed stderr must not panic the caller, which may
+        // be reporting a row it has already stored.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "{payload}");
     }
 }
 
@@ -371,6 +386,34 @@ pub(crate) static SYS_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::ne
 /// Every audit line written to stdout.
 #[cfg(test)]
 pub(crate) static AUDIT_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+
+/// Services whose audit lines go to a writer that fails, as a closed stdout
+/// does.
+#[cfg(test)]
+static STDOUT_CLOSED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn close_stdout_for(service_id: &str) {
+    STDOUT_CLOSED.lock_or_recover().push(service_id.to_string());
+}
+
+#[cfg(test)]
+pub(crate) fn stdout_closed_for(service_id: &str) -> bool {
+    STDOUT_CLOSED.lock_or_recover().iter().any(|s| s == service_id)
+}
+
+#[cfg(test)]
+pub(crate) struct ClosedPipe;
+
+#[cfg(test)]
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 impl Default for Engine {
     fn default() -> Self { Self::new() }
@@ -433,5 +476,19 @@ mod adapter_tests {
         assert!(matches!(err, fasten_core::Error::RowRejected(ref t) if t == "AuditStoreRejected"), "{err:?}");
         let err = SdkStoreAdapter(Arc::new(Refusing(false))).insert(&row).unwrap_err();
         assert!(matches!(err, fasten_core::Error::Store(ref t) if t == "AuditStoreInsert"), "{err:?}");
+    }
+
+    /// A row that could not be sealed is retried, and the drainer's
+    /// `last_error` says it was the seal, not the database.
+    #[test]
+    fn a_seal_failure_reaches_the_drainer_by_its_own_name() {
+        struct Unsealable;
+        impl AuditStore for Unsealable {
+            fn insert(&self, _: &crate::Row) -> Result<(), crate::Error> {
+                Err(crate::Error::Seal("random source unavailable".into()))
+            }
+        }
+        let err = SdkStoreAdapter(Arc::new(Unsealable)).insert(&fasten_core::Row::default()).unwrap_err();
+        assert!(matches!(err, fasten_core::Error::Store(ref t) if t == "Seal"), "{err:?}");
     }
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{chain::ChainRow, error::Error, row::Row};
+use crate::{chain::ChainRow, checkpoint::ChainTip, error::Error, row::Row};
 
 /// Query filter for read-path operations.
 ///
@@ -87,19 +87,42 @@ impl RedactGate {
 /// Implementations must be `Send + Sync`; methods are called from several
 /// threads.
 pub trait Store: Send + Sync {
-    /// Persist `row`.  Duplicate IDs are silently ignored
-    /// (`ON CONFLICT (id) DO NOTHING`).
+    /// Persist `row`. A row whose id is already stored is left as it is and
+    /// the call succeeds, whatever the new row holds.
     ///
     /// When `row.monotonic_seq` is 0 the store assigns the next seq for
     /// `row.source_node_id` and seals the row after the node's last sealed
     /// row, all inside the insert transaction (spec §2.1). Chain fields the
-    /// row carries are replaced.
+    /// row carries are replaced. The row must be one this node originated:
+    /// an `origin_id` other than `id` is `RowRejected`.
     ///
-    /// A non-zero seq is written as given, chain fields included: a sealed
-    /// row replicated from elsewhere keeps its hash, and a row without one
-    /// stays unsealed. A writer that picks its own seqs must not share a
-    /// node id with rows sealed here (spec §8.2).
+    /// A non-zero seq is written as given, chain fields included, so a row
+    /// without a hash is stored unsealed. An unsealed row at or above a
+    /// node's sealed rows makes `verify_chain` fail for that node, so a
+    /// writer that picks its own seqs must not share a node id with rows
+    /// sealed here (spec §8.2).
+    ///
+    /// `detail` is written as `serde_json` renders `row.detail`. That keeps
+    /// the hash of a row this process built, but not always of a row sealed
+    /// elsewhere: a `Row` cannot hold `-0`, an integer past 64 bits, `NaN` or
+    /// an unpaired surrogate as its writer hashed them. Store those with
+    /// [`Store::insert_sealed`].
     fn insert(&self, row: &Row) -> Result<(), Error>;
+
+    /// Persist a sealed row from elsewhere exactly as it was sealed: every
+    /// field as given, and `detail` as the text of `row.detail`
+    /// ([`crate::chain::Json`]'s `Display`), so each number token and string
+    /// reads back as it was hashed. `pii_in_detail` is the row's flag, which
+    /// a `ChainRow` does not carry.
+    ///
+    /// The row must have a hash and a non-zero `monotonic_seq`; anything
+    /// else is `RowRejected`. The hash is not verified here: verify the
+    /// batch with `verify_chain` first. Storing the same row again is a
+    /// no-op; a different row under a stored id is `RowRejected`, and a
+    /// clash on `(source_node_id, monotonic_seq)` is `SeqClash`.
+    fn insert_sealed(&self, _row: &ChainRow, _pii_in_detail: bool) -> Result<(), Error> {
+        Err(Error::Unsupported("insert_sealed"))
+    }
 
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
     /// sufficient; on PostgreSQL, a lost connection is re-established first.
@@ -109,10 +132,15 @@ pub trait Store: Send + Sync {
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error>;
 
     /// Rows matching `filter` as [`ChainRow`]s for
-    /// [`crate::chain::verify_chain`], ordered by `monotonic_seq ASC`. Their
-    /// `detail` is parsed from the stored text, so every number is the token
-    /// that was hashed; `query` reads numbers into `serde_json` types, which
-    /// can change them.
+    /// [`crate::chain::verify_chain`], ordered by `source_node_id`, then
+    /// `monotonic_seq`. Their `detail` is parsed from the stored text, so
+    /// every number is the token that was hashed; `query` reads numbers into
+    /// `serde_json` types, which can change them.
+    ///
+    /// Every matching row is read into memory in one query, and the store's
+    /// connection is held until it returns, so inserts wait meanwhile.
+    /// `filter.limit` and `filter.offset` page through a large table; a page
+    /// is a partial chain (see `CheckpointOptions::partial`).
     fn chain_rows(&self, _filter: &Filter) -> Result<Vec<ChainRow>, Error> {
         Err(Error::Unsupported("chain_rows"))
     }
@@ -120,7 +148,7 @@ pub trait Store: Send + Sync {
     /// Each node's sealed row with the highest `monotonic_seq`, ordered by
     /// node id, for [`crate::checkpoint::checkpoints_of`]. A node with no
     /// sealed row is left out.
-    fn chain_tips(&self) -> Result<Vec<ChainRow>, Error> {
+    fn chain_tips(&self) -> Result<Vec<ChainTip>, Error> {
         Err(Error::Unsupported("chain_tips"))
     }
 
@@ -176,11 +204,16 @@ pub trait Store: Send + Sync {
     }
 }
 
-/// `row` as an allocating insert stores it: at `seq`, sealed after
-/// `prev_hash`. Chain fields the caller set are dropped first: the store
-/// picks the seq, so a hash sealed over another seq could never verify.
+/// `row` as an allocating insert stores it: at `seq`, the next one the
+/// store read for the node, sealed after `prev_hash`. Chain fields the caller
+/// set are dropped first: the store picks the seq, so a hash sealed over
+/// another seq could never verify.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn sealed_at(row: &Row, seq: u64, prev_hash: &str) -> Result<Row, Error> {
+pub(crate) fn sealed_at(row: &Row, seq: i64, prev_hash: &str) -> Result<Row, Error> {
+    // The hash covers the seq, so it must be the number the column holds.
+    let seq = u64::try_from(seq).map_err(|_| {
+        Error::Store(format!("node '{}': next monotonic_seq {seq} is negative", row.source_node_id))
+    })?;
     let row = Row {
         monotonic_seq: seq,
         prev_hash: None,
@@ -190,7 +223,132 @@ pub(crate) fn sealed_at(row: &Row, seq: u64, prev_hash: &str) -> Result<Row, Err
         detail_commitment: None,
         ..row.clone()
     };
-    crate::chain::seal_row(prev_hash, &row).map_err(|e| Error::Store(e.to_string()))
+    crate::chain::seal_row(prev_hash, &row).map_err(|e| Error::Seal(e.to_string()))
+}
+
+/// The seq of a row with one of its own, as the BIGINT column takes it.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn column_seq(row: &Row) -> Result<i64, Error> {
+    i64::try_from(row.monotonic_seq).map_err(|_| {
+        Error::RowRejected(format!("row {}: monotonic_seq {} is out of range", row.id, row.monotonic_seq))
+    })
+}
+
+/// A seq read from the BIGINT column. A negative one is not a seq.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn stored_seq(id: &str, seq: i64) -> Result<u64, Error> {
+    u64::try_from(seq).map_err(|_| Error::Store(format!("row {id}: monotonic_seq {seq} is negative")))
+}
+
+/// A seq-0 row is one this node originated (`origin_id == id`), as the
+/// Python and Go stores require of the rows they seal.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn check_originated(row: &Row) -> Result<(), Error> {
+    if row.origin_id == row.id {
+        return Ok(());
+    }
+    Err(Error::RowRejected(format!(
+        "row {}: a row with monotonic_seq 0 is sealed here and requires origin_id == id (got origin_id {:?})",
+        row.id, row.origin_id
+    )))
+}
+
+/// A row with this id is already stored and is not the row being inserted.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn differs(id: &str) -> Error {
+    Error::RowRejected(format!("row {id}: differs from the stored row with that id"))
+}
+
+/// What an insert found.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) enum Outcome {
+    /// The row was written; this is it as stored.
+    Inserted(Row),
+    /// A row with this id was already stored and nothing was written: that
+    /// row, and the text of its `detail` column.
+    Held(Row, String),
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+impl Outcome {
+    /// `row` as the store holds it. For a row already stored that is `row`
+    /// with the stored seq and chain fields, once the stored row is checked
+    /// to be the same event, at the same seq and hash when `row` has its
+    /// own; a different row under that id is `RowRejected`.
+    pub(crate) fn stored(self, row: &Row) -> Result<Row, Error> {
+        let (held, detail) = match self {
+            Outcome::Inserted(stored) => return Ok(stored),
+            Outcome::Held(held, detail) => (held, detail),
+        };
+        let same = chain_row(&held, &detail)?.same_event(&ChainRow::from(row))
+            && (row.monotonic_seq == 0
+                || (row.monotonic_seq == held.monotonic_seq
+                    && row.hash.as_deref().unwrap_or("") == held.hash.as_deref().unwrap_or("")));
+        if !same {
+            return Err(differs(&row.id));
+        }
+        Ok(Row {
+            monotonic_seq: held.monotonic_seq,
+            prev_hash: held.prev_hash,
+            hash: held.hash,
+            canonical_form_id: held.canonical_form_id,
+            detail_salt: held.detail_salt,
+            detail_commitment: held.detail_commitment,
+            ..row.clone()
+        })
+    }
+
+    /// The result of `insert_sealed` for `row`: a row already stored must
+    /// have the same hash.
+    pub(crate) fn sealed(self, row: &ChainRow) -> Result<(), Error> {
+        match self {
+            Outcome::Held(held, _) if held.hash.as_deref() != Some(row.hash.as_str()) => Err(differs(&row.id)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `row` as the columns `insert_sealed` writes, and the text of its detail.
+/// The `Row`'s own `detail` is not written. For the SDK's stores; not a
+/// stable API.
+#[doc(hidden)]
+pub fn sealed_columns(row: &ChainRow, pii_in_detail: bool) -> Result<(Row, String), Error> {
+    if row.hash.is_empty() || row.monotonic_seq == 0 {
+        return Err(Error::RowRejected(format!(
+            "row {}: insert_sealed requires a sealed row (a hash and a non-zero monotonic_seq)",
+            row.id
+        )));
+    }
+    let columns = Row {
+        wire_version: row.wire_version.clone(),
+        id: row.id.clone(),
+        origin_id: row.origin_id.clone(),
+        monotonic_seq: row.monotonic_seq,
+        timestamp: row.timestamp.clone(),
+        code: row.code.clone(),
+        action: row.action.clone(),
+        severity: row.severity.clone(),
+        service_id: row.service_id.clone(),
+        source_node_id: row.source_node_id.clone(),
+        tenant_id: row.tenant_id.clone(),
+        actor: row.actor.clone(),
+        actor_kind: row.actor_kind.clone(),
+        target: row.target.clone(),
+        category: row.category.clone(),
+        domain: row.domain.clone(),
+        method: row.method.clone(),
+        request_id: row.request_id.clone(),
+        detail: serde_json::Value::Null,
+        pii_in_detail,
+        shipped_at: row.shipped_at.clone(),
+        prev_hash: Some(row.prev_hash.clone()),
+        hash: Some(row.hash.clone()),
+        canonical_form_id: Some(row.canonical_form_id.clone()).filter(|f| !f.is_empty()),
+        detail_salt: row.detail_salt.clone(),
+        detail_commitment: row.detail_commitment.clone(),
+        ..Default::default()
+    };
+    Ok((columns, row.detail.to_string()))
 }
 
 /// Selects the hash of a node's sealed row with the highest seq, which its
@@ -203,14 +361,16 @@ pub(crate) fn tip_sql(table: &str, param: &str) -> String {
     )
 }
 
-/// Selects each node's sealed row with the highest seq, as `columns` of
-/// `table`, ordered by node id. It walks the (source_node_id, monotonic_seq)
-/// index: the next node id after the last, then that node's sealed row with
-/// the highest seq. The same in SQLite and Postgres, and the query the Python
-/// and Go stores run.
-pub fn chain_tips_sql(table: &str, columns: &str) -> String {
+/// Selects `source_node_id, monotonic_seq, hash` of each node's sealed row
+/// with the highest seq, ordered by node id. It walks the (source_node_id,
+/// monotonic_seq) index: the next node id after the last, then that node's
+/// sealed row with the highest seq. The same in SQLite and Postgres, and the
+/// query the Python and Go stores run. For the SDK's stores; not a stable
+/// API.
+#[doc(hidden)]
+pub fn chain_tips_sql(table: &str) -> String {
     format!(
-        "SELECT {columns} FROM {table} JOIN (\
+        "SELECT source_node_id, monotonic_seq, hash FROM {table} JOIN (\
          WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM {table} UNION ALL \
          SELECT (SELECT MIN(source_node_id) FROM {table} WHERE source_node_id > node) \
          FROM nodes WHERE node IS NOT NULL) \
@@ -226,10 +386,7 @@ pub fn chain_tips_sql(table: &str, columns: &str) -> String {
 /// `detail` taken from the column text.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn chain_row(row: &Row, detail_text: &str) -> Result<ChainRow, Error> {
-    let mut out = ChainRow::from(row);
-    out.detail = crate::chain::Json::parse(detail_text)
-        .map_err(|e| Error::Store(format!("row {}: detail: {e}", row.id)))?;
-    Ok(out)
+    ChainRow::from_row(row, detail_text).map_err(|e| Error::Store(format!("row {}: detail: {e}", row.id)))
 }
 
 /// Chain columns (spec §1, §2), in table order. A table an older
@@ -253,8 +410,6 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
      request_id,detail,pii_in_detail,shipped_at,\
      prev_hash,hash,canonical_form_id,detail_salt,detail_commitment";
 
-/// `''` and NULL both mean "no salt / commitment" (form "1").
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
 /// The age purge (spec §2.3). Per node it deletes only the rows below the
 /// lowest seq it keeps, a row at or after the cutoff or, with
 /// `respect_unshipped`, an unshipped row, so what is left is a seq suffix.
@@ -265,6 +420,7 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 /// monotonic_seq) index, and the LIMIT keeps the planner from repeating it
 /// per row. Postgres deletes with USING; SQLite has no USING, so it matches
 /// ids.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
     let (unshipped, shipped) = if respect_unshipped {
         (" OR shipped_at IS NULL", " AND d.shipped_at IS NOT NULL")
@@ -310,6 +466,7 @@ pub(crate) fn purge_cutoff(before: &str) -> Result<String, Error> {
     Ok(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
+/// `''` and NULL both mean "no salt" or "no commitment".
 pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }

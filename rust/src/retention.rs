@@ -144,8 +144,15 @@ pub(crate) fn error_type(e: &Error) -> &'static str {
     match e {
         Error::AuditStoreInsert(_) => "AuditStoreInsert",
         Error::AuditStoreRejected(_) => "AuditStoreRejected",
+        Error::AuditStoreRead(_) => "AuditStoreRead",
+        Error::Seal(_) => "Seal",
+        Error::Chain(_) => "Chain",
+        Error::Checkpoint(_) => "Checkpoint",
+        Error::CheckpointFile(_) => "CheckpointFile",
         Error::Unsupported(_) => "Unsupported",
+        Error::Io(_) => "Io",
         Error::Json(_) => "Json",
+        Error::Custom(_) => "Custom",
         _ => "Error",
     }
 }

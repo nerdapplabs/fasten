@@ -19,10 +19,12 @@
 //!
 //! Numbers are hashed from their JSON tokens, so [`Json`] keeps each number
 //! as the text it was written with: `75.0` stays `75.0` and a long integer
-//! keeps every digit.
+//! keeps every digit. Strings are held as Python holds them, so an unpaired
+//! surrogate (`"\udcff"`) is kept and hashed as its escape.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -40,6 +42,7 @@ pub const GENESIS: &str = "genesis";
 const MAX_DEPTH: usize = 128;
 
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChainError {
     /// The text is not JSON. `at` is the byte offset of the problem.
     #[error("json at byte {at}: {what}")]
@@ -54,22 +57,121 @@ pub enum ChainError {
     Random(String),
 }
 
+/// A JSON string as Python's `str` holds it: a sequence of code points that
+/// may include unpaired surrogates, which `json.loads` keeps from a
+/// `"\udcff"` escape. Ordered by code point, the order Python sorts keys in.
+///
+/// Held as generalized UTF-8: the UTF-8 of the text, with an unpaired
+/// surrogate as the three bytes UTF-8 would give that code point. Byte order
+/// is then code point order.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct JsonString(Vec<u8>);
+
+impl JsonString {
+    /// The text, or `None` when it holds an unpaired surrogate.
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// The text with each unpaired surrogate replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> String {
+        self.code_points().map(|c| char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    }
+
+    /// The code points, an unpaired surrogate as its own value.
+    pub fn code_points(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut bytes = self.0.iter().copied();
+        std::iter::from_fn(move || {
+            let first = bytes.next()?;
+            let (mut code, more) = match first {
+                0x00..=0x7f => (u32::from(first), 0),
+                0x80..=0xdf => (u32::from(first & 0x1f), 1),
+                0xe0..=0xef => (u32::from(first & 0x0f), 2),
+                _ => (u32::from(first & 0x07), 3),
+            };
+            for _ in 0..more {
+                code = (code << 6) | u32::from(bytes.next()? & 0x3f);
+            }
+            Some(code)
+        })
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.0.extend_from_slice(s.as_bytes());
+    }
+
+    // Append one code point; `code` is a scalar value or a surrogate.
+    fn push_code(&mut self, code: u32) {
+        match char::from_u32(code) {
+            Some(c) => self.push_str(c.encode_utf8(&mut [0; 4])),
+            None => self.0.extend_from_slice(&[
+                0xe0 | (code >> 12) as u8,
+                0x80 | ((code >> 6) & 0x3f) as u8,
+                0x80 | (code & 0x3f) as u8,
+            ]),
+        }
+    }
+}
+
+impl From<&str> for JsonString {
+    fn from(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+impl From<String> for JsonString {
+    fn from(s: String) -> Self {
+        Self(s.into_bytes())
+    }
+}
+
+impl PartialEq<str> for JsonString {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+// Lets a map keyed by JsonString be searched with the bytes of a &str.
+impl Borrow<[u8]> for JsonString {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for JsonString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&GO_NUMBERS.render(&Json::String(self.clone())))
+    }
+}
+
 /// A JSON value whose numbers keep their source text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Json {
     Null,
     Bool(bool),
-    /// A number token as written, for example `75.0` or `1e-7`.
+    /// A number token as written, for example `75.0` or `1e-7`. Python's
+    /// `NaN`, `Infinity` and `-Infinity` are number tokens too.
     Number(String),
-    String(String),
+    String(JsonString),
     Array(Vec<Json>),
     /// Keys are held sorted by code point, the order they are hashed in.
-    Object(BTreeMap<String, Json>),
+    Object(BTreeMap<JsonString, Json>),
+}
+
+/// JSON text for the value: keys sorted, no whitespace, non-ASCII escaped
+/// and every number token as it is held. Parsing the text gives the value
+/// back, so a store that writes it to the `detail` column keeps the row's
+/// hash.
+impl fmt::Display for Json {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&GO_NUMBERS.render(self))
+    }
 }
 
 impl Json {
-    /// Parse JSON text. A repeated object key keeps its last value, and an
-    /// unpaired `\u` surrogate escape becomes U+FFFD.
+    /// Parse JSON text as Python's `json.loads` does. A repeated object key
+    /// keeps its last value, an unpaired `\u` surrogate escape is kept, and
+    /// `NaN`, `Infinity` and `-Infinity` are numbers.
     pub fn parse(text: &str) -> Result<Json, ChainError> {
         let mut p = Parser { src: text, pos: 0 };
         let value = p.value(0)?;
@@ -83,14 +185,16 @@ impl Json {
     /// The value for `key` when this is an object that has it.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
-            Json::Object(map) => map.get(key),
+            Json::Object(map) => map.get(key.as_bytes()),
             _ => None,
         }
     }
 
+    /// The text of a string value; `None` when it holds an unpaired
+    /// surrogate.
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Json::String(s) => Some(s),
+            Json::String(s) => s.as_str(),
             _ => None,
         }
     }
@@ -111,10 +215,10 @@ impl From<&serde_json::Value> for Json {
             serde_json::Value::Null => Json::Null,
             serde_json::Value::Bool(b) => Json::Bool(*b),
             serde_json::Value::Number(n) => Json::Number(n.to_string()),
-            serde_json::Value::String(s) => Json::String(s.clone()),
+            serde_json::Value::String(s) => Json::String(s.as_str().into()),
             serde_json::Value::Array(items) => Json::Array(items.iter().map(Json::from).collect()),
             serde_json::Value::Object(map) => {
-                Json::Object(map.iter().map(|(k, v)| (k.clone(), Json::from(v))).collect())
+                Json::Object(map.iter().map(|(k, v)| (k.as_str().into(), Json::from(v))).collect())
             }
         }
     }
@@ -149,6 +253,11 @@ impl Parser<'_> {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
             Some(b'"') => self.string().map(Json::String),
+            Some(b'N') => self.literal("NaN", Json::Number("NaN".to_string())),
+            Some(b'I') => self.literal("Infinity", Json::Number("Infinity".to_string())),
+            Some(b'-') if self.src[self.pos..].starts_with("-I") => {
+                self.literal("-Infinity", Json::Number("-Infinity".to_string()))
+            }
             Some(b'-' | b'0'..=b'9') => self.number().map(Json::Number),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
@@ -221,9 +330,9 @@ impl Parser<'_> {
         }
     }
 
-    fn string(&mut self) -> Result<String, ChainError> {
+    fn string(&mut self) -> Result<JsonString, ChainError> {
         self.pos += 1;
-        let mut out = String::new();
+        let mut out = JsonString::default();
         let mut run = self.pos;
         loop {
             match self.peek() {
@@ -236,7 +345,7 @@ impl Parser<'_> {
                 Some(b'\\') => {
                     out.push_str(&self.src[run..self.pos]);
                     self.pos += 1;
-                    out.push(self.escape()?);
+                    out.push_code(self.escape()?);
                     run = self.pos;
                 }
                 Some(c) if c < 0x20 => return Err(self.err("control character in string")),
@@ -245,19 +354,18 @@ impl Parser<'_> {
         }
     }
 
-    // The character for the escape that follows a backslash.
-    fn escape(&mut self) -> Result<char, ChainError> {
+    // The code point for the escape that follows a backslash. A \u escape
+    // of a surrogate with no partner is that surrogate.
+    fn escape(&mut self) -> Result<u32, ChainError> {
         let c = self.peek().ok_or_else(|| self.err("unterminated string"))?;
         self.pos += 1;
         Ok(match c {
-            b'"' => '"',
-            b'\\' => '\\',
-            b'/' => '/',
-            b'b' => '\u{8}',
-            b'f' => '\u{c}',
-            b'n' => '\n',
-            b'r' => '\r',
-            b't' => '\t',
+            b'"' | b'\\' | b'/' => u32::from(c),
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => 0x0a,
+            b'r' => 0x0d,
+            b't' => 0x09,
             b'u' => {
                 let hi = self.hex4()?;
                 if (0xD800..0xDC00).contains(&hi) && self.src[self.pos..].starts_with("\\u") {
@@ -265,12 +373,11 @@ impl Parser<'_> {
                     self.pos += 2;
                     let lo = self.hex4()?;
                     if (0xDC00..0xE000).contains(&lo) {
-                        let code = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
-                        return Ok(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+                        return Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
                     }
                     self.pos = back;
                 }
-                char::from_u32(hi).unwrap_or(char::REPLACEMENT_CHARACTER)
+                hi
             }
             _ => {
                 self.pos -= 1;
@@ -391,25 +498,27 @@ impl Canon {
 
     // A string as CPython writes it with ensure_ascii: short escapes where it
     // has them, and \uXXXX (UTF-16 units) for everything outside ' '..'~'.
-    fn write_str(self, s: &str, out: &mut String) {
+    // An unpaired surrogate is written as its own \uXXXX.
+    fn write_str(self, s: &JsonString, out: &mut String) {
         out.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\u{8}' => out.push_str("\\b"),
-                '\u{c}' => out.push_str("\\f"),
-                '\u{7f}' if !self.escape_del => out.push(c),
-                ' '..='~' => out.push(c),
+        for code in s.code_points() {
+            match code {
+                0x22 => out.push_str("\\\""),
+                0x5c => out.push_str("\\\\"),
+                0x0a => out.push_str("\\n"),
+                0x0d => out.push_str("\\r"),
+                0x09 => out.push_str("\\t"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                0x7f if !self.escape_del => out.push('\u{7f}'),
+                // Writing to a String cannot fail.
+                0x20..=0x7e => out.push(char::from_u32(code).unwrap_or(' ')),
+                0x10000.. => {
+                    let v = code - 0x10000;
+                    let _ = write!(out, "\\u{:04x}\\u{:04x}", 0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff));
+                }
                 _ => {
-                    let mut units = [0u16; 2];
-                    for unit in c.encode_utf16(&mut units) {
-                        // Writing to a String cannot fail.
-                        let _ = write!(out, "\\u{unit:04x}");
-                    }
+                    let _ = write!(out, "\\u{code:04x}");
                 }
             }
         }
@@ -418,15 +527,21 @@ impl Canon {
 }
 
 /// Canonical JSON of `v`: sorted keys, no whitespace, non-ASCII and DEL
-/// escaped, numbers as Python renders them.
+/// escaped, numbers as Python renders them. An unpaired surrogate is written
+/// as its `\uXXXX` escape and `NaN`, `Infinity` and `-Infinity` as they are,
+/// as `json.dumps` writes them.
 pub fn canonical_json(v: &Json) -> String {
     PY.render(v)
 }
 
 // A number token as CPython's json.dumps writes the value json.loads reads
-// from it. A token with no '.', 'e' or 'E' is an int and is kept as written,
-// except "-0", which reads as 0. Any other token is a float.
+// from it. NaN, Infinity and -Infinity are written as they are. A token with
+// no '.', 'e' or 'E' is an int and is kept as written, except "-0", which
+// reads as 0. Any other token is a float.
 fn py_number_token(tok: &str) -> String {
+    if matches!(tok, "NaN" | "Infinity" | "-Infinity") {
+        return tok.to_string();
+    }
     if !tok.contains(['.', 'e', 'E']) {
         return if tok == "-0" { "0".to_string() } else { tok.to_string() };
     }
@@ -512,9 +627,14 @@ fn commitment_with(salt: &str, detail: &Json, canon: Canon) -> String {
 /// fields, with `detail` as [`Json`] so its number tokens are exact.
 ///
 /// [`crate::Row`] holds `detail` as a `serde_json::Value`, which cannot keep
-/// `-0`, an integer past 64 bits or a float past `f64`'s range as written.
-/// Build from JSON text with [`ChainRow::from_json`] when the row was sealed
-/// elsewhere; `From<&Row>` is exact for a row this process built.
+/// `-0`, an integer past 64 bits, a float past `f64`'s range, `NaN` or an
+/// unpaired surrogate as written. Build from JSON text with
+/// [`ChainRow::from_json`], or from a stored row and its `detail` column text
+/// with [`ChainRow::from_row`], when the row was sealed elsewhere;
+/// `From<&Row>` is exact only for a row this process built.
+///
+/// "No salt" and "no commitment" are `None`; the constructors read an empty
+/// string as `None` too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainRow {
     pub wire_version: String,
@@ -556,23 +676,37 @@ impl ChainRow {
         Self::from_value(&Json::parse(text)?)
     }
 
-    /// Build from a parsed wire-format row. A missing or null string field is
-    /// empty, a missing `detail` is `{}`, a missing `wire_version` is "1" and
-    /// a missing `prev_hash` is "genesis".
+    /// Build from a parsed wire-format row. Only `monotonic_seq` is
+    /// required. For the rest:
+    ///
+    /// - a missing or null string field is empty, so a missing `hash` reads
+    ///   as an unsealed row;
+    /// - a missing `detail` is `{}`, and a null one is a redacted detail;
+    /// - a missing, null or empty `wire_version` is "1", and a missing, null
+    ///   or empty `prev_hash` is "genesis";
+    /// - a missing, null or empty `detail_salt` or `detail_commitment` is
+    ///   `None`.
+    ///
+    /// A row field with an unpaired surrogate is an error; inside `detail`
+    /// it is kept.
     pub fn from_value(v: &Json) -> Result<Self, ChainError> {
         let Json::Object(map) = v else {
             return Err(ChainError::Field("row", "not an object"));
         };
-        let opt = |key: &'static str| match map.get(key) {
+        let opt = |key: &'static str| match map.get(key.as_bytes()) {
             None | Some(Json::Null) => Ok(None),
-            Some(Json::String(s)) => Ok(Some(s.clone())),
+            Some(Json::String(s)) => match s.as_str() {
+                Some(s) => Ok(Some(s.to_string())),
+                None => Err(ChainError::Field(key, "has an unpaired surrogate")),
+            },
             Some(_) => Err(ChainError::Field(key, "not a string")),
         };
+        let non_empty = |key: &'static str| opt(key).map(|v| v.filter(|s| !s.is_empty()));
         let text = |key: &'static str| opt(key).map(Option::unwrap_or_default);
         let or = |key: &'static str, default: &str| {
             opt(key).map(|v| v.filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string()))
         };
-        let monotonic_seq = match map.get("monotonic_seq") {
+        let monotonic_seq = match map.get("monotonic_seq".as_bytes()) {
             Some(Json::Number(tok)) => tok
                 .parse::<u64>()
                 .map_err(|_| ChainError::Field("monotonic_seq", "not an unsigned integer"))?,
@@ -598,23 +732,58 @@ impl ChainRow {
             domain: text("domain")?,
             method: text("method")?,
             request_id: text("request_id")?,
-            detail: map.get("detail").cloned().unwrap_or_else(|| Json::Object(BTreeMap::new())),
+            detail: map.get("detail".as_bytes()).cloned().unwrap_or_else(|| Json::Object(BTreeMap::new())),
             shipped_at: opt("shipped_at")?,
             canonical_form_id: text("canonical_form_id")?,
             prev_hash: or("prev_hash", GENESIS)?,
             hash: text("hash")?,
-            detail_salt: opt("detail_salt")?,
-            detail_commitment: opt("detail_commitment")?,
+            detail_salt: non_empty("detail_salt")?,
+            detail_commitment: non_empty("detail_commitment")?,
         })
     }
 
-    /// Copy the chain fields of this row onto `row`.
+    /// Build from a row as a store read it and the text of its `detail`
+    /// column. Every field but `detail` comes from `row`; `detail` is parsed
+    /// from `detail_text`, so its number tokens and strings are the ones
+    /// that were hashed. This is how the stores build the rows `chain_rows`
+    /// returns.
+    pub fn from_row(row: &Row, detail_text: &str) -> Result<Self, ChainError> {
+        let mut out = Self::from(row);
+        out.detail = Json::parse(detail_text)?;
+        Ok(out)
+    }
+
+    /// Copy the chain fields of this row onto `row`. An empty salt or
+    /// commitment is copied as `None`.
     pub fn stamp(&self, row: &mut Row) {
+        let non_empty = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
         row.prev_hash = Some(self.prev_hash.clone());
         row.hash = Some(self.hash.clone());
         row.canonical_form_id = Some(self.form_id().to_string());
-        row.detail_salt.clone_from(&self.detail_salt);
-        row.detail_commitment.clone_from(&self.detail_commitment);
+        row.detail_salt = non_empty(&self.detail_salt);
+        row.detail_commitment = non_empty(&self.detail_commitment);
+    }
+
+    /// Whether `other` is the same event: every hashed field but the chain
+    /// fields, `monotonic_seq` and `shipped_at` is equal, with timestamps
+    /// compared as instants. A redacted `detail` on either side matches any
+    /// detail. The stores use it to tell a retried insert from a different
+    /// row under a stored id.
+    pub fn same_event(&self, other: &ChainRow) -> bool {
+        let content = |row: &ChainRow| {
+            let mut row = ChainRow {
+                monotonic_seq: 0,
+                shipped_at: None,
+                canonical_form_id: String::new(),
+                prev_hash: String::new(),
+                ..row.clone()
+            };
+            if self.detail == Json::Null || other.detail == Json::Null {
+                row.detail = Json::Null;
+            }
+            hashed_fields(&row, FORM_1)
+        };
+        content(self) == content(other)
     }
 
     fn form_id(&self) -> &str {
@@ -622,6 +791,12 @@ impl ChainRow {
     }
 }
 
+/// Exact only for a row this process built: `detail` takes the number text
+/// `serde_json` writes for the value it holds. A row read back with
+/// [`crate::Store::query`] has already lost any token `serde_json` cannot
+/// hold, so a chain built this way from stored rows can report a break on a
+/// row that is intact. Read stored rows with [`crate::Store::chain_rows`],
+/// or build them with [`ChainRow::from_row`].
 impl From<&Row> for ChainRow {
     fn from(row: &Row) -> Self {
         Self {
@@ -700,7 +875,7 @@ fn form_shape(form_id: &str) -> Option<Shape> {
 }
 
 fn text(s: &str) -> Json {
-    Json::String(s.to_string())
+    Json::String(s.into())
 }
 
 fn opt_text(s: Option<&str>) -> Json {
@@ -711,13 +886,13 @@ fn opt_text(s: Option<&str>) -> Json {
 fn hashed_fields(row: &ChainRow, shape: Shape) -> Json {
     let ts = |wire: &str| {
         let wire = canonical_ts(wire);
-        Json::String(if shape.iso_ts { iso_ts(&wire) } else { wire })
+        Json::String(if shape.iso_ts { iso_ts(&wire) } else { wire }.into())
     };
     let shipped_at = match &row.shipped_at {
         Some(at) if shape.shipped_at => ts(at),
         _ => Json::Null,
     };
-    let mut d: BTreeMap<String, Json> = [
+    let mut d: BTreeMap<JsonString, Json> = [
         ("action", text(&row.action)),
         ("actor", text(&row.actor)),
         ("actor_kind", text(&row.actor_kind)),
@@ -741,12 +916,12 @@ fn hashed_fields(row: &ChainRow, shape: Shape) -> Json {
         ("wire_version", text(&row.wire_version)),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
+    .map(|(k, v)| (k.into(), v))
     .collect();
     if shape.commits_detail {
-        d.insert("detail_commitment".to_string(), opt_text(row.detail_commitment.as_deref()));
+        d.insert("detail_commitment".into(), opt_text(row.detail_commitment.as_deref()));
     } else {
-        d.insert("detail".to_string(), row.detail.clone());
+        d.insert("detail".into(), row.detail.clone());
     }
     Json::Object(d)
 }
@@ -757,6 +932,12 @@ fn hash_with(row: &ChainRow, shape: Shape, canon: Canon) -> String {
 
 /// The hash of `row` under its `canonical_form_id`, or `None` for a form
 /// this version does not know.
+///
+/// This is the hash a writer computes today. It is not the test
+/// [`verify_chain`] applies: verification also accepts the encodings older
+/// releases hashed with, and for form "2" checks `detail` against its
+/// commitment, which this hash does not cover. Use `verify_chain` to decide
+/// whether a row is intact.
 pub fn row_hash(row: &ChainRow) -> Option<String> {
     form_shape(row.form_id()).map(|shape| hash_with(row, shape, PY))
 }
@@ -772,8 +953,13 @@ fn new_detail_salt() -> Result<String, ChainError> {
     Ok(out)
 }
 
-/// A copy of `row` sealed after `prev_hash`: the current `canonical_form_id`,
-/// a detail salt (the row's own when it has one) and commitment, and `hash`.
+/// A copy of `row` sealed after `prev_hash`.
+///
+/// Overwrites `canonical_form_id` (the current form), `prev_hash`,
+/// `detail_commitment` and `hash`. A non-empty `detail_salt` is kept, so a
+/// row can be sealed again to the same hash; otherwise a new one is drawn.
+/// `monotonic_seq` is hashed as the row carries it: set it before sealing,
+/// to one more than the highest seq on the node.
 pub fn seal(prev_hash: &str, row: &ChainRow) -> Result<ChainRow, ChainError> {
     let salt = match row.detail_salt.as_deref() {
         Some(salt) if !salt.is_empty() => salt.to_string(),
@@ -789,8 +975,9 @@ pub fn seal(prev_hash: &str, row: &ChainRow) -> Result<ChainRow, ChainError> {
 }
 
 /// A copy of the store row `row` sealed after `prev_hash`, at the
-/// `monotonic_seq` it carries. The stores call this inside the insert
-/// transaction, once they have allocated the seq and read the node's tip.
+/// `monotonic_seq` it carries; see [`seal`] for the fields it overwrites.
+/// The stores call this inside the insert transaction, once they have
+/// allocated the seq and read the node's tip.
 pub fn seal_row(prev_hash: &str, row: &Row) -> Result<Row, ChainError> {
     let mut sealed = row.clone();
     seal(prev_hash, &ChainRow::from(row))?.stamp(&mut sealed);
@@ -798,13 +985,41 @@ pub fn seal_row(prev_hash: &str, row: &Row) -> Result<Row, ChainError> {
 }
 
 /// Result of [`verify_chain`].
+///
+/// `ok` says no break was found among the rows given. It is also true for
+/// no rows, and for rows that were never sealed, so read `sealed_rows` with
+/// it: `ok` with `sealed_rows == 0` means nothing was checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChainVerifyResult {
     pub ok: bool,
+    /// How many rows were passed in, counting repeated copies of a row and
+    /// unsealed rows.
     pub total_rows: usize,
+    /// How many of them are sealed (have a hash), counting each row once
+    /// per node and id. These are the rows the walk checks.
+    pub sealed_rows: usize,
     /// `monotonic_seq` of the first row that breaks the chain.
     pub first_break_at: Option<u64>,
+    /// `source_node_id` of the chain that breaks there.
+    pub first_break_node: Option<String>,
     pub reason: Option<String>,
+}
+
+// A break: where it is, on which node, and why.
+pub(crate) struct Break {
+    pub(crate) seq: u64,
+    pub(crate) node: String,
+    pub(crate) reason: String,
+}
+
+// Keep in `first` whichever break is at the lower seq.
+fn lower(found: Option<Break>, first: &mut Option<Break>) {
+    if let Some(found) = found {
+        if first.as_ref().is_none_or(|f| found.seq < f.seq) {
+            *first = Some(found);
+        }
+    }
 }
 
 // Whether any string the row holds has DEL in it.
@@ -940,7 +1155,9 @@ fn first_break(sorted: &[&ChainRow]) -> Option<(u64, String)> {
 ///   unsealed one must link to "genesis".
 /// - A row with an unknown `canonical_form_id` breaks the chain.
 /// - With several nodes, `first_break_at` is the lowest seq at which any
-///   breaks.
+///   breaks, and `first_break_node` the node it is on.
+/// - `ok` is true when there is nothing to check; `sealed_rows` says how
+///   many rows were.
 pub fn verify_chain(rows: &[ChainRow]) -> ChainVerifyResult {
     verify_chain_with_checkpoints(rows, &[], CheckpointOptions::default())
 }
@@ -964,16 +1181,9 @@ pub fn verify_chain_with_checkpoints(
     // One copy per (node, id), in first-seen order.
     let mut by_node: BTreeMap<&str, Vec<&ChainRow>> = BTreeMap::new();
     let mut kept: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut first: Option<(u64, String)> = None;
-    let lower = |found: Option<(u64, String)>, first: &mut Option<(u64, String)>| {
-        if let Some(found) = found {
-            if first.as_ref().is_none_or(|f| found.0 < f.0) {
-                *first = Some(found);
-            }
-        }
-    };
+    let mut first: Option<Break> = None;
 
-    let mut dup: Option<(u64, String)> = None;
+    let mut dup: Option<Break> = None;
     for row in rows {
         let node = by_node.entry(&row.source_node_id).or_default();
         let Some(&at) = kept.get(&(row.source_node_id.as_str(), row.id.as_str())) else {
@@ -991,25 +1201,31 @@ pub fn verify_chain_with_checkpoints(
                 Some(format!("row {}: two sealed copies with different hashes", row.id))
             };
             let seq = row.monotonic_seq.min(old.monotonic_seq);
-            lower(reason.map(|reason| (seq, reason)), &mut dup);
+            lower(reason.map(|reason| Break { seq, node: row.source_node_id.clone(), reason }), &mut dup);
         }
     }
 
-    for node in by_node.values_mut() {
+    let mut sealed_rows = 0;
+    for (name, node) in &mut by_node {
         node.sort_by_key(|r| r.monotonic_seq);
-        lower(first_break(node), &mut first);
+        sealed_rows += node.iter().filter(|r| !r.hash.is_empty()).count();
+        let found = first_break(node).map(|(seq, reason)| Break { seq, node: (*name).to_string(), reason });
+        lower(found, &mut first);
     }
     lower(dup, &mut first);
     lower(checkpoint_break(&by_node, checkpoints, opts.partial), &mut first);
 
-    match first {
-        Some((seq, reason)) => ChainVerifyResult {
-            ok: false,
-            total_rows: rows.len(),
-            first_break_at: Some(seq),
-            reason: Some(reason),
-        },
-        None => ChainVerifyResult { ok: true, total_rows: rows.len(), first_break_at: None, reason: None },
+    let (first_break_at, first_break_node, reason) = match first {
+        Some(b) => (Some(b.seq), Some(b.node), Some(b.reason)),
+        None => (None, None, None),
+    };
+    ChainVerifyResult {
+        ok: reason.is_none(),
+        total_rows: rows.len(),
+        sealed_rows,
+        first_break_at,
+        first_break_node,
+        reason,
     }
 }
 
@@ -1086,6 +1302,49 @@ mod tests {
                 changed.target = "sensor/\u{7f}x".to_string();
                 assert!(!verify_chain(&[changed]).ok);
             }
+        }
+    }
+
+    // The commitment under one encoding and the hash under another, as a
+    // row written across a Go upgrade has them: each is checked on its own.
+    #[test]
+    fn raw_del_commitment_and_hash_are_checked_apart() {
+        for (commit_canon, hash_canon) in [(GO_RAW_DEL, PY), (PY, GO_RAW_DEL), (PY_RAW_DEL, GO_NUMBERS)] {
+            let mut sealed = row(r#"{"note": "a\u007fb"}"#);
+            sealed.target = "order/\u{7f}42".to_string();
+            sealed.canonical_form_id = "2".to_string();
+            sealed.detail_salt = Some("b".repeat(64));
+            sealed.detail_commitment = Some(commitment_with(&"b".repeat(64), &sealed.detail, commit_canon));
+            sealed.hash = hash_with(&sealed, FORM_2, hash_canon);
+            let res = verify_chain(&[sealed.clone()]);
+            assert!(res.ok, "{res:?}");
+
+            let mut moved = sealed.clone();
+            moved.target = "order/\u{7f}43".to_string();
+            assert!(verify_chain(&[moved]).reason.unwrap_or_default().contains("hash mismatch"));
+            let mut changed = sealed;
+            changed.detail = Json::parse(r#"{"note": "a\u007fc"}"#).unwrap();
+            assert!(verify_chain(&[changed]).reason.unwrap_or_default().contains("commitment"));
+        }
+    }
+
+    #[test]
+    fn same_event_ignores_the_chain_fields() {
+        let a = row(r#"{"k": 1.0}"#);
+        let mut sealed = seal(GENESIS, &ChainRow { monotonic_seq: 7, ..a.clone() }).unwrap();
+        sealed.shipped_at = Some("2026-06-16T08:00:00.250000Z".to_string());
+        sealed.timestamp = "2026-06-15T12:30:45.123456+02:00".to_string();
+        assert!(a.same_event(&sealed) && sealed.same_event(&a));
+        // Redacted on one side: the detail is not compared.
+        let redacted = ChainRow { detail: Json::Null, detail_salt: None, ..sealed.clone() };
+        assert!(a.same_event(&redacted) && redacted.same_event(&a));
+        for other in [
+            ChainRow { target: "sensor/43".into(), ..a.clone() },
+            ChainRow { detail: Json::parse(r#"{"k": 2.0}"#).unwrap(), ..a.clone() },
+            ChainRow { timestamp: "2026-06-15T10:30:45.123457Z".into(), ..a.clone() },
+            ChainRow { tenant_id: Some("acme".into()), ..a.clone() },
+        ] {
+            assert!(!a.same_event(&other), "{other:?}");
         }
     }
 
