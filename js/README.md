@@ -97,7 +97,7 @@ stores: the node's next seq, `prev_hash` from the node's latest sealed row,
 a detail salt and commitment, and the hash (canonical form "2",
 [spec §1.4](../spec/chain-replication.md)). Each stored row is then written
 to stdout a second time, sealed (spec §8); in raise mode `emit()` returns,
-or resolves to, the sealed row. Python, Go and JS writers can share a node
+or resolves to, the sealed row. Python, Go, Rust and JS writers can share a node
 in one table: `PostgresStore` writes into a table the Python or Go store
 created, and adds the columns it lacks. A store of your own seals only if
 it does so itself and has a `seals()` method that returns true; otherwise

@@ -32,6 +32,8 @@ name = "fasten"
 default = []
 async = ["tokio"]
 store-postgres = ["dep:pg", "fasten-core/postgres-tls"]
+# SQLite is compiled in, so the build needs a C compiler.
+store-sqlite = ["fasten-core/sqlite"]
 codes-yaml = ["serde_yaml"]
 
 [dev-dependencies]

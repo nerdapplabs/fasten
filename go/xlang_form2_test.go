@@ -107,11 +107,23 @@ func TestCrossLanguage_GoSealedVectorIsStable(t *testing.T) {
 	}
 }
 
-// spec/js-sealed-form2.json is the JS->Go direction: four rows from the JS
-// SDK's sealed stdout lines (Postgres store), with float, large-integer,
-// non-ASCII, DEL and nested detail, and one row redacted after sealing.
+// spec/rust-sealed-form2.json and spec/js-sealed-form2.json are the Rust->Go
+// and JS->Go directions: four rows each SDK sealed through its own store,
+// with float, large-integer, non-ASCII, DEL and nested detail, and one row
+// redacted after sealing.
+func TestCrossLanguage_GoVerifiesARustSealedChain(t *testing.T) {
+	verifySealedVector(t, "../spec/rust-sealed-form2.json", "Rust", "76.0")
+}
+
 func TestCrossLanguage_GoVerifiesAJSSealedChain(t *testing.T) {
-	raw, err := os.ReadFile("../spec/js-sealed-form2.json")
+	verifySealedVector(t, "../spec/js-sealed-form2.json", "JS", "76.5")
+}
+
+// verifySealedVector checks each row's commitment and hash, the chain, and
+// that a changed detail on the first row is caught.
+func verifySealedVector(t *testing.T, path, sdk, tampered string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read vector: %v", err)
 	}
@@ -135,23 +147,22 @@ func TestCrossLanguage_GoVerifiesAJSSealedChain(t *testing.T) {
 			continue
 		}
 		if got := detailCommitment(r.DetailSalt, r.Detail); got != r.DetailCommitment {
-			t.Errorf("%s: commitment disagrees with JS:\n got %s\nwant %s", r.ID, got, r.DetailCommitment)
+			t.Errorf("%s: commitment disagrees with %s:\n got %s\nwant %s", r.ID, sdk, got, r.DetailCommitment)
 		}
 		if got := hashFnByForm[r.CanonicalFormID](r, canonicalJSON); got != r.Hash {
-			t.Errorf("%s: hash disagrees with JS:\n got %s\nwant %s", r.ID, got, r.Hash)
+			t.Errorf("%s: hash disagrees with %s:\n got %s\nwant %s", r.ID, sdk, got, r.Hash)
 		}
 	}
 	if redacted != 1 {
 		t.Errorf("redacted rows = %d want 1", redacted)
 	}
 	if res := VerifyChain(rows); !res.OK {
-		t.Fatalf("Go rejects a JS-sealed chain: %s", res.Reason)
+		t.Fatalf("Go rejects a %s-sealed chain: %s", sdk, res.Reason)
 	}
 
-	// A changed detail on a JS-sealed row is caught.
-	rows[0].Detail = map[string]any{"setpoint": json.Number("76.5")}
+	rows[0].Detail = map[string]any{"setpoint": json.Number(tampered)}
 	if res := VerifyChain(rows); res.OK {
-		t.Fatal("Go accepted a tampered detail on a JS-sealed row")
+		t.Fatalf("Go accepted a tampered detail on a %s-sealed row", sdk)
 	}
 }
 
