@@ -498,6 +498,21 @@ def test_js_sealed_row_detail_tampering_is_caught_by_python():
         "Python accepted tampered detail on a JS-sealed row"
 
 
+def test_python_ingests_js_sealed_rows():
+    """Replication from a JS node: ingest stores the JS-sealed rows as they
+    were sealed, and they verify as stored."""
+    from fasten.replication import ingest
+    from fasten.store.sqlite import SQLiteStore
+    store = SQLiteStore(":memory:")
+    rows = _rows_from_js_vector()
+    result = ingest(store, rows)
+    assert result.rejected_from_seq is None and result.inserted == len(rows), result.reason
+    stored = store.query(limit=100)
+    assert sorted(r.hash for r in stored) == sorted(r.hash for r in rows)
+    assert verify_chain(stored).ok
+    assert ingest(store, rows).rejected_from_seq is None
+
+
 def test_python_verifies_the_js_stdout_lines_as_an_ingester_reads_them():
     lines = [json.loads(line) for line in JS_STDOUT.read_text().splitlines()]
     assert all(d.pop("shape") == "audit" for d in lines)

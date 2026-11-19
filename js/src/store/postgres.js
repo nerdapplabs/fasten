@@ -17,10 +17,9 @@ import {
 import { canonicalTS } from "../canonical_ts.js";
 import {
 	AuditSealError,
-	bigintReviver,
-	ChainError,
 	canonicalJSON,
 	canonicalTimestamp,
+	compareCodePoints,
 	detailText,
 	GENESIS,
 	parseJson,
@@ -28,6 +27,24 @@ import {
 	seal,
 	toChainRow,
 } from "../chain.js";
+import {
+	conflictAsync,
+	cutAtConflict,
+	ingestWithoutLocalNode,
+	readBatch,
+	StoredMeanwhile,
+	skippedUnsealed,
+	verifiedPrefix,
+} from "../replication.js";
+import {
+	CHAIN_COLUMNS,
+	chainRow,
+	chainTipsSQL,
+	differs,
+	mapRow,
+	seqHeld,
+	snakeRow,
+} from "./rows.js";
 
 // pg is an optional peer dependency, so import it only when first needed.
 let _Pool = null;
@@ -127,87 +144,6 @@ function _ddlStatements(table, idx) {
 	];
 }
 
-/**
- * A pg result row as a row object with the wire's snake_case keys: `detail`
- * parsed from its JSON text (an integer a number cannot hold exactly is a
- * BigInt, null once redacted), `pii_in_detail` a boolean, an empty salt or
- * commitment null.
- * @param {Record<string,unknown>} r
- * @returns {Record<string,unknown>}
- */
-function _mapRow(r) {
-	return {
-		wire_version: r.wire_version || "1",
-		id: r.id,
-		origin_id: r.origin_id,
-		monotonic_seq: Number(r.monotonic_seq),
-		timestamp: r.timestamp,
-		code: r.code,
-		action: r.action,
-		severity: r.severity,
-		service_id: r.service_id,
-		source_node_id: r.source_node_id,
-		tenant_id: r.tenant_id ?? null,
-		actor: r.actor,
-		actor_kind: r.actor_kind,
-		target: r.target,
-		category: r.category,
-		domain: r.domain,
-		method: r.method,
-		request_id: r.request_id,
-		detail:
-			typeof r.detail === "string"
-				? JSON.parse(r.detail, bigintReviver)
-				: r.detail,
-		pii_in_detail: Number(r.pii_in_detail) === 1,
-		shipped_at: r.shipped_at ?? null,
-		canonical_form_id: r.canonical_form_id || "1",
-		prev_hash: r.prev_hash ?? "",
-		hash: r.hash ?? "",
-		detail_salt: r.detail_salt || null,
-		detail_commitment: r.detail_commitment || null,
-	};
-}
-
-// The columns a chain row is read from. Timestamps come back canonical
-// through the pool's type parser when the column is TIMESTAMPTZ (a table
-// the Go store created).
-const _CHAIN_COLUMNS =
-	"id, wire_version, origin_id, monotonic_seq, timestamp, code, action, severity, service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, method, request_id, detail, shipped_at, canonical_form_id, prev_hash, hash, detail_salt, detail_commitment, pii_in_detail";
-
-// A row selected as _CHAIN_COLUMNS, with detail parsed from the column
-// text, so its numbers are the tokens that were hashed. Throws ChainError
-// naming the row when it cannot be read.
-function _chainRow(r) {
-	try {
-		return toChainRow({
-			...r,
-			monotonic_seq: Number(r.monotonic_seq),
-			detail: parseJson(r.detail),
-			pii_in_detail: Number(r.pii_in_detail) === 1,
-		});
-	} catch (err) {
-		throw new ChainError(`fasten PostgresStore: row ${r.id}: ${err.message}`);
-	}
-}
-
-// Each node's latest sealed row, one walk of the (source_node_id,
-// monotonic_seq) index per node. The same query as the Rust and Python
-// stores.
-function _chainTipsSQL(t) {
-	return (
-		`SELECT source_node_id, monotonic_seq, hash FROM ${t} JOIN (` +
-		`WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM ${t} UNION ALL ` +
-		`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) ` +
-		`FROM nodes WHERE node IS NOT NULL) ` +
-		`SELECT node, (SELECT monotonic_seq FROM ${t} WHERE source_node_id = node ` +
-		`AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1) AS seq ` +
-		`FROM nodes WHERE node IS NOT NULL) AS tip ` +
-		`ON source_node_id = tip.node AND monotonic_seq = tip.seq ` +
-		`WHERE hash <> '' ORDER BY source_node_id, id`
-	);
-}
-
 const _NODE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
 // A failed COMMIT, after which the row may or may not be stored.
@@ -218,68 +154,9 @@ class _CommitError extends Error {
 	}
 }
 
-// A row's detail: an object as it is, a string read as JSON text (it must
-// be an object), a missing one {}.
-function _detail(row) {
-	const d = row.detail;
-	if (typeof d !== "string") return d ?? {};
-	let v;
-	try {
-		v = parseJson(d);
-	} catch (err) {
-		throw new AuditRowRejectedError(`row ${row.id}: detail: ${err.message}`);
-	}
-	// parseJson gives objects no prototype; a number is a JsonNumber.
-	if (
-		v === null ||
-		typeof v !== "object" ||
-		Object.getPrototypeOf(v) !== null
-	) {
-		throw new AuditRowRejectedError(
-			`row ${row.id}: detail text is not a JSON object`,
-		);
-	}
-	return v;
-}
-
-// A row from emit() (snake_case) or with camelCase keys, as snake_case.
-function _snake(row) {
-	const ts = row.timestamp;
-	return {
-		wire_version: row.wire_version ?? row.wireVersion ?? "1",
-		id: row.id,
-		origin_id: row.origin_id ?? row.originId,
-		monotonic_seq: Number(row.monotonic_seq ?? row.monotonicSeq ?? 0),
-		timestamp: ts instanceof Date ? canonicalTS(ts) : ts,
-		code: row.code,
-		action: row.action,
-		severity: row.severity,
-		service_id: row.service_id ?? row.serviceId,
-		source_node_id: row.source_node_id ?? row.sourceNodeId,
-		tenant_id: row.tenant_id ?? row.tenantId ?? null,
-		actor: row.actor,
-		actor_kind: row.actor_kind ?? row.actorKind,
-		target: row.target,
-		category: row.category,
-		domain: row.domain,
-		method: row.method,
-		request_id: row.request_id ?? row.requestId,
-		detail: _detail(row),
-		pii_in_detail: !!(row.pii_in_detail || row.piiInDetail),
-		shipped_at: row.shipped_at ?? row.shippedAt ?? null,
-		canonical_form_id: row.canonical_form_id ?? row.canonicalFormId ?? "",
-		prev_hash: row.prev_hash ?? row.prevHash ?? "",
-		hash: row.hash ?? "",
-		detail_salt: row.detail_salt ?? row.detailSalt ?? null,
-		detail_commitment: row.detail_commitment ?? row.detailCommitment ?? null,
-	};
-}
-
-function _differs(id) {
-	return new AuditRowRejectedError(
-		`row ${id}: differs from the stored row with that id`,
-	);
-}
+// Timestamps come back canonical through the pool's type parser when the
+// column is TIMESTAMPTZ (a table the Go store created).
+const _chainRow = (r) => chainRow("PostgresStore", r);
 
 /**
  * Build a parameterised WHERE clause from filter options.
@@ -446,7 +323,7 @@ export class PostgresStore {
 	 */
 	async insert(row) {
 		await this._ensureReady();
-		const r = _snake(row);
+		const r = snakeRow(row);
 		// A row that no retry can store is refused before anything is taken.
 		try {
 			toChainRow(r);
@@ -468,7 +345,7 @@ export class PostgresStore {
 				sameEvent(held, r) &&
 				(r.monotonic_seq === 0 ||
 					(r.monotonic_seq === held.monotonic_seq && r.hash === held.hash));
-			if (!same) throw _differs(r.id);
+			if (!same) throw differs(r.id);
 			return held;
 		};
 		try {
@@ -556,7 +433,7 @@ export class PostgresStore {
 		}
 		await this._ensureReady();
 		const check = (held) => {
-			if (held.hash !== r.hash) throw _differs(r.id);
+			if (held.hash !== r.hash) throw differs(r.id);
 		};
 		try {
 			await this._transaction(async (client) => {
@@ -577,6 +454,124 @@ export class PostgresStore {
 		}
 	}
 
+	/**
+	 * Store one sealed row replicated from another node (spec §5). The same
+	 * as `insertSealed`; `ingestReplicated` verifies a batch first.
+	 *
+	 * @param {Record<string,unknown>|string} row
+	 * @param {{ detailText?: string }} [opts]
+	 * @returns {Promise<void>}
+	 */
+	async insertReplicated(row, opts) {
+		return this.insertSealed(row, opts);
+	}
+
+	/**
+	 * Verify a batch of rows replicated from other nodes and store its
+	 * verified prefix in one transaction (spec §4). Each row is a wire-format
+	 * row object or one line of JSON text; parse received text with
+	 * `parseJson`, or pass the lines, so detail numbers keep the tokens they
+	 * were hashed with. Rows are stored as they were sealed, never sealed
+	 * again, with their detail text as `insertSealed` writes it.
+	 *
+	 * A chain break does not throw. The rows from the first break on are not
+	 * stored, and the result says where it is: `rejectedFromSeq` is the
+	 * `monotonic_seq` to resend from, `reason` why. A break is a row that
+	 * fails `verifyChain` within the batch, or one that disagrees with what
+	 * the store holds: a different row under a stored id or at a stored
+	 * (node, seq), a `prev_hash` that does not link to the stored row before
+	 * it, or a stored row after it that does not link to it. A row already
+	 * stored with the same hash is a re-delivery and counts in `inserted`,
+	 * as in Python and Go. Unsealed rows are not stored.
+	 *
+	 * With `localNodeId`, the batch stops at the first row from that node,
+	 * reported as the break: a node's own rows come from its emit path.
+	 *
+	 * Takes the node lock of every node in the batch, in node order. Throws
+	 * ChainError for a row it cannot read; other errors are pg's, and a
+	 * failed COMMIT throws its error (the batch can be sent again).
+	 *
+	 * @param {Iterable<Record<string,unknown>|string>} rows
+	 * @param {{ localNodeId?: string }} [opts]
+	 * @returns {Promise<{ inserted: number, rejectedFromSeq: number | null, reason: string | null }>}
+	 */
+	async ingestReplicated(rows, { localNodeId } = {}) {
+		const batch = readBatch(rows);
+		return ingestWithoutLocalNode((rs) => this._ingest(rs), batch, localNodeId);
+	}
+
+	async _ingest(batch) {
+		const verified = verifiedPrefix(batch);
+		const unsealed = skippedUnsealed(batch, verified.rejectedFromSeq);
+		if (verified.prefix.length === 0 && unsealed.length === 0) {
+			return {
+				inserted: 0,
+				rejectedFromSeq: verified.rejectedFromSeq,
+				reason: verified.reason || null,
+			};
+		}
+		await this._ensureReady();
+		const t = this._table;
+		const nodes = [
+			...new Set(
+				[...verified.prefix, ...unsealed].map((r) => r.source_node_id),
+			),
+		].sort(compareCodePoints);
+		// The node locks don't cover ids, which are unique across nodes; if an
+		// ingest for another node stored one of these ids meanwhile, check
+		// again.
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				return await this._transaction(async (client) => {
+					for (const node of nodes) await client.query(_NODE_LOCK, [node]);
+					const one = async (sql, params) =>
+						(await client.query(sql, params)).rows[0] ?? null;
+					const look = {
+						byId: async (id) =>
+							(await one(`SELECT hash FROM ${t} WHERE id = $1`, [id]))?.hash ??
+							null,
+						atSeq: (node, seq) =>
+							one(
+								`SELECT id, hash, prev_hash FROM ${t} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1`,
+								[node, seq],
+							),
+						sealedBelow: async (node, seq) =>
+							(await one(
+								`SELECT 1 FROM ${t} WHERE source_node_id = $1 AND monotonic_seq < $2 AND hash <> '' LIMIT 1`,
+								[node, seq],
+							)) !== null,
+					};
+					const v = cutAtConflict(
+						verified,
+						await conflictAsync(verified.prefix, unsealed, look),
+					);
+					for (const row of v.prefix) {
+						const n = await this._insertRow(
+							client,
+							row,
+							detailText(row.detail),
+						);
+						// Skipped: fine for a re-delivery, not for any other row.
+						if (n === 0 && (await look.byId(row.id)) !== row.hash) {
+							throw new StoredMeanwhile(row.id);
+						}
+					}
+					return {
+						inserted: v.prefix.length,
+						rejectedFromSeq: v.rejectedFromSeq,
+						reason: v.reason || null,
+					};
+				});
+			} catch (err) {
+				if (err instanceof StoredMeanwhile) continue;
+				throw err instanceof _CommitError ? err.cause : err;
+			}
+		}
+		throw new Error(
+			"fasten PostgresStore: ingestReplicated: rows kept being stored by another writer",
+		);
+	}
+
 	/** The store seals rows with seq 0 (spec §2.1); the engine checks this. */
 	seals() {
 		return true;
@@ -594,7 +589,7 @@ export class PostgresStore {
 	async chainRows(sourceNodeId) {
 		await this._ensureReady();
 		const res = await this._pool.query(
-			`SELECT ${_CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = $1 ORDER BY monotonic_seq`,
+			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = $1 ORDER BY monotonic_seq`,
 			[sourceNodeId],
 		);
 		return res.rows.map(_chainRow);
@@ -611,7 +606,7 @@ export class PostgresStore {
 	async allChainRows() {
 		await this._ensureReady();
 		const res = await this._pool.query(
-			`SELECT ${_CHAIN_COLUMNS} FROM ${this._table} ORDER BY source_node_id, monotonic_seq`,
+			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} ORDER BY source_node_id, monotonic_seq`,
 		);
 		return res.rows.map(_chainRow);
 	}
@@ -624,7 +619,7 @@ export class PostgresStore {
 	 */
 	async chainTips() {
 		await this._ensureReady();
-		const res = await this._pool.query(_chainTipsSQL(this._table));
+		const res = await this._pool.query(chainTipsSQL(this._table));
 		return res.rows.map((r) => ({
 			source_node_id: r.source_node_id,
 			monotonic_seq: Number(r.monotonic_seq),
@@ -669,7 +664,7 @@ export class PostgresStore {
 		let res;
 		try {
 			res = await this._pool.query(
-				`SELECT ${_CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
+				`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
 				[id],
 			);
 		} catch (readErr) {
@@ -687,17 +682,13 @@ export class PostgresStore {
 			`SELECT id FROM ${this._table} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1`,
 			[r.source_node_id, r.monotonic_seq],
 		);
-		if (res.rows.length) {
-			throw new AuditRowRejectedError(
-				`row ${r.id}: seq ${r.monotonic_seq} on node ${JSON.stringify(r.source_node_id)} is held by row ${res.rows[0].id}`,
-			);
-		}
+		if (res.rows.length) throw seqHeld(r, res.rows[0].id);
 	}
 
 	// The row stored under `id`, as a chain row, or null.
 	async _held(client, id) {
 		const res = await client.query(
-			`SELECT ${_CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
+			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
 			[id],
 		);
 		return res.rows.length ? _chainRow(res.rows[0]) : null;
@@ -787,7 +778,7 @@ export class PostgresStore {
 		params.push(limit, offset);
 		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
 		const res = await this._pool.query(sql, params);
-		return res.rows.map(_mapRow);
+		return res.rows.map(mapRow);
 	}
 
 	/**
@@ -829,20 +820,30 @@ export class PostgresStore {
 	}
 
 	/**
-	 * List rows that have not been shipped yet (shipped_at IS NULL),
-	 * ordered oldest-first (monotonic_seq ASC), in the shape `query()`
-	 * returns.
+	 * List rows that have not been shipped yet (shipped_at IS NULL), oldest
+	 * seq first, in the shape `query()` returns.
+	 *
+	 * With both `serviceId` and `sourceNodeId`, only the rows that identity
+	 * originated (`origin_id = id`), so rows ingested from other nodes are
+	 * not shipped again (spec §4). With `exact`, rows as `chainRows` reads
+	 * them, detail numbers as the tokens that were hashed: ship those, as
+	 * `JSON.stringify` writes them, so the receiver verifies them.
 	 *
 	 * @param {number} [limit]
+	 * @param {{ serviceId?: string, sourceNodeId?: string, exact?: boolean }} [opts]
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
-	async listUnshipped(limit = 100) {
+	async listUnshipped(limit = 100, { serviceId, sourceNodeId, exact } = {}) {
 		await this._ensureReady();
+		const scoped = serviceId != null && sourceNodeId != null;
+		const cols = exact ? CHAIN_COLUMNS : "*";
 		const res = await this._pool.query(
-			`SELECT * FROM ${this._table} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1`,
-			[limit],
+			scoped
+				? `SELECT ${cols} FROM ${this._table} WHERE shipped_at IS NULL AND service_id = $2 AND source_node_id = $3 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $1`
+				: `SELECT ${cols} FROM ${this._table} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1`,
+			scoped ? [limit, serviceId, sourceNodeId] : [limit],
 		);
-		return res.rows.map(_mapRow);
+		return res.rows.map(exact ? _chainRow : mapRow);
 	}
 
 	/**

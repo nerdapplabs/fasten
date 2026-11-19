@@ -34,7 +34,7 @@ register('user', {
 
 // Optional: a sync audit-store sink. Without one, rows print to stdout only.
 // A store of your own writes rows unsealed unless it seals them (see
-// "A store of your own" below); PostgresStore seals them.
+// "A store of your own" below); SqliteStore and PostgresStore seal them.
 const auditStore = {
     insert(row) { /* persist row to your DB / queue / file */ },
 };
@@ -92,13 +92,13 @@ it lost rows. An idle drainer does not
 keep the process alive.
 
 **Chain.** `emit()` returns the row with `monotonic_seq: 0`.
-`PostgresStore` seals it into its node's hash chain in the insert
-transaction, under the same per-node lock as the Python, Go and Rust
-stores: the node's next seq, `prev_hash` from the node's latest sealed row,
+`PostgresStore` and `SqliteStore` seal it into its node's hash chain in
+the insert transaction, under the same per-node lock as the Python, Go and
+Rust stores (SQLite: `BEGIN IMMEDIATE`): the node's next seq, `prev_hash` from the node's latest sealed row,
 a detail salt and commitment, and the hash (canonical form "2",
 [spec §1.4](../spec/chain-replication.md)). Python, Go, Rust and JS writers
-can share a node in one table: `PostgresStore` writes into a table the Python
-or Go store created, and adds the columns it lacks.
+can share a node in one table: `PostgresStore` and `SqliteStore` write into a
+table the Python or Go store created, and add the columns it lacks.
 
 What `insert()` returns decides the rest. When it returns (or resolves to)
 a row with the same `id` as the row given, raise-mode `emit()` returns that
@@ -145,11 +145,11 @@ text `String(n)` gives (what `JSON.stringify` writes) and hashed as CPython
 renders the value that text reads back as: `75` as `75`, `75.5` as `75.5`,
 `1e-7` as `1e-07`. JS has no float `75.0`; send it as `75`, an int. A
 `BigInt` is an exact integer, so pass one for an integer above 2^53.
-`PostgresStore` writes `detail` as the same canonical text, so what is
-stored is what was hashed. A string `detail` given to
-`PostgresStore.insert` is read as JSON text and must be an object.
+The stores write `detail` as the same canonical text, so what is stored is
+what was hashed. A string `detail` given to a store's `insert` is read as
+JSON text and must be an object.
 
-**Reading rows.** `PostgresStore.query()` and `listUnshipped()` return rows
+**Reading rows.** A store's `query()` and `listUnshipped()` return rows
 with the wire's snake_case keys, the shape of `Row` and of what `insert()`
 returns. Their `detail` is parsed with `JSON.parse`, and an integer a
 number cannot hold exactly is a `BigInt`. `JSON.stringify` throws on a
@@ -162,13 +162,104 @@ on rows of the PII codes older than `before`: codes with `piiInDetail` or
 `AUDIT_ROW_REDACTED` row naming it, written before the row is cleared. Rows
 are never deleted. Set `retentionPii: '30d'` (or `FASTEN_RETENTION_PII`) in
 `init()` to run it on init and then hourly; the store must implement
-`listRedactionCandidates` and `redactRows`, as `PostgresStore` does.
+`listRedactionCandidates` and `redactRows`, as both bundled stores do.
 
 **Differs from the other SDKs:** Node is single-threaded, so `emit()` cannot
 block on a counting semaphore the way Python, Go, Rust and C++ do.
 `queueCapacity` is a warning threshold (it drives the
 `audit_queue_high_water` / `audit_queue_near_full` sys events), not a hard
 cap.
+
+## SQLite store
+
+`SqliteStore` keeps the audit rows in a SQLite file, on Node's built-in
+`node:sqlite`, with no dependency to install:
+
+```js
+import fasten from 'fasten-sdk';
+import { SqliteStore } from 'fasten-sdk/store/sqlite';
+
+const auditStore = new SqliteStore('./audit.db');   // or { table, wal, busyTimeoutMs }
+fasten.init({ serviceId: 'auth-service', nodeId: 'host-01', auditStore });
+```
+
+It does what `PostgresStore` does, with the same methods and row shapes:
+it seals rows into the chain, returns the stored row on a retry, rejects a
+different row under a stored id or at a taken seq, and has `insertSealed`,
+`chainRows`, `allChainRows`, `chainTips`, `query`, `count`, `listUnshipped`,
+`markShipped`, `purge`, the redaction methods and replication (below). A
+seq is taken in a `BEGIN IMMEDIATE` transaction, so several processes and
+threads can write one file and still get one chain per node. A new file is
+created owner-only (0600), in WAL mode, and a writer waits up to 5 s for
+another's write lock.
+
+The table works with the Python, Go and Rust SQLite stores, so they can
+share one file. `SqliteStore` adds the columns a table another SDK created
+lacks. On a table it creates, the `(source_node_id, monotonic_seq)` index is
+unique, as in the Go and Rust stores; on an existing table without such an
+index it adds a plain one, since older rows may repeat a seq.
+
+`node:sqlite` is synchronous. Each call runs to the end before it returns
+and blocks the event loop meanwhile, including while it waits for another
+connection's write lock. The methods return promises only so the store has
+`PostgresStore`'s interface. Where a wait on the lock would hold up
+requests, use `PostgresStore`. In Node 24's documentation `node:sqlite`
+is at stability 1.2, release candidate (since v24.15.0); it was
+experimental before that.
+
+## Replication
+
+A node ships the rows it originated to an aggregator, which verifies them
+and stores them without sealing them again
+([spec §4](../spec/chain-replication.md)). On the node:
+
+```js
+const rows = await fasten.listUnshipped(500);   // this node's own rows, oldest first
+await send(rows.map((r) => JSON.stringify(r)).join('\n'));
+await fasten.markShipped(rows.map((r) => r.id));
+```
+
+`fasten.listUnshipped` asks the store for the rows this service and node
+originated (`origin_id = id`), so rows ingested from other nodes are not
+shipped again, and reads them with `exact: true`: their detail numbers are
+the tokens that were hashed, and `JSON.stringify` writes them as they are.
+A store's own `listUnshipped(limit, { serviceId, sourceNodeId, exact })`
+takes the same options.
+
+On the aggregator, pass each received line as it is, or parsed with
+`parseJson` (`JSON.parse` turns `75.0` into `75`, and the row then fails to
+verify):
+
+```js
+const result = await store.ingestReplicated(lines, { localNodeId: 'aggregator-01' });
+// { inserted: 500, rejectedFromSeq: null, reason: null }
+```
+
+`ingestReplicated` verifies the batch's chain per node and checks it against
+the rows the store already holds, in one transaction: a different row under
+a stored id or at a stored (node, seq), a `prev_hash` that does not link to
+the stored row before it, or a stored row after it that does not link to it,
+is a break. It stores the rows before the first break, with each row's hash
+and detail text as they were sealed, and does not throw on a break: the
+result says where the batch broke, so the sender resends from there.
+Unsealed rows are not stored. A re-delivered batch is a no-op.
+
+| `IngestResult` (JS) | Python | Go | |
+|---|---|---|---|
+| `inserted` | `inserted` | `Inserted` | rows of the verified prefix passed to the insert, re-deliveries included |
+| `rejectedFromSeq` | `rejected_from_seq` | `RejectedFromSeq` | seq of the first broken row; `null` (Go: 0) when none |
+| `reason` | `reason` | `Reason` | why it broke there; `null` (Go: "") when it did not |
+
+With `localNodeId`, the batch stops at the first row from that node, which
+is reported as the break: a node's own rows come only from its emit path,
+and such a row usually means two nodes share a node id. `fasten.ingestReplicated(rows)`
+does the same with the default engine's store and node id.
+`ingestReplicated` throws `ChainError` for a row it cannot read at all.
+`insertReplicated(row)` stores one sealed row from elsewhere without
+verifying a batch; it is `insertSealed`.
+
+The transport must authenticate the sender: ingest verifies the chain, not
+who sent it.
 
 ## Verifying the chain
 

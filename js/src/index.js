@@ -691,6 +691,50 @@ export class Engine {
 		return redacted;
 	}
 
+	// The audit store, with the methods `op` needs.
+	_storeWith(op, ...methods) {
+		const store = this.#config.auditStore;
+		if (!store || methods.some((m) => typeof store[m] !== "function")) {
+			throw new AuditStoreError(
+				new Error(
+					`${op}: the audit store does not implement ${methods.join(" / ")}`,
+				),
+			);
+		}
+		return store;
+	}
+
+	/**
+	 * Rows this engine's service and node originated that are not shipped
+	 * yet, oldest first, as the store's `listUnshipped` returns them with
+	 * `exact` set: ship them as `JSON.stringify` writes them. Rows ingested
+	 * from other nodes are left out (spec §4).
+	 */
+	async listUnshipped(limit = 100) {
+		const store = this._storeWith("listUnshipped", "listUnshipped");
+		return store.listUnshipped(limit, {
+			serviceId: this.#config.serviceId,
+			sourceNodeId: this.#config.nodeId,
+			exact: true,
+		});
+	}
+
+	/** Mark rows shipped upstream, by id. */
+	async markShipped(ids) {
+		await this._storeWith("markShipped", "markShipped").markShipped(ids);
+	}
+
+	/**
+	 * Verify a batch replicated from other nodes and store its verified
+	 * prefix (spec §4), through the store's `ingestReplicated`. A chain break
+	 * does not throw: the result's `rejectedFromSeq` is the seq to resend
+	 * from. The batch stops at the first row from this engine's node id.
+	 */
+	async ingestReplicated(rows) {
+		const store = this._storeWith("ingestReplicated", "ingestReplicated");
+		return store.ingestReplicated(rows, { localNodeId: this.#config.nodeId });
+	}
+
 	queueStats() {
 		return this._drainer ? this._drainer.stats() : null;
 	}
@@ -950,6 +994,15 @@ export function close(timeoutMs = 5000) {
 export async function redactExpired(opts) {
 	return defaultEngine.redactExpired(opts);
 }
+export async function listUnshipped(limit = 100) {
+	return defaultEngine.listUnshipped(limit);
+}
+export async function markShipped(ids) {
+	return defaultEngine.markShipped(ids);
+}
+export async function ingestReplicated(rows) {
+	return defaultEngine.ingestReplicated(rows);
+}
 
 export const log = defaultEngine.log;
 
@@ -985,6 +1038,9 @@ export default {
 	flush,
 	close,
 	redactExpired,
+	listUnshipped,
+	markShipped,
+	ingestReplicated,
 	piiCodes,
 	parseDuration,
 	Domain,

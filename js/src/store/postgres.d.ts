@@ -2,9 +2,14 @@
 import type {
 	AuditRepository,
 	ChainRow,
+	ChainRowInput,
 	ChainStore,
 	ChainTip,
 	Filter,
+	IngestOptions,
+	IngestResult,
+	ListUnshippedOptions,
+	ReplicationStore,
 	Row,
 } from "../index.js";
 
@@ -12,7 +17,9 @@ import type {
  * AuditRepository on PostgreSQL (node-postgres, a peer dependency). Seals
  * rows with seq 0 into their node's hash chain on insert (spec §2.1).
  */
-export class PostgresStore implements AuditRepository, ChainStore {
+export class PostgresStore
+	implements AuditRepository, ChainStore, ReplicationStore
+{
 	/**
 	 * @param connectionString A libpq DSN or connection URL.
 	 * @param opts.table Table name, optionally schema-qualified. Defaults to
@@ -33,6 +40,20 @@ export class PostgresStore implements AuditRepository, ChainStore {
 		row: Parameters<ChainStore["insertSealed"]>[0],
 		opts?: { detailText?: string },
 	): Promise<void>;
+	/** insertSealed, for a row replicated from another node (spec §5). */
+	insertReplicated(
+		row: ChainRowInput,
+		opts?: { detailText?: string },
+	): Promise<void>;
+	/**
+	 * Verify a replicated batch and store its verified prefix in one
+	 * transaction (spec §4). A chain break does not throw; it is in the
+	 * result. Throws ChainError for a row it cannot read.
+	 */
+	ingestReplicated(
+		rows: Iterable<ChainRowInput>,
+		opts?: IngestOptions,
+	): Promise<IngestResult>;
 	seals(): true;
 	chainRows(sourceNodeId: string): Promise<ChainRow[]>;
 	allChainRows(): Promise<ChainRow[]>;
@@ -43,8 +64,18 @@ export class PostgresStore implements AuditRepository, ChainStore {
 	 */
 	query(filter?: Filter): Promise<Row[]>;
 	count(filter?: Omit<Filter, "limit" | "offset">): Promise<number>;
-	/** Unshipped rows, oldest seq first, in the shape query() returns. */
-	listUnshipped(limit?: number): Promise<Row[]>;
+	/**
+	 * Unshipped rows, oldest seq first, in the shape query() returns; with
+	 * exact, as chainRows reads them.
+	 */
+	listUnshipped(
+		limit?: number,
+		opts?: ListUnshippedOptions & { exact?: false },
+	): Promise<Row[]>;
+	listUnshipped(
+		limit: number | undefined,
+		opts: ListUnshippedOptions & { exact: true },
+	): Promise<ChainRow[]>;
 	markShipped(ids: string[]): Promise<void>;
 	/** Delete, per node, a seq prefix of rows older than before (spec §2.3). */
 	purge(opts: { before: string; respectUnshipped?: boolean }): Promise<number>;

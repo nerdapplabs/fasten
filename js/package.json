@@ -18,6 +18,10 @@
     "./store/postgres": {
       "types": "./src/store/postgres.d.ts",
       "default": "./src/store/postgres.js"
+    },
+    "./store/sqlite": {
+      "types": "./src/store/sqlite.d.ts",
+      "default": "./src/store/sqlite.js"
     }
   },
   "engines": {

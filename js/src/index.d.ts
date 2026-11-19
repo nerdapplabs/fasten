@@ -230,6 +230,23 @@ export interface RedactExpiredOptions {
  */
 export function redactExpired(opts: RedactExpiredOptions): Promise<string[]>;
 
+/**
+ * Rows the default engine's service and node originated that are not
+ * shipped yet, oldest first, as the store's listUnshipped returns them with
+ * exact set. Rows ingested from other nodes are left out (spec §4).
+ */
+export function listUnshipped(limit?: number): Promise<ChainRow[]>;
+/** Mark rows shipped upstream, by id, in the default engine's store. */
+export function markShipped(ids: string[]): Promise<void>;
+/**
+ * Verify a replicated batch and store its verified prefix in the default
+ * engine's store (spec §4). The batch stops at the first row from the
+ * engine's node id. A chain break does not throw; it is in the result.
+ */
+export function ingestReplicated(
+	rows: Iterable<ChainRowInput>,
+): Promise<IngestResult>;
+
 // --- Store interfaces ----------------------------------------------------
 
 export interface Filter {
@@ -263,7 +280,10 @@ export interface AuditRepository {
 	 */
 	seals?(): boolean;
 	query(filter: Filter): Promise<Row[]> | Row[];
-	listUnshipped(limit: number): Promise<Row[]> | Row[];
+	listUnshipped(
+		limit: number,
+		opts?: ListUnshippedOptions,
+	): Promise<Row[] | ChainRow[]> | Row[] | ChainRow[];
 	markShipped(ids: string[]): Promise<void> | void;
 	purge(opts: {
 		before: string;
@@ -288,7 +308,7 @@ export interface AuditOutboxRepository {
 	depth(): Promise<number> | number;
 }
 
-/** What PostgresStore adds for the hash chain. */
+/** What PostgresStore and SqliteStore add for the hash chain. */
 export interface ChainStore {
 	seals(): boolean;
 	/**
@@ -310,6 +330,45 @@ export interface ChainStore {
 		row: ChainRowInput,
 		opts?: { detailText?: string },
 	): Promise<void>;
+}
+
+export interface ListUnshippedOptions {
+	/** With sourceNodeId: only rows this identity originated (origin_id = id). */
+	serviceId?: string;
+	sourceNodeId?: string;
+	/** Rows as chainRows reads them, detail numbers as hashed, for shipping. */
+	exact?: boolean;
+}
+
+export interface IngestOptions {
+	/** The receiving node's id: the batch stops at its first row from it. */
+	localNodeId?: string;
+}
+
+/**
+ * What ingestReplicated did (spec §4). Python's IngestResult and Go's, with
+ * camelCase names: inserted, rejected_from_seq (RejectedFromSeq),
+ * reason (Reason).
+ */
+export interface IngestResult {
+	/** Rows of the verified prefix passed to the insert, re-deliveries included. */
+	inserted: number;
+	/** monotonic_seq of the first broken row, to resend from; null when none. */
+	rejectedFromSeq: number | null;
+	/** Why the batch broke there; null when it did not. */
+	reason: string | null;
+}
+
+/** What PostgresStore and SqliteStore add for replication. */
+export interface ReplicationStore {
+	insertReplicated(
+		row: ChainRowInput,
+		opts?: { detailText?: string },
+	): Promise<void>;
+	ingestReplicated(
+		rows: Iterable<ChainRowInput>,
+		opts?: IngestOptions,
+	): Promise<IngestResult>;
 }
 
 // --- Hash chain (spec/chain-replication.md) ------------------------------
@@ -550,6 +609,9 @@ declare const _default: {
 	close: typeof close;
 
 	redactExpired: typeof redactExpired;
+	listUnshipped: typeof listUnshipped;
+	markShipped: typeof markShipped;
+	ingestReplicated: typeof ingestReplicated;
 	piiCodes: typeof piiCodes;
 	parseDuration: typeof parseDuration;
 	AuditStoreError: typeof AuditStoreError;
