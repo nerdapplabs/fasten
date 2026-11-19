@@ -6,6 +6,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Go reads rows with a NULL salt or commitment
+
+- The Go SQLite and Postgres stores read a row whose `detail_salt` or
+  `detail_commitment` is NULL as empty. Before, one such row made the whole
+  query fail. Tables created by another SDK allow NULL there, and the Rust
+  SDK writes it when it redacts a row.
+
 ### Fixed: Go keeps detail numbers exact
 
 - A row read from the Go SQLite or Postgres store keeps each detail number

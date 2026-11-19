@@ -2,6 +2,7 @@ package fasten
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"testing"
@@ -114,5 +115,56 @@ func TestForm2_RedactedRowStillVerifies(t *testing.T) {
 	}
 	if res := VerifyChain(rows); !res.OK {
 		t.Fatalf("redacted form-2 row fails VerifyChain: %s", res.Reason)
+	}
+}
+
+// A table another SDK created has nullable salt and commitment columns, and
+// the Rust SDK redacts the salt to NULL. Reading such a row must not fail.
+func TestForm2_NullSaltReadsAsEmpty(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sqlite open: %v", err)
+	}
+	defer db.Close()
+	// The Go table, with the two columns nullable as Python, JS and Rust
+	// create them.
+	if _, err := db.Exec(`CREATE TABLE audit_null_salt (
+    id TEXT PRIMARY KEY, origin_id TEXT NOT NULL, monotonic_seq INTEGER NOT NULL,
+    timestamp TEXT NOT NULL, code TEXT NOT NULL, action TEXT NOT NULL,
+    severity TEXT NOT NULL, service_id TEXT NOT NULL, source_node_id TEXT NOT NULL,
+    tenant_id TEXT, actor TEXT NOT NULL, actor_kind TEXT NOT NULL,
+    target TEXT NOT NULL, category TEXT NOT NULL, domain TEXT NOT NULL,
+    method TEXT NOT NULL, request_id TEXT NOT NULL, detail TEXT NOT NULL,
+    pii_in_detail INTEGER NOT NULL DEFAULT 0, shipped_at TEXT,
+    wire_version TEXT NOT NULL DEFAULT '1', hash TEXT NOT NULL DEFAULT '',
+    prev_hash TEXT NOT NULL DEFAULT '', canonical_form_id TEXT NOT NULL DEFAULT '1',
+    detail_salt TEXT, detail_commitment TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	store, err := NewSQLiteStore(db, "audit_null_salt")
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	ctx := context.Background()
+
+	row := form2Vector(t)
+	if err := store.Insert(ctx, row); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"UPDATE audit_null_salt SET detail = 'null', detail_salt = NULL WHERE id = ?",
+		row.ID); err != nil {
+		t.Fatalf("redact: %v", err)
+	}
+
+	rows, err := store.Query(ctx, Filter{Limit: 10})
+	if err != nil {
+		t.Fatalf("query a row with a NULL salt: %v", err)
+	}
+	if len(rows) != 1 || rows[0].DetailSalt != "" {
+		t.Fatalf("rows = %d, salt = %q; want 1 row with an empty salt", len(rows), rows[0].DetailSalt)
+	}
+	if res := VerifyChain(rows); !res.OK {
+		t.Fatalf("redacted row with a NULL salt fails VerifyChain: %s", res.Reason)
 	}
 }
