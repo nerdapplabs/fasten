@@ -23,9 +23,16 @@ pub use retention::{parse_duration, RedactionCandidate, AUDIT_ROW_REDACTED};
 pub use fasten_core::drainer::QueueStats;
 
 /// Hash-chain verification (spec/chain-replication.md §3), re-exported from
-/// fasten-core. Build [`ChainRow`]s with `PostgresStore::chain_rows`, or from
-/// captured stdout lines with [`ChainRow::from_json`].
+/// fasten-core. Build [`ChainRow`]s with a bundled store's `chain_rows`, or
+/// from captured stdout lines with [`ChainRow::from_json`].
 pub use fasten_core::chain::{verify_chain, ChainRow, ChainVerifyResult};
+
+pub mod checkpoints;
+pub use checkpoints::{
+    checkpoints_since, load_checkpoints, publish_checkpoints, take_checkpoints,
+    verify_chain_with_checkpoints, Checkpoint, CheckpointError, CheckpointOptions, CheckpointSink,
+    CheckpointStore, FileCheckpointSink,
+};
 
 /// Raised by `EmitBuilder::submit()` in `raise` mode when the store insert fails.
 #[derive(Debug, thiserror::Error)]
@@ -319,6 +326,8 @@ pub enum Error {
     Unsupported(String),
     #[error("{0}")]
     InvalidRetention(String),
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -2084,6 +2093,11 @@ mod tests {
 pub mod postgres_store;
 #[cfg(feature = "store-postgres")]
 pub use postgres_store::PostgresStore;
+
+#[cfg(feature = "store-sqlite")]
+pub mod sqlite_store;
+#[cfg(feature = "store-sqlite")]
+pub use sqlite_store::SqliteStore;
 
 // Yaml catalogs, behind the `codes-yaml` feature:
 //

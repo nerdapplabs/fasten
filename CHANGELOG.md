@@ -23,6 +23,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Breaking: the Rust `Row` has three new public fields, `canonical_form_id`,
   `detail_salt` and `detail_commitment`. Code that builds a `Row` with a
   struct literal must set them or use `..Default::default()`.
+- Chain checkpoints in Rust: `publish_checkpoints`, `take_checkpoints`,
+  `FileCheckpointSink`, `load_checkpoints`, `checkpoints_since` and
+  `verify_chain_with_checkpoints`, with whole-chain and partial modes. The
+  file format and the failure reasons are the same as Python's and Go's.
+  There is no HTTP sink yet; implement `CheckpointSink` for one.
+- A bundled `SqliteStore` behind the new `store-sqlite` feature. It seals
+  rows on insert like `PostgresStore`. Both stores have `chain_rows`,
+  `all_chain_rows` and `chain_tips`.
+- fasten-core: a `checkpoint` module, `Store::chain_tips` and
+  `SqliteStore::insert_stored`.
 - fasten-core: `chain::seal`, `seal_row`, `row_hash`, `detail_commitment`
   and `verify_chain` give the same hashes as Python and Go for forms "1"
   and "2". `SqliteStore` and `PostgresStore` seal a row inserted with

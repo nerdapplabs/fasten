@@ -57,6 +57,7 @@
 
 pub mod catalog;
 pub mod chain;
+pub mod checkpoint;
 pub mod drainer;
 pub mod error;
 pub mod redact;
@@ -68,6 +69,7 @@ pub(crate) mod ffi;
 
 // Re-export the most used types at crate root for Rust callers.
 pub use catalog::{CodeRegistry, Meta, GLOBAL_REGISTRY};
+pub use checkpoint::Checkpoint;
 pub use error::{Error, FastenErrorCode};
 pub use redact::{Redactor, REDACTOR};
 pub use row::Row;

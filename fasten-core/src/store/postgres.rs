@@ -10,7 +10,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{chain_row, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{chain_row, chain_tips_sql, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -411,6 +411,14 @@ impl Store for PostgresStore {
 
     fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
         self.select(filter)?
+            .iter()
+            .map(|r| chain_row(&row_from_pg(r), r.get(18)))
+            .collect()
+    }
+
+    fn chain_tips(&self) -> Result<Vec<ChainRow>, Error> {
+        let sql = chain_tips_sql(&self.table, SELECT_COLUMNS);
+        self.with_reconnect(|inner| inner.client.query(sql.as_str(), &[]).map_err(Error::Postgres))?
             .iter()
             .map(|r| chain_row(&row_from_pg(r), r.get(18)))
             .collect()

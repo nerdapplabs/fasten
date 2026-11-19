@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::checkpoint::{checkpoint_break, Checkpoint, CheckpointOptions};
 use crate::row::Row;
 
 /// Form stamped by [`seal`]. Form "1" rows still verify.
@@ -928,8 +929,8 @@ fn first_break(sorted: &[&ChainRow]) -> Option<(u64, String)> {
 /// Walk the hash chain of each node in `rows` and report the first break.
 ///
 /// Detects a changed field, and an inserted, removed or reordered row. A cut
-/// tail or a full re-seal from genesis is not detected here; that takes
-/// checkpoints (spec 9), which this function does not check.
+/// tail or a full re-seal from genesis is detected only against checkpoints
+/// published earlier outside the store; see [`verify_chain_with_checkpoints`].
 ///
 /// - Chains are per `source_node_id`; each is walked in `monotonic_seq` order.
 /// - A row given more than once is checked once: a sealed copy wins over an
@@ -941,6 +942,25 @@ fn first_break(sorted: &[&ChainRow]) -> Option<(u64, String)> {
 /// - With several nodes, `first_break_at` is the lowest seq at which any
 ///   breaks.
 pub fn verify_chain(rows: &[ChainRow]) -> ChainVerifyResult {
+    verify_chain_with_checkpoints(rows, &[], CheckpointOptions::default())
+}
+
+/// [`verify_chain`], with `rows` also checked against `checkpoints` (spec 9).
+///
+/// Each checkpoint within a node's rows must match the row at its seq. Unless
+/// `opts.partial` is set, `rows` are taken as the whole chain: every
+/// checkpointed node must have rows, and no checkpoint may be below its
+/// node's oldest row or above its newest. Rows after a node's newest
+/// checkpoint are not covered by it. Under retention, pass only the
+/// checkpoints taken since the latest purge
+/// ([`crate::checkpoint::checkpoints_since`]): an older one below the purged
+/// rows fails. `first_break_at` is the lowest seq of any break; at one seq a
+/// chain break is reported before a checkpoint break.
+pub fn verify_chain_with_checkpoints(
+    rows: &[ChainRow],
+    checkpoints: &[Checkpoint],
+    opts: CheckpointOptions,
+) -> ChainVerifyResult {
     // One copy per (node, id), in first-seen order.
     let mut by_node: BTreeMap<&str, Vec<&ChainRow>> = BTreeMap::new();
     let mut kept: HashMap<(&str, &str), usize> = HashMap::new();
@@ -980,6 +1000,7 @@ pub fn verify_chain(rows: &[ChainRow]) -> ChainVerifyResult {
         lower(first_break(node), &mut first);
     }
     lower(dup, &mut first);
+    lower(checkpoint_break(&by_node, checkpoints, opts.partial), &mut first);
 
     match first {
         Some((seq, reason)) => ChainVerifyResult {

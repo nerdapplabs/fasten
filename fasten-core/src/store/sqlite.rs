@@ -11,7 +11,7 @@ use crate::{
     validate::{split_table, validate_table_name},
 };
 
-use super::{chain_row, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{chain_row, chain_tips_sql, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -267,6 +267,61 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Insert `row` as [`Store::insert`] does and return it as stored: with
+    /// the seq and chain fields the store gave it, or, when its id was
+    /// already stored, the ones that row has. A row with a seq of its own is
+    /// returned as given.
+    pub fn insert_stored(&self, row: &Row) -> Result<Row, Error> {
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if row.monotonic_seq != 0 {
+            insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64)?;
+            return Ok(row.clone());
+        }
+
+        // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
+        // handles on one file cannot both read the same tip (spec §2.1).
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                &format!("SELECT {SELECT_COLUMNS} FROM {} WHERE id = ?1", self.table),
+                rusqlite::params![row.id],
+                row_from_sqlite,
+            )
+            .optional()?;
+        let stored = if let Some(old) = existing {
+            Row {
+                monotonic_seq: old.monotonic_seq,
+                prev_hash: old.prev_hash,
+                hash: old.hash,
+                canonical_form_id: old.canonical_form_id,
+                detail_salt: old.detail_salt,
+                detail_commitment: old.detail_commitment,
+                ..row.clone()
+            }
+        } else {
+            let seq: i64 = tx.query_row(
+                &format!(
+                    "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
+                     WHERE source_node_id = ?1",
+                    self.table
+                ),
+                rusqlite::params![row.source_node_id],
+                |r| r.get(0),
+            )?;
+            // The seq counts every row on the node; the tip is its last
+            // sealed one.
+            let tip: Option<String> = tx
+                .query_row(&tip_sql(&self.table, "?1"), rusqlite::params![row.source_node_id], |r| r.get(0))
+                .optional()?;
+            let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
+            let sealed = sealed_at(row, seq.unsigned_abs(), prev_hash)?;
+            insert_row(&tx, &self.insert_sql, &sealed, seq)?;
+            sealed
+        };
+        tx.commit()?;
+        Ok(stored)
+    }
+
     fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
         let (schema, bare) = split_table(table);
         let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
@@ -301,40 +356,7 @@ fn placeholders(from: usize, n: usize) -> String {
 
 impl Store for SqliteStore {
     fn insert(&self, row: &Row) -> Result<(), Error> {
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if row.monotonic_seq != 0 {
-            return insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64);
-        }
-
-        // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
-        // handles on one file cannot both read the same tip (spec §2.1).
-        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)", self.table),
-            rusqlite::params![row.id],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            let seq: i64 = tx.query_row(
-                &format!(
-                    "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
-                     WHERE source_node_id = ?1",
-                    self.table
-                ),
-                rusqlite::params![row.source_node_id],
-                |r| r.get(0),
-            )?;
-            // The seq counts every row on the node; the tip is its last
-            // sealed one.
-            let tip: Option<String> = tx
-                .query_row(&tip_sql(&self.table, "?1"), rusqlite::params![row.source_node_id], |r| r.get(0))
-                .optional()?;
-            let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
-            let sealed = sealed_at(row, seq.unsigned_abs(), prev_hash)?;
-            insert_row(&tx, &self.insert_sql, &sealed, seq)?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.insert_stored(row).map(|_| ())
     }
 
     fn ping(&self) -> Result<(), Error> {
@@ -352,6 +374,15 @@ impl Store for SqliteStore {
             .iter()
             .map(|(row, detail)| chain_row(row, detail))
             .collect()
+    }
+
+    fn chain_tips(&self) -> Result<Vec<ChainRow>, Error> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&chain_tips_sql(&self.table, SELECT_COLUMNS))?;
+        let tips = stmt
+            .query_map([], |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tips.iter().map(|(row, detail)| chain_row(row, detail)).collect()
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {

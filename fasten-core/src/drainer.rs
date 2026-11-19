@@ -453,7 +453,7 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
 /// `sqlstate_rejects_row` and `sqlite_rejects_row`), or a row with an
 /// explicit seq clashed. A seq-0 row gets a fresh seq on the next attempt,
 /// so its clash is retried.
-fn rejected(e: &Error, row: &Row) -> bool {
+pub fn rejected(e: &Error, row: &Row) -> bool {
     match e {
         Error::CallbackFailed(rc) => *rc < 0,
         Error::RowRejected(_) => true,

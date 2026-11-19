@@ -117,6 +117,13 @@ pub trait Store: Send + Sync {
         Err(Error::Unsupported("chain_rows"))
     }
 
+    /// Each node's sealed row with the highest `monotonic_seq`, ordered by
+    /// node id, for [`crate::checkpoint::checkpoints_of`]. A node with no
+    /// sealed row is left out.
+    fn chain_tips(&self) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("chain_tips"))
+    }
+
     /// Return the count of rows matching `filter`.
     fn count(&self, filter: &Filter) -> Result<u64, Error>;
 
@@ -193,6 +200,25 @@ pub(crate) fn tip_sql(table: &str, param: &str) -> String {
     format!(
         "SELECT hash FROM {table} WHERE source_node_id = {param} AND hash <> '' \
          ORDER BY monotonic_seq DESC LIMIT 1"
+    )
+}
+
+/// Selects each node's sealed row with the highest seq, as `columns` of
+/// `table`, ordered by node id. It walks the (source_node_id, monotonic_seq)
+/// index: the next node id after the last, then that node's sealed row with
+/// the highest seq. The same in SQLite and Postgres, and the query the Python
+/// and Go stores run.
+pub fn chain_tips_sql(table: &str, columns: &str) -> String {
+    format!(
+        "SELECT {columns} FROM {table} JOIN (\
+         WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM {table} UNION ALL \
+         SELECT (SELECT MIN(source_node_id) FROM {table} WHERE source_node_id > node) \
+         FROM nodes WHERE node IS NOT NULL) \
+         SELECT node, (SELECT monotonic_seq FROM {table} WHERE source_node_id = node \
+         AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1) AS seq \
+         FROM nodes WHERE node IS NOT NULL) AS tip \
+         ON source_node_id = tip.node AND monotonic_seq = tip.seq \
+         WHERE hash <> '' ORDER BY source_node_id, id"
     )
 }
 

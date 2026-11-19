@@ -21,9 +21,10 @@ is the minimum toolchain (see [`rust-toolchain.toml`](../rust-toolchain.toml)).
 The crate is named `fasten-sdk`; code imports it as `fasten`
 (`use fasten::...`).
 
-Optional features: `async`, `store-postgres`, `codes-yaml`.
+Optional features: `async`, `store-postgres`, `store-sqlite`, `codes-yaml`.
 `store-postgres` connects through native-tls, which on Linux needs
 `pkg-config` and the OpenSSL headers (`libssl-dev` or `openssl-devel`).
+`store-sqlite` compiles SQLite in, which needs a C compiler.
 
 ## Quickstart
 
@@ -118,14 +119,20 @@ and `fasten::flush(timeout)` complete the public surface.
 
 ## Chain and retention
 
-`PostgresStore` seals each audit row into the node's hash chain. `submit()`
-builds the row with `monotonic_seq: 0` and no hash; in the insert
-transaction the store gives it the node's next seq, reads the hash of the
-node's last sealed row and stores the row sealed (`prev_hash`, `hash`,
-`canonical_form_id: "2"`, `detail_salt`, `detail_commitment`). It takes the
-same per-node lock as the Python, Go and JS stores, and it can write into a
-table the Python or Go store created, so Rust, Python and Go services on one
-node share one chain.
+The bundled stores, `PostgresStore` (feature `store-postgres`) and
+`SqliteStore` (feature `store-sqlite`), seal each audit row into the node's
+hash chain. `submit()` builds the row with `monotonic_seq: 0` and no hash; in
+the insert transaction the store gives it the node's next seq, reads the hash
+of the node's last sealed row and stores the row sealed (`prev_hash`, `hash`,
+`canonical_form_id: "2"`, `detail_salt`, `detail_commitment`).
+`PostgresStore` takes the same per-node lock as the Python, Go and JS stores,
+and it can write into a table the Python or Go store created, so Rust, Python
+and Go services on one node share one chain.
+
+```rust
+let store = fasten::SqliteStore::open("audit.db", "audit_logs")?;
+// or fasten::PostgresStore::new("host=localhost user=myapp dbname=audit", "audit_logs")?
+```
 
 Each stored row is written to stdout twice with the same `id`: unsealed
 when `submit()` is called, and sealed once the store has it. In `raise`
@@ -141,9 +148,10 @@ assert!(result.ok, "broken at seq {:?}: {:?}", result.first_break_at, result.rea
 ```
 
 Verification shows a row that was edited, removed or reordered inside the
-chain. It runs only when you call it, and it does not show rows cut from the
-start or end of a chain: that takes checkpoints, which the Rust SDK does not
-have yet. `ChainRow::from_json` builds a row from a captured stdout line.
+chain. It runs only when you call it, and on its own it does not show rows
+cut from the start or end of a chain, or a chain that was sealed again from
+its first row: that takes checkpoints (next section).
+`ChainRow::from_json` builds a row from a captured stdout line.
 
 A custom `AuditStore` seals rows only if it implements
 `allocate_and_insert_originated` and returns `true` from `seals()`. Without
@@ -157,6 +165,55 @@ has `pii_in_detail` or retention class Short get `detail` set to `null`, after
 an `AUDIT_ROW_REDACTED` row records it. A redacted row keeps its hash, so the
 chain still verifies. Audit rows are never deleted.
 
+## Chain checkpoints
+
+`verify_chain` cannot tell on its own that rows were cut off the end of a
+chain, or that the whole chain was re-sealed. Publish checkpoints (each
+node's latest seq and hash) somewhere the store's operator cannot rewrite,
+and verify against them later
+([spec §9](../spec/chain-replication.md#9-checkpoints)):
+
+```rust
+use fasten::{load_checkpoints, publish_checkpoints, verify_chain_with_checkpoints};
+use fasten::{CheckpointOptions, FileCheckpointSink};
+
+publish_checkpoints(&store, &FileCheckpointSink::new("/mnt/worm/checkpoints.jsonl"))?;
+
+let checkpoints = load_checkpoints("/mnt/worm/checkpoints.jsonl")?;
+let all_rows = store.all_chain_rows()?;
+let result = verify_chain_with_checkpoints(&all_rows, &checkpoints, CheckpointOptions::default());
+```
+
+`store` is a `PostgresStore` or a `SqliteStore`; a store of your own
+implements `CheckpointStore` (each node's latest sealed row). The file has
+the format the Python and Go SDKs write and read. There is no HTTP sink in
+the Rust SDK: to publish elsewhere, implement `CheckpointSink`;
+`Checkpoint` serializes with serde.
+
+By default the rows are taken as the whole chain: every checkpointed node
+must have rows, and no checkpoint may be below its oldest row or above its
+newest. To check a page or one node, pass `CheckpointOptions { partial: true }`;
+checkpoints below or above its rows, or for nodes not in them, are then
+skipped, so only a whole-chain verify detects a cut-off tail. If the file's
+last line was cut short by a crash, `load_checkpoints` skips it and writes a
+`checkpoint_unfinished_last_line` warning to stderr, and the next publish
+drops it. Use one publisher per file.
+
+With retention, checkpoints taken before a purge are below the rows it
+left, or belong to a node with no rows left, and they fail a whole-chain
+verify. The Rust SDK redacts and never deletes rows, so this applies when
+another SDK or an operator purges the table. Pass only the checkpoints taken
+since the latest purge finished, and publish again after each purge:
+
+```rust
+let kept = fasten::checkpoints_since(&checkpoints, purged_at)?;
+let result = verify_chain_with_checkpoints(&all_rows, &kept, CheckpointOptions::default());
+```
+
+A whole-chain verify shows rows deleted from the start of a chain when one
+of the given checkpoints falls among them. Rows deleted below every given
+checkpoint look the same as a purge.
+
 ## Tests
 
 From the repo root (the crate needs `../fasten-core`):
@@ -167,7 +224,9 @@ docker run --rm -v $PWD:/work -w /work/rust rust:1.90 \
 ```
 
 `--test-threads=1` because the integration tests share the global config
-and drainer.
+and drainer. Add `--features store-sqlite` to run the SQLite store's tests,
+and `--features store-postgres` with `FASTEN_TEST_POSTGRES_DSN` set for the
+Postgres store's.
 
 ## Docs and design
 

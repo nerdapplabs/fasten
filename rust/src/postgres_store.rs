@@ -200,7 +200,8 @@ fn inspect_columns(
 /// per node. A row with a seq of its own is stored as given.
 ///
 /// [`PostgresStore::chain_rows`] reads a node's rows back for
-/// [`crate::verify_chain`].
+/// [`crate::verify_chain`], and [`PostgresStore::chain_tips`] each node's
+/// latest sealed row for [`crate::publish_checkpoints`].
 ///
 /// `sslmode` in the DSN works as in libpq, except that `require` also checks
 /// the certificate and host name, like `verify-full`. The default, `prefer`,
@@ -297,53 +298,45 @@ impl PostgresStore {
     /// SDK wrote the row.
     pub fn chain_rows(&self, source_node_id: &str) -> Result<Vec<ChainRow>, crate::Error> {
         let sql = format!(
-            "SELECT id, wire_version, origin_id, monotonic_seq, {ts}, code, action, severity, \
+            "SELECT {} FROM {} WHERE source_node_id = $1 ORDER BY monotonic_seq",
+            self.chain_columns(),
+            self.table
+        );
+        self.chain_query(&sql, &[&source_node_id])
+    }
+
+    /// Every row in the table, ordered by node id and `monotonic_seq`: the
+    /// whole chain, for [`crate::verify_chain_with_checkpoints`].
+    pub fn all_chain_rows(&self) -> Result<Vec<ChainRow>, crate::Error> {
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY source_node_id, monotonic_seq",
+            self.chain_columns(),
+            self.table
+        );
+        self.chain_query(&sql, &[])
+    }
+
+    /// Each node's sealed row with the highest `monotonic_seq`, ordered by
+    /// node id, for [`crate::take_checkpoints`].
+    pub fn chain_tips(&self) -> Result<Vec<ChainRow>, crate::Error> {
+        let sql = fasten_core::store::chain_tips_sql(&self.table, &self.chain_columns());
+        self.chain_query(&sql, &[])
+    }
+
+    /// The columns `chain_row` reads, with timestamps in the canonical form.
+    fn chain_columns(&self) -> String {
+        format!(
+            "id, wire_version, origin_id, monotonic_seq, {ts}, code, action, severity, \
              service_id, source_node_id, tenant_id, actor, actor_kind, target, category, domain, \
              method, request_id, detail, {shipped}, canonical_form_id, prev_hash, hash, \
-             detail_salt, detail_commitment \
-             FROM {table} WHERE source_node_id = $1 ORDER BY monotonic_seq",
+             detail_salt, detail_commitment",
             ts = Columns::canonical(self.cols.ts_cast, "timestamp"),
             shipped = Columns::canonical(self.cols.shipped_cast, "shipped_at"),
-            table = self.table,
-        );
-        let rows = self.lock().query(&sql as &str, &[&source_node_id]).map_err(pg_err)?;
-        rows.iter()
-            .map(|r| {
-                let id: String = r.get(0);
-                let detail = Json::parse(r.get(18)).map_err(|e| {
-                    crate::Error::AuditStoreInsert(format!("row {id}: detail: {e}"))
-                })?;
-                let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
-                Ok(ChainRow {
-                    id,
-                    // An empty wire_version is hashed as "1".
-                    wire_version: Some(r.get::<_, String>(1)).filter(|v| !v.is_empty()).unwrap_or_else(|| "1".into()),
-                    origin_id: r.get(2),
-                    monotonic_seq: r.get::<_, i64>(3) as u64,
-                    timestamp: r.get(4),
-                    code: r.get(5),
-                    action: r.get(6),
-                    severity: r.get(7),
-                    service_id: r.get(8),
-                    source_node_id: r.get(9),
-                    tenant_id: r.get(10),
-                    actor: r.get(11),
-                    actor_kind: r.get(12),
-                    target: r.get(13),
-                    category: r.get(14),
-                    domain: r.get(15),
-                    method: r.get(16),
-                    request_id: r.get(17),
-                    detail,
-                    shipped_at: r.get(19),
-                    canonical_form_id: r.get(20),
-                    prev_hash: r.get(21),
-                    hash: r.get(22),
-                    detail_salt: non_empty(r.get(23)),
-                    detail_commitment: non_empty(r.get(24)),
-                })
-            })
-            .collect()
+        )
+    }
+
+    fn chain_query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<ChainRow>, crate::Error> {
+        self.lock().query(sql, params).map_err(pg_err)?.iter().map(chain_row).collect()
     }
 
     /// Insert `row` as it is on `tx`. A repeated id is a no-op.
@@ -412,6 +405,42 @@ impl PostgresStore {
     }
 }
 
+/// A row selected as `PostgresStore::chain_columns`.
+fn chain_row(r: &pg::Row) -> Result<ChainRow, crate::Error> {
+    let id: String = r.get(0);
+    let detail = Json::parse(r.get(18))
+        .map_err(|e| crate::Error::AuditStoreInsert(format!("row {id}: detail: {e}")))?;
+    let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
+    Ok(ChainRow {
+        id,
+        // An empty wire_version is hashed as "1".
+        wire_version: Some(r.get::<_, String>(1)).filter(|v| !v.is_empty()).unwrap_or_else(|| "1".into()),
+        origin_id: r.get(2),
+        monotonic_seq: r.get::<_, i64>(3) as u64,
+        timestamp: r.get(4),
+        code: r.get(5),
+        action: r.get(6),
+        severity: r.get(7),
+        service_id: r.get(8),
+        source_node_id: r.get(9),
+        tenant_id: r.get(10),
+        actor: r.get(11),
+        actor_kind: r.get(12),
+        target: r.get(13),
+        category: r.get(14),
+        domain: r.get(15),
+        method: r.get(16),
+        request_id: r.get(17),
+        detail,
+        shipped_at: r.get(19),
+        canonical_form_id: r.get(20),
+        prev_hash: r.get(21),
+        hash: r.get(22),
+        detail_salt: non_empty(r.get(23)),
+        detail_commitment: non_empty(r.get(24)),
+    })
+}
+
 /// `row` at `seq`, sealed after `prev_hash` with fasten-core's `seal`, which
 /// hashes the timestamp and detail as `insert_row` writes them. Chain fields
 /// the row came with are replaced.
@@ -430,6 +459,12 @@ fn seal(prev_hash: &str, row: &crate::Row, seq: u64) -> Result<crate::Row, crate
         detail_commitment: sealed.detail_commitment,
         ..row.clone()
     })
+}
+
+impl crate::checkpoints::CheckpointStore for PostgresStore {
+    fn chain_tips(&self) -> Result<Vec<ChainRow>, crate::Error> {
+        PostgresStore::chain_tips(self)
+    }
 }
 
 impl crate::AuditStore for PostgresStore {
@@ -959,6 +994,64 @@ mod tests {
             assert_eq!((result.ok, result.first_break_at), (false, Some(seq)), "{change}");
             assert!(result.reason.as_deref().unwrap_or("").contains(reason), "{change}: {result:?}");
         }
+    }
+
+    // Checkpoints of each node's tip show rows cut off the end of a chain,
+    // which the chain alone does not.
+    #[test]
+    fn test_checkpoints_catch_a_cut_tail() {
+        use crate::checkpoints::{
+            load_checkpoints, publish_checkpoints, verify_chain_with_checkpoints, CheckpointOptions,
+            FileCheckpointSink,
+        };
+        use crate::AuditStore;
+        let Some(dsn) = dsn() else { return };
+        let table = "fasten_pg_checkpoints";
+        let store = fresh_store(&dsn, table);
+        let (a, b) = (uniq("node-a"), uniq("node-b"));
+        for _ in 0..5 {
+            store.insert(&emit_row(&a, "TEST_CHAIN")).expect("insert");
+        }
+        let mut tip_b = String::new();
+        for _ in 0..3 {
+            tip_b = store.allocate_and_insert_originated(&emit_row(&b, "TEST_CHAIN")).expect("insert").hash;
+        }
+        let tips: Vec<(String, u64, String)> = store
+            .chain_tips()
+            .expect("chain_tips")
+            .into_iter()
+            .map(|t| (t.source_node_id, t.monotonic_seq, t.hash))
+            .collect();
+        assert_eq!(tips.len(), 2);
+        assert_eq!((tips[0].0.as_str(), tips[0].1), (a.as_str(), 5));
+        assert_eq!(tips[1], (b.clone(), 3, tip_b));
+
+        let file = std::env::temp_dir().join(format!("{}.jsonl", uniq("fasten-pg-checkpoints")));
+        let published = publish_checkpoints(&store, &FileCheckpointSink::new(&file)).expect("publish");
+        let checkpoints = load_checkpoints(&file).expect("load");
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(checkpoints, published);
+        let whole = CheckpointOptions::default();
+        let rows = store.all_chain_rows().expect("all_chain_rows");
+        assert_eq!(rows.len(), 8);
+        let result = verify_chain_with_checkpoints(&rows, &checkpoints, whole);
+        assert!(result.ok, "{result:?}");
+
+        store
+            .lock()
+            .execute(&format!("DELETE FROM {table} WHERE source_node_id = $1 AND monotonic_seq > 3"), &[&a])
+            .expect("cut");
+        let rows = store.all_chain_rows().expect("all_chain_rows");
+        assert!(crate::verify_chain(&rows).ok);
+        let result = verify_chain_with_checkpoints(&rows, &checkpoints, whole);
+        assert_eq!(result.first_break_at, Some(4));
+        assert_eq!(
+            result.reason,
+            Some(format!("node '{a}': chain ends at seq 3 before checkpoint at seq 5"))
+        );
+        // One node's rows are a partial verify.
+        let partial = CheckpointOptions { partial: true };
+        assert!(verify_chain_with_checkpoints(&store.chain_rows(&b).expect("chain_rows"), &checkpoints, partial).ok);
     }
 
     // Rows an older Rust store wrote unsealed stay below the chain: the
