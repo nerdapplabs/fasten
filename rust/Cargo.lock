@@ -223,12 +223,14 @@ name = "fasten-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "getrandom",
  "native-tls",
  "postgres",
  "postgres-native-tls",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

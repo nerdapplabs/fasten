@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: fasten-core can seal and verify rows
+
+- `fasten_core::chain` has `seal`, `row_hash`, `detail_commitment` and
+  `verify_chain`, giving the same hashes as the Python and Go SDKs for
+  canonical forms "1" and "2". Rows sealed by either verify here, and a
+  row sealed here verifies in Python.
+- Nothing calls it yet: the core stores and the Rust SDK still write
+  unsealed rows.
+
 ### Fixed: Go keeps detail numbers exact
 
 - A row read from the Go SQLite or Postgres store keeps each detail number

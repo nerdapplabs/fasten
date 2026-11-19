@@ -56,6 +56,7 @@
 )]
 
 pub mod catalog;
+pub mod chain;
 pub mod drainer;
 pub mod error;
 pub mod redact;
