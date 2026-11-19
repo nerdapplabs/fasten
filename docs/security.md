@@ -90,12 +90,13 @@ The runtime layout:
 
 - Python: `fasten.reader.router()` requires a `dependencies=` argument, such as `[Depends(require_admin)]` or the bundled `fasten.reader.require_bearer()`. FastAPI applies it to every route, including `/audit/doctor`. Calling `router()` without it raises at startup; mounting without auth takes an explicit `dependencies=[]`.
 - Go: `NewReader` requires `WithAuth(middleware)`, for example `fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")))`, or `WithoutAuth()`, and panics with neither. `RequireBearer` panics at startup when the variable is unset.
+- JS: `reader({ auth })` from `fasten-sdk/reader` requires `auth`: `{ bearer: token }` (or `requireBearer()`, which throws when `FASTEN_READER_TOKEN` is unset), `{ verify: fn }`, or the explicit opt-out `"none"`. It throws when the reader is built without one.
 - C++: `fasten::reader::simplehttp::start(port, prefix, auth)` and `mount()` require an auth function and throw on an empty one; `no_auth()` is the explicit opt-out. With another server, check the caller before calling the `fasten::reader::handle_*` functions.
 - Python: the router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
 
 **Not mitigated:**
 
-- fasten does not check the authentication itself. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
+- fasten does not check the authentication itself. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, a JS reader built with `auth: "none"`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
 - The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
 
 ---
