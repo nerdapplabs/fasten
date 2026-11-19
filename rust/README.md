@@ -118,16 +118,44 @@ and `fasten::flush(timeout)` complete the public surface.
 
 ## Chain and retention
 
-The Rust SDK does not seal rows. `submit()` returns the row with
-`monotonic_seq: 0`, and `PostgresStore` gives it the node's next seq in the
-insert transaction, under the same per-node lock as the Python, Go and JS
-stores; `hash` and `prev_hash` stay empty. `PostgresStore` can write into a
-table the Python or Go store created.
+`PostgresStore` seals each audit row into the node's hash chain. `submit()`
+builds the row with `monotonic_seq: 0` and no hash; in the insert
+transaction the store gives it the node's next seq, reads the hash of the
+node's last sealed row and stores the row sealed (`prev_hash`, `hash`,
+`canonical_form_id: "2"`, `detail_salt`, `detail_commitment`). It takes the
+same per-node lock as the Python, Go and JS stores, and it can write into a
+table the Python or Go store created, so Rust, Python and Go services on one
+node share one chain.
+
+Each stored row is written to stdout twice with the same `id`: unsealed
+when `submit()` is called, and sealed once the store has it. In `raise`
+mode `submit()` returns the sealed row. In `queue` mode it returns the row
+as built, and the drainer seals it when it stores it.
+
+To check a node's chain, read its rows and verify them:
+
+```rust
+let rows = store.chain_rows("node-1")?;
+let result = fasten::verify_chain(&rows);
+assert!(result.ok, "broken at seq {:?}: {:?}", result.first_break_at, result.reason);
+```
+
+Verification shows a row that was edited, removed or reordered inside the
+chain. It runs only when you call it, and it does not show rows cut from the
+start or end of a chain: that takes checkpoints, which the Rust SDK does not
+have yet. `ChainRow::from_json` builds a row from a captured stdout line.
+
+A custom `AuditStore` seals rows only if it implements
+`allocate_and_insert_originated` and returns `true` from `seals()`. Without
+that, or with no store at all, rows are unsealed and `init` logs
+`audit_chain_unavailable`. Rows written before sealing stay unsealed below
+the node's first sealed row and are not covered by the chain.
 
 Set `Config::retention_pii` (or `FASTEN_RETENTION_PII`) to a duration such as
 `"30d"` to redact personal data: every hour, rows older than that whose code
 has `pii_in_detail` or retention class Short get `detail` set to `null`, after
-an `AUDIT_ROW_REDACTED` row records it. Audit rows are never deleted.
+an `AUDIT_ROW_REDACTED` row records it. A redacted row keeps its hash, so the
+chain still verifies. Audit rows are never deleted.
 
 ## Tests
 

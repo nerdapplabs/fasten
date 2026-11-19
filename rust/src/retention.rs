@@ -134,7 +134,7 @@ fn redact_expired_until(
             .detail(detail)
             .build_row(cfg)?;
         EmitBuilder::write_audit_stdout(&row);
-        store.insert(&row)?;
+        crate::engine::store_row(&**store, &row)?;
         redacted.extend(store.redact_rows(std::slice::from_ref(&c.id))?);
     }
     Ok(redacted)

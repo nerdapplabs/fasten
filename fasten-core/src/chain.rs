@@ -32,7 +32,8 @@ use crate::row::Row;
 /// Form stamped by [`seal`]. Form "1" rows still verify.
 pub const CURRENT_CANONICAL_FORM_ID: &str = "2";
 
-const GENESIS: &str = "genesis";
+/// `prev_hash` of a node's first sealed row.
+pub const GENESIS: &str = "genesis";
 
 /// Nesting allowed in parsed JSON, the same as `serde_json`'s limit.
 const MAX_DEPTH: usize = 128;
@@ -783,6 +784,15 @@ pub fn seal(prev_hash: &str, row: &ChainRow) -> Result<ChainRow, ChainError> {
     sealed.detail_commitment = Some(detail_commitment(&salt, &row.detail));
     sealed.detail_salt = Some(salt);
     sealed.hash = hash_with(&sealed, FORM_2, PY);
+    Ok(sealed)
+}
+
+/// A copy of the store row `row` sealed after `prev_hash`, at the
+/// `monotonic_seq` it carries. The stores call this inside the insert
+/// transaction, once they have allocated the seq and read the node's tip.
+pub fn seal_row(prev_hash: &str, row: &Row) -> Result<Row, ChainError> {
+    let mut sealed = row.clone();
+    seal(prev_hash, &ChainRow::from(row))?.stamp(&mut sealed);
     Ok(sealed)
 }
 

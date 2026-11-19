@@ -29,13 +29,14 @@ API for querying the record back.
 
 How far that record is tamper-evident depends on the SDK:
 
-- **Python and Go** seal audit rows into a per-node hash chain when they
-  write to a bundled audit store (SQLite or Postgres). Verifying the chain
-  shows a row that was edited, reordered, or removed from inside the chain.
+- **Python, Go and Rust** seal audit rows into a per-node hash chain when
+  they write to a bundled audit store (SQLite or Postgres; Rust bundles
+  Postgres). Verifying the chain shows a row that was edited, reordered, or
+  removed from inside the chain.
 - Rows cut from the start or end of a chain still verify, and so does a
   chain whose hashes were removed or rebuilt by someone who can write to
   the store. Catching those needs checkpoints published outside the store.
-- **JS, Rust, C++ and Swift** write unsealed rows, which the chain does not
+- **JS, C++ and Swift** write unsealed rows, which the chain does not
   cover.
 
 [docs/security.md](docs/security.md) has the details and what is outside

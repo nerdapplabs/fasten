@@ -488,7 +488,7 @@ keep an in-memory sequence in this mode; that is exactly what §2.1 forbids.
 ### §8.2 Allocation without sealing
 
 A store MAY allocate `monotonic_seq` (§2.1) for a writer that cannot seal, for
-example one writing through fasten-core. Such rows have an empty `hash`;
+example the JS, C++ or Swift SDK. Such rows have an empty `hash`;
 `verify_chain` treats them as unsealed (§2). The writer MUST log
 `audit_chain_unavailable` once per init, as in §8.1.
 

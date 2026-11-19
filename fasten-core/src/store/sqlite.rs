@@ -1,16 +1,17 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
+    chain::ChainRow,
     error::Error,
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{chain_row, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -235,6 +236,37 @@ impl SqliteStore {
         Ok(Missing { table_or_indexes: have.is_empty() || !indexes, node_seq_index: !node_seq, columns })
     }
 
+    /// The rows matching `filter`, ordered by `monotonic_seq`, each mapped
+    /// by `map`.
+    fn select<T>(
+        &self,
+        filter: &Filter,
+        map: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, Error> {
+        let (where_clause, params_owned) = build_filter_where(filter);
+        // LIMIT and OFFSET are integers, so interpolating them is safe.
+        let mut sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            sql.push_str(&format!(" LIMIT {}", filter.limit));
+            if filter.offset > 0 {
+                sql.push_str(&format!(" OFFSET {}", filter.offset));
+            }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_owned.iter().map(|p| p.as_ref()).collect();
+
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |r| map(r))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     fn redact_gate(conn: &Connection, table: &str) -> Result<RedactGate, Error> {
         let (schema, bare) = split_table(table);
         let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)")?;
@@ -273,7 +305,6 @@ impl Store for SqliteStore {
         if row.monotonic_seq != 0 {
             return insert_row(&guard, &self.insert_sql, row, row.monotonic_seq as i64);
         }
-        let row = &unsealed(row);
 
         // BEGIN IMMEDIATE takes the write lock before the MAX read, so two
         // handles on one file cannot both read the same tip (spec §2.1).
@@ -293,7 +324,14 @@ impl Store for SqliteStore {
                 rusqlite::params![row.source_node_id],
                 |r| r.get(0),
             )?;
-            insert_row(&tx, &self.insert_sql, row, seq)?;
+            // The seq counts every row on the node; the tip is its last
+            // sealed one.
+            let tip: Option<String> = tx
+                .query_row(&tip_sql(&self.table, "?1"), rusqlite::params![row.source_node_id], |r| r.get(0))
+                .optional()?;
+            let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
+            let sealed = sealed_at(row, seq.unsigned_abs(), prev_hash)?;
+            insert_row(&tx, &self.insert_sql, &sealed, seq)?;
         }
         tx.commit()?;
         Ok(())
@@ -306,28 +344,14 @@ impl Store for SqliteStore {
     }
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
-        let (where_clause, params_owned) = build_filter_where(filter);
-        // LIMIT and OFFSET are integers, so interpolating them is safe.
-        let mut sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY monotonic_seq ASC",
-            self.table, where_clause
-        );
-        if filter.limit > 0 {
-            sql.push_str(&format!(" LIMIT {}", filter.limit));
-            if filter.offset > 0 {
-                sql.push_str(&format!(" OFFSET {}", filter.offset));
-            }
-        }
+        self.select(filter, row_from_sqlite)
+    }
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_owned.iter().map(|p| p.as_ref()).collect();
-
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = guard.prepare(&sql)?;
-        let rows: Vec<Row> = stmt
-            .query_map(params_refs.as_slice(), row_from_sqlite)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+    fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
+        self.select(filter, |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
+            .iter()
+            .map(|(row, detail)| chain_row(row, detail))
+            .collect()
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {
@@ -1087,9 +1111,12 @@ mod tests {
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            // Explicit seqs, so the rows are stored as given.
             if id == "evt-sealed" {
                 r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
+            } else {
+                r.monotonic_seq = 2;
             }
             store.insert(&r).unwrap();
         }
@@ -1119,9 +1146,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch(
-                "UPDATE audit_log SET hash = 'abc' WHERE id = 'evt-form1';
-                 UPDATE audit_log SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
-                 WHERE id = 'evt-form2';",
+                "UPDATE audit_log SET hash = 'abc', canonical_form_id = '1' WHERE id = 'evt-form1';
+                 UPDATE audit_log SET hash = '' WHERE id = 'evt-unsealed';",
             )
             .unwrap();
 
@@ -1207,22 +1233,33 @@ mod tests {
         assert_eq!(chain_of(&store.list_unshipped(0).unwrap()[0]), chain_of(&row));
     }
 
-    /// The store picks the seq, so a hash sealed over another one is dropped.
+    /// The store picks the seq, so a hash sealed over another one is
+    /// replaced by the store's own seal.
     #[test]
-    fn allocating_insert_drops_chain_fields() {
+    fn allocating_insert_replaces_chain_fields() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let mut row = sealed("evt-alloc");
         row.monotonic_seq = 0;
+        row.prev_hash = Some("elsewhere".into());
         store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(got.monotonic_seq, 1);
-        assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
+        assert_eq!(got.prev_hash.as_deref(), Some("genesis"));
+        assert_eq!(got.canonical_form_id.as_deref(), Some("2"));
+        assert_eq!(got.hash.as_deref().map(str::len), Some(64));
+        assert_ne!(got.detail_salt.as_deref(), Some("salt"));
+        assert_ne!(got.detail_commitment.as_deref(), Some("commit"));
+        let rows = store.chain_rows(&Filter::default()).unwrap();
+        assert!(crate::chain::verify_chain(&rows).ok);
     }
 
+    /// A row with its own seq and no hash is stored as given.
     #[test]
     fn unsealed_row_reads_back_with_empty_hash_and_no_salt() {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
-        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let mut row = make_row("evt-plain", "TEST");
+        row.monotonic_seq = 1;
+        store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(chain_of(got), [Some(""), Some(""), Some("1"), None, None]);
     }
@@ -1295,7 +1332,9 @@ mod tests {
             )
             .unwrap();
         let store = SqliteStore::open(path.to_str().unwrap(), "audit_log", false).unwrap();
-        store.insert(&make_row("evt-plain", "TEST")).unwrap();
+        let mut plain = make_row("evt-plain", "TEST");
+        plain.monotonic_seq = 1;
+        store.insert(&plain).unwrap();
         let mut row = sealed("evt-sealed");
         row.monotonic_seq = 2;
         store.insert(&row).unwrap();

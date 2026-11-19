@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Error, row::Row};
+use crate::{chain::ChainRow, error::Error, row::Row};
 
 /// Query filter for read-path operations.
 ///
@@ -33,10 +33,9 @@ pub struct RedactionCandidates {
 }
 
 /// Which rows redaction may touch, from the chain columns the table has
-/// (spec §7.1). Tables created here have none, so every row is unsealed; a
-/// table shared with an SDK that seals may hold sealed rows. A sealed form-"2"
-/// row hashes without its detail and is redacted; a sealed form-"1" row is
-/// refused.
+/// (spec §7.1). A sealed form-"2" row, which is what the stores write,
+/// hashes without its detail and is redacted, as is an unsealed row; a sealed
+/// form-"1" row is refused.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct RedactGate {
@@ -92,8 +91,14 @@ pub trait Store: Send + Sync {
     /// (`ON CONFLICT (id) DO NOTHING`).
     ///
     /// When `row.monotonic_seq` is 0 the store assigns the next seq for
-    /// `row.source_node_id` inside the insert transaction (spec §2.1, §8.2).
-    /// The row is not sealed. A non-zero seq is written as given.
+    /// `row.source_node_id` and seals the row after the node's last sealed
+    /// row, all inside the insert transaction (spec §2.1). Chain fields the
+    /// row carries are replaced.
+    ///
+    /// A non-zero seq is written as given, chain fields included: a sealed
+    /// row replicated from elsewhere keeps its hash, and a row without one
+    /// stays unsealed. A writer that picks its own seqs must not share a
+    /// node id with rows sealed here (spec §8.2).
     fn insert(&self, row: &Row) -> Result<(), Error>;
 
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
@@ -102,6 +107,15 @@ pub trait Store: Send + Sync {
 
     /// Return rows matching `filter`, ordered by `monotonic_seq ASC`.
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error>;
+
+    /// Rows matching `filter` as [`ChainRow`]s for
+    /// [`crate::chain::verify_chain`], ordered by `monotonic_seq ASC`. Their
+    /// `detail` is parsed from the stored text, so every number is the token
+    /// that was hashed; `query` reads numbers into `serde_json` types, which
+    /// can change them.
+    fn chain_rows(&self, _filter: &Filter) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("chain_rows"))
+    }
 
     /// Return the count of rows matching `filter`.
     fn count(&self, filter: &Filter) -> Result<u64, Error>;
@@ -155,19 +169,41 @@ pub trait Store: Send + Sync {
     }
 }
 
-/// `row` without its chain fields, as an allocating insert stores it: the
-/// store picks the seq, so a hash the caller sealed over another seq could
-/// never verify.
+/// `row` as an allocating insert stores it: at `seq`, sealed after
+/// `prev_hash`. Chain fields the caller set are dropped first: the store
+/// picks the seq, so a hash sealed over another seq could never verify.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn unsealed(row: &Row) -> Row {
-    Row {
+pub(crate) fn sealed_at(row: &Row, seq: u64, prev_hash: &str) -> Result<Row, Error> {
+    let row = Row {
+        monotonic_seq: seq,
         prev_hash: None,
         hash: None,
         canonical_form_id: None,
         detail_salt: None,
         detail_commitment: None,
         ..row.clone()
-    }
+    };
+    crate::chain::seal_row(prev_hash, &row).map_err(|e| Error::Store(e.to_string()))
+}
+
+/// Selects the hash of a node's sealed row with the highest seq, which its
+/// next row links to; no row means "genesis" (spec §2.1).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn tip_sql(table: &str, param: &str) -> String {
+    format!(
+        "SELECT hash FROM {table} WHERE source_node_id = {param} AND hash <> '' \
+         ORDER BY monotonic_seq DESC LIMIT 1"
+    )
+}
+
+/// A stored row for verification: `row` as the row mapper read it, with
+/// `detail` taken from the column text.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn chain_row(row: &Row, detail_text: &str) -> Result<ChainRow, Error> {
+    let mut out = ChainRow::from(row);
+    out.detail = crate::chain::Json::parse(detail_text)
+        .map_err(|e| Error::Store(format!("row {}: detail: {e}", row.id)))?;
+    Ok(out)
 }
 
 /// Chain columns (spec §1, §2), in table order. A table an older

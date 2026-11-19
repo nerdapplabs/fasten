@@ -3,13 +3,14 @@ use std::sync::Mutex;
 use pg::types::ToSql;
 
 use crate::{
+    chain::ChainRow,
     error::Error,
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
 };
 
-use super::{non_empty, purge_cutoff, purge_sql, unsealed, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
+use super::{chain_row, non_empty, purge_cutoff, purge_sql, sealed_at, tip_sql, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS, SELECT_COLUMNS};
 
 // The live connection and its prepared INSERT. When the connection is lost,
 // `with_reconnect` replaces the whole Inner. The INSERT is prepared once per
@@ -300,53 +301,6 @@ impl PostgresStore {
     }
 
     fn insert_with_reconnect(&self, row: &Row) -> Result<(), Error> {
-        let cleared;
-        let row = if row.monotonic_seq == 0 {
-            cleared = unsealed(row);
-            &cleared
-        } else {
-            row
-        };
-        let detail_str = serde_json::to_string(&row.detail)?;
-        let seq: i64 = row.monotonic_seq as i64;
-        let pii: i16 = row.pii_in_detail as i16;
-        let tenant: Option<&str> = row.tenant_id.as_deref();
-        let shipped: Option<&str> = row.shipped_at.as_deref();
-        let prev_hash = row.prev_hash.as_deref().unwrap_or("");
-        let hash = row.hash.as_deref().unwrap_or("");
-        let form = row.canonical_form_id.as_deref().unwrap_or("1");
-        let salt = row.detail_salt.as_deref().unwrap_or("");
-        let commitment = row.detail_commitment.as_deref().unwrap_or("");
-
-        let params: &[&(dyn ToSql + Sync)] = &[
-            &row.id,             // $1  id
-            &row.wire_version,   // $2  wire_version
-            &row.origin_id,      // $3  origin_id
-            &seq,                // $4  monotonic_seq (BIGINT)
-            &row.timestamp,      // $5  timestamp
-            &row.code,           // $6  code
-            &row.action,         // $7  action
-            &row.severity,       // $8  severity
-            &row.service_id,     // $9  service_id
-            &row.source_node_id, // $10 source_node_id
-            &tenant,             // $11 tenant_id     (NULL when None)
-            &row.actor,          // $12 actor
-            &row.actor_kind,     // $13 actor_kind
-            &row.target,         // $14 target
-            &row.category,       // $15 category
-            &row.domain,         // $16 domain
-            &row.method,         // $17 method
-            &row.request_id,     // $18 request_id
-            &detail_str,         // $19 detail
-            &pii,                // $20 pii_in_detail (SMALLINT)
-            &shipped,            // $21 shipped_at    (NULL when None)
-            &prev_hash,          // $22 prev_hash
-            &hash,               // $23 hash
-            &form,               // $24 canonical_form_id
-            &salt,               // $25 detail_salt
-            &commitment,         // $26 detail_commitment
-        ];
-
         let bare = self.bare.as_str();
         // Same lock key as the Python and Go stores, so every writer for
         // this node serialises here. An advisory lock rather than
@@ -359,7 +313,7 @@ impl PostgresStore {
                 let Inner { client, stmt } = inner;
                 let mut tx = client.transaction()?;
                 tx.execute(node_lock, &[&row.source_node_id])?;
-                tx.execute(&*stmt, params).map_err(|e| seq_clash(e, bare))?;
+                execute_insert(&mut tx, stmt, row, bare)?;
                 tx.commit()?;
                 Ok(())
             });
@@ -370,6 +324,7 @@ impl PostgresStore {
             "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} WHERE source_node_id = $1",
             self.table
         );
+        let tip_sql = tip_sql(&self.table, "$1");
         self.with_reconnect(|inner| {
             let Inner { client, stmt } = inner;
             let mut tx = client.transaction()?;
@@ -380,11 +335,40 @@ impl PostgresStore {
             }
             tx.execute(node_lock, &[&row.source_node_id])?;
             let seq: i64 = tx.query_one(seq_sql.as_str(), &[&row.source_node_id])?.get(0);
-            let mut p = params.to_vec();
-            p[3] = &seq; // $4 monotonic_seq
-            tx.execute(&*stmt, &p).map_err(|e| seq_clash(e, bare))?;
+            // The seq counts every row on the node; the tip is its last
+            // sealed one.
+            let tip: Option<String> =
+                tx.query_opt(tip_sql.as_str(), &[&row.source_node_id])?.map(|r| r.get(0));
+            let prev_hash = tip.as_deref().unwrap_or(crate::chain::GENESIS);
+            let sealed = sealed_at(row, seq.unsigned_abs(), prev_hash)?;
+            execute_insert(&mut tx, stmt, &sealed, bare)?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// The rows matching `filter`, ordered by `monotonic_seq`.
+    fn select(&self, filter: &Filter) -> Result<Vec<pg::Row>, Error> {
+        let (where_clause, mut all_params) = build_filter_where(filter);
+        let mut sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY monotonic_seq ASC",
+            self.table, where_clause
+        );
+        if filter.limit > 0 {
+            let n = all_params.len() + 1;
+            sql.push_str(&format!(" LIMIT ${n}"));
+            all_params.push(Box::new(i64::from(filter.limit)));
+            if filter.offset > 0 {
+                let n = all_params.len() + 1;
+                sql.push_str(&format!(" OFFSET ${n}"));
+                all_params.push(Box::new(i64::from(filter.offset)));
+            }
+        }
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+
+        self.with_reconnect(|inner| {
+            inner.client.query(sql.as_str(), &params_refs).map_err(Error::Postgres)
         })
     }
 
@@ -422,31 +406,14 @@ impl Store for PostgresStore {
     }
 
     fn query(&self, filter: &Filter) -> Result<Vec<Row>, Error> {
-        let (where_clause, mut all_params) = build_filter_where(filter);
-        let mut sql = format!(
-            "SELECT {SELECT_COLUMNS} FROM {}{} ORDER BY monotonic_seq ASC",
-            self.table, where_clause
-        );
-        if filter.limit > 0 {
-            let n = all_params.len() + 1;
-            sql.push_str(&format!(" LIMIT ${n}"));
-            all_params.push(Box::new(i64::from(filter.limit)));
-            if filter.offset > 0 {
-                let n = all_params.len() + 1;
-                sql.push_str(&format!(" OFFSET ${n}"));
-                all_params.push(Box::new(i64::from(filter.offset)));
-            }
-        }
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        Ok(self.select(filter)?.iter().map(row_from_pg).collect())
+    }
 
-        self.with_reconnect(|inner| {
-            let rows = inner
-                .client
-                .query(sql.as_str(), &params_refs)
-                .map_err(Error::Postgres)?;
-            Ok(rows.iter().map(row_from_pg).collect())
-        })
+    fn chain_rows(&self, filter: &Filter) -> Result<Vec<ChainRow>, Error> {
+        self.select(filter)?
+            .iter()
+            .map(|r| chain_row(&row_from_pg(r), r.get(18)))
+            .collect()
     }
 
     fn count(&self, filter: &Filter) -> Result<u64, Error> {
@@ -609,6 +576,56 @@ fn seq_clash(e: pg::Error, bare: &str) -> Error {
     } else {
         Error::Postgres(e)
     }
+}
+
+/// Run the prepared INSERT for `row` on `tx`.
+fn execute_insert(
+    tx: &mut pg::Transaction<'_>,
+    stmt: &pg::Statement,
+    row: &Row,
+    bare: &str,
+) -> Result<(), Error> {
+    let detail_str = serde_json::to_string(&row.detail)?;
+    let seq: i64 = row.monotonic_seq as i64;
+    let pii: i16 = row.pii_in_detail as i16;
+    let tenant: Option<&str> = row.tenant_id.as_deref();
+    let shipped: Option<&str> = row.shipped_at.as_deref();
+    let prev_hash = row.prev_hash.as_deref().unwrap_or("");
+    let hash = row.hash.as_deref().unwrap_or("");
+    let form = row.canonical_form_id.as_deref().unwrap_or("1");
+    let salt = row.detail_salt.as_deref().unwrap_or("");
+    let commitment = row.detail_commitment.as_deref().unwrap_or("");
+
+    let params: &[&(dyn ToSql + Sync)] = &[
+        &row.id,             // $1  id
+        &row.wire_version,   // $2  wire_version
+        &row.origin_id,      // $3  origin_id
+        &seq,                // $4  monotonic_seq (BIGINT)
+        &row.timestamp,      // $5  timestamp
+        &row.code,           // $6  code
+        &row.action,         // $7  action
+        &row.severity,       // $8  severity
+        &row.service_id,     // $9  service_id
+        &row.source_node_id, // $10 source_node_id
+        &tenant,             // $11 tenant_id     (NULL when None)
+        &row.actor,          // $12 actor
+        &row.actor_kind,     // $13 actor_kind
+        &row.target,         // $14 target
+        &row.category,       // $15 category
+        &row.domain,         // $16 domain
+        &row.method,         // $17 method
+        &row.request_id,     // $18 request_id
+        &detail_str,         // $19 detail
+        &pii,                // $20 pii_in_detail (SMALLINT)
+        &shipped,            // $21 shipped_at    (NULL when None)
+        &prev_hash,          // $22 prev_hash
+        &hash,               // $23 hash
+        &form,               // $24 canonical_form_id
+        &salt,               // $25 detail_salt
+        &commitment,         // $26 detail_commitment
+    ];
+    tx.execute(stmt, params).map_err(|e| seq_clash(e, bare))?;
+    Ok(())
 }
 
 fn pg_exec(client: &mut pg::Transaction<'_>, sql: &str) -> Result<(), Error> {
@@ -1289,9 +1306,12 @@ mod tests {
         for id in ["evt-sealed", "evt-unsealed"] {
             let mut r = make_row(id, "USER_LOGIN");
             r.timestamp = days_ago(40);
+            // Explicit seqs, so the rows are stored as given.
             if id == "evt-sealed" {
                 r.monotonic_seq = 1;
                 r.hash = Some("abc".into());
+            } else {
+                r.monotonic_seq = 2;
             }
             store.insert(&r).unwrap();
         }
@@ -1307,13 +1327,14 @@ mod tests {
         assert_eq!(detail_of(&store, "evt-unsealed"), serde_json::Value::Null);
     }
 
-    /// The store picks the seq, so a hash sealed over another one is dropped.
+    /// The store picks the seq, so a hash sealed over another one is
+    /// replaced by the store's own seal.
     #[test]
-    fn allocating_insert_drops_chain_fields() {
+    fn allocating_insert_replaces_chain_fields() {
         let Some(dsn) = dsn() else { return };
         let store = fresh(&dsn, "fasten_sc_pg_alloc_chain");
         let mut row = make_row("evt-alloc", "TEST");
-        row.prev_hash = Some("genesis".into());
+        row.prev_hash = Some("elsewhere".into());
         row.hash = Some("h1".into());
         row.canonical_form_id = Some("2".into());
         row.detail_salt = Some("salt".into());
@@ -1321,11 +1342,13 @@ mod tests {
         store.insert(&row).unwrap();
         let got = &store.query(&Filter::default()).unwrap()[0];
         assert_eq!(got.monotonic_seq, 1);
-        assert_eq!(
-            [got.prev_hash.as_deref(), got.hash.as_deref(), got.canonical_form_id.as_deref()],
-            [Some(""), Some(""), Some("1")]
-        );
-        assert_eq!((got.detail_salt.as_deref(), got.detail_commitment.as_deref()), (None, None));
+        assert_eq!(got.prev_hash.as_deref(), Some("genesis"));
+        assert_eq!(got.canonical_form_id.as_deref(), Some("2"));
+        assert_eq!(got.hash.as_deref().map(str::len), Some(64));
+        assert_ne!(got.detail_salt.as_deref(), Some("salt"));
+        assert_ne!(got.detail_commitment.as_deref(), Some("commit"));
+        let rows = store.chain_rows(&Filter::default()).unwrap();
+        assert!(crate::chain::verify_chain(&rows).ok);
     }
 
     /// #139: a sealed row came back without its hash.
@@ -1353,8 +1376,9 @@ mod tests {
             ]
         };
         assert_eq!(chain(&got[0]), chain(&row));
-        let s = |v: &str| Some(v.to_string());
-        assert_eq!(chain(&got[1]), [s(""), s(""), s("1"), None, None]);
+        // The allocated row links to the stored one.
+        assert_eq!(got[1].prev_hash.as_deref(), Some("h1"));
+        assert_eq!(got[1].canonical_form_id.as_deref(), Some("2"));
     }
 
     /// A table the Go store created declares salt and commitment NOT NULL.
@@ -1383,9 +1407,10 @@ mod tests {
         .unwrap();
         let store = PostgresStore::connect(&dsn, table).unwrap();
         store.insert(&make_row("evt-go", "TEST")).unwrap();
-        let got = store.query(&Filter::default()).unwrap();
-        assert_eq!(got[0].detail_salt, None);
-        assert_eq!(got[0].hash.as_deref(), Some(""));
+        let got = store.chain_rows(&Filter::default()).unwrap();
+        assert_eq!(got[0].prev_hash, "genesis");
+        assert!(got[0].detail_salt.is_some());
+        assert!(crate::chain::verify_chain(&got).ok);
     }
 
     /// A table an older fasten-core created gets the chain columns on connect.
@@ -1474,7 +1499,7 @@ mod tests {
         let mut r = make_row("evt-mixed-sealed", "USER_LOGIN");
         r.timestamp = days_ago(40);
         store.insert(&r).unwrap();
-        c.batch_execute(&format!("UPDATE {table} SET hash = 'abc'")).unwrap();
+        c.batch_execute(&format!("UPDATE {table} SET hash = 'abc', canonical_form_id = '1'")).unwrap();
 
         let codes = vec!["USER_LOGIN".to_string()];
         let found = store.list_redaction_candidates(&days_ago(30), &codes).unwrap();
@@ -1504,9 +1529,8 @@ mod tests {
             store.insert(&r).unwrap();
         }
         c.batch_execute(&format!(
-            "UPDATE {table} SET hash = 'abc' WHERE id = 'evt-form1';
-             UPDATE {table} SET hash = 'def', canonical_form_id = '2', detail_salt = 'salt'
-             WHERE id = 'evt-form2';"
+            "UPDATE {table} SET hash = 'abc', canonical_form_id = '1' WHERE id = 'evt-form1';
+             UPDATE {table} SET hash = '' WHERE id = 'evt-unsealed';"
         ))
         .unwrap();
 

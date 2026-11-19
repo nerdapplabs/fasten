@@ -48,9 +48,9 @@ pub(crate) fn sdk_row_to_core(r: &crate::Row) -> fasten_core::Row {
         shipped_at:     r.shipped_at.as_ref().map(crate::canonical_ts),
         prev_hash:      Some(r.prev_hash.clone()),
         hash:           Some(r.hash.clone()),
-        canonical_form_id: None,
-        detail_salt:    None,
-        detail_commitment: None,
+        canonical_form_id: Some(r.canonical_form_id.clone()).filter(|f| !f.is_empty()),
+        detail_salt:    r.detail_salt.clone(),
+        detail_commitment: r.detail_commitment.clone(),
         extra:          HashMap::new(),
     }
 }
@@ -90,8 +90,22 @@ fn core_to_sdk_row(r: &fasten_core::Row) -> crate::Row {
         pii_in_detail:  r.pii_in_detail,
         prev_hash:      r.prev_hash.clone().unwrap_or_default(),
         hash:           r.hash.clone().unwrap_or_default(),
+        canonical_form_id: r.canonical_form_id.clone().unwrap_or_default(),
+        detail_salt:    r.detail_salt.clone(),
+        detail_commitment: r.detail_commitment.clone(),
         shipped_at:     r.shipped_at.as_deref().and_then(|s| s.parse().ok()),
     }
+}
+
+/// Insert `row` through the store's allocating insert and return it as
+/// stored. When the store sealed it, the sealed row is written to stdout,
+/// after the unsealed line `submit` wrote (spec §8).
+pub(crate) fn store_row(store: &dyn AuditStore, row: &crate::Row) -> Result<crate::Row, Error> {
+    let stored = store.allocate_and_insert_originated(row)?;
+    if !stored.hash.is_empty() {
+        crate::EmitBuilder::write_audit_stdout(&stored);
+    }
+    Ok(stored)
 }
 
 // Lets the fasten-core drainer write through an SDK `AuditStore`.
@@ -103,7 +117,7 @@ impl fasten_core::store::Store for SdkStoreAdapter {
         let sdk_row = core_to_sdk_row(row);
         // Type only: a store error message can quote row values. The
         // drainer retries the row, unless the store rejected it.
-        self.0.insert(&sdk_row).map_err(|e| {
+        store_row(&*self.0, &sdk_row).map(|_| ()).map_err(|e| {
             let kind = crate::retention::error_type(&e).into();
             match e {
                 crate::Error::AuditStoreRejected(_) => fasten_core::Error::RowRejected(kind),
@@ -172,10 +186,18 @@ impl Engine {
         cfg_stored.retention_pii = retention_pii;
         *self.config.lock_or_recover() = Some(cfg_stored.clone());
 
-        // Spec §8.1: say once per init that rows are not chained.
-        self.sys_event("error", "audit_chain_unavailable", serde_json::json!({
-            "reason": "the Rust SDK does not seal rows (spec 2.1); rows are written unsealed",
-        }));
+        // Say once per init that rows are not chained: there is no store to
+        // allocate against (spec §8.1), or the store does not seal (§8.2).
+        let unchained = match &store {
+            None => Some("no audit store configured (spec 8.1); rows are written to stdout unsealed"),
+            Some(s) if !s.seals() => {
+                Some("the audit store does not seal rows (spec 2.1); rows are written unsealed")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = unchained {
+            self.sys_event("error", "audit_chain_unavailable", serde_json::json!({ "reason": reason }));
+        }
 
         if strategy == "queue" {
             if let Some(s) = store {
@@ -269,14 +291,21 @@ impl Engine {
         sys_line(cfg.as_ref(), level, event, fields);
     }
 
-    /// Store a row the drainer refused. A failure is reported, not returned.
-    pub(crate) fn store_inline(&self, store: &dyn AuditStore, row: &crate::Row) {
-        match store.insert(row) {
+    /// Store a row the drainer refused and return it as stored. A failure
+    /// is reported, not returned, and gives the row back as it was.
+    pub(crate) fn store_inline(&self, store: &dyn AuditStore, row: crate::Row) -> crate::Row {
+        match store_row(store, &row) {
             // Follows the drainer's audit_drain_abandoned.
-            Ok(()) => self.sys_event("info", "audit_drain_stored_inline", serde_json::json!({
-                "row_id": row.id,
-            })),
-            Err(e) => self.fallback_failed(row, e),
+            Ok(stored) => {
+                self.sys_event("info", "audit_drain_stored_inline", serde_json::json!({
+                    "row_id": row.id,
+                }));
+                stored
+            }
+            Err(e) => {
+                self.fallback_failed(&row, e);
+                row
+            }
         }
     }
 
@@ -339,6 +368,9 @@ fn write_sys(
 pub(crate) static SYS_CAPTURE: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static SYS_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+/// Every audit line written to stdout.
+#[cfg(test)]
+pub(crate) static AUDIT_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
 impl Default for Engine {
     fn default() -> Self { Self::new() }

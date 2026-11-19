@@ -6,14 +6,29 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Added: fasten-core can seal and verify rows
+### Added: the Rust SDK and fasten-core seal and verify rows
 
-- `fasten_core::chain` has `seal`, `row_hash`, `detail_commitment` and
-  `verify_chain`, giving the same hashes as the Python and Go SDKs for
-  canonical forms "1" and "2". Rows sealed by either verify here, and a
-  row sealed here verifies in Python.
-- Nothing calls it yet: the core stores and the Rust SDK still write
-  unsealed rows.
+- The Rust SDK's `PostgresStore` seals each row into the node's hash chain
+  when it stores it, as Python and Go do. Rust, Python and Go writers on
+  one table share one chain per node, and each verifies the others' rows.
+- `fasten::verify_chain` checks a chain; `PostgresStore::chain_rows` reads
+  a node's rows for it. `ChainRow` and `ChainVerifyResult` are exported.
+- A stored row is written to stdout twice, unsealed and then sealed, and
+  `submit()` returns the sealed row when the insert was synchronous.
+- `audit_chain_unavailable` is logged only with no store, or with a store
+  that does not seal. An adopter store opts in with `AuditStore::seals` and
+  `AuditStore::allocate_and_insert_originated`.
+- `PostgresStore::redact_rows` clears the salt to an empty string, where it
+  wrote NULL before, as Python and Go do.
+- Breaking: the Rust `Row` has three new public fields, `canonical_form_id`,
+  `detail_salt` and `detail_commitment`. Code that builds a `Row` with a
+  struct literal must set them or use `..Default::default()`.
+- fasten-core: `chain::seal`, `seal_row`, `row_hash`, `detail_commitment`
+  and `verify_chain` give the same hashes as Python and Go for forms "1"
+  and "2". `SqliteStore` and `PostgresStore` seal a row inserted with
+  `monotonic_seq` 0, which also applies to `fasten_store_insert`; a row
+  with its own sequence number is stored as given. `Store::chain_rows`
+  reads rows with their detail numbers exact.
 
 ### Fixed: Go keeps detail numbers exact
 
