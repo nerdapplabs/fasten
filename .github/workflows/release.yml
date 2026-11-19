@@ -389,11 +389,29 @@ jobs:
             grep -q E404 "$RUNNER_TEMP/versions.json" || { cat "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/view.err"; exit 1; }
             echo '[]' > "$RUNNER_TEMP/versions.json"
           fi
-          node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
-            > "$RUNNER_TEMP/versions.txt"
+          # Staged versions count too: a staged version keeps the dist-tag it
+          # was staged with, so a backport staged while a higher version
+          # waits for approval must not go under latest.
+          if ! npm stage list "$name" --json > "$RUNNER_TEMP/staged.json" 2> "$RUNNER_TEMP/staged.err"; then
+            grep -q E404 "$RUNNER_TEMP/staged.json" "$RUNNER_TEMP/staged.err" \
+              || { cat "$RUNNER_TEMP/staged.json" "$RUNNER_TEMP/staged.err"; exit 1; }
+            echo '[]' > "$RUNNER_TEMP/staged.json"
+          fi
+          node -e '
+            const out = [].concat(require(process.argv[1]));
+            const seen = (x) => {
+              if (Array.isArray(x)) return x.forEach(seen);
+              if (x && typeof x === "object") {
+                if (typeof x.version === "string") out.push(x.version);
+                Object.values(x).forEach(seen);
+              }
+            };
+            seen(require(process.argv[2]));
+            for (const v of new Set(out)) console.log("v" + v);
+          ' "$RUNNER_TEMP/versions.json" "$RUNNER_TEMP/staged.json" > "$RUNNER_TEMP/versions.txt"
+          echo "versions on npm or staged:"; cat "$RUNNER_TEMP/versions.txt"
           tag=$(../scripts/release/npm-dist-tag.sh "$version" < "$RUNNER_TEMP/versions.txt")
           npm --version
-          npm stage list "$name" || true
           npm stage publish . --provenance --access public --tag "$tag"
           {
             echo "### npm: $name $version is staged, not published"
