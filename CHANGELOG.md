@@ -348,6 +348,8 @@ be replaced now.
 - On npm, a release goes under the `latest` dist-tag only when it is above
   every published release; a backport such as 1.0.1 after 1.1.0 goes under
   `release-1.0`.
+- On npm, a release is staged by the workflow and becomes installable when
+  a maintainer approves it with two-factor authentication.
 - The Rust SDK needs Rust 1.90 (`rust-version`), as fasten-core does.
 
 ### Changed: Python, Rust and npm packages are named `fasten-sdk`

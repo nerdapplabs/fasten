@@ -8,6 +8,11 @@ name: Release
 # Tags must point at a commit on main. Prerelease tags (vX.Y.Z-beta.N) get a
 # GitHub prerelease only; set the repository variable PUBLISH_PRERELEASES to
 # true to also publish them to the registries.
+# npm is staged, not published: the npm job runs `npm stage publish`, and
+# the version is installable only after a maintainer approves it on npm
+# with 2FA (`npm stage approve <stage-id>`, or Staged Packages on
+# npmjs.com). NPM_TOKEN is a stage-only token, which npm refuses for a
+# direct publish. Staging needs npm 11.15.0 or later.
 # A version that is already published is skipped only when the published
 # files match this build; otherwise the job fails. The wheel records the
 # hatchling version and the npm tarball's gzip bytes depend on the npm
@@ -367,8 +372,10 @@ jobs:
       # goes out under the beta dist-tag. A plain version goes out under
       # latest only when it is above every version on npm; a backport gets
       # release-X.Y. A re-run skips a version that is already on npm with
-      # the same tarball, and fails if the tarball differs.
-      - name: Publish to npm (with provenance)
+      # the same tarball, and fails if the tarball differs. A version that
+      # is staged but not approved is not on npm yet: approve or reject it
+      # before a re-run. The list below shows what is waiting.
+      - name: Stage on npm (with provenance)
         run: |
           state=$(../scripts/release/npm-check.sh .)
           case $state in
@@ -385,7 +392,21 @@ jobs:
           node -e 'for (const v of [].concat(require(process.argv[1]))) console.log("v" + v)' "$RUNNER_TEMP/versions.json" \
             > "$RUNNER_TEMP/versions.txt"
           tag=$(../scripts/release/npm-dist-tag.sh "$version" < "$RUNNER_TEMP/versions.txt")
-          npm publish --provenance --access public --tag "$tag"
+          npm --version
+          npm stage list "$name" || true
+          npm stage publish . --provenance --access public --tag "$tag"
+          {
+            echo "### npm: $name $version is staged, not published"
+            echo
+            echo "It is installable only after a maintainer approves it with 2FA:"
+            echo
+            echo '```'
+            echo "npm stage list $name"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+            echo
+            echo "Or approve it under Staged Packages on npmjs.com."
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_OWNERS: ${{ vars.NPM_OWNERS }}
@@ -450,11 +471,12 @@ jobs:
 
       # The dist-tag is worked out without the versions on npm, so a
       # backport shows latest here instead of release-X.Y.
-      - name: npm publish --dry-run
+      - name: npm stage publish --dry-run
         run: |
           version=$(node -p 'require("./package.json").version')
           tag=$(../scripts/release/npm-dist-tag.sh "$version" < /dev/null)
-          npm publish --dry-run --access public --tag "$tag"
+          npm --version
+          npm stage publish . --dry-run --access public --tag "$tag"
 
   crates-io-dry-run:
     needs: [test-python, test-js, test-rust, versions]
