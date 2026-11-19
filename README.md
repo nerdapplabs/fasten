@@ -41,9 +41,11 @@ How far that record is tamper-evident depends on the SDK:
 [docs/security.md](docs/security.md) has the details and what is outside
 the chain's scope.
 
-**Status: v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++ and
-Swift are beta. Nothing is published to PyPI, npm or crates.io yet; install
-from source.
+**Status: v1.0.0-beta.** Python and Go are the complete SDKs; Python is the
+reference. JS, Rust, C++ and Swift are previews: they emit, redact and store
+rows, but don't seal them. Nothing is published to PyPI, npm or crates.io
+yet; install from source or from the
+[GitHub release](https://github.com/nerdapplabs/fasten/releases).
 
 [Website](https://fasten.sh)
 

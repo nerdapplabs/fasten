@@ -2,6 +2,10 @@
 
 Audit and correlation SDK for C++14 and later. v1.0.0-beta.
 
+> **Preview in this beta.** This SDK emits, redacts and stores audit rows,
+> but does not seal them into the hash chain, so its rows can't be verified
+> for tampering. The Python and Go SDKs do.
+
 The SDK is header-only. Redaction, the code catalog and the audit queue live
 in `libfasten_core` (the Rust library in [`fasten-core/`](../fasten-core)),
 so programs must link with `-lfasten_core`.
