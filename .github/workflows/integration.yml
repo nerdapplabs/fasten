@@ -14,6 +14,7 @@ on:
       - 'cpp/**'
       - 'fasten-core/**'
       - 'tests/integration/**'
+      - 'spec/row-schema.json'
       - '.github/workflows/integration.yml'
   pull_request:
     paths:
@@ -24,6 +25,7 @@ on:
       - 'cpp/**'
       - 'fasten-core/**'
       - 'tests/integration/**'
+      - 'spec/row-schema.json'
       - '.github/workflows/integration.yml'
   workflow_call:
 
