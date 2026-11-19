@@ -58,7 +58,7 @@ jobs:
       kind: ${{ steps.tag.outputs.kind }}
       publish: ${{ steps.tag.outputs.publish }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -167,7 +167,7 @@ jobs:
     if: ${{ needs.tag.outputs.kind != 'go' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # A dry run has no tag: it takes v<js/package.json version>, so the
       # check fails when the package versions disagree.
@@ -229,7 +229,7 @@ jobs:
         if: ${{ matrix.package == 'node' }}
         run: apk add --no-cache bash python3
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the package and run the smoke
         run: scripts/release/install-check.sh ${{ matrix.package }}
@@ -250,7 +250,7 @@ jobs:
       url: https://crates.io/crates/fasten-sdk
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # fasten-core is versioned on its own, so a release of the SDK can
       # reuse a fasten-core version that is already on crates.io. That is
@@ -317,7 +317,7 @@ jobs:
     # run no build tooling. The wheels come from the wheels job.
     steps:
       # For scripts/release/pypi-check.py.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Wheels only: an sdist has no libfasten_core and fails at first use.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -358,7 +358,7 @@ jobs:
         working-directory: js
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure npm registry
         run: |
@@ -439,7 +439,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # For scripts/release/pypi-check.py.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The wheels the pypi job would publish.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -475,7 +475,7 @@ jobs:
       run:
         working-directory: js
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install bash
         run: apk add --no-cache bash
@@ -505,7 +505,7 @@ jobs:
     container:
       image: rust:1.90
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Exit 3 is a warning here; the crates-io job would fail on it:
       # fasten-core changed since its version was published, or it is
@@ -556,7 +556,7 @@ jobs:
       id-token: write       # Sigstore signing certificate
       attestations: write   # store the attestations on the repo
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Release tag
         id: tag
@@ -665,7 +665,7 @@ jobs:
     permissions:
       contents: write   # create the release and upload its files
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # all tags, to pick the latest release
           persist-credentials: false
