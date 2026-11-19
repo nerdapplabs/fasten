@@ -6,6 +6,11 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: JS keeps a detail key named `__proto__`
+
+- A `__proto__` key in a detail parsed from JSON is kept and redacted like
+  any other key. Before, redaction dropped it and its value.
+
 ### Fixed: Go reads rows with a NULL salt or commitment
 
 - The Go SQLite and Postgres stores read a row whose `detail_salt` or
