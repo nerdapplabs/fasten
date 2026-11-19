@@ -262,9 +262,16 @@ function _redactObj(val, patterns, replacement) {
 	}
 	const out = {};
 	for (const [k, v] of Object.entries(val)) {
-		out[k] = _matchesAny(k, patterns)
-			? replacement
-			: _redactObj(v, patterns, replacement);
+		// defineProperty, not out[k] = ...: assigning to "__proto__" sets the
+		// prototype and the key is lost.
+		Object.defineProperty(out, k, {
+			value: _matchesAny(k, patterns)
+				? replacement
+				: _redactObj(v, patterns, replacement),
+			enumerable: true,
+			writable: true,
+			configurable: true,
+		});
 	}
 	return out;
 }
