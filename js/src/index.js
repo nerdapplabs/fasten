@@ -35,6 +35,7 @@ import {
 	coreRegisterCodes,
 	coreRegistryClear,
 } from "./core.js";
+import { isSentinel, mintSentinel, Stream } from "./streams.js";
 
 // --- Correlation context --------------------------------------------------
 
@@ -54,6 +55,13 @@ export function currentRequestID() {
 export function withRequestID(requestId, fn) {
 	return als.run({ requestId }, fn);
 }
+
+export { isSentinel, mintSentinel };
+
+// A request id from outside (an HTTP header) is used only when it is 1 to
+// 128 letters, digits, ".", "_" and "-": it is stored and indexed with every
+// row of the request.
+const _USABLE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 // --- Code catalog ---------------------------------------------------------
 
@@ -354,17 +362,85 @@ function _sealedLine(row) {
 	return `${head.slice(0, -1)},"detail":${detailText(detail === undefined ? {} : detail)}}\n`;
 }
 
+const _EMPTY_CONFIG = Object.freeze({
+	serviceId: "",
+	nodeId: "",
+	tenantId: null,
+	auditStore: null,
+	apiStore: null,
+	syslogStore: null,
+	searchEnabled: false,
+	extraRedactKeys: [],
+	redactReplacement: null,
+	failureStrategy: "queue",
+});
+
+const _STREAM_NAMES = ["api", "sys"];
+
+function _pyList(names) {
+	return `[${[...names]
+		.sort()
+		.map((n) => JSON.stringify(n))
+		.join(", ")}]`;
+}
+
+// The streams named in persistStreams (or FASTEN_PERSIST_STREAMS), or null
+// when neither is set. Throws for a name other than api or sys.
+function _persistStreams(opt) {
+	let named = null;
+	if (opt !== undefined && opt !== null) {
+		named = [...opt].map((s) => String(s).trim()).filter(Boolean);
+	} else {
+		const env = process.env.FASTEN_PERSIST_STREAMS ?? "";
+		if (env.trim()) {
+			named = env
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean);
+		}
+	}
+	if (named === null) return null;
+	const set = new Set(named);
+	const unknown = [...set].filter((s) => !_STREAM_NAMES.includes(s));
+	if (unknown.length) {
+		throw new Error(
+			`fasten.init: persistStreams=${_pyList(set)}: unknown stream(s) ${_pyList(unknown)}. Only ${_pyList(_STREAM_NAMES)} are valid (audit persistence is driven by auditStore, not persistStreams).`,
+		);
+	}
+	return set;
+}
+
+// Every named stream needs a store and every attached store must be named.
+function _checkPersistStreams(named, stores) {
+	if (named === null) return;
+	const have = new Set(_STREAM_NAMES.filter((s) => stores[s]));
+	const missing = [...named].filter((s) => !have.has(s));
+	const unlisted = [...have].filter((s) => !named.has(s));
+	const bits = [];
+	if (missing.length) {
+		bits.push(
+			`named in persistStreams but no store attached: ${_pyList(missing)}`,
+		);
+	}
+	if (unlisted.length) {
+		bits.push(`store attached but not in persistStreams: ${_pyList(unlisted)}`);
+	}
+	if (bits.length) {
+		throw new Error(
+			`fasten.init: persistStreams / stores mismatch: ${bits.join("; ")}`,
+		);
+	}
+}
+
 export class Engine {
-	#config = {
-		serviceId: "",
-		nodeId: "",
-		tenantId: null,
-		auditStore: null,
-		apiStore: null,
-		extraRedactKeys: [],
-		redactReplacement: null,
-		failureStrategy: "queue",
-	};
+	#config = { ..._EMPTY_CONFIG };
+	// The api and sys streams of the current init; see streams.js.
+	#streams = null;
+	#bootRequestId = null;
+	#bootOver = false;
+	// An audit row failed to reach the current store outside the drainer.
+	#auditWriteSwallowed = false;
+	_streamRetention = [];
 	_drainer = null; // also read by the audit_queue.js helpers
 	_retiring = new Set(); // drainers taken out of the slot, still stopping
 	#closing = null;
@@ -391,24 +467,71 @@ export class Engine {
 			);
 		}
 
+		const streamStores = {
+			api: opts.apiStore ?? null,
+			sys: opts.syslogStore ?? null,
+		};
+		for (const [name, s] of Object.entries(streamStores)) {
+			if (s && typeof s.insert !== "function") {
+				throw new Error(
+					`fasten.init: ${name === "api" ? "apiStore" : "syslogStore"} has no insert()`,
+				);
+			}
+		}
+		_checkPersistStreams(_persistStreams(opts.persistStreams), streamStores);
+		const streamRetention = [];
+		for (const [name, opt, env] of [
+			["api", "retentionApi", "FASTEN_RETENTION_API"],
+			["sys", "retentionSyslog", "FASTEN_RETENTION_SYSLOG"],
+		]) {
+			const raw = opts[opt] ?? (process.env[env] || null);
+			const ms = raw ? parseDuration(raw) : 0;
+			const s = streamStores[name];
+			if (!ms || !s) continue;
+			if (typeof s.purge !== "function") {
+				throw new Error(
+					`fasten.init: ${opt} is set but the ${name} store has no purge()`,
+				);
+			}
+			streamRetention.push({ name, store: s, ms });
+		}
+		const envSearch = (process.env.FASTEN_SEARCH_ENABLED ?? "").toLowerCase();
+
+		const prevStore = this.#config.auditStore;
 		this.#config = {
 			serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? "",
 			nodeId: opts.nodeId ?? process.env.FASTEN_NODE_ID ?? "",
 			// An empty FASTEN_TENANT_ID is no tenant, as in the other SDKs.
 			tenantId: opts.tenantId ?? (process.env.FASTEN_TENANT_ID || null),
 			auditStore: opts.auditStore ?? null,
-			apiStore: opts.apiStore ?? null,
+			apiStore: streamStores.api,
+			syslogStore: streamStores.sys,
+			searchEnabled:
+				opts.searchEnabled === true || ["1", "true", "yes"].includes(envSearch),
 			extraRedactKeys: extraKeys ?? [],
 			redactReplacement:
 				opts.redactReplacement ?? process.env.FASTEN_REDACT_REPLACEMENT ?? null,
 			failureStrategy: strategy,
 		};
+		// A gap in the previous store's history says nothing about another.
+		if (this.#config.auditStore !== prevStore) {
+			this.#auditWriteSwallowed = false;
+		}
 		this._stopRetention();
 		if (!this.#config.serviceId || !this.#config.nodeId) {
+			this.#streams = null;
 			throw new Error(
 				"fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required",
 			);
 		}
+		// Stream rows without a request_id get this boot id until the first
+		// row with a real one (spec persistent-streams §7).
+		this.#bootRequestId = mintSentinel("boot", this.#config.serviceId);
+		this.#bootOver = false;
+		this.#streams = {
+			api: new Stream("api", streamStores.api),
+			sys: new Stream("sys", streamStores.sys),
+		};
 		const piiRet =
 			opts.retentionPii ?? (process.env.FASTEN_RETENTION_PII || null);
 		const piiRetMs = piiRet ? parseDuration(piiRet) : 0;
@@ -454,6 +577,7 @@ export class Engine {
 			this._uninstallDrainer(5000, true);
 		}
 		if (piiRetMs && store) this._startRetention(piiRetMs);
+		for (const r of streamRetention) this._startStreamRetention(r);
 	}
 
 	emit(input) {
@@ -465,11 +589,13 @@ export class Engine {
 				if (d) {
 					d.put(row);
 				} else {
-					const failed = (err) =>
+					const failed = (err) => {
+						this.#auditWriteSwallowed = true;
 						this._drainerSysLog("error", "audit_sync_fallback_failed", {
 							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
 							row_id: row?.id ?? null,
 						});
+					};
 					try {
 						const p = this._storeRow(cfg.auditStore, row);
 						if (typeof p?.then === "function") p.then(undefined, failed);
@@ -695,12 +821,34 @@ export class Engine {
 		return this._drainer ? this._drainer.stats() : null;
 	}
 
-	// Also waits for drainers a re-init is retiring.
+	// Also waits for drainers a re-init is retiring, and for api and sys
+	// rows still being written to their stores.
 	async flush(timeoutMs = 5000) {
 		const ds = [...this._retiring].map((e) => e.drainer);
 		if (this._drainer) ds.push(this._drainer);
-		const ok = await Promise.all(ds.map((d) => d.flush(timeoutMs)));
+		const ok = await Promise.all([
+			...ds.map((d) => d.flush(timeoutMs)),
+			this._settleStreams(timeoutMs),
+		]);
 		return ok.every(Boolean);
+	}
+
+	async _settleStreams(timeoutMs) {
+		const s = this.#streams;
+		if (!s) return true;
+		let timer;
+		const timeout = new Promise((r) => {
+			timer = setTimeout(() => r(false), timeoutMs);
+			timer.unref?.();
+		});
+		const settled = Promise.all([s.api.settle(), s.sys.settle()]).then(
+			() => true,
+		);
+		try {
+			return await Promise.race([settled, timeout]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/**
@@ -722,7 +870,10 @@ export class Engine {
 	}
 
 	async #close(timeoutMs) {
-		if (!this._drainer && this._retiring.size === 0) return true;
+		if (!this._drainer && this._retiring.size === 0) {
+			await this._settleStreams(timeoutMs);
+			return true;
+		}
 		const deadline = Date.now() + timeoutMs;
 		const left = () => Math.max(0, deadline - Date.now());
 		await this.flush(timeoutMs / 2);
@@ -741,16 +892,9 @@ export class Engine {
 		const retiring = [...this._retiring];
 		const stopped = this._uninstallDrainer();
 		this._stopRetention();
-		this.#config = {
-			serviceId: "",
-			nodeId: "",
-			tenantId: null,
-			auditStore: null,
-			apiStore: null,
-			extraRedactKeys: [],
-			redactReplacement: null,
-			failureStrategy: "queue",
-		};
+		this.#config = { ..._EMPTY_CONFIG };
+		this.#streams = null;
+		this.#auditWriteSwallowed = false;
 		await Promise.all([stopped, ...retiring.map((e) => e.stop())]);
 		await Promise.all(retiring.map((e) => e.done));
 	}
@@ -797,6 +941,37 @@ export class Engine {
 		clearImmediate(this._retentionFirst);
 		this._retentionTimer = null;
 		this._retentionFirst = null;
+		for (const t of this._streamRetention) {
+			clearInterval(t.timer);
+			clearImmediate(t.first);
+		}
+		this._streamRetention = [];
+	}
+
+	// Delete api or sys rows older than `ms` from the stream's store, on
+	// init and then hourly (spec persistent-streams §10).
+	_startStreamRetention({ name, store, ms }) {
+		let running = false;
+		const tick = async () => {
+			if (running) return;
+			running = true;
+			try {
+				await store.purge({ before: new Date(Date.now() - ms) });
+			} catch (err) {
+				// Type only: driver messages can carry row values.
+				this._drainerSysLog("error", "retention_purge_failed", {
+					stream: name,
+					error_type: err?.name ?? "Error",
+				});
+			} finally {
+				running = false;
+			}
+		};
+		const timer = setInterval(tick, RETENTION_CHECK_MS);
+		timer.unref();
+		const first = setImmediate(tick);
+		first.unref();
+		this._streamRetention.push({ timer, first });
 	}
 
 	_installDrainer(opts) {
@@ -899,6 +1074,108 @@ export class Engine {
 			}
 		}
 		stream.write(`${JSON.stringify(out, bigintReplacer)}\n`);
+		// The redacted line, without its shape, is the stored row.
+		if (this.#streams) {
+			const { shape: _shape, ...row } = out;
+			this._pushStream("sys", row);
+		}
+	}
+
+	// Give a stream row a request_id if it has none (spec persistent-streams
+	// §7): the boot id until the first row with a real id, then an orphan id.
+	_stampRequestId(row) {
+		const rid = row.request_id;
+		if (typeof rid === "string" && rid) {
+			if (!isSentinel(rid)) this.#bootOver = true;
+			return row;
+		}
+		row.request_id =
+			this.#bootRequestId && !this.#bootOver
+				? this.#bootRequestId
+				: mintSentinel("orphan", this.#config.serviceId);
+		return row;
+	}
+
+	// Push a redacted row to the stream's ring and store.
+	_pushStream(name, row) {
+		this.#streams?.[name].push(this._stampRequestId(row));
+	}
+
+	// A redacted copy of a row from the caller, with its request_id.
+	_streamRow(row) {
+		if (row === null || typeof row !== "object" || Array.isArray(row)) {
+			throw new TypeError("fasten: a stream row must be an object");
+		}
+		return this._redact(this._stampRequestId({ ...row }));
+	}
+
+	/**
+	 * Record a sys row written by the app's own logger: redacted, kept in
+	 * the ring and stored if a syslog store is attached. Nothing is written
+	 * to stdout. Does nothing before init().
+	 */
+	pushSyslog(row) {
+		if (!this.#streams) return;
+		this.#streams.sys.push(this._streamRow(row));
+	}
+
+	/**
+	 * Record an api row (method, path, status, duration_ms, request_id,
+	 * timestamp): redacted, kept in the ring, stored if an api store is
+	 * attached, and written to stdout with shape "api". Does nothing before
+	 * init().
+	 */
+	writeApi(row) {
+		if (!this.#streams) return;
+		const r = this._streamRow(row);
+		this.#streams.api.push(r);
+		this._writeStdout(
+			`${JSON.stringify({ shape: "api", ...r }, bigintReplacer)}\n`,
+			{ request_id: r.request_id ?? null, shape: "api" },
+		);
+	}
+
+	/** writeApi() without the stdout line. */
+	pushApi(row) {
+		if (!this.#streams) return;
+		this.#streams.api.push(this._streamRow(row));
+	}
+
+	/** Streams with a store attached: "audit", "api", "sys". */
+	persistedStreams() {
+		const c = this.#config;
+		const out = new Set();
+		if (c.auditStore) out.add("audit");
+		if (c.apiStore) out.add("api");
+		if (c.syslogStore) out.add("sys");
+		return out;
+	}
+
+	/** Whether free-text search (q=, /search) is on. */
+	searchEnabled() {
+		return this.#config.searchEnabled;
+	}
+
+	/** The audit store passed to init(), or null. */
+	auditStore() {
+		return this.#config.auditStore;
+	}
+
+	// What the reader reads: settings, the stream objects, the audit state.
+	_readerState() {
+		const c = this.#config;
+		return {
+			serviceId: c.serviceId,
+			nodeId: c.nodeId,
+			tenantId: c.tenantId,
+			failureStrategy: c.failureStrategy,
+			searchEnabled: c.searchEnabled,
+			auditStore: c.auditStore,
+			streams: this.#streams,
+			auditDegraded: () =>
+				this.#auditWriteSwallowed || (this._drainer?.unstoredTotal() ?? 0) > 0,
+			chainUnavailable: !!c.auditStore && !_seals(c.auditStore),
+		};
 	}
 
 	_drainerSysLog(level, event, fields) {
@@ -952,6 +1229,57 @@ export async function redactExpired(opts) {
 }
 
 export const log = defaultEngine.log;
+
+export function pushSyslog(row) {
+	return defaultEngine.pushSyslog(row);
+}
+export function writeApi(row) {
+	return defaultEngine.writeApi(row);
+}
+export function pushApi(row) {
+	return defaultEngine.pushApi(row);
+}
+
+/**
+ * Middleware that records an api row per request, except for paths in
+ * `skip`, with the keys Python's and Go's APILogger write: method, path,
+ * status, duration_ms, request_id, timestamp. The request id is a usable
+ * X-Request-ID header, else the current one, else a new one; it is set on
+ * the response and is current for the rest of the request.
+ *
+ * Works as Express/Connect middleware `(req, res, next)`, or with
+ * http.createServer as `apiLogger()(req, res, () => handler(req, res))`.
+ */
+export function apiLogger({ skip = [], engine = defaultEngine } = {}) {
+	const skipped = new Set(skip);
+	return (req, res, next) => {
+		const path = (req.url ?? "").split("?")[0];
+		const header = req.headers?.["x-request-id"];
+		const rid =
+			typeof header === "string" && _USABLE_REQUEST_ID.test(header)
+				? header
+				: (currentRequestID() ?? mintID());
+		if (skipped.has(path)) return withRequestID(rid, () => next());
+		const start = process.hrtime.bigint();
+		if (!res.headersSent) res.setHeader("X-Request-ID", rid);
+		let done = false;
+		const record = () => {
+			if (done) return;
+			done = true;
+			engine.writeApi({
+				method: req.method ?? "",
+				path,
+				status: res.statusCode,
+				duration_ms: Number((process.hrtime.bigint() - start) / 1_000_000n),
+				request_id: rid,
+				timestamp: canonicalTS(),
+			});
+		};
+		res.once("finish", record);
+		res.once("close", record);
+		return withRequestID(rid, () => next());
+	};
+}
 
 // --- Catalog yaml ---------------------------------------------------------
 
@@ -1015,4 +1343,10 @@ export default {
 	publishCheckpoints,
 	loadCheckpoints,
 	checkpointsSince,
+	pushSyslog,
+	writeApi,
+	pushApi,
+	apiLogger,
+	mintSentinel,
+	isSentinel,
 };
