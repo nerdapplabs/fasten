@@ -6,6 +6,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: JS and Python DSN errors
+
+- DSN errors name a scheme only when the DSN has one, that is when `//`
+  follows it. A DSN such as `host:5432/db` or `user:password@host/db` gets
+  `DSN form not recognised`; an unknown scheme such as `mysql://...` is
+  still named.
+- Python's `FASTEN_AUDIT_DSN` refuses an unknown scheme or form, as
+  `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` do, instead of opening a SQLite
+  file, and `fasten doctor` reports it.
+
 ### Changed: JS (breaking for existing callers)
 
 - `PostgresStore.query()` and `listUnshipped()` return rows with the wire's

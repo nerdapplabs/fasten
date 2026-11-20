@@ -136,6 +136,18 @@ def test_an_unsupported_api_dsn_scheme_fails(doctor_env, monkeypatch, capsys):
     assert "unsupported DSN scheme 'mysql'" in out
 
 
+@pytest.mark.parametrize("dsn", [
+    "admin:s3cret@db.internal:5432/app", "db.internal:5432/app", "user:pw@host/db"])
+def test_dsn_errors_name_a_scheme_only_when_the_dsn_has_one(doctor_env, monkeypatch, capsys,
+                                                             tmp_path, dsn):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
+    monkeypatch.setenv("FASTEN_API_DSN", dsn)
+    out = _run(capsys)
+    assert out.count("DSN form not recognised") == 4
+    assert not any(w in out for w in ("admin", "s3cret", "db.internal", "pw@", "5432"))
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_error_hides_details_that_contain_the_password(doctor_env, monkeypatch, capsys):
     dsn = "postgresql://app:s3cret@db"
     monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
