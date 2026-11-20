@@ -200,7 +200,8 @@ Set `Config::retention_pii` (or `FASTEN_RETENTION_PII`) to a duration such as
 `"30d"` to redact personal data: every hour, rows older than that whose code
 has `pii_in_detail` or retention class Short get `detail` set to `null`, after
 an `AUDIT_ROW_REDACTED` row records it. A redacted row keeps its hash, so the
-chain still verifies. Audit rows are never deleted.
+chain still verifies. The engine never deletes audit rows; an operator can
+(see [Purging audit rows](#purging-audit-rows)).
 
 ## Chain checkpoints
 
@@ -250,9 +251,9 @@ on stderr. Use one publisher per file.
 
 With retention, checkpoints taken before a purge are below the rows it
 left, or belong to a node with no rows left, and they fail a whole-chain
-verify. The Rust SDK redacts and never deletes rows, so this applies when
-another SDK or an operator purges the table. Pass only the checkpoints taken
-since the latest purge finished, and publish again after each purge:
+verify. The engine never deletes rows, so this applies after a manual
+`purge` or a purge by another SDK. Pass only the checkpoints taken since the
+latest purge finished, and publish again after each purge:
 
 ```rust
 let kept = fasten::checkpoints_since(&checkpoints, purged_at)?;
@@ -262,6 +263,120 @@ let result = verify_chain_with_checkpoints(&all_rows, &kept, CheckpointOptions::
 A whole-chain verify shows rows deleted from the start of a chain when one
 of the given checkpoints falls among them. Rows deleted below every given
 checkpoint look the same as a purge.
+
+## Replication
+
+A node ships its sealed rows to another store, an aggregator, which
+verifies them and stores them as they were sealed
+([spec §4, §5](../spec/chain-replication.md#4-replication-ingest--ingestresult)). The rows go as
+JSON lines in the wire format, which the Python, Go and JS SDKs read and
+write too.
+
+On the node, list the rows this engine originated (its service and node id;
+rows it ingested from elsewhere are not shipped again), send them, then mark
+them shipped:
+
+```rust
+let rows = fasten::list_unshipped(500)?;        // 0 for all
+let body: String = rows.iter().map(|r| r.to_json() + "\n").collect();
+send_to_aggregator(&body)?;                      // your transport
+let ids: Vec<String> = rows.iter().map(|r| r.row.id.clone()).collect();
+fasten::mark_shipped(&ids)?;
+```
+
+On the aggregator, read the lines and ingest them:
+
+```rust
+let rows: Vec<fasten::ReplicatedRow> = body
+    .lines()
+    .map(fasten::ReplicatedRow::from_json)
+    .collect::<Result<_, _>>()?;
+let result = fasten::ingest_replicated(&rows)?;  // or store.ingest_replicated(&rows, None)
+if let Some(seq) = result.rejected_from_seq {
+    // Resend from `seq`; `result.reason` says why the batch stopped there.
+}
+```
+
+`ingest_replicated` verifies the batch per node and checks it against the
+rows the store holds. It stores the verified prefix in one transaction, each
+row with its detail text exactly as it was hashed, and stops at the first
+break, which it reports in `IngestResult { inserted, rejected_from_seq,
+reason }` rather than as an error:
+
+- a row whose hash, commitment or link to the row before it does not verify;
+- a different row under a stored id, or at a stored node and seq;
+- a row that does not link to the stored row before it, or that the stored
+  row after it does not link to;
+- an id that appears twice in the batch;
+- through the engine, a row from the engine's own node, whose rows come from
+  its emit path only.
+
+A row delivered again is skipped and counted in `inserted`, so a batch can
+be resent safely. A batch with a timestamp the Python and Go stores could
+not read back (not RFC 3339, year 0, a UTC year outside 1 to 9999) is
+refused whole with `Error::AuditStoreRejected`. Any error means nothing of
+the batch was stored. On Postgres the batch's node locks are taken in sorted
+order, the lock every SDK's insert takes, so ingest and local writes on one
+table do not interleave on a node.
+
+`ReplicatedRow` carries the row as a `ChainRow`, whose detail keeps each
+number as it was written, and its `pii_in_detail` flag. To store one row
+already verified, without the checks, use the store's
+`insert_replicated(&row)`. The stores'
+`list_unshipped(limit, Some((service_id, node_id)))` returns the same rows
+as `Row`s, whose detail `serde_json` holds, so ship `list_unshipped_sealed`.
+
+## Purging audit rows
+
+The engine never deletes audit rows (spec §7). An operator purges them with
+the store ([spec §2.3](../spec/chain-replication.md#23-purge-normative)):
+
+```rust
+use fasten::AuditStore;
+let deleted = store.purge(cutoff, true)?;   // cutoff: DateTime<Utc>
+```
+
+It deletes rows older than `cutoff`, per node only a run from the start of
+the chain, so the rows left still verify. With `respect_unshipped` set,
+unshipped rows and the rows after them are kept. Publish checkpoints again
+after a purge, and verify with `checkpoints_since` (see above).
+
+## Lost Postgres connections
+
+`PostgresStore` keeps one connection. When it is lost (a server restart, a
+failover, `pg_terminate_backend`), the next call connects again. A call cut
+short by the loss runs once more on the new connection if running it again
+is safe: a read, a statement that sets or removes the same rows again, or a
+whole transaction, which the lost connection rolled back. A COMMIT cut short
+is never run again: an insert reads its row back once and returns it as
+stored, or returns a retryable error, and the drainer retries; the insert
+looks up the row's id first, so it is never stored twice. A statement
+timeout (SQLSTATE 57014) is not a lost connection and is returned as it is.
+While the server stays down calls fail, and the queue holds the rows.
+
+## Stores from the environment
+
+With no `Config::audit_store`, `init` opens the audit store from
+`FASTEN_AUDIT_DSN`, in the Python SDK's forms:
+
+| DSN | Store |
+|---|---|
+| `postgres://...` or `postgresql://...` (any case) | `PostgresStore` (feature `store-postgres`) |
+| `sqlite:///relative.db` | `SqliteStore` on `relative.db` (feature `store-sqlite`) |
+| `sqlite:////absolute/path.db` | `SqliteStore` on `/absolute/path.db` |
+| `/path/audit.db` or `audit.db` | `SqliteStore` on that path |
+
+`?table=name` names the table (default `audit_log`) and `?wal=false` turns
+off SQLite's WAL journal. Another scheme, libpq's keyword form
+(`host=db dbname=app`), or a scheme whose store feature is not built is an
+error from `init` that names the scheme and never the DSN; no file is
+created. A store in the config wins. `init` again with the same DSN keeps
+the store it opened; with another DSN it opens that one, and the old store
+closes once the drainer has finished with it. A set `FASTEN_*` variable that
+looks like a DSN but is not one `init` reads (say `FASTEN_AUDIT_DNS`) is
+reported once on stderr as `env_dsn_not_read`, without its value.
+`fasten::parse_dsn` and `fasten::audit_store_from_dsn` parse and open a DSN
+directly.
 
 ## Tests
 
@@ -275,7 +390,10 @@ docker run --rm -v $PWD:/work -w /work/rust rust:1.90 \
 `--test-threads=1` because the integration tests share the global config
 and drainer. Add `--features store-sqlite` to run the SQLite store's tests,
 and `--features store-postgres` with `FASTEN_TEST_POSTGRES_DSN` set for the
-Postgres store's.
+Postgres store's, including the replication and lost-connection tests. The
+lost-connection tests end the store's connections with
+`pg_terminate_backend`, so the test role must be allowed to (a superuser, or
+a member of the role that owns them).
 
 ## Docs and design
 

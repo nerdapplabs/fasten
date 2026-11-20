@@ -776,6 +776,16 @@ pub trait AuditStore: Send + Sync {
         Err(Error::Unsupported("list_unshipped_sealed".into()))
     }
 
+    /// Store one sealed row shipped from another node exactly as it was
+    /// sealed (spec §5): the replicated insert, beside the originated one
+    /// above. Its chain is not verified here: verify the batch first, or use
+    /// [`AuditStore::ingest_replicated`]. The same row again is a no-op; a
+    /// different row under its id or at its node and seq is
+    /// [`Error::AuditStoreRejected`].
+    fn insert_replicated(&self, _row: &ReplicatedRow) -> Result<(), Error> {
+        Err(Error::Unsupported("insert_replicated".into()))
+    }
+
     /// Set `shipped_at` to now on the rows in `ids`; unknown ids are
     /// ignored.
     fn mark_shipped(&self, _ids: &[String]) -> Result<(), Error> {
@@ -814,6 +824,7 @@ pub trait AuditStore: Send + Sync {
 /// A replicated row read as a [`Row`]: a detail number `serde_json` cannot
 /// hold exactly is changed, and a detail that is not an object (a redacted
 /// one) reads as empty.
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
 pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Row {
     let c = &r.row;
     let detail = match serde_json::from_str(&c.detail.to_string()) {

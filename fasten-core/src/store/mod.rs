@@ -130,6 +130,14 @@ pub trait Store: Send + Sync {
         Err(Error::Unsupported("insert_sealed"))
     }
 
+    /// The replicated insert of spec §5: [`Store::insert_sealed`] for a
+    /// row shipped from another node, with its flag. The caller has
+    /// verified the chain; [`Store::ingest_replicated`] verifies a batch
+    /// and checks it against the stored rows first.
+    fn insert_replicated(&self, row: &ReplicatedRow) -> Result<(), Error> {
+        self.insert_sealed(&row.row, row.pii_in_detail)
+    }
+
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
     /// sufficient; on PostgreSQL, a lost connection is re-established first.
     fn ping(&self) -> Result<(), Error>;

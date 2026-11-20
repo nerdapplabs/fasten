@@ -508,6 +508,27 @@ fn postgres_stores_the_detail_text_as_sent() {
     }
 }
 
+// The replicated insert stores one row as it was sealed, flag included,
+// and refuses an unsealed row or a different row under a stored id.
+#[test]
+fn insert_replicated_stores_a_row_as_it_was_sealed() {
+    for s in subjects() {
+        let mut rows = chain(&[1, 2]);
+        rows[0].pii_in_detail = true;
+        for r in &rows {
+            s.store.insert_replicated(r).unwrap();
+            s.store.insert_replicated(r).unwrap();
+        }
+        let listed = s.store.list_unshipped_sealed(0, None).unwrap();
+        assert_eq!(listed, rows, "{}", s.name);
+        assert!(s.store.insert_replicated(&unsealed(3)).is_err(), "{}", s.name);
+        let mut other = rows[1].clone();
+        other.row.hash = "ab".repeat(32);
+        let err = s.store.insert_replicated(&other).unwrap_err();
+        assert!(matches!(err, crate::Error::AuditStoreRejected(_)), "{}: {err:?}", s.name);
+    }
+}
+
 fn register_code(code: &str) {
     let meta = crate::Meta { domain: "repl".into(), ..Default::default() };
     let _ = crate::register("repl".into(), [(code.to_string(), meta)]);

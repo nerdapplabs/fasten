@@ -211,6 +211,10 @@ impl crate::AuditStore for SqliteStore {
         self.inner.redact_rows(ids).map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
     }
 
+    fn insert_replicated(&self, row: &ReplicatedRow) -> Result<(), crate::Error> {
+        self.insert_sealed(&row.row, row.pii_in_detail)
+    }
+
     fn list_unshipped_sealed(
         &self,
         limit: usize,

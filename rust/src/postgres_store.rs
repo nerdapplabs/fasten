@@ -956,6 +956,10 @@ impl crate::AuditStore for PostgresStore {
         rows.iter().map(|r| column(r, 0, "redacted row")).collect()
     }
 
+    fn insert_replicated(&self, row: &ReplicatedRow) -> Result<(), crate::Error> {
+        self.insert_sealed(&row.row, row.pii_in_detail)
+    }
+
     fn list_unshipped_sealed(
         &self,
         limit: usize,
