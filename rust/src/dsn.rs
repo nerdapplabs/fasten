@@ -55,14 +55,14 @@ impl fmt::Display for DsnError {
         match self {
             DsnError::KeywordForm => f.write_str(
                 "DSN in libpq keyword form not supported; use postgres://user@host/db, \
-                 sqlite:///./audit.db or a bare filesystem path",
+                 sqlite:///./fasten.db or a bare filesystem path",
             ),
             DsnError::Scheme(scheme) => write!(
                 f,
-                "DSN scheme '{scheme}' not supported; use sqlite:///./audit.db, postgres://... \
+                "DSN scheme '{scheme}' not supported; use sqlite:///./fasten.db, postgres://... \
                  or a bare filesystem path"
             ),
-            DsnError::NoPath => f.write_str("the SQLite DSN has no path; use sqlite:///./audit.db or similar"),
+            DsnError::NoPath => f.write_str("the SQLite DSN has no path; use sqlite:///./fasten.db or similar"),
         }
     }
 }
