@@ -16,7 +16,24 @@
       "default": "./src/index.js"
     },
     "./store/postgres": {
+      "types": "./src/store/postgres.d.ts",
       "default": "./src/store/postgres.js"
+    },
+    "./store/sqlite": {
+      "types": "./src/store/sqlite.d.ts",
+      "default": "./src/store/sqlite.js"
+    },
+    "./reader": {
+      "types": "./src/reader.d.ts",
+      "default": "./src/reader.js"
+    },
+    "./store/stream_postgres": {
+      "types": "./src/store/stream_postgres.d.ts",
+      "default": "./src/store/stream_postgres.js"
+    },
+    "./store/stream_sqlite": {
+      "types": "./src/store/stream_sqlite.d.ts",
+      "default": "./src/store/stream_sqlite.js"
     }
   },
   "engines": {

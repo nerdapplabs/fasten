@@ -3,12 +3,40 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { canonicalTS } from "./canonical_ts.js";
 import {
+	AuditSealError,
+	bigintReplacer,
+	bigintReviver,
+	ChainError,
+	CURRENT_CANONICAL_FORM_ID,
+	canonicalJSON,
+	detailCommitment,
+	detailText,
+	GENESIS,
+	JsonNumber,
+	parseJson,
+	seal,
+	toChainRow,
+	verifyChain,
+} from "./chain.js";
+import {
+	Checkpoint,
+	checkpointsSince,
+	FileCheckpointSink,
+	HttpCheckpointSink,
+	loadCheckpoints,
+	PartialLastLineError,
+	publishCheckpoints,
+	takeCheckpoints,
+} from "./checkpoints.js";
+import {
 	coreMetaOf,
 	coreRedact,
 	coreRedactFull,
 	coreRegisterCodes,
 	coreRegistryClear,
 } from "./core.js";
+import { auditStoreFromDsn, streamStoreFromDsn } from "./store/dsn.js";
+import { isSentinel, mintSentinel, Stream } from "./streams.js";
 
 // --- Correlation context --------------------------------------------------
 
@@ -27,6 +55,19 @@ export function currentRequestID() {
 
 export function withRequestID(requestId, fn) {
 	return als.run({ requestId }, fn);
+}
+
+export { isSentinel, mintSentinel };
+
+// A request id from outside (an HTTP header) is used only when it is 1 to
+// 128 letters, digits, ".", "_" and "-", and does not look like a sentinel
+// (rows written outside a request): it is stored and indexed with every
+// row of the request. It is not authenticated.
+const _USABLE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
+function _usableRequestId(id) {
+	return (
+		typeof id === "string" && _USABLE_REQUEST_ID.test(id) && !isSentinel(id)
+	);
 }
 
 // --- Code catalog ---------------------------------------------------------
@@ -278,30 +319,171 @@ const RETENTION_CHECK_MS = 3_600_000;
 
 import {
 	_setDefaultEngine,
+	AuditOutcomeUnknownError,
 	AuditQueueDrainer,
+	AuditRowRejectedError,
 	AuditStoreError,
+	errorType,
 } from "./audit_queue.js";
 
-export { AuditStoreError };
+export {
+	AuditOutcomeUnknownError,
+	AuditRowRejectedError,
+	AuditSealError,
+	AuditStoreError,
+	ChainError,
+	Checkpoint,
+	CURRENT_CANONICAL_FORM_ID,
+	canonicalJSON,
+	checkpointsSince,
+	detailCommitment,
+	FileCheckpointSink,
+	GENESIS,
+	HttpCheckpointSink,
+	JsonNumber,
+	loadCheckpoints,
+	PartialLastLineError,
+	parseJson,
+	publishCheckpoints,
+	seal,
+	takeCheckpoints,
+	toChainRow,
+	verifyChain,
+};
+
+// Streams the engine has put an 'error' listener on, so a failed write
+// such as EPIPE is logged rather than crashing the process.
+const _watched = new WeakSet();
+
+// Whether `store` seals the rows it stores (spec §2.1). A store opts in
+// with a seals() method that returns true.
+function _seals(store) {
+	return typeof store?.seals === "function" && store.seals() === true;
+}
+
+// The second stdout line for a row, once the store sealed it (spec §8).
+// The detail is the text the store wrote and hashed, so the line verifies
+// as it is.
+function _sealedLine(row) {
+	const { detail, ...rest } = row;
+	const head = JSON.stringify({ shape: "audit", ...rest }, bigintReplacer);
+	return `${head.slice(0, -1)},"detail":${detailText(detail === undefined ? {} : detail)}}\n`;
+}
+
+const _EMPTY_CONFIG = Object.freeze({
+	serviceId: "",
+	nodeId: "",
+	tenantId: null,
+	auditStore: null,
+	apiStore: null,
+	syslogStore: null,
+	searchEnabled: false,
+	extraRedactKeys: [],
+	redactReplacement: null,
+	failureStrategy: "queue",
+});
+
+const _STREAM_NAMES = ["api", "sys"];
+
+// The variables init() opens stores from.
+const _DSN_ENV = ["FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"];
+// Variables already warned about as looking like a DSN variable.
+const _warnedEnv = new Set();
+
+function _pyList(names) {
+	return `[${[...names]
+		.sort()
+		.map((n) => JSON.stringify(n))
+		.join(", ")}]`;
+}
+
+// The streams named in persistStreams (or FASTEN_PERSIST_STREAMS), or null
+// when neither is set. Throws for a name other than api or sys.
+function _persistStreams(opt) {
+	let named = null;
+	if (opt !== undefined && opt !== null) {
+		named = [...opt].map((s) => String(s).trim()).filter(Boolean);
+	} else {
+		const env = process.env.FASTEN_PERSIST_STREAMS ?? "";
+		if (env.trim()) {
+			named = env
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean);
+		}
+	}
+	if (named === null) return null;
+	const set = new Set(named);
+	const unknown = [...set].filter((s) => !_STREAM_NAMES.includes(s));
+	if (unknown.length) {
+		throw new Error(
+			`fasten.init: persistStreams=${_pyList(set)}: unknown stream(s) ${_pyList(unknown)}. Only ${_pyList(_STREAM_NAMES)} are valid (audit persistence is driven by auditStore, not persistStreams).`,
+		);
+	}
+	return set;
+}
+
+// Every named stream needs a store and every attached store must be named.
+function _checkPersistStreams(named, stores) {
+	if (named === null) return;
+	const have = new Set(_STREAM_NAMES.filter((s) => stores[s]));
+	const missing = [...named].filter((s) => !have.has(s));
+	const unlisted = [...have].filter((s) => !named.has(s));
+	const bits = [];
+	if (missing.length) {
+		bits.push(
+			`named in persistStreams but no store attached: ${_pyList(missing)}`,
+		);
+	}
+	if (unlisted.length) {
+		bits.push(`store attached but not in persistStreams: ${_pyList(unlisted)}`);
+	}
+	if (bits.length) {
+		throw new Error(
+			`fasten.init: persistStreams / stores mismatch: ${bits.join("; ")}`,
+		);
+	}
+}
+
+// True once `work` settles, false if timeoutMs runs out first.
+async function _within(work, timeoutMs) {
+	let timer;
+	const timeout = new Promise((r) => {
+		timer = setTimeout(() => r(false), timeoutMs);
+		timer.unref?.();
+	});
+	try {
+		return await Promise.race([work.then(() => true), timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 export class Engine {
-	#config = {
-		serviceId: "",
-		nodeId: "",
-		tenantId: null,
-		auditStore: null,
-		apiStore: null,
-		extraRedactKeys: [],
-		redactReplacement: null,
-		failureStrategy: "queue",
-	};
+	#config = { ..._EMPTY_CONFIG };
+	// The api and sys streams of the current init; see streams.js.
+	#streams = null;
+	#bootRequestId = null;
+	#bootOver = false;
+	// An audit row failed to reach the current store outside the drainer.
+	#auditWriteSwallowed = false;
+	_streamRetention = [];
 	_drainer = null; // also read by the audit_queue.js helpers
 	_retiring = new Set(); // drainers taken out of the slot, still stopping
 	#closing = null;
 	_retentionTimer = null;
 	_retentionFirst = null;
+	#unsealedReported = false;
+	// Stores opened from FASTEN_*_DSN: variable name to { dsn, store }, so a
+	// re-init with the same DSN keeps the store and its connections.
+	#envStores = new Map();
+	// Streams a re-init replaced while their store writes still ran.
+	#retiringStreams = new Set();
+	// Stores opened from the environment that a re-init stopped using.
+	#abandoned = new Set();
 
 	init(opts = {}) {
+		this.#warnUnknownDsnEnv();
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
 			.split(",")
 			.map((s) => s.trim())
@@ -320,24 +502,87 @@ export class Engine {
 			);
 		}
 
+		// A store passed in wins over one from the environment, as in Python.
+		const auditStore =
+			opts.auditStore ?? this.#fromEnv("FASTEN_AUDIT_DSN", auditStoreFromDsn);
+		const streamStores = {
+			api:
+				opts.apiStore ??
+				this.#fromEnv("FASTEN_API_DSN", (d) =>
+					streamStoreFromDsn(d, "api_log"),
+				),
+			sys:
+				opts.syslogStore ??
+				this.#fromEnv("FASTEN_SYSLOG_DSN", (d) =>
+					streamStoreFromDsn(d, "syslog"),
+				),
+		};
+		for (const [name, s] of Object.entries(streamStores)) {
+			if (s && typeof s.insert !== "function") {
+				throw new Error(
+					`fasten.init: ${name === "api" ? "apiStore" : "syslogStore"} has no insert()`,
+				);
+			}
+		}
+		_checkPersistStreams(_persistStreams(opts.persistStreams), streamStores);
+		const streamRetention = [];
+		for (const [name, opt, env] of [
+			["api", "retentionApi", "FASTEN_RETENTION_API"],
+			["sys", "retentionSyslog", "FASTEN_RETENTION_SYSLOG"],
+		]) {
+			const raw = opts[opt] ?? (process.env[env] || null);
+			const ms = raw ? parseDuration(raw) : 0;
+			const s = streamStores[name];
+			if (!ms || !s) continue;
+			if (typeof s.purge !== "function") {
+				throw new Error(
+					`fasten.init: ${opt} is set but the ${name} store has no purge()`,
+				);
+			}
+			streamRetention.push({ name, store: s, ms });
+		}
+		const envSearch = (process.env.FASTEN_SEARCH_ENABLED ?? "").toLowerCase();
+
+		const prevStore = this.#config.auditStore;
 		this.#config = {
 			serviceId: opts.serviceId ?? process.env.FASTEN_SERVICE_ID ?? "",
 			nodeId: opts.nodeId ?? process.env.FASTEN_NODE_ID ?? "",
 			// An empty FASTEN_TENANT_ID is no tenant, as in the other SDKs.
 			tenantId: opts.tenantId ?? (process.env.FASTEN_TENANT_ID || null),
-			auditStore: opts.auditStore ?? null,
-			apiStore: opts.apiStore ?? null,
+			auditStore,
+			apiStore: streamStores.api,
+			syslogStore: streamStores.sys,
+			searchEnabled:
+				opts.searchEnabled === true || ["1", "true", "yes"].includes(envSearch),
 			extraRedactKeys: extraKeys ?? [],
 			redactReplacement:
 				opts.redactReplacement ?? process.env.FASTEN_REDACT_REPLACEMENT ?? null,
 			failureStrategy: strategy,
 		};
+		// A gap in the previous store's history says nothing about another.
+		if (this.#config.auditStore !== prevStore) {
+			this.#auditWriteSwallowed = false;
+		}
 		this._stopRetention();
 		if (!this.#config.serviceId || !this.#config.nodeId) {
+			this.#streams = null;
 			throw new Error(
 				"fasten.init: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required",
 			);
 		}
+		// Stream rows without a request_id get this boot id until the first
+		// row with a real one (spec persistent-streams §7).
+		this.#bootRequestId = mintSentinel("boot", this.#config.serviceId);
+		this.#bootOver = false;
+		// Streams with writes still running are kept until they settle, so
+		// flush() and close() wait for them.
+		for (const old of Object.values(this.#streams ?? {})) {
+			if (old.pending) this.#retiringStreams.add(old);
+		}
+		this.#streams = {
+			api: new Stream("api", streamStores.api),
+			sys: new Stream("sys", streamStores.sys),
+		};
 		const piiRet =
 			opts.retentionPii ?? (process.env.FASTEN_RETENTION_PII || null);
 		const piiRetMs = piiRet ? parseDuration(piiRet) : 0;
@@ -353,16 +598,25 @@ export class Engine {
 			);
 		}
 
-		// Spec §8.1: say once per init that rows are not chained.
-		this._drainerSysLog("error", "audit_chain_unavailable", {
-			store: this.#config.auditStore?.constructor?.name ?? null,
-			reason:
-				"the JS SDK does not seal rows (spec 2.1); rows are written unsealed",
-		});
+		// Say once per init that rows are not chained: there is no store to
+		// allocate against (spec §8.1), or the store does not seal (§8.2).
+		if (!store) {
+			this._drainerSysLog("error", "audit_chain_unavailable", {
+				store: null,
+				reason:
+					"no audit store configured (spec 8.1): auditStore not passed and FASTEN_AUDIT_DSN unset; rows are written to stdout unsealed",
+			});
+		} else if (!_seals(store)) {
+			this._drainerSysLog("error", "audit_chain_unavailable", {
+				store: store.constructor?.name ?? null,
+				reason:
+					"the audit store does not seal rows (spec 2.1); rows are written unsealed",
+			});
+		}
 
-		if (strategy === "queue" && this.#config.auditStore) {
+		if (strategy === "queue" && store) {
 			this._installDrainer({
-				store: this.#config.auditStore,
+				store: { insert: (row) => this._storeRow(store, row) },
 				sysLog: (l, e, f) => this._drainerSysLog(l, e, f),
 				capacity: opts.queueCapacity ?? 100,
 				retryInitialMs: opts.queueRetryInitialMs ?? 100,
@@ -374,6 +628,81 @@ export class Engine {
 			this._uninstallDrainer(5000, true);
 		}
 		if (piiRetMs && store) this._startRetention(piiRetMs);
+		for (const r of streamRetention) this._startStreamRetention(r);
+		this.#closeAbandoned();
+	}
+
+	// The store for the DSN in environment variable `name`, or null when it
+	// is unset or empty.
+	#fromEnv(name, open) {
+		const dsn = process.env[name];
+		if (!dsn) return null;
+		const held = this.#envStores.get(name);
+		if (held?.dsn === dsn) return held.store;
+		const store = open(dsn);
+		// The store for an earlier DSN is closed by #closeAbandoned.
+		if (held) this.#abandoned.add(held.store);
+		this.#envStores.set(name, { dsn, store });
+		return store;
+	}
+
+	// Close the stores opened from the environment that this init does not
+	// use, once the drainers and streams that may still write to them are
+	// done.
+	#closeAbandoned() {
+		const c = this.#config;
+		const inUse = new Set([c.auditStore, c.apiStore, c.syslogStore]);
+		for (const [name, held] of this.#envStores) {
+			if (!inUse.has(held.store)) {
+				this.#envStores.delete(name);
+				this.#abandoned.add(held.store);
+			}
+		}
+		const stores = [...this.#abandoned].filter((s) => !inUse.has(s));
+		this.#abandoned.clear();
+		if (stores.length === 0) return;
+		const waits = [
+			...[...this._retiring].map((e) => e.done),
+			...[...this.#retiringStreams].map((st) => st.settle()),
+		];
+		Promise.all(waits)
+			.then(() => this.#closeStores(stores))
+			.catch(() => {});
+	}
+
+	// Close each store, logging a failure by error type.
+	async #closeStores(stores) {
+		await Promise.all(
+			stores.map(async (s) => {
+				try {
+					await s?.close?.();
+				} catch (err) {
+					this._drainerSysLog("error", "store_close_failed", {
+						error_type: errorType(err),
+					});
+				}
+			}),
+		);
+	}
+
+	// Warn once per variable about a set FASTEN_* variable named like a DSN
+	// variable that init() does not read: a misspelt one leaves the app
+	// without the store it meant to open. The value is not logged.
+	#warnUnknownDsnEnv() {
+		for (const name of Object.keys(process.env)) {
+			if (
+				/^FASTEN_\w*(DSN|DNS|URL)$/.test(name) &&
+				!_DSN_ENV.includes(name) &&
+				process.env[name] &&
+				!_warnedEnv.has(name)
+			) {
+				_warnedEnv.add(name);
+				this._drainerSysLog("warn", "env_dsn_not_read", {
+					variable: name,
+					reason: `init() opens stores from ${_DSN_ENV.join(", ")} only`,
+				});
+			}
+		}
 	}
 
 	emit(input) {
@@ -385,13 +714,15 @@ export class Engine {
 				if (d) {
 					d.put(row);
 				} else {
-					const failed = (err) =>
+					const failed = (err) => {
+						this.#auditWriteSwallowed = true;
 						this._drainerSysLog("error", "audit_sync_fallback_failed", {
-							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
+							error_type: errorType(err),
 							row_id: row?.id ?? null,
 						});
+					};
 					try {
-						const p = cfg.auditStore.insert(row);
+						const p = this._storeRow(cfg.auditStore, row);
 						if (typeof p?.then === "function") p.then(undefined, failed);
 					} catch (err) {
 						failed(err);
@@ -400,23 +731,81 @@ export class Engine {
 			} else {
 				let p;
 				try {
-					p = cfg.auditStore.insert(row);
+					p = this._storeRow(cfg.auditStore, row);
 				} catch (err) {
 					throw new AuditStoreError(err);
 				}
 				// An async store fails after emit() returns, so hand the caller a
-				// promise for the row that rejects with AuditStoreError.
+				// promise for the stored row that rejects with AuditStoreError.
 				if (typeof p?.then === "function") {
 					return p.then(
-						() => row,
+						(stored) => stored,
 						(err) => {
 							throw new AuditStoreError(err);
 						},
 					);
 				}
+				return p;
 			}
 		}
 		return row;
+	}
+
+	// Insert `row` through `store` and return the row as stored: what
+	// insert() returned when it is a row with the same id, else `row`. A
+	// returned row with a hash is written to stdout again (spec §8); a failed
+	// write is logged as audit_stdout_failed, not thrown, since the row is
+	// stored. A store that says it seals but returns no hash is logged once.
+	_storeRow(store, row) {
+		const done = (stored) => {
+			const out =
+				stored && typeof stored === "object" && stored.id === row.id
+					? stored
+					: row;
+			if (out.hash) {
+				this._writeSealed(out);
+			} else if (!this.#unsealedReported && _seals(store)) {
+				this.#unsealedReported = true;
+				this._drainerSysLog("error", "audit_chain_row_unsealed", {
+					row_id: row.id,
+					store: store.constructor?.name ?? null,
+					reason:
+						"the audit store reports seals() but insert() did not return the row with a hash",
+				});
+			}
+			return out;
+		};
+		const p = store.insert(row);
+		return typeof p?.then === "function" ? p.then(done) : done(p);
+	}
+
+	_writeSealed(row) {
+		this._writeStdout(_sealedLine(row), { row_id: row.id, sealed: true });
+	}
+
+	// Write one line to stdout. A failed write is logged as
+	// audit_stdout_failed with `fields`, never thrown.
+	_writeStdout(line, fields) {
+		const stream = process.stdout;
+		if (!_watched.has(stream)) {
+			_watched.add(stream);
+			stream.on("error", (err) => this._stdoutFailed(err, {}));
+		}
+		try {
+			stream.write(line, (err) => {
+				if (err) this._stdoutFailed(err, fields);
+			});
+		} catch (err) {
+			this._stdoutFailed(err, fields);
+		}
+	}
+
+	_stdoutFailed(err, fields) {
+		this._drainerSysLog("error", "audit_stdout_failed", {
+			error_type: err?.name ?? "Error",
+			error_code: typeof err?.code === "string" ? err.code : null,
+			...fields,
+		});
 	}
 
 	// Builds the row and writes it to stdout (spec §8 phase 1).
@@ -434,6 +823,11 @@ export class Engine {
 			throw new Error("fasten.init() must be called before emit()");
 		const meta = _registry.get(code);
 		if (!meta) throw new Error(`unknown audit code: ${code}`);
+		if (typeof target !== "string") {
+			throw new ChainError(
+				`emit: target must be a string (got ${typeof target})`,
+			);
+		}
 
 		const id = `evt-${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 		let outDetail;
@@ -458,8 +852,7 @@ export class Engine {
 			wire_version: "1",
 			id,
 			origin_id: id,
-			// Spec §8: JS does not allocate seq or seal, so the row goes out
-			// with seq 0, as phase-1 stdout lines do; a store allocates it.
+			// Spec §8: the store allocates the seq and seals the row on insert.
 			monotonic_seq: 0,
 			timestamp: canonicalTS(),
 			code,
@@ -478,9 +871,18 @@ export class Engine {
 			detail: outDetail,
 			pii_in_detail: !!meta.piiInDetail,
 		};
-		// JS doesn't seal rows (spec §8), so this line's hashes are empty.
-		process.stdout.write(
-			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" })}\n`,
+		// A row field no store can seal (not a string, or an unpaired
+		// surrogate) fails here, before the row is written anywhere.
+		try {
+			toChainRow(row);
+		} catch (err) {
+			throw new ChainError(`emit: ${err.message}`);
+		}
+		// Not sealed yet (spec §8), so the hashes are empty. The
+		// store seals the row on insert and it is written again then.
+		this._writeStdout(
+			`${JSON.stringify({ shape: "audit", ...row, prev_hash: "", hash: "" }, bigintReplacer)}\n`,
+			{ row_id: id, sealed: false },
 		);
 
 		return row;
@@ -531,7 +933,7 @@ export class Engine {
 				},
 			});
 			try {
-				await store.insert(record);
+				await this._storeRow(store, record);
 			} catch (err) {
 				throw new AuditStoreError(err);
 			}
@@ -540,25 +942,100 @@ export class Engine {
 		return redacted;
 	}
 
+	// The audit store, with the methods `op` needs. A missing store or
+	// method is the configuration's, so it is a TypeError.
+	_storeWith(op, ...methods) {
+		const store = this.#config.auditStore;
+		if (!store || methods.some((m) => typeof store[m] !== "function")) {
+			throw new TypeError(
+				store
+					? `${op}: the audit store does not implement ${methods.join(" / ")}`
+					: `${op}: no audit store; pass auditStore to init() or set FASTEN_AUDIT_DSN`,
+			);
+		}
+		return store;
+	}
+
+	/**
+	 * Rows this engine's service and node originated that are not shipped
+	 * yet, oldest first, as the store's `listUnshipped` returns them with
+	 * `exact` set: ship them as `JSON.stringify` writes them. Rows ingested
+	 * from other nodes are left out (spec §4): the store is asked for this
+	 * identity's rows, and any other row it returns is dropped here.
+	 */
+	async listUnshipped(limit = 100) {
+		const store = this._storeWith("listUnshipped", "listUnshipped");
+		const { serviceId, nodeId } = this.#config;
+		const rows = await store.listUnshipped(limit, {
+			serviceId,
+			sourceNodeId: nodeId,
+			exact: true,
+		});
+		return rows.filter(
+			(r) =>
+				r.origin_id === r.id &&
+				r.source_node_id === nodeId &&
+				r.service_id === serviceId,
+		);
+	}
+
+	/** Mark rows shipped upstream, by id. */
+	async markShipped(ids) {
+		await this._storeWith("markShipped", "markShipped").markShipped(ids);
+	}
+
+	/**
+	 * Verify a batch replicated from other nodes and store its verified
+	 * prefix (spec §4), through the store's `ingestReplicated`. A chain break
+	 * does not throw: the result's `rejectedFromSeq` is the seq to resend
+	 * from. The batch stops at the first row from this engine's node id.
+	 */
+	async ingestReplicated(rows) {
+		const store = this._storeWith("ingestReplicated", "ingestReplicated");
+		return store.ingestReplicated(rows, { localNodeId: this.#config.nodeId });
+	}
+
 	queueStats() {
 		return this._drainer ? this._drainer.stats() : null;
 	}
 
-	// Also waits for drainers a re-init is retiring.
+	// Also waits for drainers a re-init is retiring, and for api and sys
+	// rows still being written to their stores, including the stores of
+	// streams a re-init replaced and rows pushed while it waits. Resolves
+	// false when any of them is not done by timeoutMs.
 	async flush(timeoutMs = 5000) {
 		const ds = [...this._retiring].map((e) => e.drainer);
 		if (this._drainer) ds.push(this._drainer);
-		const ok = await Promise.all(ds.map((d) => d.flush(timeoutMs)));
+		const ok = await Promise.all([
+			...ds.map((d) => d.flush(timeoutMs)),
+			this._settleStreams(timeoutMs),
+		]);
 		return ok.every(Boolean);
+	}
+
+	async _settleStreams(timeoutMs) {
+		const all = [
+			...Object.values(this.#streams ?? {}),
+			...this.#retiringStreams,
+		];
+		if (all.length === 0) return true;
+		const settled = Promise.all(all.map((st) => st.settle())).then(() => {
+			for (const st of all) this.#retiringStreams.delete(st);
+		});
+		return _within(settled, timeoutMs);
 	}
 
 	/**
 	 * Flush pending audit rows for up to half of timeoutMs, then stop the
 	 * drainer. Rows still queued get one attempt; a row not stored by
-	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Call it on
-	 * shutdown: flush() alone leaves a row in backoff unreported at exit.
-	 * Emits after close are stored without the queue. Resolves false if a
-	 * row was lost.
+	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Waits, within
+	 * timeoutMs, for api and sys rows still being written, then closes the
+	 * stores opened from FASTEN_*_DSN (a later init() opens them again)
+	 * and stops retention. Call it on shutdown: flush() alone leaves a row
+	 * in backoff unreported at exit. Emits after close are stored without
+	 * the queue, in a store passed to init(). Resolves false if a row was
+	 * lost, or the stream writes or the store closes did not finish by
+	 * timeoutMs.
 	 */
 	close(timeoutMs = 5000) {
 		// A second close while one is running waits for the same outcome.
@@ -571,18 +1048,27 @@ export class Engine {
 	}
 
 	async #close(timeoutMs) {
-		if (!this._drainer && this._retiring.size === 0) return true;
 		const deadline = Date.now() + timeoutMs;
 		const left = () => Math.max(0, deadline - Date.now());
-		await this.flush(timeoutMs / 2);
-		// A drainer a re-init is retiring is stopped within this timeout too.
-		const retiring = [...this._retiring];
-		const ok = await Promise.all([
-			this._uninstallDrainer(left()),
-			...retiring.map((e) => e.stop(left())),
-		]);
-		await Promise.all(retiring.map((e) => e.done));
-		return ok.every(Boolean);
+		let ok = [true];
+		if (this._drainer || this._retiring.size > 0) {
+			await this.flush(timeoutMs / 2);
+			// A drainer a re-init is retiring is stopped within this timeout
+			// too.
+			const retiring = [...this._retiring];
+			ok = await Promise.all([
+				this._uninstallDrainer(left()),
+				...retiring.map((e) => e.stop(left())),
+			]);
+			await Promise.all(retiring.map((e) => e.done));
+		}
+		const settled = await this._settleStreams(left());
+		// Retention would go on purging and redacting stores closed here.
+		this._stopRetention();
+		const opened = [...this.#envStores.values()].map((h) => h.store);
+		this.#envStores.clear();
+		const closed = await _within(this.#closeStores(opened), left());
+		return settled && closed && ok.every(Boolean);
 	}
 
 	// Stops the drainer and any a re-init is retiring.
@@ -590,16 +1076,10 @@ export class Engine {
 		const retiring = [...this._retiring];
 		const stopped = this._uninstallDrainer();
 		this._stopRetention();
-		this.#config = {
-			serviceId: "",
-			nodeId: "",
-			tenantId: null,
-			auditStore: null,
-			apiStore: null,
-			extraRedactKeys: [],
-			redactReplacement: null,
-			failureStrategy: "queue",
-		};
+		this.#config = { ..._EMPTY_CONFIG };
+		this.#streams = null;
+		this.#retiringStreams.clear();
+		this.#auditWriteSwallowed = false;
 		await Promise.all([stopped, ...retiring.map((e) => e.stop())]);
 		await Promise.all(retiring.map((e) => e.done));
 	}
@@ -627,7 +1107,7 @@ export class Engine {
 				// Type only: driver messages can carry row values.
 				this._drainerSysLog("error", "retention_purge_failed", {
 					stream: "audit/pii-redaction",
-					error_type: err?.cause?.name ?? err?.name ?? "Error",
+					error_type: errorType(err?.cause ?? err),
 				});
 			} finally {
 				this._redactionPass = null;
@@ -646,6 +1126,37 @@ export class Engine {
 		clearImmediate(this._retentionFirst);
 		this._retentionTimer = null;
 		this._retentionFirst = null;
+		for (const t of this._streamRetention) {
+			clearInterval(t.timer);
+			clearImmediate(t.first);
+		}
+		this._streamRetention = [];
+	}
+
+	// Delete api or sys rows older than `ms` from the stream's store, on
+	// init and then hourly (spec persistent-streams §10).
+	_startStreamRetention({ name, store, ms }) {
+		let running = false;
+		const tick = async () => {
+			if (running) return;
+			running = true;
+			try {
+				await store.purge({ before: new Date(Date.now() - ms) });
+			} catch (err) {
+				// Type only: driver messages can carry row values.
+				this._drainerSysLog("error", "retention_purge_failed", {
+					stream: name,
+					error_type: errorType(err),
+				});
+			} finally {
+				running = false;
+			}
+		};
+		const timer = setInterval(tick, RETENTION_CHECK_MS);
+		timer.unref();
+		const first = setImmediate(tick);
+		first.unref();
+		this._streamRetention.push({ timer, first });
 	}
 
 	_installDrainer(opts) {
@@ -697,7 +1208,7 @@ export class Engine {
 	// 64 KiB) is replaced by a truncation marker, as in Python and Go.
 	_redact(obj) {
 		const { extraRedactKeys: extra, redactReplacement: repl } = this.#config;
-		const json = JSON.stringify(obj);
+		const json = JSON.stringify(obj, bigintReplacer);
 		const cap = _maxDetailBytes();
 		const size = Buffer.byteLength(json, "utf8");
 		if (size > cap) {
@@ -712,6 +1223,7 @@ export class Engine {
 			extra.length || repl
 				? coreRedactFull(json, JSON.stringify(extra), repl)
 				: coreRedact(json),
+			bigintReviver,
 		);
 	}
 
@@ -722,9 +1234,9 @@ export class Engine {
 			event,
 			request_id: currentRequestID(),
 			service_id: this.#config.serviceId || undefined,
-			timestamp: new Date().toISOString(),
+			timestamp: canonicalTS(),
 			// Fields that aren't JSON (none, or a function) log as {}.
-			...(JSON.stringify(fields) === undefined ? {} : fields),
+			...(JSON.stringify(fields, bigintReplacer) === undefined ? {} : fields),
 		};
 		// The whole line, as Go and Python do: a secret can be in the event.
 		let out = this._redact(line);
@@ -746,7 +1258,109 @@ export class Engine {
 				out = { ...head, ...out };
 			}
 		}
-		stream.write(`${JSON.stringify(out)}\n`);
+		stream.write(`${JSON.stringify(out, bigintReplacer)}\n`);
+		// The redacted line, without its shape, is the stored row.
+		if (this.#streams) {
+			const { shape: _shape, ...row } = out;
+			this._pushStream("sys", row);
+		}
+	}
+
+	// Give a stream row a request_id if it has none (spec persistent-streams
+	// §7): the boot id until the first row with a real id, then an orphan id.
+	_stampRequestId(row) {
+		const rid = row.request_id;
+		if (typeof rid === "string" && rid) {
+			if (!isSentinel(rid)) this.#bootOver = true;
+			return row;
+		}
+		row.request_id =
+			this.#bootRequestId && !this.#bootOver
+				? this.#bootRequestId
+				: mintSentinel("orphan", this.#config.serviceId);
+		return row;
+	}
+
+	// Push a redacted row to the stream's ring and store.
+	_pushStream(name, row) {
+		this.#streams?.[name].push(this._stampRequestId(row));
+	}
+
+	// A redacted copy of a row from the caller, with its request_id.
+	_streamRow(row) {
+		if (row === null || typeof row !== "object" || Array.isArray(row)) {
+			throw new TypeError("fasten: a stream row must be an object");
+		}
+		return this._redact(this._stampRequestId({ ...row }));
+	}
+
+	/**
+	 * Record a sys row written by the app's own logger: redacted, kept in
+	 * the ring and stored if a syslog store is attached. Nothing is written
+	 * to stdout. Does nothing before init().
+	 */
+	pushSyslog(row) {
+		if (!this.#streams) return;
+		this.#streams.sys.push(this._streamRow(row));
+	}
+
+	/**
+	 * Record an api row (method, path, status, duration_ms, request_id,
+	 * timestamp): redacted, kept in the ring, stored if an api store is
+	 * attached, and written to stdout with shape "api". Does nothing before
+	 * init().
+	 */
+	writeApi(row) {
+		if (!this.#streams) return;
+		const r = this._streamRow(row);
+		this.#streams.api.push(r);
+		this._writeStdout(
+			`${JSON.stringify({ shape: "api", ...r }, bigintReplacer)}\n`,
+			{ request_id: r.request_id ?? null, shape: "api" },
+		);
+	}
+
+	/** writeApi() without the stdout line. */
+	pushApi(row) {
+		if (!this.#streams) return;
+		this.#streams.api.push(this._streamRow(row));
+	}
+
+	/** Streams with a store attached: "audit", "api", "sys". */
+	persistedStreams() {
+		const c = this.#config;
+		const out = new Set();
+		if (c.auditStore) out.add("audit");
+		if (c.apiStore) out.add("api");
+		if (c.syslogStore) out.add("sys");
+		return out;
+	}
+
+	/** Whether free-text search (q=, /search) is on. */
+	searchEnabled() {
+		return this.#config.searchEnabled;
+	}
+
+	/** The audit store passed to init(), or null. */
+	auditStore() {
+		return this.#config.auditStore;
+	}
+
+	// What the reader reads: settings, the stream objects, the audit state.
+	_readerState() {
+		const c = this.#config;
+		return {
+			serviceId: c.serviceId,
+			nodeId: c.nodeId,
+			tenantId: c.tenantId,
+			failureStrategy: c.failureStrategy,
+			searchEnabled: c.searchEnabled,
+			auditStore: c.auditStore,
+			streams: this.#streams,
+			auditDegraded: () =>
+				this.#auditWriteSwallowed || (this._drainer?.unstoredTotal() ?? 0) > 0,
+			chainUnavailable: !!c.auditStore && !_seals(c.auditStore),
+		};
 	}
 
 	_drainerSysLog(level, event, fields) {
@@ -798,8 +1412,97 @@ export function close(timeoutMs = 5000) {
 export async function redactExpired(opts) {
 	return defaultEngine.redactExpired(opts);
 }
+export async function listUnshipped(limit = 100) {
+	return defaultEngine.listUnshipped(limit);
+}
+export async function markShipped(ids) {
+	return defaultEngine.markShipped(ids);
+}
+export async function ingestReplicated(rows) {
+	return defaultEngine.ingestReplicated(rows);
+}
 
 export const log = defaultEngine.log;
+
+export function pushSyslog(row) {
+	return defaultEngine.pushSyslog(row);
+}
+export function writeApi(row) {
+	return defaultEngine.writeApi(row);
+}
+export function pushApi(row) {
+	return defaultEngine.pushApi(row);
+}
+
+/**
+ * Middleware that records an api row per request, except for paths in
+ * `skip`, with the keys Python's and Go's APILogger write: method, path,
+ * status, duration_ms, request_id, timestamp. The request id is a usable
+ * X-Request-ID header, else the current one, else a new one; it is set on
+ * the response and is current for the rest of the request. A client's id is
+ * taken as sent, not authenticated; one that looks like a sentinel
+ * ("boot-...", "orphan-...") is not taken.
+ *
+ * The path is stored as sent, without the query string, unless `path`
+ * rewrites it: `path: (req) => req.route?.path ?? "/other"`, for example,
+ * to keep ids and tokens in path segments out of the stored rows. `skip`
+ * matches the path as sent.
+ *
+ * A request whose connection closed before the response finished is
+ * recorded with status 499 and `aborted: true`.
+ *
+ * Works as Express/Connect middleware `(req, res, next)`, or with
+ * http.createServer as `apiLogger()(req, res, () => handler(req, res))`.
+ */
+export function apiLogger({
+	skip = [],
+	engine = defaultEngine,
+	path: rewrite = null,
+} = {}) {
+	if (rewrite !== null && typeof rewrite !== "function") {
+		throw new TypeError("apiLogger: path must be a function (req) => string");
+	}
+	const skipped = new Set(skip);
+	return (req, res, next) => {
+		const sent = (req.url ?? "").split("?")[0];
+		const header = req.headers?.["x-request-id"];
+		const rid = _usableRequestId(header)
+			? header
+			: (currentRequestID() ?? mintID());
+		if (skipped.has(sent)) return withRequestID(rid, () => next());
+		const start = process.hrtime.bigint();
+		if (!res.headersSent) res.setHeader("X-Request-ID", rid);
+		let done = false;
+		const record = (aborted) => {
+			if (done) return;
+			done = true;
+			// A throw here would reach the response's event listeners.
+			try {
+				const row = {
+					method: req.method ?? "",
+					path: rewrite ? String(rewrite(req)) : sent,
+					status: aborted ? 499 : res.statusCode,
+					duration_ms: Number((process.hrtime.bigint() - start) / 1_000_000n),
+					request_id: rid,
+					timestamp: canonicalTS(),
+				};
+				if (aborted) row.aborted = true;
+				engine.writeApi(row);
+			} catch (err) {
+				try {
+					engine._drainerSysLog("error", "api_log_failed", {
+						error_type: errorType(err),
+					});
+				} catch {
+					// Nothing left to report to.
+				}
+			}
+		};
+		res.once("finish", () => record(false));
+		res.once("close", () => record(res.writableFinished !== true));
+		return withRequestID(rid, () => next());
+	};
+}
 
 // --- Catalog yaml ---------------------------------------------------------
 
@@ -833,6 +1536,9 @@ export default {
 	flush,
 	close,
 	redactExpired,
+	listUnshipped,
+	markShipped,
+	ingestReplicated,
 	piiCodes,
 	parseDuration,
 	Domain,
@@ -842,4 +1548,31 @@ export default {
 	Method,
 	AuditCatalogError,
 	CATALOG_ERR,
+	AuditOutcomeUnknownError,
+	AuditRowRejectedError,
+	AuditSealError,
+	ChainError,
+	CURRENT_CANONICAL_FORM_ID,
+	GENESIS,
+	JsonNumber,
+	canonicalJSON,
+	detailCommitment,
+	parseJson,
+	seal,
+	toChainRow,
+	verifyChain,
+	Checkpoint,
+	PartialLastLineError,
+	FileCheckpointSink,
+	HttpCheckpointSink,
+	takeCheckpoints,
+	publishCheckpoints,
+	loadCheckpoints,
+	checkpointsSince,
+	pushSyslog,
+	writeApi,
+	pushApi,
+	apiLogger,
+	mintSentinel,
+	isSentinel,
 };

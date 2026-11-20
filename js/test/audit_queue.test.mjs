@@ -6,7 +6,9 @@ import {
     init, emit, register, registry as _reg,
     AuditStoreError, queueStats, flush, close, _clearCoreRegistry, defaultEngine,
 } from '../src/index.js';
+import { DatabaseSync } from 'node:sqlite';
 import { uninstallDrainer, activeDrainer, rejectsRow } from '../src/audit_queue.js';
+import { SqliteStore } from '../src/store/sqlite.js';
 
 // Stub stores
 
@@ -173,6 +175,51 @@ test('rejectsRow reads the SQLSTATE class', () => {
     for (const code of ['08006', '40001', '42501', '42P01', '53300', '57P01', 'SQLITE_BUSY', 'ECONNRESET', undefined, 54000]) {
         assert.equal(rejectsRow({ code }), false, String(code));
     }
+});
+
+test('rejectsRow reads node:sqlite\'s extended result code', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE t (a TEXT NOT NULL, b INTEGER CHECK (b > 0))');
+    for (const sql of ['INSERT INTO t VALUES (NULL, 1)', 'INSERT INTO t VALUES (\'x\', 0)']) {
+        let err;
+        try {
+            db.exec(sql);
+        } catch (e) {
+            err = e;
+        }
+        assert.equal(err.code, 'ERR_SQLITE_ERROR');
+        assert.equal(err.errcode & 0xff, 19);
+        assert.equal(rejectsRow(err), true, sql);
+    }
+    let noTable;
+    try {
+        db.exec('SELECT * FROM missing');
+    } catch (e) {
+        noTable = e;
+    }
+    assert.equal(rejectsRow(noTable), false);
+    db.close();
+});
+
+test('a row a SqliteStore constraint refuses is dead-lettered at once', async () => {
+    const store = new SqliteStore(':memory:');
+    await store.init();
+    store._db.exec(`CREATE TRIGGER refuse_bad BEFORE INSERT ON audit_log
+        WHEN NEW.target = 'bad' BEGIN SELECT RAISE(ABORT, 'refused'); END`);
+    let attempts = 0;
+    const insert = store.insert.bind(store);
+    store.insert = (row) => {
+        attempts++;
+        return insert(row);
+    };
+    _initQueue(store, { queueRetryInitialMs: 60000, queueRetryMaxMs: 60000, queueRetryJitter: false });
+    emit({ code: 'USER_CREATED', target: 'bad' });
+    emit({ code: 'USER_CREATED', target: 'good' });
+    assert.equal(await flush(2000), true);
+    assert.equal(attempts, 2, 'one attempt per row');
+    assert.equal(queueStats().dead_lettered_total, 1);
+    assert.deepEqual((await store.query({})).map((r) => r.target), ['good']);
+    await store.close();
 });
 
 // Sys self-report
@@ -385,6 +432,55 @@ test('sync fallback logs a failed async insert', async () => {
         `got ${JSON.stringify(captured.map(c => c.event))}`);
 });
 
+// An error shaped like pg's DatabaseError, whose name is "error" and whose
+// message can carry a row value.
+class DatabaseError extends Error {
+    constructor(message, code) {
+        super(message);
+        this.name = 'error';
+        this.code = code;
+        this.severity = 'ERROR';
+    }
+}
+
+test('the drainer records the error type, as the other SDKs do', async () => {
+    const secret = 'Key (id)=(alice@example.com) already exists';
+    let failFor = 6;
+    const store = {
+        insert() {
+            if (failFor-- > 0) throw new DatabaseError(secret, '57P01');
+            throw new DatabaseError(secret, '23505');
+        },
+    };
+    const captured = await captureSys(async () => {
+        _initQueue(store, { queueRetryInitialMs: 1, queueRetryMaxMs: 1, queueRetryJitter: false });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        await flush(2000);
+    });
+    // This test's events: a drainer an earlier test left stopping can log
+    // the same ones with another error type.
+    const by = (e) => captured.find((r) => r.event === e && (r.error ?? r.last_error) === 'DatabaseError');
+    assert.ok(by('audit_drain_failed'), JSON.stringify(captured));
+    assert.ok(by('audit_drain_degraded'), JSON.stringify(captured));
+    assert.ok(by('audit_drain_dead_letter'), JSON.stringify(captured));
+    assert.equal(queueStats().last_error, 'DatabaseError');
+    assert.ok(!JSON.stringify(captured).includes('alice'), JSON.stringify(captured));
+});
+
+test('sync fallback records the error type, as the other SDKs do', async () => {
+    let row;
+    const captured = await captureSys(async () => {
+        _initQueue(new AsyncBrokenStore('value (id)=(alice@example.com)'));
+        await uninstallDrainer();
+        row = emit({ code: 'USER_CREATED', target: 'u-1' });
+        await new Promise(r => setTimeout(r, 20));
+    });
+    const ev = captured.find((r) => r.event === 'audit_sync_fallback_failed' && r.row_id === row.id);
+    assert.equal(ev.error_type, 'Error');
+    assert.equal(ev.error, undefined);
+    assert.ok(!JSON.stringify(captured).includes('alice'));
+});
+
 test('stop writes the rows still queued', async () => {
     const store = new SlowStore(5);
     _initQueue(store);
@@ -395,6 +491,7 @@ test('stop writes the rows still queued', async () => {
 
 test('stop reports rows whose last attempt fails as lost', async () => {
     const store = new BrokenStore();
+    const ids = new Set();
     let stopped;
     const captured = await captureSys(async () => {
         _initQueue(store, {
@@ -402,15 +499,15 @@ test('stop reports rows whose last attempt fails as lost', async () => {
             queueRetryMaxMs: 60_000,
             queueRetryJitter: false,
         });
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
         const t0 = Date.now();
         stopped = await uninstallDrainer();
         assert.ok(Date.now() - t0 < 1000, 'stop must cut the backoff short');
     });
     const events = captured.map(c => c.event);
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.equal(lost.length, 2, `got ${JSON.stringify(events)}`);
     assert.equal(lost[0].error_type, 'Error');
     assert.ok(!events.includes('audit_drain_dead_letter'));
@@ -420,36 +517,45 @@ test('stop reports rows whose last attempt fails as lost', async () => {
 });
 
 test('drainer degraded reports the backoff it is about to wait', async () => {
+    // An error type of its own: a drainer an earlier test left stopping can
+    // report degraded too.
+    class BackoffProbeError extends Error {
+        name = 'BackoffProbeError';
+    }
+    const store = { insert() { throw new BackoffProbeError('down'); } };
+    const ours = (r) => r.event === 'audit_drain_degraded' && r.last_error === 'BackoffProbeError';
     const captured = await captureSys(async (seen) => {
-        _initQueue(new BrokenStore(), {
+        _initQueue(store, {
             queueRetryInitialMs: 200,
             queueRetryMaxMs: 200,
             queueRetryJitter: false,
         });
         emit({ code: 'USER_CREATED', target: 'u-1' });
         const deadline = Date.now() + 5000;
-        while (!seen.some(r => r.event === 'audit_drain_degraded') && Date.now() < deadline) {
+        while (!seen.some(ours) && Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 20));
         }
     });
-    const degraded = captured.find(r => r.event === 'audit_drain_degraded');
+    const degraded = captured.find(ours);
     assert.ok(degraded, 'audit_drain_degraded never fired');
-    assert.ok(degraded.in_backoff_seconds > 0.15,
+    assert.equal(degraded.retry_count, 5);
+    assert.ok(degraded.in_backoff_seconds > 0.15 && degraded.in_backoff_seconds <= 0.2,
         `in_backoff_seconds was ${degraded.in_backoff_seconds}`);
 });
 
 test('stop gives up after its timeout and reports what it holds as lost', async () => {
     const store = { insert: () => new Promise(() => {}) };
+    const ids = new Set();
     const captured = await captureSys(async () => {
         _initQueue(store);
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         await new Promise(r => setTimeout(r, 20));
         const t0 = Date.now();
         assert.equal(await uninstallDrainer(100), false);
         assert.ok(Date.now() - t0 < 1000);
     });
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.deepEqual(lost.map(r => r.error_type), ['TimeoutError', 'TimeoutError']);
 });
 
@@ -469,18 +575,19 @@ test('close resolves true once every row is stored', async () => {
 test('close resolves false for a row in backoff, and a second close agrees', async () => {
     const store = new BrokenStore();
     let results;
+    let row;
     const captured = await captureSys(async () => {
         _initQueue(store, {
             queueRetryInitialMs: 60_000,
             queueRetryMaxMs: 60_000,
             queueRetryJitter: false,
         });
-        emit({ code: 'USER_CREATED', target: 'u-1' });
+        row = emit({ code: 'USER_CREATED', target: 'u-1' });
         while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
         results = await Promise.all([close(200), close(200)]);
     });
     assert.deepEqual(results, [false, false]);
-    assert.equal(captured.filter(r => r.event === 'audit_drain_lost_at_stop').length, 1);
+    assert.equal(captured.filter(r => r.event === 'audit_drain_lost_at_stop' && r.row_id === row.id).length, 1);
 });
 
 test('flush counts a dead-lettered row as done', async () => {
@@ -521,18 +628,19 @@ test('flush waits for the drainer a re-init is retiring', async () => {
 
 test('re-init reports rows the old drainer could not store', async () => {
     const store = { insert: () => new Promise(() => {}) };
+    const ids = new Set();
     let closed;
     const captured = await captureSys(async () => {
         _initQueue(store);
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         _initQueue(new RecordingStore());
         const t0 = Date.now();
         closed = await close(300);
         assert.ok(Date.now() - t0 < 1500, 'close must keep to its timeout');
     });
     assert.equal(closed, false);
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.equal(lost.length, 2);
     const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
     assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);

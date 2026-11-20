@@ -13,7 +13,7 @@ This document covers the security model of the fasten SDK: what it protects, wha
 fasten is a library, not a standalone service. It runs inside the adopter's process and writes to:
 
 - **stdout**: NDJSON audit, sys and api rows (the "ring transport")
-- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` or an `audit_store` passed to `init()`. Without one, audit rows go to stdout only.
+- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python and JS) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
 
 The runtime layout:
 
@@ -33,13 +33,13 @@ The runtime layout:
 
 **Trust boundary 1, process and store:** The audit store is trusted infrastructure. A compromised store (for example a shared Postgres server another tenant can write to) is outside fasten's threat model. fasten assumes the adopter controls the store.
 
-**Trust boundary 2, caller and reader endpoints:** The reader routes (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`, `/topology` in Python and Go; `/sys`, `/api`, `/audit` in C++; all under the mount prefix) return raw audit data. Each reader needs an authentication choice when it is built, and the adopter supplies the authentication (section 2.3). An unauthenticated mount on a network interface is a misconfiguration.
+**Trust boundary 2, caller and reader endpoints:** The reader routes (`/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api`, `/topology` in Python, Go and JS; `/sys`, `/api`, `/audit` in C++; all under the mount prefix) return raw audit data. Each reader needs an authentication choice when it is built, and the adopter supplies the authentication (section 2.3). An unauthenticated mount on a network interface is a misconfiguration.
 
 **Trust boundary 3, emit and row content:** `fasten.emit()` accepts a `detail` dict from the adopter. The SDK redacts it before the row is written, but the adopter controls which keys and values go in. fasten does not check application-level correctness; it only removes recognisable secret shapes.
 
 **Trust boundary 4, replication senders:** Replication ingest stores each row under the `source_node_id` the row carries. It verifies the row's chain, but it does not authenticate who delivered it. Only trusted senders may deliver rows to an aggregator: authenticate the transport, and accept a node's rows only from that node.
 
-**What the hash chain covers:** Python, Go and Rust seal audit rows into a per-node hash chain when they write to a bundled audit store (SQLite or Postgres); JS, C++ and Swift write unsealed rows, which the chain does not cover. A Rust service with its own `AuditStore` gets sealed rows only if that store seals them, and the SDK logs `audit_chain_unavailable` at init when it does not. On sealed rows, verification detects an edited, removed or reordered row inside the chain. Verification runs only when it is called (`verify_chain` in Python, `VerifyChain` in Go, `fasten::verify_chain` in Rust): reading rows through `/audit` does not check them, and `/audit/doctor` checks only the latest 50 rows. A row whose `detail` and `detail_salt` were both cleared still verifies, because that is what redaction writes, so an erased `detail` can't be told apart from a redaction. Detecting rows removed from the start or end of a chain, or a chain whose hashes were removed or rebuilt by someone who can write to the store, needs checkpoints published outside the store (`spec/chain-replication.md` §9), which Python, Go and Rust publish and verify against (`verify_chain(rows, checkpoints=...)`, `VerifyChainWithCheckpoints`, `fasten::verify_chain_with_checkpoints`).
+**What the hash chain covers:** Python, Go, Rust and JS seal audit rows into a per-node hash chain when they write to a bundled audit store (SQLite or Postgres); C++ and Swift write unsealed rows, which the chain does not cover. A Rust or JS service with its own audit store gets sealed rows only if that store seals them, and the SDK logs `audit_chain_unavailable` at init when it does not. On sealed rows, verification detects an edited, removed or reordered row inside the chain. Verification runs only when it is called (`verify_chain` in Python, `VerifyChain` in Go, `fasten::verify_chain` in Rust, `verifyChain` in JS): reading rows through `/audit` does not check them, and `/audit/doctor` checks only the latest 50 rows. A row whose `detail` and `detail_salt` were both cleared still verifies, because that is what redaction writes, so an erased `detail` can't be told apart from a redaction. Detecting rows removed from the start or end of a chain, or a chain whose hashes were removed or rebuilt by someone who can write to the store, needs checkpoints published outside the store (`spec/chain-replication.md` §9), which Python, Go, Rust and JS publish and verify against (`verify_chain(rows, checkpoints=...)`, `VerifyChainWithCheckpoints`, `fasten::verify_chain_with_checkpoints`, `verifyChain(rows, { checkpoints })`).
 
 ---
 
@@ -90,13 +90,15 @@ The runtime layout:
 
 - Python: `fasten.reader.router()` requires a `dependencies=` argument, such as `[Depends(require_admin)]` or the bundled `fasten.reader.require_bearer()`. FastAPI applies it to every route, including `/audit/doctor`. Calling `router()` without it raises at startup; mounting without auth takes an explicit `dependencies=[]`.
 - Go: `NewReader` requires `WithAuth(middleware)`, for example `fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")))`, or `WithoutAuth()`, and panics with neither. `RequireBearer` panics at startup when the variable is unset.
+- JS: `reader({ auth })` from `fasten-sdk/reader` requires `auth`: `{ bearer: token }` (or `requireBearer()`, which throws when `FASTEN_READER_TOKEN` is unset), `{ verify: fn }`, or the explicit opt-out `"none"`. It throws when the reader is built without one. With `bearer` the `Authorization` header must start with exactly `Bearer ` and the rest must equal the token, compared in constant time. A `verify` function must return exactly `true`; anything else is a 401 and a throw is a 500 without its message. The check runs before the tenant scope and the query parameters, so an unauthenticated caller gets a 401, never a 422.
+- JS: the reader matches the request path as sent (`req.url` up to `?`), which is what Node and Express route on, so a guard in front of it that checks the raw path sees the path the reader serves. A path with an empty, `.` or `..` segment, a backslash, or `%2e`, `%2f` or `%5c` is not served.
 - C++: `fasten::reader::simplehttp::start(port, prefix, auth)` and `mount()` require an auth function and throw on an empty one; `no_auth()` is the explicit opt-out. With another server, check the caller before calling the `fasten::reader::handle_*` functions.
 - Python: the router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
 
 **Not mitigated:**
 
-- fasten does not check the authentication itself. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
-- The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on. Store errors go to the service log, not the response.
+- fasten checks a credential only with its bundled shared-token helpers (`require_bearer()` in Python, `RequireBearer` in Go, `{ bearer }` / `requireBearer()` in JS), which compare one static token. Anything else, such as user identity, roles or token expiry, is the adopter's dependency, middleware or `verify` function. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, a JS reader built with `auth: "none"`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
+- The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on; in JS a scoped doctor reports only the caller's data, so the queue, ring depths, process id, host service and node ids and store type are `null` as well. Store errors go to the service log, not the response.
 
 ---
 
@@ -107,9 +109,10 @@ The runtime layout:
 **Mitigations in place:**
 
 - The `tenant_id` column is part of the row schema and is stored in the audit table. The `query()` / `count()` methods accept `tenant_id` as a filter.
-- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithAuth(mw), WithTenantScope(...))` in Go) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`) refuses to build the reader without the hook.
-- Adopters can also enforce per-tenant filtering in their own auth dependency by extracting the tenant from the authenticated identity and passing it explicitly to `fasten.audit_store().query(tenant_id=...)`.
-- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`). They all run on in-memory SQLite; no test checks cross-tenant reads against Postgres in CI.
+- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithAuth(mw), WithTenantScope(...))` in Go, `reader({ auth, tenantScope })` in JS) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`, JS: `enforceTenantIsolation: true`) refuses to build the reader without the hook.
+- In JS the reader applies the tenant scope to every row it returns: audit rows from `/audit`, `/correlate` and `/search` are checked against the tenant after the store's `tenantId` filter, as sys and api rows and `/topology` rows are, so a custom store that ignores `tenantId` does not widen a read.
+- Adopters can also enforce per-tenant filtering in their own auth dependency by extracting the tenant from the authenticated identity and passing it explicitly to `fasten.audit_store().query(tenant_id=...)` (JS: `store.query({ tenantId })`).
+- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`, `js/test/reader.test.mjs`, `js/test/reader_stores.test.mjs`). The Python and Go tests run on in-memory SQLite. The JS tests run on in-memory stores, SQLite and Postgres; the Postgres half runs in CI, where `FASTEN_REQUIRE_POSTGRES=1` makes a missing database a failure.
 
 **Not mitigated:**
 
@@ -128,7 +131,8 @@ The runtime layout:
 - `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields and the value-shape pass to `event` itself. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
 - JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
 - `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
-- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting.
+- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting. In JS an audit DSN with an unknown scheme is an error, as a stream DSN is, and so is libpq's keyword form: the error names the scheme only, and no file is created.
+- JS `apiLogger` stores the request path as sent, without the query string. Path segments can carry ids or tokens; apiLogger can rewrite the stored path (`path: (req) => string`). A client-supplied `X-Request-ID` is stored as sent and is not authenticated, in Python, Go and JS; in JS a request id that looks like a sentinel is not taken from the client.
 - The C++ fallback that calls the audit sink directly logs the first line of a store error.
 
 **Postgres connections and TLS:** set `sslmode` in the DSN. Where the default is `prefer` (libpq, so Python and the C++ store; pgx; the Rust SDK and fasten-core), it uses TLS when the server offers it, without checking the server certificate, and otherwise connects in plaintext; it does not protect against an active attacker on the network.
@@ -180,6 +184,7 @@ The runtime layout:
 **Description:** The in-memory sys and api rings have a fixed capacity. Under high throughput the oldest rows are overwritten first. This is a data-loss concern rather than a security concern, but worth noting:
 
 - The ring size is fixed when the transport is created (default 2000 rows per stream). An adversary who can generate high log volume can push older rows out of the ring before they are read.
+- In JS at most 10,000 writes wait on one api or sys store; past that a row is not written to the store (stdout and the ring still get it) and the stream reads as degraded.
 - The audit queue (`queue_capacity`, default 100) blocks `emit()` callers when full, applying back-pressure rather than dropping rows silently. An adversary who can saturate the audit store can make `emit()` block on the request path, but that requires controlling the store, which is outside the threat model.
 
 ---
@@ -191,7 +196,7 @@ The following are outside fasten's security boundary by design:
 | Scenario | Rationale |
 |----------|-----------|
 | Compromised host OS | If the host is compromised, the process memory, the SQLite file, stdout and the Postgres credentials are all readable. fasten adds no protection above the OS. |
-| Compromised audit store | An attacker who can write to the audit store directly, without going through fasten, can insert or modify rows. On rows Python, Go or Rust sealed, the hash chain detects an edited, removed or reordered row when verification is run, not when rows are read. It does not prevent the change, it can't tell an erased `detail` from a redaction, and it needs external checkpoints to detect rows removed from the start or end of a chain, or removed or rebuilt hashes (section 1). |
+| Compromised audit store | An attacker who can write to the audit store directly, without going through fasten, can insert or modify rows. On rows Python, Go, Rust or JS sealed, the hash chain detects an edited, removed or reordered row when verification is run, not when rows are read. It does not prevent the change, it can't tell an erased `detail` from a redaction, and it needs external checkpoints to detect rows removed from the start or end of a chain, or removed or rebuilt hashes (section 1). |
 | Denial of service against the adopter service | fasten is a library. Traffic against the adopter's HTTP service can saturate fasten's rings, but that is an application-level concern, not a fasten security boundary. |
 | Unauthenticated reader mount | Deploying the reader without authentication on a public interface is a misconfiguration. fasten documents this and provides the hook; enforcement is the deployer's responsibility. |
 | Secrets in adopter-controlled `detail` values that match no known shape | fasten catches what it knows. Custom token formats, encoded secrets or new PII patterns need `extra_redact_keys` / `extra_value_redact_patterns` registered by the adopter. |

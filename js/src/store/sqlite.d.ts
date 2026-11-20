@@ -1,0 +1,145 @@
+// Types for fasten-sdk/store/sqlite.
+import type {
+	AuditRepository,
+	ChainRow,
+	ChainRowInput,
+	ChainStore,
+	ChainTip,
+	Filter,
+	IngestOptions,
+	IngestResult,
+	ListUnshippedOptions,
+	ReplicationStore,
+	Row,
+} from "../index.js";
+
+export interface SqliteStoreOptions {
+	/** Table name, a plain SQL identifier. Defaults to "audit_log". */
+	table?: string;
+	/**
+	 * WAL journal mode. Defaults to true; ignored for ":memory:". Commits
+	 * use SQLite's default synchronous=FULL.
+	 */
+	wal?: boolean;
+	/** How long to wait for another connection's write lock. Defaults to 5000. */
+	busyTimeoutMs?: number;
+}
+
+/**
+ * AuditRepository on SQLite (node:sqlite, built into Node). Seals rows with
+ * seq 0 into their node's hash chain on insert (spec §2.1), and behaves as
+ * PostgresStore does. node:sqlite is synchronous: each call blocks the
+ * event loop until it is done.
+ */
+export class SqliteStore
+	implements AuditRepository, ChainStore, ReplicationStore
+{
+	/**
+	 * Open the database at path (a new file is created owner-only, with
+	 * its WAL and shared-memory files), or ":memory:". The table is created
+	 * by init() or the first call.
+	 */
+	constructor(path: string, opts?: SqliteStoreOptions);
+	/** Create the table, its indexes and any column it lacks. Idempotent. */
+	init(): Promise<void>;
+	/**
+	 * Insert one row and return it as stored. A row with monotonic_seq 0 is
+	 * sealed; a row whose id is already stored returns the stored row.
+	 * Throws AuditRowRejectedError for a row it refuses, AuditSealError when
+	 * sealing fails for another reason, and AuditOutcomeUnknownError when
+	 * the COMMIT failed and the row could not be read back.
+	 */
+	insert(row: Row | Record<string, unknown>): Promise<Row>;
+	insertSealed(
+		row: ChainRowInput,
+		opts?: { detailText?: string },
+	): Promise<void>;
+	/** insertSealed, for a row replicated from another node (spec §5). */
+	insertReplicated(
+		row: ChainRowInput,
+		opts?: { detailText?: string },
+	): Promise<void>;
+	/**
+	 * Verify a replicated batch and store its verified prefix in one
+	 * transaction (spec §4). A chain break does not throw; it is in the
+	 * result. Throws ChainError for a row it cannot read.
+	 */
+	ingestReplicated(
+		rows: Iterable<ChainRowInput>,
+		opts?: IngestOptions,
+	): Promise<IngestResult>;
+	seals(): true;
+	chainRows(sourceNodeId: string): Promise<ChainRow[]>;
+	allChainRows(): Promise<ChainRow[]>;
+	chainTips(): Promise<ChainTip[]>;
+	/**
+	 * Rows newest first, snake_case like Row. detail is parsed with
+	 * JSON.parse: 75.0 reads as 75, and an integer past 2^53 is a BigInt.
+	 */
+	query(filter?: Filter): Promise<Row[]>;
+	count(
+		filter?: Omit<Filter, "limit" | "offset" | "afterSeq">,
+	): Promise<number>;
+	/**
+	 * Case-insensitive substring search of the detail JSON within
+	 * [since, until], newest first, optionally for one tenant. q is
+	 * lowercased in full, the stored text by SQLite's lower() (ASCII only),
+	 * as in the Python and Go SQLite stores.
+	 */
+	search(opts: {
+		q: string;
+		since: string;
+		until?: string | null;
+		limit?: number;
+		tenantId?: string | null;
+	}): Promise<Row[]>;
+	/** Row count and first and last timestamp per node, service and tenant. */
+	sources(opts?: { since?: string; until?: string }): Promise<
+		{
+			source_node_id: string;
+			service_id: string;
+			tenant_id: string | null;
+			rows: number;
+			first_seen: string;
+			last_seen: string;
+		}[]
+	>;
+	/** The node's newest `limit` rows by seq, oldest first, as chainRows reads them. */
+	chainTail(sourceNodeId: string, limit: number): Promise<ChainRow[]>;
+	/**
+	 * Unshipped rows, oldest seq first, in the shape query() returns; with
+	 * exact, as chainRows reads them. With serviceId and sourceNodeId, only
+	 * the rows that identity originated; throws TypeError when only one is
+	 * given.
+	 */
+	listUnshipped(
+		limit?: number,
+		opts?: ListUnshippedOptions & { exact?: false },
+	): Promise<Row[]>;
+	listUnshipped(
+		limit: number | undefined,
+		opts: ListUnshippedOptions & { exact: true },
+	): Promise<ChainRow[]>;
+	listUnshipped(
+		limit?: number,
+		opts?: ListUnshippedOptions,
+	): Promise<Row[] | ChainRow[]>;
+	markShipped(ids: string[]): Promise<void>;
+	/**
+	 * Delete, per node, a seq prefix of rows older than before (spec §2.3).
+	 * before is a Date or a timestamp in any offset, canonicalised.
+	 */
+	purge(opts: {
+		before: Date | string;
+		respectUnshipped?: boolean;
+	}): Promise<number>;
+	listRedactionCandidates(opts: {
+		before: Date | string;
+		codes: string[];
+	}): Promise<{
+		candidates: { id: string; monotonicSeq: number }[];
+		skipped: number;
+	}>;
+	redactRows(opts: { ids: string[] }): Promise<string[]>;
+	close(): Promise<void>;
+}

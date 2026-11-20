@@ -6,6 +6,143 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed: JS (breaking for existing callers)
+
+- `PostgresStore.query()` and `listUnshipped()` return rows with the wire's
+  snake_case keys (`origin_id`, `monotonic_seq`, `source_node_id`,
+  `tenant_id`, `pii_in_detail`, `shipped_at`, `prev_hash`, ...), the shape of
+  `Row` and of what `insert()` returns, instead of camelCase. They also carry
+  `wire_version`, `canonical_form_id`, `detail_salt` and
+  `detail_commitment`, and `verifyChain` reads them.
+- An integer in `detail` that a number cannot hold exactly reads back from
+  `query()` as a `BigInt`. `JSON.stringify` throws on it without a replacer.
+- `emit()` throws `ChainError` when `target` is not a string, or a row field
+  is not a string or holds an unpaired surrogate, in both modes and before
+  anything is written.
+- A string `detail` given to `PostgresStore.insert()` must be JSON text of
+  an object; other text is rejected with `AuditRowRejectedError`.
+- `PostgresStore.insert()` and `insertSealed()` reject a row with its own
+  `monotonic_seq` when another row holds that seq on its node.
+- `AuditRepository.purge` is typed `purge({ before, respectUnshipped })`, as
+  `PostgresStore` implements it.
+- A failed write of the first stdout line is logged as
+  `audit_stdout_failed`, not thrown.
+- The drainer's `last_error`, `audit_drain_failed`, `audit_drain_degraded`
+  and `audit_drain_dead_letter` record the error type only, as the other
+  SDKs do. `audit_sync_fallback_failed` reports it as `error_type` (was
+  `error`).
+- `apiStore` is now used: it is the api stream's store (`StreamStore`). It
+  was typed as an audit store and ignored; remove an audit store passed
+  there.
+- `init()` now opens the audit store from `FASTEN_AUDIT_DSN` when no
+  `auditStore` is passed, so an app with that variable set starts writing
+  to that store. An audit or stream DSN with an unknown scheme, or in
+  libpq's keyword form, makes `init()` throw, naming the scheme only.
+- `close()` waits for api and sys store writes and resolves false when they
+  do not finish in its timeout, then closes the stores it opened from
+  `FASTEN_*_DSN`.
+- `init()` now reads `FASTEN_PERSIST_STREAMS`, `FASTEN_RETENTION_API` and
+  `FASTEN_RETENTION_SYSLOG` when the matching option is not passed, and
+  throws on a value it cannot use: a stream name other than `api` or
+  `sys`, a stream named without a store or a store attached but not named,
+  or a retention that is not a positive whole number of `s`, `m`, `h` or
+  `d` (checked even when that stream has no store). A retention for a
+  store without `purge()` throws too. An app with these variables set can
+  now fail to start.
+
+### Added: JS SQLite store, replication, reader and stored logs
+
+- `SqliteStore` (`fasten-sdk/store/sqlite`), on Node's built-in
+  `node:sqlite` with no new dependency, seals rows into the per-node hash
+  chain as `PostgresStore` does, and shares one file with the Python, Go and
+  Rust SQLite stores, adding the columns their tables lack. Its calls are
+  synchronous and block the event loop while they run. `node:sqlite` is a
+  release candidate from Node 24.15.0 and experimental before it.
+- Replication on both stores: `ingestReplicated(rows, { localNodeId })`
+  verifies a replicated batch, checks it against the stored rows, stores the
+  verified prefix as it was sealed, and returns `{ inserted,
+  rejectedFromSeq, reason }` (Python's and Go's `IngestResult`).
+  `insertReplicated(row)` stores one sealed row.
+  `listUnshipped(limit, { serviceId, sourceNodeId, exact })` can list only
+  the rows an identity originated, with detail numbers exact for shipping.
+  The engine adds `listUnshipped()`, `markShipped(ids)` and
+  `ingestReplicated(rows)`, which throw `TypeError` without a store that
+  has the method. A store's `listUnshipped` throws `TypeError` when only
+  one of `serviceId` and `sourceNodeId` is given.
+- HTTP reader (`fasten-sdk/reader`): `reader({ auth, ... })` serves
+  `/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api` and
+  `/topology` with the Python and Go readers' parameters, responses and
+  limits, over either store. `auth` is required (`{ bearer }`,
+  `requireBearer()`, `{ verify }` or `"none"`), and `tenantScope` /
+  `enforceTenantIsolation` scope every route.
+- Stored sys and api logs: `PostgresStreamStore` and `SqliteStreamStore` on
+  the stream tables the other SDKs use, `init({ apiStore, syslogStore,
+  persistStreams, searchEnabled, retentionApi, retentionSyslog })`,
+  `apiLogger()`, `writeApi`, `pushApi`, `pushSyslog`, `mintSentinel` and
+  `isSentinel`. `SqliteStreamStore` methods return promises, and it creates
+  its table on `init()` or first use.
+- Both audit stores gain `search`, `sources`, `chainTail` and
+  `query({ afterSeq })`. On SQLite, search folds ASCII letters only, as the
+  Python and Go SQLite stores do.
+- `init()` opens the audit, api and sys stores from `FASTEN_AUDIT_DSN`,
+  `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` when none is passed, with
+  Python's DSN forms (`postgres://`, `postgresql://`, `sqlite:///rel.db`,
+  `sqlite:////abs.db`, a bare path, `?table=`, `?wal=false`).
+- `PostgresStore` and `PostgresStreamStore` recover when the database drops
+  their connections: a dead idle connection no longer ends the process, and
+  a read or transaction that meets one runs again on a new connection. A
+  stream INSERT is not run again, so a lost connection cannot store a
+  stream row twice; it counts as a failed write.
+- `PostgresStore` takes a pg `Pool` as well as a DSN, so it can share one
+  with `PostgresStreamStore`.
+- `apiLogger({ path })` can rewrite the stored path. A request aborted
+  before its response finished is recorded with status 499 and
+  `aborted: true`. A request id that looks like a sentinel is not taken
+  from the client.
+- The reader matches the request path as sent, applies the tenant scope to
+  every row it returns, and a scoped doctor reports only the caller's data.
+  It resolves the tenant scope before reading query parameters, so a
+  caller without a tenant gets 401, not 422.
+  The doctor's chain block reports `sealed_rows` and gives `verified: null`
+  when no sealed row was checked.
+- `purge({ before })` on both audit stores takes a `Date` or a timestamp in
+  any offset.
+- `SqliteStreamStore` takes `busyTimeoutMs` (default 5000).
+- A set `FASTEN_*` variable named like a DSN variable but not read is
+  reported once at init (`env_dsn_not_read`).
+
+### Added: the JS SDK seals and verifies rows
+
+- The JS `PostgresStore` seals each row into the node's hash chain when it
+  stores it, as Python, Go and Rust do. Writers in any of them share one
+  chain per node on one table, and each verifies the others' rows.
+- When the store returns a row with a hash, the engine writes it to stdout
+  a second time, sealed; in raise mode `emit()` returns it. A retry of a
+  stored id returns the stored row. A store whose `seals()` is true but
+  that returns no hashed row is logged once as `audit_chain_row_unsealed`.
+  `audit_chain_unavailable` is logged with no store, or a store whose
+  `seals()` does not return true. A failed stdout write, or an `error`
+  event on stdout, is logged as `audit_stdout_failed` with `error_code`.
+- A row a store cannot seal as given is rejected with
+  `AuditRowRejectedError` and dead-lettered at once; `AuditSealError`
+  (retried) is left for other seal failures. When a COMMIT fails the store
+  reads the row back once; `AuditOutcomeUnknownError` says it could not.
+- `verifyChain(rows, {checkpoints, partial})` reports `sealedRows`,
+  `checkpointsChecked` and the node of the first break. `seal`,
+  `detailCommitment`, `canonicalJSON` and `parseJson` give the same bytes
+  as the other SDKs; `parseJson` keeps each number as written.
+- Checkpoints: `publishCheckpoints`, `FileCheckpointSink`,
+  `HttpCheckpointSink`, `loadCheckpoints` and `checkpointsSince`, with the
+  other SDKs' file format. `loadCheckpoints` throws `PartialLastLineError`,
+  carrying the checkpoints read so far, when the last line was cut short.
+- `PostgresStore` gains `chainRows`, `allChainRows`, `chainTips` and
+  `insertSealed`, adds the columns a Python or Go table lacks, and has
+  TypeScript types (`fasten-sdk/store/postgres`).
+- A `BigInt` in `detail` keeps its digits.
+- `spec/js-sealed-form2.json` and `spec/js-sealed-stdout.jsonl`, written by
+  `scripts/gen_js_vectors.mjs` from the JS engine and store, hold sealed
+  rows and the stdout lines for them; the Python and Go suites verify both.
+
 ### Added: the Rust SDK and fasten-core seal and verify rows
 
 - The Rust SDK's `PostgresStore`, and a new `SqliteStore` behind the

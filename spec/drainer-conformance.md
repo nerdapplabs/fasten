@@ -95,12 +95,20 @@ successful insert, so the next failure burst can emit
 **Rejected rows.** When the store rejects the row itself (bad content,
 a constraint it can never meet), retrying cannot help, and the row would
 hold up every row behind it for the whole retry budget. Such a failure
-SHOULD dead-letter the row on that attempt. These are rejected rows:
+SHOULD dead-letter the row on that attempt, with `attempt_count` the
+number of attempts made: 1 when the first attempt is rejected, more when
+earlier attempts failed with errors that are retried. These are rejected
+rows:
 
 - a Postgres error in SQLSTATE class 22 (data exception), 23 (integrity
   constraint violation) or 54 (program limit exceeded, such as a value too
   long for an index);
-- a SQLite constraint or datatype-mismatch error.
+- a SQLite constraint or datatype-mismatch error: primary result code 19
+  (`SQLITE_CONSTRAINT`, with its extended codes) or 20 (`SQLITE_MISMATCH`);
+- the store's own refusal of the row: `AuditRowRejectedError` from the JS
+  stores, `AuditStoreRejected` from a Rust SDK store, `RowRejected` in
+  fasten-core. A store raises it for a row no retry can store, such as a
+  different row under a stored id or a row it cannot seal as given.
 
 Class 42 (syntax error or access rule violation) is retried: it usually
 means the deploy, such as a revoked grant or a table renamed mid-migration,
@@ -110,8 +118,14 @@ Over the shared C ABI, an insert callback signals a rejected row by
 returning a negative code (`FASTEN_INSERT_REJECTED`); any positive code is
 retried as usual. fasten-core's native stores, the Rust SDK's Postgres
 store and store adapter, and the Python, Go and JS drainers apply these
-rules. The C++ and Swift SDKs do not read a SQLSTATE yet, so they retry a
-rejected row until `max_attempts`.
+rules. Where they differ:
+
+- Python also takes any DB-API `DataError` or `IntegrityError` as a
+  rejected row, whatever its SQLSTATE.
+- fasten-core also dead-letters a row with its own `monotonic_seq` when
+  another row holds that seq on its node.
+- The C++ and Swift SDKs do not read a SQLSTATE yet, so they retry a
+  rejected row until `max_attempts`.
 
 ---
 
@@ -161,10 +175,22 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 | `audit_drain_recovered_at_stop` | `info` | Rows the drainer still held at shutdown were stored after it stopped |
 | `audit_drain_stored_inline` | `info` | A row the drainer refused is stored synchronously by the SDK |
 
+**Errors.** `error` and `last_error` SHOULD name the error type only, not
+its message: a driver message can carry row values, SQL or the database
+host.
+The JS drainer records the error's name (its class name when the name is
+pg's `error`); the Rust SDK records the variant of its error, such as
+`AuditStoreInsert` or `AuditStoreRejected`. Python and Go drain through
+fasten-core over the C ABI, where the insert callback returns only a code,
+so their events carry fasten-core's `insert callback returned non-zero
+rc=<n>` in place of a type; the exception itself goes to their own logger,
+redacted. The Swift drainer does not follow this yet: it writes
+`"<Type>: <message>"`.
+
 **`audit_drain_failed` fields:**
 
 ```json
-{ "error": "<ExceptionType>: <message>" }
+{ "error": "<error type>" }
 ```
 
 **`audit_drain_degraded` fields:**
@@ -173,7 +199,7 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 {
   "retry_count": <int>,
   "in_backoff_seconds": <float, 3 decimals>,
-  "last_error": "<ExceptionType>: <message>"
+  "last_error": "<error type>"
 }
 ```
 
@@ -189,7 +215,7 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 {
   "row_id": "<string|null>",
   "attempt_count": <int>,
-  "last_error": "<ExceptionType>: <message>"
+  "last_error": "<error type>"
 }
 ```
 
@@ -231,6 +257,26 @@ early warning again. A dip into the 50 to 80 % band re-arms neither flag.
 ```json
 { "row_id": "<string>" }
 ```
+
+### Stdout events
+
+| Event | Level | When |
+|---|---|---|
+| `audit_stdout_failed` | `error` | An audit line could not be written to stdout. It is not an error of the emit: the row is still queued, stored or returned |
+
+**`audit_stdout_failed` fields:**
+
+```json
+{ "error_type": "<error type>", "row_id": "<string>", "sealed": <bool> }
+```
+
+`sealed` says which line failed: the unsealed line `emit()` writes, or the
+sealed line written once the store has sealed the row (spec §8). JS and
+Rust emit this event. JS adds `error_code` (the Node error code, or null),
+and logs a failed api line with `request_id` and `shape: "api"` in place of
+`row_id` and `sealed`, and an `error` event on stdout with no row fields.
+Rust adds `service_id`. Python logs a failed sealed line to its own logger
+instead, and Go does not report a failed stdout write.
 
 ---
 
