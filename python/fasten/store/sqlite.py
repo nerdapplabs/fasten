@@ -120,6 +120,17 @@ def _create_owner_only(path: str | os.PathLike[str]) -> None:
     os.close(fd)
 
 
+def dsn_scheme(dsn: str) -> str | None:
+    """The scheme of a store DSN, lowercased, or "" for a bare path. None
+    when the text before the colon is none of the store schemes and "//"
+    does not follow it, as in host:5432/db or user:password@host/db: that
+    text is not a scheme, and errors must not name it."""
+    scheme = urlparse(dsn).scheme.lower()
+    if scheme in ("", "sqlite", "postgres", "postgresql"):
+        return scheme
+    return scheme if dsn.partition(":")[2].startswith("//") else None
+
+
 def sqlite_dsn_path(dsn: str) -> str:
     """File path of a SQLite DSN. Strips only the URL-separator slash, as the
     stream store does: sqlite:///rel.db is relative, sqlite:////abs/path.db

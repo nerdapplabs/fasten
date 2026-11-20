@@ -86,6 +86,9 @@ class FastenConfig:
     persist_streams: Optional[frozenset[str]]
 
 
+_DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
+
+
 def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
     if arg is not None:
         return arg
@@ -93,8 +96,29 @@ def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
     return v if v is not None else default
 
 
+def _check_dsn_scheme(dsn: str, kind: str, file: str) -> str:
+    """The DSN's scheme (see dsn_scheme). Raises ValueError for any other
+    scheme or form; the message names the scheme only when the DSN has one."""
+    from .store.sqlite import dsn_scheme
+
+    scheme = dsn_scheme(dsn)
+    if scheme is None:
+        raise ValueError(
+            f"fasten: {kind} DSN form not recognised. "
+            f"Use postgres://..., sqlite:///./{file}, or a bare filesystem path."
+        )
+    if scheme not in _DSN_SCHEMES:
+        raise ValueError(
+            f"fasten: {kind} DSN scheme {scheme!r} not supported. "
+            f"Use sqlite:///./{file}, postgres://..., or a "
+            "bare filesystem path."
+        )
+    return scheme
+
+
 def _store_from_dsn(dsn: str) -> Any:
     """Return the correct store implementation for a given DSN."""
+    _check_dsn_scheme(dsn, "audit", "audit.db")
     if dsn.startswith(("postgres://", "postgresql://")):
         from .store.postgres import PostgresStore
         return PostgresStore.from_dsn(dsn)
@@ -114,9 +138,6 @@ def _store_key(store: Any) -> Any:
     return ("object", id(store))
 
 
-_STREAM_DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
-
-
 def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     """Build an api/sys stream store from a DSN.
 
@@ -128,13 +149,7 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     from urllib.parse import parse_qs, urlparse
 
     u = urlparse(dsn)
-    scheme = u.scheme.lower()
-    if scheme not in _STREAM_DSN_SCHEMES:
-        raise ValueError(
-            f"fasten: stream DSN scheme {scheme!r} not supported. "
-            "Use sqlite:///./streams.db, postgres://..., or a "
-            "bare filesystem path."
-        )
+    scheme = _check_dsn_scheme(dsn, "stream", "streams.db")
     if scheme in ("postgres", "postgresql"):
         from .store.stream_postgres import PostgresStreamStore
         return PostgresStreamStore.from_dsn(dsn, default_table)
