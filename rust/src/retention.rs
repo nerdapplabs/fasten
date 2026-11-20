@@ -153,6 +153,8 @@ pub(crate) fn error_type(e: &Error) -> &'static str {
         Error::Io(_) => "Io",
         Error::Json(_) => "Json",
         Error::Custom(_) => "Custom",
+        Error::StreamStore(_) => "StreamStore",
+        Error::InvalidConfig(_) => "InvalidConfig",
         _ => "Error",
     }
 }

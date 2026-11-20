@@ -13,7 +13,79 @@ use chrono::{DateTime, Utc};
 use fasten_core::drainer::{Drainer, DrainerConfig};
 
 use crate::retention::{parse_duration, Purger};
+use crate::streams::{StreamPurger, StreamStore, Streams};
 use crate::{current_request_id, AuditStore, Config, Error};
+
+/// How often a stream store is purged for age.
+const STREAM_PURGE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long re-init waits for the previous streams' queued writes.
+const STREAM_RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Python's repr of a sorted list of names, for error texts that match it.
+fn py_list(names: &[&str]) -> String {
+    let mut v: Vec<&str> = names.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    format!("[{}]", v.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "))
+}
+
+/// The stream stores to use: the config's, else one built from the
+/// stream's DSN variable.
+fn resolve_stream_store(
+    given: Option<Arc<dyn StreamStore>>,
+    env: &str,
+    default_table: &str,
+) -> Result<Option<Arc<dyn StreamStore>>, Error> {
+    if given.is_some() {
+        return Ok(given);
+    }
+    match std::env::var(env).ok().filter(|s| !s.is_empty()) {
+        Some(dsn) => crate::streams::stream_store_from_dsn(&dsn, default_table).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Refuse a `persist_streams` name other than "api" and "sys".
+fn check_stream_names(named: &[String]) -> Result<(), Error> {
+    let names: Vec<&str> = named.iter().map(String::as_str).collect();
+    let unknown: Vec<&str> = names.iter().copied().filter(|n| *n != "api" && *n != "sys").collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(Error::InvalidConfig(format!(
+        "fasten.init: persist_streams={}: unknown stream(s) {}. Only ['api', 'sys'] are valid (audit persistence is driven by audit_store, not persist_streams).",
+        py_list(&names),
+        py_list(&unknown)
+    )))
+}
+
+/// Check `persist_streams` against the attached stores, with Python's
+/// errors: every named stream needs a store and every store must be named.
+fn check_persist_streams(named: Option<&[String]>, api: bool, sys: bool) -> Result<(), Error> {
+    let Some(named) = named else { return Ok(()) };
+    let names: Vec<&str> = named.iter().map(String::as_str).collect();
+    let have: Vec<&str> = [("api", api), ("sys", sys)].into_iter().filter(|(_, h)| *h).map(|(n, _)| n).collect();
+    let missing: Vec<&str> = names.iter().copied().filter(|n| !have.contains(n)).collect();
+    let unlisted: Vec<&str> = have.iter().copied().filter(|n| !names.contains(n)).collect();
+    if missing.is_empty() && unlisted.is_empty() {
+        return Ok(());
+    }
+    let mut bits = Vec::new();
+    if !missing.is_empty() {
+        bits.push(format!("named in persist_streams but no store attached: {}", py_list(&missing)));
+    }
+    if !unlisted.is_empty() {
+        bits.push(format!("store attached but not in persist_streams: {}", py_list(&unlisted)));
+    }
+    Err(Error::InvalidConfig(format!("fasten.init: persist_streams / stores mismatch: {}", bits.join("; "))))
+}
+
+/// What the reader reads for one request.
+pub(crate) struct ReaderState {
+    pub(crate) cfg: Option<Config>,
+    pub(crate) streams: Option<Arc<Streams>>,
+}
 
 trait LockOrRecover<T: ?Sized> {
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
@@ -154,6 +226,12 @@ pub struct Engine {
     pub(crate) config:  Mutex<Option<Config>>,
     pub(crate) drainer: Mutex<Option<Arc<Drainer>>>,
     purger:             Mutex<Option<Purger>>,
+    streams:            Mutex<Option<Arc<Streams>>>,
+    stream_purgers:     Mutex<Vec<StreamPurger>>,
+    /// An audit row failed to reach the current store: a failed inline
+    /// insert, or rows a stopped drainer left. Cleared by an init with a
+    /// different store.
+    audit_swallowed:    AtomicBool,
 }
 
 impl Engine {
@@ -162,6 +240,9 @@ impl Engine {
             config:  Mutex::new(None),
             drainer: Mutex::new(None),
             purger:  Mutex::new(None),
+            streams: Mutex::new(None),
+            stream_purgers: Mutex::new(Vec::new()),
+            audit_swallowed: AtomicBool::new(false),
         }
     }
 
@@ -184,7 +265,32 @@ impl Engine {
             .or_else(|| std::env::var("FASTEN_RETENTION_PII").ok())
             .filter(|s| !s.is_empty());
         let pii_horizon = retention_pii.as_deref().map(parse_duration).transpose()?;
+
+        let env_or = |given: &Option<String>, name: &str| {
+            given.clone().or_else(|| std::env::var(name).ok()).filter(|s| !s.is_empty())
+        };
+        let retention_api = env_or(&cfg.retention_api, "FASTEN_RETENTION_API");
+        let retention_syslog = env_or(&cfg.retention_syslog, "FASTEN_RETENTION_SYSLOG");
+        let api_horizon = retention_api.as_deref().map(parse_duration).transpose()?;
+        let sys_horizon = retention_syslog.as_deref().map(parse_duration).transpose()?;
+        let search_enabled = cfg.search_enabled
+            || std::env::var("FASTEN_SEARCH_ENABLED")
+                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        let persist_streams = cfg.persist_streams.clone().or_else(|| {
+            std::env::var("FASTEN_PERSIST_STREAMS").ok().filter(|s| !s.is_empty()).map(|s| {
+                s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
+            })
+        });
+        // Unknown names first, before any store is opened.
+        if let Some(named) = &persist_streams {
+            check_stream_names(named)?;
+        }
+        let api_store = resolve_stream_store(cfg.api_store.clone(), "FASTEN_API_DSN", "api_log")?;
+        let syslog_store = resolve_stream_store(cfg.syslog_store.clone(), "FASTEN_SYSLOG_DSN", "syslog")?;
+        check_persist_streams(persist_streams.as_deref(), api_store.is_some(), syslog_store.is_some())?;
+
         self.stop_purger();
+        self.stop_stream_purgers();
 
         let store = cfg.audit_store.clone();
         let capacity     = cfg.queue_capacity.unwrap_or(100);
@@ -196,7 +302,36 @@ impl Engine {
         let mut cfg_stored = cfg;
         cfg_stored.audit_store_failure_strategy = Some(strategy.clone());
         cfg_stored.retention_pii = retention_pii;
-        *self.config.lock_or_recover() = Some(cfg_stored.clone());
+        cfg_stored.retention_api = retention_api;
+        cfg_stored.retention_syslog = retention_syslog;
+        cfg_stored.search_enabled = search_enabled;
+        cfg_stored.persist_streams = persist_streams;
+        cfg_stored.api_store = api_store.clone();
+        cfg_stored.syslog_store = syslog_store.clone();
+        let previous = self.config.lock_or_recover().replace(cfg_stored.clone());
+        // A gap in the previous store's history says nothing about another.
+        let same_store = match (previous.as_ref().and_then(|c| c.audit_store.as_ref()), store.as_ref()) {
+            (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_store {
+            self.audit_swallowed.store(false, Ordering::Relaxed);
+        }
+
+        let streams = Arc::new(Streams::new(&cfg_stored.service_id, api_store.clone(), syslog_store.clone()));
+        let old_streams = self.streams.lock_or_recover().replace(streams);
+        if let Some(old) = old_streams {
+            old.close(std::time::Instant::now() + STREAM_RETIRE_TIMEOUT);
+        }
+        {
+            let mut purgers = self.stream_purgers.lock_or_recover();
+            for (name, st, horizon) in [("api", &api_store, api_horizon), ("sys", &syslog_store, sys_horizon)] {
+                if let (Some(st), Some(h)) = (st, horizon) {
+                    purgers.push(StreamPurger::start(name, Arc::clone(st), h, cfg_stored.clone(), STREAM_PURGE_INTERVAL));
+                }
+            }
+        }
 
         // Say once per init that rows are not chained: there is no store to
         // allocate against (spec §8.1), or the store does not seal (§8.2).
@@ -258,6 +393,9 @@ impl Engine {
             let flushed = old.flush(Duration::from_secs(5));
             old.stop(Duration::from_secs(2));
             let unstored = old.unstored_total() - unstored_before;
+            if unstored > 0 {
+                self.audit_swallowed.store(true, Ordering::Relaxed);
+            }
             if !flushed || unstored > 0 {
                 self.sys_event("warn", "audit_drain_install_incomplete", serde_json::json!({
                     "flushed": flushed,
@@ -278,29 +416,117 @@ impl Engine {
         Some(self.active_drainer()?.stats())
     }
 
+    /// Block until queued audit rows and stream writes are stored, or
+    /// `timeout` elapses. True when nothing is left.
     pub fn flush(&self, timeout: Duration) -> bool {
-        match self.active_drainer() {
+        let deadline = std::time::Instant::now() + timeout;
+        let drained = match self.active_drainer() {
             Some(d) => d.flush(timeout),
             None    => true,
+        };
+        let streams = self.streams.lock_or_recover().clone();
+        let written = streams.is_none_or(|s| s.flush(deadline));
+        drained && written
+    }
+
+    /// Flush within `timeout`, then stop the drainer, the purgers and the
+    /// stream writers. Later rows and log lines go to stdout only, until
+    /// the next `init`. True when everything queued was stored.
+    pub fn close(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let flushed = self.flush(timeout);
+        self.stop_purger();
+        self.stop_stream_purgers();
+        let streams = self.streams.lock_or_recover().take();
+        let written = streams.is_none_or(|s| s.close(deadline));
+        let old = { let mut slot = self.drainer.lock_or_recover(); slot.take() };
+        if let Some(d) = old {
+            d.stop(deadline.saturating_duration_since(std::time::Instant::now()));
         }
+        flushed && written
     }
 
     pub fn reset_for_tests(&self) {
         self.stop_purger();
+        self.stop_stream_purgers();
         self.uninstall_drainer();
+        if let Some(s) = self.streams.lock_or_recover().take() {
+            s.close(std::time::Instant::now() + Duration::from_secs(2));
+        }
+        self.audit_swallowed.store(false, Ordering::Relaxed);
         *self.config.lock_or_recover() = None;
     }
 
-    /// Write a log line (`fasten::log`) to stdout.
-    pub fn log_sys(&self, level: &str, event: &str, fields: serde_json::Value) {
-        let cfg = self.config.lock_or_recover().clone();
-        write_sys(true, cfg.as_ref(), level, event, fields);
+    fn stop_stream_purgers(&self) {
+        let old: Vec<StreamPurger> = std::mem::take(&mut *self.stream_purgers.lock_or_recover());
+        for p in old {
+            p.stop();
+        }
     }
 
-    /// Write an SDK sys event to stderr.
+    /// Write a log line (`fasten::log`) to stdout, and to the sys stream.
+    pub fn log_sys(&self, level: &str, event: &str, fields: serde_json::Value) {
+        let cfg = self.config.lock_or_recover().clone();
+        let streams = self.streams.lock_or_recover().clone();
+        write_sys(true, cfg.as_ref(), level, event, fields, streams.as_deref());
+    }
+
+    /// Write an api row (`fasten::log::api`): to stdout as
+    /// `{"shape":"api",...}`, and to the api stream. `fields` is the row,
+    /// typically `method`, `path`, `status` and `duration_ms`; `timestamp`,
+    /// `service_id` and the current `request_id` are added when missing. A
+    /// row without a request id gets a sentinel one (spec §7). The row is
+    /// redacted first, as sys lines are.
+    pub fn log_api(&self, fields: serde_json::Value) {
+        let cfg = self.config.lock_or_recover().clone();
+        let streams = self.streams.lock_or_recover().clone();
+        let mut row = match fields {
+            serde_json::Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        row.entry("timestamp").or_insert_with(|| crate::canonical_ts(&Utc::now()).into());
+        if let Some(c) = &cfg {
+            row.entry("service_id").or_insert_with(|| c.service_id.clone().into());
+        }
+        if let Some(rid) = current_request_id() {
+            row.entry("request_id").or_insert(rid.into());
+        }
+        if let Some(s) = &streams {
+            s.stamp(&mut row);
+        }
+        let row = redact_map(row, cfg.as_ref());
+        if let Some(s) = &streams {
+            s.api.push(row.clone());
+        }
+        let mut line = row;
+        line.insert("shape".into(), "api".into());
+        let line = serde_json::Value::Object(line);
+        #[cfg(test)]
+        API_STDOUT.lock_or_recover().push(line.clone());
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout().lock(), "{line}");
+    }
+
+    /// Write an SDK sys event to stderr, and to the sys stream.
     pub(crate) fn sys_event(&self, level: &str, event: &str, fields: serde_json::Value) {
         let cfg = self.config.lock_or_recover().clone();
-        sys_line(cfg.as_ref(), level, event, fields);
+        let streams = self.streams.lock_or_recover().clone();
+        write_sys(false, cfg.as_ref(), level, event, fields, streams.as_deref());
+    }
+
+    /// The config and streams one reader request reads.
+    pub(crate) fn reader_state(&self) -> ReaderState {
+        ReaderState {
+            cfg: self.config.lock_or_recover().clone(),
+            streams: self.streams.lock_or_recover().clone(),
+        }
+    }
+
+    /// Whether stored audit history has gaps: a row failed to reach the
+    /// store, or the drainer dead-lettered one.
+    pub(crate) fn audit_degraded(&self) -> bool {
+        self.audit_swallowed.load(Ordering::Relaxed)
+            || self.queue_stats().is_some_and(|q| q.dead_lettered_total > 0)
     }
 
     /// Store a row the drainer refused and return it as stored. A failure
@@ -323,6 +549,7 @@ impl Engine {
 
     /// Report a queue-mode row submit could not store inline.
     pub(crate) fn fallback_failed(&self, row: &crate::Row, e: Error) {
+        self.audit_swallowed.store(true, Ordering::Relaxed);
         // Type only: a store error message can quote row values.
         self.sys_event("error", "audit_sync_fallback_failed", serde_json::json!({
             "error_type": crate::retention::error_type(&e),
@@ -333,35 +560,50 @@ impl Engine {
 
 /// Write an SDK sys event to stderr.
 pub(crate) fn sys_line(cfg: Option<&Config>, level: &str, event: &str, fields: serde_json::Value) {
-    write_sys(false, cfg, level, event, fields);
+    write_sys(false, cfg, level, event, fields, None);
 }
 
-// The whole line is redacted: a secret can be in any field.
+fn redact_map(row: serde_json::Map<String, serde_json::Value>, cfg: Option<&Config>) -> serde_json::Map<String, serde_json::Value> {
+    let v = crate::redact_value(
+        &serde_json::Value::Object(row),
+        cfg.and_then(|c| c.extra_redact_keys.as_deref()),
+        cfg.and_then(|c| c.redact_replacement.as_deref()),
+    );
+    match v {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    }
+}
+
+// The whole line is redacted: a secret can be in any field. With streams,
+// a line without a request id gets a sentinel one and the row is kept in
+// the sys stream.
 fn write_sys(
     stdout: bool,
     cfg: Option<&Config>,
     level: &str,
     event: &str,
     fields: serde_json::Value,
+    streams: Option<&Streams>,
 ) {
-    let mut payload = serde_json::json!({
-        "shape": "sys",
-        "level": level,
-        "event": event,
-        "request_id": current_request_id().unwrap_or_default(),
-        "service_id": cfg.map(|c| c.service_id.as_str()).unwrap_or_default(),
-        "timestamp": crate::canonical_ts(&Utc::now()),
-    });
-    if let serde_json::Value::Object(merge_into) = &mut payload {
-        if let serde_json::Value::Object(extra) = fields {
-            for (k, v) in extra { merge_into.insert(k, v); }
-        }
+    let mut row = serde_json::Map::new();
+    row.insert("level".into(), level.into());
+    row.insert("event".into(), event.into());
+    row.insert("request_id".into(), current_request_id().unwrap_or_default().into());
+    row.insert("service_id".into(), cfg.map(|c| c.service_id.as_str()).unwrap_or_default().into());
+    row.insert("timestamp".into(), crate::canonical_ts(&Utc::now()).into());
+    if let serde_json::Value::Object(extra) = fields {
+        for (k, v) in extra { row.insert(k, v); }
     }
-    let payload = crate::redact_value(
-        &payload,
-        cfg.and_then(|c| c.extra_redact_keys.as_deref()),
-        cfg.and_then(|c| c.redact_replacement.as_deref()),
-    );
+    if let Some(s) = streams {
+        s.stamp(&mut row);
+    }
+    let mut row = redact_map(row, cfg);
+    if let Some(s) = streams {
+        s.sys.push(row.clone());
+    }
+    row.insert("shape".into(), "sys".into());
+    let payload = serde_json::Value::Object(row);
     #[cfg(test)]
     {
         SYS_CAPTURE.lock_or_recover().push(payload.clone());
@@ -383,6 +625,8 @@ fn write_sys(
 pub(crate) static SYS_CAPTURE: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static SYS_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static API_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 /// Every audit line written to stdout.
 #[cfg(test)]
 pub(crate) static AUDIT_STDOUT: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());

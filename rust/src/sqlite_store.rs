@@ -173,6 +173,30 @@ impl crate::AuditStore for SqliteStore {
     fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, crate::Error> {
         self.inner.redact_rows(ids).map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
     }
+
+    fn query(&self, q: &crate::AuditQuery) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.read_rows(q).map_err(read_err)
+    }
+
+    fn count(&self, q: &crate::AuditQuery) -> Result<u64, crate::Error> {
+        self.inner.count_rows(q).map_err(read_err)
+    }
+
+    fn search(&self, s: &crate::AuditSearch) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.search_rows(s).map_err(read_err)
+    }
+
+    fn sources(&self, since: Option<&str>, until: Option<&str>) -> Result<Vec<crate::Source>, crate::Error> {
+        self.inner.sources(since, until).map_err(read_err)
+    }
+
+    fn chain_tail(&self, source_node_id: &str, limit: u32) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.chain_tail(source_node_id, limit).map_err(read_err)
+    }
+
+    fn kind(&self) -> &str {
+        "SqliteStore"
+    }
 }
 
 #[cfg(test)]

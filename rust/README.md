@@ -263,6 +263,95 @@ A whole-chain verify shows rows deleted from the start of a chain when one
 of the given checkpoints falls among them. Rows deleted below every given
 checkpoint look the same as a purge.
 
+## Stored sys and api logs
+
+Every `fasten::log` line (shape `sys`) and every `fasten::log::api` row
+(shape `api`) is written to stdout and kept in a 2,000-row ring per stream.
+Attach a stream store and each row is also written to a table that the
+Python, Go and JS stream stores share (spec/persistent-streams.md), so any
+SDK can read what another wrote:
+
+```rust
+use std::sync::Arc;
+use fasten::{Config, PostgresStreamStore, SqliteStreamStore};
+
+let dsn = "host=localhost user=app dbname=logs sslmode=verify-full";
+fasten::init(Config {
+    service_id: "orders".into(),
+    node_id: "host-01".into(),
+    api_store: Some(Arc::new(PostgresStreamStore::new(dsn, "api_log")?)),
+    syslog_store: Some(Arc::new(SqliteStreamStore::open("streams.db", "syslog")?)),
+    persist_streams: Some(vec!["api".into(), "sys".into()]),
+    retention_api: Some("7d".into()),
+    retention_syslog: Some("30d".into()),
+    ..Default::default()
+})?;
+fasten::log::api(serde_json::json!({ "method": "GET", "path": "/orders", "status": 200 }));
+```
+
+- Without a store in `Config`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` are
+  used: `postgres://...` or `postgresql://...` (needs `store-postgres`),
+  `sqlite:///./streams.db` or a bare path (needs `store-sqlite`), with
+  `?table=` to change the default `api_log` / `syslog` table. Other schemes
+  are refused.
+- `persist_streams` (or `FASTEN_PERSIST_STREAMS=api,sys`) makes `init` fail
+  unless it names exactly the streams that have a store, with Python's
+  error texts.
+- `retention_api` / `retention_syslog` (or `FASTEN_RETENTION_API` /
+  `FASTEN_RETENTION_SYSLOG`) delete older stream rows hourly. Audit rows are
+  never deleted for age.
+- Rows are redacted before they are kept, stored or printed, and a row
+  without a `request_id` gets a sentinel one (`boot-...` until the first
+  real request id, then `orphan-...`).
+- Writes run on one thread per stream, in order; at most 10,000 rows wait.
+  A failed or dropped write keeps the stdout line, marks the stream
+  `store-degraded` for good, and is reported on stderr by error type only,
+  once at the start of an outage and then at most once a minute. A stream
+  INSERT is never run again after a lost connection.
+- `fasten::flush(timeout)` waits for queued audit rows and stream writes;
+  `fasten::close(timeout)` flushes and then stops the drainer, purgers and
+  stream writers.
+
+## HTTP reader
+
+`fasten::reader` serves `/audit`, `/audit/doctor`, `/correlate`, `/search`,
+`/sys`, `/api` and `/topology` with the parameters, response shapes and
+error texts of Python's reader. It takes a plain request and returns a
+status, headers and a JSON body, so it fits any server; it adds no
+dependency. It must be built with an auth choice:
+
+```rust
+use fasten::reader::{require_bearer, Reader, Request};
+
+let reader = Reader::builder()
+    .auth(require_bearer("FASTEN_READER_TOKEN")?) // or Auth::verify(fn), or Auth::None
+    .tenant_scope(|req| req.header("x-tenant").map(str::to_string)) // optional
+    .prefix("/api/v1/logs")
+    .build()?;
+
+let res = reader.handle(&Request::new("GET", "/api/v1/logs/audit?limit=10")
+    .with_header("Authorization", "Bearer s3cret"));
+// res.status, res.headers, res.body (JSON text)
+```
+
+- Routes are matched on the path as sent; a path with an empty, `.` or `..`
+  segment, a backslash, or `%2e`, `%2f` or `%5c` is not served.
+  `try_handle` returns `None` for a path the reader does not serve.
+- Order: 405 for anything but GET, then 401 for auth, 401 for an unresolved
+  tenant, then 422 for bad parameters.
+- With a tenant scope every row returned is the caller's, audit rows
+  included, and a scoped doctor reports only the caller's row count and
+  chain verdict.
+- `/audit/doctor` verifies the newest 50 rows of the node's chain, read
+  exactly as stored; `verified` is `null` when no sealed row was checked.
+- Audit reads go through `AuditStore::query`, `count`, `search`, `sources`
+  and `chain_tail`, which `SqliteStore` and `PostgresStore` implement. A
+  custom store without them gets `Unsupported`, which the reader reports.
+- Free-text search (`/search`, `/sys?q=`) needs `search_enabled` (or
+  `FASTEN_SEARCH_ENABLED=true`) and a `since`.
+
+`examples/reader.rs` runs the reader behind tiny_http.
+
 ## Tests
 
 From the repo root (the crate needs `../fasten-core`):
@@ -273,9 +362,10 @@ docker run --rm -v $PWD:/work -w /work/rust rust:1.90 \
 ```
 
 `--test-threads=1` because the integration tests share the global config
-and drainer. Add `--features store-sqlite` to run the SQLite store's tests,
-and `--features store-postgres` with `FASTEN_TEST_POSTGRES_DSN` set for the
-Postgres store's.
+and drainer. Add `--features store-sqlite` to run the SQLite store's tests
+and the reader and stream tests, and `--features store-postgres` with
+`FASTEN_TEST_POSTGRES_DSN` set to run them on Postgres too
+(`FASTEN_REQUIRE_POSTGRES=1` makes a missing DSN a failure).
 
 ## Docs and design
 
