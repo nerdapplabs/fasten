@@ -419,7 +419,7 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                     break;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
+                    let msg = error_text(&e);
                     attempt += 1;
                     // Spec §10: no retry once stopping. Spec §3: no retry for
                     // a row the store rejected.
@@ -493,6 +493,16 @@ fn error_type(e: &Error) -> String {
     }
     let debug = format!("{e:?}");
     debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
+}
+
+/// What `error` and `last_error` record for `e`: its type, as
+/// spec/drainer-conformance.md asks. A callback's return code is kept, as
+/// it is the host's own value.
+fn error_text(e: &Error) -> String {
+    match e {
+        Error::CallbackFailed(_) => e.to_string(),
+        _ => error_type(e),
+    }
 }
 
 fn on_success(inner: &DrainerInner) {
@@ -831,4 +841,56 @@ mod stop_tests {
         assert!(find("audit_drain_dead_letter").is_none());
         assert_eq!(find("audit_drain_lost_at_stop").unwrap()["error_type"], "PgError");
     }
+
+    struct ErrStore(fn() -> crate::error::Error, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Store for ErrStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err((self.0)())
+        }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// `error` and `last_error` hold the error's type; a callback's code
+    /// is kept.
+    #[test]
+    fn failures_are_recorded_by_type() {
+        let cases: [(fn() -> crate::error::Error, &str); 2] = [
+            (|| crate::error::Error::InvalidTimestamp("acct-12345 2026-13-01".into()), "InvalidTimestamp"),
+            (|| crate::error::Error::CallbackFailed(7), "insert callback returned non-zero rc=7"),
+        ];
+        for (make, want) in cases {
+            let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let sink = events.clone();
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let d = Drainer::with_sys_log(Box::new(ErrStore(make, attempts.clone())), DrainerConfig {
+                capacity: 4,
+                retry_initial: Duration::from_millis(5),
+                retry_max: Duration::from_millis(5),
+                retry_jitter: false,
+                max_attempts: 2,
+            }, Some(Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+            })));
+            assert!(d.enqueue(Row { id: "r-1".into(), ..Row::default() }));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while d.stats().dead_lettered_total == 0 {
+                assert!(Instant::now() < deadline, "row was not dead-lettered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            d.stop(Duration::from_secs(2));
+            let events = events.lock().unwrap();
+            let find = |name: &str| events.iter().find(|e| e["event"] == name).cloned().unwrap();
+            assert_eq!(find("audit_drain_failed")["error"], want);
+            assert_eq!(find("audit_drain_dead_letter")["last_error"], want);
+        }
+    }
+
 }
