@@ -500,6 +500,13 @@ let res = reader.handle(&Request::new("GET", "/api/v1/logs/audit?limit=10")
 
 `examples/reader.rs` runs the reader behind tiny_http.
 
+For a terminal view, the Python CLI's `fasten tail` and `fasten tui` work
+against this reader, at whatever prefix you mount it. Install the Python
+package ([python/README.md](../python/README.md#install); `fasten tui`
+needs the `tui` extra), then run
+`fasten tail --url http://host:port/api/v1/logs --token <token>`, with
+`--stream sys` or `--stream api`, `--request-id` and `--json` as needed.
+
 ## Tests
 
 From the repo root (the crate needs `../fasten-core`):
