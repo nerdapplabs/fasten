@@ -294,27 +294,31 @@ fn queue_mode_loses_no_row_while_connections_drop() {
         )
         .unwrap();
 
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    let done = Arc::new(AtomicBool::new(false));
+    let kills = Arc::new(AtomicI64::new(0));
     let killer = {
-        let (dsn, app, done) = (dsn.clone(), app.clone(), done.clone());
+        let (dsn, app, done, kills) = (dsn.clone(), app.clone(), done.clone(), kills.clone());
         std::thread::spawn(move || {
-            let mut kills = 0;
-            while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                kills += terminate(&dsn, &app);
+            while !done.load(Ordering::SeqCst) {
+                kills.fetch_add(terminate(&dsn, &app), Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(15));
             }
-            kills
         })
     };
-    const N: u64 = 400;
+    // Emit at least MIN rows, and keep going until enough connections were
+    // cut while emitting, so the test does not depend on the runner's speed.
+    const MIN: usize = 400;
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut ids = std::collections::HashSet::new();
-    for _ in 0..N {
+    while ids.len() < MIN || (kills.load(Ordering::SeqCst) < 5 && Instant::now() < deadline) {
         let row = crate::EmitBuilder::new("RECOVERY_QUEUE", "t").submit_to(&engine).unwrap();
         ids.insert(row.id);
         std::thread::sleep(Duration::from_micros(500));
     }
-    done.store(true, std::sync::atomic::Ordering::SeqCst);
-    let kills = killer.join().unwrap();
+    done.store(true, Ordering::SeqCst);
+    killer.join().unwrap();
+    let kills = kills.load(Ordering::SeqCst);
     assert!(engine.flush(Duration::from_secs(60)), "the queue did not drain");
     let stats = engine.queue_stats().unwrap();
     engine.reset_for_tests();
@@ -322,7 +326,7 @@ fn queue_mode_loses_no_row_while_connections_drop() {
     assert!(kills >= 5, "only {kills} connections were cut");
     assert_eq!(stats.dead_lettered_total, 0, "{stats:?}");
     let rows = store.chain_rows("node-q").unwrap();
-    assert_eq!(rows.len() as u64, N);
+    assert_eq!(rows.len(), ids.len());
     assert_eq!(rows.iter().map(|r| r.id.clone()).collect::<std::collections::HashSet<_>>(), ids);
-    assert_chain(&store, "node-q", N);
+    assert_chain(&store, "node-q", ids.len() as u64);
 }
