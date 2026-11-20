@@ -407,7 +407,12 @@ mod postgres {
         let sep = if dsn.contains('?') { '&' } else { '?' };
         let timed = format!("{dsn}{sep}application_name={}&options=-c%20statement_timeout%3D300", t.name);
         let store = PostgresStore::connect(&timed, &t.name).unwrap();
-        store.insert(&originated("s-1", "node-1", "svc")).unwrap();
+        // Advisory locks are shared by the whole database, so this test locks a
+        // node no other test uses: under its timeout, another test's lock on the
+        // same node would fail an insert that should succeed.
+        let node = format!("node-{}", t.name);
+        let node = node.as_str();
+        store.insert(&originated("s-1", node, "svc")).unwrap();
         let pid = |t: &Table| -> Vec<i32> {
             t.sql(&format!("SELECT pid FROM pg_stat_activity WHERE application_name = '{}'", t.name))
                 .iter()
@@ -416,12 +421,12 @@ mod postgres {
         };
         let before = pid(&t);
         let mut holder = connect_client(&dsn).unwrap();
-        holder.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&"node-1"]).unwrap();
-        let err = store.insert(&originated("s-2", "node-1", "svc")).unwrap_err();
+        holder.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&node]).unwrap();
+        let err = store.insert(&originated("s-2", node, "svc")).unwrap_err();
         assert!(matches!(&err, Error::Postgres(e) if e.code().map(pg::error::SqlState::code) == Some("57014")), "{err:?}");
         assert_eq!(pid(&t), before);
-        holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&"node-1"]).unwrap();
-        store.insert(&originated("s-2", "node-1", "svc")).unwrap();
+        holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&node]).unwrap();
+        store.insert(&originated("s-2", node, "svc")).unwrap();
     }
 
     impl Table {
