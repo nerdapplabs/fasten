@@ -3,6 +3,7 @@
 package fasten
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -59,5 +60,33 @@ func TestEnvDSN_PostgresRoundTrip(t *testing.T) {
 	}
 	if err := pgAudit.db.Ping(); err == nil {
 		t.Fatal("the Postgres store is still open after Close")
+	}
+}
+
+// FASTEN_SYSLOG_DSN takes a Postgres DSN, with the default table syslog.
+func TestEnvSyslogDSN_PostgresDefaultTable(t *testing.T) {
+	dsn := pgDSN(t)
+	db := pgDB(t)
+	dropTable(t, db, "syslog")
+	t.Cleanup(func() { dropTable(t, db, "syslog") })
+	e := envEngine(t)
+	t.Setenv("FASTEN_SYSLOG_DSN", dsn)
+	if err := initRaise(e, Config{}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ps, ok := e.syslogStore.(*PostgresStreamStore)
+	if !ok {
+		t.Fatalf("sys store is %T, want *PostgresStreamStore", e.syslogStore)
+	}
+	e.LogSys(context.Background(), "info", "pg_sys", nil)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM syslog`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("syslog rows %d, %v; want 1", n, err)
+	}
+	if !e.Close(5 * time.Second) {
+		t.Fatal("Close returned false")
+	}
+	if err := ps.db.Ping(); err == nil {
+		t.Fatal("the Postgres sys store is still open after Close")
 	}
 }

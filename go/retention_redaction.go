@@ -81,11 +81,14 @@ func ensureRedactionCode() error {
 // The record is written first. If that fails nothing is destroyed; if the
 // destroy fails the data is intact and the next run picks it up again.
 func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason string) ([]string, error) {
-	store, ok := e.auditStore.(RedactionRepository)
+	e.storeMu.RLock()
+	audit := e.auditStore
+	e.storeMu.RUnlock()
+	store, ok := audit.(RedactionRepository)
 	if !ok {
 		return nil, fmt.Errorf(
 			"fasten.RedactExpired: audit store %T does not implement "+
-				"RedactionRepository (spec §7.1)", e.auditStore)
+				"RedactionRepository (spec §7.1)", audit)
 	}
 	codes := piiCodes()
 	if len(codes) == 0 {

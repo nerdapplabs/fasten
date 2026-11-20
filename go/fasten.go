@@ -502,7 +502,8 @@ func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
 
 // Close flushes and stops the Default engine's drainer, stops retention and
 // closes the stores Init opened from FASTEN_*_DSN; call it on shutdown. It
-// returns within about timeout, and false if a row was lost.
+// returns within about timeout, and false if a row was lost or a store call
+// or purge was still running. See Engine.Close for what later rows do.
 func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.

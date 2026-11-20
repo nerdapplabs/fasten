@@ -9,8 +9,9 @@ import (
 func TestStreamDSNErrorsOmitDSN(t *testing.T) {
 	for _, dsn := range []string{
 		"postgres://app:s3cret@db/audit",
-		"sqlite://app:s3cret@db/%zz",
+		"sqlite://app:s3cret@db",
 		"sqlite://app:s3cret@",
+		"app:s3cret@db/audit",
 	} {
 		_, err := parseStreamDSN(dsn, "sys")
 		if err == nil {

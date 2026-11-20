@@ -92,11 +92,7 @@ func openSQLiteStreamStore(d storeDSN) (*StreamStore, error) {
 // does not create it with the umask. An existing file keeps its mode. If the
 // file cannot be created, the driver reports the error on first use.
 func createOwnerOnly(path string) {
-	if strings.HasPrefix(path, "file:") {
-		path = uriFilePath(path)
-	} else if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path = sqliteFile(path)
 	if path == "" || path == ":memory:" {
 		return
 	}
@@ -106,6 +102,16 @@ func createOwnerOnly(path string) {
 	if err == nil {
 		f.Close()
 	}
+}
+
+// sqliteFile returns the file a SQLite DSN for the driver names: a bare path
+// without its query, or the file of a file: URI ("" when there is none).
+func sqliteFile(dsn string) string {
+	if strings.HasPrefix(dsn, "file:") {
+		return uriFilePath(dsn)
+	}
+	path, _, _ := strings.Cut(dsn, "?")
+	return path
 }
 
 // uriFilePath returns the file path of a SQLite file: URI, or "" when the URI

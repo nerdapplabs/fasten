@@ -16,14 +16,30 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `database/sql` driver registered as `postgres` (for example
   `import _ "github.com/lib/pq"`); without one, `Init` says so. A store
   passed in `Config` still wins.
-- `Init` checks every DSN before opening any store. An unknown scheme,
-  libpq's keyword form, a missing path or directory, or an invalid table
-  name is an `Init` error naming the variable and scheme only, and a
-  failed `Init` creates no file and keeps the stores it had. A store that
-  cannot be opened is reported by the variable, scheme and error type.
+- `Init` checks every DSN, and everything else it can refuse, before
+  opening any store. An unknown scheme, libpq's keyword form, a missing
+  path or directory, or an invalid table name is an `Init` error naming the
+  variable and no part of the DSN; DSN errors name a scheme only when the
+  DSN has one. A store that cannot be opened is reported by the variable,
+  scheme and error type; the stores that `Init` opened are closed again and
+  the files it created are removed. A failed `Init` keeps the stores,
+  retention and drainer it had.
+- SQLite DSN paths, in `Init` and `OpenStreamStore`, are used as written:
+  `%20` is not decoded, a lone `%` is accepted, and a `#fragment` is
+  dropped, as in Python, JS and Rust.
+- For existing `OpenStreamStore` callers: `?table=` and `?wal=false` on a
+  bare path are now honoured (they used to be passed to the driver),
+  `file:///abs/path.db` URIs are accepted, and a bare path that starts like
+  a scheme (`name:rest`) is refused, as in Python.
 - `Init` again with the same DSN keeps its store; with another DSN, the old
-  store is closed. `Close` now also stops retention and closes the stores
-  opened from the environment.
+  store is closed. A `SlogHandler` follows `Init` and `Close`: it writes to
+  the stores of the latest `Init`, not those it was created with.
+- `Close` now also stops retention and closes the stores opened from the
+  environment, within its timeout: a purge still running is left to
+  finish, its stores are closed once it returns, and `Close` returns false.
+  Until the next `Init`, rows for those stores go to stdout or the in-memory
+  rings only, and are not counted as store failures. Stores passed in
+  `Config` are not closed and still receive rows.
 - A set `FASTEN_*` variable named like a DSN that `Init` does not read (for
   example `FASTEN_AUDIT_DNS`) is reported once as `env_dsn_not_read`.
 

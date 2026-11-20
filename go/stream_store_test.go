@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -223,14 +224,15 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 	}
 }
 
-// A sqlite DSN url.Parse refuses gives a fixed error that quotes none of it.
+// A sqlite DSN with a host but no path gives a fixed error that quotes
+// none of it.
 func TestParseStreamDSN_ErrorQuotesNoPartOfTheDSN(t *testing.T) {
-	for _, dsn := range []string{"sqlite://app:s3cret", "sqlite://app:pa%ss@host/x.db"} {
+	for _, dsn := range []string{"sqlite://app:s3cret", "sqlite://app:pa%ss@host"} {
 		_, err := parseStreamDSN(dsn, "t")
 		if err == nil {
 			t.Fatalf("%q: want an error", dsn)
 		}
-		if msg := err.Error(); msg != "fasten StreamStore: invalid sqlite DSN" {
+		if msg := err.Error(); strings.Contains(msg, "s3cret") || strings.Contains(msg, "pa%ss") || !strings.Contains(msg, "no path") {
 			t.Errorf("%q: error %q", dsn, msg)
 		}
 	}

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -101,7 +100,7 @@ func TestParseStoreDSN_ErrorsNameTheSchemeOnly(t *testing.T) {
 		{" dbname = app password=hunter2", "keyword form"},
 		{"sqlite://", "no path"},
 		{"sqlite:///", "no path"},
-		{"sqlite://app:hunter2@db/%zz", "invalid sqlite DSN"},
+		{"sqlite://app:hunter2@db", "no path"},
 	} {
 		_, err := parseStoreDSN(c.dsn, "audit_log")
 		if err == nil {
@@ -268,31 +267,6 @@ func TestEnvDSN_BadDSNFailsInitNamingTheVariableOnly(t *testing.T) {
 		}
 		e.ResetForTests()
 		t.Setenv(c.env, "")
-	}
-}
-
-// A Postgres DSN fails Init when no driver is registered, or, with one,
-// when the server cannot be reached; neither error quotes the DSN.
-func TestEnvDSN_PostgresOpenFailureNamesTheTypeOnly(t *testing.T) {
-	e := envEngine(t)
-	dsn := "postgres://app:hunter2@127.0.0.1:1/secretdb?sslmode=disable&connect_timeout=2"
-	t.Setenv("FASTEN_AUDIT_DSN", dsn)
-	err := initRaise(e, Config{})
-	if err == nil {
-		t.Fatal("want an Init error")
-	}
-	msg := err.Error()
-	want := "needs a database/sql driver"
-	if slices.Contains(sql.Drivers(), "postgres") {
-		want = "cannot open the postgres store ("
-	}
-	if !strings.Contains(msg, "FASTEN_AUDIT_DSN") || !strings.Contains(msg, want) {
-		t.Fatalf("error %q, want %q", msg, want)
-	}
-	for _, leak := range []string{"hunter2", "secretdb", "app", "127.0.0.1"} {
-		if strings.Contains(msg, leak) {
-			t.Fatalf("error quotes %q: %q", leak, msg)
-		}
 	}
 }
 

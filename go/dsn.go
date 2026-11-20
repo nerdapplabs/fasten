@@ -22,9 +22,11 @@ import (
 //   - ?table=name names the table, and ?wal=false turns SQLite's WAL
 //     journal off.
 //
-// Any other scheme, and libpq's keyword form (host=db dbname=app), is an
-// error. An error names the scheme at most, never the DSN, which can hold a
-// password.
+// A SQLite path is used as written, without decoding %XX escapes, and a
+// #fragment is dropped, as Python's urlparse does. Any other scheme, and
+// libpq's keyword form (host=db dbname=app), is an error. An error never
+// quotes the DSN, which can hold a password, and names a scheme only when
+// the DSN has one.
 
 // dsnEnvVars are the variables Init opens stores from.
 var dsnEnvVars = []string{"FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"}
@@ -34,6 +36,9 @@ var (
 	dsnKeywordRe = regexp.MustCompile(`^\s*[A-Za-z_]+\s*=`)
 	dsnLikeEnvRe = regexp.MustCompile(`^FASTEN_\w*(DSN|DNS|URL)$`)
 )
+
+// sqlDrivers lists the registered database/sql drivers.
+var sqlDrivers = sql.Drivers
 
 // storeDSN is a parsed store DSN.
 type storeDSN struct {
@@ -59,49 +64,69 @@ func parseStoreDSN(dsn, defaultTable string) (storeDSN, error) {
 	case "postgres", "postgresql":
 		return parsePostgresDSN(scheme, dsn[len(scheme)+1:], defaultTable), nil
 	case "sqlite":
-		u, err := url.Parse(dsn)
-		if err != nil {
-			// A fixed message: url.Parse's own error, even its cause, can
-			// quote part of the DSN (a password read as a port or an escape).
-			return storeDSN{}, errors.New("invalid sqlite DSN")
+		path, query := splitDSNPath(dsn[len("sqlite:"):])
+		// Drop the host, then the one separator slash: sqlite:///rel.db
+		// gives "rel.db", sqlite:////abs.db gives "/abs.db".
+		if rest, ok := strings.CutPrefix(path, "//"); ok {
+			_, tail, found := strings.Cut(rest, "/")
+			path = ""
+			if found {
+				path = "/" + tail
+			}
 		}
-		// Strip the one separator slash: sqlite:///rel.db gives "rel.db",
-		// sqlite:////abs.db gives "/abs.db".
-		path := strings.TrimPrefix(u.Path, "/")
-		q := u.Query()
-		return sqliteDSN(path, q.Get("table"), q.Get("wal"), defaultTable)
+		path = strings.TrimPrefix(path, "/")
+		table, wal, _ := dsnParams(query)
+		return sqliteDSN(path, table, wal, defaultTable)
 	case "":
+		path, query := splitDSNPath(dsn)
 		// table and wal are ours; any other parameter is left for the driver.
-		path, query, _ := strings.Cut(dsn, "?")
-		var table, wal string
-		var kept []string
-		for _, p := range strings.Split(query, "&") {
-			if p == "" {
-				continue
-			}
-			k, v, _ := strings.Cut(p, "=")
-			switch queryUnescape(k) {
-			case "table":
-				if table == "" {
-					table = queryUnescape(v)
-				}
-			case "wal":
-				if wal == "" {
-					wal = queryUnescape(v)
-				}
-			default:
-				kept = append(kept, p)
-			}
-		}
+		table, wal, kept := dsnParams(query)
 		d, err := sqliteDSN(path, table, wal, defaultTable)
 		if err == nil && len(kept) > 0 {
 			d.conn += "?" + strings.Join(kept, "&")
 		}
 		return d, err
 	default:
-		return storeDSN{}, fmt.Errorf("DSN scheme %q not supported; "+
-			"use sqlite:///./fasten.db, postgres://... or a bare filesystem path", scheme)
+		// Text before a ':' is a scheme only when "//" follows; otherwise
+		// it can be a user name or a host.
+		if strings.HasPrefix(dsn[len(scheme)+1:], "//") {
+			return storeDSN{}, fmt.Errorf("DSN scheme %q not supported; "+
+				"use sqlite:///./fasten.db, postgres://... or a bare filesystem path", scheme)
+		}
+		return storeDSN{}, errors.New("DSN form not recognised; " +
+			"use postgres://..., sqlite:///./fasten.db or a bare filesystem path")
 	}
+}
+
+// splitDSNPath drops a #fragment and splits off the query.
+func splitDSNPath(s string) (path, query string) {
+	s, _, _ = strings.Cut(s, "#")
+	path, query, _ = strings.Cut(s, "?")
+	return path, query
+}
+
+// dsnParams returns the first non-empty table and wal parameters of a query,
+// decoded, and the other parameters as they are.
+func dsnParams(query string) (table, wal string, kept []string) {
+	for _, p := range strings.Split(query, "&") {
+		if p == "" {
+			continue
+		}
+		k, v, _ := strings.Cut(p, "=")
+		switch queryUnescape(k) {
+		case "table":
+			if table == "" {
+				table = queryUnescape(v)
+			}
+		case "wal":
+			if wal == "" {
+				wal = queryUnescape(v)
+			}
+		default:
+			kept = append(kept, p)
+		}
+	}
+	return table, wal, kept
 }
 
 func sqliteDSN(path, table, wal, defaultTable string) (storeDSN, error) {
@@ -159,13 +184,13 @@ func queryUnescape(s string) string {
 
 // check refuses, before any store is opened, a DSN whose table name the
 // store would refuse, whose SQLite directory does not exist, or whose
-// Postgres driver is not registered, so a failed Init creates no file.
+// Postgres driver is not registered.
 func (d storeDSN) check() error {
 	if d.scheme == "postgres" {
 		if !validPgIdentifierRe.MatchString(d.table) {
 			return errors.New("the table name is not a valid SQL identifier")
 		}
-		if !slices.Contains(sql.Drivers(), "postgres") {
+		if !slices.Contains(sqlDrivers(), "postgres") {
 			return errors.New(`a postgres DSN needs a database/sql driver registered as "postgres", ` +
 				`such as github.com/lib/pq`)
 		}
@@ -174,12 +199,7 @@ func (d storeDSN) check() error {
 	if !validIdentifierRe.MatchString(d.table) {
 		return errors.New("the table name is not a valid SQL identifier")
 	}
-	path := d.conn
-	if strings.HasPrefix(path, "file:") {
-		path = uriFilePath(path)
-	} else if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path := sqliteFile(d.conn)
 	if path == "" || path == ":memory:" {
 		return nil
 	}
@@ -195,6 +215,7 @@ func (d storeDSN) check() error {
 
 // envStore is a store Init opened from a DSN variable.
 type envStore struct {
+	name  string // the variable
 	dsn   string
 	store any // AuditRepository or StreamRepository
 	db    *sql.DB
@@ -264,32 +285,34 @@ func errorType(err error) string {
 	}
 }
 
-// storesFromEnv opens the stores cfg does not pass from FASTEN_AUDIT_DSN,
-// FASTEN_API_DSN and FASTEN_SYSLOG_DSN, and returns cfg with them set. A
-// store already opened from the same DSN is kept. Every DSN is parsed and
-// checked before any store opens, and a store that opens is dropped again
-// if a later one fails, so a failed call changes nothing. Stores this call
-// stops using are added to e.envUnused, to close once nothing writes to
-// them.
-func (e *Engine) storesFromEnv(cfg Config) (Config, error) {
-	type slot struct {
+// envSlot is a DSN variable Init uses: the store it keeps from the last
+// Init, or else the DSN it opens.
+type envSlot struct {
+	name string
+	dsn  string
+	held *envStore
+	d    storeDSN
+}
+
+// planEnvStores parses and checks the DSN variables for the stores cfg does
+// not pass, and returns the ones that are set. It opens nothing. A store in
+// held opened from the same DSN is kept.
+func planEnvStores(cfg Config, held map[string]*envStore) ([]envSlot, error) {
+	var slots []envSlot
+	for _, s := range []struct {
 		name, table string
 		passed      bool
-	}
-	slots := []slot{
+	}{
 		{"FASTEN_AUDIT_DSN", "audit_log", cfg.AuditStore != nil},
 		{"FASTEN_API_DSN", "api_log", cfg.APIStore != nil},
 		{"FASTEN_SYSLOG_DSN", "syslog", cfg.SyslogStore != nil},
-	}
-	next := map[string]*envStore{}
-	parsed := map[string]storeDSN{}
-	for _, s := range slots {
+	} {
 		dsn := envOr(s.name, "")
 		if s.passed || dsn == "" {
 			continue
 		}
-		if held := e.envStores[s.name]; held != nil && held.dsn == dsn {
-			next[s.name] = held
+		if h := held[s.name]; h != nil && h.dsn == dsn {
+			slots = append(slots, envSlot{name: s.name, dsn: dsn, held: h})
 			continue
 		}
 		d, err := parseStoreDSN(dsn, s.table)
@@ -297,66 +320,119 @@ func (e *Engine) storesFromEnv(cfg Config) (Config, error) {
 			err = d.check()
 		}
 		if err != nil {
-			return cfg, fmt.Errorf("fasten.Init: %s: %v", s.name, err)
+			return nil, fmt.Errorf("fasten.Init: %s: %v", s.name, err)
 		}
-		parsed[s.name] = d
+		slots = append(slots, envSlot{name: s.name, dsn: dsn, d: d})
 	}
+	return slots, nil
+}
+
+// hasSlot reports whether slots holds the variable name.
+func hasSlot(slots []envSlot, name string) bool {
+	return slices.ContainsFunc(slots, func(s envSlot) bool { return s.name == name })
+}
+
+// testHookEnvOpened, when set, is called with each store openEnvStores opens.
+var testHookEnvOpened func(*envStore)
+
+// openEnvStores opens the stores slots does not keep, and returns every
+// store for slots by variable. If one fails to open, the stores this call
+// opened are closed again and the files it created are removed.
+func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
+	next := map[string]*envStore{}
 	var opened []*envStore
+	var created []string
 	for _, s := range slots {
-		d, ok := parsed[s.name]
-		if !ok {
+		if s.held != nil {
+			next[s.name] = s.held
 			continue
+		}
+		var files []string
+		if s.d.scheme == "sqlite" {
+			if f := sqliteFile(s.d.conn); f != "" && f != ":memory:" {
+				for _, p := range []string{f, f + "-wal", f + "-shm", f + "-journal"} {
+					if _, err := os.Lstat(p); os.IsNotExist(err) {
+						files = append(files, p)
+					}
+				}
+			}
 		}
 		open := openStreamStore
 		if s.name == "FASTEN_AUDIT_DSN" {
 			open = openAuditStore
 		}
-		es, err := open(d)
+		es, err := open(s.d)
+		created = append(created, files...)
 		if err != nil {
-			for _, o := range opened {
-				o.db.Close()
+			e.closeStores(opened)
+			for _, p := range created {
+				os.Remove(p)
 			}
-			return cfg, fmt.Errorf("fasten.Init: %s: cannot open the %s store (%s)",
-				s.name, d.scheme, errorType(err))
+			return nil, fmt.Errorf("fasten.Init: %s: cannot open the %s store (%s)",
+				s.name, s.d.scheme, errorType(err))
 		}
-		es.dsn = envOr(s.name, "")
+		es.name, es.dsn = s.name, s.dsn
+		if testHookEnvOpened != nil {
+			testHookEnvOpened(es)
+		}
 		opened = append(opened, es)
 		next[s.name] = es
 	}
-	for name, held := range e.envStores {
-		if next[name] != held {
-			e.envUnused = append(e.envUnused, held)
-		}
-	}
-	e.envStores = next
-	if es := next["FASTEN_AUDIT_DSN"]; es != nil {
-		cfg.AuditStore = es.store.(AuditRepository)
-	}
-	if es := next["FASTEN_API_DSN"]; es != nil {
-		cfg.APIStore = es.store.(StreamRepository)
-	}
-	if es := next["FASTEN_SYSLOG_DSN"]; es != nil {
-		cfg.SyslogStore = es.store.(StreamRepository)
-	}
-	return cfg, nil
+	return next, nil
 }
 
-// closeEnvStores closes the stores in e.envUnused, and with all set, every
-// store opened from the environment. It returns false if a close failed.
-func (e *Engine) closeEnvStores(all bool) bool {
-	stores := e.envUnused
-	e.envUnused = nil
-	if all {
-		for _, held := range e.envStores {
-			stores = append(stores, held)
+// unusedEnvStores returns the stores in e.envStores that next does not hold.
+func (e *Engine) unusedEnvStores(next map[string]*envStore) []*envStore {
+	var unused []*envStore
+	for _, name := range dsnEnvVars {
+		if held := e.envStores[name]; held != nil && next[name] != held {
+			unused = append(unused, held)
 		}
-		e.envStores = nil
 	}
+	return unused
+}
+
+// releaseEnvStores stops using the stores Init opened from the environment,
+// and returns them for the caller to close once nothing writes to them.
+// Later sys and api rows go to the rings only, and audit rows to stdout
+// only. Stores passed in Config are kept.
+func (e *Engine) releaseEnvStores() []*envStore {
+	stores := e.unusedEnvStores(nil)
+	held := e.envStores
+	e.envStores = nil
+	if len(stores) == 0 {
+		return nil
+	}
+	isEnv := func(name string, store any) bool {
+		h := held[name]
+		return h != nil && store != nil && h.store == store
+	}
+	e.storeMu.Lock()
+	if isEnv("FASTEN_AUDIT_DSN", e.auditStore) {
+		e.auditStore = nil
+	}
+	e.storeMu.Unlock()
+	if isEnv("FASTEN_API_DSN", e.apiStore) {
+		e.apiStore = nil
+	}
+	if isEnv("FASTEN_SYSLOG_DSN", e.syslogStore) {
+		e.syslogStore = nil
+	}
+	if x := e.xport.Load(); x != nil && (isEnv("FASTEN_API_DSN", x.APIStore) || isEnv("FASTEN_SYSLOG_DSN", x.SyslogStore)) {
+		e.xport.Store(x.withStores(e.apiStore, e.syslogStore))
+	}
+	e.persistedStreams = persistedStreams(e.auditStore, e.apiStore, e.syslogStore)
+	return stores
+}
+
+// closeStores closes stores. It returns false if a close failed.
+func (e *Engine) closeStores(stores []*envStore) bool {
 	ok := true
 	for _, s := range stores {
 		if err := s.db.Close(); err != nil {
 			ok = false
 			e.drainerSysLog("error", "store_close_failed", map[string]any{
+				"variable":   s.name,
 				"error_type": errorType(err),
 			})
 		}
