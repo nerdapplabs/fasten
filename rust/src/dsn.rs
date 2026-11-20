@@ -9,7 +9,9 @@
 //!
 //! Any other scheme, and libpq's keyword form (`host=db dbname=app`), is an
 //! error. An error names the scheme at most, never the DSN, which can hold
-//! a password.
+//! a password, and names it only when `//` follows it: in
+//! `user:password@host/db` or `host:5432/db` the text before the colon is
+//! not a scheme.
 
 use std::fmt;
 
@@ -58,6 +60,9 @@ pub enum DsnError {
     KeywordForm,
     /// A scheme other than `sqlite`, `postgres` and `postgresql`.
     Scheme(String),
+    /// Text before a colon that is none of those schemes and has no `//`
+    /// after it, such as `host:5432/db`.
+    Form,
     /// A SQLite DSN with no path.
     NoPath,
 }
@@ -73,6 +78,10 @@ impl fmt::Display for DsnError {
                 f,
                 "DSN scheme '{scheme}' not supported; use sqlite:///./fasten.db, postgres://... \
                  or a bare filesystem path"
+            ),
+            DsnError::Form => f.write_str(
+                "DSN form not recognised; use postgres://..., sqlite:///./fasten.db \
+                 or a bare filesystem path",
             ),
             DsnError::NoPath => f.write_str("the SQLite DSN has no path; use sqlite:///./fasten.db or similar"),
         }
@@ -190,7 +199,8 @@ pub fn parse_dsn(dsn: &str, default_table: &str) -> Result<Dsn, DsnError> {
             let wal = param(&query, "wal") != Some("false");
             Ok(Dsn::Sqlite { path: path.to_string(), table, wal })
         }
-        _ => Err(DsnError::Scheme(scheme)),
+        _ if rest.starts_with("//") => Err(DsnError::Scheme(scheme)),
+        _ => Err(DsnError::Form),
     }
 }
 
@@ -333,6 +343,25 @@ mod tests {
     }
 
     #[test]
+    fn dsn_errors_name_a_scheme_only_when_the_dsn_has_one() {
+        let words = ["admin", "s3cret", "db.internal", "user", "pw", "host", "hunter2"];
+        for (dsn, want) in [
+            ("admin:s3cret@db.internal:5432/app", DsnError::Form),
+            ("db.internal:5432/app", DsnError::Form),
+            ("user:pw@host/db", DsnError::Form),
+            ("mysql://u:hunter2@db/app", DsnError::Scheme("mysql".into())),
+        ] {
+            let err = parse_dsn(dsn, "audit_log").unwrap_err();
+            assert_eq!(err, want, "{dsn}");
+            let text = err.to_string();
+            assert!(!words.iter().any(|w| text.contains(w)), "{text}");
+        }
+        // The sqlite forms without "//" still parse.
+        assert_eq!(parse_dsn("sqlite:rel.db", "audit_log"), Ok(sqlite("rel.db", "audit_log", true)));
+        assert_eq!(parse_dsn("sqlite:/abs.db", "audit_log"), Ok(sqlite("abs.db", "audit_log", true)));
+    }
+
+    #[test]
     fn query_decoding() {
         assert_eq!(decode("a%20b%zz%4"), "a b%zz%4");
         assert_eq!(decode("%e2%82%ac"), "€");
@@ -456,6 +485,31 @@ mod init_tests {
         }
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
         assert!(e.current_config().is_err(), "a failed init left a config");
+    }
+
+    #[test]
+    fn dsn_errors_from_init_name_a_scheme_only_when_the_dsn_has_one() {
+        let words = ["admin", "s3cret", "db.internal", "user", "pw", "host", "hunter2"];
+        let e = Engine::new();
+        for name in crate::dsn::DSN_ENV {
+            for dsn in ["admin:s3cret@db.internal:5432/app", "db.internal:5432/app", "user:pw@host/db"] {
+                let text = e.init_with_env(config("dsn-f"), &env(&[(name, dsn)])).unwrap_err().to_string();
+                assert_eq!(
+                    text,
+                    format!("{name}: DSN form not recognised; use postgres://..., sqlite:///./fasten.db or a bare filesystem path")
+                );
+            }
+            let text = e.init_with_env(config("dsn-f"), &env(&[(name, "mysql://u:hunter2@db/app")])).unwrap_err().to_string();
+            assert!(text.contains("'mysql'"), "{text}");
+            assert!(!words.iter().any(|w| text.contains(w)), "{text}");
+        }
+        for dsn in ["admin:s3cret@db.internal:5432/app", "db.internal:5432/app", "user:pw@host/db"] {
+            assert!(crate::audit_store_from_dsn(dsn).is_err());
+            assert!(crate::stream_store_from_dsn(dsn, "syslog").is_err());
+        }
+        for path in ["admin:s3cret@db.internal:5432", "s3cret@db.internal:5432", "db.internal:5432", "5432", "user:pw@host", "pw@host", "app"] {
+            assert!(!std::path::Path::new(path).exists(), "{path}");
+        }
     }
 
     #[test]

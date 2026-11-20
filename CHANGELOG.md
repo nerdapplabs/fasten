@@ -223,6 +223,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   does a store from one of them that cannot be opened:
   `<variable>: cannot open the <scheme> store (<error type>)`, without the
   driver's text.
+- DSN errors name a scheme only when the DSN has one (`//` follows it).
 - A sys line without a request id now carries a sentinel id (`boot-…`, then
   `orphan-…`) instead of an empty string, as in Python and Go.
 - After `init`, SDK sys events (such as `audit_chain_unavailable`) are also
