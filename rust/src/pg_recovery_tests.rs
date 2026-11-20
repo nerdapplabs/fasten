@@ -253,20 +253,25 @@ fn a_statement_timeout_is_not_a_lost_connection() {
     let table = table("rec_timeout");
     let _drop = DropTable(dsn.clone(), table.clone());
     let app = table.clone();
+    // Advisory locks are shared by the whole database, so this test locks a
+    // node no other test uses: under its timeout, another test's lock on the
+    // same node would fail an insert that should succeed.
+    let node = format!("node-{table}");
+    let node = node.as_str();
     let timed = with_param(&dsn, &format!("application_name={app}&options=-c%20statement_timeout%3D300"));
     let store = PostgresStore::new(&timed, table).unwrap();
-    store.allocate_and_insert_originated(&row("t-1", "node-1")).unwrap();
+    store.allocate_and_insert_originated(&row("t-1", node)).unwrap();
     let before = pids(&dsn, &app);
     assert_eq!(before.len(), 1);
 
-    let mut holder = hold_node_lock(&dsn, "node-1");
-    let err = store.allocate_and_insert_originated(&row("t-2", "node-1")).unwrap_err();
+    let mut holder = hold_node_lock(&dsn, node);
+    let err = store.allocate_and_insert_originated(&row("t-2", node)).unwrap_err();
     assert!(matches!(&err, crate::Error::AuditStoreInsert(m) if m.contains("statement timeout")), "{err:?}");
     assert_eq!(pids(&dsn, &app), before, "the store connected again");
-    holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&"node-1"]).unwrap();
+    holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&node]).unwrap();
 
-    store.allocate_and_insert_originated(&row("t-2", "node-1")).unwrap();
-    assert_chain(&store, "node-1", 2);
+    store.allocate_and_insert_originated(&row("t-2", node)).unwrap();
+    assert_chain(&store, node, 2);
 }
 
 // Rows emitted in queue mode while the store's connection keeps being cut:
