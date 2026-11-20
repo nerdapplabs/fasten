@@ -6,6 +6,7 @@ use crate::{
     chain::ChainRow,
     checkpoint::ChainTip,
     error::Error,
+    replication::{self, IngestResult, IngestTx, ReplicatedRow, StoredRow},
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
@@ -32,6 +33,23 @@ impl Inner {
         let stmt = client.prepare(insert_sql)?;
         Ok(Self { client, stmt })
     }
+}
+
+/// Whether `e` means the connection is gone, so a new one can help, as the
+/// Python and JS stores decide: a closed client, a socket error, or a
+/// SQLSTATE of class 08 (connection exception) or 57 (operator
+/// intervention, such as a server shutdown or `pg_terminate_backend`).
+/// 57014, a statement timeout or a cancel, is not: it comes over a live
+/// connection, and another run would be as slow.
+pub fn connection_lost(e: &pg::Error) -> bool {
+    if e.is_closed() {
+        return true;
+    }
+    if let Some(code) = e.code() {
+        let code = code.code();
+        return code != "57014" && (code.starts_with("08") || code.starts_with("57"));
+    }
+    std::error::Error::source(e).is_some_and(|s| s.is::<std::io::Error>())
 }
 
 /// How a `require`-level DSN checks the server certificate.
@@ -289,15 +307,25 @@ impl PostgresStore {
         })
     }
 
-    /// Run `f` against the live connection; if the connection is closed,
-    /// reconnect once and retry.
+    /// Run `f` against the live connection; when the connection is lost
+    /// (see [`connection_lost`]), reconnect once and run it again.
+    ///
+    /// Every `f` here is a read, a statement whose second run does what one
+    /// run does, or a whole transaction that first reads what is stored
+    /// under the node's lock. A lost connection rolls an open transaction
+    /// back. After a COMMIT whose outcome is unknown the second run reads
+    /// the row the first one may have stored, and returns it rather than
+    /// writing it again.
     fn with_reconnect<F, R>(&self, f: F) -> Result<R, Error>
     where
         F: Fn(&mut Inner) -> Result<R, Error>,
     {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.client.is_closed() {
+            *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
+        }
         match f(&mut *guard) {
-            Err(Error::Postgres(ref e)) if e.is_closed() => {
+            Err(Error::Postgres(ref e)) if connection_lost(e) || guard.client.is_closed() => {
                 *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
                 f(&mut *guard)
             }
@@ -503,13 +531,71 @@ impl Store for PostgresStore {
         })
     }
 
+    fn list_unshipped_sealed(
+        &self,
+        limit: u32,
+        origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        let limit: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let t = &self.table;
+        let rows = match origin {
+            Some((service_id, node)) => {
+                let sql = format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL AND service_id = $1 \
+                     AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3"
+                );
+                self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&service_id, &node, &limit])?))?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1"
+                );
+                self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&limit])?))?
+            }
+        };
+        rows.iter()
+            .map(|r| {
+                let row = row_from_pg(r)?;
+                let detail: String = column(r, 18, &format!("row {}", row.id))?;
+                Ok(ReplicatedRow { row: chain_row(&row, &detail)?, pii_in_detail: row.pii_in_detail })
+            })
+            .collect()
+    }
+
+    fn ingest_replicated(&self, rows: &[ReplicatedRow], local_node_id: Option<&str>) -> Result<IngestResult, Error> {
+        let node_lock = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+        replication::ingest(
+            rows,
+            local_node_id,
+            |verified| {
+                self.with_reconnect(|inner| {
+                    let Inner { client, stmt } = inner;
+                    let mut tx = client.transaction()?;
+                    // The lock allocation takes, in sorted node order so two
+                    // ingests cannot deadlock.
+                    for node in verified.nodes() {
+                        tx.execute(node_lock, &[&node])?;
+                    }
+                    let out = replication::ingest_on(
+                        &mut Ingest { tx: &mut tx, stmt, table: &self.table, bare: &self.bare },
+                        verified,
+                    )?;
+                    // Dropping the transaction without a commit rolls it back.
+                    if out.is_some() {
+                        tx.commit()?;
+                    }
+                    Ok(out)
+                })
+            },
+            || Error::Store(replication::STORED_MEANWHILE.to_string()),
+        )
+    }
+
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
         // The ids go in one array parameter: Postgres caps a statement at
         // 65,535 parameters.
@@ -632,6 +718,50 @@ fn seq_clash(e: pg::Error, bare: &str) -> Error {
         Error::SeqClash(e.to_string())
     } else {
         Error::Postgres(e)
+    }
+}
+
+/// Ingest's reads and inserts on one Postgres transaction.
+struct Ingest<'a, 'b> {
+    tx: &'a mut pg::Transaction<'b>,
+    stmt: &'a pg::Statement,
+    table: &'a str,
+    bare: &'a str,
+}
+
+impl IngestTx for Ingest<'_, '_> {
+    type Error = Error;
+
+    fn by_id(&mut self, id: &str) -> Result<Option<String>, Error> {
+        let sql = format!("SELECT hash FROM {} WHERE id = $1", self.table);
+        Ok(self.tx.query_opt(sql.as_str(), &[&id])?.map(|r| r.try_get(0)).transpose()?)
+    }
+
+    fn at_seq(&mut self, node: &str, seq: u64) -> Result<Option<StoredRow>, Error> {
+        // A seq past the column's range is not stored.
+        let Ok(seq) = i64::try_from(seq) else { return Ok(None) };
+        let sql = format!(
+            "SELECT id, hash, prev_hash FROM {} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1",
+            self.table
+        );
+        match self.tx.query_opt(sql.as_str(), &[&node, &seq])? {
+            Some(r) => Ok(Some(StoredRow { id: r.try_get(0)?, hash: r.try_get(1)?, prev_hash: r.try_get(2)? })),
+            None => Ok(None),
+        }
+    }
+
+    fn sealed_below(&mut self, node: &str, seq: u64) -> Result<bool, Error> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE source_node_id = $1 AND monotonic_seq < $2 AND hash <> '' LIMIT 1",
+            self.table
+        );
+        Ok(self.tx.query_opt(sql.as_str(), &[&node, &seq])?.is_some())
+    }
+
+    fn insert(&mut self, row: &ReplicatedRow) -> Result<u64, Error> {
+        let (columns, detail) = sealed_columns(&row.row, row.pii_in_detail)?;
+        execute_insert(self.tx, self.stmt, &columns, column_seq(&columns)?, &detail, self.bare)
     }
 }
 

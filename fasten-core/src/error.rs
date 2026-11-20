@@ -124,6 +124,13 @@ pub enum Error {
     Seal(String),
 }
 
+/// A replicated batch with a row the stores cannot hold is refused whole.
+impl From<crate::replication::BatchError> for Error {
+    fn from(e: crate::replication::BatchError) -> Self {
+        Error::RowRejected(e.to_string())
+    }
+}
+
 // Without the sqlite or postgres feature the backend variants are absent and
 // opening that backend returns UnknownBackend.
 

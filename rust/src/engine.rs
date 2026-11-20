@@ -3,7 +3,7 @@
 //! The free functions in `lib.rs` (`init`, `flush`, ...) and
 //! `EmitBuilder::submit()` all use [`DEFAULT`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use fasten_core::drainer::{Drainer, DrainerConfig};
 
 use crate::retention::{parse_duration, Purger};
-use crate::{current_request_id, AuditStore, Config, Error};
+use crate::{current_request_id, AuditStore, Config, Error, IngestResult, ReplicatedRow};
 
 trait LockOrRecover<T: ?Sized> {
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
@@ -150,22 +150,56 @@ impl fasten_core::store::Store for SdkStoreAdapter {
     fn max_monotonic_seq(&self) -> Result<u64, fasten_core::Error> { Ok(0) }
 }
 
+/// A store opened from FASTEN_AUDIT_DSN, and that DSN.
+type EnvStore = (String, Arc<dyn AuditStore>);
+
+/// Variables already reported as not read, once per process.
+static UNREAD_DSN_REPORTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// The `FASTEN_*` variables of the process environment that hold text.
+fn fasten_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| k.starts_with("FASTEN_"))
+        .collect()
+}
+
+/// The store adapter the drainer writes through, for tests.
+#[cfg(test)]
+pub(crate) fn adapter_for_tests(store: Arc<dyn AuditStore>) -> impl fasten_core::store::Store {
+    SdkStoreAdapter(store)
+}
+
 pub struct Engine {
     pub(crate) config:  Mutex<Option<Config>>,
     pub(crate) drainer: Mutex<Option<Arc<Drainer>>>,
     purger:             Mutex<Option<Purger>>,
+    /// The audit store opened from FASTEN_AUDIT_DSN, kept so that init with
+    /// the same DSN keeps the store and its connection.
+    env_store:          Mutex<Option<EnvStore>>,
 }
 
 impl Engine {
     pub const fn new() -> Self {
         Self {
-            config:  Mutex::new(None),
-            drainer: Mutex::new(None),
-            purger:  Mutex::new(None),
+            config:    Mutex::new(None),
+            drainer:   Mutex::new(None),
+            purger:    Mutex::new(None),
+            env_store: Mutex::new(None),
         }
     }
 
+    /// Initialise with `cfg`. With no `cfg.audit_store`, the audit store is
+    /// opened from `FASTEN_AUDIT_DSN` when it is set (see
+    /// [`crate::audit_store_from_dsn`]); a store in `cfg` wins. An init with
+    /// the same DSN keeps the store opened before; with another one, or
+    /// none, that store is closed once the drainer lets go of it.
     pub fn init(&self, cfg: Config) -> Result<(), Error> {
+        self.init_with_env(cfg, &fasten_env())
+    }
+
+    /// [`Engine::init`] with `env` as the `FASTEN_*` variables.
+    pub(crate) fn init_with_env(&self, mut cfg: Config, env: &[(String, String)]) -> Result<(), Error> {
         if cfg.service_id.is_empty() || cfg.node_id.is_empty() {
             return Err(Error::NotInitialised);
         }
@@ -184,6 +218,7 @@ impl Engine {
             .or_else(|| std::env::var("FASTEN_RETENTION_PII").ok())
             .filter(|s| !s.is_empty());
         let pii_horizon = retention_pii.as_deref().map(parse_duration).transpose()?;
+        cfg.audit_store = self.resolve_audit_store(cfg.audit_store.take(), env)?;
         self.stop_purger();
 
         let store = cfg.audit_store.clone();
@@ -200,8 +235,13 @@ impl Engine {
 
         // Say once per init that rows are not chained: there is no store to
         // allocate against (spec §8.1), or the store does not seal (§8.2).
+        self.report_unread_dsn_env(env);
+
         let unchained = match &store {
-            None => Some("no audit store configured (spec 8.1); rows are written to stdout unsealed"),
+            None => Some(
+                "no audit store configured (spec 8.1): Config::audit_store not set and FASTEN_AUDIT_DSN unset; \
+                 rows are written to stdout unsealed",
+            ),
             Some(s) if !s.seals() => {
                 Some("the audit store does not seal rows (spec 2.1); rows are written unsealed")
             }
@@ -227,6 +267,81 @@ impl Engine {
             *self.purger.lock_or_recover() = Some(Purger::start(cfg_stored, horizon));
         }
         Ok(())
+    }
+
+    /// The audit store init uses: `explicit` when set, else the one
+    /// FASTEN_AUDIT_DSN names, kept from the last init when the DSN is the
+    /// same. A store opened from an older DSN is let go of here.
+    fn resolve_audit_store(
+        &self,
+        explicit: Option<Arc<dyn AuditStore>>,
+        env: &[(String, String)],
+    ) -> Result<Option<Arc<dyn AuditStore>>, Error> {
+        let dsn = env
+            .iter()
+            .find(|(k, _)| k == "FASTEN_AUDIT_DSN")
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty());
+        let (Some(dsn), None) = (dsn, explicit.as_ref()) else {
+            *self.env_store.lock_or_recover() = None;
+            return Ok(explicit);
+        };
+        let held = self.env_store.lock_or_recover().clone();
+        let store = match held {
+            Some((same, store)) if same == dsn => store,
+            _ => crate::dsn::audit_store_from_dsn(&dsn)?,
+        };
+        *self.env_store.lock_or_recover() = Some((dsn, store.clone()));
+        Ok(Some(store))
+    }
+
+    /// Report, once per process, each set `FASTEN_*` variable named like a
+    /// DSN variable that init does not read: a misspelt one leaves the app
+    /// without the store it meant to open. The value is not reported.
+    fn report_unread_dsn_env(&self, env: &[(String, String)]) {
+        for (name, value) in env {
+            if value.is_empty() || !crate::dsn::unread_dsn_name(name) {
+                continue;
+            }
+            let first = UNREAD_DSN_REPORTED.lock_or_recover().get_or_insert_with(HashSet::new).insert(name.clone());
+            if first {
+                self.sys_event("warn", "env_dsn_not_read", serde_json::json!({
+                    "variable": name,
+                    "reason": format!("init opens stores from {} only", crate::dsn::DSN_ENV.join(", ")),
+                }));
+            }
+        }
+    }
+
+    /// The configured audit store, or an error naming `op`.
+    fn audit_store(&self, op: &str) -> Result<(Config, Arc<dyn AuditStore>), Error> {
+        let cfg = self.current_config()?;
+        let store = cfg.audit_store.clone().ok_or_else(|| {
+            Error::Unsupported(format!("{op}: no audit store; set Config::audit_store or FASTEN_AUDIT_DSN"))
+        })?;
+        Ok((cfg, store))
+    }
+
+    /// This engine's unshipped audit rows, exactly as they were sealed, that
+    /// it originated (its service and node id), oldest first, for shipping
+    /// to another node (spec §5). `limit == 0` returns all.
+    pub fn list_unshipped(&self, limit: usize) -> Result<Vec<ReplicatedRow>, Error> {
+        let (cfg, store) = self.audit_store("list_unshipped")?;
+        store.list_unshipped_sealed(limit, Some((&cfg.service_id, &cfg.node_id)))
+    }
+
+    /// Mark rows of the audit store as shipped.
+    pub fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
+        self.audit_store("mark_shipped")?.1.mark_shipped(ids)
+    }
+
+    /// Verify a batch of rows from other nodes and store its verified prefix
+    /// in the audit store. A row from this engine's node is a break: its
+    /// rows come from its emit path, never from replication. See
+    /// [`AuditStore::ingest_replicated`].
+    pub fn ingest_replicated(&self, rows: &[ReplicatedRow]) -> Result<IngestResult, Error> {
+        let (cfg, store) = self.audit_store("ingest_replicated")?;
+        store.ingest_replicated(rows, Some(&cfg.node_id))
     }
 
     /// Redact PII rows older than `before` and record each one (spec §7).
@@ -289,6 +404,7 @@ impl Engine {
         self.stop_purger();
         self.uninstall_drainer();
         *self.config.lock_or_recover() = None;
+        *self.env_store.lock_or_recover() = None;
     }
 
     /// Write a log line (`fasten::log`) to stdout.

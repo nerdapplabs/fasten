@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 use fasten_core::chain::{ChainRow, GENESIS};
 use fasten_core::checkpoint::ChainTip;
+use fasten_core::replication::{self, IngestResult, IngestTx, ReplicatedRow, StoredRow, Verified};
+use fasten_core::store::postgres::connection_lost;
 use pg::types::ToSql;
 
 // Table names must match ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$
@@ -230,6 +232,19 @@ fn inspect_columns(
 /// checks the certificate but not the host name; `sslmode=disable` uses
 /// plaintext.
 ///
+/// The store holds one connection. When it is lost (a socket error, a
+/// closed client, or SQLSTATE class 08 or 57 other than 57014, a statement
+/// timeout), the call connects again and runs once more: a read, a
+/// statement whose second run does what one run does, or a whole
+/// transaction, which the lost connection rolled back. A COMMIT that failed
+/// on a lost connection is not run again: an insert reads its row back
+/// once, under the node's lock, and returns it as stored, or the error
+/// when it is not there, or [`crate::Error::AuditStoreInsert`] when it
+/// cannot be read. Either error is one the drainer retries, and the
+/// insert reads the row stored under its id first, so the retry never
+/// stores it twice. When the server is still down the call fails and the
+/// next one tries again.
+///
 /// ```no_run
 /// use std::sync::Arc;
 /// use fasten::{Config, PostgresStore};
@@ -248,11 +263,73 @@ fn inspect_columns(
 /// ```
 pub struct PostgresStore {
     client: Mutex<pg::Client>,
+    /// Kept to connect again after the connection is lost.
+    dsn: String,
     table: String,
     /// Table name without the schema prefix; the index names are built from it.
     #[allow(dead_code)]
     idx: String,
     cols: Columns,
+}
+
+/// A failed call, sorted by what may follow it.
+enum Fail {
+    /// The connection is gone and nothing was committed: the call can run
+    /// again on a new connection.
+    Lost(crate::Error),
+    /// The connection was lost during a COMMIT, so whether it took effect
+    /// is unknown. The work must not run again; it can be read back.
+    Commit(crate::Error),
+    /// Anything else, which another run would not change.
+    Other(crate::Error),
+}
+
+impl From<crate::Error> for Fail {
+    fn from(e: crate::Error) -> Self {
+        Fail::Other(e)
+    }
+}
+
+impl From<Fail> for crate::Error {
+    fn from(f: Fail) -> Self {
+        match f {
+            Fail::Lost(e) | Fail::Commit(e) | Fail::Other(e) => e,
+        }
+    }
+}
+
+/// A failed write or transaction statement.
+fn write(e: pg::Error) -> Fail {
+    if connection_lost(&e) {
+        Fail::Lost(pg_err(e))
+    } else {
+        Fail::Other(pg_err(e))
+    }
+}
+
+/// A failed read.
+fn read(e: pg::Error) -> Fail {
+    if connection_lost(&e) {
+        Fail::Lost(pg_read_err(e))
+    } else {
+        Fail::Other(pg_read_err(e))
+    }
+}
+
+/// Commit `tx`. A COMMIT that fails on a lost connection is `Fail::Commit`;
+/// any other failure means it did not take effect.
+fn commit(tx: pg::Transaction<'_>) -> Result<(), Fail> {
+    tx.commit().map_err(|e| if connection_lost(&e) { Fail::Commit(pg_err(e)) } else { write(e) })
+}
+
+/// The error for a row whose COMMIT failed and that could not be read back.
+/// Retryable: the insert reads the row stored under its id first, so a
+/// second one never stores it twice.
+fn outcome_unknown(id: &str) -> crate::Error {
+    crate::Error::AuditStoreInsert(format!(
+        "row {id}: the connection was lost during COMMIT and the row could not be read back, \
+         so whether it is stored is unknown"
+    ))
 }
 
 impl PostgresStore {
@@ -262,6 +339,10 @@ impl PostgresStore {
     /// `table` may be a plain name (`"audit_logs"`) or schema-qualified
     /// (`"audit.audit_logs"`).  Either form must match
     /// `^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$`.
+    ///
+    /// When the connection is lost later (a server restart, a failover, an
+    /// idle connection cut), the next call connects again; see the type's
+    /// documentation.
     pub fn new(dsn: &str, table: impl Into<String>) -> Result<Self, crate::Error> {
         let table = table.into();
         validate_table_name(&table)?;
@@ -271,12 +352,7 @@ impl PostgresStore {
             None => (None, table.clone()),
         };
 
-        // fasten-core's connect, for its sslmode handling (TLS by default,
-        // checked under require, verify-ca and verify-full).
-        let mut client = fasten_core::store::postgres::connect_client(dsn).map_err(|e| match e {
-            fasten_core::error::Error::Postgres(e) => pg_err(e),
-            other => crate::Error::AuditStoreInsert(other.to_string()),
-        })?;
+        let mut client = connect(dsn)?;
 
         // Serialise bootstrap across processes and SDKs: concurrent CREATE /
         // ALTER on one table deadlock or fail. Same key as the Python store.
@@ -300,6 +376,7 @@ impl PostgresStore {
 
         Ok(Self {
             client: Mutex::new(client),
+            dsn: dsn.to_owned(),
             table,
             idx: bare,
             cols,
@@ -308,6 +385,42 @@ impl PostgresStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, pg::Client> {
         self.client.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `f` on the connection. When it fails on a lost connection
+    /// (`Fail::Lost`), connect again and run it once more, as the Python
+    /// store does. A client already closed is replaced first.
+    ///
+    /// Only for an `f` whose second run is safe: a read, a statement whose
+    /// second run does what one run does, or a whole transaction, which a
+    /// lost connection rolls back. A COMMIT that failed on a lost
+    /// connection comes back as `Fail::Commit` and is not run again.
+    fn retry<T>(&self, mut f: impl FnMut(&mut pg::Client) -> Result<T, Fail>) -> Result<T, Fail> {
+        let mut client = self.lock();
+        if client.is_closed() {
+            *client = connect(&self.dsn)?;
+        }
+        match f(&mut client) {
+            Err(Fail::Lost(_)) => {
+                *client = connect(&self.dsn)?;
+                f(&mut client)
+            }
+            other => other,
+        }
+    }
+
+    /// After a COMMIT that failed on a lost connection, the row stored under
+    /// `id` on `node`, read once on a new connection. The node's lock is
+    /// taken first, so a COMMIT the server was still finishing is seen.
+    fn after_failed_commit(&self, node: &str, id: &str) -> Result<Option<ChainRow>, crate::Error> {
+        self.retry(|client| {
+            let mut tx = client.transaction().map_err(read)?;
+            tx.execute(NODE_LOCK, &[&node]).map_err(read)?;
+            let held = self.held(&mut tx, id)?;
+            tx.commit().map_err(read)?;
+            Ok(held)
+        })
+        .map_err(|_| outcome_unknown(id))
     }
 
     /// The rows of `source_node_id`, ordered by `monotonic_seq`, for
@@ -349,9 +462,7 @@ impl PostgresStore {
     /// node id, for [`crate::take_checkpoints`].
     pub fn chain_tips(&self) -> Result<Vec<ChainTip>, crate::Error> {
         let sql = fasten_core::store::chain_tips_sql(&self.table);
-        self.lock()
-            .query(&sql as &str, &[])
-            .map_err(pg_read_err)?
+        self.retry(|client| client.query(&sql as &str, &[]).map_err(read))?
             .iter()
             .map(|r| {
                 let node: String = column(r, 0, "chain tip")?;
@@ -367,30 +478,42 @@ impl PostgresStore {
     /// `-0` or a 30-digit integer reads back as it was hashed. A
     /// [`crate::Row`] cannot carry those; `insert` is for rows this process
     /// built. `pii_in_detail` is the row's flag, which a `ChainRow` does not
-    /// hold.
+    /// hold. Timestamps are stored in the canonical form.
     ///
-    /// The row must have a hash and a non-zero `monotonic_seq`. Its hash is
-    /// not verified here: run [`crate::verify_chain`] over the batch first.
-    /// Storing the same row again is a no-op; a different row under a stored
-    /// id, or another row at its node and seq, is
-    /// [`crate::Error::AuditStoreRejected`].
+    /// The row must have a hash, a non-zero `monotonic_seq`, and timestamps
+    /// the Python and Go stores can read back
+    /// ([`crate::replication::canonical_timestamp`]). Its hash is not
+    /// verified here: run [`crate::verify_chain`] over the batch first, or
+    /// use [`PostgresStore::ingest_replicated`]. Storing the same row again
+    /// is a no-op; a different row under a stored id, or another row at its
+    /// node and seq, is [`crate::Error::AuditStoreRejected`].
     pub fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), crate::Error> {
         let (columns, detail) = fasten_core::store::sealed_columns(row, pii_in_detail)
             .map_err(|e| crate::Error::AuditStoreRejected(e.to_string()))?;
-        let mut guard = self.lock();
-        let mut tx = guard.transaction().map_err(pg_err)?;
-        tx.execute(NODE_LOCK, &[&row.source_node_id]).map_err(pg_err)?;
-        let mut held = self.held(&mut tx, &row.id)?;
-        if held.is_none() {
-            self.check_seq_free(&mut tx, &columns)?;
-            if self.insert_row(&mut tx, &columns, &detail)? == 0 {
-                held = self.held(&mut tx, &row.id)?;
-            }
-        }
-        tx.commit().map_err(pg_err)?;
-        match held {
+        let check = |held: Option<ChainRow>| match held {
             Some(held) if held.hash != row.hash => Err(differs(&row.id)),
             _ => Ok(()),
+        };
+        let out = self.retry(|client| {
+            let mut tx = client.transaction().map_err(write)?;
+            tx.execute(NODE_LOCK, &[&row.source_node_id]).map_err(write)?;
+            let mut held = self.held(&mut tx, &row.id)?;
+            if held.is_none() {
+                self.check_seq_free(&mut tx, &columns)?;
+                if self.insert_row(&mut tx, &columns, &detail)? == 0 {
+                    held = self.held(&mut tx, &row.id)?;
+                }
+            }
+            commit(tx)?;
+            Ok(held)
+        });
+        match out {
+            Ok(held) => check(held),
+            Err(Fail::Commit(e)) => match self.after_failed_commit(&row.source_node_id, &row.id)? {
+                Some(held) => check(Some(held)),
+                None => Err(e),
+            },
+            Err(f) => Err(f.into()),
         }
     }
 
@@ -407,20 +530,20 @@ impl PostgresStore {
     }
 
     fn chain_query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<ChainRow>, crate::Error> {
-        self.lock().query(sql, params).map_err(pg_read_err)?.iter().map(chain_row).collect()
+        self.retry(|client| client.query(sql, params).map_err(read))?.iter().map(chain_row).collect()
     }
 
     /// The row stored under `id`, if there is one.
-    fn held(&self, tx: &mut pg::Transaction<'_>, id: &str) -> Result<Option<ChainRow>, crate::Error> {
+    fn held(&self, tx: &mut pg::Transaction<'_>, id: &str) -> Result<Option<ChainRow>, Fail> {
         let sql = format!("SELECT {} FROM {} WHERE id = $1", self.chain_columns(), self.table);
-        tx.query_opt(&sql as &str, &[&id]).map_err(pg_err)?.as_ref().map(chain_row).transpose()
+        Ok(tx.query_opt(&sql as &str, &[&id]).map_err(write)?.as_ref().map(chain_row).transpose()?)
     }
 
     /// Rejects `row` when another row is stored at its node and seq. The
     /// (source_node_id, monotonic_seq) index is not unique, as a table
     /// Python created may already repeat a seq, so the check is made here,
     /// under the node's lock.
-    fn check_seq_free(&self, tx: &mut pg::Transaction<'_>, row: &fasten_core::Row) -> Result<(), crate::Error> {
+    fn check_seq_free(&self, tx: &mut pg::Transaction<'_>, row: &fasten_core::Row) -> Result<(), Fail> {
         let seq = i64::try_from(row.monotonic_seq).map_err(|_| {
             crate::Error::AuditStoreRejected(format!(
                 "row {}: monotonic_seq {} is out of range",
@@ -428,10 +551,10 @@ impl PostgresStore {
             ))
         })?;
         let sql = fasten_core::store::at_seq_sql(&self.table, "$1", "$2");
-        match tx.query_opt(&sql as &str, &[&row.source_node_id, &seq]).map_err(pg_err)? {
+        match tx.query_opt(&sql as &str, &[&row.source_node_id, &seq]).map_err(write)? {
             Some(r) => {
                 let other: String = column(&r, 0, &format!("row {}", row.id))?;
-                Err(crate::Error::AuditStoreRejected(fasten_core::store::seq_taken(row, &other).to_string()))
+                Err(crate::Error::AuditStoreRejected(fasten_core::store::seq_taken(row, &other).to_string()).into())
             }
             None => Ok(()),
         }
@@ -444,7 +567,7 @@ impl PostgresStore {
         tx: &mut pg::Transaction<'_>,
         row: &fasten_core::Row,
         detail: &str,
-    ) -> Result<u64, crate::Error> {
+    ) -> Result<u64, Fail> {
         let pii_in_detail: i16 = i16::from(row.pii_in_detail);
         let monotonic_seq = i64::try_from(row.monotonic_seq).map_err(|_| {
             crate::Error::AuditStoreRejected(format!(
@@ -507,8 +630,99 @@ impl PostgresStore {
             &salt,
             &commitment,
         ];
-        tx.execute(&sql as &str, params).map_err(pg_err)
+        tx.execute(&sql as &str, params).map_err(write)
     }
+
+    /// The unshipped rows, ordered by `monotonic_seq`, read as the
+    /// [`crate::Row`] type holds them: a detail number `serde_json` cannot
+    /// hold exactly is changed, and a redacted detail reads as empty. Ship
+    /// [`crate::AuditStore::list_unshipped_sealed`] instead, which keeps
+    /// each row as it was hashed. `limit == 0` returns all; `origin` is as
+    /// there.
+    pub fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
+        let rows = crate::AuditStore::list_unshipped_sealed(self, limit, origin)?;
+        Ok(rows.iter().map(crate::row_from_replicated).collect())
+    }
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix; see [`crate::AuditStore::ingest_replicated`].
+    pub fn ingest_replicated(
+        &self,
+        rows: &[ReplicatedRow],
+        local_node_id: Option<&str>,
+    ) -> Result<IngestResult, crate::Error> {
+        crate::AuditStore::ingest_replicated(self, rows, local_node_id)
+    }
+
+    /// One ingest attempt: the batch's node locks in sorted order, then the
+    /// checks and the inserts, in one transaction.
+    fn ingest_tx(&self, client: &mut pg::Client, verified: &Verified) -> Result<Option<IngestResult>, Fail> {
+        let mut tx = client.transaction().map_err(write)?;
+        for node in verified.nodes() {
+            tx.execute(NODE_LOCK, &[&node]).map_err(write)?;
+        }
+        let out = replication::ingest_on(&mut Ingest { store: self, tx: &mut tx }, verified)?;
+        // Dropping the transaction without a commit rolls it back.
+        if out.is_some() {
+            commit(tx)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Ingest's reads and inserts on one transaction of the SDK store.
+struct Ingest<'a, 'b> {
+    store: &'a PostgresStore,
+    tx: &'a mut pg::Transaction<'b>,
+}
+
+impl IngestTx for Ingest<'_, '_> {
+    type Error = Fail;
+
+    fn by_id(&mut self, id: &str) -> Result<Option<String>, Fail> {
+        let sql = format!("SELECT hash FROM {} WHERE id = $1", self.store.table);
+        let row = self.tx.query_opt(sql.as_str(), &[&id]).map_err(write)?;
+        Ok(row.map(|r| column(&r, 0, &format!("row {id}"))).transpose()?)
+    }
+
+    fn at_seq(&mut self, node: &str, seq: u64) -> Result<Option<StoredRow>, Fail> {
+        // A seq past the column's range is not stored.
+        let Ok(seq) = i64::try_from(seq) else { return Ok(None) };
+        let sql = format!(
+            "SELECT id, hash, prev_hash FROM {} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1",
+            self.store.table
+        );
+        let Some(r) = self.tx.query_opt(sql.as_str(), &[&node, &seq]).map_err(write)? else {
+            return Ok(None);
+        };
+        let owner = format!("node '{node}' seq {seq}");
+        Ok(Some(StoredRow { id: column(&r, 0, &owner)?, hash: column(&r, 1, &owner)?, prev_hash: column(&r, 2, &owner)? }))
+    }
+
+    fn sealed_below(&mut self, node: &str, seq: u64) -> Result<bool, Fail> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE source_node_id = $1 AND monotonic_seq < $2 AND hash <> '' LIMIT 1",
+            self.store.table
+        );
+        Ok(self.tx.query_opt(sql.as_str(), &[&node, &seq]).map_err(write)?.is_some())
+    }
+
+    fn insert(&mut self, row: &ReplicatedRow) -> Result<u64, Fail> {
+        let (columns, detail) = fasten_core::store::sealed_columns(&row.row, row.pii_in_detail)
+            .map_err(|e| crate::Error::AuditStoreRejected(e.to_string()))?;
+        self.store.insert_row(self.tx, &columns, &detail)
+    }
+}
+
+/// A client for `dsn`, with fasten-core's sslmode handling (TLS by default,
+/// checked under require, verify-ca and verify-full). The error names no
+/// part of the DSN.
+fn connect(dsn: &str) -> Result<pg::Client, crate::Error> {
+    fasten_core::store::postgres::connect_client(dsn).map_err(|e| match e {
+        fasten_core::error::Error::Postgres(e) => pg_err(e),
+        other => crate::Error::AuditStoreInsert(other.to_string()),
+    })
 }
 
 /// Column `idx` of `r`, which belongs to the row or node `owner` names. A
@@ -599,68 +813,79 @@ impl crate::AuditStore for PostgresStore {
                 ..row.clone()
             })
         };
+        // Sealed here, so it must be a row this node originated, as the
+        // Python and Go stores require.
+        if row.monotonic_seq == 0 && row.origin_id != row.id {
+            return Err(crate::Error::AuditStoreRejected(format!(
+                "row {}: allocate_and_insert_originated requires origin_id == id (got origin_id {:?})",
+                row.id, row.origin_id
+            )));
+        }
 
-        let mut guard = self.lock();
-        let mut tx = guard.transaction().map_err(pg_err)?;
-        // A row with its own seq takes the lock too, or it could take the
-        // seq a seq-0 insert has just picked.
-        tx.execute(NODE_LOCK, &[&row.source_node_id]).map_err(pg_err)?;
-        // A retry of a row that already landed must not take a new seq; it
-        // gets the chain fields the row was stored with.
-        if let Some(held) = self.held(&mut tx, &row.id)? {
-            tx.commit().map_err(pg_err)?;
-            return as_held(held);
-        }
-        let stored = if row.monotonic_seq == 0 {
-            // Sealed here, so it must be a row this node originated, as the
-            // Python and Go stores require.
-            if row.origin_id != row.id {
-                return Err(crate::Error::AuditStoreRejected(format!(
-                    "row {}: allocate_and_insert_originated requires origin_id == id (got origin_id {:?})",
-                    row.id, row.origin_id
-                )));
+        // A lost connection rolls the transaction back, so it runs again on
+        // a new one; after a failed COMMIT the row is read back instead.
+        let out = self.retry(|client| {
+            let mut tx = client.transaction().map_err(write)?;
+            // A row with its own seq takes the lock too, or it could take the
+            // seq a seq-0 insert has just picked.
+            tx.execute(NODE_LOCK, &[&row.source_node_id]).map_err(write)?;
+            // A retry of a row that already landed must not take a new seq;
+            // it gets the chain fields the row was stored with.
+            if let Some(held) = self.held(&mut tx, &row.id)? {
+                commit(tx)?;
+                return Ok(as_held(held)?);
             }
-            // The seq counts every row on the node, sealed or not; prev_hash
-            // comes from the node's last sealed row.
-            let next = tx
-                .query_one(
-                    &format!(
-                        "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
-                         WHERE source_node_id = $1",
-                        self.table
-                    ),
-                    &[&row.source_node_id],
-                )
-                .map_err(pg_err)?;
-            let owner = format!("node '{}'", row.source_node_id);
-            let seq = stored_seq(&owner, column(&next, 0, &owner)?)?;
-            let tip = tx
-                .query_opt(
-                    &format!(
-                        "SELECT hash FROM {} WHERE source_node_id = $1 AND hash <> '' \
-                         ORDER BY monotonic_seq DESC LIMIT 1",
-                        self.table
-                    ),
-                    &[&row.source_node_id],
-                )
-                .map_err(pg_err)?;
-            let tip: Option<String> = tip.as_ref().map(|r| column(r, 0, &owner)).transpose()?;
-            crate::seal_row(tip.as_deref().unwrap_or(GENESIS), row, seq)?
-        } else {
-            self.check_seq_free(&mut tx, &crate::engine::sdk_row_to_core(row))?;
-            row.clone()
-        };
-        let detail = serde_json::to_string(&stored.detail)?;
-        if self.insert_row(&mut tx, &crate::engine::sdk_row_to_core(&stored), &detail)? == 0 {
-            // The id was stored under another node's lock meanwhile.
-            let held = self.held(&mut tx, &row.id)?.ok_or_else(|| {
-                crate::Error::AuditStoreInsert(format!("row {}: not inserted and not stored", row.id))
-            })?;
-            tx.commit().map_err(pg_err)?;
-            return as_held(held);
+            let stored = if row.monotonic_seq == 0 {
+                // The seq counts every row on the node, sealed or not;
+                // prev_hash comes from the node's last sealed row.
+                let next = tx
+                    .query_one(
+                        &format!(
+                            "SELECT COALESCE(MAX(monotonic_seq), 0) + 1 FROM {} \
+                             WHERE source_node_id = $1",
+                            self.table
+                        ),
+                        &[&row.source_node_id],
+                    )
+                    .map_err(write)?;
+                let owner = format!("node '{}'", row.source_node_id);
+                let seq = stored_seq(&owner, column(&next, 0, &owner)?)?;
+                let tip = tx
+                    .query_opt(
+                        &format!(
+                            "SELECT hash FROM {} WHERE source_node_id = $1 AND hash <> '' \
+                             ORDER BY monotonic_seq DESC LIMIT 1",
+                            self.table
+                        ),
+                        &[&row.source_node_id],
+                    )
+                    .map_err(write)?;
+                let tip: Option<String> = tip.as_ref().map(|r| column(r, 0, &owner)).transpose()?;
+                crate::seal_row(tip.as_deref().unwrap_or(GENESIS), row, seq)?
+            } else {
+                self.check_seq_free(&mut tx, &crate::engine::sdk_row_to_core(row))?;
+                row.clone()
+            };
+            let detail = serde_json::to_string(&stored.detail).map_err(crate::Error::from)?;
+            if self.insert_row(&mut tx, &crate::engine::sdk_row_to_core(&stored), &detail)? == 0 {
+                // The id was stored under another node's lock meanwhile.
+                let held = self.held(&mut tx, &row.id)?.ok_or_else(|| {
+                    crate::Error::AuditStoreInsert(format!("row {}: not inserted and not stored", row.id))
+                })?;
+                commit(tx)?;
+                return Ok(as_held(held)?);
+            }
+            commit(tx)?;
+            Ok(stored)
+        });
+        match out {
+            Ok(stored) => Ok(stored),
+            Err(Fail::Commit(e)) => match self.after_failed_commit(&row.source_node_id, &row.id)? {
+                Some(held) => as_held(held),
+                None => Err(e),
+            },
+            Err(f) => Err(f.into()),
         }
-        tx.commit().map_err(pg_err)?;
-        Ok(stored)
     }
 
     // Unsealed rows (hash '') and form-"2" rows only. A sealed form-"1" row
@@ -682,7 +907,7 @@ impl crate::AuditStore for PostgresStore {
         );
         let before = crate::canonical_ts(&before);
         let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
-        let rows = self.lock().query(&sql as &str, &[&before, &codes]).map_err(pg_read_err)?;
+        let rows = self.retry(|client| client.query(&sql as &str, &[&before, &codes]).map_err(read))?;
         rows.iter()
             .map(|r| {
                 let id: String = column(r, 0, "redaction candidate")?;
@@ -709,7 +934,7 @@ impl crate::AuditStore for PostgresStore {
         );
         let before = crate::canonical_ts(&before);
         let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
-        let row = self.lock().query_one(&sql as &str, &[&before, &codes]).map_err(pg_read_err)?;
+        let row = self.retry(|client| client.query_one(&sql as &str, &[&before, &codes]).map_err(read))?;
         let count: i64 = column(&row, 0, "skipped rows")?;
         Ok(count.unsigned_abs())
     }
@@ -720,14 +945,90 @@ impl crate::AuditStore for PostgresStore {
         }
         // '' rather than NULL for the salt, as the Python and Go stores
         // write it: a table the Go store created declares it NOT NULL.
+        // Run again after a lost connection, it sets the same values.
         let sql = format!(
             "UPDATE {} SET detail = 'null', detail_salt = '' \
              WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2') RETURNING id",
             self.table
         );
         let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let rows = self.lock().query(&sql as &str, &[&ids_ref]).map_err(pg_err)?;
+        let rows = self.retry(|client| client.query(&sql as &str, &[&ids_ref]).map_err(write))?;
         rows.iter().map(|r| column(r, 0, "redacted row")).collect()
+    }
+
+    fn list_unshipped_sealed(
+        &self,
+        limit: usize,
+        origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, crate::Error> {
+        let limit = if limit == 0 { i64::MAX } else { i64::try_from(limit).unwrap_or(i64::MAX) };
+        // A table the Go store created may hold the flag as a boolean.
+        let columns = format!("{}, COALESCE(pii_in_detail::int, 0) <> 0", self.chain_columns());
+        let t = &self.table;
+        let rows = match origin {
+            Some((service_id, node)) => {
+                let sql = format!(
+                    "SELECT {columns} FROM {t} WHERE shipped_at IS NULL AND service_id = $1 \
+                     AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3"
+                );
+                self.retry(|client| client.query(&sql as &str, &[&service_id, &node, &limit]).map_err(read))?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {columns} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1"
+                );
+                self.retry(|client| client.query(&sql as &str, &[&limit]).map_err(read))?
+            }
+        };
+        rows.iter()
+            .map(|r| {
+                let row = chain_row(r)?;
+                let pii_in_detail = column(r, 25, &format!("row {}", row.id))?;
+                Ok(ReplicatedRow { row, pii_in_detail })
+            })
+            .collect()
+    }
+
+    fn mark_shipped(&self, ids: &[String]) -> Result<(), crate::Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // One array parameter, so no per-id bind limit. Run again after a
+        // lost connection, it marks the same rows.
+        let sql = format!(
+            "UPDATE {} SET shipped_at = $1::text{} WHERE id = ANY($2)",
+            self.table, self.cols.shipped_cast
+        );
+        let now = crate::canonical_ts(&chrono::Utc::now());
+        let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.retry(|client| client.execute(&sql as &str, &[&now, &ids_ref]).map_err(write))?;
+        Ok(())
+    }
+
+    fn ingest_replicated(
+        &self,
+        rows: &[ReplicatedRow],
+        local_node_id: Option<&str>,
+    ) -> Result<IngestResult, crate::Error> {
+        replication::ingest(
+            rows,
+            local_node_id,
+            // A lost connection before the COMMIT rolls the attempt back, and
+            // it runs again on a new one. A COMMIT that failed is reported:
+            // sending the batch again stores what is missing, and counts the
+            // rest as re-delivered.
+            |verified| self.retry(|client| self.ingest_tx(client, verified)).map_err(crate::Error::from),
+            || crate::Error::AuditStoreInsert(replication::STORED_MEANWHILE.to_string()),
+        )
+    }
+
+    fn purge(&self, before: chrono::DateTime<chrono::Utc>, respect_unshipped: bool) -> Result<u64, crate::Error> {
+        let param = format!("$1::text{}", self.cols.ts_cast);
+        let sql = fasten_core::store::purge_sql(&self.table, &param, respect_unshipped, true);
+        let before = crate::canonical_ts(&before);
+        // Run again after a lost connection, it deletes what is left of the
+        // same rows.
+        Ok(self.retry(|client| client.execute(&sql as &str, &[&before]).map_err(write))?)
     }
 }
 

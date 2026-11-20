@@ -7,6 +7,7 @@ use crate::{
     chain::ChainRow,
     checkpoint::ChainTip,
     error::Error,
+    replication::{self, IngestResult, IngestTx, ReplicatedRow, StoredRow},
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
@@ -458,13 +459,66 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn list_unshipped_sealed(
+        &self,
+        limit: u32,
+        origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        let limit: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let t = &self.table;
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let map = |r: &rusqlite::Row| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?));
+        let rows = match origin {
+            // Unary + keeps SQLite off the (node, seq) index, which would walk
+            // the node's whole history, as the Python store does.
+            Some((service_id, node)) => guard
+                .prepare_cached(&format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL AND service_id = ?1 \
+                     AND +source_node_id = ?2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT ?3"
+                ))?
+                .query_map(rusqlite::params![service_id, node, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => guard
+                .prepare_cached(&format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1"
+                ))?
+                .query_map(rusqlite::params![limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        drop(guard);
+        rows.iter()
+            .map(|(row, detail)| Ok(ReplicatedRow { row: chain_row(row, detail)?, pii_in_detail: row.pii_in_detail }))
+            .collect()
+    }
+
+    fn ingest_replicated(&self, rows: &[ReplicatedRow], local_node_id: Option<&str>) -> Result<IngestResult, Error> {
+        replication::ingest(
+            rows,
+            local_node_id,
+            |verified| {
+                let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                // BEGIN IMMEDIATE holds off other writers from before the
+                // first read, so the checks still hold at the inserts.
+                let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let out = replication::ingest_on(
+                    &mut Ingest { conn: &tx, table: &self.table, insert_sql: &self.insert_sql },
+                    verified,
+                )?;
+                // Dropping the transaction without a commit rolls it back.
+                if out.is_some() {
+                    tx.commit()?;
+                }
+                Ok(out)
+            },
+            || Error::Store(replication::STORED_MEANWHILE.to_string()),
+        )
+    }
+
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
         // SQLite caps bound parameters (32,766), so chunk the ids, in one
         // transaction. ?1 = shipped_at; ?2 .. = the chunk's ids.
@@ -582,8 +636,58 @@ impl Store for SqliteStore {
     }
 }
 
+/// Ingest's reads and inserts on one SQLite transaction.
+struct Ingest<'a> {
+    conn: &'a Connection,
+    table: &'a str,
+    insert_sql: &'a str,
+}
+
+impl IngestTx for Ingest<'_> {
+    type Error = Error;
+
+    fn by_id(&mut self, id: &str) -> Result<Option<String>, Error> {
+        let sql = format!("SELECT hash FROM {} WHERE id = ?1", self.table);
+        Ok(self.conn.prepare_cached(&sql)?.query_row([id], |r| r.get(0)).optional()?)
+    }
+
+    fn at_seq(&mut self, node: &str, seq: u64) -> Result<Option<StoredRow>, Error> {
+        // A seq past the column's range is not stored.
+        let Ok(seq) = i64::try_from(seq) else { return Ok(None) };
+        let sql = format!(
+            "SELECT id, hash, prev_hash FROM {} WHERE source_node_id = ?1 AND monotonic_seq = ?2 LIMIT 1",
+            self.table
+        );
+        let found = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(rusqlite::params![node, seq], |r| {
+                Ok(StoredRow { id: r.get(0)?, hash: r.get(1)?, prev_hash: r.get(2)? })
+            })
+            .optional()?;
+        Ok(found)
+    }
+
+    fn sealed_below(&mut self, node: &str, seq: u64) -> Result<bool, Error> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE source_node_id = ?1 AND monotonic_seq < ?2 AND hash <> '' LIMIT 1",
+            self.table
+        );
+        let found: Option<i64> =
+            self.conn.prepare_cached(&sql)?.query_row(rusqlite::params![node, seq], |r| r.get(0)).optional()?;
+        Ok(found.is_some())
+    }
+
+    fn insert(&mut self, row: &ReplicatedRow) -> Result<u64, Error> {
+        let (columns, detail) = sealed_columns(&row.row, row.pii_in_detail)?;
+        let n = insert_row(self.conn, self.insert_sql, &columns, column_seq(&columns)?, &detail)?;
+        Ok(n as u64)
+    }
+}
+
 /// Insert `row` at `seq`, with `detail` as the text of its detail column.
-fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<(), Error> {
+fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<usize, Error> {
     let pii: i64 = row.pii_in_detail as i64;
     let mut stmt = conn.prepare_cached(insert_sql)?;
     stmt.execute(rusqlite::params![
@@ -614,9 +718,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: 
         row.detail_salt.as_deref().unwrap_or(""),
         row.detail_commitment.as_deref().unwrap_or(""),
     ])
-    .map_err(seq_clash)?;
-
-    Ok(())
+    .map_err(seq_clash)
 }
 
 /// A UNIQUE failure on insert is the (source_node_id, monotonic_seq) index:

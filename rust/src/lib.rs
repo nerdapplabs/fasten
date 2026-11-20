@@ -31,6 +31,14 @@ pub use fasten_core::chain::{
     verify_chain, ChainError, ChainRow, ChainVerifyResult, Json, JsonString, GENESIS,
 };
 
+pub mod dsn;
+pub use dsn::{audit_store_from_dsn, parse_dsn, Dsn, DsnError};
+
+/// Replication (spec/chain-replication.md §4, §5), re-exported from
+/// fasten-core: the rows a node ships and the result of ingesting a batch.
+/// See [`list_unshipped`], [`mark_shipped`] and [`ingest_replicated`].
+pub use fasten_core::replication::{self, IngestResult, ReplicatedRow};
+
 pub mod checkpoints;
 pub use checkpoints::{
     checkpoints_since, load_checkpoints, publish_checkpoints, take_checkpoints,
@@ -361,6 +369,13 @@ pub enum Error {
     /// Build it with [`Error::custom`].
     #[error(transparent)]
     Custom(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// A replicated batch with a row the stores cannot hold is refused whole.
+impl From<fasten_core::replication::BatchError> for Error {
+    fn from(e: fasten_core::replication::BatchError) -> Self {
+        Error::AuditStoreRejected(e.to_string())
+    }
 }
 
 impl Error {
@@ -745,6 +760,101 @@ pub trait AuditStore: Send + Sync {
     fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported("redact_rows".into()))
     }
+
+    /// Unshipped rows exactly as they were sealed, for shipping to another
+    /// node (spec §5), ordered by `monotonic_seq`. `limit == 0` returns all.
+    ///
+    /// With `origin`, `(service_id, source_node_id)`, only the rows that
+    /// identity originated (`origin_id == id`), so rows it ingested from
+    /// other nodes are not shipped again. Without it, every unshipped row.
+    /// [`list_unshipped`] asks for the engine's own identity.
+    fn list_unshipped_sealed(
+        &self,
+        _limit: usize,
+        _origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        Err(Error::Unsupported("list_unshipped_sealed".into()))
+    }
+
+    /// Set `shipped_at` to now on the rows in `ids`; unknown ids are
+    /// ignored.
+    fn mark_shipped(&self, _ids: &[String]) -> Result<(), Error> {
+        Err(Error::Unsupported("mark_shipped".into()))
+    }
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix exactly as it was sealed, in one transaction (spec §4).
+    ///
+    /// The batch is verified per node and checked against the stored rows:
+    /// a re-delivered row is skipped, and a different row under a stored id
+    /// or at a stored node and seq, or one that does not link to the stored
+    /// rows before and after it, is a break. Ingest stops at the first
+    /// break and reports it in [`IngestResult`], not as an error. With
+    /// `local_node_id`, a row from that node is a break too. An error means
+    /// nothing of the batch was stored; a batch with a timestamp the stores
+    /// cannot hold is [`Error::AuditStoreRejected`].
+    fn ingest_replicated(
+        &self,
+        _rows: &[ReplicatedRow],
+        _local_node_id: Option<&str>,
+    ) -> Result<IngestResult, Error> {
+        Err(Error::Unsupported("ingest_replicated".into()))
+    }
+
+    /// Delete audit rows older than `before`, per node only a seq prefix
+    /// (spec §2.3), so the rows left still verify; with
+    /// `respect_unshipped`, unshipped rows and the rows above them are kept.
+    /// Returns the rows deleted. The engine never calls it: audit rows are
+    /// kept until the operator purges them (spec §7).
+    fn purge(&self, _before: DateTime<Utc>, _respect_unshipped: bool) -> Result<u64, Error> {
+        Err(Error::Unsupported("purge".into()))
+    }
+}
+
+/// A replicated row read as a [`Row`]: a detail number `serde_json` cannot
+/// hold exactly is changed, and a detail that is not an object (a redacted
+/// one) reads as empty.
+pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Row {
+    let c = &r.row;
+    let detail = match serde_json::from_str(&c.detail.to_string()) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    let severity = match c.severity.to_ascii_lowercase().as_str() {
+        "debug" => Severity::Debug,
+        "warn" => Severity::Warn,
+        "error" => Severity::Error,
+        "critical" => Severity::Critical,
+        _ => Severity::Info,
+    };
+    Row {
+        wire_version: c.wire_version.clone(),
+        id: c.id.clone(),
+        origin_id: c.origin_id.clone(),
+        monotonic_seq: c.monotonic_seq,
+        timestamp: c.timestamp.parse().unwrap_or_default(),
+        code: c.code.clone(),
+        action: c.action.clone(),
+        severity,
+        service_id: c.service_id.clone(),
+        source_node_id: c.source_node_id.clone(),
+        tenant_id: c.tenant_id.clone(),
+        actor: c.actor.clone(),
+        actor_kind: c.actor_kind.clone(),
+        target: c.target.clone(),
+        category: c.category.clone(),
+        domain: c.domain.clone(),
+        method: c.method.clone(),
+        request_id: c.request_id.clone(),
+        detail,
+        pii_in_detail: r.pii_in_detail,
+        prev_hash: c.prev_hash.clone(),
+        hash: c.hash.clone(),
+        canonical_form_id: c.canonical_form_id.clone(),
+        detail_salt: c.detail_salt.clone(),
+        detail_commitment: c.detail_commitment.clone(),
+        shipped_at: c.shipped_at.as_deref().and_then(|s| s.parse().ok()),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -814,6 +924,26 @@ pub fn config_from_env() -> Result<Config, Error> {
 /// default), this starts the fasten-core drainer thread (see
 /// `fasten_core::drainer`).
 pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
+
+/// The default engine's unshipped audit rows, exactly as they were sealed,
+/// that it originated (its service and node id), oldest first, for shipping
+/// to another node (spec §5). `limit == 0` returns all. Ship each with
+/// [`ReplicatedRow::to_json`], then call [`mark_shipped`].
+pub fn list_unshipped(limit: usize) -> Result<Vec<ReplicatedRow>, Error> {
+    DEFAULT.list_unshipped(limit)
+}
+
+/// Mark rows of the default engine's audit store as shipped.
+pub fn mark_shipped(ids: &[String]) -> Result<(), Error> {
+    DEFAULT.mark_shipped(ids)
+}
+
+/// Verify a batch of rows from other nodes and store its verified prefix in
+/// the default engine's audit store, refusing rows from the engine's own
+/// node; see [`AuditStore::ingest_replicated`].
+pub fn ingest_replicated(rows: &[ReplicatedRow]) -> Result<IngestResult, Error> {
+    DEFAULT.ingest_replicated(rows)
+}
 
 /// Redact PII rows older than `before` and write an `AUDIT_ROW_REDACTED`
 /// row for each (spec §7). Returns the redacted ids.
@@ -2380,6 +2510,12 @@ pub use postgres_store::PostgresStore;
 
 #[cfg(feature = "store-sqlite")]
 pub mod sqlite_store;
+
+#[cfg(all(test, feature = "store-sqlite"))]
+mod replication_tests;
+
+#[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+mod pg_recovery_tests;
 #[cfg(feature = "store-sqlite")]
 pub use sqlite_store::SqliteStore;
 

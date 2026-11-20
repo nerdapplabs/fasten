@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{chain::ChainRow, checkpoint::ChainTip, error::Error, row::Row};
+use crate::{
+    chain::ChainRow,
+    checkpoint::ChainTip,
+    error::Error,
+    replication::{IngestResult, ReplicatedRow},
+    row::Row,
+};
 
 /// Query filter for read-path operations.
 ///
@@ -159,10 +165,36 @@ pub trait Store: Send + Sync {
     /// `monotonic_seq ASC`.  `limit == 0` returns all unshipped rows.
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error>;
 
+    /// Unshipped rows exactly as they were sealed, for shipping to another
+    /// node (spec §5), ordered by `monotonic_seq`. `limit == 0` returns all.
+    ///
+    /// With `origin`, `(service_id, source_node_id)`, only the rows that
+    /// identity originated (`origin_id == id`), so rows it ingested from
+    /// other nodes are not shipped again. Without it, every unshipped row.
+    fn list_unshipped_sealed(
+        &self,
+        _limit: u32,
+        _origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        Err(Error::Unsupported("list_unshipped_sealed"))
+    }
+
     /// Set `shipped_at` to the current UTC time for all rows in `ids`, in
     /// one transaction however many ids there are.
     /// IDs that do not exist are silently ignored.
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix in one transaction (spec §4); see [`crate::replication::ingest`].
+    /// A break is reported in the result, not as an error. An error means
+    /// nothing of the batch was stored.
+    fn ingest_replicated(
+        &self,
+        _rows: &[ReplicatedRow],
+        _local_node_id: Option<&str>,
+    ) -> Result<IngestResult, Error> {
+        Err(Error::Unsupported("ingest_replicated"))
+    }
 
     /// Delete rows whose `timestamp` is before `before_iso8601`, per node only
     /// a seq prefix (spec §2.3): rows above a kept row stay, so the rows left
@@ -336,12 +368,21 @@ pub fn sealed_columns(row: &ChainRow, pii_in_detail: bool) -> Result<(Row, Strin
             row.id
         )));
     }
+    // Stored in the wire form, so the text compares as the other SDKs
+    // write it; one the Python and Go stores cannot read is refused.
+    let canonical = |field: &str, ts: &str| {
+        crate::replication::canonical_timestamp(ts).ok_or_else(|| {
+            Error::RowRejected(format!("row {}: {field} is not an RFC 3339 timestamp", row.id))
+        })
+    };
+    let timestamp = canonical("timestamp", &row.timestamp)?;
+    let shipped_at = row.shipped_at.as_deref().map(|s| canonical("shipped_at", s)).transpose()?;
     let columns = Row {
         wire_version: row.wire_version.clone(),
         id: row.id.clone(),
         origin_id: row.origin_id.clone(),
         monotonic_seq: row.monotonic_seq,
-        timestamp: row.timestamp.clone(),
+        timestamp,
         code: row.code.clone(),
         action: row.action.clone(),
         severity: row.severity.clone(),
@@ -357,7 +398,7 @@ pub fn sealed_columns(row: &ChainRow, pii_in_detail: bool) -> Result<(Row, Strin
         request_id: row.request_id.clone(),
         detail: serde_json::Value::Null,
         pii_in_detail,
-        shipped_at: row.shipped_at.clone(),
+        shipped_at,
         prev_hash: Some(row.prev_hash.clone()),
         hash: Some(row.hash.clone()),
         canonical_form_id: Some(row.canonical_form_id.clone()).filter(|f| !f.is_empty()),
@@ -437,8 +478,10 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 /// monotonic_seq) index, and the LIMIT keeps the planner from repeating it
 /// per row. Postgres deletes with USING; SQLite has no USING, so it matches
 /// ids.
+/// For the SDK's stores; not a stable API.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
+#[doc(hidden)]
+pub fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
     let (unshipped, shipped) = if respect_unshipped {
         (" OR shipped_at IS NULL", " AND d.shipped_at IS NOT NULL")
     } else {
