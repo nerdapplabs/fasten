@@ -290,7 +290,7 @@ for (const [name, make] of BACKENDS) {
 
         test('a timestamp that is not RFC 3339 is refused by insert, insertSealed and ingest', async () => {
             const s = await fresh();
-            for (const ts of ['yesterday', '2026-02-30T10:00:00.000000Z', '2026-08-21T10:00:00+24:00']) {
+            for (const ts of ['yesterday', '2026-02-30T10:00:00.000000Z', '2026-08-21T10:00:00+24:00', '0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00']) {
                 await assert.rejects(s.insert({ ...row(0, { id: `evt-own-${ts}` }), timestamp: ts }),
                     (err) => err instanceof AuditRowRejectedError && /timestamp .* is not an RFC 3339 timestamp/.test(err.message), ts);
                 // seal() hashes the text it cannot read as it is, so the row verifies.

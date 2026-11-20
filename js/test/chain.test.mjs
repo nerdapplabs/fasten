@@ -422,6 +422,14 @@ describe('sealing', () => {
         assert.equal(canonicalTimestamp('not a time'), 'not a time');
     });
 
+    test('an offset that moves the time outside years 1 to 9999 is not a wire timestamp', () => {
+        for (const ts of ['0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00']) {
+            assert.equal(canonicalTimestamp(ts), ts);
+        }
+        assert.equal(canonicalTimestamp('0001-01-01T01:00:00+01:00'), '0001-01-01T00:00:00.000000Z');
+        assert.equal(canonicalTimestamp('9999-12-31T22:59:59-01:00'), '9999-12-31T23:59:59.000000Z');
+    });
+
     test('the sealed copy carries every hashed field as it was hashed', () => {
         const sealed = seal(GENESIS, { id: 'evt-min', monotonic_seq: 1, timestamp: '2026-06-15T12:30:41+02:00', extra: 'kept' });
         assert.deepEqual(

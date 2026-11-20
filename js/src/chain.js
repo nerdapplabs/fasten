@@ -533,7 +533,7 @@ const _TS =
  * An RFC 3339 timestamp in the wire form (spec 4.3): UTC, six fractional
  * digits, "Z". Digits past the sixth are dropped. Text that is not RFC 3339
  * is returned as it is, as is a date Python's datetime cannot hold: year 0,
- * or an offset of 24 hours or more.
+ * an offset of 24 hours or more, or a UTC time outside years 1 to 9999.
  */
 export function canonicalTimestamp(ts) {
 	return wireTimestamp(ts) ?? ts;
@@ -569,7 +569,12 @@ export function wireTimestamp(ts) {
 	if (off.length === 6) {
 		ms -= (off[0] === "-" ? -1 : 1) * (offH * 60 + offM) * 60_000;
 	}
-	const at = new Date(ms).toISOString();
+	const utc = new Date(ms);
+	// The offset can move the time into year 0 or 10000, which the Python
+	// and Go stores cannot read.
+	const utcYear = utc.getUTCFullYear();
+	if (utcYear < 1 || utcYear > 9999) return null;
+	const at = utc.toISOString();
 	return `${at.slice(0, 19)}.${frac.slice(0, 6).padEnd(6, "0")}Z`;
 }
 
