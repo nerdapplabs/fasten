@@ -218,6 +218,11 @@ struct EnvStores {
     syslog: EnvStore<dyn StreamStore>,
 }
 
+/// The value of the DSN variable `name` in `env`, unless it is empty.
+fn env_dsn<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
+}
+
 /// The store init uses for the DSN variable `name`: `explicit` when set,
 /// else the one `held` was opened from the same DSN, else a new one from
 /// `open`. Returns it and what to hold after this init. An unset or empty
@@ -229,7 +234,7 @@ fn store_from_env<S: ?Sized>(
     held: &EnvStore<S>,
     open: impl FnOnce(&str) -> Result<Arc<S>, Error>,
 ) -> Result<(Option<Arc<S>>, EnvStore<S>), Error> {
-    let dsn = env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
+    let dsn = env_dsn(env, name);
     let (Some(dsn), None) = (dsn, explicit.as_ref()) else {
         return Ok((explicit, None));
     };
@@ -332,8 +337,22 @@ impl Engine {
         if let Some(named) = &persist_streams {
             check_stream_names(named)?;
         }
-        // Every store is opened before any is let go of, so a failed init
-        // leaves the stores of the last one as they were.
+        // Every DSN is checked before a store is opened, and every store is
+        // opened before any is let go of, so a failed init leaves the stores
+        // of the last one as they were.
+        for (name, given) in [
+            ("FASTEN_AUDIT_DSN", cfg.audit_store.is_some()),
+            ("FASTEN_API_DSN", cfg.api_store.is_some()),
+            ("FASTEN_SYSLOG_DSN", cfg.syslog_store.is_some()),
+        ] {
+            let dsn = env_dsn(env, name);
+            if let (Some(dsn), false) = (dsn, given) {
+                crate::parse_dsn(dsn, "audit_log").map_err(|e| match name {
+                    "FASTEN_AUDIT_DSN" => Error::Unsupported(format!("{name}: {e}")),
+                    _ => Error::InvalidConfig(format!("{name}: {e}")),
+                })?;
+            }
+        }
         let mut held = self.env_stores.lock_or_recover();
         let (audit_store, audit_env) =
             store_from_env(cfg.audit_store.take(), env, "FASTEN_AUDIT_DSN", &held.audit, crate::dsn::audit_store_from_dsn)?;

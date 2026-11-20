@@ -393,6 +393,88 @@ mod init_tests {
         assert!(e.current_config().is_err(), "a failed init left a config");
     }
 
+    #[test]
+    fn init_opens_the_stream_stores_from_their_dsns_by_the_same_rules() {
+        let dir = TempDir::new();
+        let api = format!("sqlite:///{}?table=env_api", dir.0.join("s.db").display());
+        let sys = format!("{}", dir.0.join("s.db").display());
+        let audit = format!("{}", dir.0.join("a.db").display());
+        let vars = env(&[("FASTEN_AUDIT_DSN", &audit), ("FASTEN_API_DSN", &api), ("FASTEN_SYSLOG_DSN", &sys)]);
+        let e = Engine::new();
+        e.init_with_env(config("dsn-s"), &vars).unwrap();
+        let cfg = e.current_config().unwrap();
+        let (first_api, first_sys) = (cfg.api_store.unwrap(), cfg.syslog_store.unwrap());
+        let first_audit = cfg.audit_store.unwrap();
+        e.log_api(serde_json::json!({ "path": "/x" }));
+        assert!(e.flush(std::time::Duration::from_secs(5)));
+        let again = crate::SqliteStreamStore::open(dir.0.join("s.db").to_str().unwrap(), "env_api").unwrap();
+        assert_eq!(crate::StreamStore::count(&again).unwrap(), 1);
+
+        // The same DSNs: the same stores.
+        e.init_with_env(config("dsn-s"), &vars).unwrap();
+        let cfg = e.current_config().unwrap();
+        assert!(Arc::ptr_eq(&first_api, cfg.api_store.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&first_sys, cfg.syslog_store.as_ref().unwrap()));
+        drop(cfg);
+
+        // A bad syslog DSN fails init, naming the variable and the scheme
+        // only, and leaves every store as it was.
+        let bad = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", dir.0.join("other.db").display())),
+            ("FASTEN_API_DSN", &api),
+            ("FASTEN_SYSLOG_DSN", "mysql://u:s3cret@db/app"),
+        ]);
+        let text = e.init_with_env(config("dsn-s"), &bad).unwrap_err().to_string();
+        assert!(text.contains("FASTEN_SYSLOG_DSN") && text.contains("'mysql'"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!dir.0.join("other.db").exists(), "a failed init left a store open");
+        e.init_with_env(config("dsn-s"), &vars).unwrap();
+        let cfg = e.current_config().unwrap();
+        assert!(Arc::ptr_eq(&first_audit, cfg.audit_store.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&first_api, cfg.api_store.as_ref().unwrap()));
+        drop(cfg);
+
+        // Another DSN: a new store, and the old one let go of.
+        let other = format!("sqlite:///{}", dir.0.join("t.db").display());
+        let moved = env(&[("FASTEN_AUDIT_DSN", &audit), ("FASTEN_API_DSN", &api), ("FASTEN_SYSLOG_DSN", &other)]);
+        e.init_with_env(config("dsn-s"), &moved).unwrap();
+        let cfg = e.current_config().unwrap();
+        assert!(!Arc::ptr_eq(&first_sys, cfg.syslog_store.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(&first_api, cfg.api_store.as_ref().unwrap()));
+        assert_eq!(Arc::strong_count(&first_sys), 1, "the old stream store is still held");
+        drop(cfg);
+
+        // A store in the config wins; no DSN opens none.
+        let mine: Arc<dyn crate::StreamStore> = Arc::new(crate::SqliteStreamStore::open(":memory:", "syslog").unwrap());
+        let cfg = Config { syslog_store: Some(mine.clone()), ..config("dsn-s") };
+        e.init_with_env(cfg, &env(&[("FASTEN_SYSLOG_DSN", &other)])).unwrap();
+        let cfg = e.current_config().unwrap();
+        assert!(Arc::ptr_eq(&mine, cfg.syslog_store.as_ref().unwrap()));
+        assert!(cfg.api_store.is_none());
+        assert_eq!(Arc::strong_count(&first_api), 1);
+        drop(cfg);
+        e.close(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn set_stream_dsns_are_read_not_reported() {
+        let dir = TempDir::new();
+        let path = format!("{}", dir.0.join("s.db").display());
+        let e = Engine::new();
+        let vars = env(&[("FASTEN_API_DSN", &path), ("FASTEN_SYSLOG_DSN", &path)]);
+        e.init_with_env(config("dsn-r"), &vars).unwrap();
+        let cfg = e.current_config().unwrap();
+        assert!(cfg.api_store.is_some() && cfg.syslog_store.is_some());
+        let reported = crate::engine::SYS_CAPTURE
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["event"] == "env_dsn_not_read" && v["variable"].as_str().is_some_and(|n| n.ends_with("_API_DSN") || n.ends_with("_SYSLOG_DSN")));
+        assert!(!reported);
+        drop(cfg);
+        e.close(std::time::Duration::from_secs(5));
+    }
+
     #[cfg(feature = "store-postgres")]
     #[test]
     fn a_postgres_dsn_opens_a_postgres_store_on_its_table() {
