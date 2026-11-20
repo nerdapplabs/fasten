@@ -119,6 +119,13 @@ mux.Handle("/api/v1/logs/", http.StripPrefix("/api/v1/logs", reader))
 startup when the variable is unset. Pass your own middleware to `WithAuth`
 for other schemes.
 
+For a terminal view, the Python CLI's `fasten tail` and `fasten tui` work
+against this reader, at whatever prefix you mount it. Install the Python
+package ([python/README.md](../python/README.md#install); `fasten tui`
+needs the `tui` extra), then run
+`fasten tail --url http://host:port/api/v1/logs --token <token>`, with
+`--stream sys` or `--stream api`, `--request-id` and `--json` as needed.
+
 ## Reading logs back: whole record or recent window?
 
 Every reader response carries a per-stream `completeness` flag that answers

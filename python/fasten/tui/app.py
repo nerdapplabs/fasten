@@ -251,7 +251,7 @@ def _render_log(rows: list[dict[str, Any]], label: str, primary: bool) -> Any:
         ts = str(r.get("timestamp") or "")[-12:-3] or "—"
         if label == "sys":
             t.add_row(ts, str(r.get("level") or "info"),
-                      str(r.get("message") or r.get("msg") or "—"),
+                      str(r.get("message") or r.get("msg") or r.get("event") or "—"),
                       str(r.get("request_id") or "—")[:10])
         else:
             t.add_row(ts, str(r.get("method") or "GET"),
