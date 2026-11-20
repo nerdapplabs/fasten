@@ -41,8 +41,12 @@ const NO_AUDIT_STORE: &str = "audit store not initialised — call fasten.init()
 const MAX_Q: usize = 1024;
 const SEARCH_STREAMS: [&str; 3] = ["audit", "api", "sys"];
 
-/// A request as the server received it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A request as the server received it. Build it with [`Request::new`] or
+/// a struct literal ending in `..Default::default()`.
+///
+/// Its `Debug` output lists every header name but leaves out the values of
+/// `Authorization`, `Cookie` and `Proxy-Authorization`.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Request {
     pub method: String,
     /// The path as sent, without the query.
@@ -50,6 +54,34 @@ pub struct Request {
     /// The raw query string, without the `?`.
     pub query: String,
     pub headers: Vec<(String, String)>,
+}
+
+/// Headers whose values `Request`'s `Debug` leaves out.
+const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Headers<'a>(&'a [(String, String)]);
+        impl std::fmt::Debug for Headers<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut list = f.debug_list();
+                for (name, value) in self.0 {
+                    if CREDENTIAL_HEADERS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+                        list.entry(&(name, ".."));
+                    } else {
+                        list.entry(&(name, value));
+                    }
+                }
+                list.finish()
+            }
+        }
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &Headers(&self.headers))
+            .finish()
+    }
 }
 
 impl Request {
@@ -70,8 +102,10 @@ impl Request {
     }
 }
 
-/// The reader's answer: a status, headers and a JSON body.
+/// The reader's answer: a status, headers and a JSON body. The server
+/// sets `Content-Length` from the body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -80,12 +114,11 @@ pub struct Response {
 }
 
 impl Response {
-    fn new(status: u16, body: String) -> Self {
-        let headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-            ("Content-Length".to_string(), body.len().to_string()),
-        ];
-        Self { status, headers, body }
+    /// A response with `status`, the JSON text `body`, and a
+    /// `Content-Type: application/json` header.
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        Self { status, headers, body: body.into() }
     }
 
     fn detail(status: u16, detail: &str) -> Self {
@@ -104,10 +137,12 @@ type TenantFn = dyn Fn(&Request) -> Option<String> + Send + Sync;
 
 /// How the reader authenticates a request. There is no default.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Auth {
     /// `Authorization: Bearer <token>`, compared in constant time.
     Bearer(String),
-    /// A function that returns true when the request may read.
+    /// A function that returns true when the request may read. A panic in
+    /// it is a 401.
     Verify(Arc<VerifyFn>),
     /// No check: for routes authenticated in front of the reader (a
     /// gateway, the server's own middleware), or a trusted network only.
@@ -177,7 +212,9 @@ impl ReaderBuilder {
         self
     }
 
-    /// The engine to read; default [`DEFAULT`].
+    /// The engine to read; default [`DEFAULT`]. An engine lives as long
+    /// as the process, as `DEFAULT` does: a `static Engine` (`Engine::new`
+    /// is `const`) or a leaked one.
     pub fn engine(mut self, engine: &'static Engine) -> Self {
         self.engine = Some(engine);
         self
@@ -933,7 +970,10 @@ fn route_audit(ctx: &Ctx<'_>, p: &Params, tenant: Option<&str>, out: &mut Out) -
     };
     let rows = scope_audit(store.query(&q)?, tenant);
     let total = ctx.reader.count_or_null(store.as_ref(), &q);
-    // Rows are newest first, so next_after is the smallest seq.
+    // The cursor is the last row's seq: rows are newest first by timestamp,
+    // then seq, and the next page keeps rows with a lower seq. With rows
+    // from several nodes, or a clock step back, that is not the page's
+    // lowest seq.
     let next_after = rows.last().map(|r| r.monotonic_seq);
     let rows: Vec<Value> = rows.iter().map(|r| audit_json(r, out)).collect();
     Ok(json!({

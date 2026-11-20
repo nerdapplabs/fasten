@@ -37,9 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         fasten::log::api(serde_json::json!({ "method": r.method, "path": r.path, "status": res.status }));
         let mut out = Response::from_string(res.body).with_status_code(res.status);
         for (k, v) in &res.headers {
-            if k != "Content-Length" {
-                out.add_header(Header::from_bytes(k.as_bytes(), v.as_bytes()).map_err(|()| "header")?);
-            }
+            out.add_header(Header::from_bytes(k.as_bytes(), v.as_bytes()).map_err(|()| "header")?);
         }
         let _ = req.respond(out);
     }

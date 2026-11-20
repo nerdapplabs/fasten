@@ -8,8 +8,9 @@
 //! (`store/repo.py`), Go (`ingest.go`) and JS (`replication.js`) SDKs, and
 //! the result has the same fields.
 //!
-//! The stores run the steps on their own transactions through
-//! [`IngestTx`] and [`ingest`].
+//! The stores run the steps on their own transactions through `IngestTx`
+//! and `ingest`, which are for the stores of this crate and the SDK, not a
+//! stable API.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -102,23 +103,48 @@ impl ReplicatedRow {
     }
 }
 
-/// Result of an ingest, with the names the Python and Go SDKs use.
-///
-/// `inserted` counts the verified rows the call stored or found already
-/// stored (a re-delivery). When the batch breaks, `rejected_from_seq` is
-/// the `monotonic_seq` of the first row not stored and `reason` says why;
-/// the rows from that seq on, on every node, are left for the sender to
-/// resend. Both are `None` when the whole batch was stored.
+/// Result of an ingest, with the field names the Python, Go and JS SDKs
+/// use. Build one with [`IngestResult::stored`] or [`IngestResult::cut`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IngestResult {
+    /// The verified rows the call stored or found already stored (a
+    /// re-delivery).
     pub inserted: usize,
+    /// When the batch broke, the `monotonic_seq` of the first row not
+    /// stored; the rows from that seq on, on every node, are left for the
+    /// sender to resend. Set together with `reason`: both are `None` when
+    /// the whole batch was stored.
     pub rejected_from_seq: Option<u64>,
+    /// Why the batch broke at `rejected_from_seq`; set together with it.
     pub reason: Option<String>,
+}
+
+impl IngestResult {
+    /// The whole batch was stored: `inserted` rows, no break.
+    pub fn stored(inserted: usize) -> Self {
+        Self { inserted, rejected_from_seq: None, reason: None }
+    }
+
+    /// `inserted` rows were stored, and the batch broke at `seq` for
+    /// `reason`.
+    pub fn cut(inserted: usize, seq: u64, reason: impl Into<String>) -> Self {
+        Self { inserted, rejected_from_seq: Some(seq), reason: Some(reason.into()) }
+    }
+
+    /// `inserted` rows, and the break, if any, as `(seq, reason)`.
+    fn with_break(inserted: usize, cut: Option<(u64, String)>) -> Self {
+        match cut {
+            Some((seq, reason)) => Self::cut(inserted, seq, reason),
+            None => Self::stored(inserted),
+        }
+    }
 }
 
 /// A row of the batch whose timestamp the stores cannot hold. The whole
 /// batch is refused and nothing is stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BatchError {
     /// The row's index in the batch.
     pub index: usize,
@@ -145,7 +171,9 @@ static RFC3339: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// or `None` when it is not an RFC 3339 timestamp the Python and Go stores
 /// can read back: year 0, a second of 60, an offset above 23:59, or a UTC
 /// year outside 1 to 9999 once the offset is applied. Digits past the
-/// sixth are dropped.
+/// sixth are dropped. For the stores of this crate and the SDK; not a
+/// stable API.
+#[doc(hidden)]
 pub fn canonical_timestamp(ts: &str) -> Option<String> {
     let c = RFC3339.captures(ts)?;
     let num = |i: usize| c.get(i).map_or(0, |m| m.as_str().parse::<u32>().unwrap_or(u32::MAX));
@@ -161,17 +189,28 @@ pub fn canonical_timestamp(ts: &str) -> Option<String> {
     Some(t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
-/// What a store holds at a node and seq.
+/// What a store holds at a node and seq. For the stores of this crate and
+/// the SDK; not a stable API.
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StoredRow {
     pub id: String,
     pub hash: String,
     pub prev_hash: String,
 }
 
+impl StoredRow {
+    pub fn new(id: String, hash: String, prev_hash: String) -> Self {
+        Self { id, hash, prev_hash }
+    }
+}
+
 /// The reads and the insert ingest makes, all on one transaction of the
 /// store, which holds each batch node's advisory lock, or the database's
-/// write lock, from before the first read.
+/// write lock, from before the first read. For the stores of this crate and
+/// the SDK; not a stable API.
+#[doc(hidden)]
 pub trait IngestTx {
     type Error;
 
@@ -191,12 +230,14 @@ pub trait IngestTx {
 
 /// A batch after verification: its longest verified run of sealed rows
 /// from each chain's start, and the unsealed rows below the first break.
+/// For the stores of this crate and the SDK; not a stable API.
+#[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct Verified {
     prefix: Vec<ReplicatedRow>,
     unsealed: Vec<ReplicatedRow>,
-    rejected_from_seq: Option<u64>,
-    reason: Option<String>,
+    /// The first break, as its seq and why.
+    cut: Option<(u64, String)>,
 }
 
 impl Verified {
@@ -209,7 +250,7 @@ impl Verified {
     }
 
     fn nothing_to_store(&self) -> IngestResult {
-        IngestResult { inserted: 0, rejected_from_seq: self.rejected_from_seq, reason: self.reason.clone() }
+        IngestResult::with_break(0, self.cut.clone())
     }
 }
 
@@ -221,7 +262,8 @@ fn verify_batch(rows: &[ReplicatedRow]) -> Verified {
     sorted.sort_by_key(|r| r.row.monotonic_seq);
     let chain: Vec<ChainRow> = sorted.iter().map(|r| r.row.clone()).collect();
     let result = verify_chain(&chain);
-    let break_at = if result.ok { None } else { result.first_break_at };
+    let cut = result.first_break_at.zip(result.reason);
+    let break_at = cut.as_ref().map(|(seq, _)| *seq);
     let below = |r: &ReplicatedRow| break_at.is_none_or(|b| r.row.monotonic_seq < b);
     let mut seen = HashSet::new();
     let mut prefix = Vec::new();
@@ -236,7 +278,7 @@ fn verify_batch(rows: &[ReplicatedRow]) -> Verified {
             prefix.push(r.clone());
         }
     }
-    Verified { prefix, unsealed, rejected_from_seq: break_at, reason: if result.ok { None } else { result.reason } }
+    Verified { prefix, unsealed, cut }
 }
 
 /// The first row that disagrees with what the store holds (spec §4), as
@@ -302,15 +344,15 @@ fn stored_conflict<T: IngestTx>(tx: &mut T, v: &Verified) -> Result<Option<(u64,
 /// Check `v` against the store on `tx` and insert the rows that agree.
 /// `Ok(None)` means another writer stored one of the ids after the checks
 /// ran: roll back and run it again. On an error, roll back; nothing of the
-/// batch may be committed.
+/// batch may be committed. For the stores of this crate and the SDK; not a
+/// stable API.
+#[doc(hidden)]
 pub fn ingest_on<T: IngestTx>(tx: &mut T, v: &Verified) -> Result<Option<IngestResult>, T::Error> {
-    let mut rejected_from_seq = v.rejected_from_seq;
-    let mut reason = v.reason.clone();
+    let mut cut = v.cut.clone();
     let mut prefix: Vec<&ReplicatedRow> = v.prefix.iter().collect();
     if let Some((seq, why)) = stored_conflict(tx, v)? {
         prefix.retain(|r| r.row.monotonic_seq < seq);
-        rejected_from_seq = Some(seq);
-        reason = Some(why);
+        cut = Some((seq, why));
     }
     for row in &prefix {
         // Skipped: fine for a re-delivery, not for any other row.
@@ -318,14 +360,16 @@ pub fn ingest_on<T: IngestTx>(tx: &mut T, v: &Verified) -> Result<Option<IngestR
             return Ok(None);
         }
     }
-    Ok(Some(IngestResult { inserted: prefix.len(), rejected_from_seq, reason }))
+    Ok(Some(IngestResult::with_break(prefix.len(), cut)))
 }
 
 /// How many times ingest runs when other writers keep storing its ids.
 const ATTEMPTS: usize = 3;
 
-/// The message of the error [`ingest`] returns when other writers kept
-/// storing the batch's ids between its checks and its inserts.
+/// The message of the error `ingest` returns when other writers kept
+/// storing the batch's ids between its checks and its inserts. For the
+/// stores of this crate and the SDK; not a stable API.
+#[doc(hidden)]
 pub const STORED_MEANWHILE: &str = "ingest_replicated: rows kept being stored by another writer";
 
 /// Ingest `rows` with `attempt`, which runs [`ingest_on`] on a new
@@ -341,6 +385,9 @@ pub const STORED_MEANWHILE: &str = "ingest_replicated: rows kept being stored by
 /// the lowest-seq one are ingested, and that row is reported unless an
 /// earlier break is found. A node's own rows come from its emit path, never
 /// from replication. An empty or absent `local_node_id` skips the check.
+///
+/// For the stores of this crate and the SDK; not a stable API.
+#[doc(hidden)]
 pub fn ingest<E: From<BatchError>>(
     rows: &[ReplicatedRow],
     local_node_id: Option<&str>,
@@ -377,18 +424,17 @@ pub fn ingest<E: From<BatchError>>(
             }
         }
     }
-    let Some(mut result) = result else {
+    let Some(result) = result else {
         return Err(exhausted());
     };
-    if let (Some(first), None) = (first_local, result.rejected_from_seq) {
-        result.rejected_from_seq = Some(first.row.monotonic_seq);
-        result.reason = Some(format!(
-            "row {}: source_node_id '{}' is this node",
-            first.row.id,
-            local.unwrap_or_default()
-        ));
+    match (first_local, result.rejected_from_seq) {
+        (Some(first), None) => Ok(IngestResult::cut(
+            result.inserted,
+            first.row.monotonic_seq,
+            format!("row {}: source_node_id '{}' is this node", first.row.id, local.unwrap_or_default()),
+        )),
+        _ => Ok(result),
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -506,6 +552,31 @@ mod tests {
                 .unwrap();
             assert_eq!(r.inserted, 0);
         }
+    }
+
+    fn sealed_on(node: &str, seq: u64) -> ReplicatedRow {
+        let text = format!(
+            r#"{{"id":"{node}-{seq}","origin_id":"{node}-{seq}","monotonic_seq":{seq},"timestamp":"2026-06-15T10:30:01Z","source_node_id":"{node}"}}"#
+        );
+        ReplicatedRow::from(crate::chain::seal("genesis", &ChainRow::from_json(&text).unwrap()).unwrap())
+    }
+
+    // Two ingests take the node locks in one order whatever order their
+    // batches list the nodes in, so they cannot deadlock.
+    #[test]
+    fn the_nodes_to_lock_are_sorted_whatever_the_batch_order() {
+        let a = [sealed_on("b", 1), sealed_on("a", 1), sealed_on("c", 1)];
+        let b = [sealed_on("c", 1), sealed_on("a", 1), sealed_on("b", 1)];
+        for rows in [&a[..], &b[..]] {
+            assert_eq!(verify_batch(rows).nodes(), ["a", "b", "c"]);
+        }
+    }
+
+    #[test]
+    fn a_result_has_a_break_seq_and_a_reason_together() {
+        assert_eq!(IngestResult::stored(3), IngestResult { inserted: 3, rejected_from_seq: None, reason: None });
+        let cut = IngestResult::cut(1, 2, "why");
+        assert_eq!((cut.inserted, cut.rejected_from_seq, cut.reason.as_deref()), (1, Some(2), Some("why")));
     }
 
     #[test]

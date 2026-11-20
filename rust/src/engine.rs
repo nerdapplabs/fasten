@@ -339,7 +339,10 @@ impl Engine {
         }
         // Every DSN is checked before a store is opened, and every store is
         // opened before any is let go of, so a failed init leaves the stores
-        // of the last one as they were.
+        // of the last one as they were. A SQLite file in a directory that
+        // does not exist is refused here too, so no other store has created
+        // its file yet.
+        let mut parsed = Vec::new();
         for (name, given) in [
             ("FASTEN_AUDIT_DSN", cfg.audit_store.is_some()),
             ("FASTEN_API_DSN", cfg.api_store.is_some()),
@@ -347,15 +350,17 @@ impl Engine {
         ] {
             let dsn = env_dsn(env, name);
             if let (Some(dsn), false) = (dsn, given) {
-                crate::parse_dsn(dsn, "audit_log").map_err(|e| match name {
-                    "FASTEN_AUDIT_DSN" => Error::Unsupported(format!("{name}: {e}")),
-                    _ => Error::InvalidConfig(format!("{name}: {e}")),
-                })?;
+                let d = crate::parse_dsn(dsn, "audit_log").map_err(|e| Error::InvalidConfig(format!("{name}: {e}")))?;
+                parsed.push((name, d));
             }
         }
+        for (name, d) in &parsed {
+            crate::dsn::check_openable(name, d)?;
+        }
         let mut held = self.env_stores.lock_or_recover();
-        let (audit_store, audit_env) =
-            store_from_env(cfg.audit_store.take(), env, "FASTEN_AUDIT_DSN", &held.audit, crate::dsn::audit_store_from_dsn)?;
+        let (audit_store, audit_env) = store_from_env(cfg.audit_store.take(), env, "FASTEN_AUDIT_DSN", &held.audit, |dsn| {
+            crate::dsn::open_audit_store("FASTEN_AUDIT_DSN", dsn)
+        })?;
         let (api_store, api_env) = store_from_env(cfg.api_store.take(), env, "FASTEN_API_DSN", &held.api, |dsn| {
             crate::streams::open_stream_store("FASTEN_API_DSN", dsn, "api_log")
         })?;
@@ -563,8 +568,16 @@ impl Engine {
     }
 
     /// Flush within `timeout`, then stop the drainer, the purgers and the
-    /// stream writers. Later rows and log lines go to stdout only, until
-    /// the next `init`. True when everything queued was stored.
+    /// stream writers, and release the stores opened from
+    /// `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`. True
+    /// when everything queued was stored.
+    ///
+    /// Until the next `init`, log lines and api rows go to stdout only. An
+    /// audit row goes to stdout, and is stored only when the config passed
+    /// to `init` holds the audit store itself: then it is inserted inline
+    /// as it is emitted. A row for a store opened from `FASTEN_AUDIT_DSN`
+    /// goes to stdout only, unsealed. The next `init` opens the DSN stores
+    /// again.
     pub fn close(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let flushed = self.flush(timeout);
@@ -576,7 +589,35 @@ impl Engine {
         if let Some(d) = old {
             d.stop(deadline.saturating_duration_since(std::time::Instant::now()));
         }
+        self.release_env_stores();
         flushed && written
+    }
+
+    /// Let go of the stores opened from DSN variables, in the env store
+    /// table and in the config. A store dropped here closes once the
+    /// last call using it returns.
+    fn release_env_stores(&self) {
+        let held = std::mem::replace(
+            &mut *self.env_stores.lock_or_recover(),
+            EnvStores { audit: None, api: None, syslog: None },
+        );
+        fn same<S: ?Sized>(a: &Option<Arc<S>>, b: &EnvStore<S>) -> bool {
+            match (a, b) {
+                (Some(a), Some((_, b))) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+                _ => false,
+            }
+        }
+        if let Some(cfg) = self.config.lock_or_recover().as_mut() {
+            if same(&cfg.audit_store, &held.audit) {
+                cfg.audit_store = None;
+            }
+            if same(&cfg.api_store, &held.api) {
+                cfg.api_store = None;
+            }
+            if same(&cfg.syslog_store, &held.syslog) {
+                cfg.syslog_store = None;
+            }
+        }
     }
 
     pub fn reset_for_tests(&self) {

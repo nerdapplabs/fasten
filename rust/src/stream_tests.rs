@@ -358,8 +358,11 @@ fn stream_dsns() {
     let bare = crate::stream_store_from_dsn(path.to_str().unwrap(), "syslog").unwrap();
     assert_eq!(bare.count().unwrap(), 0);
     let err = crate::stream_store_from_dsn(&format!("{}?table=bad-name", path.display()), "syslog").err().unwrap();
-    assert!(err.to_string().contains("not a valid SQL identifier"), "{err}");
+    assert!(err.to_string().contains("invalid table name \"bad-name\""), "{err}");
     let err = crate::stream_store_from_dsn(&format!("sqlite:///{}?table=bad-name", path.display()), "syslog").err().unwrap();
+    assert!(err.to_string().contains("invalid table name \"bad-name\""), "{err}");
+    // A schema the SQLite stream store does not take.
+    let err = crate::stream_store_from_dsn(&format!("{}?table=main.x", path.display()), "syslog").err().unwrap();
     assert!(err.to_string().contains("not a valid SQL identifier"), "{err}");
     #[cfg(feature = "store-postgres")]
     if let Some(dsn) = crate::test_support::pg_dsn() {

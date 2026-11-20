@@ -486,10 +486,13 @@ fn sqlite_rejects_row(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// The variant name, e.g. `CallbackFailed`, or the type a `Store` error carries.
+/// The variant name, e.g. `CallbackFailed`, or the type a `Store` error
+/// carries. A `Store` error built in this crate carries a message, which can
+/// name rows and nodes, so it is recorded as `Store`.
 fn error_type(e: &Error) -> String {
     if let Error::Store(t) = e {
-        return t.clone();
+        let is_type = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        return if is_type { t.clone() } else { "Store".to_owned() };
     }
     let debug = format!("{e:?}");
     debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
@@ -757,6 +760,19 @@ mod stop_tests {
         fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
         fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
         fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// What the drainer records for an error: its type, never a message
+    /// that names a row or node.
+    #[test]
+    fn errors_are_recorded_by_type() {
+        assert_eq!(error_text(&Error::Store("PgError".into())), "PgError");
+        assert_eq!(error_text(&Error::Store("row evt-1: not inserted and not stored".into())), "Store");
+        assert_eq!(error_text(&Error::Store("node 'n-1': next monotonic_seq -1 is negative".into())), "Store");
+        assert_eq!(error_text(&Error::Store(String::new())), "Store");
+        assert_eq!(error_text(&Error::RowRejected("row evt-1: differs".into())), "RowRejected");
+        assert_eq!(error_text(&Error::SeqClash("row evt-1: seq 3".into())), "SeqClash");
+        assert_eq!(error_text(&Error::CallbackFailed(-2)), "insert callback returned non-zero rc=-2");
     }
 
     struct RejectingStore(Arc<std::sync::atomic::AtomicUsize>);

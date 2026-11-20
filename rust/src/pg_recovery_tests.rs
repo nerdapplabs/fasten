@@ -330,3 +330,44 @@ fn queue_mode_loses_no_row_while_connections_drop() {
     assert_eq!(rows.iter().map(|r| r.id.clone()).collect::<std::collections::HashSet<_>>(), ids);
     assert_chain(&store, "node-q", ids.len() as u64);
 }
+
+/// Rows on `node` dated in 2020, so a purge before 2021 deletes them.
+fn old_rows(store: &PostgresStore, node: &str, n: usize) {
+    for i in 0..n {
+        let mut r = row(&format!("{node}-old-{i}"), node);
+        r.timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        store.allocate_and_insert_originated(&r).unwrap();
+    }
+}
+
+// A purge is never run a second time. A connection that ended while idle
+// is replaced first, so the purge runs once and its count is right; one
+// that ends while the DELETE runs is an error saying the outcome is
+// unknown, and nothing is run again.
+#[test]
+fn a_purge_runs_once_and_says_when_its_outcome_is_unknown() {
+    let Some(dsn) = dsn() else { return };
+    let (store, app, drop) = store(&dsn, "rec_purge");
+    let table = drop.1.clone();
+    let cutoff = "2021-01-01T00:00:00Z".parse().unwrap();
+    old_rows(&store, "node-p", 3);
+
+    assert_eq!(terminate(&dsn, &app), 1);
+    assert_eq!(store.purge(cutoff, false).unwrap(), 3);
+
+    old_rows(&store, "node-q", 2);
+    // The DELETE waits on a table lock while its connection is ended.
+    let mut holder = client(&dsn);
+    holder.batch_execute(&format!("BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")).unwrap();
+    let purge = {
+        let store = store.clone();
+        std::thread::spawn(move || store.purge(cutoff, false))
+    };
+    wait_for_lock_wait(&dsn, &app);
+    assert_eq!(terminate(&dsn, &app), 1);
+    let err = purge.join().unwrap().unwrap_err();
+    holder.batch_execute("ROLLBACK").unwrap();
+    assert!(matches!(&err, crate::Error::AuditStorePurge(m) if m.contains("unknown")), "{err:?}");
+    assert_eq!(store.chain_rows("node-q").unwrap().len(), 2, "the purge ran again");
+    assert_eq!(store.purge(cutoff, false).unwrap(), 2);
+}

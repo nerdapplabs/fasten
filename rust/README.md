@@ -339,7 +339,10 @@ let deleted = store.purge(cutoff, true)?;   // cutoff: DateTime<Utc>
 It deletes rows older than `cutoff`, per node only a run from the start of
 the chain, so the rows left still verify. With `respect_unshipped` set,
 unshipped rows and the rows after them are kept. Publish checkpoints again
-after a purge, and verify with `checkpoints_since` (see above).
+after a purge, and verify with `checkpoints_since` (see above). A failed
+purge is `Error::AuditStorePurge`. A purge is never run a second time on its
+own: when the Postgres connection is lost while it runs, the error says how
+many rows it deleted is unknown; run it again before publishing checkpoints.
 
 ## Lost Postgres connections
 
@@ -350,8 +353,10 @@ is safe: a read, a statement that sets or removes the same rows again, or a
 whole transaction, which the lost connection rolled back. A COMMIT cut short
 is never run again: an insert reads its row back once and returns it as
 stored, or returns a retryable error, and the drainer retries; the insert
-looks up the row's id first, so it is never stored twice. A statement
-timeout (SQLSTATE 57014) is not a lost connection and is returned as it is.
+looks up the row's id first, so it is never stored twice. A purge is not
+run again either (see above); a connection that ended while idle is
+replaced before it runs. A statement timeout (SQLSTATE 57014) is not a lost
+connection and is returned as it is.
 While the server stays down calls fail, and the queue holds the rows.
 
 ## Stores from the environment
@@ -367,10 +372,16 @@ With no `Config::audit_store`, `init` opens the audit store from
 | `/path/audit.db` or `audit.db` | `SqliteStore` on that path |
 
 `?table=name` names the table (default `audit_log`) and `?wal=false` turns
-off SQLite's WAL journal. Another scheme, libpq's keyword form
-(`host=db dbname=app`), or a scheme whose store feature is not built is an
-error from `init` that names the scheme and never the DSN; no file is
-created. A store in the config wins. `init` again with the same DSN keeps
+off SQLite's WAL journal. Every DSN error from `init` is
+`Error::InvalidConfig` and names the variable and the scheme only, never
+the DSN or the driver's text: another scheme, libpq's keyword form
+(`host=db dbname=app`), a scheme whose store feature is not built, a bad
+table name, or a store that cannot be opened
+(`FASTEN_AUDIT_DSN: cannot open the postgres store (AuditStoreInsert)`).
+All three DSNs are parsed, and their table names and SQLite directories
+checked, before any store is opened, so a failure there creates no file. A
+store that fails to open after another one opened can leave that one's new
+SQLite file behind. A store in the config wins. `init` again with the same DSN keeps
 the store it opened; with another DSN it opens that one, and the old store
 closes once the drainer has finished with it. A set `FASTEN_*` variable that
 looks like a DSN but is not one `init` reads (say `FASTEN_AUDIT_DNS`) is
@@ -426,16 +437,36 @@ fasten::log::api(serde_json::json!({ "method": "GET", "path": "/orders", "status
   once at the start of an outage and then at most once a minute. A stream
   INSERT is never run again after a lost connection.
 - `fasten::flush(timeout)` waits for queued audit rows and stream writes;
-  `fasten::close(timeout)` flushes and then stops the drainer, purgers and
-  stream writers.
+  `fasten::close(timeout)` flushes, stops the drainer, purgers and stream
+  writers, and releases the stores opened from `FASTEN_*_DSN`, as the JS
+  SDK's close does. Until the next `init`, log lines and api rows go to
+  stdout only; an audit row is stored inline only when the config holds the
+  store itself, and otherwise goes to stdout unsealed.
+- A `limit` of 0 means no limit in every read: `StreamStore::query` and
+  `search`, `AuditQuery`, `AuditSearch` and `list_unshipped`. The reader
+  never passes 0; its routes use their own defaults and bounds.
 
 ## HTTP reader
 
 `fasten::reader` serves `/audit`, `/audit/doctor`, `/correlate`, `/search`,
 `/sys`, `/api` and `/topology` with the parameters, response shapes and
-error texts of Python's reader. It takes a plain request and returns a
-status, headers and a JSON body, so it fits any server; it adds no
-dependency. It must be built with an auth choice:
+error texts of Python's reader. Where Python's and JS's readers differ, it
+follows JS:
+
+- A 422 body is `{"detail": "<text>"}`, not FastAPI's list of errors.
+- `since` and `until` go through one timestamp parser, which refuses a date
+  alone and an epoch number.
+- An unresolved tenant is a 401 before any parameter is checked, so a
+  caller without a tenant never gets a 422.
+- `/audit/doctor` reports `sealed_rows`, and gives a scoped caller `null`
+  for the host's queue, transport and store details.
+- Timestamps in responses are canonical, in UTC with a `Z`.
+- A verify function that panics is a 401.
+
+It takes a plain request and returns a status, headers and a JSON body, so
+it fits any server; it adds no dependency. The server sets
+`Content-Length`. A `Request`'s `Debug` leaves out the values of
+credential headers. It must be built with an auth choice:
 
 ```rust
 use fasten::reader::{require_bearer, Reader, Request};

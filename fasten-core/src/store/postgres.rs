@@ -255,6 +255,10 @@ mod tls_tests {
     }
 }
 
+/// How long a call that must run once waits to learn whether an idle
+/// connection still works.
+const VALID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct PostgresStore {
     inner: Mutex<Inner>,
     table: String,
@@ -312,7 +316,8 @@ impl PostgresStore {
     ///
     /// Every `f` here is a read, a statement whose second run does what one
     /// run does, or a whole transaction that first reads what is stored
-    /// under the node's lock. A lost connection rolls an open transaction
+    /// under the node's lock. Purge, whose count a second run would change,
+    /// goes through `once`. A lost connection rolls an open transaction
     /// back. After a COMMIT whose outcome is unknown the second run reads
     /// the row the first one may have stored, and returns it rather than
     /// writing it again.
@@ -329,6 +334,26 @@ impl PostgresStore {
                 *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
                 f(&mut *guard)
             }
+            other => other,
+        }
+    }
+
+    /// Run `f` once on the live connection, replacing a connection that
+    /// has ended first. For a statement whose second run would not do what
+    /// one run does: a lost connection is an error that says the outcome is
+    /// unknown, and the next call connects again.
+    fn once<F, R>(&self, what: &str, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut Inner) -> Result<R, Error>,
+    {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.client.is_closed() || guard.client.is_valid(VALID_TIMEOUT).is_err() {
+            *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
+        }
+        match f(&mut *guard) {
+            Err(Error::Postgres(ref e)) if connection_lost(e) || guard.client.is_closed() => Err(Error::Store(format!(
+                "{what}: the connection was lost while it ran, so its outcome is unknown; run it again"
+            ))),
             other => other,
         }
     }
@@ -615,7 +640,9 @@ impl Store for PostgresStore {
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
         let before = purge_cutoff(before)?;
         let sql = purge_sql(&self.table, "$1", respect_unshipped, true);
-        self.with_reconnect(|inner| {
+        // Not run again after a lost connection: the DELETE may have
+        // committed, and a second run would return only what it deleted.
+        self.once("purge", |inner| {
             inner
                 .client
                 .execute(sql.as_str(), &[&before as &(dyn ToSql + Sync)])

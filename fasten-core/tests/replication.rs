@@ -218,6 +218,48 @@ fn sqlite_lists_what_a_node_originated_for_shipping() {
     check_unshipped(&SqliteStore::open(":memory:", "audit_log", true).unwrap());
 }
 
+/// Two threads ingest batches spanning two nodes, listing them in opposite
+/// orders, while two threads allocate on a local node, each pair on its own
+/// handle. Every call succeeds, nothing is refused, and every chain
+/// verifies.
+fn check_concurrent(stores: [&dyn Store; 2]) {
+    let seqs: Vec<u64> = (1..=24).collect();
+    let a = chain("node-a", &seqs, "ca");
+    let b = chain("node-b", &seqs, "cb");
+    std::thread::scope(|scope| {
+        for (i, store) in stores.into_iter().enumerate() {
+            let (a, b) = (&a, &b);
+            scope.spawn(move || {
+                for (ca, cb) in a.chunks(4).zip(b.chunks(4)) {
+                    let batch = if i == 0 { [ca, cb].concat() } else { [cb, ca].concat() };
+                    assert_eq!(got(&store.ingest_replicated(&batch, None).unwrap()), (batch.len(), None));
+                }
+            });
+            scope.spawn(move || {
+                for n in 0..15 {
+                    store.insert(&originated(&format!("local-{i}-{n}"), "local", "svc")).unwrap();
+                }
+            });
+        }
+    });
+    let rows = all_rows(stores[0]);
+    assert_eq!(rows.len(), 24 * 2 + 30);
+    let v = verify_chain(&rows);
+    assert!(v.ok, "{v:?}");
+    for (node, last) in [("node-a", 24), ("node-b", 24), ("local", 30)] {
+        let seqs: Vec<u64> = rows.iter().filter(|r| r.source_node_id == node).map(|r| r.monotonic_seq).collect();
+        assert_eq!(seqs, (1..=last).collect::<Vec<u64>>(), "{node}");
+    }
+}
+
+#[test]
+fn sqlite_concurrent_ingests_and_allocations_on_one_file() {
+    let db = TempDb::new();
+    let one = SqliteStore::open(&db.path(), "audit_log", true).unwrap();
+    let two = SqliteStore::open(&db.path(), "audit_log", true).unwrap();
+    check_concurrent([&one, &two]);
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -380,5 +422,102 @@ mod postgres {
         assert_eq!(pid(&t), before);
         holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&"node-1"]).unwrap();
         store.insert(&originated("s-2", "node-1", "svc")).unwrap();
+    }
+
+    impl Table {
+        /// Wait until the store's connection waits on a lock.
+        fn wait_for_lock_wait(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let waiting = self.sql(&format!(
+                    "SELECT 1 FROM pg_stat_activity WHERE application_name = '{}' AND wait_event_type = 'Lock'",
+                    self.name
+                ));
+                if !waiting.is_empty() {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "the store never waited on a lock");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn node_rows(store: &PostgresStore, node: &str) -> Vec<ChainRow> {
+        store.chain_rows(&Filter { source_node_id: Some(node.into()), ..Default::default() }).unwrap()
+    }
+
+    // Ingest takes the node lock allocation takes, so it waits for a writer
+    // holding it. Ended while it waits, it runs again on a new connection
+    // and stores each row once.
+    #[test]
+    fn postgres_ingest_takes_the_node_lock_allocation_takes() {
+        let Some(dsn) = dsn() else { return };
+        let t = Table::new(&dsn, "repl_lock");
+        let store = std::sync::Arc::new(t.store());
+        let lock = "SELECT pg_advisory_lock(hashtextextended($1, 0))";
+        let unlock = "SELECT pg_advisory_unlock(hashtextextended($1, 0))";
+        for (node, end_while_waiting) in [("node-l", false), ("node-m", true)] {
+            let mut holder = connect_client(&dsn).unwrap();
+            holder.execute(lock, &[&node]).unwrap();
+            let batch = chain(node, &[1, 2, 3], node);
+            let ingest = {
+                let (store, batch) = (store.clone(), batch.clone());
+                std::thread::spawn(move || store.ingest_replicated(&batch, None))
+            };
+            t.wait_for_lock_wait();
+            assert!(!ingest.is_finished());
+            if end_while_waiting {
+                assert_eq!(t.terminate(), 1);
+            }
+            holder.execute(unlock, &[&node]).unwrap();
+            let r = ingest.join().unwrap().unwrap();
+            assert_eq!(got(&r), (3, None), "{node}");
+            let rows = node_rows(&store, node);
+            assert_eq!(rows.iter().map(|r| r.monotonic_seq).collect::<Vec<_>>(), [1, 2, 3], "{node}");
+            assert!(verify_chain(&rows).ok, "{node}");
+            // Allocation on the node continues the ingested chain.
+            store.insert(&originated(&format!("{node}-own"), node, "svc")).unwrap();
+            let rows = node_rows(&store, node);
+            assert_eq!(rows.len(), 4, "{node}");
+            assert!(verify_chain(&rows).ok, "{node}");
+        }
+    }
+
+    #[test]
+    fn postgres_concurrent_ingests_and_allocations() {
+        let Some(dsn) = dsn() else { return };
+        let t = Table::new(&dsn, "repl_conc");
+        let (one, two) = (t.store(), t.store());
+        check_concurrent([&one, &two]);
+    }
+
+    // A purge is not run a second time: ended while its DELETE waits, it
+    // fails saying the outcome is unknown and deletes nothing; a connection
+    // that ended while idle is replaced before the purge runs.
+    #[test]
+    fn postgres_purge_runs_once() {
+        let Some(dsn) = dsn() else { return };
+        let t = Table::new(&dsn, "repl_purge");
+        let store = std::sync::Arc::new(t.store());
+        let old = |id: &str| Row { timestamp: "2020-01-01T00:00:00.000000Z".into(), ..originated(id, "node-p", "svc") };
+        store.insert(&old("p-1")).unwrap();
+        store.insert(&old("p-2")).unwrap();
+        assert_eq!(t.terminate(), 1);
+        assert_eq!(store.purge("2021-01-01", false).unwrap(), 2);
+
+        store.insert(&old("p-3")).unwrap();
+        let mut holder = connect_client(&dsn).unwrap();
+        holder.batch_execute(&format!("BEGIN; LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", t.name)).unwrap();
+        let purge = {
+            let store = store.clone();
+            std::thread::spawn(move || store.purge("2021-01-01", false))
+        };
+        t.wait_for_lock_wait();
+        assert_eq!(t.terminate(), 1);
+        let err = purge.join().unwrap().unwrap_err();
+        holder.batch_execute("ROLLBACK").unwrap();
+        assert!(matches!(&err, Error::Store(m) if m.contains("unknown")), "{err:?}");
+        assert_eq!(node_rows(&store, "node-p").len(), 1);
+        assert_eq!(store.purge("2021-01-01", false).unwrap(), 1);
     }
 }

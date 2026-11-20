@@ -5,6 +5,9 @@
 
 use serde_json::{Map, Value};
 
+use crate::error::Error;
+use crate::validate::validate_table_name;
+
 /// One api or sys row: a JSON object, stored whole as the `payload` text.
 pub type StreamRow = Map<String, Value>;
 
@@ -38,7 +41,7 @@ pub enum StreamParam {
 
 impl StreamFilter {
     /// The text filters that apply, as (column, value).
-    pub fn equalities(&self) -> Vec<(&'static str, &str)> {
+    pub(crate) fn equalities(&self) -> Vec<(&'static str, &str)> {
         [
             ("level", &self.level),
             ("request_id", &self.request_id),
@@ -53,7 +56,10 @@ impl StreamFilter {
     }
 
     /// The WHERE clause (with a leading space, or empty) and its values.
-    /// `placeholder(n)` renders the n-th parameter, counting from 1.
+    /// `placeholder(n)` renders the n-th parameter, counting from 1. The
+    /// column names are fixed; every value is a parameter. For the stream
+    /// stores of this crate and the SDK; not a stable API.
+    #[doc(hidden)]
     pub fn where_clause(&self, placeholder: impl Fn(usize) -> String) -> (String, Vec<StreamParam>) {
         let mut conds = Vec::new();
         let mut params = Vec::new();
@@ -162,8 +168,18 @@ pub fn like_pattern(q: &str) -> String {
 }
 
 /// The CREATE statements for a stream table: the table, then its indexes.
-/// `index_prefix` is the table name without a schema.
-pub fn ddl(table: &str, index_prefix: &str, postgres: bool) -> Vec<String> {
+/// `index_prefix` is the table name without a schema. `table` must be a
+/// name or `schema.name` and `index_prefix` a name, each matching
+/// `[A-Za-z_][A-Za-z0-9_]*`, as the stores require; anything else is
+/// `InvalidTableName`. For the stream stores of this crate and the SDK; not
+/// a stable API.
+#[doc(hidden)]
+pub fn ddl(table: &str, index_prefix: &str, postgres: bool) -> Result<Vec<String>, Error> {
+    validate_table_name(table)?;
+    if index_prefix.contains('.') {
+        return Err(Error::InvalidTableName(index_prefix.to_owned()));
+    }
+    validate_table_name(index_prefix)?;
     let seq = if postgres { "BIGSERIAL PRIMARY KEY" } else { "INTEGER PRIMARY KEY AUTOINCREMENT" };
     let mut out = vec![format!(
         "CREATE TABLE IF NOT EXISTS {table} (
@@ -191,16 +207,20 @@ pub fn ddl(table: &str, index_prefix: &str, postgres: bool) -> Vec<String> {
     ] {
         out.push(format!("CREATE INDEX IF NOT EXISTS idx_{index_prefix}_{suffix} ON {table}({col})"));
     }
-    out
+    Ok(out)
 }
 
 /// The INSERT for a stream table, with `placeholder(n)` for the n-th value.
-pub fn insert_sql(table: &str, placeholder: impl Fn(usize) -> String) -> String {
+/// `table` is checked as in [`ddl`]. For the stream stores of this crate
+/// and the SDK; not a stable API.
+#[doc(hidden)]
+pub fn insert_sql(table: &str, placeholder: impl Fn(usize) -> String) -> Result<String, Error> {
+    validate_table_name(table)?;
     let values: Vec<String> = (1..=9).map(placeholder).collect();
-    format!(
+    Ok(format!(
         "INSERT INTO {table} (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES ({})",
         values.join(",")
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -251,6 +271,18 @@ mod tests {
         assert!(f.matches(&row(json!({"event": "x"}))));
         let f = StreamFilter { since: Some("2026".into()), ..Default::default() };
         assert!(!f.matches(&row(json!({"event": "x"}))));
+    }
+
+    #[test]
+    fn ddl_and_insert_refuse_a_table_name_the_stores_refuse() {
+        assert!(ddl("logs.syslog", "syslog", true).is_ok());
+        assert!(insert_sql("logs.syslog", |n| format!("${n}")).is_ok());
+        for bad in ["x; DROP TABLE y", "a.b.c", "", "1x", "a-b"] {
+            assert!(matches!(ddl(bad, "x", false), Err(Error::InvalidTableName(_))), "{bad}");
+            assert!(matches!(insert_sql(bad, |n| format!("?{n}")), Err(Error::InvalidTableName(_))), "{bad}");
+        }
+        assert!(matches!(ddl("t", "a.b", false), Err(Error::InvalidTableName(_))));
+        assert!(matches!(ddl("t", "x y", false), Err(Error::InvalidTableName(_))));
     }
 
     #[test]

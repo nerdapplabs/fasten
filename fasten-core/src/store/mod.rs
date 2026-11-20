@@ -48,7 +48,7 @@ pub struct AuditQuery {
     pub target:         Option<String>,
     pub since:          Option<String>,
     pub until:          Option<String>,
-    /// Maximum rows to return; 0 returns none.
+    /// Maximum rows to return; 0 means no limit.
     pub limit:          u32,
     pub offset:         u64,
     pub after_seq:      u64,
@@ -95,13 +95,39 @@ pub struct AuditSearch {
     pub q:         String,
     pub since:     String,
     pub until:     Option<String>,
+    /// Maximum rows to return; 0 means no limit.
     pub limit:     u32,
     pub tenant_id: Option<String>,
+}
+
+impl AuditQuery {
+    /// `limit` as a SQL LIMIT value: 0, no limit, is the largest BIGINT.
+    #[doc(hidden)]
+    pub fn sql_limit(&self) -> i64 {
+        sql_limit(self.limit)
+    }
+}
+
+impl AuditSearch {
+    /// `limit` as a SQL LIMIT value: 0, no limit, is the largest BIGINT.
+    #[doc(hidden)]
+    pub fn sql_limit(&self) -> i64 {
+        sql_limit(self.limit)
+    }
+}
+
+/// A read's `limit` as a SQL LIMIT value: 0, no limit, is the largest
+/// BIGINT, which SQLite and Postgres both take. For the SDK's stores; not a
+/// stable API.
+#[doc(hidden)]
+pub fn sql_limit(limit: u32) -> i64 {
+    if limit == 0 { i64::MAX } else { i64::from(limit) }
 }
 
 /// Rows written per `(source_node_id, service_id, tenant_id)`, for the
 /// reader's `/topology`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Source {
     pub source_node_id: String,
     pub service_id:     String,
@@ -109,6 +135,21 @@ pub struct Source {
     pub rows:           u64,
     pub first_seen:     Option<String>,
     pub last_seen:      Option<String>,
+}
+
+impl Source {
+    /// `rows` rows from one node, service and tenant, first and last seen
+    /// at the given canonical timestamps.
+    pub fn new(
+        source_node_id: String,
+        service_id: String,
+        tenant_id: Option<String>,
+        rows: u64,
+        first_seen: Option<String>,
+        last_seen: Option<String>,
+    ) -> Self {
+        Self { source_node_id, service_id, tenant_id, rows, first_seen, last_seen }
+    }
 }
 
 /// Result of [`Store::list_redaction_candidates`].
@@ -275,7 +316,8 @@ pub trait Store: Send + Sync {
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
 
     /// Verify a batch of rows sealed on other nodes and store its verified
-    /// prefix in one transaction (spec §4); see [`crate::replication::ingest`].
+    /// prefix in one transaction (spec §4), as the Python, Go and JS stores
+    /// do.
     /// A break is reported in the result, not as an error. An error means
     /// nothing of the batch was stored.
     fn ingest_replicated(
@@ -295,7 +337,10 @@ pub trait Store: Send + Sync {
     ///
     /// Returns the number of deleted rows. `before` is an RFC 3339 timestamp
     /// (any offset) or a date, taken as midnight UTC; anything else is an
-    /// `InvalidTimestamp` error and deletes nothing.
+    /// `InvalidTimestamp` error and deletes nothing. It is never run a
+    /// second time on its own: when the connection is lost while it runs,
+    /// the Postgres store returns a `Store` error saying the outcome is
+    /// unknown.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if

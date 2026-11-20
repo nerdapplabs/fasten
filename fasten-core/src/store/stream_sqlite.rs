@@ -60,10 +60,10 @@ impl SqliteStreamStore {
         if wal && path != ":memory:" {
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         }
-        for stmt in ddl(table, table, false) {
+        for stmt in ddl(table, table, false)? {
             conn.execute_batch(&stmt)?;
         }
-        Ok(Self { conn: Mutex::new(conn), table: table.to_owned(), insert_sql: insert_sql(table, |n| format!("?{n}")) })
+        Ok(Self { conn: Mutex::new(conn), table: table.to_owned(), insert_sql: insert_sql(table, |n| format!("?{n}"))? })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -92,12 +92,12 @@ impl SqliteStreamStore {
         texts.iter().map(|t| parse_payload(t).map_err(Error::from)).collect()
     }
 
-    /// Up to `limit` rows matching `filter`, newest first.
+    /// Up to `limit` rows matching `filter`, newest first; 0 means no limit.
     pub fn query(&self, filter: &StreamFilter, limit: u32) -> Result<Vec<StreamRow>, Error> {
-        let (clause, mut params) = filter.where_clause(|n| format!("?{n}"));
-        let n = params.len() + 1;
-        params.push(StreamParam::Int(i32::try_from(limit).unwrap_or(i32::MAX)));
-        self.rows(&format!("SELECT payload FROM {}{clause} ORDER BY seq DESC LIMIT ?{n}", self.table), &params)
+        let (clause, params) = filter.where_clause(|n| format!("?{n}"));
+        // LIMIT is an integer, so writing it into the SQL is safe.
+        let limit = super::sql_limit(limit);
+        self.rows(&format!("SELECT payload FROM {}{clause} ORDER BY seq DESC LIMIT {limit}", self.table), &params)
     }
 
     /// How many rows match `filter`, with no limit.
@@ -112,8 +112,8 @@ impl SqliteStreamStore {
     }
 
     /// Case-insensitive substring search of the stored JSON within
-    /// `[since, until]`, newest first. A linear `LIKE` scan; `%`, `_` and
-    /// `\` in `q` match literally.
+    /// `[since, until]`, newest first, at most `limit` rows (0 for all). A
+    /// linear `LIKE` scan; `%`, `_` and `\` in `q` match literally.
     pub fn search(&self, q: &str, since: &str, until: Option<&str>, limit: u32) -> Result<Vec<StreamRow>, Error> {
         let mut conds = vec!["COALESCE(timestamp, '') >= ?1", "lower(payload) LIKE ?2 ESCAPE '\\'"];
         let mut params = vec![StreamParam::Text(since.to_string()), StreamParam::Text(like_pattern(&q.to_lowercase()))];
@@ -121,9 +121,8 @@ impl SqliteStreamStore {
             conds.push("COALESCE(timestamp, '') <= ?3");
             params.push(StreamParam::Text(u.to_string()));
         }
-        let n = params.len() + 1;
-        params.push(StreamParam::Int(i32::try_from(limit).unwrap_or(i32::MAX)));
-        let sql = format!("SELECT payload FROM {} WHERE {} ORDER BY seq DESC LIMIT ?{n}", self.table, conds.join(" AND "));
+        let limit = super::sql_limit(limit);
+        let sql = format!("SELECT payload FROM {} WHERE {} ORDER BY seq DESC LIMIT {limit}", self.table, conds.join(" AND "));
         self.rows(&sql, &params)
     }
 

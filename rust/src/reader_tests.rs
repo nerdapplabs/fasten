@@ -676,3 +676,107 @@ fn a_repeated_parameter_takes_its_last_value() {
     assert_eq!(get_ok(&r, "/audit?limit=abc&limit=1")["rows"].as_array().unwrap().len(), 1);
     assert_eq!(get_ok(&r, "/audit?target=a+b")["total"], 0);
 }
+
+#[test]
+fn request_debug_leaves_out_credential_headers() {
+    let req = Request::new("GET", "/audit?limit=5")
+        .with_header("Authorization", "Bearer s3cret-token")
+        .with_header("COOKIE", "session=s3cret-cookie")
+        .with_header("proxy-authorization", "Basic s3cret-proxy")
+        .with_header("X-Tenant", "t1");
+    let text = format!("{req:?}");
+    assert!(!text.contains("s3cret"), "{text}");
+    for shown in ["Authorization", "COOKIE", "proxy-authorization", "X-Tenant", "t1", "/audit", "limit=5", "GET"] {
+        assert!(text.contains(shown), "{shown} missing from {text}");
+    }
+    // The values are still there for the reader.
+    assert_eq!(req.header("authorization"), Some("Bearer s3cret-token"));
+}
+
+#[test]
+fn a_response_leaves_content_length_to_the_server() {
+    let r = Reader::builder().auth(Auth::None).engine(leak(Engine::new())).build().unwrap();
+    let res = r.handle(&Request::new("GET", "/sys"));
+    assert!(res.headers.iter().all(|(k, _)| !k.eq_ignore_ascii_case("content-length")), "{:?}", res.headers);
+    assert_eq!(res.headers, [("Content-Type".to_string(), "application/json".to_string())]);
+}
+
+/// Refuses every insert; reads return nothing.
+struct Refusing;
+
+impl AuditStore for Refusing {
+    fn insert(&self, _: &crate::Row) -> Result<(), Error> {
+        Err(Error::AuditStoreInsert("down".into()))
+    }
+    fn query(&self, _: &AuditQuery) -> Result<Vec<ChainRow>, Error> {
+        Ok(Vec::new())
+    }
+    fn count(&self, _: &AuditQuery) -> Result<u64, Error> {
+        Ok(0)
+    }
+}
+
+// Audit completeness is store-degraded once the drainer dead-letters a row
+// for the engine's own store; a re-init with another store, or a reader
+// given its own store, reads as store.
+#[test]
+fn audit_completeness_follows_dead_lettered_rows_of_the_engines_store() {
+    crate::test_support::ensure_code();
+    let engine = leak(Engine::new());
+    let queued = |store: Arc<dyn AuditStore>| crate::Config {
+        service_id: uniq("svc"),
+        node_id: "n".into(),
+        audit_store: Some(store),
+        audit_store_failure_strategy: Some("queue".into()),
+        queue_drain_max_attempts: Some(1),
+        ..Default::default()
+    };
+    engine.init(queued(Arc::new(Refusing))).unwrap();
+    let r = Reader::builder().auth(Auth::None).engine(engine).build().unwrap();
+    let audit = |r: &Reader| r.handle(&Request::new("GET", "/audit")).json()["completeness"]["audit"].clone();
+    assert_eq!(audit(&r), "store");
+
+    crate::EmitBuilder::new(crate::test_support::CODE, "t").submit_to(engine).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.queue_stats().is_none_or(|q| q.dead_lettered_total == 0) {
+        assert!(std::time::Instant::now() < deadline, "the row was never dead-lettered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(audit(&r), "store-degraded");
+    let own: Arc<dyn AuditStore> = Arc::new(crate::SqliteStore::open(":memory:", "audit_log").unwrap());
+    let given = Reader::builder().auth(Auth::None).engine(engine).audit_store(Some(own.clone())).build().unwrap();
+    assert_eq!(audit(&given), "store");
+
+    engine.init(queued(own)).unwrap();
+    assert_eq!(audit(&r), "store");
+    engine.close(std::time::Duration::from_secs(5));
+}
+
+// A limit of 0 means no limit, on every audit and stream read.
+#[test]
+fn a_limit_of_zero_means_no_limit() {
+    for b in backends() {
+        let env = setup(&b, None);
+        let rid = uniq("r-zero");
+        for i in 0..3 {
+            emit(env.engine, "t", &rid, json!({ "zero_limit": i }));
+            log_both(env.engine, &rid, None, "x");
+        }
+        env.flush();
+        let q = AuditQuery { request_id: Some(rid.clone()), ..Default::default() };
+        assert_eq!(env.store.query(&q).unwrap().len(), 3, "{}", b.label());
+        let s = AuditSearch { q: "zero_limit".into(), since: "2000-01-01T00:00:00.000000Z".into(), ..Default::default() };
+        assert_eq!(env.store.search(&s).unwrap().len(), 3, "{}", b.label());
+        let f = StreamFilter { request_id: Some(rid.clone()), ..Default::default() };
+        for stream in [&env.api, &env.sys] {
+            assert_eq!(stream.query(&f, 0).unwrap().len(), 3, "{}", b.label());
+            assert_eq!(stream.search(&rid, "2000-01-01T00:00:00.000000Z", None, 0).unwrap().len(), 3, "{}", b.label());
+        }
+    }
+    let ring = crate::streams::Stream::new("api", None);
+    for i in 0..3 {
+        ring.push(serde_json::from_value(json!({ "n": i })).unwrap());
+    }
+    assert_eq!(ring.query(&StreamFilter::default(), 0).unwrap().len(), 3);
+    assert_eq!(ring.query(&StreamFilter::default(), 2).unwrap().len(), 2);
+}

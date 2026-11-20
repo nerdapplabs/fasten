@@ -293,8 +293,8 @@ impl SqliteStore {
     }
 
     /// Rows matching `q`, newest first (timestamp, then seq), at most
-    /// `q.limit` after skipping `q.offset`. Read as stored, so detail
-    /// numbers are exact.
+    /// `q.limit` (0 for all) after skipping `q.offset`. Read as stored, so
+    /// detail numbers are exact.
     pub fn read_rows(&self, q: &AuditQuery) -> Result<Vec<ChainRow>, Error> {
         // Unary +: without statistics SQLite would pick the node/seq index
         // and sort the node's whole history instead of walking idx_ts.
@@ -304,7 +304,7 @@ impl SqliteStore {
             values.push(Box::new(i64::try_from(q.after_seq).unwrap_or(i64::MAX)));
             conds.push(format!("monotonic_seq < ?{}", values.len()));
         }
-        values.push(Box::new(i64::from(q.limit)));
+        values.push(Box::new(q.sql_limit()));
         let limit = values.len();
         values.push(Box::new(i64::try_from(q.offset).unwrap_or(i64::MAX)));
         let sql = format!(
@@ -340,7 +340,7 @@ impl SqliteStore {
             values.push(Box::new(t.clone()));
             conds.push(format!("tenant_id = ?{}", values.len()));
         }
-        values.push(Box::new(i64::from(s.limit)));
+        values.push(Box::new(s.sql_limit()));
         let sql = format!(
             "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?{}",
             self.table,

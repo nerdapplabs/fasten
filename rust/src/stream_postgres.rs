@@ -43,6 +43,7 @@ use crate::Error;
 pub struct PostgresStreamStore {
     dsn: String,
     table: String,
+    insert_sql: String,
     client: Mutex<Option<pg::Client>>,
     write_failures: AtomicU64,
 }
@@ -103,9 +104,18 @@ impl PostgresStreamStore {
                 "fasten PostgresStreamStore: table name {table:?} is not a valid SQL identifier. Use only letters, digits, underscores, and an optional 'schema.' prefix."
             )));
         }
+        let ddl = ddl(table, bare, true).map_err(|e| Error::InvalidConfig(format!("fasten PostgresStreamStore: {e}")))?;
+        let insert_sql =
+            insert_sql(table, |n| format!("${n}")).map_err(|e| Error::InvalidConfig(format!("fasten PostgresStreamStore: {e}")))?;
         let mut client = connect(dsn)?;
-        bootstrap(&mut client, table, schema, bare).map_err(|e| db_err(&e))?;
-        Ok(Self { dsn: dsn.to_string(), table: table.to_string(), client: Mutex::new(Some(client)), write_failures: AtomicU64::new(0) })
+        bootstrap(&mut client, table, schema, &ddl).map_err(|e| db_err(&e))?;
+        Ok(Self {
+            dsn: dsn.to_string(),
+            table: table.to_string(),
+            insert_sql,
+            client: Mutex::new(Some(client)),
+            write_failures: AtomicU64::new(0),
+        })
     }
 
     /// Failed writes that were dropped.
@@ -149,15 +159,15 @@ impl PostgresStreamStore {
     }
 }
 
-fn bootstrap(client: &mut pg::Client, table: &str, schema: Option<&str>, bare: &str) -> Result<(), pg::Error> {
+fn bootstrap(client: &mut pg::Client, table: &str, schema: Option<&str>, ddl: &[String]) -> Result<(), pg::Error> {
     let mut tx = client.transaction()?;
     // Stores starting together on a new table race on CREATE TABLE.
     tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&format!("fasten.bootstrap.{table}")])?;
     if let Some(schema) = schema {
         tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))?;
     }
-    for stmt in ddl(table, bare, true) {
-        tx.batch_execute(&stmt)?;
+    for stmt in ddl {
+        tx.batch_execute(stmt)?;
     }
     tx.commit()
 }
@@ -168,10 +178,9 @@ impl StreamStore for PostgresStreamStore {
             ["request_id", "timestamp", "level", "service_id", "event", "method", "path"].iter().map(|f| lifted_text(row, f)).collect();
         let status = lifted_status(row);
         let payload = payload_text(row);
-        let sql = insert_sql(&self.table, |n| format!("${n}"));
         self.call(false, |c| {
             c.execute(
-                sql.as_str(),
+                self.insert_sql.as_str(),
                 &[&text[0], &text[1], &text[2], &text[3], &text[4], &text[5], &text[6], &status, &payload],
             )
         })
@@ -181,6 +190,7 @@ impl StreamStore for PostgresStreamStore {
     fn query(&self, filter: &StreamFilter, limit: u32) -> Result<Vec<StreamRow>, Error> {
         let (clause, values) = filter.where_clause(|n| format!("${n}"));
         // LIMIT is an integer, so writing it into the SQL is safe.
+        let limit = fasten_core::store::sql_limit(limit);
         self.rows(&format!("SELECT payload FROM {}{clause} ORDER BY seq DESC LIMIT {limit}", self.table), &values)
     }
 
@@ -201,6 +211,7 @@ impl StreamStore for PostgresStreamStore {
             conds.push("COALESCE(timestamp, '') <= $3");
             values.push(StreamParam::Text(u.to_string()));
         }
+        let limit = fasten_core::store::sql_limit(limit);
         let sql = format!("SELECT payload FROM {} WHERE {} ORDER BY seq DESC LIMIT {limit}", self.table, conds.join(" AND "));
         self.rows(&sql, &values)
     }
@@ -208,7 +219,9 @@ impl StreamStore for PostgresStreamStore {
     fn purge(&self, before: DateTime<Utc>) -> Result<u64, Error> {
         let cutoff = crate::canonical_ts(&before);
         let sql = format!("DELETE FROM {} WHERE timestamp < $1", self.table);
-        // A DELETE can run twice without harm.
+        // Run again after a lost connection it deletes what is left of the
+        // same rows; the count is then the second run's. The retention
+        // purger reads only the error.
         self.call(true, |c| c.execute(sql.as_str(), &[&cutoff]))
     }
 

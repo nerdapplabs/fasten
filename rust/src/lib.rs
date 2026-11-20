@@ -35,9 +35,10 @@ pub mod dsn;
 pub use dsn::{audit_store_from_dsn, parse_dsn, Dsn, DsnError};
 
 /// Replication (spec/chain-replication.md §4, §5), re-exported from
-/// fasten-core: the rows a node ships and the result of ingesting a batch.
-/// See [`list_unshipped`], [`mark_shipped`] and [`ingest_replicated`].
-pub use fasten_core::replication::{self, IngestResult, ReplicatedRow};
+/// fasten-core: the rows a node ships, the result of ingesting a batch, and
+/// the error for a batch the stores cannot hold. See [`list_unshipped`],
+/// [`mark_shipped`] and [`ingest_replicated`].
+pub use fasten_core::replication::{BatchError, IngestResult, ReplicatedRow};
 /// Filters and results of the audit reads the HTTP reader uses, re-exported
 /// from fasten-core.
 pub use fasten_core::store::{AuditQuery, AuditSearch, Source};
@@ -358,12 +359,22 @@ pub enum Error {
     /// dead-lettered at once. A custom [`AuditStore`] can return it too.
     #[error("audit store rejected the row: {0}")]
     AuditStoreRejected(String),
+    /// [`AuditStore::purge`] failed. When the connection was lost while it
+    /// ran, how many rows it deleted is unknown and the text says so: run it
+    /// again, and publish checkpoints after it succeeds.
+    #[error("audit store purge: {0}")]
+    AuditStorePurge(String),
     #[error("not supported: {0}")]
     Unsupported(String),
     #[error("{0}")]
     InvalidRetention(String),
-    /// A configuration `init` refuses, such as `persist_streams` naming a
-    /// stream without a store, or a stream DSN it cannot use.
+    /// A configuration refused: by `init` (such as `persist_streams` naming
+    /// a stream without a store, or a `FASTEN_*_DSN` that does not parse or
+    /// whose store cannot be opened), by the reader's builder (no auth
+    /// choice, an empty bearer token, a missing tenant scope) or
+    /// [`reader::require_bearer`], by [`mint_sentinel`] (an unknown kind),
+    /// or by a stream store's constructor (a bad table name). An error for a
+    /// DSN names the variable and the scheme only.
     #[error("{0}")]
     InvalidConfig(String),
     /// A stream store write or read failed.
@@ -390,8 +401,8 @@ pub enum Error {
 }
 
 /// A replicated batch with a row the stores cannot hold is refused whole.
-impl From<fasten_core::replication::BatchError> for Error {
-    fn from(e: fasten_core::replication::BatchError) -> Self {
+impl From<BatchError> for Error {
+    fn from(e: BatchError) -> Self {
         Error::AuditStoreRejected(e.to_string())
     }
 }
@@ -824,7 +835,8 @@ pub trait AuditStore: Send + Sync {
     /// break and reports it in [`IngestResult`], not as an error. With
     /// `local_node_id`, a row from that node is a break too. An error means
     /// nothing of the batch was stored; a batch with a timestamp the stores
-    /// cannot hold is [`Error::AuditStoreRejected`].
+    /// cannot hold is [`Error::AuditStoreRejected`]. A custom store builds
+    /// the result with [`IngestResult::stored`] or [`IngestResult::cut`].
     fn ingest_replicated(
         &self,
         _rows: &[ReplicatedRow],
@@ -837,7 +849,9 @@ pub trait AuditStore: Send + Sync {
     /// (spec §2.3), so the rows left still verify; with
     /// `respect_unshipped`, unshipped rows and the rows above them are kept.
     /// Returns the rows deleted. The engine never calls it: audit rows are
-    /// kept until the operator purges them (spec §7).
+    /// kept until the operator purges them (spec §7). A failure is
+    /// [`Error::AuditStorePurge`]; it is never run a second time on its own,
+    /// so a count is that of one DELETE.
     fn purge(&self, _before: DateTime<Utc>, _respect_unshipped: bool) -> Result<u64, Error> {
         Err(Error::Unsupported("purge".into()))
     }
@@ -881,15 +895,20 @@ pub trait AuditStore: Send + Sync {
 }
 
 /// A replicated row read as a [`Row`]: a detail number `serde_json` cannot
-/// hold exactly is changed, and a detail that is not an object (a redacted
-/// one) reads as empty.
+/// hold exactly is changed, and a JSON null detail (a redacted row) reads as
+/// empty. A timestamp or `shipped_at` a `Row` cannot hold, or a detail that
+/// is neither an object nor null, is [`Error::AuditStoreRead`].
 #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Row {
+pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Result<Row, Error> {
     let c = &r.row;
+    let unreadable = |what: &str| Error::AuditStoreRead(format!("row {}: {what} cannot be read as a Row", c.id));
     let detail = match serde_json::from_str(&c.detail.to_string()) {
         Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-        _ => HashMap::new(),
+        Ok(serde_json::Value::Null) => HashMap::new(),
+        _ => return Err(unreadable("detail")),
     };
+    let timestamp = c.timestamp.parse().map_err(|_| unreadable("timestamp"))?;
+    let shipped_at = c.shipped_at.as_deref().map(str::parse).transpose().map_err(|_| unreadable("shipped_at"))?;
     let severity = match c.severity.to_ascii_lowercase().as_str() {
         "debug" => Severity::Debug,
         "warn" => Severity::Warn,
@@ -897,12 +916,12 @@ pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Row {
         "critical" => Severity::Critical,
         _ => Severity::Info,
     };
-    Row {
+    Ok(Row {
         wire_version: c.wire_version.clone(),
         id: c.id.clone(),
         origin_id: c.origin_id.clone(),
         monotonic_seq: c.monotonic_seq,
-        timestamp: c.timestamp.parse().unwrap_or_default(),
+        timestamp,
         code: c.code.clone(),
         action: c.action.clone(),
         severity,
@@ -923,8 +942,8 @@ pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Row {
         canonical_form_id: c.canonical_form_id.clone(),
         detail_salt: c.detail_salt.clone(),
         detail_commitment: c.detail_commitment.clone(),
-        shipped_at: c.shipped_at.as_deref().and_then(|s| s.parse().ok()),
-    }
+        shipped_at,
+    })
 }
 
 #[derive(Clone, Default)]

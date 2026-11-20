@@ -19,9 +19,21 @@ use std::fmt;
 pub enum Dsn {
     /// A Postgres server. `url` is the DSN with its scheme in lowercase and
     /// without its `table` parameter, both as the driver needs.
+    #[non_exhaustive]
     Postgres { url: String, table: String },
     /// A SQLite file.
+    #[non_exhaustive]
     Sqlite { path: String, table: String, wal: bool },
+}
+
+impl Dsn {
+    /// `postgres` or `sqlite`, as errors name the scheme.
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            Dsn::Postgres { .. } => "postgres",
+            Dsn::Sqlite { .. } => "sqlite",
+        }
+    }
 }
 
 /// Leaves out the Postgres URL, which can hold a password.
@@ -184,25 +196,76 @@ pub fn parse_dsn(dsn: &str, default_table: &str) -> Result<Dsn, DsnError> {
 
 /// The audit store for `dsn` (see [`parse_dsn`]): a [`crate::PostgresStore`]
 /// or a [`crate::SqliteStore`], with the table `audit_log` unless the DSN
-/// names one. A scheme whose store feature (`store-postgres`,
-/// `store-sqlite`) is not built in is an error naming the feature.
+/// names one. Every error is [`crate::Error::InvalidConfig`] and names
+/// `FASTEN_AUDIT_DSN` and the scheme only: a DSN that does not parse, a
+/// scheme whose store feature (`store-postgres`, `store-sqlite`) is not
+/// built in, or a store that cannot be opened.
 pub fn audit_store_from_dsn(dsn: &str) -> Result<std::sync::Arc<dyn crate::AuditStore>, crate::Error> {
-    let bad = |e: DsnError| crate::Error::Unsupported(format!("FASTEN_AUDIT_DSN: {e}"));
-    match parse_dsn(dsn, "audit_log").map_err(bad)? {
+    open_audit_store("FASTEN_AUDIT_DSN", dsn)
+}
+
+/// [`audit_store_from_dsn`], with errors starting with `label`.
+pub(crate) fn open_audit_store(label: &str, dsn: &str) -> Result<std::sync::Arc<dyn crate::AuditStore>, crate::Error> {
+    let parsed = parse_dsn(dsn, "audit_log").map_err(|e| crate::Error::InvalidConfig(format!("{label}: {e}")))?;
+    check_openable(label, &parsed)?;
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let failed = |e: crate::Error| open_failed(label, &parsed, &e);
+    match &parsed {
         #[cfg(feature = "store-postgres")]
-        Dsn::Postgres { url, table } => Ok(std::sync::Arc::new(crate::PostgresStore::new(&url, table)?)),
-        #[cfg(not(feature = "store-postgres"))]
-        Dsn::Postgres { .. } => Err(crate::Error::Unsupported(
-            "FASTEN_AUDIT_DSN: a postgres DSN needs the store-postgres feature".into(),
-        )),
+        Dsn::Postgres { url, table } => {
+            Ok(std::sync::Arc::new(crate::PostgresStore::new(url, table.as_str()).map_err(failed)?))
+        }
         #[cfg(feature = "store-sqlite")]
         Dsn::Sqlite { path, table, wal } => {
-            Ok(std::sync::Arc::new(crate::SqliteStore::open_with_wal(&path, &table, wal)?))
+            Ok(std::sync::Arc::new(crate::SqliteStore::open_with_wal(path, table, *wal).map_err(failed)?))
         }
-        #[cfg(not(feature = "store-sqlite"))]
-        Dsn::Sqlite { .. } => Err(crate::Error::Unsupported(
-            "FASTEN_AUDIT_DSN: a sqlite DSN needs the store-sqlite feature".into(),
-        )),
+        #[allow(unreachable_patterns)]
+        other => Err(feature_missing(label, other)),
+    }
+}
+
+/// The error for a DSN whose store feature is not built in.
+pub(crate) fn feature_missing(label: &str, dsn: &Dsn) -> crate::Error {
+    let scheme = dsn.scheme();
+    crate::Error::InvalidConfig(format!("{label}: a {scheme} DSN needs the store-{scheme} feature"))
+}
+
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+/// The error for a store from `dsn` that could not be opened. The driver's
+/// text is left out: it can quote the user, host, path or database name. A
+/// configuration error of the store's own, such as a bad table name, is
+/// kept.
+pub(crate) fn open_failed(label: &str, dsn: &Dsn, e: &crate::Error) -> crate::Error {
+    if let crate::Error::InvalidConfig(msg) = e {
+        return crate::Error::InvalidConfig(format!("{label}: {msg}"));
+    }
+    crate::Error::InvalidConfig(format!(
+        "{label}: cannot open the {} store ({})",
+        dsn.scheme(),
+        crate::retention::error_type(e)
+    ))
+}
+
+/// Refuse, before any store is opened, a DSN whose table name no store
+/// takes, or a SQLite DSN whose file cannot be created because its
+/// directory does not exist, so a failed `init` creates no file for the
+/// other DSNs.
+pub(crate) fn check_openable(label: &str, dsn: &Dsn) -> Result<(), crate::Error> {
+    let table = match dsn {
+        Dsn::Postgres { table, .. } | Dsn::Sqlite { table, .. } => table,
+    };
+    fasten_core::validate::validate_table_name(table)
+        .map_err(|e| crate::Error::InvalidConfig(format!("{label}: {e}")))?;
+    let Dsn::Sqlite { path, .. } = dsn else { return Ok(()) };
+    if path == ":memory:" || path.starts_with("file:") {
+        return Ok(());
+    }
+    let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty());
+    match dir {
+        Some(d) if !d.is_dir() => {
+            Err(crate::Error::InvalidConfig(format!("{label}: cannot open the sqlite store (NotFound)")))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -348,7 +411,8 @@ mod init_tests {
                 r#"{"id":"e1","origin_id":"e1","monotonic_seq":0,"timestamp":"2026-06-15T10:30:00Z","source_node_id":"node-1"}"#,
             )
             .unwrap(),
-        )));
+        ))
+        .unwrap());
         assert_eq!(stored.unwrap().monotonic_seq, 1);
 
         // The same DSN: the same store.
@@ -385,6 +449,7 @@ mod init_tests {
             ("host=db password=s3cret".to_string(), "keyword form"),
         ] {
             let err = e.init_with_env(config("dsn-b"), &env(&[("FASTEN_AUDIT_DSN", &dsn)])).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidConfig(_)), "{err:?}");
             let text = err.to_string();
             assert!(text.contains(want) && text.contains("FASTEN_AUDIT_DSN"), "{text}");
             assert!(!text.contains("s3cret") && !text.contains(&dir.0.display().to_string()), "{text}");
@@ -454,6 +519,88 @@ mod init_tests {
         assert_eq!(Arc::strong_count(&first_api), 1);
         drop(cfg);
         e.close(std::time::Duration::from_secs(5));
+    }
+
+    // A DSN that parses but whose store cannot be opened fails init, naming
+    // the variable and scheme only. The directory is checked before any
+    // store opens, so the audit DSN's new file is not created, and the
+    // stores of the last init stay.
+    #[test]
+    fn a_dsn_whose_store_cannot_be_opened_fails_init_and_creates_no_file() {
+        let dir = TempDir::new();
+        let audit = format!("{}", dir.0.join("a.db").display());
+        let e = Engine::new();
+        e.init_with_env(config("dsn-o"), &env(&[("FASTEN_AUDIT_DSN", &audit)])).unwrap();
+        let before = store_of(&e).unwrap();
+
+        let missing = dir.0.join("no-such-dir").join("s.db");
+        let new_audit = dir.0.join("new.db");
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", new_audit.display())),
+            ("FASTEN_SYSLOG_DSN", &format!("sqlite:///{}", missing.display())),
+        ]);
+        let err = e.init_with_env(config("dsn-o"), &vars).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)), "{err:?}");
+        let text = err.to_string();
+        assert_eq!(text, "FASTEN_SYSLOG_DSN: cannot open the sqlite store (NotFound)");
+        assert!(Arc::ptr_eq(&before, &store_of(&e).unwrap()));
+        assert!(!new_audit.exists(), "a failed init created the audit file");
+
+        // A store that fails to open names the variable and scheme, not the
+        // path or the driver's text.
+        let file = dir.0.join("plain-file");
+        std::fs::write(&file, b"not a database").unwrap();
+        let err = e
+            .init_with_env(config("dsn-o"), &env(&[("FASTEN_API_DSN", &format!("{}", file.display()))]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("FASTEN_API_DSN: cannot open the sqlite store ("), "{err}");
+        assert!(!err.contains("plain-file") && !err.contains(&dir.0.display().to_string()), "{err}");
+    }
+
+    // close releases the stores opened from DSNs, as JS's close does; a store
+    // passed in the config stays in use.
+    #[test]
+    fn close_releases_the_stores_opened_from_dsns() {
+        let dir = TempDir::new();
+        let e = Engine::new();
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", dir.0.join("a.db").display())),
+            ("FASTEN_SYSLOG_DSN", &format!("{}", dir.0.join("s.db").display())),
+        ]);
+        e.init_with_env(config("dsn-close"), &vars).unwrap();
+        let (audit, sys) = {
+            let cfg = e.current_config().unwrap();
+            (cfg.audit_store.unwrap(), cfg.syslog_store.unwrap())
+        };
+        assert!(e.close(std::time::Duration::from_secs(5)));
+        let cfg = e.current_config().unwrap();
+        assert!(cfg.audit_store.is_none() && cfg.syslog_store.is_none());
+        assert_eq!(Arc::strong_count(&audit), 1, "the audit store is still held");
+        assert_eq!(Arc::strong_count(&sys), 1, "the sys store is still held");
+        drop(cfg);
+
+        // The next init opens them again.
+        e.init_with_env(config("dsn-close"), &vars).unwrap();
+        assert!(!Arc::ptr_eq(&audit, &store_of(&e).unwrap()));
+
+        let mine: Arc<dyn AuditStore> = Arc::new(crate::SqliteStore::open(":memory:", "mine").unwrap());
+        e.init_with_env(Config { audit_store: Some(mine.clone()), ..config("dsn-close") }, &[]).unwrap();
+        e.close(std::time::Duration::from_secs(5));
+        assert!(Arc::ptr_eq(&mine, &store_of(&e).unwrap()));
+    }
+
+    #[cfg(feature = "store-postgres")]
+    #[test]
+    fn a_postgres_dsn_that_cannot_connect_names_the_variable_only() {
+        let e = Engine::new();
+        let err = e
+            .init_with_env(config("dsn-p"), &env(&[("FASTEN_AUDIT_DSN", "postgres://u:hunter2@127.0.0.1:1/db")]))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidConfig(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.starts_with("FASTEN_AUDIT_DSN: cannot open the postgres store ("), "{text}");
+        assert!(!text.contains("hunter2") && !text.contains("127.0.0.1"), "{text}");
     }
 
     #[test]

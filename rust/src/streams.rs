@@ -53,7 +53,8 @@ pub trait StreamStore: Send + Sync {
     /// since the first attempt may have committed.
     fn insert(&self, row: &StreamRow) -> Result<(), Error>;
 
-    /// Up to `limit` rows matching `filter`, newest first.
+    /// Up to `limit` rows matching `filter`, newest first; 0 means no
+    /// limit.
     fn query(&self, filter: &StreamFilter, limit: u32) -> Result<Vec<StreamRow>, Error>;
 
     /// How many rows match `filter`, with no limit.
@@ -65,8 +66,8 @@ pub trait StreamStore: Send + Sync {
     }
 
     /// Case-insensitive substring search of the stored JSON within
-    /// `[since, until]`, newest first (spec §9). `%`, `_` and `\` in `q`
-    /// match literally.
+    /// `[since, until]`, newest first (spec §9), at most `limit` rows (0
+    /// for all). `%`, `_` and `\` in `q` match literally.
     fn search(&self, q: &str, since: &str, until: Option<&str>, limit: u32) -> Result<Vec<StreamRow>, Error>;
 
     /// Delete rows with a timestamp before `before`; rows without one are
@@ -162,18 +163,21 @@ pub(crate) struct Stream {
     store: Option<Arc<dyn StreamStore>>,
     writer: Arc<Writer>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Whether the writer thread started. Without it rows are not queued.
+    has_writer: bool,
     write_failures: Arc<AtomicU64>,
     outage: Arc<Mutex<Outage>>,
 }
 
 impl Stream {
     pub(crate) fn new(name: &'static str, store: Option<Arc<dyn StreamStore>>) -> Self {
-        let s = Self {
+        let mut s = Self {
             name,
             ring: Ring::new(RING_SIZE),
             store,
             writer: Arc::new(Writer { queue: Mutex::new(Queue::default()), work: Condvar::new(), idle: Condvar::new() }),
             thread: Mutex::new(None),
+            has_writer: false,
             write_failures: Arc::new(AtomicU64::new(0)),
             outage: Arc::new(Mutex::new(Outage::default())),
         };
@@ -185,11 +189,13 @@ impl Stream {
                 failures: Arc::clone(&s.write_failures),
                 outage: Arc::clone(&s.outage),
             };
-            let handle = std::thread::Builder::new()
-                .name(format!("fasten-{name}-persist"))
-                .spawn(move || ctx.run())
-                .ok();
-            *s.thread.lock().unwrap_or_else(|e| e.into_inner()) = handle;
+            match std::thread::Builder::new().name(format!("fasten-{name}-persist")).spawn(move || ctx.run()) {
+                Ok(handle) => {
+                    *s.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                    s.has_writer = true;
+                }
+                Err(e) => stderr_line(&format!("fasten: {} persist writer not started: {:?}", s.label(), e.kind())),
+            }
         }
         s
     }
@@ -210,8 +216,19 @@ impl Stream {
             return;
         };
         self.ring.push(row.clone());
+        if !self.has_writer {
+            failed(self.label(), "NoWriter", store.as_ref(), &self.write_failures, &self.outage);
+            return;
+        }
         let mut q = self.writer.lock();
-        if q.rows.len() + usize::from(q.in_flight) >= MAX_PENDING || q.stop {
+        if q.stop {
+            // A push racing a re-init that retired this stream. The store
+            // may serve the next streams, so only this stream counts it.
+            drop(q);
+            self.write_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if q.rows.len() + usize::from(q.in_flight) >= MAX_PENDING {
             drop(q);
             failed(self.label(), "QueueFull", store.as_ref(), &self.write_failures, &self.outage);
             return;
@@ -223,7 +240,7 @@ impl Stream {
     /// Wait until every queued row has been written, or `deadline` passes.
     /// True when nothing is left.
     pub(crate) fn flush(&self, deadline: Instant) -> bool {
-        if self.store.is_none() {
+        if self.store.is_none() || !self.has_writer {
             return true;
         }
         let mut q = self.writer.lock();
@@ -277,7 +294,7 @@ impl Stream {
     pub(crate) fn query(&self, filter: &StreamFilter, limit: u32) -> Result<Vec<StreamRow>, Error> {
         match &self.store {
             Some(s) => s.query(filter, limit),
-            None => Ok(self.ring.query(filter, limit as usize)),
+            None => Ok(self.ring.query(filter, if limit == 0 { usize::MAX } else { limit as usize })),
         }
     }
 
@@ -457,7 +474,8 @@ impl StreamPurger {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let flag = Arc::clone(&stop);
         let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
-        let handle = std::thread::Builder::new()
+        let report = cfg.clone();
+        let spawned = std::thread::Builder::new()
             .name(format!("fasten-retention-{stream}"))
             .spawn(move || loop {
                 let before = Utc::now().checked_sub_signed(retention).unwrap_or(DateTime::<Utc>::MIN_UTC);
@@ -474,8 +492,17 @@ impl StreamPurger {
                 if *guard {
                     return;
                 }
-            })
-            .ok();
+            });
+        let handle = match spawned {
+            Ok(h) => Some(h),
+            Err(e) => {
+                crate::engine::sys_line(Some(&report), "error", "retention_purge_failed", serde_json::json!({
+                    "stream": format!("{stream}/age-purge"),
+                    "error_type": format!("{:?}", e.kind()),
+                }));
+                None
+            }
+        };
         Self { stop, handle }
     }
 
@@ -507,9 +534,10 @@ impl Drop for StreamPurger {
 
 /// A stream store for `dsn`, in the forms of [`crate::parse_dsn`]: a
 /// [`crate::PostgresStreamStore`] or a [`crate::SqliteStreamStore`], on
-/// `default_table` (`api_log` or `syslog`) unless the DSN names one. A
-/// scheme whose store feature is not built in is an error naming the
-/// feature. Errors never quote the DSN.
+/// `default_table` (`api_log` or `syslog`) unless the DSN names one. Every
+/// error is [`Error::InvalidConfig`] and names the scheme at most: a DSN
+/// that does not parse, a scheme whose store feature is not built in, or a
+/// store that cannot be opened.
 pub fn stream_store_from_dsn(dsn: &str, default_table: &str) -> Result<Arc<dyn StreamStore>, Error> {
     open_stream_store("stream DSN", dsn, default_table)
 }
@@ -517,18 +545,19 @@ pub fn stream_store_from_dsn(dsn: &str, default_table: &str) -> Result<Arc<dyn S
 /// [`stream_store_from_dsn`], with errors starting with `label`, such as
 /// the variable the DSN came from.
 pub(crate) fn open_stream_store(label: &str, dsn: &str, default_table: &str) -> Result<Arc<dyn StreamStore>, Error> {
-    use crate::dsn::Dsn;
-    match crate::parse_dsn(dsn, default_table).map_err(|e| Error::InvalidConfig(format!("{label}: {e}")))? {
+    let parsed = crate::parse_dsn(dsn, default_table).map_err(|e| Error::InvalidConfig(format!("{label}: {e}")))?;
+    crate::dsn::check_openable(label, &parsed)?;
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let failed = |e: Error| crate::dsn::open_failed(label, &parsed, &e);
+    match &parsed {
         #[cfg(feature = "store-postgres")]
-        Dsn::Postgres { url, table } => Ok(Arc::new(crate::PostgresStreamStore::new(&url, &table)?)),
-        #[cfg(not(feature = "store-postgres"))]
-        Dsn::Postgres { .. } => {
-            Err(Error::InvalidConfig(format!("{label}: a postgres DSN needs the store-postgres feature")))
-        }
+        crate::Dsn::Postgres { url, table } => Ok(Arc::new(crate::PostgresStreamStore::new(url, table).map_err(failed)?)),
         #[cfg(feature = "store-sqlite")]
-        Dsn::Sqlite { path, table, wal } => Ok(Arc::new(crate::SqliteStreamStore::open_with(&path, &table, wal)?)),
-        #[cfg(not(feature = "store-sqlite"))]
-        Dsn::Sqlite { .. } => Err(Error::InvalidConfig(format!("{label}: a sqlite DSN needs the store-sqlite feature"))),
+        crate::Dsn::Sqlite { path, table, wal } => {
+            Ok(Arc::new(crate::SqliteStreamStore::open_with(path, table, *wal).map_err(failed)?))
+        }
+        #[allow(unreachable_patterns)]
+        other => Err(crate::dsn::feature_missing(label, other)),
     }
 }
 
@@ -543,6 +572,20 @@ mod tests {
         assert!(is_sentinel(&id));
         assert!(!is_sentinel("bootstrap"));
         assert!(mint_sentinel("nope", "s").is_err());
+    }
+
+    // A push that races a re-init lands on the retired stream: it counts
+    // there, and the store, which the next streams may use, is not marked.
+    #[cfg(feature = "store-sqlite")]
+    #[test]
+    fn a_push_after_close_does_not_mark_the_store() {
+        let store: Arc<dyn StreamStore> = Arc::new(crate::SqliteStreamStore::open(":memory:", "syslog").unwrap());
+        let stream = Stream::new("sys", Some(store.clone()));
+        assert!(stream.close(Instant::now() + Duration::from_secs(5)));
+        stream.push(StreamRow::new());
+        assert!(!store.degraded());
+        assert_eq!(stream.source(), "store-degraded");
+        assert_eq!(Stream::new("sys", Some(store)).source(), "store");
     }
 
     #[test]

@@ -81,13 +81,15 @@ impl SqliteStore {
 
     /// The unshipped rows, ordered by `monotonic_seq`, read as the
     /// [`crate::Row`] type holds them: a detail number `serde_json` cannot
-    /// hold exactly is changed, and a redacted detail reads as empty. Ship
-    /// [`crate::AuditStore::list_unshipped_sealed`] instead, which keeps
-    /// each row as it was hashed. `limit == 0` returns all; `origin` is as
-    /// there.
+    /// hold exactly is changed, and a redacted detail reads as empty. A row
+    /// a `Row` cannot hold (a timestamp outside its range, a detail that is
+    /// not an object) fails the call with [`crate::Error::AuditStoreRead`].
+    /// Ship [`crate::AuditStore::list_unshipped_sealed`] instead, which
+    /// keeps each row as it was hashed. `limit == 0` returns all; `origin`
+    /// is as there.
     pub fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
         let rows = crate::AuditStore::list_unshipped_sealed(self, limit, origin)?;
-        Ok(rows.iter().map(crate::row_from_replicated).collect())
+        rows.iter().map(crate::row_from_replicated).collect()
     }
 
     /// Verify a batch of rows sealed on other nodes and store its verified
@@ -138,9 +140,8 @@ impl SqliteStore {
     /// hold.
     ///
     /// The row must have a hash, a non-zero `monotonic_seq`, and timestamps
-    /// the Python and Go stores can read back
-    /// ([`crate::replication::canonical_timestamp`]); timestamps are stored
-    /// in the canonical form. Its hash is not verified here: run
+    /// the Python and Go stores can read back (RFC 3339, years 1 to 9999 in
+    /// UTC); timestamps are stored in the canonical form. Its hash is not verified here: run
     /// [`crate::verify_chain`] over the batch first, or use
     /// [`SqliteStore::ingest_replicated`]. Storing the same row again is a
     /// no-op; a different row under a stored id, or another row at its node
@@ -239,7 +240,7 @@ impl crate::AuditStore for SqliteStore {
     fn purge(&self, before: chrono::DateTime<chrono::Utc>, respect_unshipped: bool) -> Result<u64, crate::Error> {
         self.inner
             .purge(&crate::canonical_ts(&before), respect_unshipped)
-            .map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
+            .map_err(|e| crate::Error::AuditStorePurge(e.to_string()))
     }
 
     fn query(&self, q: &crate::AuditQuery) -> Result<Vec<ChainRow>, crate::Error> {

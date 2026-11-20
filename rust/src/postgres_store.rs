@@ -68,6 +68,9 @@ fn differs(id: &str) -> crate::Error {
 
 const NODE_LOCK: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
+/// How long purge waits to learn whether an idle connection still works.
+const VALID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn ensure_schema(client: &mut pg::Client, schema: &str) -> Result<(), crate::Error> {
     let sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
     client.execute(&sql, &[]).map_err(pg_err)?;
@@ -243,7 +246,10 @@ fn inspect_columns(
 /// cannot be read. Either error is one the drainer retries, and the
 /// insert reads the row stored under its id first, so the retry never
 /// stores it twice. When the server is still down the call fails and the
-/// next one tries again.
+/// next one tries again. [`crate::AuditStore::purge`] is not run again:
+/// its count is what operators act on, and a second DELETE would count only
+/// what the first left. It returns [`crate::Error::AuditStorePurge`] saying
+/// the outcome is unknown, and the next call connects again.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -481,8 +487,8 @@ impl PostgresStore {
     /// hold. Timestamps are stored in the canonical form.
     ///
     /// The row must have a hash, a non-zero `monotonic_seq`, and timestamps
-    /// the Python and Go stores can read back
-    /// ([`crate::replication::canonical_timestamp`]). Its hash is not
+    /// the Python and Go stores can read back (RFC 3339, years 1 to 9999 in
+    /// UTC). Its hash is not
     /// verified here: run [`crate::verify_chain`] over the batch first, or
     /// use [`PostgresStore::ingest_replicated`]. Storing the same row again
     /// is a no-op; a different row under a stored id, or another row at its
@@ -509,11 +515,20 @@ impl PostgresStore {
         });
         match out {
             Ok(held) => check(held),
-            Err(Fail::Commit(e)) => match self.after_failed_commit(&row.source_node_id, &row.id)? {
-                Some(held) => check(Some(held)),
-                None => Err(e),
-            },
+            Err(Fail::Commit(e)) => self.sealed_after_failed_commit(row, e),
             Err(f) => Err(f.into()),
+        }
+    }
+
+    /// The outcome of `insert_sealed` for `row` after its COMMIT failed with
+    /// `e` on a lost connection: done when the row stored under its id has
+    /// its hash, the "differs" error when another row is stored there, and
+    /// `e` when none is.
+    fn sealed_after_failed_commit(&self, row: &ChainRow, e: crate::Error) -> Result<(), crate::Error> {
+        match self.after_failed_commit(&row.source_node_id, &row.id)? {
+            Some(held) if held.hash != row.hash => Err(differs(&row.id)),
+            Some(_) => Ok(()),
+            None => Err(e),
         }
     }
 
@@ -645,13 +660,15 @@ impl PostgresStore {
 
     /// The unshipped rows, ordered by `monotonic_seq`, read as the
     /// [`crate::Row`] type holds them: a detail number `serde_json` cannot
-    /// hold exactly is changed, and a redacted detail reads as empty. Ship
-    /// [`crate::AuditStore::list_unshipped_sealed`] instead, which keeps
-    /// each row as it was hashed. `limit == 0` returns all; `origin` is as
-    /// there.
+    /// hold exactly is changed, and a redacted detail reads as empty. A row
+    /// a `Row` cannot hold (a timestamp outside its range, a detail that is
+    /// not an object) fails the call with [`crate::Error::AuditStoreRead`].
+    /// Ship [`crate::AuditStore::list_unshipped_sealed`] instead, which
+    /// keeps each row as it was hashed. `limit == 0` returns all; `origin`
+    /// is as there.
     pub fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
         let rows = crate::AuditStore::list_unshipped_sealed(self, limit, origin)?;
-        Ok(rows.iter().map(crate::row_from_replicated).collect())
+        rows.iter().map(crate::row_from_replicated).collect()
     }
 
     /// Verify a batch of rows sealed on other nodes and store its verified
@@ -706,7 +723,7 @@ impl IngestTx for Ingest<'_, '_> {
             return Ok(None);
         };
         let owner = format!("node '{node}' seq {seq}");
-        Ok(Some(StoredRow { id: column(&r, 0, &owner)?, hash: column(&r, 1, &owner)?, prev_hash: column(&r, 2, &owner)? }))
+        Ok(Some(StoredRow::new(column(&r, 0, &owner)?, column(&r, 1, &owner)?, column(&r, 2, &owner)?)))
     }
 
     fn sealed_below(&mut self, node: &str, seq: u64) -> Result<bool, Fail> {
@@ -1024,7 +1041,7 @@ impl crate::AuditStore for PostgresStore {
             self.chain_columns(),
             self.table,
             where_of(&conds),
-            q.limit,
+            q.sql_limit(),
             i64::try_from(q.offset).unwrap_or(i64::MAX)
         );
         let refs: Vec<&(dyn ToSql + Sync)> = values.iter().map(AsRef::as_ref).collect();
@@ -1058,7 +1075,7 @@ impl crate::AuditStore for PostgresStore {
             self.chain_columns(),
             self.table,
             where_of(&conds),
-            s.limit
+            s.sql_limit()
         );
         let refs: Vec<&(dyn ToSql + Sync)> = values.iter().map(AsRef::as_ref).collect();
         self.chain_query(&sql, &refs)
@@ -1078,14 +1095,14 @@ impl crate::AuditStore for PostgresStore {
         self.retry(|client| client.query(sql.as_str(), &refs).map_err(read))?
             .iter()
             .map(|r| {
-                Ok(crate::Source {
-                    source_node_id: column(r, 0, "source")?,
-                    service_id: column(r, 1, "source")?,
-                    tenant_id: column(r, 2, "source")?,
-                    rows: column::<i64>(r, 3, "source")?.unsigned_abs(),
-                    first_seen: column(r, 4, "source")?,
-                    last_seen: column(r, 5, "source")?,
-                })
+                Ok(crate::Source::new(
+                    column(r, 0, "source")?,
+                    column(r, 1, "source")?,
+                    column(r, 2, "source")?,
+                    column::<i64>(r, 3, "source")?.unsigned_abs(),
+                    column(r, 4, "source")?,
+                    column(r, 5, "source")?,
+                ))
             })
             .collect()
     }
@@ -1127,9 +1144,28 @@ impl crate::AuditStore for PostgresStore {
         let param = format!("$1::text{}", self.cols.ts_cast);
         let sql = fasten_core::store::purge_sql(&self.table, &param, respect_unshipped, true);
         let before = crate::canonical_ts(&before);
-        // Run again after a lost connection, it deletes what is left of the
-        // same rows.
-        Ok(self.retry(|client| client.execute(&sql as &str, &[&before]).map_err(write))?)
+        let failed = |e: pg::Error| crate::Error::AuditStorePurge(match e.as_db_error() {
+            Some(db) => format!("{e}: {}", db.message()),
+            None => e.to_string(),
+        });
+        let mut client = self.lock();
+        // A connection that ended while idle is replaced before the DELETE.
+        if client.is_closed() || client.is_valid(VALID_TIMEOUT).is_err() {
+            *client = connect(&self.dsn).map_err(|e| crate::Error::AuditStorePurge(e.to_string()))?;
+        }
+        // Not run again after a lost connection: the DELETE may have
+        // committed, and a second run would return only what it deleted.
+        client.execute(&sql as &str, &[&before]).map_err(|e| {
+            if connection_lost(&e) || client.is_closed() {
+                crate::Error::AuditStorePurge(
+                    "the connection was lost while the purge ran, so how many rows it deleted is unknown; \
+                     run it again"
+                        .into(),
+                )
+            } else {
+                failed(e)
+            }
+        })
     }
 
     fn chain_tail(&self, source_node_id: &str, limit: u32) -> Result<Vec<ChainRow>, crate::Error> {
@@ -2252,5 +2288,81 @@ mod tests {
         let result =
             PostgresStore::new("host=127.0.0.1 port=1 user=nobody dbname=nobody", "audit");
         assert!(result.is_err(), "expected error for unreachable host");
+    }
+
+    /// A store on its own table whose connection is named after the table,
+    /// and a row sealed on a node of its own.
+    fn named_store(dsn: &str) -> (std::sync::Arc<PostgresStore>, String, crate::replication_tests::pg::DropTable) {
+        let table = crate::replication_tests::pg::table("readback");
+        let sep = if dsn.contains('?') { '&' } else { '?' };
+        let store = PostgresStore::new(&format!("{dsn}{sep}application_name={table}"), table.clone()).unwrap();
+        (std::sync::Arc::new(store), table.clone(), crate::replication_tests::pg::DropTable(dsn.to_string(), table))
+    }
+
+    fn sealed(id: &str, node: &str, target: &str) -> ChainRow {
+        let mut r = make_row(id, "READBACK");
+        r.source_node_id = node.into();
+        r.target = target.into();
+        let core = crate::engine::sdk_row_to_core(&r);
+        fasten_core::chain::seal(GENESIS, &ChainRow::from(&core)).unwrap()
+    }
+
+    // The read-back after a failed COMMIT finds a row another client stored,
+    // refuses a different row under the id, and reports the COMMIT's error
+    // when nothing is stored.
+    #[test]
+    fn the_commit_read_back_finds_what_another_client_stored() {
+        let Some(dsn) = dsn() else { return };
+        let (store, _app, _drop) = named_store(&dsn);
+        let node = uniq("node");
+        let row = sealed("rb-1", &node, "t");
+        assert!(store.after_failed_commit(&node, "rb-1").unwrap().is_none());
+        let lost = || crate::Error::AuditStoreInsert("lost".into());
+        assert!(matches!(store.sealed_after_failed_commit(&row, lost()), Err(crate::Error::AuditStoreInsert(m)) if m == "lost"));
+
+        let other = PostgresStore::new(&dsn, store.table.clone()).unwrap();
+        other.insert_sealed(&row, false).unwrap();
+        let found = store.after_failed_commit(&node, "rb-1").unwrap().expect("the row another client stored");
+        assert_eq!(found.hash, row.hash);
+        store.sealed_after_failed_commit(&row, lost()).unwrap();
+
+        let differs = sealed("rb-1", &node, "another target");
+        let err = store.sealed_after_failed_commit(&differs, lost()).unwrap_err();
+        assert!(matches!(&err, crate::Error::AuditStoreRejected(m) if m.contains("differs")), "{err:?}");
+    }
+
+    // The read-back takes the node's lock, so it waits while a writer holds
+    // it, and reads once the lock is let go.
+    #[test]
+    fn the_commit_read_back_waits_for_the_node_lock() {
+        let Some(dsn) = dsn() else { return };
+        let (store, app, _drop) = named_store(&dsn);
+        let node = uniq("node");
+        let row = sealed("rb-2", &node, "t");
+        PostgresStore::new(&dsn, store.table.clone()).unwrap().insert_sealed(&row, false).unwrap();
+        let mut holder = pg::Client::connect(&dsn, pg::NoTls).unwrap();
+        holder.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&node]).unwrap();
+        let reader = {
+            let (store, node) = (store.clone(), node.clone());
+            std::thread::spawn(move || store.after_failed_commit(&node, "rb-2"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting = holder
+                .query(
+                    "SELECT 1 FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'",
+                    &[&app],
+                )
+                .unwrap();
+            if !waiting.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the read-back never waited on the node lock");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!reader.is_finished());
+        holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&node]).unwrap();
+        let found = reader.join().unwrap().unwrap().expect("the stored row");
+        assert_eq!(found.hash, row.hash);
     }
 }
