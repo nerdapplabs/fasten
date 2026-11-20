@@ -106,8 +106,9 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The query parameters, decoded, in order.
-fn params(query: &str) -> Vec<(String, String)> {
+/// The query parameters, decoded (`+` is a space), in order. A key
+/// without `=` has an empty value.
+pub(crate) fn params(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|p| !p.is_empty())
@@ -266,6 +267,19 @@ mod tests {
         }
         let debug = format!("{:?}", parse_dsn("postgres://u:s3cret@db/app", "t").unwrap());
         assert!(!debug.contains("s3cret"), "{debug}");
+    }
+
+    #[test]
+    fn query_decoding() {
+        assert_eq!(decode("a%20b%zz%4"), "a b%zz%4");
+        assert_eq!(decode("%e2%82%ac"), "€");
+        assert_eq!(params("a=1&b&c=x+y&a=2&d=%2B"), vec![
+            ("a".into(), "1".into()),
+            ("b".into(), String::new()),
+            ("c".into(), "x y".into()),
+            ("a".into(), "2".into()),
+            ("d".into(), "+".into()),
+        ]);
     }
 
     #[test]

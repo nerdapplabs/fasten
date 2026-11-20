@@ -38,6 +38,14 @@ pub use dsn::{audit_store_from_dsn, parse_dsn, Dsn, DsnError};
 /// fasten-core: the rows a node ships and the result of ingesting a batch.
 /// See [`list_unshipped`], [`mark_shipped`] and [`ingest_replicated`].
 pub use fasten_core::replication::{self, IngestResult, ReplicatedRow};
+/// Filters and results of the audit reads the HTTP reader uses, re-exported
+/// from fasten-core.
+pub use fasten_core::store::{AuditQuery, AuditSearch, Source};
+
+pub mod streams;
+pub use streams::{is_sentinel, mint_sentinel, stream_store_from_dsn, StreamFilter, StreamRow, StreamStore};
+
+pub mod reader;
 
 pub mod checkpoints;
 pub use checkpoints::{
@@ -64,6 +72,9 @@ impl From<AuditStoreError> for Error {
 /// Block until pending audit rows drain (or `timeout` elapses).
 /// Returns `true` at once when no drainer is installed.
 pub fn flush(timeout: std::time::Duration) -> bool { DEFAULT.flush(timeout) }
+
+/// Flush within `timeout`, then stop background work (see [`Engine::close`]).
+pub fn close(timeout: std::time::Duration) -> bool { DEFAULT.close(timeout) }
 
 /// Snapshot of the active drainer, or `None` when none is installed.
 pub fn queue_stats() -> Option<QueueStats> { DEFAULT.queue_stats() }
@@ -351,6 +362,13 @@ pub enum Error {
     Unsupported(String),
     #[error("{0}")]
     InvalidRetention(String),
+    /// A configuration `init` refuses, such as `persist_streams` naming a
+    /// stream without a store, or a stream DSN it cannot use.
+    #[error("{0}")]
+    InvalidConfig(String),
+    /// A stream store write or read failed.
+    #[error("stream store: {0}")]
+    StreamStore(String),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     /// A checkpoint file could not be read or written. Names the path.
@@ -650,6 +668,10 @@ pub mod log {
     pub fn error(event: &str, fields: serde_json::Value) { write("error", event, fields); }
     pub fn debug(event: &str, fields: serde_json::Value) { write("debug", event, fields); }
 
+    /// An api row: written to stdout as `{"shape":"api",...}` and kept in
+    /// the api stream. See [`crate::Engine::log_api`].
+    pub fn api(fields: serde_json::Value) { super::DEFAULT.log_api(fields); }
+
     /// Variant for callers without serde_json::json! at hand.
     pub fn info_with<T: Serialize>(event: &str, fields: &T) {
         let v = serde_json::to_value(fields).unwrap_or(serde_json::Value::Null);
@@ -819,6 +841,43 @@ pub trait AuditStore: Send + Sync {
     fn purge(&self, _before: DateTime<Utc>, _respect_unshipped: bool) -> Result<u64, Error> {
         Err(Error::Unsupported("purge".into()))
     }
+
+    // The reads below serve the HTTP reader ([`reader::Reader`]). Each
+    // returns rows read as stored, so detail numbers are the tokens that
+    // were hashed. A store without one returns `Unsupported`, and the
+    // reader reports what it cannot serve.
+
+    /// Rows matching `q`, newest first (timestamp, then `monotonic_seq`).
+    fn query(&self, _q: &AuditQuery) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("query".into()))
+    }
+
+    /// How many rows match `q`, ignoring `limit`, `offset` and `after_seq`.
+    fn count(&self, _q: &AuditQuery) -> Result<u64, Error> {
+        Err(Error::Unsupported("count".into()))
+    }
+
+    /// Case-insensitive substring search of `detail` (spec persistent-streams.md §9).
+    fn search(&self, _s: &AuditSearch) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("search".into()))
+    }
+
+    /// Rows written per node, service and tenant within `[since, until]`
+    /// (canonical timestamps), busiest first.
+    fn sources(&self, _since: Option<&str>, _until: Option<&str>) -> Result<Vec<Source>, Error> {
+        Err(Error::Unsupported("sources".into()))
+    }
+
+    /// The node's newest `limit` rows by `monotonic_seq`, oldest first: the
+    /// doctor's chain sample.
+    fn chain_tail(&self, _source_node_id: &str, _limit: u32) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("chain_tail".into()))
+    }
+
+    /// A short name for the store, which `/audit/doctor` reports.
+    fn kind(&self) -> &str {
+        "AuditStore"
+    }
 }
 
 /// A replicated row read as a [`Row`]: a detail number `serde_json` cannot
@@ -900,6 +959,28 @@ pub struct Config {
     /// their detail redacted once older than this (spec §7). Needs an audit
     /// store. None falls back to `FASTEN_RETENTION_PII`.
     pub retention_pii: Option<String>,
+    /// Store for the api stream (spec persistent-streams.md). None falls
+    /// back to `FASTEN_API_DSN`; with neither, api rows are kept in memory
+    /// only.
+    pub api_store: Option<Arc<dyn StreamStore>>,
+    /// Store for the sys stream. None falls back to `FASTEN_SYSLOG_DSN`.
+    pub syslog_store: Option<Arc<dyn StreamStore>>,
+    /// Streams ("api", "sys") that must have a store. When set, `init`
+    /// fails unless it names exactly the streams with a store attached.
+    /// None falls back to `FASTEN_PERSIST_STREAMS` (comma-separated), and
+    /// without that any attached store is used. Audit persistence follows
+    /// `audit_store` alone.
+    pub persist_streams: Option<Vec<String>>,
+    /// Allow free-text search (`/search`, `/sys?q=`), a linear scan. Also on
+    /// when `FASTEN_SEARCH_ENABLED` is 1, true or yes.
+    pub search_enabled: bool,
+    /// Max age of api stream rows, e.g. `"7d"`; older rows are deleted
+    /// hourly. Needs an api store. None falls back to `FASTEN_RETENTION_API`.
+    /// Audit rows are never deleted for age.
+    pub retention_api: Option<String>,
+    /// Max age of sys stream rows. None falls back to
+    /// `FASTEN_RETENTION_SYSLOG`.
+    pub retention_syslog: Option<String>,
 }
 
 /// Read env vars; return Config.
@@ -2530,11 +2611,28 @@ mod pg_recovery_tests;
 #[cfg(feature = "store-sqlite")]
 pub use sqlite_store::SqliteStore;
 
+#[cfg(feature = "store-sqlite")]
+pub mod stream_sqlite;
+#[cfg(feature = "store-sqlite")]
+pub use stream_sqlite::SqliteStreamStore;
+
+#[cfg(feature = "store-postgres")]
+pub mod stream_postgres;
+#[cfg(feature = "store-postgres")]
+pub use stream_postgres::PostgresStreamStore;
+
 // Yaml catalogs, behind the `codes-yaml` feature:
 //
 //   fasten-sdk = { version = "1", features = ["codes-yaml"] }
 //   fasten::codes::load("fleet.codes.yaml")?;
 //   fasten::codes::reload()?;
+
+#[cfg(all(test, feature = "store-sqlite"))]
+mod test_support;
+#[cfg(all(test, feature = "store-sqlite"))]
+mod reader_tests;
+#[cfg(all(test, feature = "store-sqlite"))]
+mod stream_tests;
 
 #[cfg(feature = "codes-yaml")]
 pub mod codes_yaml;

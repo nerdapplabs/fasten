@@ -529,6 +529,16 @@ impl PostgresStore {
         )
     }
 
+    /// The n-th parameter compared with `timestamp`, cast for a table that
+    /// keeps it as TIMESTAMPTZ.
+    fn ts_param(&self, n: usize) -> String {
+        if self.cols.ts_cast.is_empty() {
+            format!("${n}")
+        } else {
+            format!("${n}::text::timestamptz")
+        }
+    }
+
     fn chain_query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<ChainRow>, crate::Error> {
         self.retry(|client| client.query(sql, params).map_err(read))?.iter().map(chain_row).collect()
     }
@@ -723,6 +733,14 @@ fn connect(dsn: &str) -> Result<pg::Client, crate::Error> {
         fasten_core::error::Error::Postgres(e) => pg_err(e),
         other => crate::Error::AuditStoreInsert(other.to_string()),
     })
+}
+
+fn where_of(conds: &[String]) -> String {
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    }
 }
 
 /// Column `idx` of `r`, which belongs to the row or node `owner` names. A
@@ -993,6 +1011,85 @@ impl crate::AuditStore for PostgresStore {
             .collect()
     }
 
+    fn query(&self, q: &crate::AuditQuery) -> Result<Vec<ChainRow>, crate::Error> {
+        let (mut conds, params) = q.conditions("source_node_id", |n| self.ts_param(n), |n| format!("${n}"));
+        let mut values: Vec<Box<dyn ToSql + Sync>> = params.into_iter().map(|p| Box::new(p) as Box<dyn ToSql + Sync>).collect();
+        if q.after_seq > 0 {
+            values.push(Box::new(i64::try_from(q.after_seq).unwrap_or(i64::MAX)));
+            conds.push(format!("monotonic_seq < ${}", values.len()));
+        }
+        // LIMIT and OFFSET are integers, so writing them into the SQL is safe.
+        let sql = format!(
+            "SELECT {} FROM {} {} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT {} OFFSET {}",
+            self.chain_columns(),
+            self.table,
+            where_of(&conds),
+            q.limit,
+            i64::try_from(q.offset).unwrap_or(i64::MAX)
+        );
+        let refs: Vec<&(dyn ToSql + Sync)> = values.iter().map(AsRef::as_ref).collect();
+        self.chain_query(&sql, &refs)
+    }
+
+    fn count(&self, q: &crate::AuditQuery) -> Result<u64, crate::Error> {
+        let (conds, params) = q.conditions("source_node_id", |n| self.ts_param(n), |n| format!("${n}"));
+        let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let sql = format!("SELECT COUNT(*) FROM {} {}", self.table, where_of(&conds));
+        let n: i64 = self.retry(|client| client.query_one(sql.as_str(), &refs).map_err(read))?.get(0);
+        Ok(n.unsigned_abs())
+    }
+
+    fn search(&self, s: &crate::AuditSearch) -> Result<Vec<ChainRow>, crate::Error> {
+        let since = if self.cols.ts_cast.is_empty() { "COALESCE(timestamp, '')" } else { "timestamp" };
+        // E'\\' is one backslash whatever standard_conforming_strings says.
+        let mut conds = vec![format!("{since} >= {}", self.ts_param(1)), "detail::text ILIKE $2 ESCAPE E'\\\\'".to_string()];
+        let mut values: Vec<Box<dyn ToSql + Sync>> =
+            vec![Box::new(s.since.clone()), Box::new(fasten_core::store::stream::like_pattern(&s.q))];
+        if let Some(u) = s.until.as_deref().filter(|u| !u.is_empty()) {
+            values.push(Box::new(u.to_string()));
+            conds.push(format!("{since} <= {}", self.ts_param(values.len())));
+        }
+        if let Some(t) = &s.tenant_id {
+            values.push(Box::new(t.clone()));
+            conds.push(format!("tenant_id = ${}", values.len()));
+        }
+        let sql = format!(
+            "SELECT {} FROM {} {} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT {}",
+            self.chain_columns(),
+            self.table,
+            where_of(&conds),
+            s.limit
+        );
+        let refs: Vec<&(dyn ToSql + Sync)> = values.iter().map(AsRef::as_ref).collect();
+        self.chain_query(&sql, &refs)
+    }
+
+    fn sources(&self, since: Option<&str>, until: Option<&str>) -> Result<Vec<crate::Source>, crate::Error> {
+        let q = crate::AuditQuery { since: since.map(str::to_string), until: until.map(str::to_string), ..Default::default() };
+        let (conds, params) = q.conditions("source_node_id", |n| self.ts_param(n), |n| format!("${n}"));
+        let ts = Columns::canonical(self.cols.ts_cast, "timestamp");
+        let sql = format!(
+            "SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, MIN({ts}), MAX({ts}) FROM {} {} \
+             GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC, source_node_id, service_id",
+            self.table,
+            where_of(&conds)
+        );
+        let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        self.retry(|client| client.query(sql.as_str(), &refs).map_err(read))?
+            .iter()
+            .map(|r| {
+                Ok(crate::Source {
+                    source_node_id: column(r, 0, "source")?,
+                    service_id: column(r, 1, "source")?,
+                    tenant_id: column(r, 2, "source")?,
+                    rows: column::<i64>(r, 3, "source")?.unsigned_abs(),
+                    first_seen: column(r, 4, "source")?,
+                    last_seen: column(r, 5, "source")?,
+                })
+            })
+            .collect()
+    }
+
     fn mark_shipped(&self, ids: &[String]) -> Result<(), crate::Error> {
         if ids.is_empty() {
             return Ok(());
@@ -1033,6 +1130,21 @@ impl crate::AuditStore for PostgresStore {
         // Run again after a lost connection, it deletes what is left of the
         // same rows.
         Ok(self.retry(|client| client.execute(&sql as &str, &[&before]).map_err(write))?)
+    }
+
+    fn chain_tail(&self, source_node_id: &str, limit: u32) -> Result<Vec<ChainRow>, crate::Error> {
+        let sql = format!(
+            "SELECT {} FROM {} WHERE source_node_id = $1 ORDER BY monotonic_seq DESC LIMIT {limit}",
+            self.chain_columns(),
+            self.table
+        );
+        let mut rows = self.chain_query(&sql, &[&source_node_id])?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    fn kind(&self) -> &str {
+        "PostgresStore"
     }
 }
 
