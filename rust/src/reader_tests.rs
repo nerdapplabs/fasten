@@ -285,6 +285,37 @@ fn exact_numbers_and_text_come_back() {
     }
 }
 
+// Rows another node sealed and this engine ingested are served as stored,
+// and the doctor verifies that node's chain.
+#[test]
+fn replicated_rows_are_read_and_verified() {
+    let python = crate::replication_tests::vector("python-sealed-forms.json");
+    let sent = python.iter().find(|r| r.row.id == "evt-form2_numbers").unwrap().clone();
+    for b in backends() {
+        let env = setup(&b, None);
+        emit(env.engine, "own", "rid-own", json!({}));
+        let result = env.engine.ingest_replicated(std::slice::from_ref(&sent)).unwrap();
+        assert_eq!((result.inserted, result.rejected_from_seq), (1, None), "{} {:?}", b.label(), result.reason);
+
+        let audit = get(&env.reader(), "/audit?source_node_id=node-1");
+        assert_eq!(audit.status, 200, "{}", audit.body);
+        let body = audit.json();
+        assert_eq!(body["total"], 1, "{} {body}", b.label());
+        assert_eq!(body["rows"][0]["id"], "evt-form2_numbers");
+        assert_eq!(body["rows"][0]["hash"], sent.row.hash.as_str());
+        assert!(audit.body.contains(r#""bigint":12345678901234567890"#), "{}", audit.body);
+        assert!(audit.body.contains(r#""whole":75.0"#), "{}", audit.body);
+
+        let doctor = get_ok(&env.builder().node_id("node-1").build().unwrap(), "/audit/doctor");
+        assert_eq!(doctor["chain"]["verified"], true, "{} {doctor}", b.label());
+        assert_eq!(doctor["chain"]["sealed_rows"], 1);
+        assert_eq!(doctor["store"]["rows"], 2);
+        let own = get_ok(&env.reader(), "/audit/doctor");
+        assert_eq!(own["chain"]["verified"], true, "{} {own}", b.label());
+        assert_eq!(own["chain"]["sealed_rows"], 1);
+    }
+}
+
 #[test]
 fn streams_correlate_topology() {
     for b in backends() {

@@ -453,7 +453,8 @@ fn an_offset_timestamp_is_stored_in_the_wire_form() {
     }
 }
 
-fn vector(file: &str) -> Vec<ReplicatedRow> {
+/// The rows of a vector file in spec/.
+pub(crate) fn vector(file: &str) -> Vec<ReplicatedRow> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec").join(file);
     let parsed = crate::Json::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
     let rows: Vec<crate::Json> = match parsed.get("cases") {
