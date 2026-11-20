@@ -7,8 +7,10 @@ import type { StreamFilter, StreamRow, StreamStore } from "../index.js";
  */
 export class PostgresStreamStore implements StreamStore {
 	/**
-	 * @param connection A libpq DSN or connection URL, or a pg Pool (close()
-	 *   leaves a pool it was given open).
+	 * Nothing connects until init() or the first call.
+	 * @param connection A postgres:// connection URL, or a pg Pool, for
+	 *   example one shared with PostgresStore (close() leaves a pool it was
+	 *   given open).
 	 * @param opts.table Required, optionally schema-qualified: "api_log",
 	 *   "syslog".
 	 */
@@ -17,7 +19,11 @@ export class PostgresStreamStore implements StreamStore {
 		opts: { table: string },
 	);
 	init(): Promise<void>;
-	/** Inserts run in the order they were called. */
+	/**
+	 * Inserts run in the order they were called. An insert that meets a
+	 * lost connection fails rather than running again, so a row is never
+	 * stored twice.
+	 */
 	insert(row: StreamRow): Promise<void>;
 	noteWriteFailure(): void;
 	readonly writeFailures: number;
@@ -31,6 +37,7 @@ export class PostgresStreamStore implements StreamStore {
 		until?: string | null;
 		limit?: number;
 	}): Promise<StreamRow[]>;
+	/** before is a Date or a timestamp in any offset, canonicalised. */
 	purge(opts: { before: Date | string }): Promise<number>;
 	close(): Promise<void>;
 }

@@ -386,6 +386,16 @@ export function uninstallDrainer(timeoutMs) {
 	return _defaultEngine?._uninstallDrainer(timeoutMs) ?? Promise.resolve(true);
 }
 
+// A sys line through the default engine, for code with no engine of its
+// own, such as the stores. Never throws.
+export function sysLog(level, event, fields) {
+	try {
+		_defaultEngine?._drainerSysLog(level, event, fields);
+	} catch {
+		// Logging must not fail the caller.
+	}
+}
+
 export function activeDrainer() {
 	return _defaultEngine?._drainer ?? null;
 }

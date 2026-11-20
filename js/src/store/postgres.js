@@ -41,16 +41,18 @@ import {
 	CHAIN_COLUMNS,
 	chainRow,
 	chainTipsSQL,
+	cutoffTS,
 	differs,
 	mapRow,
 	seqHeld,
 	snakeRow,
+	unshippedIdentity,
 } from "./rows.js";
 
 // pg is an optional peer dependency, so import it only when first needed.
 let _Pool = null;
 let _types = null;
-async function _getPool(connectionString) {
+async function _loadPg() {
 	if (!_Pool) {
 		const mod = await import("pg");
 		const pg = mod.default ?? mod;
@@ -58,7 +60,8 @@ async function _getPool(connectionString) {
 		const base = pg.types;
 		// timestamptz (1184) and timestamp (1114) as text: a Date keeps only
 		// milliseconds, so a Go-written .123456 would come back as .123000.
-		// Set on this pool only, not on pg globally.
+		// Passed with each query, so a pool shared with other code keeps
+		// its own parsers.
 		_types = {
 			getTypeParser: (oid, format) =>
 				oid === 1184 || oid === 1114
@@ -66,8 +69,10 @@ async function _getPool(connectionString) {
 					: base.getTypeParser(oid, format),
 		};
 	}
-	return watchPool(new _Pool({ connectionString, types: _types }));
 }
+
+// `sql` and `params` as a query config with this module's type parsers.
+const _config = (sql, params) => ({ text: sql, values: params, types: _types });
 
 // "2026-08-21 10:00:00.123456+05:30" → "2026-08-21T04:30:00.123456Z".
 // A timestamp with no offset is UTC.
@@ -228,23 +233,29 @@ function _buildWhere(filters) {
 
 export class PostgresStore {
 	/**
-	 * @param {string} connectionString  libpq-compatible DSN or connection URL.
+	 * Nothing connects until init() or the first call, which runs the DDL.
+	 *
+	 * @param {string | { query: Function, connect: Function }} connection
+	 *   libpq-compatible DSN or connection URL, or a pg Pool to use (close()
+	 *   leaves it open), for example one shared with PostgresStreamStore.
 	 * @param {{ table?: string }} [opts]
 	 */
-	constructor(connectionString, { table = "audit_log" } = {}) {
+	constructor(connection, { table = "audit_log" } = {}) {
 		if (!_SAFE_IDENTIFIER.test(table)) {
 			throw new Error(
 				`fasten PostgresStore: table name ${JSON.stringify(table)} is not a valid SQL identifier. Use only letters, digits, underscores, and an optional 'schema.' prefix.`,
 			);
 		}
-		this._connectionString = connectionString;
+		this._ownPool = typeof connection === "string";
+		this._connectionString = this._ownPool ? connection : null;
 		this._table = table;
 		// Index names can't contain the schema prefix.
 		this._idx = table.includes(".") ? table.split(".").pop() : table;
 		this._schema = table.includes(".")
 			? table.split(".").slice(0, -1).join(".")
 			: null;
-		this._pool = null;
+		/** @type {any} */
+		this._pool = this._ownPool ? null : connection;
 		this._ready = null;
 	}
 
@@ -254,7 +265,12 @@ export class PostgresStore {
 	 * @returns {Promise<void>}
 	 */
 	async init() {
-		if (!this._pool) this._pool = await _getPool(this._connectionString);
+		await _loadPg();
+		if (!this._pool) {
+			this._pool = watchPool(
+				new _Pool({ connectionString: this._connectionString }),
+			);
+		}
 		try {
 			await retryLost(this._pool, () =>
 				this._transaction(async (client) => {
@@ -651,10 +667,11 @@ export class PostgresStore {
 		}));
 	}
 
-	// pool.query, run again on a lost connection: every query outside
-	// a transaction is a single statement that can run twice.
+	// pool.query, run again on a lost connection. Only for a statement
+	// whose second run does what one run does: a read, or an UPDATE or
+	// DELETE that sets or removes the same rows again.
 	async _query(sql, params) {
-		return retryLost(this._pool, () => this._pool.query(sql, params));
+		return retryLost(this._pool, () => this._pool.query(_config(sql, params)));
 	}
 
 	// Run fn(client) in a transaction and return what it returns. A failed
@@ -662,10 +679,13 @@ export class PostgresStore {
 	// is released with the error, so the pool discards it.
 	async _transaction(fn) {
 		const client = await checkout(this._pool);
+		const tx = {
+			query: (sql, params) => client.query(_config(sql, params)),
+		};
 		let broken;
 		try {
 			await client.query("BEGIN");
-			const out = await fn(client);
+			const out = await fn(tx);
 			try {
 				await client.query("COMMIT");
 			} catch (err) {
@@ -937,13 +957,15 @@ export class PostgresStore {
 	 * originated (`origin_id = id`), so rows ingested from other nodes are
 	 * not shipped again (spec §4). With `exact`, rows as `chainRows` reads
 	 * them, detail numbers as the tokens that were hashed: ship those, as
-	 * `JSON.stringify` writes them, so the receiver verifies them.
+	 * `JSON.stringify` writes them, so the receiver verifies them. Throws
+	 * when only one of `serviceId` and `sourceNodeId` is given.
 	 *
 	 * @param {number} [limit]
 	 * @param {{ serviceId?: string, sourceNodeId?: string, exact?: boolean }} [opts]
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
 	async listUnshipped(limit = 100, { serviceId, sourceNodeId, exact } = {}) {
+		unshippedIdentity(serviceId, sourceNodeId);
 		await this._ensureReady();
 		const scoped = serviceId != null && sourceNodeId != null;
 		const cols = exact ? CHAIN_COLUMNS : "*";
@@ -976,12 +998,14 @@ export class PostgresStore {
 	 * Delete rows whose timestamp is before `before`, per node only a seq
 	 * prefix (spec §2.3): rows above a kept row stay, so the rows left still
 	 * verify. When respectUnshipped is true (default), unshipped rows are kept,
-	 * and so are the rows above them.
+	 * and so are the rows above them. `before` is a Date or a timestamp,
+	 * canonicalised.
 	 *
-	 * @param {{ before: string, respectUnshipped?: boolean }} opts
+	 * @param {{ before: Date | string, respectUnshipped?: boolean }} opts
 	 * @returns {Promise<number>}  Number of rows deleted.
 	 */
 	async purge({ before, respectUnshipped = true }) {
+		const cutoff = cutoffTS("PostgresStore", before);
 		await this._ensureReady();
 		// Rows at seq 0 are not chained and go by age alone. Each node's
 		// lowest kept seq is one walk up the (source_node_id, monotonic_seq)
@@ -995,7 +1019,7 @@ export class PostgresStore {
 			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
 			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
 			`DELETE FROM ${t} AS d USING bound WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < $1${shipped}`;
-		const res = await this._query(sql, [before]);
+		const res = await this._query(sql, [cutoff]);
 		return res.rowCount ?? 0;
 	}
 
@@ -1012,13 +1036,7 @@ export class PostgresStore {
 		if (!codes || codes.length === 0) return { candidates: [], skipped: 0 };
 		await this._ensureReady();
 		// timestamp is compared as text, so the cutoff must be canonical too.
-		const d = before instanceof Date ? before : new Date(before);
-		if (Number.isNaN(d.getTime())) {
-			throw new Error(
-				`fasten PostgresStore: bad before ${JSON.stringify(before)}`,
-			);
-		}
-		const cutoff = canonicalTS(d);
+		const cutoff = cutoffTS("PostgresStore", before);
 		const skippedRes = await this._query(
 			`SELECT COUNT(*) FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND hash <> '' AND canonical_form_id <> '2'`,
 			[cutoff, codes],
@@ -1059,10 +1077,10 @@ export class PostgresStore {
 	}
 
 	/**
-	 * Close the underlying connection pool.
+	 * Close the connection pool, unless it was passed in.
 	 * @returns {Promise<void>}
 	 */
 	async close() {
-		await this._pool?.end();
+		if (this._ownPool) await this._pool?.end();
 	}
 }

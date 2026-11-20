@@ -117,7 +117,29 @@ function _windowTS(name, s) {
 
 function _int(name, s) {
 	if (!/^[+-]?\d+$/.test(s)) throw unprocessable(`${name} must be an integer`);
-	return Number(s);
+	const n = Number(s);
+	if (!Number.isSafeInteger(n)) {
+		throw unprocessable(
+			`${name} must be between ${Number.MIN_SAFE_INTEGER} and ${Number.MAX_SAFE_INTEGER}`,
+		);
+	}
+	return n;
+}
+
+// The path as sent, up to "?". A path with an empty, "." or ".." segment,
+// a backslash, or "%2e", "%2f" or "%5c" is not one the reader serves:
+// URL parsing would read it as another path than a router in front sees.
+function _rawPath(url) {
+	const path = url.split("?")[0];
+	if (
+		path.includes("//") ||
+		path.includes("\\") ||
+		/\/\.\.?(\/|$)/.test(path) ||
+		/%(2e|2f|5c)/i.test(path)
+	) {
+		return null;
+	}
+	return path;
 }
 
 function _limit(s, def, max) {
@@ -162,7 +184,7 @@ function _storeStream(store) {
 		};
 	}
 	return {
-		source: () => (store.degraded ? "store-degraded" : "store"),
+		source: () => (store.degraded === true ? "store-degraded" : "store"),
 		query: (o) => store.query(o),
 		countMatching: (f) => store.countMatching(f),
 		search: (o) => store.search(o),
@@ -191,9 +213,10 @@ function _storeStream(store) {
  *   Required. "none" only when something in front of the reader
  *   authenticates every request.
  * @param {any} [opts.engine] the Engine to read; default the default engine.
- * @param {any} [opts.store] audit store to read; default the engine's.
+ * @param {any} [opts.store] audit store to read; default the engine's;
+ *   null for no audit store.
  * @param {{ api?: any, sys?: any }} [opts.streams] stream stores to read;
- *   default the engine's rings and stores.
+ *   a stream left out is the engine's, null is no store.
  * @param {(req: any) => string | null | Promise<string | null>} [opts.tenantScope]
  *   resolves the caller's tenant; every route is then limited to it and a
  *   caller without one gets a 401.
@@ -220,19 +243,29 @@ export function reader(opts = {}) {
 	if (tenantScope !== null && typeof tenantScope !== "function") {
 		throw new Error("fasten reader: tenantScope must be a function.");
 	}
-	const explicitStreams = opts.streams
-		? {
-				api: _storeStream(opts.streams.api),
-				sys: _storeStream(opts.streams.sys),
-			}
-		: null;
+	const given = {};
+	for (const name of ["api", "sys"]) {
+		if (opts.streams && opts.streams[name] !== undefined) {
+			given[name] = _storeStream(opts.streams[name]);
+		}
+	}
 	const base = prefix.replace(/\/+$/, "");
+
+	// The streams one request reads: those passed to reader(), the engine's
+	// for the rest; null when neither has any.
+	const readStreams = (own) => {
+		if (!given.api && !given.sys) return own;
+		return {
+			api: given.api ?? own?.api ?? _storeStream(null),
+			sys: given.sys ?? own?.sys ?? _storeStream(null),
+		};
+	};
 
 	// What one request reads.
 	const context = () => {
 		const st = engine._readerState();
 		const store = opts.store !== undefined ? opts.store : st.auditStore;
-		const streams = explicitStreams ?? st.streams;
+		const streams = readStreams(st.streams);
 		const source = (name) => {
 			if (name === "audit") {
 				if (!store) return "ring";
@@ -275,9 +308,9 @@ export function reader(opts = {}) {
 	};
 
 	return async function fastenReader(req, res, next) {
-		const url = new URL(req.url ?? "/", "http://reader.invalid");
-		let path = url.pathname;
-		if (base) {
+		const rawUrl = req.url ?? "/";
+		let path = _rawPath(rawUrl);
+		if (path !== null && base) {
 			if (path === base || path.startsWith(`${base}/`)) {
 				path = path.slice(base.length) || "/";
 			} else {
@@ -297,8 +330,8 @@ export function reader(opts = {}) {
 			if (check && (await check(req)) !== true) {
 				return send(res, 401, { detail: "unauthenticated" });
 			}
-			const q = _params(url.searchParams);
-			const run = route(q);
+			// The tenant before the parameters: a caller without one learns
+			// nothing from a 422.
 			let tenant = null;
 			if (tenantScope) {
 				const t = await tenantScope(req);
@@ -308,6 +341,11 @@ export function reader(opts = {}) {
 				}
 				tenant = t;
 			}
+			const qs = rawUrl.indexOf("?");
+			const q = _params(
+				new URLSearchParams(qs >= 0 ? rawUrl.slice(qs + 1) : ""),
+			);
+			const run = route(q);
 			return send(res, 200, await run(context(), tenant));
 		} catch (err) {
 			if (err instanceof HttpError) {
@@ -318,6 +356,18 @@ export function reader(opts = {}) {
 			return send(res, 500, { detail: "internal error" });
 		}
 	};
+
+	// The store's count of rows matching `filters`, or null when it has no
+	// count() or it fails: the rows are still worth returning.
+	async function countOrNull(store, filters) {
+		if (typeof store.count !== "function") return null;
+		try {
+			return await store.count(filters);
+		} catch (err) {
+			log("reader_count_failed", { error_type: errorType(err) });
+			return null;
+		}
+	}
 
 	// Doctor check failures go to the log by type; the response gets a fixed
 	// text.
@@ -463,12 +513,15 @@ export function reader(opts = {}) {
 				since,
 				until,
 			};
-			const rows = await s.query({
-				...filters,
-				limit,
-				offset,
-				afterSeq: after ?? 0,
-			});
+			const rows = scope(
+				await s.query({
+					...filters,
+					limit,
+					offset,
+					afterSeq: after ?? 0,
+				}),
+				tenant,
+			);
 			const total = await countOrNull(s, filters);
 			// Rows are newest first, so next_after is the smallest seq.
 			return {
@@ -492,33 +545,46 @@ export function reader(opts = {}) {
 			// Every stream is scoped, so a known request_id cannot reach another
 			// tenant's rows.
 			const audit = s
-				? await s.query({ limit, requestId: rid, tenantId: tenant })
-				: [];
-			const api = streams
-				? scope(await streams.api.query({ limit, requestId: rid }), tenant)
-				: [];
-			const sys = streams
-				? scope(await streams.sys.query({ limit, requestId: rid }), tenant)
+				? scope(
+						await s.query({ limit, requestId: rid, tenantId: tenant }),
+						tenant,
+					)
 				: [];
 			const auditTotal = s
 				? await countOrNull(s, { requestId: rid, tenantId: tenant })
 				: null;
-			const streamTotal = async (name, rows) => {
-				if (!streams) return 0;
-				// Stream counts cannot take a tenant: count what the caller sees.
-				if (tenant !== null) return rows.length;
-				return streams[name].countMatching({ requestId: rid });
+			const counts = { audit: audit.length };
+			const totals = { audit: auditTotal };
+			const truncated = {
+				audit: auditTotal === null ? null : audit.length < auditTotal,
 			};
-			const counts = { audit: audit.length, api: api.length, sys: sys.length };
-			const totals = {
-				audit: auditTotal,
-				api: await streamTotal("api", api),
-				sys: await streamTotal("sys", sys),
-			};
-			const truncated = {};
-			for (const k of ["audit", "api", "sys"]) {
-				truncated[k] = totals[k] === null ? null : counts[k] < totals[k];
+			const out = {};
+			for (const name of ["api", "sys"]) {
+				if (!streams) {
+					out[name] = [];
+					counts[name] = 0;
+					totals[name] = 0;
+					truncated[name] = false;
+					continue;
+				}
+				const fetched = await streams[name].query({ limit, requestId: rid });
+				const rows = scope(fetched, tenant);
+				out[name] = rows;
+				counts[name] = rows.length;
+				if (tenant === null) {
+					totals[name] = await streams[name].countMatching({ requestId: rid });
+					truncated[name] = counts[name] < totals[name];
+				} else if (fetched.length < limit) {
+					// Every matching row was fetched, so the scoped rows are all.
+					totals[name] = rows.length;
+					truncated[name] = false;
+				} else {
+					// Stream counts cannot take a tenant: unknown.
+					totals[name] = null;
+					truncated[name] = null;
+				}
 			}
+			const { api, sys } = out;
 			return {
 				request_id: rid,
 				audit,
@@ -585,7 +651,10 @@ export function reader(opts = {}) {
 						counts.audit = 0;
 						continue;
 					}
-					const rows = await s.search({ ...opts, tenantId: tenant });
+					const rows = scope(
+						await s.search({ ...opts, tenantId: tenant }),
+						tenant,
+					);
 					counts.audit = rows.length;
 					for (const row of rows) {
 						matches.push({
@@ -660,81 +729,95 @@ export function reader(opts = {}) {
 	function routeDoctor() {
 		return async (ctx, tenant) => {
 			const { st, store: s } = ctx;
+			// A scoped caller gets its own rows' data, not the host's.
+			const scoped = tenant !== null;
 			const storeBlock = {
-				kind: s ? (s.constructor?.name ?? null) : null,
+				kind: s && !scoped ? (s.constructor?.name ?? null) : null,
 				reachable: false,
+				degraded: s ? ctx.source("audit") === "store-degraded" : false,
 				rows: null,
 				last_insert_at: null,
 				last_error: null,
 			};
-			if (s) {
+			if (s && typeof s.count === "function") {
 				try {
-					// Scoped: a tenant caller sees only its own row count.
-					if (typeof s.count === "function") {
-						storeBlock.rows =
-							tenant !== null
-								? await s.count({ tenantId: tenant })
-								: await s.count();
-					}
+					storeBlock.rows = scoped
+						? await s.count({ tenantId: tenant })
+						: await s.count();
 					storeBlock.reachable = true;
 				} catch (err) {
 					storeBlock.last_error = checkFailed("store", err);
 				}
 			}
 
-			const stats = engine.queueStats();
-			const queueBlock = stats
-				? { ...stats, last_error: _errorType(stats.last_error) }
-				: null;
-
-			const own = st.streams;
-			const transportBlock = {
-				stdout_active: own !== null,
-				syslog_ring_depth: own ? own.sys.ring.length : 0,
-				api_ring_depth: own ? own.api.ring.length : 0,
-			};
+			let queueBlock = null;
+			let transportBlock = null;
+			if (!scoped) {
+				const stats = engine.queueStats();
+				queueBlock = stats
+					? { ...stats, last_error: _errorType(stats.last_error) }
+					: null;
+				const own = st.streams;
+				transportBlock = {
+					stdout_active: own !== null,
+					syslog_ring_depth: own ? own.sys.ring.length : 0,
+					api_ring_depth: own ? own.api.ring.length : 0,
+				};
+			}
 
 			const chainUnavailable = !!s && !_seals(s);
 			let chainBlock = {
 				verified: null,
 				breaks: null,
+				sealed_rows: null,
 				last_verified_at: null,
 				chain_unavailable: chainUnavailable,
 			};
-			if (s && typeof s.query === "function") {
+			const node = ctx.nodeId;
+			// Rows read as stored, so detail numbers are the tokens that were
+			// hashed: query() rows parse them with JSON.parse and would read
+			// as breaks.
+			const tail =
+				typeof s?.chainTail === "function"
+					? () => s.chainTail(node, 50)
+					: typeof s?.chainRows === "function"
+						? async () => (await s.chainRows(node)).slice(-50)
+						: null;
+			if (s && (node === null || tail === null)) {
+				// A store that does not seal can never be verified.
+				if (chainUnavailable) chainBlock.verified = false;
+				chainBlock.reason =
+					node === null
+						? "no node id to check"
+						: "the store has no chainTail or chainRows";
+			} else if (s) {
 				try {
-					const node = ctx.nodeId;
-					let recent;
-					if (node !== null && typeof s.chainTail === "function") {
-						// By seq: a timestamp-ordered sample skips seqs after a
-						// clock step back and reads as a break.
-						recent = await s.chainTail(node, 50);
-					} else {
-						const q = { limit: 50 };
-						if (node !== null) q.sourceNodeId = node;
-						recent = (await s.query(q)).reverse();
-					}
-					if (recent.length) {
-						const result = verifyChain(recent);
-						chainBlock = {
-							verified: chainUnavailable ? false : result.ok,
-							breaks: chainUnavailable ? null : result.ok ? 0 : 1,
-							first_break_at: result.firstBreakAt,
-							reason: result.reason,
-							last_verified_at: canonicalTS(),
-							chain_unavailable: chainUnavailable,
-						};
-						// The sample is this node's chain, which can hold other
-						// tenants' rows: a scoped caller gets the verdict only.
-						if (tenant !== null && !result.ok) {
-							chainBlock.first_break_at = null;
-							chainBlock.reason = "chain break in this node's recent rows";
-						}
+					// By seq: a timestamp-ordered sample skips seqs after a clock
+					// step back and reads as a break.
+					const recent = await tail();
+					storeBlock.reachable = true;
+					const result = verifyChain(recent);
+					const sealed = result.sealedRows;
+					chainBlock = {
+						verified: chainUnavailable ? false : sealed ? result.ok : null,
+						breaks: chainUnavailable || !sealed ? null : result.ok ? 0 : 1,
+						sealed_rows: sealed,
+						first_break_at: result.firstBreakAt,
+						reason: sealed ? result.reason : "no sealed rows in sample",
+						last_verified_at: sealed ? canonicalTS() : null,
+						chain_unavailable: chainUnavailable,
+					};
+					// The sample is this node's chain, which can hold other
+					// tenants' rows: a scoped caller gets the verdict only.
+					if (scoped && !result.ok) {
+						chainBlock.first_break_at = null;
+						chainBlock.reason = "chain break in this node's recent rows";
 					}
 				} catch (err) {
 					chainBlock = {
 						verified: null,
 						breaks: null,
+						sealed_rows: null,
 						error: errorType(err),
 						reason: checkFailed("chain", err),
 						last_verified_at: null,
@@ -749,12 +832,12 @@ export function reader(opts = {}) {
 				transport: transportBlock,
 				redactor: { active: !!st.serviceId },
 				init: {
-					service_id: st.serviceId || null,
-					node_id: st.nodeId || null,
+					service_id: scoped ? null : st.serviceId || null,
+					node_id: scoped ? null : st.nodeId || null,
 					// The host's own tenant is not a scoped caller's to read.
-					tenant_id: tenant !== null ? null : (st.tenantId ?? null),
+					tenant_id: scoped ? null : (st.tenantId ?? null),
 					failure_strategy: st.failureStrategy,
-					worker_pid: process.pid,
+					worker_pid: scoped ? null : process.pid,
 				},
 				chain: chainBlock,
 			};
@@ -767,17 +850,6 @@ export function reader(opts = {}) {
 function scope(rows, tenant) {
 	if (tenant === null) return rows;
 	return rows.filter((r) => r?.tenant_id === tenant);
-}
-
-// The store's count of rows matching `filters`, or null when it has no
-// count() or it fails: the rows are still worth returning.
-async function countOrNull(store, filters) {
-	if (typeof store.count !== "function") return null;
-	try {
-		return await store.count(filters);
-	} catch {
-		return null;
-	}
 }
 
 // Query parameters: the last value of a repeated one, as FastAPI reads it.

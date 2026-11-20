@@ -1,6 +1,7 @@
 // The HTTP reader against in-memory stores: auth, tenant scope on every
 // route, limits, paging, search, correlate, topology and the doctor.
 import { test, describe, before, after } from 'node:test';
+import http from 'node:http';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { Engine, register } from '../src/index.js';
@@ -538,6 +539,322 @@ describe('doctor', () => {
         await serve(reader({ auth: 'none', engine: e }), async (get) => {
             const r = await get('/audit/doctor');
             assert.equal(r.body.queue.last_error, 'PgError');
+        });
+        await e.resetForTests();
+    });
+});
+
+// Sends `path` byte for byte (fetch would resolve ".." and "./").
+async function serveRaw(handler, fn) {
+    const server = http.createServer((req, res) => handler(req, res));
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const raw = (path, method = 'GET', headers = {}) => new Promise((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+            let text = '';
+            res.on('data', (d) => { text += d; });
+            res.on('end', () => resolve({ status: res.statusCode, text, headers: res.headers }));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+    try {
+        return await fn(raw);
+    } finally {
+        await new Promise((r) => server.close(r));
+    }
+}
+
+const ROUTES = ['/audit', '/audit/doctor', '/correlate?request_id=req-a', '/search?q=x&since=2026-01-01T00:00:00Z', '/sys', '/api', '/topology'];
+
+describe('the reader matches the request path as sent', () => {
+    let ctx;
+    before(async () => {
+        ctx = await setup();
+    });
+
+    test('a path with dot segments, empty segments, backslashes or encoded separators is not served', async () => {
+        const h = reader({ auth: 'none', engine: ctx.engine, prefix: '/api/v1/logs' });
+        await serveRaw(h, async (raw) => {
+            assert.equal((await raw('/api/v1/logs/audit')).status, 200);
+            assert.equal((await raw('/api/v1/logs/audit?limit=1&x=/../')).status, 200);
+            for (const path of [
+                '/x/../api/v1/logs/audit', '//evil/api/v1/logs/audit', '/\\x/api/v1/logs/audit',
+                '/api/v1/logs/x/../audit', '/api/v1/logs/./audit', '/api/v1/logs//audit',
+                '/api/v1/logs/audit/.', '/api/v1/logs/audit/doctor/..', '/api/v1/logs\\audit',
+                '/api/v1/logs/%61udit', '/api/v1/logs/%2e%2e/audit', '/api/v1/logs%2faudit',
+                '/api/v1/logs/audit%5c', '/api/v1/logs/audit/', '/api/v1/logs', '/api/v1/logs/',
+                '/audit',
+            ]) {
+                const r = await raw(path);
+                assert.equal(r.status, 404, path);
+                assert.ok(!r.text.includes('"rows"'), path);
+            }
+        });
+    });
+
+    test('without a prefix too, and such a path goes to next', async () => {
+        const h = reader({ auth: 'none', engine: ctx.engine });
+        await serveRaw(h, async (raw) => {
+            for (const path of ['/x/../audit', '//audit', '/%61udit', '/audit\\', '/./audit', '/audit/']) {
+                assert.equal((await raw(path)).status, 404, path);
+            }
+        });
+        const seen = [];
+        await serveRaw((req, res) => h(req, res, () => { seen.push(req.url); res.end('next'); }), async (raw) => {
+            assert.equal((await raw('/x/../audit')).text, 'next');
+        });
+        assert.deepEqual(seen, ['/x/../audit']);
+    });
+});
+
+describe('request order and methods', () => {
+    let ctx;
+    before(async () => {
+        ctx = await setup();
+    });
+
+    test('authentication comes before the tenant, and the tenant before the parameters', async () => {
+        await serve(reader({ auth: { bearer: TOKEN }, engine: ctx.engine }), async (get) => {
+            assert.equal((await get('/audit?limit=0')).status, 401);
+            assert.equal((await get('/audit?limit=0', AUTH)).status, 422);
+        });
+        const scoped = reader({
+            auth: { bearer: TOKEN }, engine: ctx.engine,
+            tenantScope: (req) => req.headers['x-tenant'] ?? null,
+        });
+        await serve(scoped, async (get) => {
+            assert.equal((await get('/audit?limit=0')).status, 401);
+            assert.equal((await get('/correlate', AUTH)).status, 401);
+            assert.equal((await get('/correlate', AUTH)).body.detail, 'unauthenticated: tenant scope unresolved');
+            assert.equal((await get('/correlate', { ...AUTH, 'x-tenant': 'tenant-a' })).status, 422);
+        });
+    });
+
+    test('every route takes GET only; HEAD is a 405, as in the Python reader', async () => {
+        await serveRaw(reader({ auth: { bearer: TOKEN }, engine: ctx.engine }), async (raw) => {
+            for (const path of ROUTES) {
+                for (const method of ['POST', 'PUT', 'DELETE', 'HEAD', 'PATCH']) {
+                    const r = await raw(path, method, AUTH);
+                    assert.equal(r.status, 405, `${method} ${path}`);
+                    assert.equal(r.headers.allow, 'GET');
+                }
+            }
+        });
+    });
+
+    test('a repeated parameter takes its last value, and the scope still wins', async () => {
+        const scoped = reader({
+            auth: 'none', engine: ctx.engine, streams: { sys: ctx.sys, api: ctx.api },
+            tenantScope: () => 'tenant-a',
+        });
+        await serve(scoped, async (get) => {
+            const a = await get('/audit?tenant_id=tenant-b&tenant_id=tenant-a&tenant_id=tenant-b');
+            assert.equal(a.body.total, 2);
+            assert.ok(a.body.rows.every((r) => r.tenant_id === 'tenant-a'));
+            const c = await get('/correlate?request_id=req-a&request_id=req-b');
+            assert.equal(c.body.request_id, 'req-b');
+            assert.deepEqual(c.body.counts, { audit: 0, api: 0, sys: 0 });
+        });
+    });
+
+    test('offset and after past 2^53 are 422s', async () => {
+        await serve(reader({ auth: 'none', engine: ctx.engine }), async (get) => {
+            for (const q of ['offset=9007199254740993', 'after=9007199254740993', 'offset=99999999999999999999']) {
+                const r = await get(`/audit?${q}`);
+                assert.equal(r.status, 422, q);
+                assert.match(r.body.detail, /^(offset|after) must be between /);
+            }
+            assert.equal((await get('/audit?offset=9007199254740991')).status, 200);
+        });
+    });
+});
+
+// Stores that leave tenantId to the caller.
+class UnscopedAuditStore extends MemoryAuditStore {
+    query({ tenantId: _t, ...rest } = {}) {
+        return super.query(rest);
+    }
+
+    search({ tenantId: _t, ...rest }) {
+        return super.search(rest);
+    }
+}
+
+describe('the reader applies the tenant scope to every row it returns', () => {
+    test('audit rows from /audit, /correlate and /search, whatever the store returns', async () => {
+        const store = new UnscopedAuditStore();
+        const e = new Engine();
+        await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n1', auditStore: store, auditStoreFailureStrategy: 'raise', searchEnabled: true }));
+        store.insert(auditRow({ request_id: 'req-x', detail: { note: 'needle' } }));
+        store.insert(auditRow({ tenant_id: 'tenant-b', request_id: 'req-x', detail: { note: 'needle' } }));
+        store.insert(auditRow({ tenant_id: null, request_id: 'req-x', detail: { note: 'needle' } }));
+        await serve(reader({ auth: 'none', engine: e, tenantScope: () => 'tenant-a' }), async (get) => {
+            const a = await get('/audit');
+            assert.deepEqual(a.body.rows.map((r) => r.tenant_id), ['tenant-a']);
+            const c = await get('/correlate?request_id=req-x');
+            assert.deepEqual(c.body.audit.map((r) => r.tenant_id), ['tenant-a']);
+            const s = await get('/search?q=needle&since=2026-01-01T00:00:00Z&streams=audit');
+            assert.deepEqual(s.body.matches.map((m) => m.row.tenant_id), ['tenant-a']);
+            assert.equal(s.body.counts.audit, 1);
+        });
+    });
+
+    test('/correlate stream totals under a scope are exact when every row was fetched, else unknown', async () => {
+        const ctx = await setup();
+        const h = reader({ auth: 'none', engine: ctx.engine, streams: { sys: ctx.sys, api: ctx.api }, tenantScope: () => 'tenant-a' });
+        await serve(h, async (get) => {
+            const all = await get('/correlate?request_id=req-a');
+            assert.deepEqual(all.body.totals, { audit: 2, api: 1, sys: 1 });
+            assert.deepEqual(all.body.truncated, { audit: false, api: false, sys: false });
+            // Two sys rows carry req-a, the newest without a tenant: with a
+            // limit of 1 this tenant's row is cut off, which the reader
+            // cannot count.
+            const one = await get('/correlate?request_id=req-a&limit=1');
+            assert.equal(one.body.counts.sys, 0);
+            assert.equal(one.body.totals.sys, null);
+            assert.equal(one.body.truncated.sys, null);
+            assert.equal(one.body.truncated.audit, true);
+        });
+    });
+});
+
+describe('a scoped doctor reports only the caller\'s data', () => {
+    test('no queue, rings, pid, host ids or store kind for a scoped caller', async () => {
+        const store = new MemoryAuditStore();
+        const e = new Engine();
+        await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n1', tenantId: 'host', auditStore: store }));
+        store.insert(auditRow());
+        try {
+            await serve(reader({ auth: 'none', engine: e, tenantScope: () => 'tenant-a' }), async (get) => {
+                const r = (await get('/audit/doctor')).body;
+                assert.equal(r.queue, null);
+                assert.equal(r.transport, null);
+                assert.deepEqual(r.init, { service_id: null, node_id: null, tenant_id: null, failure_strategy: 'queue', worker_pid: null });
+                assert.equal(r.store.kind, null);
+                assert.equal(r.store.rows, 1);
+                assert.equal(r.store.reachable, true);
+                assert.equal(r.chain.verified, true);
+            });
+            await serve(reader({ auth: 'none', engine: e }), async (get) => {
+                const r = (await get('/audit/doctor')).body;
+                assert.equal(r.queue.capacity, 100);
+                assert.equal(typeof r.transport.api_ring_depth, 'number');
+                assert.equal(r.init.worker_pid, process.pid);
+                assert.equal(r.store.kind, 'MemoryAuditStore');
+                assert.equal(r.store.degraded, false);
+            });
+        } finally {
+            await e.resetForTests();
+        }
+    });
+});
+
+describe('doctor chain check', () => {
+    async function engineOver(store) {
+        const e = new Engine();
+        await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n1', auditStore: store, auditStoreFailureStrategy: 'raise' }));
+        return e;
+    }
+
+    test('only unsealed rows are not verified', async () => {
+        const store = new MemoryAuditStore();
+        store.rows.push({ ...auditRow(), monotonic_seq: 1, hash: '', prev_hash: '' });
+        store.rows.push({ ...auditRow(), monotonic_seq: 2, hash: '', prev_hash: '' });
+        await serve(reader({ auth: 'none', engine: await engineOver(store) }), async (get) => {
+            const c = (await get('/audit/doctor')).body.chain;
+            assert.equal(c.verified, null);
+            assert.equal(c.breaks, null);
+            assert.equal(c.sealed_rows, 0);
+            assert.equal(c.reason, 'no sealed rows in sample');
+        });
+    });
+
+    test('sealed_rows counts the rows checked', async () => {
+        const c = await setup();
+        await serve(reader({ auth: 'none', engine: c.engine }), async (get) => {
+            const chain = (await get('/audit/doctor')).body.chain;
+            assert.equal(chain.verified, true);
+            assert.equal(chain.sealed_rows, 3);
+        });
+    });
+
+    test('chainRows serves when there is no chainTail; query() rows are never verified', async () => {
+        const store = new MemoryAuditStore();
+        store.insert(auditRow());
+        store.insert(auditRow());
+        store.chainRows = (node) => store.rows.filter((r) => r.source_node_id === node);
+        store.chainTail = undefined;
+        await serve(reader({ auth: 'none', engine: await engineOver(store) }), async (get) => {
+            const chain = (await get('/audit/doctor')).body.chain;
+            assert.equal(chain.verified, true);
+            assert.equal(chain.sealed_rows, 2);
+        });
+        store.chainRows = undefined;
+        let queried = 0;
+        const query = store.query.bind(store);
+        store.query = (o) => { queried++; return query(o); };
+        await serve(reader({ auth: 'none', engine: await engineOver(store) }), async (get) => {
+            const r = (await get('/audit/doctor')).body;
+            assert.equal(r.chain.verified, null);
+            assert.equal(r.chain.reason, 'the store has no chainTail or chainRows');
+            assert.equal(r.store.reachable, true);
+        });
+        assert.equal(queried, 0);
+    });
+
+    test('reachable only after a call succeeds', async () => {
+        const store = { insert() {}, query: () => [], seals: () => true };
+        await serve(reader({ auth: 'none', engine: await engineOver(store) }), async (get) => {
+            assert.equal((await get('/audit/doctor')).body.store.reachable, false);
+        });
+    });
+});
+
+describe('reader options', () => {
+    test('a stream left out of streams is the engine\'s; store: null is no audit store', async () => {
+        const ctx = await setup();
+        ctx.engine.writeApi({ method: 'GET', path: '/from-ring', status: 200 });
+        await captureLines(() => ctx.engine.writeApi({ method: 'GET', path: '/from-ring', status: 200 }));
+        const h = reader({ auth: 'none', engine: ctx.engine, streams: { sys: ctx.sys }, store: null });
+        await serve(h, async (get) => {
+            const api = await get('/api');
+            assert.equal(api.body.completeness.api, 'ring');
+            assert.ok(api.body.rows.some((r) => r.path === '/from-ring'));
+            const sys = await get('/sys');
+            assert.equal(sys.body.completeness.sys, 'store');
+            assert.equal(sys.body.rows.length, 3);
+            const a = await get('/audit');
+            assert.equal(a.body.error, 'audit store not initialised — call fasten.init() first');
+        });
+    });
+
+    test('a failed count is logged by type and the total is null', async () => {
+        const ctx = await setup();
+        ctx.store.count = () => { throw Object.assign(new Error('host db.internal'), { name: 'PgError' }); };
+        const { err } = await captureLines(() => serve(reader({ auth: 'none', engine: ctx.engine }), async (get) => {
+            const r = await get('/audit');
+            assert.equal(r.status, 200);
+            assert.equal(r.body.total, null);
+        }));
+        const line = err.find((l) => l.includes('reader_count_failed'));
+        assert.ok(line?.includes('"error_type":"PgError"'));
+        assert.ok(!err.join('').includes('db.internal'));
+    });
+
+    test('a stream store without noteWriteFailure or degraded still reads as degraded', async () => {
+        const store = {
+            insert: () => Promise.reject(new Error('down')),
+            query: () => [], countMatching: () => 0, search: () => [],
+        };
+        const e = new Engine();
+        await captureLines(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n1', syslogStore: store });
+            e.log.info('x', {});
+            await e.flush();
+        });
+        await serve(reader({ auth: 'none', engine: e }), async (get) => {
+            assert.equal((await get('/sys')).body.completeness.sys, 'store-degraded');
         });
         await e.resetForTests();
     });

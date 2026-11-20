@@ -1,5 +1,6 @@
 // @ts-check
 // Lost connections on node-postgres, for the Postgres stores.
+import { errorType, sysLog } from "../audit_queue.js";
 
 /**
  * Whether `err` means the connection is gone, so a new one can help: a
@@ -69,15 +70,20 @@ export function release(client, err) {
 	client.release(err);
 }
 
+// An idle client lost: logged by error type only, since a driver message
+// can name the host.
+const _idleLost = (/** @type {unknown} */ err) =>
+	sysLog("debug", "pg_idle_connection_lost", { error_type: errorType(err) });
+
 /**
  * Listen for errors on the pool's idle clients. pg drops such a client
  * itself; without a listener the error would be thrown and end the
- * process.
+ * process. Each is logged at debug level by error type.
  * @template {{ on: Function }} P
  * @param {P} pool
  * @returns {P}
  */
 export function watchPool(pool) {
-	pool.on("error", _ignore);
+	pool.on("error", _idleLost);
 	return pool;
 }

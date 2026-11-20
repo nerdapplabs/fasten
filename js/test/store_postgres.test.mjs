@@ -15,9 +15,10 @@ import { randomUUID } from 'node:crypto';
 import { PostgresStore } from '../src/store/postgres.js';
 import {
     AuditOutcomeUnknownError, AuditRowRejectedError, AuditStoreError, ChainError, Engine,
-    checkpointsSince, register as registerCodes, takeCheckpoints, verifyChain,
+    checkpointsSince, register as registerCodes, seal, takeCheckpoints, verifyChain,
 } from '../src/index.js';
 import { PostgresStreamStore } from '../src/store/stream_postgres.js';
+import { connectionLost } from '../src/store/pg_conn.js';
 import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
@@ -1246,35 +1247,141 @@ async function _terminate(admin, app) {
     return r.rowCount;
 }
 
-test('stores recover after the server drops their connections', { skip }, async () => {
+// A pool for application `app` that counts the lost-connection errors its
+// queries meet, so a test sees that a call was run again.
+async function _countingPool(app, hits) {
+    const { default: pg } = await import('pg');
+    const pool = new pg.Pool({ connectionString: _appDsn(app) });
+    pool.on('error', () => {});
+    const count = (p) => p.catch((err) => {
+        if (connectionLost(err)) hits.n++;
+        throw err;
+    });
+    // Every query, pool.query's included, runs on a client from the pool.
+    pool.on('connect', (client) => {
+        const q = client.query.bind(client);
+        client.query = (...args) => {
+            const cb = args.at(-1);
+            if (typeof cb === 'function') {
+                args[args.length - 1] = (err, res) => {
+                    if (err && connectionLost(err)) hits.n++;
+                    cb(err, res);
+                };
+            }
+            const r = q(...args);
+            return typeof r?.then === 'function' ? count(r) : r;
+        };
+    });
+    return pool;
+}
+
+test('stores recover after the server drops their connections, running the call again', { skip }, async () => {
     await _withTable(async ({ admin, t }) => {
         const app = `fasten_drop_${randomUUID().slice(0, 8)}`;
-        const s = new PostgresStore(_appDsn(app), { table: t });
-        const api = new PostgresStreamStore(_appDsn(app), { table: `${t}_api` });
+        const hits = { n: 0 };
+        const pool = await _countingPool(app, hits);
+        const s = new PostgresStore(pool, { table: t });
+        const api = new PostgresStreamStore(pool, { table: `${t}_api` });
+        let inserted = 0;
         try {
-            for (const wait of [200, 0]) {
-                await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-drop' }));
-                await api.insert({ method: 'GET', path: '/a', request_id: 'r' });
-                // Idle connections in both pools now.
+            await api.init();
+            // Until the calls have met dropped connections a few times: each
+            // must still succeed.
+            for (let i = 0; i < 20 && hits.n < 3; i++) {
                 await s.query({ limit: 1 });
-                assert.ok(await _terminate(admin, app) >= 2);
-                // With a wait pg has seen the idle clients close; without
-                // one the next query can still pick a dead client.
-                if (wait) await new Promise((r) => setTimeout(r, wait));
+                await _terminate(admin, app);
                 await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-drop' }));
-                await api.insert({ method: 'GET', path: '/b', request_id: 'r' });
+                inserted++;
                 await _terminate(admin, app);
                 assert.equal(typeof (await s.count()), 'number');
                 await _terminate(admin, app);
-                assert.equal(await api.countMatching({ requestId: 'r' }) > 0, true);
+                assert.equal(typeof (await api.countMatching({ requestId: 'r' })), 'number');
             }
+            assert.ok(hits.n >= 1, 'no call met a dropped connection');
             const rows = await s.chainRows('n-drop');
-            assert.deepEqual(rows.map((r) => r.monotonic_seq), [1, 2, 3, 4]);
+            assert.deepEqual(rows.map((r) => r.monotonic_seq), Array.from({ length: inserted }, (_, i) => i + 1));
             assert.ok(verifyChain(rows).ok);
         } finally {
             await s.close();
             await api.close();
+            await pool.end();
             await admin.query(`DROP TABLE IF EXISTS ${t}_api`);
+        }
+    });
+});
+
+test('PostgresStore takes a pool it shares with PostgresStreamStore, and leaves it open', { skip }, async () => {
+    await _withTable(async ({ admin, t }) => {
+        const { default: pg } = await import('pg');
+        const pool = new pg.Pool({ connectionString: DSN });
+        const s = new PostgresStore(pool, { table: t });
+        const api = new PostgresStreamStore(pool, { table: `${t}_api` });
+        try {
+            const row = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-pool' }));
+            await api.insert({ method: 'GET', path: '/p' });
+            assert.equal(row.monotonic_seq, 1);
+            assert.equal(await api.count(), 1);
+            await s.close();
+            await api.close();
+            assert.equal((await pool.query('SELECT 1 AS one')).rows[0].one, 1);
+        } finally {
+            await pool.end();
+            await admin.query(`DROP TABLE IF EXISTS ${t}_api`);
+        }
+    });
+});
+
+test('a pool passed in keeps its own type parsers; the store reads TIMESTAMPTZ as text', { skip }, async () => {
+    const { default: pg } = await import('pg');
+    const admin = new pg.Pool({ connectionString: DSN });
+    const pool = new pg.Pool({ connectionString: DSN });
+    const t = `t_go_pool_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    const s = new PostgresStore(pool, { table: t });
+    try {
+        await admin.query(GO_DDL(t));
+        const ts = '2026-08-21T10:00:00.123456Z';
+        const row = makeRow({ timestamp: ts });
+        await s.insert(row);
+        const [got] = await s.query({ requestId: row.request_id });
+        assert.equal(got.timestamp, ts);
+        const own = await pool.query(`SELECT timestamp FROM ${t} WHERE id = $1`, [row.id]);
+        assert.ok(own.rows[0].timestamp instanceof Date);
+    } finally {
+        await pool.end();
+        await admin.query(`DROP TABLE IF EXISTS ${t}`);
+        await admin.end();
+    }
+});
+
+test('a failed read leaves the connection idle, not in error', { skip }, async () => {
+    await _withTable(async ({ admin, t }) => {
+        const { default: pg } = await import('pg');
+        const pool = new pg.Pool({ connectionString: DSN, max: 2 });
+        const s = new PostgresStore(pool, { table: t });
+        try {
+            await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-fail' }));
+            await admin.query(`DROP TABLE ${t}`);
+            const sealed = seal('genesis', makeRow({ source_node_id: 'n-other', monotonic_seq: 1 }));
+            for (const read of [
+                () => s.query({ limit: 1 }), () => s.count(), () => s.chainTail('n-fail', 5),
+                () => s.ingestReplicated([sealed]),
+            ]) {
+                await assert.rejects(read(), (err) => err.code === '42P01');
+            }
+            assert.equal(pool.waitingCount, 0);
+            assert.equal(pool.idleCount, pool.totalCount);
+            // Every client is outside a transaction: now() is the statement's
+            // start only there.
+            const clients = await Promise.all(Array.from({ length: pool.totalCount }, () => pool.connect()));
+            for (const c of clients) {
+                const r = await c.query('SELECT now() = statement_timestamp() AS idle');
+                assert.equal(r.rows[0].idle, true);
+                c.release();
+            }
+            await s.init();
+            assert.equal(await s.count(), 0);
+        } finally {
+            await pool.end();
         }
     });
 });

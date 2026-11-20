@@ -13,7 +13,7 @@ import {
     AuditStoreError, ChainError, defaultEngine, Engine, ingestReplicated, init, listUnshipped,
     markShipped, register as registerCodes, seal, verifyChain,
 } from '../src/index.js';
-import { parseJson } from '../src/chain.js';
+import { detailText, parseJson } from '../src/chain.js';
 
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
 
@@ -301,6 +301,106 @@ for (const [name, make] of BACKENDS) {
                 { inserted: 1, rejectedFromSeq: null, reason: null });
         });
 
+        test('listUnshipped takes both of serviceId and sourceNodeId, or neither', async () => {
+            const s = await fresh();
+            await assert.rejects(s.listUnshipped(10, { serviceId: 'svc' }), TypeError);
+            await assert.rejects(s.listUnshipped(10, { sourceNodeId: 'node-1' }), TypeError);
+            assert.deepEqual(await s.listUnshipped(10, {}), []);
+        });
+
+        test('purge takes a Date or a timestamp in any offset', async () => {
+            const s = await fresh();
+            await s.ingestReplicated(chain([1, 2]));
+            await s.markShipped(['evt-1', 'evt-2']);
+            // evt-1 is 10:30:01Z, evt-2 10:30:02Z.
+            assert.equal(await s.purge({ before: '2026-06-15T16:00:01.5+05:30' }), 1);
+            assert.equal(await s.purge({ before: new Date('2026-06-15T10:30:03Z') }), 1);
+            await assert.rejects(s.purge({ before: 'not a date' }), /bad before/);
+            assert.equal(await s.count(), 0);
+        });
+
+        test('an insert error mid-batch stores nothing and leaves no transaction open', async () => {
+            const s = await fresh();
+            const rows = chain([1, 2, 3, 4]);
+            const insertRow = s._insertRow.bind(s);
+            let n = 0;
+            s._insertRow = (...args) => {
+                if (++n === 3) throw Object.assign(new Error('disk full'), { code: 'SQLITE_FULL' });
+                return insertRow(...args);
+            };
+            await assert.rejects(s.ingestReplicated(rows), /disk full/);
+            s._insertRow = insertRow;
+            assert.equal(await s.count(), 0);
+            if (name === 'SqliteStore') {
+                assert.equal(s._db.isTransaction, false);
+            } else {
+                assert.equal(s._pool.idleCount, s._pool.totalCount);
+            }
+            assert.deepEqual(await s.ingestReplicated(rows), { inserted: 4, rejectedFromSeq: null, reason: null });
+            assert.ok(verifyChain(await s.chainRows('node-1')).ok);
+        });
+
+        test('local rows given out of order: the batch is cut at the lowest local seq, every time', async () => {
+            const s = await fresh();
+            const batch = [
+                ...chain([1, 2, 3, 4], { node: 'node-2' }),
+                seal('genesis', row(3, { id: 'evt-l3' })),
+                seal('genesis', row(2, { id: 'evt-l2' })),
+            ];
+            const want = { inserted: 1, rejectedFromSeq: 2, reason: "row evt-l2: source_node_id 'node-1' is this node" };
+            assert.deepEqual(await s.ingestReplicated(batch, { localNodeId: 'node-1' }), want);
+            // Sent again, it is refused again, and nothing more is stored.
+            assert.deepEqual(await s.ingestReplicated(batch, { localNodeId: 'node-1' }), want);
+            assert.deepEqual(await stored(s), [[1, 'evt-1', 'u/1']]);
+        });
+
+        if (name === 'PostgresStore') test('rows stored meanwhile by another writer three times over: it gives up', async () => {
+            const s = await fresh();
+            await s.ingestReplicated(chain([1], { node: 'node-2' }));
+            const transaction = s._transaction.bind(s);
+            let rounds = 0;
+            s._transaction = (fn) => transaction((client) => {
+                rounds++;
+                return fn({
+                    query: (q, p) => (/SELECT hash FROM \S+ WHERE id = /.test(q) && p?.[0] === 'evt-1'
+                        ? Promise.resolve({ rows: [] }) : client.query(q, p)),
+                });
+            });
+            await assert.rejects(s.ingestReplicated(chain([1, 2])), /rows kept being stored by another writer/);
+            s._transaction = transaction;
+            assert.equal(rounds, 3);
+            assert.deepEqual(await stored(s), [[1, 'evt-1', 'u/1']]);
+        });
+
+        if (name === 'PostgresStore') test('a COMMIT whose answer was lost: the resend is a re-delivery', async () => {
+            const s = await fresh();
+            await s._ensureReady();
+            const rows = chain([1, 2, 3]);
+            const connect = s._pool.connect.bind(s._pool);
+            let commits = 0;
+            s._pool.connect = async () => {
+                const client = await connect();
+                const q = client.query.bind(client);
+                client.query = async (...args) => {
+                    const res = await q(...args);
+                    if (args[0] === 'COMMIT' && ++commits === 1) {
+                        throw Object.assign(new Error('terminating connection'), { code: '57P01', severity: 'FATAL' });
+                    }
+                    return res;
+                };
+                return client;
+            };
+            try {
+                await assert.rejects(s.ingestReplicated(rows), (err) => err.code === '57P01');
+            } finally {
+                s._pool.connect = connect;
+            }
+            assert.equal(await s.count(), 3);
+            assert.deepEqual(await s.ingestReplicated(rows), { inserted: 3, rejectedFromSeq: null, reason: null });
+            assert.equal(await s.count(), 3);
+            assert.ok(verifyChain(await s.chainRows('node-1')).ok);
+        });
+
         test('a row stored meanwhile is not counted as stored', async () => {
             const s = await fresh();
             // evt-1 is stored on node-2; the batch carries evt-1 on node-1, and
@@ -361,9 +461,31 @@ test('the engine ingests other nodes, refuses its own, and lists only its own ro
     const bare = new Engine();
     bare.init({ serviceId: 'svc', nodeId: 'node-1', auditStore: { insert() {} } });
     try {
-        await assert.rejects(bare.ingestReplicated([]), (err) => err instanceof AuditStoreError && /ingestReplicated/.test(err.message));
+        await assert.rejects(bare.ingestReplicated([]), (err) => err instanceof TypeError && /ingestReplicated/.test(err.message));
     } finally {
         await bare.resetForTests();
+    }
+});
+
+test('the engine drops rows a store returns that this node did not originate', async () => {
+    const own = { ...row(1, { id: 'evt-own' }), service_id: 'svc', source_node_id: 'node-1' };
+    const rows = [
+        own,
+        { ...row(2, { id: 'evt-copy' }), origin_id: 'evt-elsewhere' },
+        { ...row(3, { id: 'evt-n2', node: 'node-2' }) },
+        { ...row(4, { id: 'evt-svc2' }), service_id: 'svc-2' },
+    ];
+    const seen = [];
+    const e = new Engine();
+    e.init({
+        serviceId: 'svc', nodeId: 'node-1', auditStoreFailureStrategy: 'raise',
+        auditStore: { insert() {}, listUnshipped: async (limit, opts) => { seen.push(opts); return rows; } },
+    });
+    try {
+        assert.deepEqual((await e.listUnshipped(10)).map((r) => r.id), ['evt-own']);
+        assert.deepEqual(seen, [{ serviceId: 'svc', sourceNodeId: 'node-1', exact: true }]);
+    } finally {
+        await e.resetForTests();
     }
 });
 
@@ -383,19 +505,32 @@ test('the module functions use the default engine', async () => {
 
 const vector = (path) => parseJson(readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8'));
 
-test('rows Python and Go sealed are ingested as they were sealed, and verify', async () => {
-    for (const rows of [
-        vector('spec/checkpoint-vectors.json').cases[0].rows,
-        vector('spec/go-sealed-form2.json'),
-        vector('spec/go-sealed-numbers.json'),
-        vector('spec/rust-sealed-form2.json'),
-    ]) {
-        const s = new SqliteStore(':memory:');
-        const res = await s.ingestReplicated(rows);
-        assert.deepEqual([res.inserted, res.rejectedFromSeq], [rows.length, null], res.reason);
-        const back = await s.allChainRows();
-        assert.ok(verifyChain(back).ok);
-        assert.deepEqual(back.map((r) => r.hash).sort(), rows.map((r) => r.hash).sort());
-        await s.close();
-    }
-});
+// The detail column text of each stored row, by id.
+async function rawDetails(s) {
+    const sql = `SELECT id, detail FROM ${s._table}`;
+    const rows = s instanceof SqliteStore ? s._db.prepare(sql).all() : (await s._pool.query(sql)).rows;
+    return new Map(rows.map((r) => [r.id, r.detail]));
+}
+
+for (const [name, make] of BACKENDS) {
+    test(`rows Python and Go sealed are ingested by ${name} as they were sealed, and verify`, { skip: name === 'PostgresStore' && !DSN }, async () => {
+        for (const rows of [
+            vector('spec/checkpoint-vectors.json').cases[0].rows,
+            vector('spec/go-sealed-form2.json'),
+            vector('spec/go-sealed-numbers.json'),
+            vector('spec/rust-sealed-form2.json'),
+        ]) {
+            const o = await make();
+            opened.push(o);
+            const s = o.store;
+            const res = await s.ingestReplicated(rows);
+            assert.deepEqual([res.inserted, res.rejectedFromSeq], [rows.length, null], res.reason);
+            const back = await s.allChainRows();
+            assert.ok(verifyChain(back).ok);
+            assert.deepEqual(back.map((r) => r.hash).sort(), rows.map((r) => r.hash).sort());
+            // The detail column holds the sender's text, number tokens as sent.
+            const raw = await rawDetails(s);
+            for (const r of rows) assert.equal(raw.get(r.id), detailText(r.detail), r.id);
+        }
+    });
+}

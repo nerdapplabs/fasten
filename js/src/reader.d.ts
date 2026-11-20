@@ -8,7 +8,9 @@ import type { AuditRepository, Engine, StreamStore } from "./index.js";
  * every request.
  */
 export type ReaderAuth =
+	/** Compared, in constant time, with the text after "Bearer " exactly. */
 	| { bearer: string }
+	/** Must return (or resolve to) exactly true; a throw is a 500. */
 	| { verify: (req: IncomingMessage) => boolean | Promise<boolean> }
 	| "none";
 
@@ -17,15 +19,20 @@ export interface ReaderOptions {
 	/** The engine to read. Defaults to the default engine. */
 	engine?: Engine;
 	/**
-	 * Audit store to read; defaults to the engine's. /search on audit needs
-	 * search(), /topology sources(), and the doctor uses chainTail().
+	 * Audit store to read; defaults to the engine's, and null is no audit
+	 * store. /search on audit needs search(), /topology sources(), and the
+	 * doctor chainTail() or chainRows().
 	 */
 	store?: AuditRepository | null;
-	/** Stream stores to read instead of the engine's rings and stores. */
+	/**
+	 * Stream stores to read. A stream left out is the engine's ring or
+	 * store; null is no store (no rows).
+	 */
 	streams?: { api?: StreamStore | null; sys?: StreamStore | null };
 	/**
-	 * The caller's tenant. Every route is then limited to it; null or ""
-	 * is a 401.
+	 * The caller's tenant. Every route is then limited to it, every row
+	 * returned is checked against it, and the doctor leaves out host-wide
+	 * data. null or "" is a 401, checked before the query parameters.
 	 */
 	tenantScope?: (
 		req: IncomingMessage,
@@ -36,7 +43,11 @@ export interface ReaderOptions {
 	searchEnabled?: boolean;
 	/** Node whose chain the doctor checks. Defaults to the engine's. */
 	nodeId?: string;
-	/** Path prefix to strip, e.g. "/api/v1/logs". */
+	/**
+	 * Path prefix to strip, e.g. "/api/v1/logs". Routes are matched on the
+	 * path as sent; one with an empty, "." or ".." segment, a backslash, or
+	 * "%2e", "%2f" or "%5c" is not served.
+	 */
 	prefix?: string;
 }
 

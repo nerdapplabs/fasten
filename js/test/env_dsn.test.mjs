@@ -6,7 +6,7 @@
 import { test, describe, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -162,8 +162,8 @@ describe('FASTEN_API_DSN and FASTEN_SYSLOG_DSN', () => {
             e.log.info('env_event', {});
             e.writeApi({ method: 'GET', path: '/x', status: 200 });
         });
-        assert.equal(streams.sys.store.countMatching({ event: 'env_event' }), 1);
-        assert.equal(streams.api.store.countMatching({ path: '/x' }), 1);
+        assert.equal(await streams.sys.store.countMatching({ event: 'env_event' }), 1);
+        assert.equal(await streams.api.store.countMatching({ path: '/x' }), 1);
     });
 
     test('?table= overrides the default table', async () => {
@@ -198,5 +198,149 @@ describe('FASTEN_API_DSN and FASTEN_SYSLOG_DSN', () => {
         await assert.rejects(init(), /stream DSN scheme 'postgresql\+psycopg' not supported/);
         setEnv({ FASTEN_API_DSN: 'sqlite://' });
         await assert.rejects(init(), /^Error: fasten: the stream DSN has no path\. Use sqlite:\/\/\/\.\/streams\.db$/);
+    });
+});
+
+describe('an audit DSN with an unknown scheme is an error, as a stream DSN is', () => {
+    test('the error names the scheme only, and no file is created', async () => {
+        const cwd = process.cwd();
+        const dir = mkdtempSync(join(DIR, 'scheme-'));
+        process.chdir(dir);
+        try {
+            for (const [dsn, scheme] of [
+                ['mysql://app:s3cret@db/x', 'mysql'],
+                ['Mysql://app:s3cret@db/x', 'mysql'],
+                ['postgresql+psycopg://app:s3cret@db/x', 'postgresql+psycopg'],
+                ['file:///tmp/s3cret.db', 'file'],
+            ]) {
+                setEnv({ FASTEN_AUDIT_DSN: dsn });
+                await assert.rejects(init(), (err) =>
+                    err.message === `fasten: audit DSN scheme '${scheme}' not supported. Use sqlite:///./audit.db, postgres://..., or a bare filesystem path.`
+                    && !err.message.includes('s3cret'), dsn);
+            }
+            setEnv({ FASTEN_AUDIT_DSN: 'host=db.internal user=app password=s3cret dbname=x' });
+            await assert.rejects(init(), (err) =>
+                /^fasten: audit DSN in libpq keyword form not supported/.test(err.message)
+                && !err.message.includes('s3cret') && !err.message.includes('db.internal'));
+            setEnv({ FASTEN_SYSLOG_DSN: 'host=db.internal password=s3cret' });
+            await assert.rejects(init(), /stream DSN in libpq keyword form not supported/);
+            assert.deepEqual(readdirSync(dir), []);
+        } finally {
+            process.chdir(cwd);
+        }
+    });
+
+    test('an upper-case postgres scheme opens a PostgresStore', async () => {
+        setEnv({ FASTEN_AUDIT_DSN: 'POSTGRES://u:p@db.invalid/x' });
+        assert.ok((await init()).auditStore() instanceof PostgresStore);
+    });
+});
+
+describe('DSN parameters', () => {
+    test('a fragment is dropped and the other parameters keep their order', async () => {
+        setEnv({ FASTEN_AUDIT_DSN: 'postgres://u:p@db.invalid/x?sslmode=require&table=aud_f&application_name=a%20b&connect_timeout=5#frag' });
+        const s = (await init()).auditStore();
+        assert.equal(s._table, 'aud_f');
+        assert.equal(s._connectionString, 'postgres://u:p@db.invalid/x?sslmode=require&application_name=a+b&connect_timeout=5#frag');
+        const path = join(DIR, `${randomUUID()}.db`);
+        setEnv({ FASTEN_AUDIT_DSN: `sqlite:///${path}?table=frag_t#x` });
+        assert.equal((await init()).auditStore()._table, 'frag_t');
+        assert.ok(existsSync(path));
+    });
+
+    test('an empty ?table= is the default table, as Python reads it', async () => {
+        setEnv({ FASTEN_AUDIT_DSN: 'postgres://u:p@db.invalid/x?table=' });
+        assert.equal((await init()).auditStore()._table, 'audit_log');
+        setEnv({ FASTEN_SYSLOG_DSN: `sqlite:///${join(DIR, `${randomUUID()}.db`)}?table=` });
+        assert.equal((await init())._readerState().streams.sys.store._table, 'syslog');
+    });
+
+    test('an invalid ?table= is an error that does not quote the DSN', async () => {
+        for (const dsn of ['postgres://u:s3cret@db.invalid/x?table=a;b', `sqlite:///${join(DIR, 's3cret.db')}?table=a-b`]) {
+            setEnv({ FASTEN_AUDIT_DSN: dsn });
+            await assert.rejects(init(), (err) =>
+                /not a valid SQL identifier/.test(err.message) && !err.message.includes('s3cret'), dsn);
+        }
+    });
+});
+
+describe('the environment at init', () => {
+    test('without an audit store, the line says which variable was read', async () => {
+        setEnv({});
+        const e = new Engine();
+        engines.push(e);
+        const { err } = await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n' }));
+        const line = err.map((l) => JSON.parse(l)).find((r) => r.event === 'audit_chain_unavailable');
+        assert.match(line.reason, /FASTEN_AUDIT_DSN unset/);
+    });
+
+    test('a set FASTEN_* variable named like a DSN but not read is reported once, without its value', async () => {
+        process.env.FASTEN_AUDIT_DNS = 'postgres://u:s3cret@db/x';
+        process.env.FASTEN_SYSLOG_URL = 'sqlite:///x.db';
+        try {
+            const e = new Engine();
+            engines.push(e);
+            const first = await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n' }));
+            const warned = first.err.map((l) => JSON.parse(l)).filter((r) => r.event === 'env_dsn_not_read');
+            assert.deepEqual(warned.map((r) => r.variable).sort(), ['FASTEN_AUDIT_DNS', 'FASTEN_SYSLOG_URL']);
+            assert.equal(warned[0].level, 'warn');
+            assert.ok(!first.err.join('').includes('s3cret'));
+            const again = await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n' }));
+            assert.ok(!again.err.some((l) => l.includes('env_dsn_not_read')));
+        } finally {
+            delete process.env.FASTEN_AUDIT_DNS;
+            delete process.env.FASTEN_SYSLOG_URL;
+        }
+    });
+});
+
+describe('stores opened from the environment', () => {
+    test('close() closes them after the stream writes settle, and a later init opens them again', async () => {
+        const path = join(DIR, `${randomUUID()}.db`);
+        setEnv({ FASTEN_AUDIT_DSN: `sqlite:///${path}`, FASTEN_SYSLOG_DSN: `sqlite:///${path}` });
+        const e = new Engine();
+        engines.push(e);
+        let closed;
+        await captureLines(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n' });
+            e.emit({ code: 'ENVDSN_EVENT', target: 't' });
+            e.log.info('before_close', {});
+            closed = await e.close();
+        });
+        assert.equal(closed, true);
+        const audit = e.auditStore();
+        const sys = e._readerState().streams.sys.store;
+        assert.equal(audit._db.isOpen, false);
+        assert.equal(sys._db.isOpen, false);
+        const db = new DatabaseSync(path);
+        assert.equal(db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n, 1);
+        assert.equal(db.prepare("SELECT COUNT(*) AS n FROM syslog WHERE event = 'before_close'").get().n, 1);
+        db.close();
+        await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n' }));
+        assert.notEqual(e.auditStore(), audit);
+        assert.equal(e.auditStore()._db.isOpen, true);
+    });
+
+    test('a re-init with another DSN closes the store it no longer uses', async () => {
+        const [p1, p2] = [join(DIR, `${randomUUID()}.db`), join(DIR, `${randomUUID()}.db`)];
+        setEnv({ FASTEN_SYSLOG_DSN: p1 });
+        const e = new Engine();
+        engines.push(e);
+        await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n' }));
+        const first = e._readerState().streams.sys.store;
+        setEnv({ FASTEN_SYSLOG_DSN: p2 });
+        await captureLines(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n' });
+            await e.flush();
+            await new Promise((r) => setImmediate(r));
+        });
+        assert.equal(first._db.isOpen, false);
+        assert.equal(e._readerState().streams.sys.store._db.isOpen, true);
+        setEnv({});
+        await captureLines(async () => {
+            e.init({ serviceId: 'svc', nodeId: 'n', syslogStore: null });
+            await e.flush();
+            await new Promise((r) => setImmediate(r));
+        });
     });
 });

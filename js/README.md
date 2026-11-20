@@ -88,7 +88,12 @@ Re-`init()` flushes the old drainer for up to 5 s, then stops it the same
 way, also when the new config is raise mode or has no store. `flush()` and
 `close()` wait for it, rows it could not store are reported with
 `audit_drain_install_incomplete`, and the next `close()` resolves false if
-it lost rows. An idle drainer does not
+it lost rows. `close()` also waits, within its timeout, for api and sys
+rows still being written to their stores (those of streams a re-init
+replaced included), resolves false if they did not finish, and then closes
+the stores it opened from `FASTEN_*_DSN` (a later `init()` opens them
+again). `flush()` waits for those writes too, including rows pushed while
+it waits. An idle drainer does not
 keep the process alive. `queueStats().last_error` and the drainer's sys
 events (`audit_drain_failed`, `audit_drain_degraded`,
 `audit_drain_dead_letter`, `audit_sync_fallback_failed`'s `error_type`)
@@ -102,7 +107,12 @@ dead idle connections without ending the process. A write that still fails
 is retried by the drainer in queue mode; in raise mode that `emit()`
 rejects with `AuditStoreError` and the next one works. A COMMIT whose
 answer was lost is not run again: the row is read back, as before. The
-chain stays whole either way, since a retried row takes no new seq.
+chain stays whole either way, since a retried row takes no new seq. A
+stream store's INSERT is not run again after a lost connection, since it
+may have committed: the write fails and is counted as a failed write
+(below), so a lost connection cannot store a stream row twice. Reads, and
+the DELETE of a purge, are run again. A dead idle connection the pool drops
+is logged at debug level as `pg_idle_connection_lost`, by error type.
 
 **Chain.** `emit()` returns the row with `monotonic_seq: 0`.
 `PostgresStore` and `SqliteStore` seal it into its node's hash chain in
@@ -180,7 +190,9 @@ are never deleted. Set `retentionPii: '30d'` (or `FASTEN_RETENTION_PII`) in
 **Age purge.** The engine never deletes audit rows, as in Python and Go:
 `retentionApi` and `retentionSyslog` purge only the api and sys stores. To
 drop old audit rows, call the store's `purge({ before, respectUnshipped })`
-yourself. Per node it deletes only a seq prefix
+yourself; `before` is a `Date` or a timestamp in any offset, which the
+bundled stores turn into the canonical form the stored timestamps are
+compared in. Per node it deletes only a seq prefix
 ([spec §2.3](../spec/chain-replication.md)), and by default keeps unshipped
 rows and every row above them, so the rows left still verify: the chain
 starts at a purged head. Publish checkpoints again after each purge and
@@ -217,8 +229,12 @@ letters, as the Python and Go SQLite stores do; Postgres's `ILIKE` folds
 all letters. A
 seq is taken in a `BEGIN IMMEDIATE` transaction, so several processes and
 threads can write one file and still get one chain per node. A new file is
-created owner-only (0600), in WAL mode, and a writer waits up to 5 s for
-another's write lock.
+created owner-only (0600), and so are its WAL and shared-memory files. It
+uses WAL mode with SQLite's default `synchronous` (FULL, a commit is
+fsynced; `SqliteStreamStore` uses `synchronous=NORMAL`), and a writer waits
+up to 5 s (`busyTimeoutMs`) for another's write lock. A relative path is
+resolved when the store is constructed, so a later `process.chdir` does not
+move it.
 
 The table works with the Python, Go and Rust SQLite stores, so they can
 share one file. `SqliteStore` adds the columns a table another SDK created
@@ -228,11 +244,14 @@ index it adds a plain one, since older rows may repeat a seq.
 
 `node:sqlite` is synchronous. Each call runs to the end before it returns
 and blocks the event loop meanwhile, including while it waits for another
-connection's write lock. The methods return promises only so the store has
-`PostgresStore`'s interface. Where a wait on the lock would hold up
-requests, use `PostgresStore`. In Node 24's documentation `node:sqlite`
-is at stability 1.2, release candidate (since v24.15.0); it was
-experimental before that.
+connection's write lock. That includes the long ones: `allChainRows`
+reads the whole table, `purge` and the stream stores' retention delete in
+one statement, and `ingestReplicated` verifies and stores a whole batch.
+The methods return promises only so the stores have the Postgres stores'
+interface. Where such a wait would hold up requests, use the Postgres
+stores. `node:sqlite` is a release candidate (stability 1.2) from Node
+24.15.0 and experimental before it, where loading it prints a warning; the
+SDK loads it only when a SQLite store is first constructed.
 
 ## Stores from the environment
 
@@ -245,12 +264,35 @@ forms of the Python SDK:
 | `postgres://...` or `postgresql://...` | `PostgresStore`, or `PostgresStreamStore` for the streams |
 | `sqlite:///./rel.db`, `sqlite:////abs/path.db`, `/abs/path.db` | `SqliteStore`, or `SqliteStreamStore` |
 
-`?table=` names the table (default `audit_log`, `api_log`, `syslog`) and is
-taken off a Postgres DSN before connecting; `?wal=false` turns WAL off on
-SQLite. A store passed to `init()` wins over the environment. A stream DSN
-with another scheme (`mysql://`, `postgresql+psycopg://`) is an error, not
-a file. A re-init with the same DSN keeps the store it opened. The engine
-does not close these stores; they live as long as the process.
+`?table=` names the table (default `audit_log`, `api_log`, `syslog`; an
+empty one is the default, as in Python) and is taken off a Postgres DSN
+before connecting, keeping the other parameters in order; `?wal=false`
+turns WAL off on SQLite. A store passed to `init()` wins over the
+environment. Any other scheme (`mysql://`, `postgresql+psycopg://`,
+`file:`), compared in lower case, and libpq's keyword form (`host=db
+dbname=app`, which node-postgres cannot read) are errors, not files, for
+every one of the three variables: `init()` throws, naming the scheme but no
+other part of the DSN, and creates nothing.
+
+A bad DSN surfaces in one of two places. A scheme, path or table name
+`init()` cannot use makes `init()` throw. A Postgres DSN that parses but
+cannot connect (a wrong host or password) surfaces on the store's first
+call, which is the first emit or log line: in queue mode the drainer
+retries it and logs `audit_drain_failed`, in raise mode `emit()` rejects,
+and a stream write is counted as failed.
+
+A re-init with the same DSN keeps the store it opened; a re-init with
+another DSN, or with a store passed in instead, closes the store it no
+longer uses once the writes still running on it are done. `close()` closes
+the stores opened from the environment, so emits after `close()` need a
+new `init()` to reach them.
+
+Without an audit store, the `audit_chain_unavailable` line at init says
+that `auditStore` was not passed and `FASTEN_AUDIT_DSN` is unset. A set
+variable named like one of these but not read (`FASTEN_AUDIT_DNS`,
+`FASTEN_SYSLOG_URL`; any `FASTEN_*` name ending in `DSN`, `DNS` or `URL`)
+gets one `env_dsn_not_read` warning per process, naming the variable and
+not its value.
 
 Go reads only `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, and only for SQLite;
 Python and JS read all three, for SQLite and Postgres.
@@ -272,7 +314,14 @@ originated (`origin_id = id`), so rows ingested from other nodes are not
 shipped again, and reads them with `exact: true`: their detail numbers are
 the tokens that were hashed, and `JSON.stringify` writes them as they are.
 A store's own `listUnshipped(limit, { serviceId, sourceNodeId, exact })`
-takes the same options.
+takes the same options; the bundled stores throw a `TypeError` when only
+one of `serviceId` and `sourceNodeId` is given. A store of your own must
+honour them (only rows that identity originated, `origin_id = id`), or rows
+ingested from other nodes would be shipped again; the engine also drops any
+row it gets back whose `origin_id` is not its `id` or whose node or service
+is not the engine's. Without a store that has `listUnshipped`,
+`markShipped` or `ingestReplicated`, the engine's method throws a
+`TypeError`.
 
 On the aggregator, pass each received line as it is, or parsed with
 `parseJson` (`JSON.parse` turns `75.0` into `75`, and the row then fails to
@@ -415,6 +464,13 @@ app.use(apiLogger({ skip: ['/healthz'] }));   // Express; see below for node:htt
   SDK reads what another wrote. `table` is required, so api rows cannot land
   in the syslog table. `SqliteStreamStore` from `fasten-sdk/store/stream_sqlite`
   is the same on `node:sqlite` (synchronous, WAL, file created 0600).
+- `PostgresStreamStore` and `PostgresStore` take a pg `Pool` in place of
+  the DSN, so they can share one; `close()` leaves a pool it was given open.
+  Neither connects until `init()` or its first call, which creates the
+  table. `SqliteStreamStore` opens its file when constructed and creates
+  the table on `init()` or its first call; its methods return promises, as
+  `PostgresStreamStore`'s do, and `busyTimeoutMs` (default 5000) sets how
+  long a write waits for another connection's write lock.
 - `persistStreams` (or `FASTEN_PERSIST_STREAMS`) is optional. When set,
   `init()` throws unless it names exactly the streams with a store: a named
   stream without one, or a store not named, is an error.
@@ -422,16 +478,42 @@ app.use(apiLogger({ skip: ['/healthz'] }));   // Express; see below for node:htt
   a `request_id` gets a `boot-<service>-<id>` id until the first row with a
   real one, then an `orphan-` id. Rows reach the store in the order they
   were logged; `flush()` and `close()` wait for writes still running.
-- A failed store write does not lose the stdout line. The store is marked
-  degraded (`store-degraded` in every read from then on) and stderr gets
-  `fasten: syslog persist failed: <ErrorType>`, without the row's values.
+- A failed store write does not lose the stdout line. The stream is marked
+  degraded (`store-degraded` in every read from then on), from its own
+  count of failed writes, so a store of your own without
+  `noteWriteFailure` or `degraded` reads as degraded too. stderr gets
+  `fasten: syslog persist failed: <ErrorType>` (`fasten: api persist
+  failed: ...` for the api stream), without the row's values. During an
+  outage that line comes for the first failure, then once a minute with
+  the count since, and once more with the count left when a write
+  succeeds again.
+- At most 10,000 writes wait on one store. Past that a row is not written
+  to the store (the ring and stdout still get it) and counts as a failed
+  write with the type `QueueFull`.
+- `retentionApi` and `retentionSyslog` are ignored for a stream without a
+  store.
 - `apiLogger()` records `method`, `path`, `status`, `duration_ms`,
   `request_id` and `timestamp`, writes the row to stdout with shape `api`,
   sets `X-Request-ID` (a usable incoming one, else a new id) and makes that
   id current for the request. With `node:http`:
   `apiLogger()(req, res, () => handler(req, res))`.
+- The path is stored as sent, without the query string, ids and tokens in
+  its segments included, unless `apiLogger` rewrites it: pass
+  `path: (req) => string`, for example
+  `apiLogger({ path: (req) => req.route?.path ?? 'unmatched' })` in Express.
+  `skip` matches the path as sent.
+- A client's `X-Request-ID` is taken as sent and is not authenticated, as
+  in Python and Go: it is stored with every row of the request. One longer
+  than 128 characters, with other characters than letters, digits, `.`,
+  `_` and `-`, or that looks like a sentinel (`boot-`, `sched-`, `bg-`,
+  `lib-`, `orphan-`) is not taken from the client; the request gets a new
+  id.
+- A request whose connection closed before the response finished is
+  recorded with status 499 and `aborted: true`. An error while recording
+  is logged as `api_log_failed` by error type and does not reach the
+  response.
 - `pushSyslog(row)` records a row from your own logger, and `pushApi(row)`
-  an api row, without a stdout line. `writeApi(row)` writes one too.
+  an api row; neither writes a stdout line. `writeApi(row)` writes one too.
 
 With no stream store, reads come from the ring and say `ring`; search needs
 a store.
@@ -456,9 +538,23 @@ http.createServer((req, res) => logs(req, res)).listen(9000);
 
 `auth` is `{ bearer: token }`, `{ verify: (req) => boolean | Promise<boolean> }`,
 or `"none"` when something in front of the reader authenticates every
-request. Anything else throws when the reader is built. A missing or wrong
-token gets `401 {"detail":"unauthenticated"}`; tokens are compared in
-constant time.
+request. Anything else throws when the reader is built. With `bearer`, the
+`Authorization` header must start with exactly `Bearer ` (that case, one
+space) and the rest must equal the token; tokens are compared in constant
+time. A `verify` function must return (or resolve to) exactly `true`; any
+other value is a 401, and a throw is a 500 whose message is not sent. A
+missing or wrong token gets `401 {"detail":"unauthenticated"}`.
+
+Requests are checked in this order: the method (any but GET, HEAD
+included, is a 405, as in the Python reader), auth (401), the tenant scope
+(401), then the parameters (422).
+
+The reader matches the request path as sent (`req.url` up to `?`), as
+Node and Express pass it, not a normalised form. A path with an empty,
+`.` or `..` segment, a backslash, or `%2e`, `%2f` or `%5c` is not one it
+serves: it goes to `next`, or gets a 404. So does a trailing slash, the
+prefix alone, and any other spelling of a route (`/%61udit`). A guard in
+front of the reader sees the same path the reader matches.
 
 | Route | Parameters |
 |---|---|
@@ -470,29 +566,47 @@ constant time.
 | `GET /api` | `method path request_id status since until limit` |
 | `GET /topology` | `since until`: rows per node, service and tenant |
 
-- `limit` is 1 to 1000 (default 100; `/search` 1 to 200, default 50). A bad
-  value is a 422 with `{"detail": "..."}`.
+- `limit` is 1 to 1000 (default 100; `/search` 1 to 200, default 50).
+  `offset` and `after` must be integers up to 2^53 - 1. A bad value is a
+  422 with `{"detail": "..."}`. A repeated parameter takes its last value.
 - `/audit` returns `total`, `limit`, `offset` and `next_after`, the lowest
   `monotonic_seq` on the page: pass it back as `after=` for the next page.
 - `since` and `until` take RFC 3339 in any offset and are compared in the
   canonical form.
-- Search is off unless `init({ searchEnabled: true })` or
-  `FASTEN_SEARCH_ENABLED=true`. It needs `since`, matches case-insensitive
+- Search is on when the reader's `searchEnabled` option says so; without
+  that option, when `init({ searchEnabled: true })` was passed or
+  `FASTEN_SEARCH_ENABLED` is `1`, `true` or `yes` (an init option of
+  `false` does not turn the variable off). It needs `since`, matches case-insensitive
   substrings of the stored JSON (on SQLite, ASCII letters only), and a
   stream without a store gets an entry in `errors`. `q=` on `/sys` cannot be combined with filters (400), and
   `/api` refuses `q=` (400).
-- Each response has `completeness` per stream: `store`, `store-degraded`
-  or `ring`, as in the Python and Go readers.
+- Each response has `completeness` per stream, as in the Python and Go
+  readers: `store` (read from a store, every write reached it),
+  `store-degraded` (read from a store that missed writes: rows may be
+  missing) or `ring` (no store: the in-memory ring of this process, at most
+  2000 rows since it started).
 - Rows are the snake_case rows the store's `query()` returns. A `BigInt`
   is written as its digits, a JSON number (no precision lost).
-- The doctor verifies the chain from `chainTail()`, which reads the detail
-  text as stored, so rows sealed by any SDK verify. It reports `verified`,
-  `breaks`, `first_break_at`, `reason` and `chain_unavailable`.
+- The doctor verifies this node's latest 50 rows from `chainTail()` (or the
+  tail of `chainRows()`), which read the detail text as stored, so rows
+  sealed by any SDK verify; it never verifies `query()` rows, whose numbers
+  `JSON.parse` has changed. `chain.verified` is `true` when the sampled
+  sealed rows verify, `false` when they break or the store does not seal
+  (`chain_unavailable`), and `null` when nothing was checked: no rows, no
+  sealed rows in the sample (`reason` says so), no node id, a store with
+  neither method, or a failed check (`error`). `sealed_rows` is how many
+  were checked, and `breaks` is `null` whenever `verified` is not a
+  verdict. `store.reachable` is true only after a call to the store
+  succeeded, and `store.degraded` says audit rows failed to reach it.
+- `/topology` rows are `sources()` rows, snake_case because their fields
+  are row columns.
 - A store error is a 500 `{"detail":"internal error"}`; the service log
   gets `reader_query_failed` with the error type only.
 
 `store` and `streams` read other stores than the engine's, for example a
-reader process over tables other services write:
+reader process over tables other services write. `store: null` is no audit
+store; a stream left out of `streams` is the engine's, and `null` is no
+store:
 
 ```js
 reader({
@@ -506,10 +620,25 @@ reader({
 
 On a shared multi-tenant store, pass `tenantScope: (req) => tenant` and
 `enforceTenantIsolation: true`. Every route is then limited to the caller's
-tenant and ignores `?tenant_id=`; a caller without a tenant gets a 401. sys
-and api rows are matched on their `tenant_id` field, and rows without one
-are left out. The doctor counts only the caller's rows, leaves out the host
-`tenant_id`, and reports a chain break without the row it is on.
+tenant and ignores `?tenant_id=`; a caller without a tenant gets a 401. The
+store is asked for the tenant's audit rows, and the reader applies the
+tenant scope to every row it returns as well, so a store of your own that
+ignores `tenantId` in `query` or `search` does not widen a read. sys and api
+rows are matched on their `tenant_id` field, and rows without one are left
+out; the SDK does not add one to the rows it writes, so add `tenant_id` to
+the fields you log for a scoped reader to show them.
+
+Under a scope, `/correlate` fetches up to `limit` api and sys rows for the
+request id and keeps the tenant's. When fewer than `limit` came back, its
+`totals` and `truncated` for those streams are exact; when `limit` came
+back, they are `null`, since a stream store cannot count by tenant. On
+`/search` the api and sys `counts` are the rows returned after the scope:
+other tenants' rows within the window can leave fewer than `limit`.
+
+A scoped doctor reports only the caller's data: its row count and the
+chain verdict (a break without the row it is on). `queue`, `transport`,
+`store.kind`, and `init`'s `service_id`, `node_id`, `tenant_id` and
+`worker_pid` are `null`.
 
 ## Tests
 

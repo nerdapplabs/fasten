@@ -9,7 +9,6 @@
  *   const syslogStore = new PostgresStreamStore(dsn, { table: 'syslog' });
  *   fasten.init({ apiStore, syslogStore, persistStreams: ['api', 'sys'] });
  */
-import { canonicalTS } from "../canonical_ts.js";
 import {
 	FILTER_COLUMNS,
 	liftedValues,
@@ -20,6 +19,7 @@ import {
 	statusFilter,
 } from "../streams.js";
 import { checkout, release, retryLost, watchPool } from "./pg_conn.js";
+import { cutoffTS } from "./rows.js";
 
 /**
  * @param {string} t full table name
@@ -86,8 +86,11 @@ function _where(f) {
 
 export class PostgresStreamStore {
 	/**
+	 * Nothing connects until init() or the first call, which creates the
+	 * table.
 	 * @param {string | { query: Function }} connection A libpq DSN or
-	 *   connection URL, or a pg Pool to use (close() leaves it open).
+	 *   connection URL, or a pg Pool to use (close() leaves it open), for
+	 *   example one shared with PostgresStore.
 	 * @param {{ table: string }} opts table name, optionally schema-qualified.
 	 *   Required, so api rows cannot land in the syslog table.
 	 */
@@ -168,7 +171,9 @@ export class PostgresStreamStore {
 
 	/**
 	 * Store one row: the whole row as JSON in `payload`, the lifted fields in
-	 * their columns.
+	 * their columns. The INSERT is not run again after a lost connection,
+	 * since it may have committed: the call fails, and the stream counts it
+	 * as a failed write.
 	 * @param {Record<string, unknown>} row
 	 * @returns {Promise<void>}
 	 */
@@ -177,7 +182,7 @@ export class PostgresStreamStore {
 		const values = liftedValues(row);
 		const run = async () => {
 			await this._ensureReady();
-			await this._query(
+			await this._pool.query(
 				`INSERT INTO ${this._table} (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 				[...values, payload],
 			);
@@ -188,7 +193,7 @@ export class PostgresStreamStore {
 	}
 
 	// pool.query, run again on a lost connection, as the Python store
-	// does.
+	// does. Only for reads and the DELETE of purge, which can run twice.
 	async _query(sql, params) {
 		return retryLost(this._pool, () => this._pool.query(sql, params));
 	}
@@ -269,13 +274,13 @@ export class PostgresStreamStore {
 	}
 
 	/**
-	 * Delete rows older than `before` (a Date or canonical timestamp) and
-	 * return how many. Rows without a timestamp are kept.
+	 * Delete rows older than `before` (a Date or a timestamp, canonicalised)
+	 * and return how many. Rows without a timestamp are kept.
 	 * @param {{ before: Date | string }} opts
 	 * @returns {Promise<number>}
 	 */
 	async purge({ before }) {
-		const cutoff = before instanceof Date ? canonicalTS(before) : before;
+		const cutoff = cutoffTS("PostgresStreamStore", before);
 		await this._ensureReady();
 		const res = await this._query(
 			`DELETE FROM ${this._table} WHERE timestamp < $1`,

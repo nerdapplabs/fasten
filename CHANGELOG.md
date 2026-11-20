@@ -31,8 +31,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   and `audit_drain_dead_letter` record the error type only, as the other
   SDKs do. `audit_sync_fallback_failed` reports it as `error_type` (was
   `error`).
-- `InitOptions.apiStore` is typed as a stream store (`StreamStore`); it was
-  typed as an audit store but was not used.
+- `apiStore` is now used: it is the api stream's store (`StreamStore`). It
+  was typed as an audit store and ignored; remove an audit store passed
+  there.
+- `init()` now opens the audit store from `FASTEN_AUDIT_DSN` when no
+  `auditStore` is passed, so an app with that variable set starts writing
+  to that store. An audit or stream DSN with an unknown scheme, or in
+  libpq's keyword form, makes `init()` throw, naming the scheme only.
+- `close()` waits for api and sys store writes and resolves false when they
+  do not finish in its timeout, then closes the stores it opened from
+  `FASTEN_*_DSN`.
+- `listUnshipped`, `markShipped` and `ingestReplicated` on the engine throw
+  `TypeError` (was `AuditStoreError`) without a store that has the method.
+  The bundled stores' `listUnshipped` throws `TypeError` when only one of
+  `serviceId` and `sourceNodeId` is given.
+- `SqliteStreamStore` methods return promises, and it creates its table on
+  `init()` or first use.
+- The reader resolves the tenant scope before reading query parameters: a
+  scoped reader answers a caller without a tenant 401, not 422.
 
 ### Added: JS SQLite store, replication, reader and stored logs
 
@@ -41,7 +57,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   chain as `PostgresStore` does, and shares one file with the Python, Go and
   Rust SQLite stores, adding the columns their tables lack. Its calls are
   synchronous and block the event loop while they run. `node:sqlite` is a
-  release candidate in Node 24.
+  release candidate from Node 24.15.0 and experimental before it.
 - Replication on both stores: `ingestReplicated(rows, { localNodeId })`
   verifies a replicated batch, checks it against the stored rows, stores the
   verified prefix as it was sealed, and returns `{ inserted,
@@ -71,7 +87,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `sqlite:////abs.db`, a bare path, `?table=`, `?wal=false`).
 - `PostgresStore` and `PostgresStreamStore` recover when the database drops
   their connections: a dead idle connection no longer ends the process, and
-  a call that meets one runs again on a new connection.
+  a read or transaction that meets one runs again on a new connection. A
+  stream INSERT is not run again, so a lost connection cannot store a
+  stream row twice; it counts as a failed write.
+- `PostgresStore` takes a pg `Pool` as well as a DSN, so it can share one
+  with `PostgresStreamStore`.
+- `apiLogger({ path })` can rewrite the stored path. A request aborted
+  before its response finished is recorded with status 499 and
+  `aborted: true`. A request id that looks like a sentinel is not taken
+  from the client.
+- The reader matches the request path as sent, applies the tenant scope to
+  every row it returns, and a scoped doctor reports only the caller's data.
+  The doctor's chain block reports `sealed_rows` and gives `verified: null`
+  when no sealed row was checked.
+- `purge({ before })` on both audit stores takes a `Date` or a timestamp in
+  any offset.
+- `SqliteStreamStore` takes `busyTimeoutMs` (default 5000).
+- A set `FASTEN_*` variable named like a DSN variable but not read is
+  reported once at init (`env_dsn_not_read`).
 
 ### Added: the JS SDK seals and verifies rows
 

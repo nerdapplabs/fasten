@@ -103,8 +103,9 @@ export interface InitOptions {
 	tenantId?: string | null;
 	/**
 	 * Without one, FASTEN_AUDIT_DSN opens a store: PostgresStore for
-	 * postgres:// or postgresql://, else SqliteStore on the DSN's path
-	 * (sqlite:///rel.db, sqlite:////abs.db or a bare path; ?table=, ?wal=).
+	 * postgres:// or postgresql://, SqliteStore on the DSN's path for
+	 * sqlite:///rel.db, sqlite:////abs.db or a bare path (?table=, ?wal=).
+	 * Another scheme, or libpq's keyword form, makes init() throw.
 	 */
 	auditStore?: AuditRepository | null;
 	/**
@@ -122,9 +123,15 @@ export interface InitOptions {
 	persistStreams?: Iterable<"api" | "sys"> | null;
 	/** Free-text search (q=, /search). Also FASTEN_SEARCH_ENABLED. */
 	searchEnabled?: boolean;
-	/** Purge api rows older than this ("7d"). Also FASTEN_RETENTION_API. */
+	/**
+	 * Purge api rows older than this ("7d"). Also FASTEN_RETENTION_API.
+	 * Ignored without an api store.
+	 */
 	retentionApi?: string;
-	/** Purge sys rows older than this. Also FASTEN_RETENTION_SYSLOG. */
+	/**
+	 * Purge sys rows older than this. Also FASTEN_RETENTION_SYSLOG. Ignored
+	 * without a syslog store.
+	 */
 	retentionSyslog?: string;
 	extraRedactKeys?: string[];
 	/** Replaces redacted values. Also read from FASTEN_REDACT_REPLACEMENT. */
@@ -200,9 +207,16 @@ export interface StreamFilter {
  * own on the same table layout. Methods may return values or promises.
  */
 export interface StreamStore {
+	/** Create the table. The bundled stores also do it on first use. */
+	init?(): Promise<void>;
 	insert(row: StreamRow): void | Promise<void>;
-	noteWriteFailure(): void;
-	readonly degraded: boolean;
+	/**
+	 * Called for each failed or dropped write. The stream counts them too,
+	 * so a store without it still reads as degraded.
+	 */
+	noteWriteFailure?(): void;
+	/** True marks the stream degraded, as its own failure count does. */
+	readonly degraded?: boolean;
 	query(
 		opts?: StreamFilter & { limit?: number },
 	): StreamRow[] | Promise<StreamRow[]>;
@@ -214,11 +228,12 @@ export interface StreamStore {
 		limit?: number;
 	}): StreamRow[] | Promise<StreamRow[]>;
 	purge?(opts: { before: Date | string }): number | Promise<number>;
+	close?(): void | Promise<void>;
 }
 
 /**
  * Record a sys row from the app's own logger: redacted, kept in memory and
- * stored if a syslog store is attached. No stdout line.
+ * stored if a syslog store is attached. It writes no stdout line.
  */
 export function pushSyslog(row: StreamRow): void;
 /**
@@ -230,16 +245,23 @@ export function writeApi(row: StreamRow): void;
 export function pushApi(row: StreamRow): void;
 
 export interface ApiLoggerOptions {
-	/** Paths not recorded, e.g. "/healthz". */
+	/** Paths not recorded, as sent, e.g. "/healthz". */
 	skip?: Iterable<string>;
 	engine?: Engine;
+	/**
+	 * The path to store for the request. Without it the path is stored as
+	 * sent (without the query string), ids and tokens in it included.
+	 */
+	path?: (req: import("node:http").IncomingMessage) => string;
 }
 
 /**
  * Middleware recording one api row per request (method, path, status,
  * duration_ms, request_id, timestamp), for Express/Connect or
  * http.createServer. Sets X-Request-ID and makes the id current for the
- * request.
+ * request. A client's X-Request-ID is taken as sent, not authenticated,
+ * unless it looks like a sentinel. A request whose connection closed before
+ * the response finished gets status 499 and `aborted: true`.
  */
 export function apiLogger(
 	opts?: ApiLoggerOptions,
@@ -262,6 +284,10 @@ export class Engine {
 	flush(timeoutMs?: number): Promise<boolean>;
 	close(timeoutMs?: number): Promise<boolean>;
 	redactExpired(opts: RedactExpiredOptions): Promise<string[]>;
+	/** See the module function listUnshipped. */
+	listUnshipped(limit?: number): Promise<ChainRow[]>;
+	markShipped(ids: string[]): Promise<void>;
+	ingestReplicated(rows: Iterable<ChainRowInput>): Promise<IngestResult>;
 	pushSyslog(row: StreamRow): void;
 	writeApi(row: StreamRow): void;
 	pushApi(row: StreamRow): void;
@@ -326,13 +352,16 @@ export interface QueueStats {
 // Returns null in raise mode (no drainer running).
 export function queueStats(): QueueStats | null;
 
-// Wait for queued rows to be written. Returns false on timeout, and true
-// right away in raise mode.
+// Wait for queued audit rows and running api and sys store writes, those
+// of streams a re-init replaced included. Returns false on timeout; with
+// no queue and no stream writes, true at once.
 export function flush(timeoutMs?: number): Promise<boolean>;
 
 // Call on shutdown: flushes for up to half of timeoutMs, then stops the
-// drainer, giving queued rows one attempt. Resolves false if a row was lost
-// (audit_drain_lost_at_stop). Emits after close skip the queue.
+// drainer, giving queued rows one attempt, waits for api and sys store
+// writes, and closes the stores opened from FASTEN_*_DSN. Resolves false
+// if a row was lost (audit_drain_lost_at_stop) or the stream writes did not
+// finish in time. Emits after close skip the queue.
 export function close(timeoutMs?: number): Promise<boolean>;
 
 export interface RedactExpiredOptions {
@@ -353,7 +382,10 @@ export function redactExpired(opts: RedactExpiredOptions): Promise<string[]>;
 /**
  * Rows the default engine's service and node originated that are not
  * shipped yet, oldest first, as the store's listUnshipped returns them with
- * exact set. Rows ingested from other nodes are left out (spec §4).
+ * exact set. Rows ingested from other nodes are left out (spec §4): any row
+ * the store returns whose origin_id is not its id, or whose node or service
+ * is not the engine's, is dropped. Throws TypeError without a store that
+ * has listUnshipped.
  */
 export function listUnshipped(limit?: number): Promise<ChainRow[]>;
 /** Mark rows shipped upstream, by id, in the default engine's store. */
@@ -402,13 +434,43 @@ export interface AuditRepository {
 	 */
 	seals?(): boolean;
 	query(filter: Filter): Promise<Row[]> | Row[];
+	/** Rows matching the filter; the reader's totals and doctor use it. */
+	count?(
+		filter?: Omit<Filter, "limit" | "offset" | "afterSeq">,
+	): Promise<number> | number;
+	/** /search on audit. Must honour tenantId. */
+	search?(opts: {
+		q: string;
+		since: string;
+		until?: string | null;
+		limit?: number;
+		tenantId?: string | null;
+	}): Promise<Row[]> | Row[];
+	/** /topology. Rows use the row column names, so they are snake_case. */
+	sources?(opts?: {
+		since?: string;
+		until?: string;
+	}): Promise<SourceRow[]> | SourceRow[];
+	/** The doctor's chain sample: the node's newest rows by seq, oldest first. */
+	chainTail?(
+		sourceNodeId: string,
+		limit: number,
+	): Promise<ChainRow[]> | ChainRow[];
+	/**
+	 * Unshipped rows, oldest seq first. Engine.listUnshipped passes
+	 * serviceId, sourceNodeId and exact: the store must honour them (only
+	 * rows that identity originated, origin_id = id), or rows ingested from
+	 * other nodes would be shipped again. The engine drops any other row
+	 * it gets back.
+	 */
 	listUnshipped(
 		limit: number,
 		opts?: ListUnshippedOptions,
 	): Promise<Row[] | ChainRow[]> | Row[] | ChainRow[];
 	markShipped(ids: string[]): Promise<void> | void;
 	purge(opts: {
-		before: string;
+		/** A Date or a timestamp; the bundled stores canonicalise it. */
+		before: Date | string;
 		respectUnshipped?: boolean;
 	}): Promise<number> | number;
 	// Spec §7.1; needed by redactExpired and retentionPii.
@@ -420,6 +482,16 @@ export interface AuditRepository {
 		skipped: number;
 	}>;
 	redactRows?(opts: { ids: string[] }): Promise<string[]>;
+}
+
+/** One (node, service, tenant) group from sources(). */
+export interface SourceRow {
+	source_node_id: string;
+	service_id: string;
+	tenant_id: string | null;
+	rows: number;
+	first_seen: string;
+	last_seen: string;
 }
 
 export interface AuditOutboxRepository {
@@ -455,7 +527,10 @@ export interface ChainStore {
 }
 
 export interface ListUnshippedOptions {
-	/** With sourceNodeId: only rows this identity originated (origin_id = id). */
+	/**
+	 * With sourceNodeId: only rows this identity originated (origin_id = id).
+	 * The bundled stores throw when only one of the two is given.
+	 */
 	serviceId?: string;
 	sourceNodeId?: string;
 	/** Rows as chainRows reads them, detail numbers as hashed, for shipping. */
@@ -468,9 +543,9 @@ export interface IngestOptions {
 }
 
 /**
- * What ingestReplicated did (spec §4). Python's IngestResult and Go's, with
- * camelCase names: inserted, rejected_from_seq (RejectedFromSeq),
- * reason (Reason).
+ * What ingestReplicated did (spec §4). The same fields as Python's and Go's
+ * IngestResult: inserted (Python inserted, Go Inserted), rejectedFromSeq
+ * (rejected_from_seq, RejectedFromSeq), reason (reason, Reason).
  */
 export interface IngestResult {
 	/** Rows of the verified prefix passed to the insert, re-deliveries included. */
@@ -729,6 +804,8 @@ declare const _default: {
 	queueStats: typeof queueStats;
 	flush: typeof flush;
 	close: typeof close;
+	Engine: typeof Engine;
+	defaultEngine: typeof defaultEngine;
 
 	redactExpired: typeof redactExpired;
 	listUnshipped: typeof listUnshipped;

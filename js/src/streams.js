@@ -152,12 +152,17 @@ export class Ring {
 
 // Rows waiting on one store's insert at most; past that a row is dropped
 // and counted as a write failure.
-const MAX_PENDING = 10_000;
+export const MAX_PENDING = 10_000;
+
+// During an outage stderr gets the first failure, then one line with the
+// count every this many ms, as the drainer reports its first failure and
+// then a summary.
+export const REPORT_EVERY_MS = 60_000;
 
 /**
  * One stream: its ring and, if attached, its store. A row is pushed to the
  * ring and written to the store; a failed or dropped store write marks the
- * store degraded and is reported on stderr by error type only. Reads come
+ * stream degraded and is reported on stderr by error type only. Reads come
  * from the store when there is one.
  */
 export class Stream {
@@ -166,6 +171,10 @@ export class Stream {
 		this.store = store ?? null;
 		this.ring = new Ring(maxlen);
 		this._pending = new Set();
+		this.writeFailures = 0;
+		// Failures since the last stderr line, and when that was.
+		this._unreported = 0;
+		this._reportedAt = null;
 	}
 
 	push(row) {
@@ -183,40 +192,89 @@ export class Stream {
 			this._failed(err);
 			return;
 		}
-		if (typeof p?.then !== "function") return;
+		if (typeof p?.then !== "function") {
+			this._stored();
+			return;
+		}
 		const tracked = p.then(
-			() => {},
+			() => this._stored(),
 			(err) => this._failed(err),
 		);
 		this._pending.add(tracked);
 		tracked.finally(() => this._pending.delete(tracked));
 	}
 
-	// The message is left out: a driver error can quote the row's values.
-	_failed(err, type) {
+	_label() {
+		return this.name === "sys" ? "syslog" : this.name;
+	}
+
+	_stderr(line) {
 		try {
-			this.store.noteWriteFailure?.();
-		} catch {
-			// The stderr line below still reports it.
-		}
-		const label = this.name === "sys" ? "syslog" : this.name;
-		try {
-			process.stderr.write(
-				`fasten: ${label} persist failed: ${type ?? errorType(err)}\n`,
-			);
+			process.stderr.write(line);
 		} catch {
 			// Nothing left to report to.
 		}
 	}
 
-	/** Resolves once the store writes started so far have settled. */
+	// A write succeeded: failures not yet reported get their line now.
+	_stored() {
+		if (this._reportedAt === null) return;
+		if (this._unreported > 0) {
+			this._stderr(
+				`fasten: ${this._label()} persist failed: ${this._unreported} more, then a write succeeded\n`,
+			);
+		}
+		this._unreported = 0;
+		this._reportedAt = null;
+	}
+
+	// The message is left out: a driver error can quote the row's values.
+	_failed(err, type) {
+		this.writeFailures++;
+		try {
+			this.store.noteWriteFailure?.();
+		} catch {
+			// The stream's own count still marks it degraded.
+		}
+		const now = Date.now();
+		const label = this._label();
+		if (this._reportedAt === null) {
+			this._reportedAt = now;
+			this._stderr(
+				`fasten: ${label} persist failed: ${type ?? errorType(err)}\n`,
+			);
+			return;
+		}
+		this._unreported++;
+		if (now - this._reportedAt >= REPORT_EVERY_MS) {
+			this._stderr(
+				`fasten: ${label} persist failed: ${type ?? errorType(err)} (${this._unreported} since the last report)\n`,
+			);
+			this._unreported = 0;
+			this._reportedAt = now;
+		}
+	}
+
+	/**
+	 * Resolves once the store writes started so far, and any started while
+	 * it waits, have settled.
+	 */
 	async settle() {
+		// A tick first, so a row pushed right after the call is waited for.
+		await null;
 		while (this._pending.size) await Promise.all([...this._pending]);
+	}
+
+	/** Whether store writes are still running. */
+	get pending() {
+		return this._pending.size;
 	}
 
 	source() {
 		if (!this.store) return "ring";
-		return this.store.degraded ? "store-degraded" : "store";
+		return this.writeFailures > 0 || this.store.degraded === true
+			? "store-degraded"
+			: "store";
 	}
 
 	query(opts) {

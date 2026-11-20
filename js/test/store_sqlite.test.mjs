@@ -5,15 +5,16 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import { SqliteStore } from '../src/store/sqlite.js';
+import { SqliteStreamStore } from '../src/store/stream_sqlite.js';
 import {
     AuditOutcomeUnknownError, AuditRowRejectedError, ChainError, Engine,
-    checkpointsSince, register as registerCodes, takeCheckpoints, verifyChain,
+    checkpointsSince, register as registerCodes, seal, takeCheckpoints, verifyChain,
 } from '../src/index.js';
 import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
@@ -297,6 +298,209 @@ test('an insert waits for another connection\'s write lock', async () => {
     const row = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-lock' }));
     assert.equal(row.monotonic_seq, 1);
     assert.equal(s._db.isTransaction, false);
+});
+
+// A thread that takes the write lock on `path`, says so, and lets go
+// after `ms`.
+const LOCKER = `
+import { workerData, parentPort } from 'node:worker_threads';
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(workerData.path);
+db.exec('BEGIN IMMEDIATE');
+parentPort.postMessage('held');
+setTimeout(() => { db.exec('ROLLBACK'); db.close(); parentPort.postMessage('released'); }, workerData.ms);
+`;
+
+async function holdLock(path, ms) {
+    const wk = new Worker(LOCKER, { eval: true, workerData: { path, ms } });
+    const released = new Promise((resolve, reject) => {
+        wk.on('message', (m) => { if (m === 'released') resolve(); });
+        wk.once('error', reject);
+    });
+    await new Promise((resolve, reject) => {
+        wk.once('message', resolve);
+        wk.once('error', reject);
+    });
+    // Wrapped: an async function returning a promise would wait for it.
+    return { released };
+}
+
+test('an insert waits out a write lock held for 150 ms, then takes seq 1', async () => {
+    const path = dbPath();
+    const s = open(path);
+    await s.init();
+    const { released } = await holdLock(path, 150);
+    const t0 = Date.now();
+    const row = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-wait' }));
+    const waited = Date.now() - t0;
+    await released;
+    assert.equal(row.monotonic_seq, 1);
+    assert.ok(waited >= 100, `waited ${waited} ms`);
+});
+
+test('SqliteStreamStore waits for the write lock as SqliteStore does', async () => {
+    const path = dbPath();
+    const s = new SqliteStreamStore(path, { table: 'syslog' });
+    await s.init();
+    assert.equal(s._db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+    const { released } = await holdLock(path, 150);
+    const t0 = Date.now();
+    await s.insert({ event: 'waited' });
+    const waited = Date.now() - t0;
+    await released;
+    assert.ok(waited >= 100, `waited ${waited} ms`);
+    assert.equal(await s.count(), 1);
+    const short = new SqliteStreamStore(path, { table: 'syslog', busyTimeoutMs: 20 });
+    const { released: again } = await holdLock(path, 300);
+    await assert.rejects(short.insert({ event: 'gave up' }), /locked/);
+    await again;
+    await short.close();
+    await s.close();
+});
+
+test('a failed ROLLBACK does not hide the error that caused it', async () => {
+    const s = open();
+    await s.init();
+    const exec = s._db.exec.bind(s._db);
+    s._db.exec = (q) => {
+        if (q === 'ROLLBACK') {
+            exec(q);
+            throw new Error('rollback failed');
+        }
+        return exec(q);
+    };
+    const insertRow = s._insertRow.bind(s);
+    s._insertRow = () => { throw new Error('the first error'); };
+    try {
+        await assert.rejects(s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-rb' })), /the first error/);
+    } finally {
+        s._db.exec = exec;
+        s._insertRow = insertRow;
+    }
+    assert.equal(s._db.isTransaction, false);
+});
+
+test('the WAL and shared-memory files are owner-only too', { skip: process.platform === 'win32' }, async () => {
+    const path = dbPath();
+    const s = open(path);
+    await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-wal' }));
+    for (const f of [path, `${path}-wal`, `${path}-shm`]) {
+        assert.equal(statSync(f).mode & 0o777, 0o600, f);
+    }
+    const spath = dbPath();
+    const st = new SqliteStreamStore(spath, { table: 'syslog' });
+    await st.insert({ event: 'x' });
+    for (const f of [spath, `${spath}-wal`, `${spath}-shm`]) {
+        assert.equal(statSync(f).mode & 0o777, 0o600, f);
+    }
+    await st.close();
+});
+
+test('a relative path stays the file it named after process.chdir', async () => {
+    const cwd = process.cwd();
+    const a = mkdtempSync(join(DIR, 'rel-a-'));
+    const b = mkdtempSync(join(DIR, 'rel-b-'));
+    process.chdir(a);
+    let s;
+    let st;
+    try {
+        s = new SqliteStore('rel.db');
+        st = new SqliteStreamStore('rel-streams.db', { table: 'syslog' });
+        process.chdir(b);
+        await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-rel' }));
+        await st.insert({ event: 'rel' });
+    } finally {
+        process.chdir(cwd);
+    }
+    await s.close();
+    await st.close();
+    assert.deepEqual(readdirSync(b), []);
+    const db = sql(join(a, 'rel.db'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n, 1);
+    db.close();
+    const db2 = sql(join(a, 'rel-streams.db'));
+    assert.equal(db2.prepare('SELECT COUNT(*) AS n FROM syslog').get().n, 1);
+    db2.close();
+});
+
+// Threads that ingest a batch (JSON lines, so detail tokens stay as sent)
+// or insert seq-0 rows, all released at once.
+const MIXED = `
+import { workerData, parentPort } from 'node:worker_threads';
+const { SqliteStore } = await import(workerData.store);
+const s = new SqliteStore(workerData.path);
+const go = new Int32Array(workerData.go);
+Atomics.wait(go, 0, 0);
+const out = [];
+if (workerData.batches) {
+    for (const batch of workerData.batches) out.push(await s.ingestReplicated(batch));
+} else {
+    for (let i = 0; i < workerData.n; i++) {
+        const id = 'evt-e' + workerData.w + '-' + i;
+        await s.insert({ id, origin_id: id, monotonic_seq: 0, timestamp: '2026-08-21T10:00:00.000000Z',
+            code: 'C', action: 'a', severity: 'info', service_id: 'svc', source_node_id: workerData.node,
+            tenant_id: null, actor: 'x', actor_kind: 'user', target: 't', category: 'c',
+            domain: 'd', method: 'm', request_id: 'r', detail: { i } });
+    }
+}
+await s.close();
+parentPort.postMessage(out);
+`;
+
+async function runThreads(path, jobs) {
+    const go = new SharedArrayBuffer(4);
+    const store = new URL('../src/store/sqlite.js', import.meta.url).href;
+    const workers = jobs.map((job, w) => new Worker(MIXED, { eval: true, workerData: { path, go, store, w, ...job } }));
+    const done = workers.map((wk) => new Promise((resolve, reject) => {
+        wk.once('message', resolve);
+        wk.once('error', reject);
+    }));
+    await new Promise((r) => setTimeout(r, 100));
+    Atomics.store(new Int32Array(go), 0, 1);
+    Atomics.notify(new Int32Array(go), 0);
+    return Promise.all(done);
+}
+
+function sealedChain(node, n) {
+    const rows = [];
+    let prev = 'genesis';
+    for (let i = 1; i <= n; i++) {
+        const r = seal(prev, makeRow({ source_node_id: node, monotonic_seq: i, detail: parseJson(`{"i": ${i}, "f": 1.50}`) }));
+        prev = r.hash;
+        rows.push(JSON.stringify(r));
+    }
+    return rows;
+}
+
+test('two threads ingesting overlapping batches give one chain', async () => {
+    const path = dbPath();
+    await open(path).init();
+    const rows = sealedChain('n-overlap', 45);
+    const results = await runThreads(path, [
+        { batches: [rows.slice(0, 30)] },
+        { batches: [rows.slice(14, 45)] },
+    ]);
+    for (const [res] of results) assert.equal(res.rejectedFromSeq, null, res.reason);
+    const back = await open(path).chainRows('n-overlap');
+    assert.deepEqual(back.map((r) => r.monotonic_seq), Array.from({ length: 45 }, (_, i) => i + 1));
+    const v = verifyChain(back);
+    assert.ok(v.ok, v.reason);
+});
+
+test('a thread emitting on one node while another ingests another node', async () => {
+    const path = dbPath();
+    await open(path).init();
+    const rows = sealedChain('n-remote', 40);
+    const batches = Array.from({ length: 8 }, (_, i) => rows.slice(i * 5, i * 5 + 5));
+    const [, ingested] = await runThreads(path, [{ node: 'n-local', n: 40 }, { batches }]);
+    assert.ok(ingested.every((r) => r.inserted === 5 && r.rejectedFromSeq === null));
+    const s = open(path);
+    for (const node of ['n-local', 'n-remote']) {
+        const back = await s.chainRows(node);
+        assert.deepEqual(back.map((r) => r.monotonic_seq), Array.from({ length: 40 }, (_, i) => i + 1), node);
+        const v = verifyChain(back);
+        assert.ok(v.ok, `${node}: ${v.reason}`);
+    }
 });
 
 test('a retried row returns the stored row; a different row under its id is rejected', async () => {

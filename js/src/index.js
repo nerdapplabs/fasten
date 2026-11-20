@@ -60,9 +60,15 @@ export function withRequestID(requestId, fn) {
 export { isSentinel, mintSentinel };
 
 // A request id from outside (an HTTP header) is used only when it is 1 to
-// 128 letters, digits, ".", "_" and "-": it is stored and indexed with every
-// row of the request.
+// 128 letters, digits, ".", "_" and "-", and does not look like a sentinel
+// (rows written outside a request): it is stored and indexed with every
+// row of the request. It is not authenticated.
 const _USABLE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
+function _usableRequestId(id) {
+	return (
+		typeof id === "string" && _USABLE_REQUEST_ID.test(id) && !isSentinel(id)
+	);
+}
 
 // --- Code catalog ---------------------------------------------------------
 
@@ -379,6 +385,11 @@ const _EMPTY_CONFIG = Object.freeze({
 
 const _STREAM_NAMES = ["api", "sys"];
 
+// The variables init() opens stores from.
+const _DSN_ENV = ["FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"];
+// Variables already warned about as looking like a DSN variable.
+const _warnedEnv = new Set();
+
 function _pyList(names) {
 	return `[${[...names]
 		.sort()
@@ -449,11 +460,16 @@ export class Engine {
 	_retentionTimer = null;
 	_retentionFirst = null;
 	#unsealedReported = false;
-	// Stores opened from FASTEN_*_DSN, by variable and DSN, so a re-init
-	// with the same DSN keeps the store and its connections.
+	// Stores opened from FASTEN_*_DSN: variable name to { dsn, store }, so a
+	// re-init with the same DSN keeps the store and its connections.
 	#envStores = new Map();
+	// Streams a re-init replaced while their store writes still ran.
+	#retiringStreams = new Set();
+	// Stores opened from the environment that a re-init stopped using.
+	#abandoned = new Set();
 
 	init(opts = {}) {
+		this.#warnUnknownDsnEnv();
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
 			.split(",")
 			.map((s) => s.trim())
@@ -544,6 +560,11 @@ export class Engine {
 		// row with a real one (spec persistent-streams §7).
 		this.#bootRequestId = mintSentinel("boot", this.#config.serviceId);
 		this.#bootOver = false;
+		// Streams with writes still running are kept until they settle, so
+		// flush() and close() wait for them.
+		for (const old of Object.values(this.#streams ?? {})) {
+			if (old.pending) this.#retiringStreams.add(old);
+		}
 		this.#streams = {
 			api: new Stream("api", streamStores.api),
 			sys: new Stream("sys", streamStores.sys),
@@ -569,7 +590,7 @@ export class Engine {
 			this._drainerSysLog("error", "audit_chain_unavailable", {
 				store: null,
 				reason:
-					"no audit store configured (spec 8.1); rows are written to stdout unsealed",
+					"no audit store configured (spec 8.1): auditStore not passed and FASTEN_AUDIT_DSN unset; rows are written to stdout unsealed",
 			});
 		} else if (!_seals(store)) {
 			this._drainerSysLog("error", "audit_chain_unavailable", {
@@ -594,6 +615,7 @@ export class Engine {
 		}
 		if (piiRetMs && store) this._startRetention(piiRetMs);
 		for (const r of streamRetention) this._startStreamRetention(r);
+		this.#closeAbandoned();
 	}
 
 	// The store for the DSN in environment variable `name`, or null when it
@@ -601,13 +623,72 @@ export class Engine {
 	#fromEnv(name, open) {
 		const dsn = process.env[name];
 		if (!dsn) return null;
-		const key = `${name}\n${dsn}`;
-		let store = this.#envStores.get(key);
-		if (!store) {
-			store = open(dsn);
-			this.#envStores.set(key, store);
-		}
+		const held = this.#envStores.get(name);
+		if (held?.dsn === dsn) return held.store;
+		const store = open(dsn);
+		// The store for an earlier DSN is closed by #closeAbandoned.
+		if (held) this.#abandoned.add(held.store);
+		this.#envStores.set(name, { dsn, store });
 		return store;
+	}
+
+	// Close the stores opened from the environment that this init does not
+	// use, once the drainers and streams that may still write to them are
+	// done.
+	#closeAbandoned() {
+		const c = this.#config;
+		const inUse = new Set([c.auditStore, c.apiStore, c.syslogStore]);
+		for (const [name, held] of this.#envStores) {
+			if (!inUse.has(held.store)) {
+				this.#envStores.delete(name);
+				this.#abandoned.add(held.store);
+			}
+		}
+		const stores = [...this.#abandoned].filter((s) => !inUse.has(s));
+		this.#abandoned.clear();
+		if (stores.length === 0) return;
+		const waits = [
+			...[...this._retiring].map((e) => e.done),
+			...[...this.#retiringStreams].map((st) => st.settle()),
+		];
+		Promise.all(waits)
+			.then(() => this.#closeStores(stores))
+			.catch(() => {});
+	}
+
+	// Close each store, logging a failure by error type.
+	async #closeStores(stores) {
+		await Promise.all(
+			stores.map(async (s) => {
+				try {
+					await s?.close?.();
+				} catch (err) {
+					this._drainerSysLog("error", "store_close_failed", {
+						error_type: errorType(err),
+					});
+				}
+			}),
+		);
+	}
+
+	// Warn once per variable about a set FASTEN_* variable named like a DSN
+	// variable that init() does not read: a misspelt one leaves the app
+	// without the store it meant to open. The value is not logged.
+	#warnUnknownDsnEnv() {
+		for (const name of Object.keys(process.env)) {
+			if (
+				/^FASTEN_\w*(DSN|DNS|URL)$/.test(name) &&
+				!_DSN_ENV.includes(name) &&
+				process.env[name] &&
+				!_warnedEnv.has(name)
+			) {
+				_warnedEnv.add(name);
+				this._drainerSysLog("warn", "env_dsn_not_read", {
+					variable: name,
+					reason: `init() opens stores from ${_DSN_ENV.join(", ")} only`,
+				});
+			}
+		}
 	}
 
 	emit(input) {
@@ -847,14 +928,15 @@ export class Engine {
 		return redacted;
 	}
 
-	// The audit store, with the methods `op` needs.
+	// The audit store, with the methods `op` needs. A missing store or
+	// method is the configuration's, so it is a TypeError.
 	_storeWith(op, ...methods) {
 		const store = this.#config.auditStore;
 		if (!store || methods.some((m) => typeof store[m] !== "function")) {
-			throw new AuditStoreError(
-				new Error(
-					`${op}: the audit store does not implement ${methods.join(" / ")}`,
-				),
+			throw new TypeError(
+				store
+					? `${op}: the audit store does not implement ${methods.join(" / ")}`
+					: `${op}: no audit store; pass auditStore to init() or set FASTEN_AUDIT_DSN`,
 			);
 		}
 		return store;
@@ -864,15 +946,23 @@ export class Engine {
 	 * Rows this engine's service and node originated that are not shipped
 	 * yet, oldest first, as the store's `listUnshipped` returns them with
 	 * `exact` set: ship them as `JSON.stringify` writes them. Rows ingested
-	 * from other nodes are left out (spec §4).
+	 * from other nodes are left out (spec §4): the store is asked for this
+	 * identity's rows, and any other row it returns is dropped here.
 	 */
 	async listUnshipped(limit = 100) {
 		const store = this._storeWith("listUnshipped", "listUnshipped");
-		return store.listUnshipped(limit, {
-			serviceId: this.#config.serviceId,
-			sourceNodeId: this.#config.nodeId,
+		const { serviceId, nodeId } = this.#config;
+		const rows = await store.listUnshipped(limit, {
+			serviceId,
+			sourceNodeId: nodeId,
 			exact: true,
 		});
+		return rows.filter(
+			(r) =>
+				r.origin_id === r.id &&
+				r.source_node_id === nodeId &&
+				r.service_id === serviceId,
+		);
 	}
 
 	/** Mark rows shipped upstream, by id. */
@@ -896,7 +986,9 @@ export class Engine {
 	}
 
 	// Also waits for drainers a re-init is retiring, and for api and sys
-	// rows still being written to their stores.
+	// rows still being written to their stores, including the stores of
+	// streams a re-init replaced and rows pushed while it waits. Resolves
+	// false when any of them is not done by timeoutMs.
 	async flush(timeoutMs = 5000) {
 		const ds = [...this._retiring].map((e) => e.drainer);
 		if (this._drainer) ds.push(this._drainer);
@@ -908,16 +1000,20 @@ export class Engine {
 	}
 
 	async _settleStreams(timeoutMs) {
-		const s = this.#streams;
-		if (!s) return true;
+		const all = [
+			...Object.values(this.#streams ?? {}),
+			...this.#retiringStreams,
+		];
+		if (all.length === 0) return true;
 		let timer;
 		const timeout = new Promise((r) => {
 			timer = setTimeout(() => r(false), timeoutMs);
 			timer.unref?.();
 		});
-		const settled = Promise.all([s.api.settle(), s.sys.settle()]).then(
-			() => true,
-		);
+		const settled = Promise.all(all.map((st) => st.settle())).then(() => {
+			for (const st of all) this.#retiringStreams.delete(st);
+			return true;
+		});
 		try {
 			return await Promise.race([settled, timeout]);
 		} finally {
@@ -928,10 +1024,13 @@ export class Engine {
 	/**
 	 * Flush pending audit rows for up to half of timeoutMs, then stop the
 	 * drainer. Rows still queued get one attempt; a row not stored by
-	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Call it on
-	 * shutdown: flush() alone leaves a row in backoff unreported at exit.
-	 * Emits after close are stored without the queue. Resolves false if a
-	 * row was lost.
+	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Waits, within
+	 * timeoutMs, for api and sys rows still being written, then closes the
+	 * stores opened from FASTEN_*_DSN (a later init() opens them again).
+	 * Call it on shutdown: flush() alone leaves a row in backoff unreported
+	 * at exit. Emits after close are stored without the queue, in a store
+	 * passed to init(). Resolves false if a row was lost or the stream
+	 * writes did not settle in time.
 	 */
 	close(timeoutMs = 5000) {
 		// A second close while one is running waits for the same outcome.
@@ -944,21 +1043,25 @@ export class Engine {
 	}
 
 	async #close(timeoutMs) {
-		if (!this._drainer && this._retiring.size === 0) {
-			await this._settleStreams(timeoutMs);
-			return true;
-		}
 		const deadline = Date.now() + timeoutMs;
 		const left = () => Math.max(0, deadline - Date.now());
-		await this.flush(timeoutMs / 2);
-		// A drainer a re-init is retiring is stopped within this timeout too.
-		const retiring = [...this._retiring];
-		const ok = await Promise.all([
-			this._uninstallDrainer(left()),
-			...retiring.map((e) => e.stop(left())),
-		]);
-		await Promise.all(retiring.map((e) => e.done));
-		return ok.every(Boolean);
+		let ok = [true];
+		if (this._drainer || this._retiring.size > 0) {
+			await this.flush(timeoutMs / 2);
+			// A drainer a re-init is retiring is stopped within this timeout
+			// too.
+			const retiring = [...this._retiring];
+			ok = await Promise.all([
+				this._uninstallDrainer(left()),
+				...retiring.map((e) => e.stop(left())),
+			]);
+			await Promise.all(retiring.map((e) => e.done));
+		}
+		const settled = await this._settleStreams(left());
+		const opened = [...this.#envStores.values()].map((h) => h.store);
+		this.#envStores.clear();
+		await this.#closeStores(opened);
+		return settled && ok.every(Boolean);
 	}
 
 	// Stops the drainer and any a re-init is retiring.
@@ -968,6 +1071,7 @@ export class Engine {
 		this._stopRetention();
 		this.#config = { ..._EMPTY_CONFIG };
 		this.#streams = null;
+		this.#retiringStreams.clear();
 		this.#auditWriteSwallowed = false;
 		await Promise.all([stopped, ...retiring.map((e) => e.stop())]);
 		await Promise.all(retiring.map((e) => e.done));
@@ -1328,38 +1432,67 @@ export function pushApi(row) {
  * `skip`, with the keys Python's and Go's APILogger write: method, path,
  * status, duration_ms, request_id, timestamp. The request id is a usable
  * X-Request-ID header, else the current one, else a new one; it is set on
- * the response and is current for the rest of the request.
+ * the response and is current for the rest of the request. A client's id is
+ * taken as sent, not authenticated; one that looks like a sentinel
+ * ("boot-...", "orphan-...") is not taken.
+ *
+ * The path is stored as sent, without the query string, unless `path`
+ * rewrites it: `path: (req) => req.route?.path ?? "/other"`, for example,
+ * to keep ids and tokens in path segments out of the stored rows. `skip`
+ * matches the path as sent.
+ *
+ * A request whose connection closed before the response finished is
+ * recorded with status 499 and `aborted: true`.
  *
  * Works as Express/Connect middleware `(req, res, next)`, or with
  * http.createServer as `apiLogger()(req, res, () => handler(req, res))`.
  */
-export function apiLogger({ skip = [], engine = defaultEngine } = {}) {
+export function apiLogger({
+	skip = [],
+	engine = defaultEngine,
+	path: rewrite = null,
+} = {}) {
+	if (rewrite !== null && typeof rewrite !== "function") {
+		throw new TypeError("apiLogger: path must be a function (req) => string");
+	}
 	const skipped = new Set(skip);
 	return (req, res, next) => {
-		const path = (req.url ?? "").split("?")[0];
+		const sent = (req.url ?? "").split("?")[0];
 		const header = req.headers?.["x-request-id"];
-		const rid =
-			typeof header === "string" && _USABLE_REQUEST_ID.test(header)
-				? header
-				: (currentRequestID() ?? mintID());
-		if (skipped.has(path)) return withRequestID(rid, () => next());
+		const rid = _usableRequestId(header)
+			? header
+			: (currentRequestID() ?? mintID());
+		if (skipped.has(sent)) return withRequestID(rid, () => next());
 		const start = process.hrtime.bigint();
 		if (!res.headersSent) res.setHeader("X-Request-ID", rid);
 		let done = false;
-		const record = () => {
+		const record = (aborted) => {
 			if (done) return;
 			done = true;
-			engine.writeApi({
-				method: req.method ?? "",
-				path,
-				status: res.statusCode,
-				duration_ms: Number((process.hrtime.bigint() - start) / 1_000_000n),
-				request_id: rid,
-				timestamp: canonicalTS(),
-			});
+			// A throw here would reach the response's event listeners.
+			try {
+				const row = {
+					method: req.method ?? "",
+					path: rewrite ? String(rewrite(req)) : sent,
+					status: aborted ? 499 : res.statusCode,
+					duration_ms: Number((process.hrtime.bigint() - start) / 1_000_000n),
+					request_id: rid,
+					timestamp: canonicalTS(),
+				};
+				if (aborted) row.aborted = true;
+				engine.writeApi(row);
+			} catch (err) {
+				try {
+					engine._drainerSysLog("error", "api_log_failed", {
+						error_type: errorType(err),
+					});
+				} catch {
+					// Nothing left to report to.
+				}
+			}
 		};
-		res.once("finish", record);
-		res.once("close", record);
+		res.once("finish", () => record(false));
+		res.once("close", () => record(res.writableFinished !== true));
 		return withRequestID(rid, () => next());
 	};
 }

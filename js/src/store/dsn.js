@@ -56,19 +56,41 @@ function _postgres(dsn, defaultTable) {
 	};
 }
 
+const _SCHEMES = ["sqlite", "postgres", "postgresql", ""];
+
+// The DSN split, after checking its scheme. The error names the scheme
+// only: the rest of a DSN can hold a password.
+function _checked(dsn, kind) {
+	const file = kind === "stream" ? "streams.db" : "audit.db";
+	// libpq's keyword form ("host=db dbname=app"): pg reads only URLs.
+	if (/^\s*[A-Za-z_]+\s*=/.test(dsn)) {
+		throw new Error(
+			`fasten: ${kind} DSN in libpq keyword form not supported. Use postgres://user@host/db, sqlite:///./${file}, or a bare filesystem path.`,
+		);
+	}
+	const d = _split(dsn);
+	if (!_SCHEMES.includes(d.scheme)) {
+		throw new Error(
+			`fasten: ${kind} DSN scheme '${d.scheme}' not supported. Use sqlite:///./${file}, postgres://..., or a bare filesystem path.`,
+		);
+	}
+	return d;
+}
+
 /**
  * The audit store for a DSN: PostgresStore for postgres:// and
- * postgresql://, else SqliteStore on the DSN's path (sqlite:///rel.db,
- * sqlite:////abs.db or a bare path). `?table=` names the table and
- * `?wal=false` turns WAL off, as in Python.
+ * postgresql://, SqliteStore on the DSN's path for sqlite:///rel.db,
+ * sqlite:////abs.db or a bare path. `?table=` names the table and
+ * `?wal=false` turns WAL off, as in Python. Any other scheme, or libpq's
+ * keyword form, is an error, and no file is created.
  * @param {string} dsn
  */
 export function auditStoreFromDsn(dsn) {
-	if (dsn.startsWith("postgres://") || dsn.startsWith("postgresql://")) {
+	const d = _checked(dsn, "audit");
+	if (d.scheme === "postgres" || d.scheme === "postgresql") {
 		const { conn, table } = _postgres(dsn, "audit_log");
 		return new PostgresStore(conn, { table });
 	}
-	const d = _split(dsn);
 	const path = _sqlitePath(d);
 	if (!path) {
 		throw new Error(
@@ -84,17 +106,13 @@ export function auditStoreFromDsn(dsn) {
 /**
  * The api or sys stream store for a DSN: PostgresStreamStore for
  * postgres:// and postgresql://, SqliteStreamStore for sqlite:///path or a
- * bare path. Any other scheme is an error, not a file.
+ * bare path. Any other scheme, or libpq's keyword form, is an error, not
+ * a file.
  * @param {string} dsn
  * @param {string} defaultTable
  */
 export function streamStoreFromDsn(dsn, defaultTable) {
-	const d = _split(dsn);
-	if (!["sqlite", "postgres", "postgresql", ""].includes(d.scheme)) {
-		throw new Error(
-			`fasten: stream DSN scheme '${d.scheme}' not supported. Use sqlite:///./streams.db, postgres://..., or a bare filesystem path.`,
-		);
-	}
+	const d = _checked(dsn, "stream");
 	if (d.scheme === "postgres" || d.scheme === "postgresql") {
 		const { conn, table } = _postgres(dsn, defaultTable);
 		return new PostgresStreamStore(conn, { table });

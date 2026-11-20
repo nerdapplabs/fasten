@@ -78,6 +78,61 @@ describe('PostgresStreamStore', { skip }, () => {
         await s.close();
     });
 
+    test('an INSERT whose answer was lost is not run again, so the row is stored once', async () => {
+        const { default: pg } = await import('pg');
+        const own = new pg.Pool({ connectionString: DSN });
+        const query = own.query.bind(own);
+        let inserts = 0;
+        // The first INSERT commits, then its connection is reported lost.
+        own.query = async (...args) => {
+            const res = await query(...args);
+            if (/^INSERT/.test(String(args[0])) && ++inserts === 1) {
+                throw Object.assign(new Error('terminating connection due to administrator command'),
+                    { code: '57P01', severity: 'FATAL' });
+            }
+            return res;
+        };
+        const s = new PostgresStreamStore(own, { table: table('api_once') });
+        try {
+            await assert.rejects(s.insert({ method: 'GET', path: '/once' }), (err) => err.code === '57P01');
+            assert.equal(inserts, 1);
+            assert.equal(await s.count(), 1);
+            await s.insert({ method: 'GET', path: '/next' });
+            assert.equal(await s.count(), 2);
+        } finally {
+            await own.end();
+        }
+    });
+
+    test('through the engine, that failed write marks the stream degraded', async () => {
+        const { default: pg } = await import('pg');
+        const own = new pg.Pool({ connectionString: DSN });
+        const query = own.query.bind(own);
+        let inserts = 0;
+        own.query = async (...args) => {
+            const res = await query(...args);
+            if (/^INSERT/.test(String(args[0])) && ++inserts === 1) {
+                throw Object.assign(new Error('terminating connection'), { code: '57P01', severity: 'FATAL' });
+            }
+            return res;
+        };
+        const s = new PostgresStreamStore(own, { table: table('api_once_e') });
+        const e = new Engine();
+        try {
+            const { err } = await captureLines(async () => {
+                e.init({ serviceId: 'svc', nodeId: 'n', apiStore: s });
+                e.pushApi({ method: 'GET', path: '/x' });
+                await e.flush();
+            });
+            assert.ok(err.includes('fasten: api persist failed: Error\n'), JSON.stringify(err));
+            assert.equal(e._readerState().streams.api.source(), 'store-degraded');
+            assert.equal(await s.count(), 1);
+        } finally {
+            await e.resetForTests();
+            await own.end();
+        }
+    });
+
     test('a schema-qualified table and a pool of the caller', async () => {
         const t = `s_${suffix}.syslog`;
         const s = new PostgresStreamStore(pool, { table: t });
@@ -229,6 +284,63 @@ function readerSuite(label, { skip: skipIt = false, backend }) {
             await e.resetForTests();
             await gone.close();
         });
+
+        // Last: it adds another tenant's rows to the tables.
+        test('a scoped caller sees exactly its own rows beside another tenant', async () => {
+            const b = new Engine();
+            await captureLines(async () => {
+                b.init({
+                    serviceId: 'svc-b', nodeId: 'node-b', tenantId: 'tenant-b', auditStore: audit,
+                    apiStore: api, syslogStore: sys, auditStoreFailureStrategy: 'raise',
+                    searchEnabled: true,
+                });
+                for (const rid of ['req-pg', 'req-b']) {
+                    await withRequestID(rid, () => b.emit({ code: 'PGR_EVENT', target: 't', detail: { note: 'needle b' } }));
+                }
+                withRequestID('req-pg', () => {
+                    b.log.info('b_sys_event', { tenant_id: 'tenant-b', note: 'needle' });
+                    b.writeApi({ method: 'GET', path: '/b', status: 200, request_id: 'req-pg', tenant_id: 'tenant-b', note: 'needle', timestamp: '2026-09-01T00:00:00.000000Z' });
+                    engine.log.info('a_sys_event', { tenant_id: 'tenant-a', note: 'needle' });
+                    engine.writeApi({ method: 'GET', path: '/a', status: 201, request_id: 'req-pg', tenant_id: 'tenant-a', note: 'needle', timestamp: '2026-09-01T00:00:00.000000Z' });
+                });
+                await b.flush();
+                await engine.flush();
+            });
+            try {
+                await serve(reader({ auth: 'none', engine, tenantScope: () => 'tenant-a' }), async (get) => {
+                    const a = await get('/audit?limit=100');
+                    assert.equal(a.body.total, rows.length);
+                    assert.deepEqual(a.body.rows.map((r) => r.id).sort(), rows.map((r) => r.id).sort());
+                    const c = await get('/correlate?request_id=req-pg');
+                    assert.deepEqual(c.body.counts, { audit: rows.length, api: 1, sys: 1 });
+                    assert.deepEqual(c.body.totals, { audit: rows.length, api: 1, sys: 1 });
+                    assert.deepEqual(c.body.truncated, { audit: false, api: false, sys: false });
+                    assert.equal(c.body.sys[0].event, 'a_sys_event');
+                    assert.equal(c.body.api[0].path, '/a');
+                    const t = await get('/topology');
+                    assert.deepEqual(t.body.sources.map((x) => [x.source_node_id, x.tenant_id, x.rows]),
+                        [['node-pg', 'tenant-a', rows.length]]);
+                    const s = await get('/search?q=needle&since=2026-01-01T00:00:00Z&streams=sys,api,audit');
+                    assert.deepEqual(s.body.counts, { sys: 1, api: 1, audit: 0 });
+                    assert.ok(s.body.matches.every((m) => m.row.tenant_id === 'tenant-a'));
+                    assert.deepEqual((await get('/sys')).body.rows.map((r) => r.event), ['a_sys_event']);
+                    assert.deepEqual((await get('/api')).body.rows.map((r) => r.path), ['/a']);
+                    assert.equal((await get('/audit/doctor')).body.store.rows, rows.length);
+                });
+                await serve(reader({ auth: 'none', engine, tenantScope: () => 'tenant-b' }), async (get) => {
+                    assert.equal((await get('/audit')).body.total, 2);
+                    assert.deepEqual((await get('/correlate?request_id=req-pg')).body.counts, { audit: 1, api: 1, sys: 1 });
+                    const s = await get('/search?q=needle&since=2026-01-01T00:00:00Z&streams=audit');
+                    assert.equal(s.body.counts.audit, 2);
+                });
+                const found = await audit.search({ q: 'needle', since: '2026-01-01T00:00:00.000000Z', tenantId: 'tenant-b' });
+                assert.equal(found.length, 2);
+                assert.ok(found.every((r) => r.tenant_id === 'tenant-b'));
+                assert.deepEqual(await audit.search({ q: 'needle', since: '2026-01-01T00:00:00.000000Z', tenantId: 'tenant-a' }), []);
+            } finally {
+                await b.resetForTests();
+            }
+        });
     });
 }
 
@@ -267,14 +379,123 @@ readerSuite('SQLite', {
             setActor(id, actor) {
                 raw.prepare('UPDATE audit_log SET actor = ? WHERE id = ?').run(actor, id);
             },
-            goneStream() {
+            async goneStream() {
                 const store = new SqliteStreamStore(path, { table: 'syslog_gone' });
+                await store.init();
                 return {
                     store,
                     drop: () => raw.exec('DROP TABLE syslog_gone'),
-                    restore: () => new SqliteStreamStore(path, { table: 'syslog_gone' }).close(),
+                    restore: async () => {
+                        const again = new SqliteStreamStore(path, { table: 'syslog_gone' });
+                        await again.init();
+                        await again.close();
+                    },
                 };
             },
         };
     },
+});
+
+describe('the doctor across a re-init', () => {
+    test('before the first emit, and after a re-init onto another sealing store', async () => {
+        const first = new SqliteStore(':memory:');
+        const second = new SqliteStore(':memory:');
+        const e = new Engine();
+        try {
+            await captureLines(() => e.init({ serviceId: 'svc', nodeId: 'n-re', auditStore: first, auditStoreFailureStrategy: 'raise' }));
+            await serve(reader({ auth: 'none', engine: e }), async (get) => {
+                const r = (await get('/audit/doctor')).body;
+                assert.equal(r.store.reachable, true);
+                assert.equal(r.store.rows, 0);
+                assert.deepEqual([r.chain.verified, r.chain.breaks, r.chain.chain_unavailable], [null, null, false]);
+            });
+            await captureLines(async () => {
+                e.init({ serviceId: 'svc', nodeId: 'n-re', auditStore: second, auditStoreFailureStrategy: 'raise' });
+                await e.emit({ code: 'PGR_EVENT', target: 't' });
+                await e.emit({ code: 'PGR_EVENT', target: 't' });
+            });
+            await serve(reader({ auth: 'none', engine: e }), async (get) => {
+                const r = (await get('/audit/doctor')).body;
+                assert.equal(r.store.rows, 2);
+                assert.deepEqual([r.chain.verified, r.chain.breaks, r.chain.sealed_rows], [true, 0, 2]);
+            });
+            assert.equal(await first.count(), 0);
+        } finally {
+            await e.resetForTests();
+            await first.close();
+            await second.close();
+        }
+    });
+});
+
+// The same rows in the ring, a SqliteStreamStore and a PostgresStreamStore
+// read back the same through /sys and /api.
+describe('/sys and /api agree across the ring and the stream stores', () => {
+    const SYS = [
+        { level: 'info', event: 'cmp_a', request_id: 'r1', timestamp: '2025-01-01T00:00:00.000000Z' },
+        { level: 'error', event: 'cmp_b', request_id: 'r2' },
+        { level: 'error', event: 'cmp_c', request_id: 'r3', timestamp: '2025-01-03T00:00:00.000000Z' },
+        { level: 'info', event: 'cmp_d', request_id: 'r4', timestamp: '2025-01-04T00:00:00.000000Z' },
+    ];
+    const API = [
+        { method: 'GET', path: '/a', status: 200, request_id: 'r1', timestamp: '2025-01-01T00:00:00.000000Z' },
+        { method: 'POST', path: '/b', status: 500, request_id: 'r2' },
+        { method: 'GET', path: '/c', status: '500', request_id: 'r3', timestamp: '2025-01-03T00:00:00.000000Z' },
+        { method: 'GET', path: '/d', status: 500, request_id: 'r4', timestamp: '2025-01-05T00:00:00.000000Z' },
+    ];
+    const QUERIES = [
+        '/sys?until=2025-01-03T00:00:00Z', '/sys?since=2025-01-02T00:00:00Z', '/sys?level=error',
+        '/sys?level=error&since=2025-01-01T00:00:00Z', '/sys?limit=2', '/sys?until=2025-01-02T00:00:00Z&limit=1',
+        '/api?status=500', '/api?status=500&since=2025-01-02T00:00:00Z', '/api?until=2025-01-02T00:00:00Z',
+        '/api?limit=2', '/api?status=500&limit=1', '/api?method=GET&until=2025-01-04T00:00:00Z',
+    ];
+
+    async function readAll(streams) {
+        const e = new Engine();
+        const out = {};
+        try {
+            await captureLines(async () => {
+                e.init({ serviceId: 'svc', nodeId: 'n-cmp', apiStore: streams?.api, syslogStore: streams?.sys });
+                for (const r of SYS) e.pushSyslog(r);
+                for (const r of API) e.pushApi(r);
+                await e.flush();
+            });
+            await serve(reader({ auth: 'none', engine: e }), async (get) => {
+                for (const q of QUERIES) {
+                    // Only these rows: the init writes sys lines of its own.
+                    out[q] = (await get(q)).body.rows.filter((r) => /^(cmp_|$)/.test(r.event ?? '') && r.request_id?.startsWith('r'));
+                }
+            });
+        } finally {
+            await e.resetForTests();
+        }
+        return out;
+    }
+
+    test('ring and SqliteStreamStore', async () => {
+        const ring = await readAll(null);
+        const sqlite = {
+            api: new SqliteStreamStore(':memory:', { table: 'api_log' }),
+            sys: new SqliteStreamStore(':memory:', { table: 'syslog' }),
+        };
+        const fromSqlite = await readAll(sqlite);
+        assert.deepEqual(fromSqlite, ring);
+        assert.deepEqual(ring['/api?status=500'].map((r) => r.path), ['/d', '/c', '/b']);
+        assert.deepEqual(ring['/sys?until=2025-01-03T00:00:00Z'].map((r) => r.event), ['cmp_c', 'cmp_b', 'cmp_a']);
+        assert.deepEqual(ring['/sys?since=2025-01-02T00:00:00Z'].map((r) => r.event), ['cmp_d', 'cmp_c']);
+        if (!skip) {
+            const pg = {
+                api: new PostgresStreamStore(DSN, { table: table('cmp_api') }),
+                sys: new PostgresStreamStore(DSN, { table: table('cmp_sys') }),
+            };
+            try {
+                assert.deepEqual(await readAll(pg), ring);
+            } finally {
+                await pg.api.close();
+                await pg.sys.close();
+            }
+        }
+        await sqlite.api.close();
+        await sqlite.sys.close();
+    });
 });

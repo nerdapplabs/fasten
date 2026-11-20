@@ -2,7 +2,40 @@
 // Row shapes and SQL shared by the bundled stores.
 import { AuditRowRejectedError } from "../audit_queue.js";
 import { canonicalTS } from "../canonical_ts.js";
-import { bigintReviver, ChainError, parseJson, toChainRow } from "../chain.js";
+import {
+	bigintReviver,
+	ChainError,
+	canonicalTimestamp,
+	parseJson,
+	toChainRow,
+} from "../chain.js";
+
+const _CANONICAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+
+/**
+ * A purge or redaction cutoff as the canonical timestamp text the stored
+ * timestamps are compared with: a Date, or a timestamp string in any
+ * offset (or any text Date parses). Throws for anything else.
+ * @param {string} store
+ * @param {Date | string} before
+ * @returns {string}
+ */
+export function cutoffTS(store, before) {
+	if (typeof before === "string") {
+		const c = canonicalTimestamp(before);
+		if (_CANONICAL.test(c)) return c;
+	}
+	const d =
+		before instanceof Date
+			? before
+			: typeof before === "string"
+				? new Date(before)
+				: new Date(Number.NaN);
+	if (Number.isNaN(d.getTime())) {
+		throw new Error(`fasten ${store}: bad before ${JSON.stringify(before)}`);
+	}
+	return canonicalTS(d);
+}
 
 /**
  * A result row as a row object with the wire's snake_case keys: `detail`
@@ -162,4 +195,17 @@ export function seqHeld(r, holder) {
 	return new AuditRowRejectedError(
 		`row ${r.id}: seq ${r.monotonic_seq} on node ${JSON.stringify(r.source_node_id)} is held by row ${holder}`,
 	);
+}
+
+/**
+ * listUnshipped's identity: both of serviceId and sourceNodeId, or neither.
+ * @param {unknown} serviceId
+ * @param {unknown} sourceNodeId
+ */
+export function unshippedIdentity(serviceId, sourceNodeId) {
+	if ((serviceId == null) !== (sourceNodeId == null)) {
+		throw new TypeError(
+			"listUnshipped: pass both serviceId and sourceNodeId, or neither",
+		);
+	}
 }

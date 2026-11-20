@@ -21,12 +21,26 @@ export class PostgresStore
 	implements AuditRepository, ChainStore, ReplicationStore
 {
 	/**
-	 * @param connectionString A libpq DSN or connection URL.
+	 * Nothing connects until init() or the first call.
+	 * @param connection A postgres:// connection URL (pg does not read
+	 *   libpq's keyword form), or a pg Pool to use, for example one shared
+	 *   with PostgresStreamStore; close() leaves a pool it was given open.
 	 * @param opts.table Table name, optionally schema-qualified. Defaults to
 	 *   "audit_log".
 	 */
-	constructor(connectionString: string, opts?: { table?: string });
-	/** Create the table, its indexes and any column it lacks. Idempotent. */
+	constructor(
+		connection:
+			| string
+			| {
+					query: (...args: unknown[]) => unknown;
+					connect: (...args: unknown[]) => unknown;
+			  },
+		opts?: { table?: string },
+	);
+	/**
+	 * Create the table, its indexes and any column it lacks. Idempotent;
+	 * the first call runs it otherwise.
+	 */
 	init(): Promise<void>;
 	/**
 	 * Insert one row and return it as stored. A row with monotonic_seq 0 is
@@ -92,7 +106,9 @@ export class PostgresStore
 	chainTail(sourceNodeId: string, limit: number): Promise<ChainRow[]>;
 	/**
 	 * Unshipped rows, oldest seq first, in the shape query() returns; with
-	 * exact, as chainRows reads them.
+	 * exact, as chainRows reads them. With serviceId and sourceNodeId, only
+	 * the rows that identity originated; throws TypeError when only one is
+	 * given.
 	 */
 	listUnshipped(
 		limit?: number,
@@ -102,9 +118,19 @@ export class PostgresStore
 		limit: number | undefined,
 		opts: ListUnshippedOptions & { exact: true },
 	): Promise<ChainRow[]>;
+	listUnshipped(
+		limit?: number,
+		opts?: ListUnshippedOptions,
+	): Promise<Row[] | ChainRow[]>;
 	markShipped(ids: string[]): Promise<void>;
-	/** Delete, per node, a seq prefix of rows older than before (spec §2.3). */
-	purge(opts: { before: string; respectUnshipped?: boolean }): Promise<number>;
+	/**
+	 * Delete, per node, a seq prefix of rows older than before (spec §2.3).
+	 * before is a Date or a timestamp in any offset, canonicalised.
+	 */
+	purge(opts: {
+		before: Date | string;
+		respectUnshipped?: boolean;
+	}): Promise<number>;
 	listRedactionCandidates(opts: {
 		before: Date | string;
 		codes: string[];

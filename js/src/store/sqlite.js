@@ -42,10 +42,12 @@ import {
 	CHAIN_COLUMNS,
 	chainRow,
 	chainTipsSQL,
+	cutoffTS,
 	differs,
 	mapRow,
 	seqHeld,
 	snakeRow,
+	unshippedIdentity,
 } from "./rows.js";
 
 const _SAFE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -273,7 +275,8 @@ export class SqliteStore {
 
 	// Run fn() in a BEGIN IMMEDIATE transaction, which takes the write lock
 	// before the first read, and return what it returns. A failed COMMIT
-	// throws _CommitError, after a ROLLBACK.
+	// throws _CommitError, after a ROLLBACK. A failed ROLLBACK does not hide
+	// the error that caused it.
 	_write(fn) {
 		this._db.exec("BEGIN IMMEDIATE");
 		let out;
@@ -293,7 +296,11 @@ export class SqliteStore {
 	}
 
 	_rollback() {
-		if (this._db.isTransaction) this._db.exec("ROLLBACK");
+		try {
+			if (this._db.isTransaction) this._db.exec("ROLLBACK");
+		} catch {
+			// The caller throws the error that led here.
+		}
 	}
 
 	/**
@@ -553,7 +560,7 @@ export class SqliteStore {
 	/**
 	 * Every row in the table, ordered by node and `monotonic_seq`: the whole
 	 * chain, for verifyChain with checkpoints. Reads the whole table into
-	 * memory.
+	 * memory, blocking the event loop until it is read.
 	 *
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
@@ -787,12 +794,14 @@ export class SqliteStore {
 	 * Rows not shipped yet, oldest seq first, as PostgresStore.listUnshipped
 	 * returns them: with both `serviceId` and `sourceNodeId`, only the rows
 	 * that identity originated; with `exact`, rows as `chainRows` reads them.
+	 * Throws when only one of `serviceId` and `sourceNodeId` is given.
 	 *
 	 * @param {number} [limit]
 	 * @param {{ serviceId?: string, sourceNodeId?: string, exact?: boolean }} [opts]
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
 	async listUnshipped(limit = 100, { serviceId, sourceNodeId, exact } = {}) {
+		unshippedIdentity(serviceId, sourceNodeId);
 		this._ensureReady();
 		const cols = exact ? CHAIN_COLUMNS : "*";
 		const rows =
@@ -830,13 +839,16 @@ export class SqliteStore {
 	}
 
 	/**
-	 * Delete rows whose timestamp is before `before`, per node only a seq
-	 * prefix (spec §2.3), as PostgresStore.purge does.
+	 * Delete rows whose timestamp is before `before` (a Date or a timestamp,
+	 * canonicalised), per node only a seq prefix (spec §2.3), as
+	 * PostgresStore.purge does. One DELETE, which blocks the event loop
+	 * until it is done.
 	 *
-	 * @param {{ before: string, respectUnshipped?: boolean }} opts
+	 * @param {{ before: Date | string, respectUnshipped?: boolean }} opts
 	 * @returns {Promise<number>}  Number of rows deleted.
 	 */
 	async purge({ before, respectUnshipped = true }) {
+		const cutoff = cutoffTS("SqliteStore", before);
 		this._ensureReady();
 		// SQLite has no DELETE ... USING, so the rows are matched by id.
 		const t = this._table;
@@ -849,7 +861,7 @@ export class SqliteStore {
 			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
 			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
 			`SELECT d.id FROM bound, ${t} AS d WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < ?1${shipped})`;
-		return Number(this._db.prepare(sql).run(before).changes);
+		return Number(this._db.prepare(sql).run(cutoff).changes);
 	}
 
 	/**
@@ -863,13 +875,7 @@ export class SqliteStore {
 	async listRedactionCandidates({ before, codes }) {
 		if (!codes || codes.length === 0) return { candidates: [], skipped: 0 };
 		this._ensureReady();
-		const d = before instanceof Date ? before : new Date(before);
-		if (Number.isNaN(d.getTime())) {
-			throw new Error(
-				`fasten SqliteStore: bad before ${JSON.stringify(before)}`,
-			);
-		}
-		const cutoff = canonicalTS(d);
+		const cutoff = cutoffTS("SqliteStore", before);
 		const inCodes = `code IN (${codes.map(() => "?").join(",")})`;
 		const t = this._table;
 		const skipped = this._db

@@ -2,14 +2,16 @@
 /**
  * SQLite store for the api or sys stream, on node:sqlite (built into Node
  * 24). The same table as the Python and Go SQLite stream stores
- * (spec persistent-streams.md §2). Every insert is a synchronous write; the
- * file uses WAL with synchronous=NORMAL, so a commit does not fsync.
+ * (spec persistent-streams.md §2). The file uses WAL with
+ * synchronous=NORMAL, so a commit does not fsync. node:sqlite is
+ * synchronous: each call blocks the event loop until it is done, including
+ * a wait for another connection's write lock (up to the busy timeout). The
+ * methods return promises, as PostgresStreamStore's do.
  *
  *   import { SqliteStreamStore } from 'fasten-sdk/store/stream_sqlite';
  *   const syslogStore = new SqliteStreamStore('/var/lib/app/streams.db', { table: 'syslog' });
  */
 import { closeSync, openSync } from "node:fs";
-import { canonicalTS } from "../canonical_ts.js";
 import {
 	FILTER_COLUMNS,
 	liftedValues,
@@ -18,11 +20,15 @@ import {
 	payloadText,
 	statusFilter,
 } from "../streams.js";
+import { cutoffTS } from "./rows.js";
 
 // Loaded on first use, as in sqlite.js.
 const _sqlite = () => process.getBuiltinModule("node:sqlite");
 
 const _SAFE_TABLE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// How long a writer waits for the write lock, as in SqliteStore.
+const BUSY_TIMEOUT_MS = 5000;
 
 /** @param {string} t */
 function _ddl(t) {
@@ -83,11 +89,19 @@ function _where(f) {
 
 export class SqliteStreamStore {
 	/**
+	 * Open the database. The table is created by init() or on first use.
 	 * @param {string} path database file, or ":memory:". A new file is
 	 *   created owner-only (0600).
-	 * @param {{ table: string, wal?: boolean }} opts
+	 * @param {{ table: string, wal?: boolean, busyTimeoutMs?: number }} opts
 	 */
-	constructor(path, { table, wal = true } = /** @type {any} */ ({})) {
+	constructor(
+		path,
+		{
+			table,
+			wal = true,
+			busyTimeoutMs = BUSY_TIMEOUT_MS,
+		} = /** @type {any} */ ({}),
+	) {
 		if (!table) {
 			throw new Error(
 				'fasten SqliteStreamStore: table name is required (no default: pass "api_log" or "syslog")',
@@ -102,23 +116,39 @@ export class SqliteStreamStore {
 			closeSync(openSync(path, "a", 0o600));
 		}
 		this._table = table;
-		this._db = new (_sqlite().DatabaseSync)(path);
+		this._db = new (_sqlite().DatabaseSync)(path, { timeout: busyTimeoutMs });
 		if (wal && path !== ":memory:") {
 			this._db.exec("PRAGMA journal_mode=WAL");
 			this._db.exec("PRAGMA synchronous=NORMAL");
 		}
-		this._db.exec(_ddl(table));
-		this._insert = this._db.prepare(
-			`INSERT INTO ${table} (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES (?,?,?,?,?,?,?,?,?)`,
-		);
+		/** @type {any} */
+		this._insert = null;
 		this._writeFailures = 0;
 	}
 
 	/**
-	 * Store one row, synchronously.
-	 * @param {Record<string, unknown>} row
+	 * Create the table and its indexes. Idempotent; called on first use.
+	 * @returns {Promise<void>}
 	 */
-	insert(row) {
+	async init() {
+		this._ensureReady();
+	}
+
+	_ensureReady() {
+		if (this._insert) return;
+		this._db.exec(_ddl(this._table));
+		this._insert = this._db.prepare(
+			`INSERT INTO ${this._table} (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES (?,?,?,?,?,?,?,?,?)`,
+		);
+	}
+
+	/**
+	 * Store one row. The write is done when the call returns.
+	 * @param {Record<string, unknown>} row
+	 * @returns {Promise<void>}
+	 */
+	async insert(row) {
+		this._ensureReady();
 		this._insert.run(...liftedValues(row), payloadText(row));
 	}
 
@@ -137,9 +167,10 @@ export class SqliteStreamStore {
 	/**
 	 * Up to `limit` rows, newest first. Filters as PostgresStreamStore.
 	 * @param {Record<string, any>} [opts]
-	 * @returns {Record<string, unknown>[]}
+	 * @returns {Promise<Record<string, unknown>[]>}
 	 */
-	query({ limit = 100, ...filters } = {}) {
+	async query({ limit = 100, ...filters } = {}) {
+		this._ensureReady();
 		const { where, params } = _where(filters);
 		return this._db
 			.prepare(
@@ -151,9 +182,10 @@ export class SqliteStreamStore {
 
 	/**
 	 * @param {Record<string, any>} [filters]
-	 * @returns {number}
+	 * @returns {Promise<number>}
 	 */
-	countMatching(filters = {}) {
+	async countMatching(filters = {}) {
+		this._ensureReady();
 		const { where, params } = _where(filters);
 		const r = this._db
 			.prepare(`SELECT COUNT(*) AS n FROM ${this._table}${where}`)
@@ -161,8 +193,8 @@ export class SqliteStreamStore {
 		return Number(r?.n ?? 0);
 	}
 
-	/** @returns {number} */
-	count() {
+	/** @returns {Promise<number>} */
+	async count() {
 		return this.countMatching();
 	}
 
@@ -171,9 +203,10 @@ export class SqliteStreamStore {
 	 * [since, until], newest first. A linear LIKE scan; %, _ and \ in q
 	 * match literally.
 	 * @param {{ q: string, since: string, until?: string | null, limit?: number }} opts
-	 * @returns {Record<string, unknown>[]}
+	 * @returns {Promise<Record<string, unknown>[]>}
 	 */
-	search({ q, since, until = null, limit = 50 }) {
+	async search({ q, since, until = null, limit = 50 }) {
+		this._ensureReady();
 		const conds = [
 			"COALESCE(timestamp, '') >= ?",
 			"lower(payload) LIKE ? ESCAPE '\\'",
@@ -192,20 +225,23 @@ export class SqliteStreamStore {
 	}
 
 	/**
-	 * Delete rows older than `before` and return how many. Rows without a
-	 * timestamp are kept.
+	 * Delete rows older than `before` (a Date or a timestamp, canonicalised)
+	 * and return how many. Rows without a timestamp are kept. One DELETE,
+	 * which blocks the event loop until it is done.
 	 * @param {{ before: Date | string }} opts
-	 * @returns {number}
+	 * @returns {Promise<number>}
 	 */
-	purge({ before }) {
-		const cutoff = before instanceof Date ? canonicalTS(before) : before;
+	async purge({ before }) {
+		const cutoff = cutoffTS("SqliteStreamStore", before);
+		this._ensureReady();
 		const r = this._db
 			.prepare(`DELETE FROM ${this._table} WHERE timestamp < ?`)
 			.run(cutoff);
 		return Number(r.changes);
 	}
 
-	close() {
-		this._db.close();
+	/** @returns {Promise<void>} */
+	async close() {
+		if (this._db.isOpen) this._db.close();
 	}
 }

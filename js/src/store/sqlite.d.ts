@@ -16,7 +16,10 @@ import type {
 export interface SqliteStoreOptions {
 	/** Table name, a plain SQL identifier. Defaults to "audit_log". */
 	table?: string;
-	/** WAL journal mode. Defaults to true; ignored for ":memory:". */
+	/**
+	 * WAL journal mode. Defaults to true; ignored for ":memory:". Commits
+	 * use SQLite's default synchronous=FULL.
+	 */
 	wal?: boolean;
 	/** How long to wait for another connection's write lock. Defaults to 5000. */
 	busyTimeoutMs?: number;
@@ -32,8 +35,9 @@ export class SqliteStore
 	implements AuditRepository, ChainStore, ReplicationStore
 {
 	/**
-	 * Open the database at path (a new file is created owner-only), or
-	 * ":memory:".
+	 * Open the database at path (a new file is created owner-only, with
+	 * its WAL and shared-memory files), or ":memory:". The table is created
+	 * by init() or the first call.
 	 */
 	constructor(path: string, opts?: SqliteStoreOptions);
 	/** Create the table, its indexes and any column it lacks. Idempotent. */
@@ -104,7 +108,9 @@ export class SqliteStore
 	chainTail(sourceNodeId: string, limit: number): Promise<ChainRow[]>;
 	/**
 	 * Unshipped rows, oldest seq first, in the shape query() returns; with
-	 * exact, as chainRows reads them.
+	 * exact, as chainRows reads them. With serviceId and sourceNodeId, only
+	 * the rows that identity originated; throws TypeError when only one is
+	 * given.
 	 */
 	listUnshipped(
 		limit?: number,
@@ -114,9 +120,19 @@ export class SqliteStore
 		limit: number | undefined,
 		opts: ListUnshippedOptions & { exact: true },
 	): Promise<ChainRow[]>;
+	listUnshipped(
+		limit?: number,
+		opts?: ListUnshippedOptions,
+	): Promise<Row[] | ChainRow[]>;
 	markShipped(ids: string[]): Promise<void>;
-	/** Delete, per node, a seq prefix of rows older than before (spec §2.3). */
-	purge(opts: { before: string; respectUnshipped?: boolean }): Promise<number>;
+	/**
+	 * Delete, per node, a seq prefix of rows older than before (spec §2.3).
+	 * before is a Date or a timestamp in any offset, canonicalised.
+	 */
+	purge(opts: {
+		before: Date | string;
+		respectUnshipped?: boolean;
+	}): Promise<number>;
 	listRedactionCandidates(opts: {
 		before: Date | string;
 		codes: string[];

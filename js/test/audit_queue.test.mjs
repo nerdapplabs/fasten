@@ -410,24 +410,26 @@ test('the drainer records the error type, as the other SDKs do', async () => {
         emit({ code: 'USER_CREATED', target: 'u-1' });
         await flush(2000);
     });
-    const by = (e) => captured.find((r) => r.event === e);
-    assert.equal(by('audit_drain_failed').error, 'DatabaseError');
-    assert.equal(by('audit_drain_degraded').last_error, 'DatabaseError');
-    assert.equal(by('audit_drain_dead_letter').last_error, 'DatabaseError');
+    // This test's events: a drainer an earlier test left stopping can log
+    // the same ones with another error type.
+    const by = (e) => captured.find((r) => r.event === e && (r.error ?? r.last_error) === 'DatabaseError');
+    assert.ok(by('audit_drain_failed'), JSON.stringify(captured));
+    assert.ok(by('audit_drain_degraded'), JSON.stringify(captured));
+    assert.ok(by('audit_drain_dead_letter'), JSON.stringify(captured));
     assert.equal(queueStats().last_error, 'DatabaseError');
     assert.ok(!JSON.stringify(captured).includes('alice'), JSON.stringify(captured));
 });
 
 test('sync fallback records the error type, as the other SDKs do', async () => {
+    let row;
     const captured = await captureSys(async () => {
         _initQueue(new AsyncBrokenStore('value (id)=(alice@example.com)'));
         await uninstallDrainer();
-        emit({ code: 'USER_CREATED', target: 'u-1' });
+        row = emit({ code: 'USER_CREATED', target: 'u-1' });
         await new Promise(r => setTimeout(r, 20));
     });
-    const ev = captured.find((r) => r.event === 'audit_sync_fallback_failed');
+    const ev = captured.find((r) => r.event === 'audit_sync_fallback_failed' && r.row_id === row.id);
     assert.equal(ev.error_type, 'Error');
-    assert.equal(typeof ev.row_id, 'string');
     assert.equal(ev.error, undefined);
     assert.ok(!JSON.stringify(captured).includes('alice'));
 });
@@ -442,6 +444,7 @@ test('stop writes the rows still queued', async () => {
 
 test('stop reports rows whose last attempt fails as lost', async () => {
     const store = new BrokenStore();
+    const ids = new Set();
     let stopped;
     const captured = await captureSys(async () => {
         _initQueue(store, {
@@ -449,15 +452,15 @@ test('stop reports rows whose last attempt fails as lost', async () => {
             queueRetryMaxMs: 60_000,
             queueRetryJitter: false,
         });
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
         const t0 = Date.now();
         stopped = await uninstallDrainer();
         assert.ok(Date.now() - t0 < 1000, 'stop must cut the backoff short');
     });
     const events = captured.map(c => c.event);
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.equal(lost.length, 2, `got ${JSON.stringify(events)}`);
     assert.equal(lost[0].error_type, 'Error');
     assert.ok(!events.includes('audit_drain_dead_letter'));
@@ -467,36 +470,45 @@ test('stop reports rows whose last attempt fails as lost', async () => {
 });
 
 test('drainer degraded reports the backoff it is about to wait', async () => {
+    // An error type of its own: a drainer an earlier test left stopping can
+    // report degraded too.
+    class BackoffProbeError extends Error {
+        name = 'BackoffProbeError';
+    }
+    const store = { insert() { throw new BackoffProbeError('down'); } };
+    const ours = (r) => r.event === 'audit_drain_degraded' && r.last_error === 'BackoffProbeError';
     const captured = await captureSys(async (seen) => {
-        _initQueue(new BrokenStore(), {
+        _initQueue(store, {
             queueRetryInitialMs: 200,
             queueRetryMaxMs: 200,
             queueRetryJitter: false,
         });
         emit({ code: 'USER_CREATED', target: 'u-1' });
         const deadline = Date.now() + 5000;
-        while (!seen.some(r => r.event === 'audit_drain_degraded') && Date.now() < deadline) {
+        while (!seen.some(ours) && Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 20));
         }
     });
-    const degraded = captured.find(r => r.event === 'audit_drain_degraded');
+    const degraded = captured.find(ours);
     assert.ok(degraded, 'audit_drain_degraded never fired');
-    assert.ok(degraded.in_backoff_seconds > 0.15,
+    assert.equal(degraded.retry_count, 5);
+    assert.ok(degraded.in_backoff_seconds > 0.15 && degraded.in_backoff_seconds <= 0.2,
         `in_backoff_seconds was ${degraded.in_backoff_seconds}`);
 });
 
 test('stop gives up after its timeout and reports what it holds as lost', async () => {
     const store = { insert: () => new Promise(() => {}) };
+    const ids = new Set();
     const captured = await captureSys(async () => {
         _initQueue(store);
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         await new Promise(r => setTimeout(r, 20));
         const t0 = Date.now();
         assert.equal(await uninstallDrainer(100), false);
         assert.ok(Date.now() - t0 < 1000);
     });
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.deepEqual(lost.map(r => r.error_type), ['TimeoutError', 'TimeoutError']);
 });
 
@@ -516,18 +528,19 @@ test('close resolves true once every row is stored', async () => {
 test('close resolves false for a row in backoff, and a second close agrees', async () => {
     const store = new BrokenStore();
     let results;
+    let row;
     const captured = await captureSys(async () => {
         _initQueue(store, {
             queueRetryInitialMs: 60_000,
             queueRetryMaxMs: 60_000,
             queueRetryJitter: false,
         });
-        emit({ code: 'USER_CREATED', target: 'u-1' });
+        row = emit({ code: 'USER_CREATED', target: 'u-1' });
         while (store.attempts === 0) await new Promise(r => setTimeout(r, 5));
         results = await Promise.all([close(200), close(200)]);
     });
     assert.deepEqual(results, [false, false]);
-    assert.equal(captured.filter(r => r.event === 'audit_drain_lost_at_stop').length, 1);
+    assert.equal(captured.filter(r => r.event === 'audit_drain_lost_at_stop' && r.row_id === row.id).length, 1);
 });
 
 test('flush counts a dead-lettered row as done', async () => {
@@ -568,18 +581,19 @@ test('flush waits for the drainer a re-init is retiring', async () => {
 
 test('re-init reports rows the old drainer could not store', async () => {
     const store = { insert: () => new Promise(() => {}) };
+    const ids = new Set();
     let closed;
     const captured = await captureSys(async () => {
         _initQueue(store);
-        emit({ code: 'USER_CREATED', target: 'u-1' });
-        emit({ code: 'USER_CREATED', target: 'u-2' });
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-1' }).id);
+        ids.add(emit({ code: 'USER_CREATED', target: 'u-2' }).id);
         _initQueue(new RecordingStore());
         const t0 = Date.now();
         closed = await close(300);
         assert.ok(Date.now() - t0 < 1500, 'close must keep to its timeout');
     });
     assert.equal(closed, false);
-    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop');
+    const lost = captured.filter(r => r.event === 'audit_drain_lost_at_stop' && ids.has(r.row_id));
     assert.equal(lost.length, 2);
     const inc = captured.filter(r => r.event === 'audit_drain_install_incomplete');
     assert.equal(inc.length, 1, `got ${JSON.stringify(captured.map(c => c.event))}`);
