@@ -6,6 +6,27 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Added: Go stores from the environment
+
+- `Init` opens the audit store from `FASTEN_AUDIT_DSN` when
+  `Config.AuditStore` is nil, as Python, JS and Rust do: `postgres://` or
+  `postgresql://`, `sqlite:///rel.db`, `sqlite:////abs.db` or a bare path,
+  with `?table=` and `?wal=false`. `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`
+  take the same forms, now including Postgres. A Postgres DSN needs a
+  `database/sql` driver registered as `postgres` (for example
+  `import _ "github.com/lib/pq"`); without one, `Init` says so. A store
+  passed in `Config` still wins.
+- `Init` checks every DSN before opening any store. An unknown scheme,
+  libpq's keyword form, a missing path or directory, or an invalid table
+  name is an `Init` error naming the variable and scheme only, and a
+  failed `Init` creates no file and keeps the stores it had. A store that
+  cannot be opened is reported by the variable, scheme and error type.
+- `Init` again with the same DSN keeps its store; with another DSN, the old
+  store is closed. `Close` now also stops retention and closes the stores
+  opened from the environment.
+- A set `FASTEN_*` variable named like a DSN that `Init` does not read (for
+  example `FASTEN_AUDIT_DNS`) is reported once as `env_dsn_not_read`.
+
 ### Changed: JS (breaking for existing callers)
 
 - `PostgresStore.query()` and `listUnshipped()` return rows with the wire's
