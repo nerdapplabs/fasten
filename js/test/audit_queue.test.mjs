@@ -6,7 +6,9 @@ import {
     init, emit, register, registry as _reg,
     AuditStoreError, queueStats, flush, close, _clearCoreRegistry, defaultEngine,
 } from '../src/index.js';
+import { DatabaseSync } from 'node:sqlite';
 import { uninstallDrainer, activeDrainer, rejectsRow } from '../src/audit_queue.js';
+import { SqliteStore } from '../src/store/sqlite.js';
 
 // Stub stores
 
@@ -173,6 +175,51 @@ test('rejectsRow reads the SQLSTATE class', () => {
     for (const code of ['08006', '40001', '42501', '42P01', '53300', '57P01', 'SQLITE_BUSY', 'ECONNRESET', undefined, 54000]) {
         assert.equal(rejectsRow({ code }), false, String(code));
     }
+});
+
+test('rejectsRow reads node:sqlite\'s extended result code', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec('CREATE TABLE t (a TEXT NOT NULL, b INTEGER CHECK (b > 0))');
+    for (const sql of ['INSERT INTO t VALUES (NULL, 1)', 'INSERT INTO t VALUES (\'x\', 0)']) {
+        let err;
+        try {
+            db.exec(sql);
+        } catch (e) {
+            err = e;
+        }
+        assert.equal(err.code, 'ERR_SQLITE_ERROR');
+        assert.equal(err.errcode & 0xff, 19);
+        assert.equal(rejectsRow(err), true, sql);
+    }
+    let noTable;
+    try {
+        db.exec('SELECT * FROM missing');
+    } catch (e) {
+        noTable = e;
+    }
+    assert.equal(rejectsRow(noTable), false);
+    db.close();
+});
+
+test('a row a SqliteStore constraint refuses is dead-lettered at once', async () => {
+    const store = new SqliteStore(':memory:');
+    await store.init();
+    store._db.exec(`CREATE TRIGGER refuse_bad BEFORE INSERT ON audit_log
+        WHEN NEW.target = 'bad' BEGIN SELECT RAISE(ABORT, 'refused'); END`);
+    let attempts = 0;
+    const insert = store.insert.bind(store);
+    store.insert = (row) => {
+        attempts++;
+        return insert(row);
+    };
+    _initQueue(store, { queueRetryInitialMs: 60000, queueRetryMaxMs: 60000, queueRetryJitter: false });
+    emit({ code: 'USER_CREATED', target: 'bad' });
+    emit({ code: 'USER_CREATED', target: 'good' });
+    assert.equal(await flush(2000), true);
+    assert.equal(attempts, 2, 'one attempt per row');
+    assert.equal(queueStats().dead_lettered_total, 1);
+    assert.deepEqual((await store.query({})).map((r) => r.target), ['good']);
+    await store.close();
 });
 
 // Sys self-report

@@ -532,31 +532,64 @@ const _TS =
 /**
  * An RFC 3339 timestamp in the wire form (spec 4.3): UTC, six fractional
  * digits, "Z". Digits past the sixth are dropped. Text that is not RFC 3339
- * is returned as it is.
+ * is returned as it is, as is a date Python's datetime cannot hold: year 0,
+ * or an offset of 24 hours or more.
  */
 export function canonicalTimestamp(ts) {
+	return wireTimestamp(ts) ?? ts;
+}
+
+/**
+ * canonicalTimestamp, but null for anything it would return as it is.
+ * @param {unknown} ts
+ * @returns {string | null}
+ */
+export function wireTimestamp(ts) {
 	const m = typeof ts === "string" ? _TS.exec(ts) : null;
-	if (!m) return ts;
+	if (!m) return null;
 	const [, y, mo, d, h, mi, s, frac = "", off] = m;
 	const [Y, M, D, H, MI, S] = [y, mo, d, h, mi, s].map(Number);
 	const t = new Date(Date.UTC(Y, M - 1, D, H, MI, S));
 	t.setUTCFullYear(Y);
+	const offH = off.length === 6 ? Number(off.slice(1, 3)) : 0;
+	const offM = off.length === 6 ? Number(off.slice(4, 6)) : 0;
 	if (
+		Y === 0 ||
 		t.getUTCMonth() !== M - 1 ||
 		t.getUTCDate() !== D ||
 		H > 23 ||
 		MI > 59 ||
-		S > 59
+		S > 59 ||
+		offH > 23 ||
+		offM > 59
 	) {
-		return ts;
+		return null;
 	}
 	let ms = t.getTime();
-	if (off !== "Z" && off !== "z") {
-		const mins = Number(off.slice(1, 3)) * 60 + Number(off.slice(4, 6));
-		ms -= (off[0] === "-" ? -1 : 1) * mins * 60_000;
+	if (off.length === 6) {
+		ms -= (off[0] === "-" ? -1 : 1) * (offH * 60 + offM) * 60_000;
 	}
 	const at = new Date(ms).toISOString();
 	return `${at.slice(0, 19)}.${frac.slice(0, 6).padEnd(6, "0")}Z`;
+}
+
+/**
+ * Throw ChainError unless the row's timestamp, and its shipped_at when
+ * set, are RFC 3339 timestamps canonicalTimestamp can put in the wire
+ * form. The Python and Go stores cannot read a row stored with anything
+ * else.
+ * @param {{ timestamp?: unknown, shipped_at?: unknown }} row
+ */
+export function checkTimestamps(row) {
+	for (const field of ["timestamp", "shipped_at"]) {
+		const v = row[field];
+		if (field === "shipped_at" && (v === null || v === undefined)) continue;
+		if (wireTimestamp(v) === null) {
+			throw new ChainError(
+				`${field} ${JSON.stringify(v ?? null)} is not an RFC 3339 timestamp`,
+			);
+		}
+	}
 }
 
 // A wire timestamp as form "1" hashes it, which is Python's

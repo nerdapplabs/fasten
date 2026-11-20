@@ -629,9 +629,10 @@ out; the SDK does not add one to the rows it writes, so add `tenant_id` to
 the fields you log for a scoped reader to show them.
 
 Under a scope, `/correlate` fetches up to `limit` api and sys rows for the
-request id and keeps the tenant's. When fewer than `limit` came back, its
-`totals` and `truncated` for those streams are exact; when `limit` came
-back, they are `null`, since a stream store cannot count by tenant. On
+request id and keeps the tenant's. A stream store cannot count by tenant,
+so a scoped caller's api and sys `totals` count its own rows, as Python and
+Go do, and `truncated` is `false`; raise `limit` to be sure of seeing them
+all. On
 `/search` the api and sys `counts` are the rows returned after the scope:
 other tenants' rows within the window can leave fewer than `limit`.
 

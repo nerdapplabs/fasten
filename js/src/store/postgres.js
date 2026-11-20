@@ -19,6 +19,7 @@ import {
 	AuditSealError,
 	canonicalJSON,
 	canonicalTimestamp,
+	checkTimestamps,
 	compareCodePoints,
 	detailText,
 	GENESIS,
@@ -238,6 +239,8 @@ export class PostgresStore {
 	 * @param {string | { query: Function, connect: Function }} connection
 	 *   libpq-compatible DSN or connection URL, or a pg Pool to use (close()
 	 *   leaves it open), for example one shared with PostgresStreamStore.
+	 *   A pool given gets the same idle-client error listener as one the
+	 *   store creates.
 	 * @param {{ table?: string }} [opts]
 	 */
 	constructor(connection, { table = "audit_log" } = {}) {
@@ -255,7 +258,7 @@ export class PostgresStore {
 			? table.split(".").slice(0, -1).join(".")
 			: null;
 		/** @type {any} */
-		this._pool = this._ownPool ? null : connection;
+		this._pool = this._ownPool ? null : watchPool(connection);
 		this._ready = null;
 	}
 
@@ -332,7 +335,8 @@ export class PostgresStore {
 	 * Throws AuditRowRejectedError for a row it refuses: a different row
 	 * under a stored id, a seq-0 row whose origin_id is not its id, a seq
 	 * another row holds, a row field that is not a string or holds an
-	 * unpaired surrogate, a detail that is not JSON. Throws AuditSealError
+	 * unpaired surrogate, a detail that is not JSON, a timestamp or shipped_at
+	 * that is not RFC 3339. Throws AuditSealError
 	 * when sealing fails for another reason (the random source, a malformed
 	 * stored prev hash), and AuditOutcomeUnknownError when the COMMIT failed
 	 * and the row could not be read back. Other errors are pg's.
@@ -345,7 +349,7 @@ export class PostgresStore {
 		const r = snakeRow(row);
 		// A row that no retry can store is refused before anything is taken.
 		try {
-			toChainRow(r);
+			checkTimestamps(toChainRow(r));
 			canonicalJSON(r.detail);
 		} catch (err) {
 			throw new AuditRowRejectedError(`row ${r.id}: ${err.message}`);
@@ -437,7 +441,8 @@ export class PostgresStore {
 	 * not checked here: run verifyChain over the batch first. Storing the
 	 * same row again is a no-op.
 	 *
-	 * Throws AuditRowRejectedError for a row it cannot read, an unsealed row,
+	 * Throws AuditRowRejectedError for a row it cannot read (a timestamp that
+	 * is not RFC 3339 included), an unsealed row,
 	 * a different row (another hash) under a stored id, or a seq another row
 	 * holds on the node; AuditOutcomeUnknownError when the COMMIT failed and
 	 * the row could not be read back; an Error when the row was neither
@@ -451,6 +456,7 @@ export class PostgresStore {
 		let r;
 		try {
 			r = toChainRow(row);
+			checkTimestamps(r);
 			if (text !== undefined) parseJson(text);
 		} catch (err) {
 			throw new AuditRowRejectedError(`insertSealed: ${err.message}`);

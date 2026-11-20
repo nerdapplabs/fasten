@@ -902,6 +902,7 @@ test('search: case-insensitive substring of the detail, newest first, %, _ and \
     await put(3, { note: '100% done' });
     await put(4, { note: 'a_b c\\d' });
     await put(5, { note: 'axb' });
+    await put(6, { note: 'aQb 100Z' });
     const notes = async (o) => (await s.search({ since: at(0), ...o })).map((r) => r.detail.note);
     assert.deepEqual(await notes({ q: 'DISK full' }), ['disk full again', 'Disk FULL on /var']);
     assert.deepEqual(await notes({ q: 'disk', tenantId: 't-1' }), ['disk full again']);

@@ -16,14 +16,20 @@ const DEGRADED_AFTER = 5;
 // cannot help. `pg` puts the SQLSTATE in `code`: class 22 is a data
 // exception, 23 an integrity violation, 54 a program limit (for example a
 // value too long for an index). Class 42 is retried: a revoked grant or a
-// renamed table is the deploy, not the row. SQLite drivers put
+// renamed table is the deploy, not the row. Some SQLite drivers put
 // SQLITE_CONSTRAINT (with its extended forms such as
-// SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`. Same rules as
-// fasten-core's sqlstate_rejects_row and the Python and Go drainers.
+// SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`; node:sqlite puts
+// ERR_SQLITE_ERROR there and the extended result code in `errcode`, whose
+// low byte is 19 (SQLITE_CONSTRAINT) or 20 (SQLITE_MISMATCH). Same rules
+// as fasten-core's sqlstate_rejects_row and the Python and Go drainers.
 // An AuditRowRejectedError is the store refusing the row itself.
 export function rejectsRow(err) {
 	if (err instanceof AuditRowRejectedError) return true;
 	const code = err?.code;
+	if (code === "ERR_SQLITE_ERROR" && typeof err.errcode === "number") {
+		const primary = err.errcode & 0xff;
+		return primary === 19 || primary === 20;
+	}
 	if (typeof code !== "string") return false;
 	if (code.startsWith("SQLITE_CONSTRAINT") || code === "SQLITE_MISMATCH") {
 		return true;

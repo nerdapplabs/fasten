@@ -445,6 +445,20 @@ function _checkPersistStreams(named, stores) {
 	}
 }
 
+// True once `work` settles, false if timeoutMs runs out first.
+async function _within(work, timeoutMs) {
+	let timer;
+	const timeout = new Promise((r) => {
+		timer = setTimeout(() => r(false), timeoutMs);
+		timer.unref?.();
+	});
+	try {
+		return await Promise.race([work.then(() => true), timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export class Engine {
 	#config = { ..._EMPTY_CONFIG };
 	// The api and sys streams of the current init; see streams.js.
@@ -1005,20 +1019,10 @@ export class Engine {
 			...this.#retiringStreams,
 		];
 		if (all.length === 0) return true;
-		let timer;
-		const timeout = new Promise((r) => {
-			timer = setTimeout(() => r(false), timeoutMs);
-			timer.unref?.();
-		});
 		const settled = Promise.all(all.map((st) => st.settle())).then(() => {
 			for (const st of all) this.#retiringStreams.delete(st);
-			return true;
 		});
-		try {
-			return await Promise.race([settled, timeout]);
-		} finally {
-			clearTimeout(timer);
-		}
+		return _within(settled, timeoutMs);
 	}
 
 	/**
@@ -1026,11 +1030,12 @@ export class Engine {
 	 * drainer. Rows still queued get one attempt; a row not stored by
 	 * timeoutMs is reported lost (audit_drain_lost_at_stop). Waits, within
 	 * timeoutMs, for api and sys rows still being written, then closes the
-	 * stores opened from FASTEN_*_DSN (a later init() opens them again).
-	 * Call it on shutdown: flush() alone leaves a row in backoff unreported
-	 * at exit. Emits after close are stored without the queue, in a store
-	 * passed to init(). Resolves false if a row was lost or the stream
-	 * writes did not settle in time.
+	 * stores opened from FASTEN_*_DSN (a later init() opens them again)
+	 * and stops retention. Call it on shutdown: flush() alone leaves a row
+	 * in backoff unreported at exit. Emits after close are stored without
+	 * the queue, in a store passed to init(). Resolves false if a row was
+	 * lost, or the stream writes or the store closes did not finish by
+	 * timeoutMs.
 	 */
 	close(timeoutMs = 5000) {
 		// A second close while one is running waits for the same outcome.
@@ -1058,10 +1063,12 @@ export class Engine {
 			await Promise.all(retiring.map((e) => e.done));
 		}
 		const settled = await this._settleStreams(left());
+		// Retention would go on purging and redacting stores closed here.
+		this._stopRetention();
 		const opened = [...this.#envStores.values()].map((h) => h.store);
 		this.#envStores.clear();
-		await this.#closeStores(opened);
-		return settled && ok.every(Boolean);
+		const closed = await _within(this.#closeStores(opened), left());
+		return settled && closed && ok.every(Boolean);
 	}
 
 	// Stops the drainer and any a re-init is retiring.
@@ -1227,7 +1234,7 @@ export class Engine {
 			event,
 			request_id: currentRequestID(),
 			service_id: this.#config.serviceId || undefined,
-			timestamp: new Date().toISOString(),
+			timestamp: canonicalTS(),
 			// Fields that aren't JSON (none, or a function) log as {}.
 			...(JSON.stringify(fields, bigintReplacer) === undefined ? {} : fields),
 		};

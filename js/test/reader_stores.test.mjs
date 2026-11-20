@@ -78,6 +78,16 @@ describe('PostgresStreamStore', { skip }, () => {
         await s.close();
     });
 
+    test('search matches % and _ as themselves', async () => {
+        const s = new PostgresStreamStore(DSN, { table: table('api_esc') });
+        for (const note of ['x_y', 'xQy', '100%', '100Z']) {
+            await s.insert({ method: 'GET', path: `/${note}`, note, timestamp: '2026-01-01T00:00:00.000000Z' });
+        }
+        assert.deepEqual((await s.search({ q: 'x_y', since: '' })).map((r) => r.note), ['x_y']);
+        assert.deepEqual((await s.search({ q: '100%', since: '' })).map((r) => r.note), ['100%']);
+        await s.close();
+    });
+
     test('an INSERT whose answer was lost is not run again, so the row is stored once', async () => {
         const { default: pg } = await import('pg');
         const own = new pg.Pool({ connectionString: DSN });
@@ -285,6 +295,30 @@ function readerSuite(label, { skip: skipIt = false, backend }) {
             await gone.close();
         });
 
+        test('a status outside int32 or a NUL in a parameter is a 422, not a store error', async () => {
+            const { err } = await captureLines(async () => {
+                await serve(reader({ auth: 'none', engine }), async (get) => {
+                    for (const url of ['/api?status=2147483648', '/api?status=-2147483649']) {
+                        const r = await get(url);
+                        assert.equal(r.status, 422, url);
+                        assert.equal(r.body.detail, 'status must be between -2147483648 and 2147483647');
+                    }
+                    assert.equal((await get('/api?status=2147483647')).status, 200);
+                    for (const [url, name] of [
+                        ['/api?path=%2Fx%00', 'path'], ['/api?request_id=a%00b', 'request_id'],
+                        ['/sys?event=%00', 'event'], ['/sys?level=info%00', 'level'],
+                        ['/audit?actor=%00', 'actor'], ['/correlate?request_id=r%00', 'request_id'],
+                        ['/search?q=needle%00&since=2026-01-01T00:00:00Z&streams=audit,sys,api', 'q'],
+                    ]) {
+                        const r = await get(url);
+                        assert.equal(r.status, 422, url);
+                        assert.equal(r.body.detail, `${name} must not contain a NUL character`);
+                    }
+                });
+            });
+            assert.ok(!err.some((l) => l.includes('reader_query_failed')), JSON.stringify(err));
+        });
+
         // Last: it adds another tenant's rows to the tables.
         test('a scoped caller sees exactly its own rows beside another tenant', async () => {
             const b = new Engine();
@@ -339,6 +373,36 @@ function readerSuite(label, { skip: skipIt = false, backend }) {
                 assert.deepEqual(await audit.search({ q: 'needle', since: '2026-01-01T00:00:00.000000Z', tenantId: 'tenant-a' }), []);
             } finally {
                 await b.resetForTests();
+            }
+        });
+
+        // After the tenant test: it adds rows of a tenant of its own.
+        test('search matches % and _ as themselves on the audit and stream stores', async () => {
+            const e = new Engine();
+            const since = '2026-01-01T00:00:00.000000Z';
+            const notes = ['x_y', 'xQy', '100%', '100Z'];
+            await captureLines(async () => {
+                e.init({
+                    serviceId: 'svc-esc', nodeId: 'node-esc', tenantId: 'tenant-esc', auditStore: audit,
+                    auditStoreFailureStrategy: 'raise',
+                });
+                for (const note of notes) {
+                    await e.emit({ code: 'PGR_EVENT', target: 't', detail: { note } });
+                    await api.insert({ method: 'GET', path: `/esc/${note}`, note, timestamp: '2026-09-02T00:00:00.000000Z' });
+                    await sys.insert({ level: 'info', event: 'esc', note, timestamp: '2026-09-02T00:00:00.000000Z' });
+                }
+            });
+            try {
+                for (const [q, want] of [['x_y', 'x_y'], ['100%', '100%']]) {
+                    const a = await audit.search({ q, since, tenantId: 'tenant-esc' });
+                    assert.deepEqual(a.map((r) => r.detail.note), [want], `audit ${q}`);
+                    for (const [name, store] of [['api', api], ['sys', sys]]) {
+                        const rows = (await store.search({ q, since })).filter((r) => notes.includes(r.note));
+                        assert.deepEqual(rows.map((r) => r.note), [want], `${name} ${q}`);
+                    }
+                }
+            } finally {
+                await e.resetForTests();
             }
         });
     });

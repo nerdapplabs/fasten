@@ -22,6 +22,7 @@ import {
 	AuditSealError,
 	canonicalJSON,
 	canonicalTimestamp,
+	checkTimestamps,
 	detailText,
 	GENESIS,
 	parseJson,
@@ -326,7 +327,8 @@ export class SqliteStore {
 	 * Throws AuditRowRejectedError for a row it refuses: a different row
 	 * under a stored id, a seq-0 row whose origin_id is not its id, a seq
 	 * another row holds, a row field that is not a string or holds an
-	 * unpaired surrogate, a detail that is not JSON. Throws AuditSealError
+	 * unpaired surrogate, a detail that is not JSON, a timestamp or shipped_at
+	 * that is not RFC 3339. Throws AuditSealError
 	 * when sealing fails for another reason, and AuditOutcomeUnknownError
 	 * when the COMMIT failed and the row could not be read back. Other
 	 * errors are node:sqlite's.
@@ -338,7 +340,7 @@ export class SqliteStore {
 		this._ensureReady();
 		const r = snakeRow(row);
 		try {
-			toChainRow(r);
+			checkTimestamps(toChainRow(r));
 			canonicalJSON(r.detail);
 		} catch (err) {
 			throw new AuditRowRejectedError(`row ${r.id}: ${err.message}`);
@@ -410,7 +412,8 @@ export class SqliteStore {
 	 * not checked here: run verifyChain over the batch first, or use
 	 * `ingestReplicated`. Storing the same row again is a no-op.
 	 *
-	 * Throws AuditRowRejectedError for a row it cannot read, an unsealed row,
+	 * Throws AuditRowRejectedError for a row it cannot read (a timestamp that
+	 * is not RFC 3339 included), an unsealed row,
 	 * a different row (another hash) under a stored id, or a seq another row
 	 * holds on the node; AuditOutcomeUnknownError when the COMMIT failed and
 	 * the row could not be read back.
@@ -423,6 +426,7 @@ export class SqliteStore {
 		let r;
 		try {
 			r = toChainRow(row);
+			checkTimestamps(r);
 			if (text !== undefined) parseJson(text);
 		} catch (err) {
 			throw new AuditRowRejectedError(`insertSealed: ${err.message}`);
@@ -852,7 +856,9 @@ export class SqliteStore {
 		this._ensureReady();
 		// SQLite has no DELETE ... USING, so the rows are matched by id.
 		const t = this._table;
-		const keep = `timestamp >= ?1${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
+		// A plain ? per use of the cutoff: Node before 24.7 cannot bind one
+		// argument to a ?1 used twice.
+		const keep = `timestamp >= ?${respectUnshipped ? " OR shipped_at IS NULL" : ""}`;
 		const shipped = respectUnshipped ? " AND d.shipped_at IS NOT NULL" : "";
 		const max = "9223372036854775807";
 		const sql =
@@ -860,8 +866,8 @@ export class SqliteStore {
 			`WITH RECURSIVE nodes(node) AS (SELECT MIN(source_node_id) FROM ${t} UNION ALL ` +
 			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
 			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
-			`SELECT d.id FROM bound, ${t} AS d WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < ?1${shipped})`;
-		return Number(this._db.prepare(sql).run(cutoff).changes);
+			`SELECT d.id FROM bound, ${t} AS d WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < ?${shipped})`;
+		return Number(this._db.prepare(sql).run(cutoff, cutoff).changes);
 	}
 
 	/**

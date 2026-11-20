@@ -25,6 +25,8 @@ export class PostgresStore
 	 * @param connection A postgres:// connection URL (pg does not read
 	 *   libpq's keyword form), or a pg Pool to use, for example one shared
 	 *   with PostgresStreamStore; close() leaves a pool it was given open.
+	 *   A pool given gets an "error" listener, so an idle client lost does
+	 *   not end the process; the app's own listeners stay.
 	 * @param opts.table Table name, optionally schema-qualified. Defaults to
 	 *   "audit_log".
 	 */

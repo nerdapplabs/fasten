@@ -440,7 +440,15 @@ export function reader(opts = {}) {
 	function routeApi(q) {
 		const limit = _limit(q.get("limit"), 100, 1000);
 		const status = q.get("status");
-		if (status !== null && status !== "") _int("status", status);
+		// The status column is a 32-bit INTEGER.
+		if (status !== null && status !== "") {
+			const n = _int("status", status);
+			if (n < -2147483648 || n > 2147483647) {
+				throw unprocessable(
+					"status must be between -2147483648 and 2147483647",
+				);
+			}
+		}
 		const text = q.get("q");
 		if (text !== null && [...text].length > MAX_Q) {
 			throw unprocessable(`q must be at most ${MAX_Q} characters`);
@@ -574,14 +582,11 @@ export function reader(opts = {}) {
 				if (tenant === null) {
 					totals[name] = await streams[name].countMatching({ requestId: rid });
 					truncated[name] = counts[name] < totals[name];
-				} else if (fetched.length < limit) {
-					// Every matching row was fetched, so the scoped rows are all.
+				} else {
+					// Stream counts cannot take a tenant, so a scoped caller's
+					// totals count its own rows, as Python and Go do.
 					totals[name] = rows.length;
 					truncated[name] = false;
-				} else {
-					// Stream counts cannot take a tenant: unknown.
-					totals[name] = null;
-					truncated[name] = null;
 				}
 			}
 			const { api, sys } = out;
@@ -853,11 +858,17 @@ function scope(rows, tenant) {
 }
 
 // Query parameters: the last value of a repeated one, as FastAPI reads it.
+// The query parameters; a value read with a NUL in it is a 422, since a
+// Postgres text value cannot hold one.
 function _params(sp) {
 	return {
 		get: (name) => {
 			const all = sp.getAll(name);
-			return all.length ? all[all.length - 1] : null;
+			const v = all.length ? all[all.length - 1] : null;
+			if (v?.includes("\0")) {
+				throw unprocessable(`${name} must not contain a NUL character`);
+			}
+			return v;
 		},
 		has: (name) => sp.has(name),
 	};

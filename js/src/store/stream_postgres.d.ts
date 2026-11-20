@@ -10,7 +10,8 @@ export class PostgresStreamStore implements StreamStore {
 	 * Nothing connects until init() or the first call.
 	 * @param connection A postgres:// connection URL, or a pg Pool, for
 	 *   example one shared with PostgresStore (close() leaves a pool it was
-	 *   given open).
+	 *   given open). A pool given gets an "error" listener, so an idle
+	 *   client lost does not end the process; the app's own listeners stay.
 	 * @param opts.table Required, optionally schema-qualified: "api_log",
 	 *   "syslog".
 	 */

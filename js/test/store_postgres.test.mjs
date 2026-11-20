@@ -1424,3 +1424,94 @@ for (const strategy of ['queue', 'raise']) {
         });
     });
 }
+
+// Errors that end the process arrive here in place of a crash while fn runs.
+async function _uncaught(fn) {
+    const seen = [];
+    const onErr = (err) => seen.push(err);
+    process.on('uncaughtException', onErr);
+    try {
+        await fn();
+    } finally {
+        process.removeListener('uncaughtException', onErr);
+    }
+    return seen;
+}
+
+test('emit in queue mode survives backends terminated over and over, and loses no row', { skip }, async () => {
+    await _withTable(async ({ admin, t }) => {
+        const app = `fasten_kill_${randomUUID().slice(0, 8)}`;
+        const s = new PostgresStore(_appDsn(app), { table: t });
+        const e = new Engine();
+        const node = 'n-kill';
+        let emitted = 0;
+        let kills = 0;
+        const seen = await _uncaught(() => _captured(async () => {
+            e.init({
+                serviceId: 'svc', nodeId: node, auditStore: s, auditStoreFailureStrategy: 'queue',
+                queueRetryInitialMs: 5, queueRetryMaxMs: 100, queueRetryJitter: false,
+            });
+            // Emits paced over about 1.5 s while the store's backends are
+            // terminated every 20 ms. The retry budget outlasts that.
+            let emitting = true;
+            const killer = (async () => {
+                while (emitting) {
+                    kills += await _terminate(admin, app);
+                    await new Promise((r) => setTimeout(r, 20));
+                }
+            })();
+            for (; emitted < 300; emitted++) {
+                await e.emit({ code: 'T124_EVENT', target: `x-${emitted}` });
+                await new Promise((r) => setTimeout(r, 5));
+            }
+            emitting = false;
+            await killer;
+            assert.equal(await e.flush(20_000), true);
+            await e.resetForTests();
+        }));
+        assert.deepEqual(seen, []);
+        assert.ok(kills > 0, 'no backend was terminated');
+        const rows = await s.chainRows(node);
+        assert.equal(rows.length, emitted);
+        assert.deepEqual(rows.map((r) => r.monotonic_seq), rows.map((_, i) => i + 1));
+        const res = verifyChain(rows);
+        assert.ok(res.ok, res.reason);
+        await s.close();
+    });
+});
+
+test('a pool passed in gets an idle-client error listener, next to the app\'s own', { skip }, async () => {
+    await _withTable(async ({ admin, t }) => {
+        const { default: pg } = await import('pg');
+        for (const appListens of [false, true]) {
+            const app = `fasten_pool_${randomUUID().slice(0, 8)}`;
+            const pool = new pg.Pool({ connectionString: _appDsn(app) });
+            const appSeen = [];
+            if (appListens) pool.on('error', (err) => appSeen.push(err));
+            const s = new PostgresStore(pool, { table: t });
+            const api = new PostgresStreamStore(pool, { table: `${t}_api` });
+            try {
+                // One listener of the stores' however many stores share the pool.
+                assert.equal(pool.listenerCount('error'), appListens ? 2 : 1);
+                await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-pool' }));
+                await api.insert({ method: 'GET', path: '/p' });
+                assert.ok(pool.idleCount > 0);
+                const seen = await _uncaught(async () => {
+                    assert.ok(await _terminate(admin, app) > 0);
+                    for (let i = 0; i < 100 && pool.totalCount > 0; i++) {
+                        await new Promise((r) => setTimeout(r, 20));
+                    }
+                });
+                assert.deepEqual(seen, []);
+                assert.equal(pool.totalCount, 0);
+                if (appListens) assert.ok(appSeen.length > 0);
+                assert.equal(await api.count(), 1);
+            } finally {
+                await s.close();
+                await api.close();
+                await pool.end();
+                await admin.query(`DROP TABLE IF EXISTS ${t}_api`);
+            }
+        }
+    });
+});

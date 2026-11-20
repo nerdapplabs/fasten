@@ -5,12 +5,10 @@ import { canonicalTS } from "../canonical_ts.js";
 import {
 	bigintReviver,
 	ChainError,
-	canonicalTimestamp,
 	parseJson,
 	toChainRow,
+	wireTimestamp,
 } from "../chain.js";
-
-const _CANONICAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 
 /**
  * A purge or redaction cutoff as the canonical timestamp text the stored
@@ -21,10 +19,8 @@ const _CANONICAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
  * @returns {string}
  */
 export function cutoffTS(store, before) {
-	if (typeof before === "string") {
-		const c = canonicalTimestamp(before);
-		if (_CANONICAL.test(c)) return c;
-	}
+	const c = wireTimestamp(before);
+	if (c !== null) return c;
 	const d =
 		before instanceof Date
 			? before

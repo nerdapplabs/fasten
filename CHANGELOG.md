@@ -41,14 +41,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - `close()` waits for api and sys store writes and resolves false when they
   do not finish in its timeout, then closes the stores it opened from
   `FASTEN_*_DSN`.
-- `listUnshipped`, `markShipped` and `ingestReplicated` on the engine throw
-  `TypeError` (was `AuditStoreError`) without a store that has the method.
-  The bundled stores' `listUnshipped` throws `TypeError` when only one of
-  `serviceId` and `sourceNodeId` is given.
-- `SqliteStreamStore` methods return promises, and it creates its table on
-  `init()` or first use.
-- The reader resolves the tenant scope before reading query parameters: a
-  scoped reader answers a caller without a tenant 401, not 422.
+- `init()` now reads `FASTEN_PERSIST_STREAMS`, `FASTEN_RETENTION_API` and
+  `FASTEN_RETENTION_SYSLOG` when the matching option is not passed, and
+  throws on a value it cannot use: a stream name other than `api` or
+  `sys`, a stream named without a store or a store attached but not named,
+  or a retention that is not a positive whole number of `s`, `m`, `h` or
+  `d` (checked even when that stream has no store). A retention for a
+  store without `purge()` throws too. An app with these variables set can
+  now fail to start.
 
 ### Added: JS SQLite store, replication, reader and stored logs
 
@@ -66,7 +66,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `listUnshipped(limit, { serviceId, sourceNodeId, exact })` can list only
   the rows an identity originated, with detail numbers exact for shipping.
   The engine adds `listUnshipped()`, `markShipped(ids)` and
-  `ingestReplicated(rows)`.
+  `ingestReplicated(rows)`, which throw `TypeError` without a store that
+  has the method. A store's `listUnshipped` throws `TypeError` when only
+  one of `serviceId` and `sourceNodeId` is given.
 - HTTP reader (`fasten-sdk/reader`): `reader({ auth, ... })` serves
   `/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api` and
   `/topology` with the Python and Go readers' parameters, responses and
@@ -77,7 +79,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   the stream tables the other SDKs use, `init({ apiStore, syslogStore,
   persistStreams, searchEnabled, retentionApi, retentionSyslog })`,
   `apiLogger()`, `writeApi`, `pushApi`, `pushSyslog`, `mintSentinel` and
-  `isSentinel`.
+  `isSentinel`. `SqliteStreamStore` methods return promises, and it creates
+  its table on `init()` or first use.
 - Both audit stores gain `search`, `sources`, `chainTail` and
   `query({ afterSeq })`. On SQLite, search folds ASCII letters only, as the
   Python and Go SQLite stores do.
@@ -98,6 +101,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   from the client.
 - The reader matches the request path as sent, applies the tenant scope to
   every row it returns, and a scoped doctor reports only the caller's data.
+  It resolves the tenant scope before reading query parameters, so a
+  caller without a tenant gets 401, not 422.
   The doctor's chain block reports `sealed_rows` and gives `verified: null`
   when no sealed row was checked.
 - `purge({ before })` on both audit stores takes a `Date` or a timestamp in

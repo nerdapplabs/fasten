@@ -6,7 +6,7 @@ import { connectionLost, retryLost } from '../src/store/pg_conn.js';
 
 const dbError = (code) => Object.assign(new Error(`sqlstate ${code}`), { name: 'error', severity: 'FATAL', code });
 
-test('a lost connection is a socket error, a closed client, or class 08 or 57', () => {
+test('a lost connection is a socket error, a closed client, or class 08 or 57 other than 57014', () => {
     for (const err of [
         dbError('57P01'), dbError('08006'), dbError('57P03'),
         Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET', syscall: 'read' }),
@@ -16,7 +16,8 @@ test('a lost connection is a socket error, a closed client, or class 08 or 57', 
     ]) {
         assert.equal(connectionLost(err), true, err.message);
     }
-    for (const err of [dbError('23505'), dbError('42P01'), dbError('40001'), new Error('row x: differs'), null]) {
+    // 57014, a statement timeout or cancel, comes over a live connection.
+    for (const err of [dbError('23505'), dbError('42P01'), dbError('40001'), dbError('57014'), new Error('row x: differs'), null]) {
         assert.equal(connectionLost(err), false, String(err?.message));
     }
 });
@@ -56,5 +57,14 @@ test('retryLost does not run again after another error or one `final` accepts', 
         calls++;
         throw lost;
     }, (err) => err === lost));
+    assert.equal(calls, 1);
+});
+
+test('retryLost does not run a statement that timed out again', async () => {
+    let calls = 0;
+    await assert.rejects(retryLost({ idleCount: 5 }, async () => {
+        calls++;
+        throw dbError('57014');
+    }), (err) => err.code === '57014');
     assert.equal(calls, 1);
 });

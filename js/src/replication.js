@@ -7,6 +7,7 @@
  */
 import {
 	ChainError,
+	checkTimestamps,
 	compareCodePoints,
 	toChainRow,
 	verifyChain,
@@ -19,14 +20,17 @@ import {
 
 /**
  * The batch as chain rows. Throws ChainError naming the index of a row it
- * cannot read.
+ * cannot read, a timestamp that is not RFC 3339 included, as the Python
+ * and Go SDKs refuse such a row before ingest.
  * @param {Iterable<unknown>} rows
  * @returns {ChainRow[]}
  */
 export function readBatch(rows) {
 	return [...rows].map((r, i) => {
 		try {
-			return toChainRow(/** @type {any} */ (r));
+			const row = toChainRow(/** @type {any} */ (r));
+			checkTimestamps(row);
+			return row;
 		} catch (err) {
 			throw new ChainError(`rows[${i}]: ${err.message}`);
 		}

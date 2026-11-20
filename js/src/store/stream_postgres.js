@@ -90,7 +90,8 @@ export class PostgresStreamStore {
 	 * table.
 	 * @param {string | { query: Function }} connection A libpq DSN or
 	 *   connection URL, or a pg Pool to use (close() leaves it open), for
-	 *   example one shared with PostgresStore.
+	 *   example one shared with PostgresStore. A pool given gets the same
+	 *   idle-client error listener as one the store creates.
 	 * @param {{ table: string }} opts table name, optionally schema-qualified.
 	 *   Required, so api rows cannot land in the syslog table.
 	 */
@@ -111,7 +112,7 @@ export class PostgresStreamStore {
 		this._ownPool = typeof connection === "string";
 		this._connectionString = this._ownPool ? connection : null;
 		/** @type {any} */
-		this._pool = this._ownPool ? null : connection;
+		this._pool = this._ownPool ? null : watchPool(connection);
 		/** @type {Promise<void> | null} */
 		this._ready = null;
 		// Inserts run one after another, so seq follows the order rows came.

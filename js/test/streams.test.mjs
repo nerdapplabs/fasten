@@ -212,6 +212,25 @@ describe('write-through', () => {
         });
         assert.ok(!store.rows.some((r) => r.event === 'old'));
     });
+
+    test('sys rows carry six-digit timestamps, so until and purge at that instant reach them', async () => {
+        const e = engine();
+        const store = new SqliteStreamStore(':memory:', { table: 'syslog' });
+        const { out } = await captureLines(async () => {
+            e.init({ ...base, syslogStore: store });
+            e.log.info('ts_event');
+            await e.flush();
+        });
+        const line = JSON.parse(out.find((l) => l.includes('ts_event')));
+        const [row] = await store.query({ event: 'ts_event' });
+        assert.match(row.timestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/);
+        assert.equal(line.timestamp, row.timestamp);
+        assert.equal(e._readerState().streams.sys.ring.query({ event: 'ts_event' })[0].timestamp, row.timestamp);
+        assert.equal((await store.query({ event: 'ts_event', until: row.timestamp })).length, 1);
+        await store.purge({ before: `${row.timestamp.slice(0, 23)}500Z` });
+        assert.equal(await store.countMatching({ event: 'ts_event' }), 0);
+        await store.close();
+    });
 });
 
 describe('apiLogger', () => {
@@ -447,6 +466,47 @@ describe('stream cap, flush and outage reporting', () => {
         }
     });
 
+    test('close keeps to its timeout when inserts and a store close hang', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'fasten-close-'));
+        process.env.FASTEN_SYSLOG_DSN = join(dir, 'sys.db');
+        try {
+            const e = engine();
+            const hang = () => new Promise(() => {});
+            let closed;
+            let ms;
+            await captureLines(async () => {
+                e.init({ ...base, auditStore: { insert: hang } });
+                // As a Postgres pool's end() waits for the client a hung
+                // insert holds.
+                const store = e._readerState().streams.sys.store;
+                store.insert = hang;
+                store.close = hang;
+                e.pushSyslog({ event: 'stuck' });
+                const t0 = Date.now();
+                closed = await e.close(20);
+                ms = Date.now() - t0;
+            });
+            assert.equal(closed, false);
+            assert.ok(ms < 200, `close(20) took ${ms} ms`);
+        } finally {
+            delete process.env.FASTEN_SYSLOG_DSN;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test('close stops the retention timers', async () => {
+        const e = engine();
+        const api = new MemoryStreamStore();
+        const sys = new MemoryStreamStore();
+        await captureLines(async () => {
+            e.init({ ...base, apiStore: api, syslogStore: sys, retentionApi: '1d', retentionSyslog: '1d' });
+            assert.equal(e._streamRetention.length, 2);
+            assert.equal(await e.close(1000), true);
+        });
+        assert.equal(e._streamRetention.length, 0);
+        assert.equal(e._retentionTimer, null);
+    });
+
     test('during an outage stderr gets the first failure, then a count', async () => {
         const e = engine();
         const store = new MemoryStreamStore({ fail: true });
@@ -536,6 +596,16 @@ describe('SqliteStreamStore', () => {
         assert.equal((await s.purge({ before: '2026-01-02T00:00:00.000000Z' })), 1);
         assert.equal((await s.count()), 2);
         assert.equal(s._db.prepare('SELECT payload FROM api_log WHERE path = ?').get('/b').payload.includes('1152921504606846976'), true);
+        await s.close();
+    });
+
+    test('search matches % and _ as themselves', async () => {
+        const s = new SqliteStreamStore(':memory:', { table: 'api_log' });
+        for (const note of ['x_y', 'xQy', '100%', '100Z']) {
+            await s.insert({ method: 'GET', path: `/${note}`, note, timestamp: '2026-01-01T00:00:00.000000Z' });
+        }
+        assert.deepEqual((await s.search({ q: 'x_y', since: '' })).map((r) => r.note), ['x_y']);
+        assert.deepEqual((await s.search({ q: '100%', since: '' })).map((r) => r.note), ['100%']);
         await s.close();
     });
 

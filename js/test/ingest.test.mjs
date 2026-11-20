@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { SqliteStore } from '../src/store/sqlite.js';
 import { PostgresStore } from '../src/store/postgres.js';
 import {
-    AuditStoreError, ChainError, defaultEngine, Engine, ingestReplicated, init, listUnshipped,
+    AuditRowRejectedError, AuditStoreError, ChainError, defaultEngine, Engine, ingestReplicated, init, listUnshipped,
     markShipped, register as registerCodes, seal, verifyChain,
 } from '../src/index.js';
 import { detailText, parseJson } from '../src/chain.js';
@@ -286,6 +286,27 @@ for (const [name, make] of BACKENDS) {
             await assert.rejects(s.ingestReplicated([chain([1])[0], { monotonic_seq: 'x' }]),
                 (err) => err instanceof ChainError && /^rows\[1\]: /.test(err.message));
             await assert.rejects(s.ingestReplicated(['not json']), ChainError);
+        });
+
+        test('a timestamp that is not RFC 3339 is refused by insert, insertSealed and ingest', async () => {
+            const s = await fresh();
+            for (const ts of ['yesterday', '2026-02-30T10:00:00.000000Z', '2026-08-21T10:00:00+24:00']) {
+                await assert.rejects(s.insert({ ...row(0, { id: `evt-own-${ts}` }), timestamp: ts }),
+                    (err) => err instanceof AuditRowRejectedError && /timestamp .* is not an RFC 3339 timestamp/.test(err.message), ts);
+                // seal() hashes the text it cannot read as it is, so the row verifies.
+                const bad = chain([1, 2]);
+                bad[1] = seal(bad[0].hash, { ...row(2), timestamp: ts });
+                assert.ok(verifyChain(bad).ok);
+                await assert.rejects(s.insertSealed(bad[1]), AuditRowRejectedError, ts);
+                await assert.rejects(s.ingestReplicated(bad),
+                    (err) => err instanceof ChainError && /^rows\[1\]: timestamp /.test(err.message), ts);
+            }
+            await assert.rejects(s.insertSealed({ ...chain([1])[0], shipped_at: 'soon' }),
+                (err) => err instanceof AuditRowRejectedError && /shipped_at "soon"/.test(err.message));
+            assert.deepEqual(await stored(s), []);
+            // Another offset is put in the wire form.
+            await s.insert({ ...row(0, { id: 'evt-offset' }), timestamp: '2026-08-21T12:00:00.5+02:00' });
+            assert.equal((await s.query({}))[0].timestamp, '2026-08-21T10:00:00.500000Z');
         });
 
         test('rows ingested from another node are not listed to ship again', async () => {

@@ -234,6 +234,25 @@ describe('routes', () => {
         });
     });
 
+    test('since and until refuse what Python\'s parser refuses', async () => {
+        await serve(h, async (get) => {
+            for (const ts of [
+                '2026-08-21T10:00:00+99:99', '2026-08-21T10:00:00+24:00', '2026-08-21T10:00:00-23:60',
+                '0000-01-01T00:00:00Z', '2026-08-21T10:00:60Z', '2026-13-01T00:00:00Z',
+                '2026-04-31T00:00:00Z', '2026-02-29T00:00:00Z',
+            ]) {
+                for (const name of ['since', 'until']) {
+                    const r = await get(`/audit?${name}=${encodeURIComponent(ts)}`);
+                    assert.equal(r.status, 422, `${name}=${ts}`);
+                    assert.match(r.body.detail, new RegExp(`^${name} must be RFC3339`));
+                }
+            }
+            for (const ts of ['2026-08-21T10:00:00+23:59', '2024-02-29T00:00:00Z', '0001-01-01T00:00:00Z']) {
+                assert.equal((await get(`/audit?since=${encodeURIComponent(ts)}`)).status, 200, ts);
+            }
+        });
+    });
+
     test('/sys and /api read the stream stores', async () => {
         await serve(h, async (get) => {
             const s = await get('/sys?level=error');
@@ -700,7 +719,7 @@ describe('the reader applies the tenant scope to every row it returns', () => {
         });
     });
 
-    test('/correlate stream totals under a scope are exact when every row was fetched, else unknown', async () => {
+    test('a scoped caller\'s /correlate totals count its own rows, as Python and Go do', async () => {
         const ctx = await setup();
         const h = reader({ auth: 'none', engine: ctx.engine, streams: { sys: ctx.sys, api: ctx.api }, tenantScope: () => 'tenant-a' });
         await serve(h, async (get) => {
@@ -708,13 +727,21 @@ describe('the reader applies the tenant scope to every row it returns', () => {
             assert.deepEqual(all.body.totals, { audit: 2, api: 1, sys: 1 });
             assert.deepEqual(all.body.truncated, { audit: false, api: false, sys: false });
             // Two sys rows carry req-a, the newest without a tenant: with a
-            // limit of 1 this tenant's row is cut off, which the reader
-            // cannot count.
+            // limit of 1 the caller's own row is not fetched.
             const one = await get('/correlate?request_id=req-a&limit=1');
             assert.equal(one.body.counts.sys, 0);
-            assert.equal(one.body.totals.sys, null);
-            assert.equal(one.body.truncated.sys, null);
+            assert.equal(one.body.totals.sys, 0);
+            assert.equal(one.body.truncated.sys, false);
             assert.equal(one.body.truncated.audit, true);
+            // The stream fields are the same for a request id with rows
+            // only under another tenant as for one with no rows, at any
+            // limit.
+            const fields = (b) => ({ counts: b.counts, totals: b.totals, truncated: b.truncated });
+            const none = fields((await get('/correlate?request_id=req-none')).body);
+            for (const limit of [1, 2, 100]) {
+                const other = fields((await get(`/correlate?request_id=req-b&limit=${limit}`)).body);
+                assert.deepEqual(other, none, `limit ${limit}`);
+            }
         });
     });
 });
