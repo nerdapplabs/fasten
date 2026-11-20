@@ -226,7 +226,7 @@ func TestPersistFailureDegradesCompletenessFlag(t *testing.T) {
 // A sqlite DSN url.Parse refuses gives a fixed error that quotes none of it.
 func TestParseStreamDSN_ErrorQuotesNoPartOfTheDSN(t *testing.T) {
 	for _, dsn := range []string{"sqlite://app:s3cret", "sqlite://app:pa%ss@host/x.db"} {
-		_, _, err := parseStreamDSN(dsn, "t")
+		_, err := parseStreamDSN(dsn, "t")
 		if err == nil {
 			t.Fatalf("%q: want an error", dsn)
 		}

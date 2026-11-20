@@ -42,6 +42,12 @@ type Engine struct {
 	// means none.
 	persistedStreams map[string]bool
 
+	// envStores holds the stores Init opened from FASTEN_*_DSN, by
+	// variable, so a re-init with the same DSN keeps them. envUnused holds
+	// those a re-init stopped using, closed once nothing writes to them.
+	envStores map[string]*envStore
+	envUnused []*envStore
+
 	unchainedStoreLogged  atomic.Bool
 	auditChainUnavailable atomic.Bool
 
@@ -87,26 +93,6 @@ type Engine struct {
 
 // Default is the package-level Engine used by all free-function API calls.
 var Default = &Engine{}
-
-// streamStoreFromEnvDSN opens a SQLite stream store from the DSN in envVar,
-// or returns (nil, nil) if it is unset. Postgres DSNs are rejected because
-// this package has no Postgres driver; pass a PostgresStreamStore in Config.
-func streamStoreFromEnvDSN(envVar, table string) (*StreamStore, error) {
-	dsn := envOr(envVar, "")
-	if dsn == "" {
-		return nil, nil
-	}
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return nil, fmt.Errorf("fasten.Init: %s is a Postgres DSN; Go does not "+
-			"autoload Postgres stream stores (no bundled driver): pass an "+
-			"explicit APIStore/SyslogStore", envVar)
-	}
-	s, err := OpenStreamStore(dsn, table)
-	if err != nil {
-		return nil, fmt.Errorf("fasten.Init: %s: %w", envVar, err)
-	}
-	return s, nil
-}
 
 // configureRedaction sets this Engine's extra redact keys and replacement
 // from config, or else from FASTEN_REDACT_KEYS (comma-separated) and
@@ -159,11 +145,16 @@ func (e *Engine) Init(cfg Config) error {
 	// A nil *SQLiteStore in the interface isn't == nil, so every later nil
 	// check would pass and the first method call would panic. Normalise it
 	// once here.
-	e.auditStore = cfg.AuditStore
-	if isTypedNil(e.auditStore) {
-		e.auditStore = nil
+	if isTypedNil(cfg.AuditStore) {
 		cfg.AuditStore = nil
 	}
+	// Stores not passed in Config are opened from FASTEN_AUDIT_DSN,
+	// FASTEN_API_DSN and FASTEN_SYSLOG_DSN.
+	cfg, err := e.storesFromEnv(cfg)
+	if err != nil {
+		return err
+	}
+	e.auditStore = cfg.AuditStore
 	// A new store starts with no swallowed writes; re-init on the same
 	// store keeps them.
 	if !sameStore(prevStore, e.auditStore) {
@@ -189,28 +180,9 @@ func (e *Engine) Init(cfg Config) error {
 	// real request arrives.
 	e.xport.serviceID = e.serviceID
 	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
-	// Stream stores not passed in Config are opened from FASTEN_API_DSN and
-	// FASTEN_SYSLOG_DSN (SQLite only).
+	e.warnUnreadDSNEnv()
 	apiStore := cfg.APIStore
-	if apiStore == nil {
-		s, err := streamStoreFromEnvDSN("FASTEN_API_DSN", "api_log")
-		if err != nil {
-			return err
-		}
-		if s != nil {
-			apiStore = s
-		}
-	}
 	syslogStore := cfg.SyslogStore
-	if syslogStore == nil {
-		s, err := streamStoreFromEnvDSN("FASTEN_SYSLOG_DSN", "syslog")
-		if err != nil {
-			return err
-		}
-		if s != nil {
-			syslogStore = s
-		}
-	}
 	e.apiStore = apiStore
 	e.syslogStore = syslogStore
 	e.xport.APIStore = apiStore
@@ -277,6 +249,10 @@ func (e *Engine) Init(cfg Config) error {
 	old, done := e.swapDrainer(next)
 	e.closed.Store(false)
 	e.retireOld(old, done, 5*time.Second, time.Time{})
+	// The old drainer and the streams no longer write to these; nor will
+	// retention, which startRetention starts again.
+	e.stopRetention()
+	e.closeEnvStores(false)
 
 	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
 		return err
@@ -640,8 +616,10 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 // drainer and stores any row it still holds. A row not stored once timeout
 // has passed is reported lost (audit_drain_lost_at_stop). Call it on
 // shutdown: Flush alone leaves a row that is still being retried unreported
-// at exit. Emits after Close are stored synchronously. Returns false if a row
-// was lost.
+// at exit. Close then stops retention and closes the stores Init opened from
+// FASTEN_*_DSN (a later Init opens them again). Emits after Close are stored
+// synchronously, in a store passed in Config. Returns false if a row was
+// lost or a store did not close.
 //
 // A store call still running at timeout is left to finish in the background,
 // and its row is reported lost then. A second Close while one is running
@@ -703,7 +681,10 @@ func (e *Engine) close(timeout time.Duration) bool {
 			e.drainerMu.Unlock()
 		}
 	}
-	return d == nil || d.lost.Load() == lost
+	// Retention would go on purging the stores closed here.
+	e.stopRetention()
+	closed := e.closeEnvStores(true)
+	return (d == nil || d.lost.Load() == lost) && closed
 }
 
 // marshalWithShape encodes row plus a "shape" key without modifying row. The
@@ -771,6 +752,7 @@ func (e *Engine) ResetForTests() {
 	e.redactReplacement = ""
 	e.redactMu.Unlock()
 	e.stopRetention()
+	e.closeEnvStores(true)
 }
 
 // SearchEnabled reports whether free-text search is enabled.

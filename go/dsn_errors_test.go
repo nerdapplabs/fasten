@@ -12,7 +12,7 @@ func TestStreamDSNErrorsOmitDSN(t *testing.T) {
 		"sqlite://app:s3cret@db/%zz",
 		"sqlite://app:s3cret@",
 	} {
-		_, _, err := parseStreamDSN(dsn, "sys")
+		_, err := parseStreamDSN(dsn, "sys")
 		if err == nil {
 			t.Fatalf("%s: want an error", dsn)
 		}

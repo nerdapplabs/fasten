@@ -14,12 +14,23 @@ import (
 	_ "github.com/lib/pq"
 )
 
-func pgDB(t *testing.T) *sql.DB {
+// pgDSN returns FASTEN_TEST_POSTGRES_DSN. Without it the test is skipped,
+// or fails when FASTEN_REQUIRE_POSTGRES=1 says the Postgres tests must run.
+func pgDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("FASTEN_TEST_POSTGRES_DSN")
 	if dsn == "" {
+		if os.Getenv("FASTEN_REQUIRE_POSTGRES") == "1" {
+			t.Fatal("FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set")
+		}
 		t.Skip("FASTEN_TEST_POSTGRES_DSN not set")
 	}
+	return dsn
+}
+
+func pgDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := pgDSN(t)
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
