@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{chain::ChainRow, checkpoint::ChainTip, error::Error, row::Row};
+use crate::{
+    chain::ChainRow,
+    checkpoint::ChainTip,
+    error::Error,
+    replication::{IngestResult, ReplicatedRow},
+    row::Row,
+};
 
 /// Query filter for read-path operations.
 ///
@@ -21,6 +27,129 @@ pub struct Filter {
     pub limit:          u32,
     /// Skip this many matching rows before returning results.
     pub offset:         u32,
+}
+
+/// Filters for the reader's audit reads, which return rows newest first
+/// (timestamp, then `monotonic_seq`), as the Python and Go stores do.
+///
+/// A `None` or empty text filter is ignored, except `tenant_id`: an empty
+/// tenant matches only rows stored with an empty tenant, so a blank scope
+/// never widens a read to every tenant. `since` and `until` are canonical
+/// timestamps (spec §4.3), inclusive. `after_seq`, when above 0, keeps rows
+/// with a lower `monotonic_seq`: the cursor of the next page.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    pub request_id:     Option<String>,
+    pub code:           Option<String>,
+    pub domain:         Option<String>,
+    pub source_node_id: Option<String>,
+    pub tenant_id:      Option<String>,
+    pub actor:          Option<String>,
+    pub target:         Option<String>,
+    pub since:          Option<String>,
+    pub until:          Option<String>,
+    /// Maximum rows to return; 0 means no limit.
+    pub limit:          u32,
+    pub offset:         u64,
+    pub after_seq:      u64,
+}
+
+impl AuditQuery {
+    /// The WHERE conditions and their values, `limit`, `offset` and
+    /// `after_seq` left out. `placeholder(n)` renders the n-th parameter.
+    /// `node` is the expression for `source_node_id`.
+    #[doc(hidden)]
+    pub fn conditions(&self, node: &str, ts: impl Fn(usize) -> String, placeholder: impl Fn(usize) -> String) -> (Vec<String>, Vec<String>) {
+        let mut conds = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+        let text = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
+        for (col, v) in [
+            ("request_id", text(&self.request_id)),
+            ("code", text(&self.code)),
+            ("domain", text(&self.domain)),
+            (node, text(&self.source_node_id)),
+            ("tenant_id", self.tenant_id.clone()),
+            ("actor", text(&self.actor)),
+            ("target", text(&self.target)),
+        ] {
+            if let Some(v) = v {
+                params.push(v);
+                conds.push(format!("{col} = {}", placeholder(params.len())));
+            }
+        }
+        for (v, op) in [(text(&self.since), ">="), (text(&self.until), "<=")] {
+            if let Some(v) = v {
+                params.push(v);
+                conds.push(format!("timestamp {op} {}", ts(params.len())));
+            }
+        }
+        (conds, params)
+    }
+}
+
+/// A free-text search of audit `detail` (spec §9): a case-insensitive
+/// substring match within `[since, until]`, newest first. `%`, `_` and `\`
+/// in `q` match literally. `tenant_id` scopes it to one tenant.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditSearch {
+    pub q:         String,
+    pub since:     String,
+    pub until:     Option<String>,
+    /// Maximum rows to return; 0 means no limit.
+    pub limit:     u32,
+    pub tenant_id: Option<String>,
+}
+
+impl AuditQuery {
+    /// `limit` as a SQL LIMIT value: 0, no limit, is the largest BIGINT.
+    #[doc(hidden)]
+    pub fn sql_limit(&self) -> i64 {
+        sql_limit(self.limit)
+    }
+}
+
+impl AuditSearch {
+    /// `limit` as a SQL LIMIT value: 0, no limit, is the largest BIGINT.
+    #[doc(hidden)]
+    pub fn sql_limit(&self) -> i64 {
+        sql_limit(self.limit)
+    }
+}
+
+/// A read's `limit` as a SQL LIMIT value: 0, no limit, is the largest
+/// BIGINT, which SQLite and Postgres both take. For the SDK's stores; not a
+/// stable API.
+#[doc(hidden)]
+pub fn sql_limit(limit: u32) -> i64 {
+    if limit == 0 { i64::MAX } else { i64::from(limit) }
+}
+
+/// Rows written per `(source_node_id, service_id, tenant_id)`, for the
+/// reader's `/topology`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Source {
+    pub source_node_id: String,
+    pub service_id:     String,
+    pub tenant_id:      Option<String>,
+    pub rows:           u64,
+    pub first_seen:     Option<String>,
+    pub last_seen:      Option<String>,
+}
+
+impl Source {
+    /// `rows` rows from one node, service and tenant, first and last seen
+    /// at the given canonical timestamps.
+    pub fn new(
+        source_node_id: String,
+        service_id: String,
+        tenant_id: Option<String>,
+        rows: u64,
+        first_seen: Option<String>,
+        last_seen: Option<String>,
+    ) -> Self {
+        Self { source_node_id, service_id, tenant_id, rows, first_seen, last_seen }
+    }
 }
 
 /// Result of [`Store::list_redaction_candidates`].
@@ -124,6 +253,14 @@ pub trait Store: Send + Sync {
         Err(Error::Unsupported("insert_sealed"))
     }
 
+    /// The replicated insert of spec §5: [`Store::insert_sealed`] for a
+    /// row shipped from another node, with its flag. The caller has
+    /// verified the chain; [`Store::ingest_replicated`] verifies a batch
+    /// and checks it against the stored rows first.
+    fn insert_replicated(&self, row: &ReplicatedRow) -> Result<(), Error> {
+        self.insert_sealed(&row.row, row.pii_in_detail)
+    }
+
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
     /// sufficient; on PostgreSQL, a lost connection is re-established first.
     fn ping(&self) -> Result<(), Error>;
@@ -159,10 +296,37 @@ pub trait Store: Send + Sync {
     /// `monotonic_seq ASC`.  `limit == 0` returns all unshipped rows.
     fn list_unshipped(&self, limit: u32) -> Result<Vec<Row>, Error>;
 
+    /// Unshipped rows exactly as they were sealed, for shipping to another
+    /// node (spec §5), ordered by `monotonic_seq`. `limit == 0` returns all.
+    ///
+    /// With `origin`, `(service_id, source_node_id)`, only the rows that
+    /// identity originated (`origin_id == id`), so rows it ingested from
+    /// other nodes are not shipped again. Without it, every unshipped row.
+    fn list_unshipped_sealed(
+        &self,
+        _limit: u32,
+        _origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        Err(Error::Unsupported("list_unshipped_sealed"))
+    }
+
     /// Set `shipped_at` to the current UTC time for all rows in `ids`, in
     /// one transaction however many ids there are.
     /// IDs that do not exist are silently ignored.
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error>;
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix in one transaction (spec §4), as the Python, Go and JS stores
+    /// do.
+    /// A break is reported in the result, not as an error. An error means
+    /// nothing of the batch was stored.
+    fn ingest_replicated(
+        &self,
+        _rows: &[ReplicatedRow],
+        _local_node_id: Option<&str>,
+    ) -> Result<IngestResult, Error> {
+        Err(Error::Unsupported("ingest_replicated"))
+    }
 
     /// Delete rows whose `timestamp` is before `before_iso8601`, per node only
     /// a seq prefix (spec §2.3): rows above a kept row stay, so the rows left
@@ -173,7 +337,10 @@ pub trait Store: Send + Sync {
     ///
     /// Returns the number of deleted rows. `before` is an RFC 3339 timestamp
     /// (any offset) or a date, taken as midnight UTC; anything else is an
-    /// `InvalidTimestamp` error and deletes nothing.
+    /// `InvalidTimestamp` error and deletes nothing. It is never run a
+    /// second time on its own: when the connection is lost while it runs,
+    /// the Postgres store returns a `Store` error saying the outcome is
+    /// unknown.
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error>;
 
     /// Return the maximum `monotonic_seq` across all stored rows, or `0` if
@@ -336,12 +503,21 @@ pub fn sealed_columns(row: &ChainRow, pii_in_detail: bool) -> Result<(Row, Strin
             row.id
         )));
     }
+    // Stored in the wire form, so the text compares as the other SDKs
+    // write it; one the Python and Go stores cannot read is refused.
+    let canonical = |field: &str, ts: &str| {
+        crate::replication::canonical_timestamp(ts).ok_or_else(|| {
+            Error::RowRejected(format!("row {}: {field} is not an RFC 3339 timestamp", row.id))
+        })
+    };
+    let timestamp = canonical("timestamp", &row.timestamp)?;
+    let shipped_at = row.shipped_at.as_deref().map(|s| canonical("shipped_at", s)).transpose()?;
     let columns = Row {
         wire_version: row.wire_version.clone(),
         id: row.id.clone(),
         origin_id: row.origin_id.clone(),
         monotonic_seq: row.monotonic_seq,
-        timestamp: row.timestamp.clone(),
+        timestamp,
         code: row.code.clone(),
         action: row.action.clone(),
         severity: row.severity.clone(),
@@ -357,7 +533,7 @@ pub fn sealed_columns(row: &ChainRow, pii_in_detail: bool) -> Result<(Row, Strin
         request_id: row.request_id.clone(),
         detail: serde_json::Value::Null,
         pii_in_detail,
-        shipped_at: row.shipped_at.clone(),
+        shipped_at,
         prev_hash: Some(row.prev_hash.clone()),
         hash: Some(row.hash.clone()),
         canonical_form_id: Some(row.canonical_form_id.clone()).filter(|f| !f.is_empty()),
@@ -437,8 +613,10 @@ pub(crate) const SELECT_COLUMNS: &str = "id,wire_version,origin_id,monotonic_seq
 /// monotonic_seq) index, and the LIMIT keeps the planner from repeating it
 /// per row. Postgres deletes with USING; SQLite has no USING, so it matches
 /// ids.
+/// For the SDK's stores; not a stable API.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
+#[doc(hidden)]
+pub fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bool) -> String {
     let (unshipped, shipped) = if respect_unshipped {
         (" OR shipped_at IS NULL", " AND d.shipped_at IS NOT NULL")
     } else {
@@ -488,8 +666,13 @@ pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }
 
+pub mod stream;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+#[cfg(feature = "sqlite")]
+pub mod stream_sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;

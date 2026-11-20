@@ -4,6 +4,7 @@
 
 use fasten_core::chain::ChainRow;
 use fasten_core::checkpoint::ChainTip;
+use fasten_core::replication::{IngestResult, ReplicatedRow};
 use fasten_core::store::{Filter, Store};
 
 /// SQLite audit store.
@@ -46,6 +47,17 @@ fn write_err(e: fasten_core::Error, row: &fasten_core::Row) -> crate::Error {
     }
 }
 
+// A failed write of a row sealed elsewhere: one the store refuses is
+// AuditStoreRejected.
+fn replicated_err(e: fasten_core::Error) -> crate::Error {
+    match e {
+        e @ (fasten_core::Error::RowRejected(_) | fasten_core::Error::SeqClash(_)) => {
+            crate::Error::AuditStoreRejected(e.to_string())
+        }
+        e => write_err(e, &fasten_core::Row::default()),
+    }
+}
+
 fn read_err(e: fasten_core::Error) -> crate::Error {
     crate::Error::AuditStoreRead(e.to_string())
 }
@@ -56,9 +68,38 @@ impl SqliteStore {
     /// A file database uses WAL journal mode. `table` must match
     /// `^[A-Za-z_][A-Za-z0-9_]*$`.
     pub fn open(path: &str, table: &str) -> Result<Self, crate::Error> {
-        let inner = fasten_core::SqliteStore::open(path, table, true)
+        Self::open_with_wal(path, table, true)
+    }
+
+    /// [`SqliteStore::open`], with WAL journal mode on or off, as a DSN's
+    /// `?wal=false` asks.
+    pub fn open_with_wal(path: &str, table: &str, wal: bool) -> Result<Self, crate::Error> {
+        let inner = fasten_core::SqliteStore::open(path, table, wal)
             .map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))?;
         Ok(Self { inner })
+    }
+
+    /// The unshipped rows, ordered by `monotonic_seq`, read as the
+    /// [`crate::Row`] type holds them: a detail number `serde_json` cannot
+    /// hold exactly is changed, and a redacted detail reads as empty. A row
+    /// a `Row` cannot hold (a timestamp outside its range, a detail that is
+    /// not an object) fails the call with [`crate::Error::AuditStoreRead`].
+    /// Ship [`crate::AuditStore::list_unshipped_sealed`] instead, which
+    /// keeps each row as it was hashed. `limit == 0` returns all; `origin`
+    /// is as there.
+    pub fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
+        let rows = crate::AuditStore::list_unshipped_sealed(self, limit, origin)?;
+        rows.iter().map(crate::row_from_replicated).collect()
+    }
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix; see [`crate::AuditStore::ingest_replicated`].
+    pub fn ingest_replicated(
+        &self,
+        rows: &[ReplicatedRow],
+        local_node_id: Option<&str>,
+    ) -> Result<IngestResult, crate::Error> {
+        crate::AuditStore::ingest_replicated(self, rows, local_node_id)
     }
 
     /// The rows of `source_node_id`, ordered by `monotonic_seq`, for
@@ -98,18 +139,15 @@ impl SqliteStore {
     /// built. `pii_in_detail` is the row's flag, which a `ChainRow` does not
     /// hold.
     ///
-    /// The row must have a hash and a non-zero `monotonic_seq`. Its hash is
-    /// not verified here: run [`crate::verify_chain`] over the batch first.
-    /// Storing the same row again is a no-op; a different row under a stored
-    /// id, or another row at its node and seq, is
-    /// [`crate::Error::AuditStoreRejected`].
+    /// The row must have a hash, a non-zero `monotonic_seq`, and timestamps
+    /// the Python and Go stores can read back (RFC 3339, years 1 to 9999 in
+    /// UTC); timestamps are stored in the canonical form. Its hash is not verified here: run
+    /// [`crate::verify_chain`] over the batch first, or use
+    /// [`SqliteStore::ingest_replicated`]. Storing the same row again is a
+    /// no-op; a different row under a stored id, or another row at its node
+    /// and seq, is [`crate::Error::AuditStoreRejected`].
     pub fn insert_sealed(&self, row: &ChainRow, pii_in_detail: bool) -> Result<(), crate::Error> {
-        self.inner.insert_sealed(row, pii_in_detail).map_err(|e| match e {
-            e @ (fasten_core::Error::RowRejected(_) | fasten_core::Error::SeqClash(_)) => {
-                crate::Error::AuditStoreRejected(e.to_string())
-            }
-            e => write_err(e, &fasten_core::Row::default()),
-        })
+        self.inner.insert_sealed(row, pii_in_detail).map_err(replicated_err)
     }
 }
 
@@ -172,6 +210,61 @@ impl crate::AuditStore for SqliteStore {
 
     fn redact_rows(&self, ids: &[String]) -> Result<Vec<String>, crate::Error> {
         self.inner.redact_rows(ids).map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
+    }
+
+    fn insert_replicated(&self, row: &ReplicatedRow) -> Result<(), crate::Error> {
+        self.insert_sealed(&row.row, row.pii_in_detail)
+    }
+
+    fn list_unshipped_sealed(
+        &self,
+        limit: usize,
+        origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, crate::Error> {
+        let limit = u32::try_from(limit).unwrap_or(0);
+        self.inner.list_unshipped_sealed(limit, origin).map_err(read_err)
+    }
+
+    fn mark_shipped(&self, ids: &[String]) -> Result<(), crate::Error> {
+        self.inner.mark_shipped(ids).map_err(|e| crate::Error::AuditStoreInsert(e.to_string()))
+    }
+
+    fn ingest_replicated(
+        &self,
+        rows: &[ReplicatedRow],
+        local_node_id: Option<&str>,
+    ) -> Result<IngestResult, crate::Error> {
+        self.inner.ingest_replicated(rows, local_node_id).map_err(replicated_err)
+    }
+
+    fn purge(&self, before: chrono::DateTime<chrono::Utc>, respect_unshipped: bool) -> Result<u64, crate::Error> {
+        self.inner
+            .purge(&crate::canonical_ts(&before), respect_unshipped)
+            .map_err(|e| crate::Error::AuditStorePurge(e.to_string()))
+    }
+
+    fn query(&self, q: &crate::AuditQuery) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.read_rows(q).map_err(read_err)
+    }
+
+    fn count(&self, q: &crate::AuditQuery) -> Result<u64, crate::Error> {
+        self.inner.count_rows(q).map_err(read_err)
+    }
+
+    fn search(&self, s: &crate::AuditSearch) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.search_rows(s).map_err(read_err)
+    }
+
+    fn sources(&self, since: Option<&str>, until: Option<&str>) -> Result<Vec<crate::Source>, crate::Error> {
+        self.inner.sources(since, until).map_err(read_err)
+    }
+
+    fn chain_tail(&self, source_node_id: &str, limit: u32) -> Result<Vec<ChainRow>, crate::Error> {
+        self.inner.chain_tail(source_node_id, limit).map_err(read_err)
+    }
+
+    fn kind(&self) -> &str {
+        "SqliteStore"
     }
 }
 
