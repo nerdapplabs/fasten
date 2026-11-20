@@ -23,6 +23,88 @@ pub struct Filter {
     pub offset:         u32,
 }
 
+/// Filters for the reader's audit reads, which return rows newest first
+/// (timestamp, then `monotonic_seq`), as the Python and Go stores do.
+///
+/// A `None` or empty text filter is ignored, except `tenant_id`: an empty
+/// tenant matches only rows stored with an empty tenant, so a blank scope
+/// never widens a read to every tenant. `since` and `until` are canonical
+/// timestamps (spec §4.3), inclusive. `after_seq`, when above 0, keeps rows
+/// with a lower `monotonic_seq`: the cursor of the next page.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    pub request_id:     Option<String>,
+    pub code:           Option<String>,
+    pub domain:         Option<String>,
+    pub source_node_id: Option<String>,
+    pub tenant_id:      Option<String>,
+    pub actor:          Option<String>,
+    pub target:         Option<String>,
+    pub since:          Option<String>,
+    pub until:          Option<String>,
+    /// Maximum rows to return; 0 returns none.
+    pub limit:          u32,
+    pub offset:         u64,
+    pub after_seq:      u64,
+}
+
+impl AuditQuery {
+    /// The WHERE conditions and their values, `limit`, `offset` and
+    /// `after_seq` left out. `placeholder(n)` renders the n-th parameter.
+    /// `node` is the expression for `source_node_id`.
+    #[doc(hidden)]
+    pub fn conditions(&self, node: &str, ts: impl Fn(usize) -> String, placeholder: impl Fn(usize) -> String) -> (Vec<String>, Vec<String>) {
+        let mut conds = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+        let text = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
+        for (col, v) in [
+            ("request_id", text(&self.request_id)),
+            ("code", text(&self.code)),
+            ("domain", text(&self.domain)),
+            (node, text(&self.source_node_id)),
+            ("tenant_id", self.tenant_id.clone()),
+            ("actor", text(&self.actor)),
+            ("target", text(&self.target)),
+        ] {
+            if let Some(v) = v {
+                params.push(v);
+                conds.push(format!("{col} = {}", placeholder(params.len())));
+            }
+        }
+        for (v, op) in [(text(&self.since), ">="), (text(&self.until), "<=")] {
+            if let Some(v) = v {
+                params.push(v);
+                conds.push(format!("timestamp {op} {}", ts(params.len())));
+            }
+        }
+        (conds, params)
+    }
+}
+
+/// A free-text search of audit `detail` (spec §9): a case-insensitive
+/// substring match within `[since, until]`, newest first. `%`, `_` and `\`
+/// in `q` match literally. `tenant_id` scopes it to one tenant.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditSearch {
+    pub q:         String,
+    pub since:     String,
+    pub until:     Option<String>,
+    pub limit:     u32,
+    pub tenant_id: Option<String>,
+}
+
+/// Rows written per `(source_node_id, service_id, tenant_id)`, for the
+/// reader's `/topology`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    pub source_node_id: String,
+    pub service_id:     String,
+    pub tenant_id:      Option<String>,
+    pub rows:           u64,
+    pub first_seen:     Option<String>,
+    pub last_seen:      Option<String>,
+}
+
 /// Result of [`Store::list_redaction_candidates`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RedactionCandidates {
@@ -488,8 +570,13 @@ pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }
 
+pub mod stream;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+#[cfg(feature = "sqlite")]
+pub mod stream_sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
