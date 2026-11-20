@@ -522,7 +522,7 @@ test('the module functions use the default engine', async () => {
     }
 });
 
-// ── Rows sealed by Python and Go ───────────────────────────────────────────
+// ── Rows sealed by Python, Go and Rust ───────────────────────────────────────────
 
 const vector = (path) => parseJson(readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8'));
 
@@ -534,7 +534,7 @@ async function rawDetails(s) {
 }
 
 for (const [name, make] of BACKENDS) {
-    test(`rows Python and Go sealed are ingested by ${name} as they were sealed, and verify`, { skip: name === 'PostgresStore' && !DSN }, async () => {
+    test(`rows Python, Go and Rust sealed are ingested by ${name} as they were sealed, and verify`, { skip: name === 'PostgresStore' && !DSN }, async () => {
         for (const rows of [
             vector('spec/checkpoint-vectors.json').cases[0].rows,
             vector('spec/go-sealed-form2.json'),
