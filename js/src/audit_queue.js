@@ -32,6 +32,18 @@ export function rejectsRow(err) {
 }
 
 /**
+ * The type of an error: its name, or its class name when the name is pg's
+ * "error". The drainer records the error type, as the other SDKs do.
+ * @param {any} err
+ * @returns {string}
+ */
+export function errorType(err) {
+	const name = err?.name;
+	if (typeof name === "string" && name && name !== "error") return name;
+	return err?.constructor?.name || "Error";
+}
+
+/**
  * The store refused the row itself, so retrying cannot help: a different row
  * under an id already stored, or a row it cannot seal as given. The drainer
  * dead-letters it.
@@ -258,7 +270,7 @@ class AuditQueueDrainer {
 	}
 
 	_onDeadLetter(row, attempt, err) {
-		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		const msg = errorType(err);
 		this._deadLetteredTotal++;
 		this._retryCount = 0;
 		this._inBackoffUntilMs = 0;
@@ -275,7 +287,7 @@ class AuditQueueDrainer {
 	_onLostAtStop(row, err) {
 		this._lostTotal++;
 		this._sysLog("error", "audit_drain_lost_at_stop", {
-			error_type: err?.name ?? "Error",
+			error_type: errorType(err),
 			row_id: row?.id ?? null,
 		});
 	}
@@ -293,7 +305,7 @@ class AuditQueueDrainer {
 	}
 
 	_onFailure(err) {
-		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		const msg = errorType(err);
 		const first = this._retryCount === 0;
 		if (first) this._failureBurstStartedAt = Date.now();
 		this._retryCount++;

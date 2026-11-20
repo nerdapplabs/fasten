@@ -10,6 +10,7 @@
  * The reader returns raw audit rows, so it needs an explicit auth choice.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
+import { errorType } from "./audit_queue.js";
 import { canonicalTS } from "./canonical_ts.js";
 import { bigintReplacer, canonicalTimestamp, verifyChain } from "./chain.js";
 import { currentRequestID, defaultEngine } from "./index.js";
@@ -313,7 +314,7 @@ export function reader(opts = {}) {
 				return send(res, err.status, { detail: err.message });
 			}
 			// Type only: driver errors can quote SQL, row values and the host.
-			log("reader_query_failed", { path, error_type: err?.name ?? "Error" });
+			log("reader_query_failed", { path, error_type: errorType(err) });
 			return send(res, 500, { detail: "internal error" });
 		}
 	};
@@ -321,7 +322,7 @@ export function reader(opts = {}) {
 	// Doctor check failures go to the log by type; the response gets a fixed
 	// text.
 	function checkFailed(check, err) {
-		log("doctor_check_failed", { check, error_type: err?.name ?? "Error" });
+		log("doctor_check_failed", { check, error_type: errorType(err) });
 		return `${check} check failed; see the service log`;
 	}
 
@@ -734,7 +735,7 @@ export function reader(opts = {}) {
 					chainBlock = {
 						verified: null,
 						breaks: null,
-						error: err?.name ?? "Error",
+						error: errorType(err),
 						reason: checkFailed("chain", err),
 						last_verified_at: null,
 						chain_unavailable: chainUnavailable,

@@ -13,7 +13,6 @@
  * promises so the store has the same interface as PostgresStore.
  */
 import { closeSync, constants, openSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import {
 	AuditOutcomeUnknownError,
 	AuditRowRejectedError,
@@ -38,6 +37,7 @@ import {
 	skippedUnsealed,
 	verifiedPrefix,
 } from "../replication.js";
+import { likeEscape } from "../streams.js";
 import {
 	CHAIN_COLUMNS,
 	chainRow,
@@ -152,6 +152,11 @@ function _buildWhere(filters) {
 
 const _chainRow = (r) => chainRow("SqliteStore", r);
 
+// node:sqlite is loaded on first use: the engine imports this module to
+// open a store from FASTEN_AUDIT_DSN, and before Node 24.15 loading
+// node:sqlite prints an experimental warning.
+const _sqlite = () => process.getBuiltinModule("node:sqlite");
+
 export class SqliteStore {
 	/**
 	 * Open (and create, owner-only) the database at `path`. `":memory:"`
@@ -171,7 +176,7 @@ export class SqliteStore {
 		}
 		this._table = table;
 		_createOwnerOnly(path);
-		this._db = new DatabaseSync(path, { timeout: busyTimeoutMs });
+		this._db = new (_sqlite().DatabaseSync)(path, { timeout: busyTimeoutMs });
 		if (wal && path !== ":memory:") this._db.exec("PRAGMA journal_mode=WAL");
 		this._ready = false;
 		this._stmts = new Map();
@@ -656,13 +661,22 @@ export class SqliteStore {
 	 *   requestId?: string, code?: string, domain?: string,
 	 *   sourceNodeId?: string, tenantId?: string, actor?: string, target?: string,
 	 *   since?: string, until?: string,
-	 *   limit?: number, offset?: number
+	 *   limit?: number, offset?: number, afterSeq?: number
 	 * }} [opts]
+	 * `afterSeq` keeps rows with a lower `monotonic_seq`, for paging on from
+	 * the last row of a page.
 	 * @returns {Promise<Record<string,unknown>[]>}
 	 */
-	async query({ limit = 100, offset = 0, ...filters } = {}) {
+	async query({ limit = 100, offset = 0, afterSeq = 0, ...filters } = {}) {
 		this._ensureReady();
-		const { where, params } = _buildWhere(filters);
+		const { where: base, params } = _buildWhere(filters);
+		let where = base;
+		if (afterSeq > 0) {
+			params.push(afterSeq);
+			where = where
+				? `${where} AND monotonic_seq < ?`
+				: "WHERE monotonic_seq < ?";
+		}
 		return this._all(
 			`SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ? OFFSET ?`,
 			...params,
@@ -681,13 +695,92 @@ export class SqliteStore {
 	 * }} [opts]
 	 * @returns {Promise<number>}
 	 */
-	async count({ limit: _limit, offset: _offset, ...filters } = {}) {
+	async count({
+		limit: _limit,
+		offset: _offset,
+		afterSeq: _afterSeq,
+		...filters
+	} = {}) {
 		this._ensureReady();
 		const { where, params } = _buildWhere(filters);
 		return Number(
 			this._get(`SELECT COUNT(*) AS n FROM ${this._table} ${where}`, ...params)
 				.n,
 		);
+	}
+
+	/**
+	 * Case-insensitive substring search of the detail JSON within
+	 * [since, until], newest first, in the shape `query()` returns. `%`, `_`
+	 * and `\` in q match literally. `tenantId` limits it to one tenant. As in
+	 * the Python and Go SQLite stores, q is lowercased in full and the
+	 * detail text by SQLite's lower(), which folds only ASCII letters.
+	 *
+	 * @param {{ q: string, since: string, until?: string | null, limit?: number, tenantId?: string | null }} opts
+	 * @returns {Promise<Record<string,unknown>[]>}
+	 */
+	async search({ q, since, until = null, limit = 50, tenantId = null }) {
+		this._ensureReady();
+		const conds = [
+			"COALESCE(timestamp, '') >= ?",
+			"lower(detail) LIKE ? ESCAPE '\\'",
+		];
+		const params = [since, `%${likeEscape(q.toLowerCase())}%`];
+		if (until) {
+			conds.push("COALESCE(timestamp, '') <= ?");
+			params.push(until);
+		}
+		if (tenantId != null) {
+			conds.push("tenant_id = ?");
+			params.push(tenantId);
+		}
+		return this._all(
+			`SELECT * FROM ${this._table} WHERE ${conds.join(" AND ")} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?`,
+			...params,
+			limit,
+		).map(mapRow);
+	}
+
+	/**
+	 * Row count and first and last timestamp per (source_node_id,
+	 * service_id, tenant_id), busiest first.
+	 *
+	 * @param {{ since?: string, until?: string }} [opts]
+	 * @returns {Promise<{ source_node_id: string, service_id: string, tenant_id: string | null, rows: number, first_seen: string, last_seen: string }[]>}
+	 */
+	async sources({ since, until } = {}) {
+		this._ensureReady();
+		const { where, params } = _buildWhere({ since, until });
+		return this._all(
+			`SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen FROM ${this._table} ${where} GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC`,
+			...params,
+		).map((r) => ({
+			source_node_id: /** @type {string} */ (r.source_node_id),
+			service_id: /** @type {string} */ (r.service_id),
+			tenant_id: /** @type {string | null} */ (r.tenant_id ?? null),
+			rows: Number(r.n),
+			first_seen: /** @type {string} */ (r.first_seen),
+			last_seen: /** @type {string} */ (r.last_seen),
+		}));
+	}
+
+	/**
+	 * The node's newest `limit` rows by `monotonic_seq`, oldest first, read
+	 * as `chainRows` reads them, for verifyChain.
+	 *
+	 * @param {string} sourceNodeId
+	 * @param {number} limit
+	 * @returns {Promise<Record<string,unknown>[]>}
+	 */
+	async chainTail(sourceNodeId, limit) {
+		this._ensureReady();
+		return this._all(
+			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = ? ORDER BY monotonic_seq DESC LIMIT ?`,
+			sourceNodeId,
+			limit,
+		)
+			.reverse()
+			.map(_chainRow);
 	}
 
 	/**

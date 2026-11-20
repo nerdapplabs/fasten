@@ -35,6 +35,7 @@ import {
 	coreRegisterCodes,
 	coreRegistryClear,
 } from "./core.js";
+import { auditStoreFromDsn, streamStoreFromDsn } from "./store/dsn.js";
 import { isSentinel, mintSentinel, Stream } from "./streams.js";
 
 // --- Correlation context --------------------------------------------------
@@ -316,6 +317,7 @@ import {
 	AuditQueueDrainer,
 	AuditRowRejectedError,
 	AuditStoreError,
+	errorType,
 } from "./audit_queue.js";
 
 export {
@@ -447,6 +449,9 @@ export class Engine {
 	_retentionTimer = null;
 	_retentionFirst = null;
 	#unsealedReported = false;
+	// Stores opened from FASTEN_*_DSN, by variable and DSN, so a re-init
+	// with the same DSN keeps the store and its connections.
+	#envStores = new Map();
 
 	init(opts = {}) {
 		const envExtra = (process.env.FASTEN_REDACT_KEYS ?? "")
@@ -467,9 +472,20 @@ export class Engine {
 			);
 		}
 
+		// A store passed in wins over one from the environment, as in Python.
+		const auditStore =
+			opts.auditStore ?? this.#fromEnv("FASTEN_AUDIT_DSN", auditStoreFromDsn);
 		const streamStores = {
-			api: opts.apiStore ?? null,
-			sys: opts.syslogStore ?? null,
+			api:
+				opts.apiStore ??
+				this.#fromEnv("FASTEN_API_DSN", (d) =>
+					streamStoreFromDsn(d, "api_log"),
+				),
+			sys:
+				opts.syslogStore ??
+				this.#fromEnv("FASTEN_SYSLOG_DSN", (d) =>
+					streamStoreFromDsn(d, "syslog"),
+				),
 		};
 		for (const [name, s] of Object.entries(streamStores)) {
 			if (s && typeof s.insert !== "function") {
@@ -503,7 +519,7 @@ export class Engine {
 			nodeId: opts.nodeId ?? process.env.FASTEN_NODE_ID ?? "",
 			// An empty FASTEN_TENANT_ID is no tenant, as in the other SDKs.
 			tenantId: opts.tenantId ?? (process.env.FASTEN_TENANT_ID || null),
-			auditStore: opts.auditStore ?? null,
+			auditStore,
 			apiStore: streamStores.api,
 			syslogStore: streamStores.sys,
 			searchEnabled:
@@ -580,6 +596,20 @@ export class Engine {
 		for (const r of streamRetention) this._startStreamRetention(r);
 	}
 
+	// The store for the DSN in environment variable `name`, or null when it
+	// is unset or empty.
+	#fromEnv(name, open) {
+		const dsn = process.env[name];
+		if (!dsn) return null;
+		const key = `${name}\n${dsn}`;
+		let store = this.#envStores.get(key);
+		if (!store) {
+			store = open(dsn);
+			this.#envStores.set(key, store);
+		}
+		return store;
+	}
+
 	emit(input) {
 		const cfg = this.#config;
 		const row = this._buildRow(input);
@@ -592,7 +622,7 @@ export class Engine {
 					const failed = (err) => {
 						this.#auditWriteSwallowed = true;
 						this._drainerSysLog("error", "audit_sync_fallback_failed", {
-							error: `${err?.name ?? "Error"}: ${err?.message ?? err}`,
+							error_type: errorType(err),
 							row_id: row?.id ?? null,
 						});
 					};
@@ -966,7 +996,7 @@ export class Engine {
 				// Type only: driver messages can carry row values.
 				this._drainerSysLog("error", "retention_purge_failed", {
 					stream: "audit/pii-redaction",
-					error_type: err?.cause?.name ?? err?.name ?? "Error",
+					error_type: errorType(err?.cause ?? err),
 				});
 			} finally {
 				this._redactionPass = null;
@@ -1005,7 +1035,7 @@ export class Engine {
 				// Type only: driver messages can carry row values.
 				this._drainerSysLog("error", "retention_purge_failed", {
 					stream: name,
-					error_type: err?.name ?? "Error",
+					error_type: errorType(err),
 				});
 			} finally {
 				running = false;

@@ -385,6 +385,53 @@ test('sync fallback logs a failed async insert', async () => {
         `got ${JSON.stringify(captured.map(c => c.event))}`);
 });
 
+// An error shaped like pg's DatabaseError, whose name is "error" and whose
+// message can carry a row value.
+class DatabaseError extends Error {
+    constructor(message, code) {
+        super(message);
+        this.name = 'error';
+        this.code = code;
+        this.severity = 'ERROR';
+    }
+}
+
+test('the drainer records the error type, as the other SDKs do', async () => {
+    const secret = 'Key (id)=(alice@example.com) already exists';
+    let failFor = 6;
+    const store = {
+        insert() {
+            if (failFor-- > 0) throw new DatabaseError(secret, '57P01');
+            throw new DatabaseError(secret, '23505');
+        },
+    };
+    const captured = await captureSys(async () => {
+        _initQueue(store, { queueRetryInitialMs: 1, queueRetryMaxMs: 1, queueRetryJitter: false });
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        await flush(2000);
+    });
+    const by = (e) => captured.find((r) => r.event === e);
+    assert.equal(by('audit_drain_failed').error, 'DatabaseError');
+    assert.equal(by('audit_drain_degraded').last_error, 'DatabaseError');
+    assert.equal(by('audit_drain_dead_letter').last_error, 'DatabaseError');
+    assert.equal(queueStats().last_error, 'DatabaseError');
+    assert.ok(!JSON.stringify(captured).includes('alice'), JSON.stringify(captured));
+});
+
+test('sync fallback records the error type, as the other SDKs do', async () => {
+    const captured = await captureSys(async () => {
+        _initQueue(new AsyncBrokenStore('value (id)=(alice@example.com)'));
+        await uninstallDrainer();
+        emit({ code: 'USER_CREATED', target: 'u-1' });
+        await new Promise(r => setTimeout(r, 20));
+    });
+    const ev = captured.find((r) => r.event === 'audit_sync_fallback_failed');
+    assert.equal(ev.error_type, 'Error');
+    assert.equal(typeof ev.row_id, 'string');
+    assert.equal(ev.error, undefined);
+    assert.ok(!JSON.stringify(captured).includes('alice'));
+});
+
 test('stop writes the rows still queued', async () => {
     const store = new SlowStore(5);
     _initQueue(store);

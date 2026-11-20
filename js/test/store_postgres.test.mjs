@@ -15,8 +15,9 @@ import { randomUUID } from 'node:crypto';
 import { PostgresStore } from '../src/store/postgres.js';
 import {
     AuditOutcomeUnknownError, AuditRowRejectedError, AuditStoreError, ChainError, Engine,
-    register as registerCodes, takeCheckpoints, verifyChain,
+    checkpointsSince, register as registerCodes, takeCheckpoints, verifyChain,
 } from '../src/index.js';
+import { PostgresStreamStore } from '../src/store/stream_postgres.js';
 import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
 const DSN = process.env.FASTEN_TEST_POSTGRES_DSN;
@@ -222,8 +223,11 @@ test('pii_in_detail round-trips as boolean', { skip }, async () => {
 });
 
 // 10. schema-qualified table
-test('schema-qualified table (fasten.<TABLE>)', { skip }, async () => {
-    const schemaTable = `fasten.${TABLE}_sq`;
+// A schema of its own: with the user "fasten", a schema "fasten" is first on
+// the default search_path, so other tests' tables would land in it.
+test('schema-qualified table (<schema>.<TABLE>)', { skip }, async () => {
+    const schema = `s_${TABLE}`;
+    const schemaTable = `${schema}.${TABLE}_sq`;
     const schemaStore = new PostgresStore(DSN, { table: schemaTable });
 
     try {
@@ -241,7 +245,7 @@ test('schema-qualified table (fasten.<TABLE>)', { skip }, async () => {
         const { Pool } = pg;
         const cleanup = new Pool({ connectionString: DSN });
         await cleanup.query(`DROP TABLE IF EXISTS ${schemaTable}`);
-        await cleanup.query('DROP SCHEMA IF EXISTS fasten CASCADE');
+        await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
         await cleanup.end();
         await schemaStore.close();
     }
@@ -892,7 +896,7 @@ test('a row the store cannot seal is dead-lettered at once, and the next row is 
         const dead = err.filter((l) => l.event === 'audit_drain_dead_letter');
         assert.equal(dead.length, 1);
         assert.equal(dead[0].attempt_count, 1);
-        assert.match(dead[0].last_error, /^AuditRowRejectedError: /);
+        assert.equal(dead[0].last_error, 'AuditRowRejectedError');
         assert.equal(err.filter((l) => l.event === 'audit_drain_failed').length, 0);
         const rows = await s.chainRows('n-dead');
         assert.deepEqual(rows.map((r) => [r.target, r.monotonic_seq]), [['next', 1]]);
@@ -1199,3 +1203,117 @@ test('query() rows are snake_case like Row, and verifyChain reads them', { skip 
         assert.deepEqual((await s.listUnshipped(10)).map((r) => r.monotonic_seq), [1, 2]);
     });
 });
+
+// ── Age purge and the chain (spec §2.3, §9) ───────────────────────────────
+
+test('after a purge the chain still verifies, and so do the checkpoints taken since', { skip }, async () => {
+    await _withTable(async ({ mk }) => {
+        const s = mk();
+        for (const days of [40, 39, 38, 10, 5]) {
+            await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-age', timestamp: _daysAgo(days) }));
+        }
+        await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-gone', timestamp: _daysAgo(50) }));
+        const before = await takeCheckpoints(s);
+        await s.markShipped((await s.query({ limit: 100 })).map((r) => r.id));
+        assert.equal(await s.purge({ before: _daysAgo(30) }), 4);
+        const rows = await s.allChainRows();
+        assert.deepEqual(rows.map((r) => [r.source_node_id, r.monotonic_seq]), [['n-age', 4], ['n-age', 5]]);
+        const res = verifyChain(rows);
+        assert.ok(res.ok, res.reason);
+        assert.equal(verifyChain(rows, { checkpoints: before }).ok, false);
+        const purgedAt = new Date().toISOString().replace(/Z$/, '000Z');
+        await new Promise((r) => setTimeout(r, 2));
+        const since = checkpointsSince([...before, ...(await takeCheckpoints(s))], purgedAt);
+        assert.deepEqual(since.map((c) => c.source_node_id), ['n-age']);
+        const res2 = verifyChain(rows, { checkpoints: since });
+        assert.ok(res2.ok, res2.reason);
+        const next = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-age' }));
+        assert.equal(next.monotonic_seq, 6);
+        assert.ok(verifyChain(await s.chainRows('n-age')).ok);
+    });
+});
+
+// ── Dropped connections ───────────────────────────────────────────────────
+
+// A DSN whose connections carry application_name `app`, so a test can end
+// its own store's connections and no other test's.
+const _appDsn = (app) => `${DSN}${DSN.includes('?') ? '&' : '?'}application_name=${app}`;
+
+// End the server connections of application `app`.
+async function _terminate(admin, app) {
+    const r = await admin.query(
+        'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1', [app]);
+    return r.rowCount;
+}
+
+test('stores recover after the server drops their connections', { skip }, async () => {
+    await _withTable(async ({ admin, t }) => {
+        const app = `fasten_drop_${randomUUID().slice(0, 8)}`;
+        const s = new PostgresStore(_appDsn(app), { table: t });
+        const api = new PostgresStreamStore(_appDsn(app), { table: `${t}_api` });
+        try {
+            for (const wait of [200, 0]) {
+                await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-drop' }));
+                await api.insert({ method: 'GET', path: '/a', request_id: 'r' });
+                // Idle connections in both pools now.
+                await s.query({ limit: 1 });
+                assert.ok(await _terminate(admin, app) >= 2);
+                // With a wait pg has seen the idle clients close; without
+                // one the next query can still pick a dead client.
+                if (wait) await new Promise((r) => setTimeout(r, wait));
+                await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-drop' }));
+                await api.insert({ method: 'GET', path: '/b', request_id: 'r' });
+                await _terminate(admin, app);
+                assert.equal(typeof (await s.count()), 'number');
+                await _terminate(admin, app);
+                assert.equal(await api.countMatching({ requestId: 'r' }) > 0, true);
+            }
+            const rows = await s.chainRows('n-drop');
+            assert.deepEqual(rows.map((r) => r.monotonic_seq), [1, 2, 3, 4]);
+            assert.ok(verifyChain(rows).ok);
+        } finally {
+            await s.close();
+            await api.close();
+            await admin.query(`DROP TABLE IF EXISTS ${t}_api`);
+        }
+    });
+});
+
+for (const strategy of ['queue', 'raise']) {
+    test(`emit in ${strategy} mode keeps the chain whole across dropped connections`, { skip }, async () => {
+        await _withTable(async ({ admin, t }) => {
+            const app = `fasten_drop_${randomUUID().slice(0, 8)}`;
+            const s = new PostgresStore(_appDsn(app), { table: t });
+            const e = new Engine();
+            const node = `n-drop-${strategy}`;
+            const failed = [];
+            await _captured(async () => {
+                e.init({
+                    serviceId: 'svc', nodeId: node, auditStore: s, auditStoreFailureStrategy: strategy,
+                    queueRetryInitialMs: 5, queueRetryJitter: false,
+                });
+                for (let i = 0; i < 6; i++) {
+                    if (i % 2 === 1) await _terminate(admin, app);
+                    try {
+                        await e.emit({ code: 'T124_EVENT', target: `x-${i}` });
+                    } catch (err) {
+                        // Raise mode may report the call that met the dropped
+                        // connection; the next one must work.
+                        assert.ok(err instanceof AuditStoreError);
+                        failed.push(i);
+                    }
+                }
+                assert.equal(await e.flush(10_000), true);
+                await e.resetForTests();
+            });
+            if (strategy === 'queue') assert.deepEqual(failed, []);
+            for (const i of failed) assert.ok(!failed.includes(i + 1));
+            const rows = await s.chainRows(node);
+            assert.equal(rows.length, 6 - failed.length);
+            assert.deepEqual(rows.map((r) => r.monotonic_seq), rows.map((_, i) => i + 1));
+            const res = verifyChain(rows);
+            assert.ok(res.ok, res.reason);
+            await s.close();
+        });
+    });
+}

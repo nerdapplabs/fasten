@@ -19,6 +19,7 @@ import {
 	SAFE_STREAM_TABLE,
 	statusFilter,
 } from "../streams.js";
+import { checkout, release, retryLost, watchPool } from "./pg_conn.js";
 
 /**
  * @param {string} t full table name
@@ -121,9 +122,16 @@ export class PostgresStreamStore {
 		if (!this._pool) {
 			const mod = await import("pg");
 			const pg = mod.default ?? mod;
-			this._pool = new pg.Pool({ connectionString: this._connectionString });
+			this._pool = watchPool(
+				new pg.Pool({ connectionString: this._connectionString }),
+			);
 		}
-		const client = await this._pool.connect();
+		await retryLost(this._pool, () => this._bootstrap());
+	}
+
+	async _bootstrap() {
+		const client = await checkout(this._pool);
+		let broken;
 		try {
 			await client.query("BEGIN");
 			// Stores starting together on a new table race on CREATE TABLE.
@@ -137,10 +145,14 @@ export class PostgresStreamStore {
 			for (const sql of _ddl(this._table, this._idx)) await client.query(sql);
 			await client.query("COMMIT");
 		} catch (err) {
-			await client.query("ROLLBACK").catch(() => {});
+			// A client whose ROLLBACK failed is released with the error, so
+			// the pool drops it.
+			await client.query("ROLLBACK").catch((e) => {
+				broken = e;
+			});
 			throw err;
 		} finally {
-			client.release();
+			release(client, broken);
 		}
 	}
 
@@ -165,7 +177,7 @@ export class PostgresStreamStore {
 		const values = liftedValues(row);
 		const run = async () => {
 			await this._ensureReady();
-			await this._pool.query(
+			await this._query(
 				`INSERT INTO ${this._table} (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 				[...values, payload],
 			);
@@ -173,6 +185,12 @@ export class PostgresStreamStore {
 		const p = this._tail.then(run, run);
 		this._tail = p.catch(() => {});
 		return p;
+	}
+
+	// pool.query, run again on a lost connection, as the Python store
+	// does.
+	async _query(sql, params) {
+		return retryLost(this._pool, () => this._pool.query(sql, params));
 	}
 
 	/** Count a failed insert that was dropped; any makes the store degraded. */
@@ -197,7 +215,7 @@ export class PostgresStreamStore {
 	async query({ limit = 100, ...filters } = {}) {
 		const { where, params } = _where(filters);
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT payload FROM ${this._table}${where} ORDER BY seq DESC LIMIT $${params.length + 1}`,
 			[...params, limit],
 		);
@@ -212,7 +230,7 @@ export class PostgresStreamStore {
 	async countMatching(filters = {}) {
 		const { where, params } = _where(filters);
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT COUNT(*) AS n FROM ${this._table}${where}`,
 			params,
 		);
@@ -243,7 +261,7 @@ export class PostgresStreamStore {
 		}
 		params.push(limit);
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT payload FROM ${this._table} WHERE ${conds.join(" AND ")} ORDER BY seq DESC LIMIT $${params.length}`,
 			params,
 		);
@@ -259,7 +277,7 @@ export class PostgresStreamStore {
 	async purge({ before }) {
 		const cutoff = before instanceof Date ? canonicalTS(before) : before;
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`DELETE FROM ${this._table} WHERE timestamp < $1`,
 			[cutoff],
 		);

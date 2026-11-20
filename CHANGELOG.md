@@ -27,6 +27,51 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `PostgresStore` implements it.
 - A failed write of the first stdout line is logged as
   `audit_stdout_failed`, not thrown.
+- The drainer's `last_error`, `audit_drain_failed`, `audit_drain_degraded`
+  and `audit_drain_dead_letter` record the error type only, as the other
+  SDKs do. `audit_sync_fallback_failed` reports it as `error_type` (was
+  `error`).
+- `InitOptions.apiStore` is typed as a stream store (`StreamStore`); it was
+  typed as an audit store but was not used.
+
+### Added: JS SQLite store, replication, reader and stored logs
+
+- `SqliteStore` (`fasten-sdk/store/sqlite`), on Node's built-in
+  `node:sqlite` with no new dependency, seals rows into the per-node hash
+  chain as `PostgresStore` does, and shares one file with the Python, Go and
+  Rust SQLite stores, adding the columns their tables lack. Its calls are
+  synchronous and block the event loop while they run. `node:sqlite` is a
+  release candidate in Node 24.
+- Replication on both stores: `ingestReplicated(rows, { localNodeId })`
+  verifies a replicated batch, checks it against the stored rows, stores the
+  verified prefix as it was sealed, and returns `{ inserted,
+  rejectedFromSeq, reason }` (Python's and Go's `IngestResult`).
+  `insertReplicated(row)` stores one sealed row.
+  `listUnshipped(limit, { serviceId, sourceNodeId, exact })` can list only
+  the rows an identity originated, with detail numbers exact for shipping.
+  The engine adds `listUnshipped()`, `markShipped(ids)` and
+  `ingestReplicated(rows)`.
+- HTTP reader (`fasten-sdk/reader`): `reader({ auth, ... })` serves
+  `/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api` and
+  `/topology` with the Python and Go readers' parameters, responses and
+  limits, over either store. `auth` is required (`{ bearer }`,
+  `requireBearer()`, `{ verify }` or `"none"`), and `tenantScope` /
+  `enforceTenantIsolation` scope every route.
+- Stored sys and api logs: `PostgresStreamStore` and `SqliteStreamStore` on
+  the stream tables the other SDKs use, `init({ apiStore, syslogStore,
+  persistStreams, searchEnabled, retentionApi, retentionSyslog })`,
+  `apiLogger()`, `writeApi`, `pushApi`, `pushSyslog`, `mintSentinel` and
+  `isSentinel`.
+- Both audit stores gain `search`, `sources`, `chainTail` and
+  `query({ afterSeq })`. On SQLite, search folds ASCII letters only, as the
+  Python and Go SQLite stores do.
+- `init()` opens the audit, api and sys stores from `FASTEN_AUDIT_DSN`,
+  `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` when none is passed, with
+  Python's DSN forms (`postgres://`, `postgresql://`, `sqlite:///rel.db`,
+  `sqlite:////abs.db`, a bare path, `?table=`, `?wal=false`).
+- `PostgresStore` and `PostgresStreamStore` recover when the database drops
+  their connections: a dead idle connection no longer ends the process, and
+  a call that meets one runs again on a new connection.
 
 ### Added: the JS SDK seals and verifies rows
 

@@ -36,6 +36,7 @@ import {
 	skippedUnsealed,
 	verifiedPrefix,
 } from "../replication.js";
+import { checkout, release, retryLost, watchPool } from "./pg_conn.js";
 import {
 	CHAIN_COLUMNS,
 	chainRow,
@@ -65,7 +66,7 @@ async function _getPool(connectionString) {
 					: base.getTypeParser(oid, format),
 		};
 	}
-	return new _Pool({ connectionString, types: _types });
+	return watchPool(new _Pool({ connectionString, types: _types }));
 }
 
 // "2026-08-21 10:00:00.123456+05:30" → "2026-08-21T04:30:00.123456Z".
@@ -143,6 +144,10 @@ function _ddlStatements(table, idx) {
 		`CREATE INDEX IF NOT EXISTS idx_${idx}_node_seq  ON ${table}(source_node_id, monotonic_seq)`,
 	];
 }
+
+// After a failed COMMIT the row may be stored, so it is read back rather
+// than written again.
+const _committing = (err) => err instanceof _CommitError;
 
 const _NODE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
@@ -250,27 +255,25 @@ export class PostgresStore {
 	 */
 	async init() {
 		if (!this._pool) this._pool = await _getPool(this._connectionString);
-		const client = await this._pool.connect();
 		try {
-			await client.query("BEGIN");
-			// Stores starting together on a new table race on CREATE TABLE.
-			// Same key as the Python store's bootstrap lock.
-			await client.query(
-				"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-				[`fasten.bootstrap.${this._table}`],
+			await retryLost(this._pool, () =>
+				this._transaction(async (client) => {
+					// Stores starting together on a new table race on CREATE
+					// TABLE. Same key as the Python store's bootstrap lock.
+					await client.query(
+						"SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+						[`fasten.bootstrap.${this._table}`],
+					);
+					if (this._schema) {
+						await client.query(`CREATE SCHEMA IF NOT EXISTS ${this._schema}`);
+					}
+					for (const sql of _ddlStatements(this._table, this._idx)) {
+						await client.query(sql);
+					}
+				}),
 			);
-			if (this._schema) {
-				await client.query(`CREATE SCHEMA IF NOT EXISTS ${this._schema}`);
-			}
-			for (const sql of _ddlStatements(this._table, this._idx)) {
-				await client.query(sql);
-			}
-			await client.query("COMMIT");
 		} catch (err) {
-			await client.query("ROLLBACK");
-			throw err;
-		} finally {
-			client.release();
+			throw err instanceof _CommitError ? err.cause : err;
 		}
 	}
 
@@ -349,52 +352,62 @@ export class PostgresStore {
 			return held;
 		};
 		try {
-			return await this._transaction(async (client) => {
-				// A row with its own seq takes the lock too, or it could take
-				// the seq a seq-0 insert has just picked.
-				await client.query(_NODE_LOCK, [r.source_node_id]);
-				// A retry of a row that already landed must not take a new seq.
-				const held = await this._held(client, r.id);
-				if (held) return asHeld(held);
-				let stored = r;
-				let text;
-				if (r.monotonic_seq === 0) {
-					// The seq counts every row on the node, sealed or not;
-					// prev_hash comes from the node's last sealed row.
-					const next = await client.query(
-						`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
-						[r.source_node_id],
-					);
-					const tip = await client.query(
-						`SELECT hash FROM ${this._table} WHERE source_node_id = $1 AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1`,
-						[r.source_node_id],
-					);
-					try {
-						stored = seal(tip.rows[0]?.hash ?? GENESIS, {
-							...r,
-							monotonic_seq: Number(next.rows[0].seq),
-							detail_salt: null,
-						});
-					} catch (err) {
-						throw new AuditSealError(err);
-					}
-					text = canonicalJSON(stored.detail);
-				} else {
-					await this._checkSeqFree(client, r);
-					text = detailText(r.detail);
-				}
-				if ((await this._insertRow(client, stored, text)) === 0) {
-					// The id was stored under another node's lock meanwhile.
-					const now = await this._held(client, r.id);
-					if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
-					return asHeld(now);
-				}
-				return stored;
-			});
+			// A lost connection rolled the transaction back, so it runs
+			// again; a COMMIT that failed is _afterFailedCommit's.
+			return await retryLost(
+				this._pool,
+				() => this._insertTx(r, asHeld),
+				_committing,
+			);
 		} catch (err) {
 			if (!(err instanceof _CommitError)) throw err;
 			return this._afterFailedCommit(r.id, err.cause, asHeld);
 		}
+	}
+
+	async _insertTx(r, asHeld) {
+		return this._transaction(async (client) => {
+			// A row with its own seq takes the lock too, or it could take
+			// the seq a seq-0 insert has just picked.
+			await client.query(_NODE_LOCK, [r.source_node_id]);
+			// A retry of a row that already landed must not take a new seq.
+			const held = await this._held(client, r.id);
+			if (held) return asHeld(held);
+			let stored = r;
+			let text;
+			if (r.monotonic_seq === 0) {
+				// The seq counts every row on the node, sealed or not;
+				// prev_hash comes from the node's last sealed row.
+				const next = await client.query(
+					`SELECT COALESCE(MAX(monotonic_seq), 0) + 1 AS seq FROM ${this._table} WHERE source_node_id = $1`,
+					[r.source_node_id],
+				);
+				const tip = await client.query(
+					`SELECT hash FROM ${this._table} WHERE source_node_id = $1 AND hash <> '' ORDER BY monotonic_seq DESC LIMIT 1`,
+					[r.source_node_id],
+				);
+				try {
+					stored = seal(tip.rows[0]?.hash ?? GENESIS, {
+						...r,
+						monotonic_seq: Number(next.rows[0].seq),
+						detail_salt: null,
+					});
+				} catch (err) {
+					throw new AuditSealError(err);
+				}
+				text = canonicalJSON(stored.detail);
+			} else {
+				await this._checkSeqFree(client, r);
+				text = detailText(r.detail);
+			}
+			if ((await this._insertRow(client, stored, text)) === 0) {
+				// The id was stored under another node's lock meanwhile.
+				const now = await this._held(client, r.id);
+				if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
+				return asHeld(now);
+			}
+			return stored;
+		});
 	}
 
 	/**
@@ -436,18 +449,24 @@ export class PostgresStore {
 			if (held.hash !== r.hash) throw differs(r.id);
 		};
 		try {
-			await this._transaction(async (client) => {
-				await client.query(_NODE_LOCK, [r.source_node_id]);
-				const before = await this._held(client, r.id);
-				if (before) return check(before);
-				await this._checkSeqFree(client, r);
-				const detail = text ?? detailText(r.detail);
-				if ((await this._insertRow(client, r, detail)) === 0) {
-					const now = await this._held(client, r.id);
-					if (!now) throw new Error(`row ${r.id}: not inserted and not stored`);
-					check(now);
-				}
-			});
+			await retryLost(
+				this._pool,
+				() =>
+					this._transaction(async (client) => {
+						await client.query(_NODE_LOCK, [r.source_node_id]);
+						const before = await this._held(client, r.id);
+						if (before) return check(before);
+						await this._checkSeqFree(client, r);
+						const detail = text ?? detailText(r.detail);
+						if ((await this._insertRow(client, r, detail)) === 0) {
+							const now = await this._held(client, r.id);
+							if (!now)
+								throw new Error(`row ${r.id}: not inserted and not stored`);
+							check(now);
+						}
+					}),
+				_committing,
+			);
 		} catch (err) {
 			if (!(err instanceof _CommitError)) throw err;
 			await this._afterFailedCommit(r.id, err.cause, check);
@@ -522,46 +541,51 @@ export class PostgresStore {
 		// again.
 		for (let attempt = 0; attempt < 3; attempt++) {
 			try {
-				return await this._transaction(async (client) => {
-					for (const node of nodes) await client.query(_NODE_LOCK, [node]);
-					const one = async (sql, params) =>
-						(await client.query(sql, params)).rows[0] ?? null;
-					const look = {
-						byId: async (id) =>
-							(await one(`SELECT hash FROM ${t} WHERE id = $1`, [id]))?.hash ??
-							null,
-						atSeq: (node, seq) =>
-							one(
-								`SELECT id, hash, prev_hash FROM ${t} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1`,
-								[node, seq],
-							),
-						sealedBelow: async (node, seq) =>
-							(await one(
-								`SELECT 1 FROM ${t} WHERE source_node_id = $1 AND monotonic_seq < $2 AND hash <> '' LIMIT 1`,
-								[node, seq],
-							)) !== null,
-					};
-					const v = cutAtConflict(
-						verified,
-						await conflictAsync(verified.prefix, unsealed, look),
-					);
-					for (const row of v.prefix) {
-						const n = await this._insertRow(
-							client,
-							row,
-							detailText(row.detail),
-						);
-						// Skipped: fine for a re-delivery, not for any other row.
-						if (n === 0 && (await look.byId(row.id)) !== row.hash) {
-							throw new StoredMeanwhile(row.id);
-						}
-					}
-					return {
-						inserted: v.prefix.length,
-						rejectedFromSeq: v.rejectedFromSeq,
-						reason: v.reason || null,
-					};
-				});
+				return await retryLost(
+					this._pool,
+					() =>
+						this._transaction(async (client) => {
+							for (const node of nodes) await client.query(_NODE_LOCK, [node]);
+							const one = async (sql, params) =>
+								(await client.query(sql, params)).rows[0] ?? null;
+							const look = {
+								byId: async (id) =>
+									(await one(`SELECT hash FROM ${t} WHERE id = $1`, [id]))
+										?.hash ?? null,
+								atSeq: (node, seq) =>
+									one(
+										`SELECT id, hash, prev_hash FROM ${t} WHERE source_node_id = $1 AND monotonic_seq = $2 LIMIT 1`,
+										[node, seq],
+									),
+								sealedBelow: async (node, seq) =>
+									(await one(
+										`SELECT 1 FROM ${t} WHERE source_node_id = $1 AND monotonic_seq < $2 AND hash <> '' LIMIT 1`,
+										[node, seq],
+									)) !== null,
+							};
+							const v = cutAtConflict(
+								verified,
+								await conflictAsync(verified.prefix, unsealed, look),
+							);
+							for (const row of v.prefix) {
+								const n = await this._insertRow(
+									client,
+									row,
+									detailText(row.detail),
+								);
+								// Skipped: fine for a re-delivery, not for any other row.
+								if (n === 0 && (await look.byId(row.id)) !== row.hash) {
+									throw new StoredMeanwhile(row.id);
+								}
+							}
+							return {
+								inserted: v.prefix.length,
+								rejectedFromSeq: v.rejectedFromSeq,
+								reason: v.reason || null,
+							};
+						}),
+					_committing,
+				);
 			} catch (err) {
 				if (err instanceof StoredMeanwhile) continue;
 				throw err instanceof _CommitError ? err.cause : err;
@@ -588,7 +612,7 @@ export class PostgresStore {
 	 */
 	async chainRows(sourceNodeId) {
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = $1 ORDER BY monotonic_seq`,
 			[sourceNodeId],
 		);
@@ -605,7 +629,7 @@ export class PostgresStore {
 	 */
 	async allChainRows() {
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} ORDER BY source_node_id, monotonic_seq`,
 		);
 		return res.rows.map(_chainRow);
@@ -619,7 +643,7 @@ export class PostgresStore {
 	 */
 	async chainTips() {
 		await this._ensureReady();
-		const res = await this._pool.query(chainTipsSQL(this._table));
+		const res = await this._query(chainTipsSQL(this._table));
 		return res.rows.map((r) => ({
 			source_node_id: r.source_node_id,
 			monotonic_seq: Number(r.monotonic_seq),
@@ -627,11 +651,17 @@ export class PostgresStore {
 		}));
 	}
 
+	// pool.query, run again on a lost connection: every query outside
+	// a transaction is a single statement that can run twice.
+	async _query(sql, params) {
+		return retryLost(this._pool, () => this._pool.query(sql, params));
+	}
+
 	// Run fn(client) in a transaction and return what it returns. A failed
 	// COMMIT throws _CommitError. A client whose COMMIT or ROLLBACK failed
 	// is released with the error, so the pool discards it.
 	async _transaction(fn) {
-		const client = await this._pool.connect();
+		const client = await checkout(this._pool);
 		let broken;
 		try {
 			await client.query("BEGIN");
@@ -653,7 +683,7 @@ export class PostgresStore {
 			}
 			throw err;
 		} finally {
-			client.release(broken);
+			release(client, broken);
 		}
 	}
 
@@ -663,7 +693,7 @@ export class PostgresStore {
 	async _afterFailedCommit(id, err, check) {
 		let res;
 		try {
-			res = await this._pool.query(
+			res = await this._query(
 				`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE id = $1`,
 				[id],
 			);
@@ -786,7 +816,7 @@ export class PostgresStore {
 		const n = params.length;
 		params.push(limit, offset);
 		const sql = `SELECT * FROM ${this._table} ${where} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${n + 1} OFFSET $${n + 2}`;
-		const res = await this._pool.query(sql, params);
+		const res = await this._query(sql, params);
 		return res.rows.map(mapRow);
 	}
 
@@ -824,7 +854,7 @@ export class PostgresStore {
 			until,
 		});
 		const sql = `SELECT COUNT(*) FROM ${this._table} ${where}`;
-		const res = await this._pool.query(sql, params);
+		const res = await this._query(sql, params);
 		return Number(res.rows[0].count);
 	}
 
@@ -851,7 +881,7 @@ export class PostgresStore {
 			conds.push(`tenant_id = $${params.length}`);
 		}
 		params.push(limit);
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT * FROM ${this._table} WHERE ${conds.join(" AND ")} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT $${params.length}`,
 			params,
 		);
@@ -868,7 +898,7 @@ export class PostgresStore {
 	async sources({ since, until } = {}) {
 		await this._ensureReady();
 		const { where, params } = _buildWhere({ since, until });
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen FROM ${this._table} ${where} GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC`,
 			params,
 		);
@@ -892,7 +922,7 @@ export class PostgresStore {
 	 */
 	async chainTail(sourceNodeId, limit) {
 		await this._ensureReady();
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT ${CHAIN_COLUMNS} FROM ${this._table} WHERE source_node_id = $1 ORDER BY monotonic_seq DESC LIMIT $2`,
 			[sourceNodeId, limit],
 		);
@@ -917,7 +947,7 @@ export class PostgresStore {
 		await this._ensureReady();
 		const scoped = serviceId != null && sourceNodeId != null;
 		const cols = exact ? CHAIN_COLUMNS : "*";
-		const res = await this._pool.query(
+		const res = await this._query(
 			scoped
 				? `SELECT ${cols} FROM ${this._table} WHERE shipped_at IS NULL AND service_id = $2 AND source_node_id = $3 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $1`
 				: `SELECT ${cols} FROM ${this._table} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1`,
@@ -936,7 +966,7 @@ export class PostgresStore {
 	async markShipped(ids) {
 		if (!ids || ids.length === 0) return;
 		await this._ensureReady();
-		await this._pool.query(
+		await this._query(
 			`UPDATE ${this._table} SET shipped_at = $2 WHERE id = ANY($1)`,
 			[ids, canonicalTS()],
 		);
@@ -965,7 +995,7 @@ export class PostgresStore {
 			`SELECT (SELECT MIN(source_node_id) FROM ${t} WHERE source_node_id > node) FROM nodes WHERE node IS NOT NULL), ` +
 			`bound AS (SELECT node, COALESCE((SELECT monotonic_seq FROM ${t} WHERE source_node_id = node AND monotonic_seq > 0 AND (${keep}) ORDER BY monotonic_seq LIMIT 1), ${max}) AS keep_from FROM nodes WHERE node IS NOT NULL LIMIT ${max}) ` +
 			`DELETE FROM ${t} AS d USING bound WHERE d.source_node_id = bound.node AND d.monotonic_seq < bound.keep_from AND d.timestamp < $1${shipped}`;
-		const res = await this._pool.query(sql, [before]);
+		const res = await this._query(sql, [before]);
 		return res.rowCount ?? 0;
 	}
 
@@ -989,11 +1019,11 @@ export class PostgresStore {
 			);
 		}
 		const cutoff = canonicalTS(d);
-		const skippedRes = await this._pool.query(
+		const skippedRes = await this._query(
 			`SELECT COUNT(*) FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND hash <> '' AND canonical_form_id <> '2'`,
 			[cutoff, codes],
 		);
-		const res = await this._pool.query(
+		const res = await this._query(
 			`SELECT id, monotonic_seq FROM ${this._table} WHERE timestamp < $1 AND code = ANY($2) AND detail <> 'null' AND (hash = '' OR canonical_form_id = '2') ORDER BY monotonic_seq`,
 			[cutoff, codes],
 		);
@@ -1021,7 +1051,7 @@ export class PostgresStore {
 		await this._ensureReady();
 		// '' rather than NULL: Go's table and the Go reader need a string, and
 		// Python treats '' as no salt.
-		const res = await this._pool.query(
+		const res = await this._query(
 			`UPDATE ${this._table} SET detail = 'null', detail_salt = '' WHERE id = ANY($1) AND (hash = '' OR canonical_form_id = '2') RETURNING id`,
 			[ids],
 		);

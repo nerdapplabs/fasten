@@ -211,7 +211,7 @@ describe('failures', () => {
             await e.resetForTests();
         });
         const failed = err.find((l) => l.event === 'audit_drain_failed');
-        assert.match(failed.error, /^AuditSealError: seal failed: random source unavailable/);
+        assert.equal(failed.error, 'AuditSealError');
         assert.equal(calls, 2);
         assert.equal(auditLines(out).length, 2);
     });
@@ -353,6 +353,6 @@ describe('failures', () => {
         });
         assert.equal(calls, 1);
         const dead = err.find((l) => l.event === 'audit_drain_dead_letter');
-        assert.match(dead.last_error, /^AuditRowRejectedError: /);
+        assert.equal(dead.last_error, 'AuditRowRejectedError');
     });
 });

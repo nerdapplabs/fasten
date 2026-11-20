@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Engine, apiLogger, currentRequestID, isSentinel, mintSentinel, withRequestID } from '../src/index.js';
 import { SqliteStreamStore } from '../src/store/stream_sqlite.js';
 import { Ring } from '../src/streams.js';
@@ -318,4 +319,88 @@ describe('SqliteStreamStore', () => {
         assert.equal(s._db.prepare('SELECT payload FROM api_log WHERE path = ?').get('/b').payload.includes('1152921504606846976'), true);
         s.close();
     });
+
+    // The stream DDL of Python's StreamStore (fasten/store/stream.py) and Go's
+    // NewStreamStore (stream_store.go), as each runs it.
+    const PY_STREAM_DDL = (t) => `
+CREATE TABLE IF NOT EXISTS ${t} (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id   TEXT,
+    timestamp    TEXT,
+    level        TEXT,
+    service_id   TEXT,
+    event        TEXT,
+    method       TEXT,
+    path         TEXT,
+    status       INTEGER,
+    payload      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_${t}_req ON ${t}(request_id);
+CREATE INDEX IF NOT EXISTS idx_${t}_ts  ON ${t}(timestamp);
+CREATE INDEX IF NOT EXISTS idx_${t}_lvl ON ${t}(level);
+CREATE INDEX IF NOT EXISTS idx_${t}_svc ON ${t}(service_id);
+CREATE INDEX IF NOT EXISTS idx_${t}_evt ON ${t}(event);
+CREATE INDEX IF NOT EXISTS idx_${t}_mth ON ${t}(method);
+CREATE INDEX IF NOT EXISTS idx_${t}_pth ON ${t}(path);
+CREATE INDEX IF NOT EXISTS idx_${t}_sts ON ${t}(status);`;
+    const GO_STREAM_DDL = (t) => `
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+CREATE TABLE IF NOT EXISTS ${t} (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT,
+    timestamp  TEXT,
+    level      TEXT,
+    service_id TEXT,
+    event      TEXT,
+    method     TEXT,
+    path       TEXT,
+    status     INTEGER,
+    payload    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_${t}_req ON ${t}(request_id);
+CREATE INDEX IF NOT EXISTS idx_${t}_ts  ON ${t}(timestamp);
+CREATE INDEX IF NOT EXISTS idx_${t}_lvl ON ${t}(level);
+CREATE INDEX IF NOT EXISTS idx_${t}_svc ON ${t}(service_id);
+CREATE INDEX IF NOT EXISTS idx_${t}_evt ON ${t}(event);
+CREATE INDEX IF NOT EXISTS idx_${t}_mth ON ${t}(method);
+CREATE INDEX IF NOT EXISTS idx_${t}_pth ON ${t}(path);
+CREATE INDEX IF NOT EXISTS idx_${t}_sts ON ${t}(status);`;
+
+    // Each writes the lifted columns and the row as JSON: Python with
+    // json.dumps(ensure_ascii=False) (", " and ": "), Go compact.
+    for (const [name, ddl, json] of [
+        ['Python', PY_STREAM_DDL, (r) => JSON.stringify(r).replaceAll(',"', ', "').replaceAll('":', '": ')],
+        ['Go', GO_STREAM_DDL, (r) => JSON.stringify(r)],
+    ]) {
+        test(`reads and appends to a table ${name}'s SQLite stream store created`, () => {
+            dir = mkdtempSync(join(tmpdir(), 'fasten-stream-'));
+            const path = join(dir, 's.db');
+            const db = new DatabaseSync(path);
+            db.exec(ddl('syslog'));
+            const ins = db.prepare('INSERT INTO syslog (request_id,timestamp,level,service_id,event,method,path,status,payload) VALUES (?,?,?,?,?,?,?,?,?)');
+            const rows = [
+                { request_id: 'r1', timestamp: '2026-01-01T00:00:00.000000Z', level: 'info', service_id: 'py', event: 'boot', note: 'Grüße' },
+                { request_id: 'r2', timestamp: '2026-01-02T00:00:00.000000Z', level: 'error', service_id: 'py', event: 'db_down', status: 503 },
+            ];
+            for (const r of rows) {
+                ins.run(r.request_id, r.timestamp, r.level, r.service_id, r.event, null, null, r.status ?? null, json(r));
+            }
+            db.close();
+            const s = new SqliteStreamStore(path, { table: 'syslog' });
+            assert.deepEqual(s.query().map((r) => r.event), ['db_down', 'boot']);
+            assert.deepEqual(s.query({ level: 'error' })[0], rows[1]);
+            assert.equal(s.countMatching({ serviceId: 'py' }), 2);
+            assert.deepEqual(s.query({ status: 503 }).map((r) => r.event), ['db_down']);
+            assert.deepEqual(s.search({ q: 'grüße', since: '2026' }).map((r) => r.event), ['boot']);
+            s.insert({ request_id: 'r3', timestamp: '2026-01-03T00:00:00.000000Z', level: 'info', service_id: 'js', event: 'js_row' });
+            assert.deepEqual(s.query({ limit: 1 }).map((r) => r.event), ['js_row']);
+            assert.equal(s.purge({ before: '2026-01-02T00:00:00.000000Z' }), 1);
+            s.close();
+            const back = new DatabaseSync(path);
+            assert.deepEqual(back.prepare('SELECT seq, service_id, event FROM syslog ORDER BY seq').all().map((r) => ({ ...r })),
+                [{ seq: 2, service_id: 'py', event: 'db_down' }, { seq: 3, service_id: 'js', event: 'js_row' }]);
+            back.close();
+        });
+    }
 });

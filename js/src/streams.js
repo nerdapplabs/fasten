@@ -1,6 +1,7 @@
 // The api and sys streams: in-memory rings, the store write-through, and
 // what the stream stores share (spec persistent-streams.md).
 import { randomUUID } from "node:crypto";
+import { errorType } from "./audit_queue.js";
 import { bigintReplacer, bigintReviver } from "./chain.js";
 
 export const SENTINEL_KINDS = Object.freeze([
@@ -201,7 +202,7 @@ export class Stream {
 		const label = this.name === "sys" ? "syslog" : this.name;
 		try {
 			process.stderr.write(
-				`fasten: ${label} persist failed: ${type ?? err?.name ?? "Error"}\n`,
+				`fasten: ${label} persist failed: ${type ?? errorType(err)}\n`,
 			);
 		} catch {
 			// Nothing left to report to.

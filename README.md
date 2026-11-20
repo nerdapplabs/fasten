@@ -30,7 +30,7 @@ API for querying the record back.
 How far that record is tamper-evident depends on the SDK:
 
 - **Python, Go, Rust and JS** seal audit rows into a per-node hash chain
-  when they write to a bundled audit store (SQLite or Postgres). Verifying
+  when they write to a bundled audit store (SQLite or Postgres in each). Verifying
   the chain shows a row that was edited, reordered, or removed from inside
   the chain.
 - Rows cut from the start or end of a chain still verify, and so does a
@@ -44,7 +44,8 @@ How far that record is tamper-evident depends on the SDK:
 the chain's scope.
 
 **Status: v1.0.0-beta.** Python is the reference SDK. Go, JS, Rust, C++ and
-Swift are beta. Nothing is published to PyPI, npm or crates.io yet; install
+Swift are beta; JS has the SQLite and Postgres stores, replication and the
+HTTP reader, as Python and Go do. Nothing is published to PyPI, npm or crates.io yet; install
 from source.
 
 [Website](https://fasten.sh)

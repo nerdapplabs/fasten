@@ -13,7 +13,7 @@ This document covers the security model of the fasten SDK: what it protects, wha
 fasten is a library, not a standalone service. It runs inside the adopter's process and writes to:
 
 - **stdout**: NDJSON audit, sys and api rows (the "ring transport")
-- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` or an `audit_store` passed to `init()`. Without one, audit rows go to stdout only.
+- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python and JS) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
 
 The runtime layout:
 

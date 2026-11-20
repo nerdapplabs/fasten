@@ -13,7 +13,7 @@ import { Worker } from 'node:worker_threads';
 import { SqliteStore } from '../src/store/sqlite.js';
 import {
     AuditOutcomeUnknownError, AuditRowRejectedError, ChainError, Engine,
-    register as registerCodes, takeCheckpoints, verifyChain,
+    checkpointsSince, register as registerCodes, takeCheckpoints, verifyChain,
 } from '../src/index.js';
 import { canonicalJSON, detailCommitment, detailText, parseJson } from '../src/chain.js';
 
@@ -685,3 +685,106 @@ for (const [name, ddl, path, pick, render] of [
         back.slice(0, rows.length).forEach((r, i) => assert.equal(r.hash, rows[i].hash));
     });
 }
+
+// ── What the reader reads ──────────────────────────────────────────────────
+
+test('search: case-insensitive substring of the detail, newest first, %, _ and \\ literal', async () => {
+    const s = open();
+    const at = (min) => `2026-03-01T10:${String(min).padStart(2, '0')}:00.000000Z`;
+    const put = (min, detail, extra = {}) =>
+        s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-search', timestamp: at(min), detail, ...extra }));
+    await put(1, { note: 'Disk FULL on /var' });
+    await put(2, { note: 'disk full again', tenant: 'x' }, { tenant_id: 't-1' });
+    await put(3, { note: '100% done' });
+    await put(4, { note: 'a_b c\\d' });
+    await put(5, { note: 'axb' });
+    const notes = async (o) => (await s.search({ since: at(0), ...o })).map((r) => r.detail.note);
+    assert.deepEqual(await notes({ q: 'DISK full' }), ['disk full again', 'Disk FULL on /var']);
+    assert.deepEqual(await notes({ q: 'disk', tenantId: 't-1' }), ['disk full again']);
+    assert.deepEqual(await notes({ q: 'disk', limit: 1 }), ['disk full again']);
+    assert.deepEqual(await notes({ q: 'disk', until: at(1) }), ['Disk FULL on /var']);
+    assert.deepEqual(await notes({ q: 'disk', since: at(2) }), ['disk full again']);
+    assert.deepEqual(await notes({ q: '100%' }), ['100% done']);
+    assert.deepEqual(await notes({ q: '0%d' }), []);
+    assert.deepEqual(await notes({ q: 'a_b' }), ['a_b c\\d']);
+    assert.deepEqual(await notes({ q: 'x_b' }), []);
+    assert.deepEqual(await notes({ q: 'c\\\\d' }), ['a_b c\\d']);
+    const [row] = await s.search({ q: 'axb', since: at(0) });
+    assert.equal(row.code, 'USER_CREATED');
+    assert.equal(typeof row.monotonic_seq, 'number');
+});
+
+test('sources: rows and first and last timestamp per node, service and tenant, busiest first', async () => {
+    const s = open();
+    const at = (d) => `2026-03-0${d}T00:00:00.000000Z`;
+    for (const [node, tenant, d] of [['n-a', null, 1], ['n-a', null, 3], ['n-b', 't-1', 2], ['n-a', null, 2]]) {
+        await s.insert(makeRow({ monotonic_seq: 0, source_node_id: node, tenant_id: tenant, timestamp: at(d) }));
+    }
+    assert.deepEqual(await s.sources(), [
+        { source_node_id: 'n-a', service_id: 'svc', tenant_id: null, rows: 3, first_seen: at(1), last_seen: at(3) },
+        { source_node_id: 'n-b', service_id: 'svc', tenant_id: 't-1', rows: 1, first_seen: at(2), last_seen: at(2) },
+    ]);
+    assert.deepEqual((await s.sources({ since: at(2), until: at(2) })).map((x) => [x.source_node_id, x.rows]),
+        [['n-a', 1], ['n-b', 1]].sort((a, b) => b[1] - a[1]));
+});
+
+test('query pages on with afterSeq; count ignores it', async () => {
+    const s = open();
+    for (let i = 1; i <= 5; i++) {
+        await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-page', timestamp: `2026-03-01T00:00:0${i}.000000Z` }));
+    }
+    const page = await s.query({ sourceNodeId: 'n-page', limit: 2 });
+    assert.deepEqual(page.map((r) => r.monotonic_seq), [5, 4]);
+    const next = await s.query({ sourceNodeId: 'n-page', limit: 2, afterSeq: page.at(-1).monotonic_seq });
+    assert.deepEqual(next.map((r) => r.monotonic_seq), [3, 2]);
+    assert.deepEqual((await s.query({ afterSeq: 2 })).map((r) => r.monotonic_seq), [1]);
+    assert.equal(await s.count({ sourceNodeId: 'n-page', afterSeq: 3 }), 5);
+});
+
+test('chainTail reads the detail text as stored, so a Python-sealed tail verifies', async () => {
+    const file = dbPath();
+    const db = sql(file);
+    db.exec(PY_DDL('audit'));
+    const rows = loadVector('spec/checkpoint-vectors.json').cases[0].rows.filter((r) => r.source_node_id === 'node-1');
+    for (const r of rows) sqlInsert(db, 'audit', r, detailText(r.detail).replaceAll(',"', ', "').replaceAll('":', '": '));
+    db.close();
+    const s = open(file, { table: 'audit' });
+    await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'node-1', detail: { price: JSON.rawJSON('75.0') } }));
+    const tail = await s.chainTail('node-1', 2);
+    assert.deepEqual(tail.map((r) => r.monotonic_seq), [rows.length, rows.length + 1]);
+    const res = verifyChain(tail);
+    assert.ok(res.ok, res.reason);
+    assert.equal(res.sealedRows, 2);
+    assert.equal(verifyChain(await s.chainTail('node-1', 100)).sealedRows, rows.length + 1);
+    assert.deepEqual(await s.chainTail('nobody', 5), []);
+});
+
+// ── Age purge and the chain (spec §2.3, §9) ───────────────────────────────
+
+test('after a purge the chain still verifies, and so do the checkpoints taken since', async () => {
+    const s = open();
+    for (const days of [40, 39, 38, 10, 5]) {
+        await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-age', timestamp: _daysAgo(days) }));
+    }
+    await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-gone', timestamp: _daysAgo(50) }));
+    const before = await takeCheckpoints(s);
+    await s.markShipped((await s.query({ limit: 100 })).map((r) => r.id));
+    assert.equal(await s.purge({ before: _daysAgo(30) }), 4);
+    assert.deepEqual(await seqsOf(s, 'n-age'), [4, 5]);
+    const rows = await s.allChainRows();
+    const res = verifyChain(rows);
+    assert.ok(res.ok, res.reason);
+    assert.equal(res.sealedRows, 2);
+    // A checkpoint of a node whose rows are all gone fails a whole-chain verify.
+    assert.equal(verifyChain(rows, { checkpoints: before }).ok, false);
+    const purgedAt = new Date().toISOString().replace(/Z$/, '000Z');
+    await new Promise((r) => setTimeout(r, 2));
+    const since = checkpointsSince([...before, ...(await takeCheckpoints(s))], purgedAt);
+    assert.deepEqual(since.map((c) => c.source_node_id), ['n-age']);
+    const res2 = verifyChain(rows, { checkpoints: since });
+    assert.ok(res2.ok, res2.reason);
+    // The next row links to the kept tail.
+    const next = await s.insert(makeRow({ monotonic_seq: 0, source_node_id: 'n-age' }));
+    assert.equal(next.monotonic_seq, 6);
+    assert.ok(verifyChain(await s.chainRows('n-age')).ok);
+});

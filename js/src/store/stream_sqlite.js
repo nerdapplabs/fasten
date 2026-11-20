@@ -9,7 +9,6 @@
  *   const syslogStore = new SqliteStreamStore('/var/lib/app/streams.db', { table: 'syslog' });
  */
 import { closeSync, openSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import { canonicalTS } from "../canonical_ts.js";
 import {
 	FILTER_COLUMNS,
@@ -19,6 +18,9 @@ import {
 	payloadText,
 	statusFilter,
 } from "../streams.js";
+
+// Loaded on first use, as in sqlite.js.
+const _sqlite = () => process.getBuiltinModule("node:sqlite");
 
 const _SAFE_TABLE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -100,7 +102,7 @@ export class SqliteStreamStore {
 			closeSync(openSync(path, "a", 0o600));
 		}
 		this._table = table;
-		this._db = new DatabaseSync(path);
+		this._db = new (_sqlite().DatabaseSync)(path);
 		if (wal && path !== ":memory:") {
 			this._db.exec("PRAGMA journal_mode=WAL");
 			this._db.exec("PRAGMA synchronous=NORMAL");

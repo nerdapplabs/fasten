@@ -89,7 +89,20 @@ way, also when the new config is raise mode or has no store. `flush()` and
 `close()` wait for it, rows it could not store are reported with
 `audit_drain_install_incomplete`, and the next `close()` resolves false if
 it lost rows. An idle drainer does not
-keep the process alive.
+keep the process alive. `queueStats().last_error` and the drainer's sys
+events (`audit_drain_failed`, `audit_drain_degraded`,
+`audit_drain_dead_letter`, `audit_sync_fallback_failed`'s `error_type`)
+record the error type, such as `DatabaseError`, as the other SDKs do.
+
+**Dropped connections.** `PostgresStore` and `PostgresStreamStore` recover
+when the database drops their connections (a restart, a failover,
+`pg_terminate_backend`): a call that meets a dead connection runs again on
+a new one, as the Python stores reconnect and retry, and the pool drops
+dead idle connections without ending the process. A write that still fails
+is retried by the drainer in queue mode; in raise mode that `emit()`
+rejects with `AuditStoreError` and the next one works. A COMMIT whose
+answer was lost is not run again: the row is read back, as before. The
+chain stays whole either way, since a retried row takes no new seq.
 
 **Chain.** `emit()` returns the row with `monotonic_seq: 0`.
 `PostgresStore` and `SqliteStore` seal it into its node's hash chain in
@@ -164,6 +177,15 @@ are never deleted. Set `retentionPii: '30d'` (or `FASTEN_RETENTION_PII`) in
 `init()` to run it on init and then hourly; the store must implement
 `listRedactionCandidates` and `redactRows`, as both bundled stores do.
 
+**Age purge.** The engine never deletes audit rows, as in Python and Go:
+`retentionApi` and `retentionSyslog` purge only the api and sys stores. To
+drop old audit rows, call the store's `purge({ before, respectUnshipped })`
+yourself. Per node it deletes only a seq prefix
+([spec §2.3](../spec/chain-replication.md)), and by default keeps unshipped
+rows and every row above them, so the rows left still verify: the chain
+starts at a purged head. Publish checkpoints again after each purge and
+verify with `checkpointsSince` (see "Chain checkpoints").
+
 **Differs from the other SDKs:** Node is single-threaded, so `emit()` cannot
 block on a counting semaphore the way Python, Go, Rust and C++ do.
 `queueCapacity` is a warning threshold (it drives the
@@ -186,8 +208,13 @@ fasten.init({ serviceId: 'auth-service', nodeId: 'host-01', auditStore });
 It does what `PostgresStore` does, with the same methods and row shapes:
 it seals rows into the chain, returns the stored row on a retry, rejects a
 different row under a stored id or at a taken seq, and has `insertSealed`,
-`chainRows`, `allChainRows`, `chainTips`, `query`, `count`, `listUnshipped`,
-`markShipped`, `purge`, the redaction methods and replication (below). A
+`chainRows`, `allChainRows`, `chainTips`, `query` (with `afterSeq`),
+`count`, `search`, `sources`, `chainTail`, `listUnshipped`, `markShipped`,
+`purge`, the redaction methods and replication (below), so the reader
+serves it as it serves `PostgresStore`. `search` lowercases `q` and
+matches it against SQLite's `lower(detail)`, which folds only ASCII
+letters, as the Python and Go SQLite stores do; Postgres's `ILIKE` folds
+all letters. A
 seq is taken in a `BEGIN IMMEDIATE` transaction, so several processes and
 threads can write one file and still get one chain per node. A new file is
 created owner-only (0600), in WAL mode, and a writer waits up to 5 s for
@@ -206,6 +233,27 @@ connection's write lock. The methods return promises only so the store has
 requests, use `PostgresStore`. In Node 24's documentation `node:sqlite`
 is at stability 1.2, release candidate (since v24.15.0); it was
 experimental before that.
+
+## Stores from the environment
+
+Without `auditStore`, `apiStore` or `syslogStore`, `init()` opens one from
+`FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN`, with the DSN
+forms of the Python SDK:
+
+| DSN | Store |
+|---|---|
+| `postgres://...` or `postgresql://...` | `PostgresStore`, or `PostgresStreamStore` for the streams |
+| `sqlite:///./rel.db`, `sqlite:////abs/path.db`, `/abs/path.db` | `SqliteStore`, or `SqliteStreamStore` |
+
+`?table=` names the table (default `audit_log`, `api_log`, `syslog`) and is
+taken off a Postgres DSN before connecting; `?wal=false` turns WAL off on
+SQLite. A store passed to `init()` wins over the environment. A stream DSN
+with another scheme (`mysql://`, `postgresql+psycopg://`) is an error, not
+a file. A re-init with the same DSN keeps the store it opened. The engine
+does not close these stores; they live as long as the process.
+
+Go reads only `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, and only for SQLite;
+Python and JS read all three, for SQLite and Postgres.
 
 ## Replication
 
@@ -430,12 +478,12 @@ constant time.
   canonical form.
 - Search is off unless `init({ searchEnabled: true })` or
   `FASTEN_SEARCH_ENABLED=true`. It needs `since`, matches case-insensitive
-  substrings of the stored JSON, and a stream without a store gets an entry
-  in `errors`. `q=` on `/sys` cannot be combined with filters (400), and
+  substrings of the stored JSON (on SQLite, ASCII letters only), and a
+  stream without a store gets an entry in `errors`. `q=` on `/sys` cannot be combined with filters (400), and
   `/api` refuses `q=` (400).
 - Each response has `completeness` per stream: `store`, `store-degraded`
   or `ring`, as in the Python and Go readers.
-- Rows are the snake_case rows `PostgresStore.query()` returns. A `BigInt`
+- Rows are the snake_case rows the store's `query()` returns. A `BigInt`
   is written as its digits, a JSON number (no precision lost).
 - The doctor verifies the chain from `chainTail()`, which reads the detail
   text as stored, so rows sealed by any SDK verify. It reports `verified`,

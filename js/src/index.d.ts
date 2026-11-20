@@ -101,10 +101,18 @@ export interface InitOptions {
 	serviceId?: string;
 	nodeId?: string;
 	tenantId?: string | null;
+	/**
+	 * Without one, FASTEN_AUDIT_DSN opens a store: PostgresStore for
+	 * postgres:// or postgresql://, else SqliteStore on the DSN's path
+	 * (sqlite:///rel.db, sqlite:////abs.db or a bare path; ?table=, ?wal=).
+	 */
 	auditStore?: AuditRepository | null;
-	/** Persists the api stream (spec persistent-streams.md). */
+	/**
+	 * Persists the api stream (spec persistent-streams.md). Without one,
+	 * FASTEN_API_DSN opens a store (table "api_log" unless ?table=).
+	 */
 	apiStore?: StreamStore | null;
-	/** Persists the sys stream. */
+	/** Persists the sys stream. Without one, FASTEN_SYSLOG_DSN ("syslog"). */
 	syslogStore?: StreamStore | null;
 	/**
 	 * The streams expected to have a store ("api", "sys"). When set (or
@@ -307,6 +315,7 @@ export interface QueueStats {
 	drained_total: number;
 	retry_count_active: number;
 	in_backoff_seconds: number;
+	/** The type of the latest failure ("DatabaseError"), null when healthy. */
 	last_error: string | null;
 	dead_lettered_total: number;
 	dead_letter_depth: number;
