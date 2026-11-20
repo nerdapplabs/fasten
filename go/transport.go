@@ -92,6 +92,24 @@ func NewTransport(maxlen int) *Transport {
 	}
 }
 
+// withStores returns a Transport that shares t's rings and settings and
+// writes to the given stores.
+func (t *Transport) withStores(api, syslog StreamRepository) *Transport {
+	t.bootMu.Lock()
+	over := t.bootOver
+	t.bootMu.Unlock()
+	return &Transport{
+		Syslog:        t.Syslog,
+		API:           t.API,
+		SyslogStore:   syslog,
+		APIStore:      api,
+		serviceID:     t.serviceID,
+		bootRequestID: t.bootRequestID,
+		bootOver:      over,
+		redact:        t.redact,
+	}
+}
+
 // stampRequestID guarantees a non-empty request_id on every stream row (the
 // sentinel invariant). A real id ends the boot window; a missing id is filled
 // with the shared boot sentinel during startup, else a unique orphan id.

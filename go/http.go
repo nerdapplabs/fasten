@@ -78,8 +78,8 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w}
 			next.ServeHTTP(rec, r)
-			if Default.xport != nil {
-				Default.xport.PushAPI(APIRow{
+			if x := Default.xport.Load(); x != nil {
+				x.PushAPI(APIRow{
 					"method":      r.Method,
 					"path":        r.URL.Path,
 					"status":      rec.Status(),
@@ -348,7 +348,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"sys": e.streamSource("sys")}, "error": "fasten not initialised"})
 		return
 	}
@@ -391,7 +391,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
+		rows, ok, err := e.xport.Load().SearchSyslog(qtext, since, until, limit)
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -422,7 +422,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
+	rows, err := e.xport.Load().QuerySyslog(limit, StreamQuery{
 		Level:     q.Get("level"),
 		RequestID: q.Get("request_id"),
 		ServiceID: q.Get("service_id"),
@@ -519,7 +519,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		fail(msg)
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		fail("fasten not initialised")
 		return
 	}
@@ -552,7 +552,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		switch stream {
 		case "sys":
-			rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
+			rows, ok, err := e.xport.Load().SearchSyslog(qtext, since, until, limit)
 			if err != nil {
 				e.serverError(w, r, err)
 				return
@@ -571,7 +571,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		case "api":
-			rows, ok, err := e.xport.SearchAPI(qtext, since, until, limit)
+			rows, ok, err := e.xport.Load().SearchAPI(qtext, since, until, limit)
 			if err != nil {
 				e.serverError(w, r, err)
 				return
@@ -636,7 +636,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"api": e.streamSource("api")}, "error": "fasten not initialised"})
 		return
 	}
@@ -662,7 +662,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	rows, err := e.xport.QueryAPI(limit, StreamQuery{
+	rows, err := e.xport.Load().QueryAPI(limit, StreamQuery{
 		Method:    q.Get("method"),
 		Path:      q.Get("path"),
 		RequestID: q.Get("request_id"),
@@ -731,14 +731,14 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	api := []APIRow{}
 	sys := []SyslogRow{}
 	apiTotal, sysTotal := 0, 0
-	if e.xport != nil {
-		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
+	if e.xport.Load() != nil {
+		a, err := e.xport.Load().QueryAPI(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
 		}
 		api = scopeAPIRows(a, tenant)
-		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
+		s, err := e.xport.Load().QuerySyslog(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -751,11 +751,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 			apiTotal = len(api)
 			sysTotal = len(sys)
 		} else {
-			if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
+			if apiTotal, err = e.xport.Load().CountAPI(StreamQuery{RequestID: rid}); err != nil {
 				e.serverError(w, r, err)
 				return
 			}
-			if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
+			if sysTotal, err = e.xport.Load().CountSyslog(StreamQuery{RequestID: rid}); err != nil {
 				e.serverError(w, r, err)
 				return
 			}
@@ -1024,13 +1024,13 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	xportBlock := map[string]any{
-		"stdout_active":     e.xport != nil,
+		"stdout_active":     e.xport.Load() != nil,
 		"syslog_ring_depth": 0,
 		"api_ring_depth":    0,
 	}
-	if e.xport != nil {
-		xportBlock["syslog_ring_depth"] = e.xport.SyslogDepth()
-		xportBlock["api_ring_depth"] = e.xport.APIDepth()
+	if x := e.xport.Load(); x != nil {
+		xportBlock["syslog_ring_depth"] = x.SyslogDepth()
+		xportBlock["api_ring_depth"] = x.APIDepth()
 	}
 
 	initBlock := map[string]any{
