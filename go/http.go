@@ -305,7 +305,10 @@ func scopeAPIRows(rows []APIRow, scope string) []APIRow {
 // It describes the stream, not one response: a ring that has dropped rows
 // still says "ring". For /correlate, counts vs totals shows truncation.
 func (e *Engine) streamSource(stream string) string {
-	if !e.persistedStreams[stream] {
+	e.storeMu.RLock()
+	persisted, api, sys := e.persistedStreams[stream], e.apiStore, e.syslogStore
+	e.storeMu.RUnlock()
+	if !persisted {
 		return "ring"
 	}
 	if stream == "audit" {
@@ -318,9 +321,9 @@ func (e *Engine) streamSource(stream string) string {
 	var st StreamRepository
 	switch stream {
 	case "api":
-		st = e.apiStore
+		st = api
 	case "sys":
-		st = e.syslogStore
+		st = sys
 	}
 	if st != nil && st.Degraded() {
 		return "store-degraded"
@@ -334,7 +337,7 @@ func (e *Engine) auditDegraded() bool {
 	if e.auditWriteSwallowed.Load() {
 		return true
 	}
-	if d, ok := e.auditStore.(interface{ Degraded() bool }); ok && d.Degraded() {
+	if d, ok := e.currentAuditStore().(interface{ Degraded() bool }); ok && d.Degraded() {
 		return true
 	}
 	if qs := e.GetQueueStats(); qs != nil && qs.DeadLetteredTotal > 0 {
@@ -594,10 +597,11 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		case "audit":
-			searcher, ok := e.auditStore.(interface {
+			store := e.currentAuditStore()
+			searcher, ok := store.(interface {
 				Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error)
 			})
-			if e.auditStore == nil || !ok {
+			if store == nil || !ok {
 				errs["audit"] = "requires an audit store with a Search method"
 				counts["audit"] = 0
 				continue
@@ -709,11 +713,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 
 	audit := []map[string]any{}
 	var auditTotal *int
-	if e.auditStore != nil {
+	if store := e.currentAuditStore(); store != nil {
 		// Tenant pushed down to the store filter — prevents the
 		// X-Request-ID pivot attack where tenant B guesses/replays a
 		// known tenant-A request_id to read A's rows.
-		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
+		rows, err := store.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -721,7 +725,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			audit = append(audit, rowToMap(row))
 		}
-		if counter, ok := e.auditStore.(filterCounter); ok {
+		if counter, ok := store.(filterCounter); ok {
 			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid, TenantID: tenant}); err == nil {
 				auditTotal = &n
 			}
@@ -800,7 +804,8 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.auditStore == nil {
+	store := e.currentAuditStore()
+	if store == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"audit": e.streamSource("audit")}, "error": "audit store not configured"})
 		return
 	}
@@ -859,7 +864,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Until:        until,
 		AfterSeq:     after,
 	}
-	rows, err := e.auditStore.Query(r.Context(), f)
+	rows, err := store.Query(r.Context(), f)
 	if err != nil {
 		e.serverError(w, r, err)
 		return
@@ -873,7 +878,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	// are reported. total is null when it can't be counted, meaning "may
 	// have more"; len(rows) would be capped at limit.
 	var total *int
-	if counter, ok := e.auditStore.(filterCounter); ok {
+	if counter, ok := store.(filterCounter); ok {
 		// CountFiltered ignores Limit, Offset and AfterSeq.
 		if n, cerr := counter.CountFiltered(r.Context(), f); cerr == nil {
 			total = &n
@@ -909,12 +914,13 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	empty := map[string]any{"sources": []any{}, "nodes": 0, "services": 0, "tenants": 0}
-	if e.auditStore == nil {
+	store := e.currentAuditStore()
+	if store == nil {
 		empty["error"] = "audit store not configured"
 		writeJSON(w, empty)
 		return
 	}
-	agg, ok := e.auditStore.(sourceAggregator)
+	agg, ok := store.(sourceAggregator)
 	if !ok {
 		empty["error"] = "store does not support topology aggregation"
 		writeJSON(w, empty)
@@ -973,7 +979,7 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	store := e.auditStore
+	store := e.currentAuditStore()
 	storeBlock := map[string]any{
 		"kind":           nil,
 		"reachable":      false,

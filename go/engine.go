@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,21 +32,24 @@ type Engine struct {
 	tenantID        string
 	auditStore      AuditRepository // written under storeMu
 	xport           atomic.Pointer[Transport]
-	apiStore        StreamRepository // nil = in memory only
-	syslogStore     StreamRepository // nil = in memory only
+	apiStore        StreamRepository // nil = in memory only; written under storeMu
+	syslogStore     StreamRepository // nil = in memory only; written under storeMu
 	seq             int64            // accessed via atomic ops
 	failureStrategy string
 	searchEnabled   bool // free-text search (/logs/search, q=)
 
 	// persistedStreams holds the streams that have a store ("audit", "api",
 	// "sys"); the reader reports completeness from it. Nil (before Init)
-	// means none.
+	// means none. Written under storeMu.
 	persistedStreams map[string]bool
 
-	// storeMu is held for reading by the emits that insert into
-	// auditStore, from reading it until the insert returns, and for writing
-	// to change it, so a store is closed only after those inserts finish.
+	// storeMu guards the store fields. It is held only to read or change
+	// them, never across a store call.
 	storeMu sync.RWMutex
+	// auditInserts counts the inserts running on auditStore. An emit adds
+	// to it under storeMu; a new store gets a new one, so the old store is
+	// closed once the old count reaches zero.
+	auditInserts *sync.WaitGroup
 
 	// envStores holds the stores Init opened from FASTEN_*_DSN, by
 	// variable, so a re-init with the same DSN keeps them.
@@ -65,6 +69,10 @@ type Engine struct {
 	closing   *closeCall    // the Close in progress, if any
 	storeGen  atomic.Int64  // bumped when Init switches to another audit store
 	closed    atomic.Bool   // Close has run and Init has not since
+
+	// pendingClose, guarded by drainerMu, is closed once the stores a
+	// timed-out Close left open are closed.
+	pendingClose chan struct{}
 
 	// auditWriteSwallowed is set when an audit insert error was swallowed.
 	// It's kept here as well as on the store because AuditRepository
@@ -207,18 +215,23 @@ func (e *Engine) Init(cfg Config) error {
 	e.serviceID = serviceID
 	e.nodeID = nodeID
 	e.tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
+	e.failureStrategy = strategy
 
-	// Taking storeMu waits for the inserts still using the previous store.
+	// Emits use the new store at once. Inserts still running on the
+	// previous one are waited for below, before it is closed.
+	var prevStore AuditRepository
+	var prevInserts *sync.WaitGroup
 	e.storeMu.Lock()
-	prevStore := e.auditStore
-	e.auditStore = cfg.AuditStore
-	e.storeMu.Unlock()
-	// A new store starts with no swallowed writes; re-init on the same
-	// store keeps them.
-	if !sameStore(prevStore, e.auditStore) {
+	if !sameStore(e.auditStore, cfg.AuditStore) {
+		prevStore, prevInserts = e.auditStore, e.auditInserts
+		e.auditStore = cfg.AuditStore
+		e.auditInserts = &sync.WaitGroup{}
+		// A new store starts with no swallowed writes; re-init on the same
+		// store keeps them.
 		e.storeGen.Add(1)
 		e.auditWriteSwallowed.Store(false)
 	}
+	e.storeMu.Unlock()
 
 	// e.seq is no longer read; the store allocates seq (spec §2.1).
 	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
@@ -242,13 +255,14 @@ func (e *Engine) Init(cfg Config) error {
 	x.SyslogStore = cfg.SyslogStore
 	e.xport.Store(x)
 	e.warnUnreadDSNEnv()
+	e.storeMu.Lock()
 	e.apiStore = cfg.APIStore
 	e.syslogStore = cfg.SyslogStore
 	e.persistedStreams = persistedStreams(cfg.AuditStore, cfg.APIStore, cfg.SyslogStore)
+	e.storeMu.Unlock()
 	e.searchEnabled = cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", ""))
 
 	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
-	e.failureStrategy = strategy
 
 	var nextDrainer *cFastenDrainer
 	if strategy == "queue" && e.auditStore != nil {
@@ -281,7 +295,10 @@ func (e *Engine) Init(cfg Config) error {
 	// The old drainer and the streams no longer write to these; nor will
 	// retention once it has stopped.
 	e.stopRetention()
-	e.closeStores(unused)
+	if prevStore != nil && slices.ContainsFunc(unused, func(s *envStore) bool { return s.store == prevStore }) {
+		<-insertsDone(prevInserts)
+	}
+	e.closeStores(e.out(), unused)
 	e.startRetention(ret)
 	return nil
 }
@@ -413,8 +430,10 @@ func (e *Engine) startRetention(ret retentionWindows) {
 	wg := &sync.WaitGroup{}
 	e.retentionCancel = cancel
 	e.retentionWg = wg
+	// A purge can outlive Close and run into the next Init.
+	serviceID := e.serviceID
 	onErr := func(stream string, err error) {
-		e.drainerSysLog("error", "retention_purge_failed", map[string]any{
+		e.sysLogTo(sysOut{e.xport.Load(), serviceID}, "error", "retention_purge_failed", map[string]any{
 			// Type-only, not err.Error() — driver error strings can carry
 			// the offending row value; sys is redacted key-pattern only.
 			"stream": stream, "error_type": fmt.Sprintf("%T", err),
@@ -566,12 +585,11 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 
 // storeAudit stores an emitted row in the audit store, if there is one.
 func (e *Engine) storeAudit(ctx context.Context, row Row, durable bool) (Row, error) {
-	e.storeMu.RLock()
-	defer e.storeMu.RUnlock()
-	store := e.auditStore
+	store, gen, done := e.useAuditStore()
 	if store == nil {
 		return row, nil
 	}
+	defer done()
 	if e.failureStrategy != "queue" {
 		// "raise": the error is returned.
 		sealed, err := e.allocateAndStore(ctx, store, e.out(), row)
@@ -584,7 +602,6 @@ func (e *Engine) storeAudit(ctx context.Context, row Row, durable bool) (Row, er
 	// lands (spec §2.1, §8). A durable emit must not return before the
 	// row is persisted, so it takes the synchronous path, and so does
 	// a row the drainer refuses.
-	gen := e.storeGen.Load()
 	d := e.activeDrainer()
 	refused := false
 	switch {
@@ -631,6 +648,41 @@ func (e *Engine) storeAudit(ctx context.Context, row Row, durable bool) (Row, er
 		"row_id":     row.ID,
 	})
 	return row, nil
+}
+
+// useAuditStore returns the audit store and its generation, and counts an
+// insert on the store until done is called; the store is not closed before
+// then. The store is nil when there is none.
+func (e *Engine) useAuditStore() (store AuditRepository, gen int64, done func()) {
+	e.storeMu.RLock()
+	defer e.storeMu.RUnlock()
+	if e.auditStore == nil {
+		return nil, 0, nil
+	}
+	e.auditInserts.Add(1)
+	return e.auditStore, e.storeGen.Load(), e.auditInserts.Done
+}
+
+// currentAuditStore returns the audit store, or nil.
+func (e *Engine) currentAuditStore() AuditRepository {
+	e.storeMu.RLock()
+	defer e.storeMu.RUnlock()
+	return e.auditStore
+}
+
+// insertsDone returns a channel closed once the inserts counted in wg have
+// returned. A nil wg counts none.
+func insertsDone(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	if wg == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
 }
 
 // GetTransport returns the active Transport (ring buffers + stdout). Nil before Init.
@@ -692,7 +744,9 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 // or purge was still running at timeout. Such a call is left to finish in
 // the background: a row it was storing is reported lost then, and the DSN
 // stores are closed once it returns. A second Close while one is running
-// waits for it, up to its own timeout, and returns the same result.
+// waits for it, up to its own timeout, and returns the same result. A later
+// Close also waits, up to its own timeout, for stores an earlier Close left
+// open, and returns false if they still are.
 func (e *Engine) Close(timeout time.Duration) bool {
 	e.drainerMu.Lock()
 	if c := e.closing; c != nil {
@@ -724,6 +778,9 @@ type closeCall struct {
 
 func (e *Engine) close(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
+	e.drainerMu.Lock()
+	earlier := e.pendingClose
+	e.drainerMu.Unlock()
 	d := e.activeDrainer()
 	var lost int64
 	if d != nil {
@@ -731,6 +788,10 @@ func (e *Engine) close(timeout time.Duration) bool {
 	}
 	e.closed.Store(true)
 	e.Flush(timeout / 2)
+	// From here an emit does not wait on a store opened from the
+	// environment, however long a call already running on it takes.
+	purged := e.cancelRetention()
+	stores, inserts := e.releaseEnvStores()
 	old, done := e.swapDrainer(nil)
 	var retiring chan struct{}
 	if old != nil {
@@ -750,20 +811,36 @@ func (e *Engine) close(timeout time.Duration) bool {
 			e.drainerMu.Unlock()
 		}
 	}
-	purged := e.cancelRetention()
-	stores := e.releaseEnvStores()
-	if !waitUntil(purged, deadline) || retiring != nil {
-		// The old drainer or a purger still uses the stores.
+	if !waitUntil(purged, deadline) || retiring != nil || !waitUntil(inserts, deadline) {
+		// The old drainer, a purger or an insert still uses the stores.
+		out := e.out()
+		pending := make(chan struct{})
+		e.drainerMu.Lock()
+		e.pendingClose = pending
+		e.drainerMu.Unlock()
 		go func() {
 			<-purged
 			if retiring != nil {
 				<-retiring
 			}
-			e.closeStores(stores)
+			<-inserts
+			e.closeStores(out, stores)
+			if earlier != nil {
+				<-earlier
+			}
+			e.drainerMu.Lock()
+			if e.pendingClose == pending {
+				e.pendingClose = nil
+			}
+			e.drainerMu.Unlock()
+			close(pending)
 		}()
 		return false
 	}
-	closed := e.closeStores(stores)
+	closed := e.closeStores(e.out(), stores)
+	if earlier != nil && !waitUntil(earlier, deadline) {
+		return false
+	}
 	return (d == nil || d.lost.Load() == lost) && closed
 }
 
@@ -830,17 +907,20 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 func (e *Engine) ResetForTests() {
 	e.uninstallDrainer()
 	e.stopRetention()
-	e.closeStores(e.releaseEnvStores())
+	stores, inserts := e.releaseEnvStores()
+	<-inserts
+	e.closeStores(e.out(), stores)
 	e.serviceID = ""
 	e.nodeID = ""
 	e.tenantID = ""
 	e.storeMu.Lock()
 	e.auditStore = nil
-	e.storeMu.Unlock()
-	e.xport.Store(nil)
+	e.auditInserts = nil
 	e.apiStore = nil
 	e.syslogStore = nil
 	e.persistedStreams = nil
+	e.storeMu.Unlock()
+	e.xport.Store(nil)
 	e.searchEnabled = false
 	atomic.StoreInt64(&e.seq, 0)
 	e.failureStrategy = ""

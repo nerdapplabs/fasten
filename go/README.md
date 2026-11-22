@@ -169,7 +169,8 @@ taken off a Postgres DSN before connecting; `?wal=false` turns WAL off on
 SQLite. A SQLite path is used as written (`%20` stays `%20`) and a
 `#fragment` is dropped, as Python's parser does. A store passed in `Config`
 wins over the environment. The scheme is compared in lower case.
-`OpenStreamStore` takes the same SQLite forms.
+`OpenStreamStore` takes the same SQLite forms. Unlike Python, JS and Rust,
+Go reads a one-letter scheme (`C:/x.db`) and a `file:` URI as a bare path.
 
 SQLite uses the `modernc.org/sqlite` driver the SDK already imports. For a
 Postgres DSN, import a `database/sql` driver registered as `postgres`:
@@ -189,7 +190,8 @@ the variable, scheme and error type only, since the driver's message can
 quote the user or database name. Every other `Init` check runs before any
 store opens. A failed `Init` keeps the stores, retention and drainer it
 had; if a store fails to open, the stores that `Init` opened are closed
-again and the files it created are removed.
+again and the database files it created are removed, leaving journal and
+WAL files alone.
 
 A re-init with the same DSN keeps the store it opened; a re-init with
 another DSN, or with a store passed in instead, closes the store it no
@@ -197,11 +199,13 @@ longer uses once the old drainer has stopped. A `SlogHandler` writes to the
 stores of the latest `Init`.
 
 `Close` stops retention and closes the stores opened from the environment;
-stores passed in `Config` stay open. A purge still running when the
-timeout passes is left to finish, its stores are closed once it returns,
-and `Close` returns false. Until the next `Init`, which opens the DSN
-stores again, sys and api rows go to the in-memory rings, and audit rows
-to stdout, unsealed; only stores passed in `Config` still receive rows.
+stores passed in `Config` stay open. A purge or insert still running when
+the timeout passes is left to finish, its stores are closed once it
+returns, and `Close` returns false. Emits do not wait for it, and a later
+`Close` waits for those stores up to its own timeout. Until the next
+`Init`, which opens the DSN stores again, sys and api rows go to the
+in-memory rings, and audit rows to stdout, unsealed; only stores passed in
+`Config` still receive rows.
 
 A set variable named like one of these but not read (`FASTEN_AUDIT_DNS`,
 `FASTEN_SYSLOG_URL`; any `FASTEN_*` name ending in `DSN`, `DNS` or `URL`)

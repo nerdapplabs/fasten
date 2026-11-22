@@ -337,7 +337,9 @@ var testHookEnvOpened func(*envStore)
 
 // openEnvStores opens the stores slots does not keep, and returns every
 // store for slots by variable. If one fails to open, the stores this call
-// opened are closed again and the files it created are removed.
+// opened are closed again and the database files it created are removed.
+// Journal and WAL files are left alone: another connection may be using
+// them.
 func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
 	next := map[string]*envStore{}
 	var opened []*envStore
@@ -347,13 +349,11 @@ func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
 			next[s.name] = s.held
 			continue
 		}
-		var files []string
+		file := ""
 		if s.d.scheme == "sqlite" {
 			if f := sqliteFile(s.d.conn); f != "" && f != ":memory:" {
-				for _, p := range []string{f, f + "-wal", f + "-shm", f + "-journal"} {
-					if _, err := os.Lstat(p); os.IsNotExist(err) {
-						files = append(files, p)
-					}
+				if _, err := os.Lstat(f); os.IsNotExist(err) {
+					file = f
 				}
 			}
 		}
@@ -361,10 +361,13 @@ func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
 		if s.name == "FASTEN_AUDIT_DSN" {
 			open = openAuditStore
 		}
+		// A store that fails to open has closed its handle.
 		es, err := open(s.d)
-		created = append(created, files...)
+		if file != "" {
+			created = append(created, file)
+		}
 		if err != nil {
-			e.closeStores(opened)
+			e.closeStores(e.out(), opened)
 			for _, p := range created {
 				os.Remove(p)
 			}
@@ -393,25 +396,28 @@ func (e *Engine) unusedEnvStores(next map[string]*envStore) []*envStore {
 }
 
 // releaseEnvStores stops using the stores Init opened from the environment,
-// and returns them for the caller to close once nothing writes to them.
-// Later sys and api rows go to the rings only, and audit rows to stdout
-// only. Stores passed in Config are kept.
-func (e *Engine) releaseEnvStores() []*envStore {
+// and returns them for the caller to close once nothing writes to them,
+// with a channel closed once the inserts running on the audit store among
+// them have returned. Later sys and api rows go to the rings only, and
+// audit rows to stdout only. Stores passed in Config are kept.
+func (e *Engine) releaseEnvStores() ([]*envStore, <-chan struct{}) {
 	stores := e.unusedEnvStores(nil)
 	held := e.envStores
 	e.envStores = nil
 	if len(stores) == 0 {
-		return nil
+		return nil, insertsDone(nil)
 	}
 	isEnv := func(name string, store any) bool {
 		h := held[name]
 		return h != nil && store != nil && h.store == store
 	}
+	var inserts *sync.WaitGroup
 	e.storeMu.Lock()
+	defer e.storeMu.Unlock()
 	if isEnv("FASTEN_AUDIT_DSN", e.auditStore) {
-		e.auditStore = nil
+		inserts = e.auditInserts
+		e.auditStore, e.auditInserts = nil, nil
 	}
-	e.storeMu.Unlock()
 	if isEnv("FASTEN_API_DSN", e.apiStore) {
 		e.apiStore = nil
 	}
@@ -422,16 +428,17 @@ func (e *Engine) releaseEnvStores() []*envStore {
 		e.xport.Store(x.withStores(e.apiStore, e.syslogStore))
 	}
 	e.persistedStreams = persistedStreams(e.auditStore, e.apiStore, e.syslogStore)
-	return stores
+	return stores, insertsDone(inserts)
 }
 
-// closeStores closes stores. It returns false if a close failed.
-func (e *Engine) closeStores(stores []*envStore) bool {
+// closeStores closes stores, reporting a failure to out. It returns false
+// if a close failed.
+func (e *Engine) closeStores(out sysOut, stores []*envStore) bool {
 	ok := true
 	for _, s := range stores {
 		if err := s.db.Close(); err != nil {
 			ok = false
-			e.drainerSysLog("error", "store_close_failed", map[string]any{
+			e.sysLogTo(out, "error", "store_close_failed", map[string]any{
 				"variable":   s.name,
 				"error_type": errorType(err),
 			})

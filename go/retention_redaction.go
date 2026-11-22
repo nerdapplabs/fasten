@@ -81,9 +81,7 @@ func ensureRedactionCode() error {
 // The record is written first. If that fails nothing is destroyed; if the
 // destroy fails the data is intact and the next run picks it up again.
 func (e *Engine) RedactExpired(ctx context.Context, before time.Time, reason string) ([]string, error) {
-	e.storeMu.RLock()
-	audit := e.auditStore
-	e.storeMu.RUnlock()
+	audit := e.currentAuditStore()
 	store, ok := audit.(RedactionRepository)
 	if !ok {
 		return nil, fmt.Errorf(
