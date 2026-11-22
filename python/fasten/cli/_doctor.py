@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
-from ..store.sqlite import dsn_scheme, sqlite_dsn_path
+from ..store.sqlite import dsn_scheme, is_keyword_dsn, sqlite_dsn_path
 
 
 @dataclass
@@ -134,6 +134,8 @@ def _check_env() -> CheckResult:
 def _scheme_failure(name: str, dsn: str) -> CheckResult | None:
     """A failed check for a DSN init refuses for its scheme or form. The
     message names the scheme only when the DSN has one."""
+    if is_keyword_dsn(dsn):
+        return CheckResult(name=name, status="fail", message=_KEYWORD_DSN)
     try:
         scheme = dsn_scheme(dsn)
     except ValueError:
@@ -158,11 +160,12 @@ def _check_audit_dsn() -> CheckResult:
     failed = _scheme_failure("audit_dsn", dsn)
     if failed:
         return failed
+    scheme = urlparse(dsn).scheme.lower()
     try:
         path = sqlite_dsn_path(dsn)
     except ValueError:
         path = ""
-    return _check_store("audit_dsn", dsn, dsn.startswith(("postgres://", "postgresql://")),
+    return _check_store("audit_dsn", dsn, scheme in ("postgres", "postgresql"),
                         path, "audit_log")
 
 

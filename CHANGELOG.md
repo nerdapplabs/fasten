@@ -15,6 +15,13 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Python's `FASTEN_AUDIT_DSN` refuses an unknown scheme or form, as
   `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` do, instead of opening a SQLite
   file, and `fasten doctor` reports it.
+- Python's `FASTEN_AUDIT_DSN` opens Postgres when its scheme is `postgres`
+  or `postgresql` in any case, such as `POSTGRES://...`, as the stream DSNs
+  do, instead of a SQLite file, and `fasten doctor` describes it the same
+  way.
+- Python refuses libpq's keyword form (`host=db dbname=app`) in
+  `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, as JS, Rust
+  and Go do, instead of opening a SQLite file named after it.
 
 ### Changed: JS (breaking for existing callers)
 

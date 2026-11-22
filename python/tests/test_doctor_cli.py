@@ -37,14 +37,17 @@ def test_postgres_dsn_password_is_never_printed(doctor_env, monkeypatch, capsys,
     assert list(tmp_path.iterdir()) == []  # a postgres DSN never creates a SQLite file
 
 
-def test_uppercase_scheme_is_described_as_init_opens_it(doctor_env, monkeypatch, capsys):
-    monkeypatch.setenv("FASTEN_AUDIT_DSN", "POSTGRES://app:s3cret@h")
+@pytest.mark.parametrize("scheme", ["Postgres", "POSTGRES"])
+def test_uppercase_scheme_is_described_as_init_opens_it(doctor_env, monkeypatch, capsys,
+                                                        tmp_path, scheme):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", f"{scheme}://app:s3cret@127.0.0.1:1/audit")
     out = _run(capsys)
-    assert "sqlite (path hidden" in out and "s3cret" not in out
+    assert "audit_dsn     postgres" in out and "s3cret" not in out
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_sqlite_path_with_credentials_is_not_printed(doctor_env, monkeypatch, capsys):
-    monkeypatch.setenv("FASTEN_AUDIT_DSN", "Postgresql://app:ab/cdEFGH@db")
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite://app:ab/cdEFGH@db")
     out = _run(capsys)
     assert "cdEFGH" not in out and "sqlite (path hidden" in out
 
@@ -134,6 +137,33 @@ def test_an_unsupported_api_dsn_scheme_fails(doctor_env, monkeypatch, capsys):
     monkeypatch.setenv("FASTEN_API_DSN", "mysql://db/api")
     out = _run(capsys)
     assert "unsupported DSN scheme 'mysql'" in out
+
+
+def test_an_unsupported_audit_dsn_scheme_names_only_the_scheme(doctor_env, monkeypatch, capsys,
+                                                               tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "mysql://u:hunter2@db/app")
+    out = _run(capsys)
+    assert out.count("unsupported DSN scheme 'mysql'") == 2
+    assert not any(w in out for w in ("hunter2", "u:", "@db", "/app"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unparseable_dsn_is_reported_without_it(doctor_env, monkeypatch, capsys, tmp_path):
+    dsn = "postgresql://admin:s3\uff20cret@db.internal/app"
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
+    monkeypatch.setenv("FASTEN_API_DSN", dsn)
+    out = _run(capsys)
+    assert out.count("unparseable DSN") == 4
+    assert not any(w in out for w in ("admin", "s3", "cret", "db.internal"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_libpq_keyword_dsn_with_an_at_sign_is_reported_as_init_refuses_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "host=db password=s3@cret")
+    out = _run(capsys)
+    assert "s3@cret" not in out and out.count("unrecognised DSN") == 2
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("dsn", [

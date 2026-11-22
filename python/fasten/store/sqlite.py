@@ -120,6 +120,15 @@ def _create_owner_only(path: str | os.PathLike[str]) -> None:
     os.close(fd)
 
 
+_KEYWORD_FORM = re.compile(r"\s*[A-Za-z_]+\s*=")
+
+
+def is_keyword_dsn(dsn: str) -> bool:
+    """True for libpq's keyword form (host=db dbname=app), which no store
+    reads."""
+    return _KEYWORD_FORM.match(dsn) is not None
+
+
 def dsn_scheme(dsn: str) -> str | None:
     """The scheme of a store DSN, lowercased, or "" for a bare path. None
     when the text before the colon is none of the store schemes and "//"

@@ -99,9 +99,25 @@ def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
 def _check_dsn_scheme(dsn: str, kind: str, file: str) -> str:
     """The DSN's scheme (see dsn_scheme). Raises ValueError for any other
     scheme or form; the message names the scheme only when the DSN has one."""
-    from .store.sqlite import dsn_scheme
+    from .store.sqlite import dsn_scheme, is_keyword_dsn
 
-    scheme = dsn_scheme(dsn)
+    if is_keyword_dsn(dsn):
+        raise ValueError(
+            f"fasten: {kind} DSN in libpq keyword form not supported. "
+            f"Use postgres://user@host/db, sqlite:///./{file}, or a bare filesystem path."
+        )
+    try:
+        scheme = dsn_scheme(dsn)
+        parsed = True
+    except ValueError:
+        # Raised below, outside this handler, so the parser's error, which
+        # can quote the DSN, is not attached to it.
+        scheme, parsed = None, False
+    if not parsed:
+        raise ValueError(
+            f"fasten: {kind} DSN could not be parsed. "
+            f"Use postgres://..., sqlite:///./{file}, or a bare filesystem path."
+        )
     if scheme is None:
         raise ValueError(
             f"fasten: {kind} DSN form not recognised. "
@@ -118,9 +134,11 @@ def _check_dsn_scheme(dsn: str, kind: str, file: str) -> str:
 
 def _store_from_dsn(dsn: str) -> Any:
     """Return the correct store implementation for a given DSN."""
-    _check_dsn_scheme(dsn, "audit", "audit.db")
-    if dsn.startswith(("postgres://", "postgresql://")):
+    scheme = _check_dsn_scheme(dsn, "audit", "audit.db")
+    if scheme in ("postgres", "postgresql"):
         from .store.postgres import PostgresStore
+        # from_dsn rebuilds the URL with urlunparse, which writes the scheme
+        # in lowercase: libpq reads a URL only in that case.
         return PostgresStore.from_dsn(dsn)
     from .store.sqlite import SQLiteStore
     return SQLiteStore.from_dsn(dsn)
@@ -148,7 +166,6 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     """
     from urllib.parse import parse_qs, urlparse
 
-    u = urlparse(dsn)
     scheme = _check_dsn_scheme(dsn, "stream", "streams.db")
     if scheme in ("postgres", "postgresql"):
         from .store.stream_postgres import PostgresStreamStore
@@ -157,6 +174,7 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
 
     from .store.sqlite import sqlite_dsn_path
 
+    u = urlparse(dsn)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     path = sqlite_dsn_path(dsn)
     if not path:
