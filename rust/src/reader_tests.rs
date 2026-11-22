@@ -683,10 +683,13 @@ fn request_debug_leaves_out_credential_headers() {
         .with_header("Authorization", "Bearer s3cret-token")
         .with_header("COOKIE", "session=s3cret-cookie")
         .with_header("proxy-authorization", "Basic s3cret-proxy")
+        .with_header("X-API-Key", "s3cret-key")
+        .with_header("x-auth-token", "s3cret-auth-token")
         .with_header("X-Tenant", "t1");
     let text = format!("{req:?}");
     assert!(!text.contains("s3cret"), "{text}");
-    for shown in ["Authorization", "COOKIE", "proxy-authorization", "X-Tenant", "t1", "/audit", "limit=5", "GET"] {
+    let shown = ["Authorization", "COOKIE", "proxy-authorization", "X-API-Key", "x-auth-token", "X-Tenant", "t1"];
+    for shown in shown.into_iter().chain(["/audit", "limit=5", "GET"]) {
         assert!(text.contains(shown), "{shown} missing from {text}");
     }
     // The values are still there for the reader.

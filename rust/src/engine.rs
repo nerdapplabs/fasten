@@ -216,6 +216,9 @@ struct EnvStores {
     audit:  EnvStore<dyn AuditStore>,
     api:    EnvStore<dyn StreamStore>,
     syslog: EnvStore<dyn StreamStore>,
+    /// How many inits have installed their stores, so `close` can tell
+    /// whether one ran after it started.
+    installs: u64,
 }
 
 /// The value of the DSN variable `name` in `env`, unless it is empty.
@@ -281,7 +284,7 @@ impl Engine {
             config:  Mutex::new(None),
             drainer: Mutex::new(None),
             purger:  Mutex::new(None),
-            env_stores: Mutex::new(EnvStores { audit: None, api: None, syslog: None }),
+            env_stores: Mutex::new(EnvStores { audit: None, api: None, syslog: None, installs: 0 }),
             streams: Mutex::new(None),
             stream_purgers: Mutex::new(Vec::new()),
             audit_swallowed: AtomicBool::new(false),
@@ -369,7 +372,8 @@ impl Engine {
                 crate::streams::open_stream_store("FASTEN_SYSLOG_DSN", dsn, "syslog")
             })?;
         check_persist_streams(persist_streams.as_deref(), api_store.is_some(), syslog_store.is_some())?;
-        *held = EnvStores { audit: audit_env, api: api_env, syslog: syslog_env };
+        let installs = held.installs.wrapping_add(1);
+        *held = EnvStores { audit: audit_env, api: api_env, syslog: syslog_env, installs };
         drop(held);
         cfg.audit_store = audit_store;
 
@@ -579,6 +583,8 @@ impl Engine {
     /// goes to stdout only, unsealed. The next `init` opens the DSN stores
     /// again.
     pub fn close(&self, timeout: Duration) -> bool {
+        // Read first: the stores of an init that runs while this closes stay.
+        let installs = self.env_stores.lock_or_recover().installs;
         let deadline = std::time::Instant::now() + timeout;
         let flushed = self.flush(timeout);
         self.stop_purger();
@@ -589,35 +595,44 @@ impl Engine {
         if let Some(d) = old {
             d.stop(deadline.saturating_duration_since(std::time::Instant::now()));
         }
-        self.release_env_stores();
+        #[cfg(test)]
+        if let Some(f) = BEFORE_RELEASE.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+        self.release_env_stores(installs);
         flushed && written
     }
 
     /// Let go of the stores opened from DSN variables, in the env store
-    /// table and in the config. A store dropped here closes once the
-    /// last call using it returns.
-    fn release_env_stores(&self) {
-        let held = std::mem::replace(
-            &mut *self.env_stores.lock_or_recover(),
-            EnvStores { audit: None, api: None, syslog: None },
-        );
+    /// table and in the config, unless an init has installed stores since
+    /// `installs` was read. A store dropped here closes once the last call
+    /// using it returns.
+    fn release_env_stores(&self, installs: u64) {
+        let mut env = self.env_stores.lock_or_recover();
+        if env.installs != installs {
+            return;
+        }
+        let (audit, api, syslog) = (env.audit.take(), env.api.take(), env.syslog.take());
         fn same<S: ?Sized>(a: &Option<Arc<S>>, b: &EnvStore<S>) -> bool {
             match (a, b) {
                 (Some(a), Some((_, b))) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
                 _ => false,
             }
         }
+        // The env store lock is still held, so no init installs stores
+        // before the config is changed.
         if let Some(cfg) = self.config.lock_or_recover().as_mut() {
-            if same(&cfg.audit_store, &held.audit) {
+            if same(&cfg.audit_store, &audit) {
                 cfg.audit_store = None;
             }
-            if same(&cfg.api_store, &held.api) {
+            if same(&cfg.api_store, &api) {
                 cfg.api_store = None;
             }
-            if same(&cfg.syslog_store, &held.syslog) {
+            if same(&cfg.syslog_store, &syslog) {
                 cfg.syslog_store = None;
             }
         }
+        drop(env);
     }
 
     pub fn reset_for_tests(&self) {
@@ -629,7 +644,9 @@ impl Engine {
         }
         self.audit_swallowed.store(false, Ordering::Relaxed);
         *self.config.lock_or_recover() = None;
-        *self.env_stores.lock_or_recover() = EnvStores { audit: None, api: None, syslog: None };
+        let mut env = self.env_stores.lock_or_recover();
+        let installs = env.installs;
+        *env = EnvStores { audit: None, api: None, syslog: None, installs };
     }
 
     fn stop_stream_purgers(&self) {
@@ -794,6 +811,14 @@ fn write_sys(
         use std::io::Write as _;
         let _ = writeln!(std::io::stderr().lock(), "{payload}");
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run by `close` on this thread after it stops the writers and before
+    /// it releases the stores opened from DSN variables.
+    pub(crate) static BEFORE_RELEASE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

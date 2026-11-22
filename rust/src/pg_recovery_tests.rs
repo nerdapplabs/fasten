@@ -376,3 +376,60 @@ fn a_purge_runs_once_and_says_when_its_outcome_is_unknown() {
     assert_eq!(store.chain_rows("node-q").unwrap().len(), 2, "the purge ran again");
     assert_eq!(store.purge(cutoff, false).unwrap(), 2);
 }
+
+/// A login role no other test uses; it and what it owns are dropped when
+/// the test ends.
+struct Role(String, String);
+
+impl Drop for Role {
+    fn drop(&mut self) {
+        let _ = client(&self.0).batch_execute(&format!("DROP OWNED BY {0}; DROP ROLE IF EXISTS {0}", self.1));
+    }
+}
+
+// A failed reconnect is reported by error type. The driver's message, which
+// here names the role, is left out.
+#[test]
+fn a_failed_reconnect_is_reported_by_error_type() {
+    let Some(dsn) = dsn() else { return };
+    let role = table("rec_role");
+    let mut admin = client(&dsn);
+    admin
+        .batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'pw'; GRANT CREATE ON SCHEMA public TO {role}"))
+        .unwrap();
+    let _role = Role(dsn.clone(), role.clone());
+    let as_role = with_param(&dsn, &format!("user={role}&password=pw"));
+    let (store, app, _drop) = store(&as_role, "rec_reconnect");
+    let stream_app = table("rec_stream");
+    let streams =
+        crate::PostgresStreamStore::new(&with_param(&as_role, &format!("application_name={stream_app}")), &stream_app)
+            .unwrap();
+    let users: Vec<String> = admin
+        .query("SELECT usename::text FROM pg_stat_activity WHERE application_name IN ($1, $2)", &[&app, &stream_app])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(users, [role.clone(), role.clone()]);
+    store.allocate_and_insert_originated(&row("f-1", "node-f")).unwrap();
+
+    admin.batch_execute(&format!("ALTER ROLE {role} NOLOGIN")).unwrap();
+    assert_eq!(terminate(&dsn, &app), 1);
+    assert_eq!(terminate(&dsn, &stream_app), 1);
+
+    let cutoff = "2021-01-01T00:00:00Z".parse().unwrap();
+    let errs = [
+        store.purge(cutoff, false).unwrap_err(),
+        store.chain_rows("node-f").unwrap_err(),
+        store.allocate_and_insert_originated(&row("f-2", "node-f")).unwrap_err(),
+        crate::StreamStore::count(&streams).unwrap_err(),
+    ];
+    let texts: Vec<String> = errs.iter().map(ToString::to_string).collect();
+    assert_eq!(texts, [
+        "audit store purge: cannot connect again (AuditStoreInsert)",
+        "audit store: cannot connect again (AuditStoreInsert)",
+        "audit store: cannot connect again (AuditStoreInsert)",
+        "stream store: cannot connect again (StreamStore)",
+    ]);
+    assert!(texts.iter().all(|t| !t.contains(&role)), "{texts:?}");
+}

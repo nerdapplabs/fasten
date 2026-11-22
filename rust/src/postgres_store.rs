@@ -404,11 +404,11 @@ impl PostgresStore {
     fn retry<T>(&self, mut f: impl FnMut(&mut pg::Client) -> Result<T, Fail>) -> Result<T, Fail> {
         let mut client = self.lock();
         if client.is_closed() {
-            *client = connect(&self.dsn)?;
+            *client = reconnect(&self.dsn, crate::Error::AuditStoreInsert)?;
         }
         match f(&mut client) {
             Err(Fail::Lost(_)) => {
-                *client = connect(&self.dsn)?;
+                *client = reconnect(&self.dsn, crate::Error::AuditStoreInsert)?;
                 f(&mut client)
             }
             other => other,
@@ -750,6 +750,13 @@ fn connect(dsn: &str) -> Result<pg::Client, crate::Error> {
         fasten_core::error::Error::Postgres(e) => pg_err(e),
         other => crate::Error::AuditStoreInsert(other.to_string()),
     })
+}
+
+/// A client to replace a lost or closed one. A failed reconnect is reported
+/// by error type, since the driver's message can name the user; `wrap` makes
+/// the error for the call that needed it.
+fn reconnect(dsn: &str, wrap: fn(String) -> crate::Error) -> Result<pg::Client, crate::Error> {
+    connect(dsn).map_err(|e| wrap(format!("cannot connect again ({})", crate::retention::error_type(&e))))
 }
 
 fn where_of(conds: &[String]) -> String {
@@ -1151,7 +1158,7 @@ impl crate::AuditStore for PostgresStore {
         let mut client = self.lock();
         // A connection that ended while idle is replaced before the DELETE.
         if client.is_closed() || client.is_valid(VALID_TIMEOUT).is_err() {
-            *client = connect(&self.dsn).map_err(|e| crate::Error::AuditStorePurge(e.to_string()))?;
+            *client = reconnect(&self.dsn, crate::Error::AuditStorePurge)?;
         }
         // Not run again after a lost connection: the DELETE may have
         // committed, and a second run would return only what it deleted.

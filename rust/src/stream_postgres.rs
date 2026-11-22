@@ -73,6 +73,12 @@ fn connect(dsn: &str) -> Result<pg::Client, Error> {
     })
 }
 
+/// A client to replace a lost or closed one. A failed reconnect is reported
+/// by error type, since the driver's message can name the user.
+fn reconnect(dsn: &str) -> Result<pg::Client, Error> {
+    connect(dsn).map_err(|e| Error::StreamStore(format!("cannot connect again ({})", crate::retention::error_type(&e))))
+}
+
 fn params(values: &[StreamParam]) -> Vec<Box<dyn ToSql + Sync>> {
     values
         .iter()
@@ -131,7 +137,7 @@ impl PostgresStreamStore {
         for attempt in 0..2 {
             if guard.as_ref().is_none_or(pg::Client::is_closed) {
                 *guard = None;
-                *guard = Some(connect(&self.dsn)?);
+                *guard = Some(reconnect(&self.dsn)?);
             }
             let Some(client) = guard.as_mut() else { break };
             match f(client) {

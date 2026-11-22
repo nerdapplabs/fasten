@@ -45,7 +45,10 @@ const SEARCH_STREAMS: [&str; 3] = ["audit", "api", "sys"];
 /// a struct literal ending in `..Default::default()`.
 ///
 /// Its `Debug` output lists every header name but leaves out the values of
-/// `Authorization`, `Cookie` and `Proxy-Authorization`.
+/// exactly these headers, matched without regard to case: `Authorization`,
+/// `Cookie`, `Proxy-Authorization`, `X-Api-Key` and `X-Auth-Token`. The
+/// query is printed as received, so a caller that puts credentials in the
+/// query must not log requests.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Request {
     pub method: String,
@@ -57,7 +60,7 @@ pub struct Request {
 }
 
 /// Headers whose values `Request`'s `Debug` leaves out.
-const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+const CREDENTIAL_HEADERS: [&str; 5] = ["authorization", "cookie", "proxy-authorization", "x-api-key", "x-auth-token"];
 
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

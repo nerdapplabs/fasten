@@ -140,9 +140,11 @@ pub(crate) fn params(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The value of the last `name` parameter, unless it is empty.
+/// The value of the first `name` parameter that is not empty, as Python's
+/// `parse_qs` reads it: empty values are dropped and the first one left is
+/// used.
 fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    params.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
+    params.iter().find(|(k, v)| k == name && !v.is_empty()).map(|(_, v)| v.as_str())
 }
 
 /// Parse a store DSN; `default_table` is the table when the DSN names none
@@ -309,6 +311,15 @@ mod tests {
         assert_eq!(parse_dsn("/var/a.db?table=t1", "audit_log"), Ok(sqlite("/var/a.db", "t1", true)));
         assert_eq!(parse_dsn("./a.db", "api_log"), Ok(sqlite("./a.db", "api_log", true)));
         assert_eq!(parse_dsn("sqlite:///a.db?table=&wal=true", "syslog"), Ok(sqlite("a.db", "syslog", true)));
+        // A repeated parameter: the first value that is not empty.
+        assert_eq!(parse_dsn("/var/a.db?table=a&table=b", "audit_log"), Ok(sqlite("/var/a.db", "a", true)));
+        assert_eq!(parse_dsn("/var/a.db?table=&table=b&table=c", "audit_log"), Ok(sqlite("/var/a.db", "b", true)));
+        assert_eq!(parse_dsn("/var/a.db?table&table=b", "audit_log"), Ok(sqlite("/var/a.db", "b", true)));
+        assert_eq!(parse_dsn("/var/a.db?wal=false&wal=true", "audit_log"), Ok(sqlite("/var/a.db", "audit_log", false)));
+        assert_eq!(
+            parse_dsn("postgres://db/app?table=a&sslmode=disable&table=b", "audit_log"),
+            Ok(Dsn::Postgres { url: "postgres://db/app?sslmode=disable".into(), table: "a".into() })
+        );
         assert_eq!(
             parse_dsn("postgres://u:p@db/app?table=audit.rows&sslmode=disable", "audit_log"),
             Ok(Dsn::Postgres { url: "postgres://u:p@db/app?sslmode=disable".into(), table: "audit.rows".into() })
@@ -642,6 +653,44 @@ mod init_tests {
         e.init_with_env(Config { audit_store: Some(mine.clone()), ..config("dsn-close") }, &[]).unwrap();
         e.close(std::time::Duration::from_secs(5));
         assert!(Arc::ptr_eq(&mine, &store_of(&e).unwrap()));
+    }
+
+    // An init that runs while close is closing keeps its stores, whether it
+    // kept the same ones or opened others. The hook runs it after close has
+    // stopped the writers, just before close releases the DSN stores.
+    #[test]
+    fn close_leaves_the_stores_of_an_init_that_runs_meanwhile() {
+        let dir = TempDir::new();
+        let e: &'static Engine = Box::leak(Box::new(Engine::new()));
+        let vars_in = |audit: &str, sys: &str| {
+            env(&[
+                ("FASTEN_AUDIT_DSN", &format!("{}", dir.0.join(audit).display())),
+                ("FASTEN_SYSLOG_DSN", &format!("{}", dir.0.join(sys).display())),
+            ])
+        };
+        let first = vars_in("a.db", "s.db");
+        for (vars, same) in [(first.clone(), true), (vars_in("b.db", "t.db"), false)] {
+            e.init_with_env(config("dsn-race"), &first).unwrap();
+            let old = store_of(e).unwrap();
+            let during = vars.clone();
+            crate::engine::BEFORE_RELEASE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || e.init_with_env(config("dsn-race"), &during).unwrap()));
+            });
+            e.close(std::time::Duration::from_secs(5));
+            let (audit, sys) = {
+                let cfg = e.current_config().unwrap();
+                (cfg.audit_store.expect("the audit store of the init that ran meanwhile"), cfg.syslog_store)
+            };
+            assert!(sys.is_some(), "the syslog store of the init that ran meanwhile");
+            assert_eq!(Arc::ptr_eq(&old, &audit), same);
+
+            // Still held: init with its DSN keeps it, and the next close
+            // releases it.
+            e.init_with_env(config("dsn-race"), &vars).unwrap();
+            assert!(Arc::ptr_eq(&audit, &store_of(e).unwrap()));
+            assert!(e.close(std::time::Duration::from_secs(5)));
+            assert!(store_of(e).is_none());
+        }
     }
 
     #[cfg(feature = "store-postgres")]
