@@ -92,6 +92,9 @@ type Transport struct {
 	retired bool
 	next    *Transport
 	pushes  sync.WaitGroup
+	// replaced, set by the engine, is closed once the pushes on the
+	// transports this one replaced have returned. Nil when there were none.
+	replaced <-chan struct{}
 }
 
 func NewTransport(maxlen int) *Transport {

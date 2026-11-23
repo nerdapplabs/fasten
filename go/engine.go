@@ -714,14 +714,21 @@ func insertsDone(wg *sync.WaitGroup) <-chan struct{} {
 }
 
 // swapTransport makes x the transport and retires the previous one, which
-// it returns with a channel closed once the pushes running on it have
-// returned.
+// it returns with a channel closed once the pushes running on it, and on
+// the transports it replaced, have returned.
 func (e *Engine) swapTransport(x *Transport) (*Transport, <-chan struct{}) {
 	prev := e.xport.Swap(x)
 	if prev == nil {
 		return nil, insertsDone(nil)
 	}
-	return prev, prev.retire(x)
+	done := prev.retire(x)
+	if prev.replaced != nil {
+		done = allDone(done, prev.replaced)
+	}
+	if x != nil {
+		x.replaced = done
+	}
+	return prev, done
 }
 
 // allDone returns a channel closed once every channel in chs is closed.
