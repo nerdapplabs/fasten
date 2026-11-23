@@ -14,28 +14,32 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   with `?table=` and `?wal=false`. `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`
   take the same forms, now including Postgres. A Postgres DSN needs a
   `database/sql` driver registered as `postgres` (for example
-  `import _ "github.com/lib/pq"`); without one, `Init` says so. A store
-  passed in `Config` still wins.
+  `import _ "github.com/lib/pq"`, or pgx's driver registered under that
+  name); without one, `Init` says so. A store passed in `Config` still
+  wins.
 - `Init` checks every DSN, and everything else it can refuse, before
   opening any store. An unknown scheme, libpq's keyword form, a missing
   path or directory, or an invalid table name is an `Init` error naming the
-  variable and no part of the DSN; DSN errors name a scheme only when the
-  DSN has one. A store that cannot be opened is reported by the variable,
-  scheme and error type; the stores that `Init` opened are closed again and
-  the database files it created are removed, leaving journal and WAL files
-  alone. A failed `Init` keeps the stores, retention and drainer it had.
+  variable and no part of the DSN; a DSN error names a scheme only when
+  `//` follows it. A store that cannot be opened is reported by the
+  variable, scheme and error type; the stores that `Init` opened are closed
+  again, and their files are left in place. A failed `Init` keeps the
+  stores, retention and drainer it had.
 - SQLite DSN paths, in `Init` and `OpenStreamStore`, are used as written:
   `%20` is not decoded, a lone `%` is accepted, and a `#fragment` is
   dropped, as in Python, JS and Rust.
 - For existing `OpenStreamStore` callers: `?table=` and `?wal=false` on a
-  bare path are now honoured (they used to be passed to the driver),
-  `file:///abs/path.db` URIs are accepted, and a bare path that starts like
-  a scheme (`name:rest`) is refused, as in Python.
+  bare path are now honoured (they used to be passed to the driver), and a
+  DSN that starts like a scheme (`name:rest`) is refused, as in Python, JS
+  and Rust. That includes a SQLite `file:` URI and a drive letter
+  (`C:/x.db`); use `sqlite:///` or a bare path instead.
 - `Init` again with the same DSN keeps its store; with another DSN, the old
-  store is closed. A `SlogHandler` follows `Init` and `Close`: it writes to
-  the stores of the latest `Init`, not those it was created with.
+  store is closed once the writes running on it have returned, and later
+  rows go to the new store. A `SlogHandler` follows `Init` and `Close`: it
+  writes to the stores of the latest `Init`, not those it was created with.
+  `Init` can run while other goroutines emit and log.
 - `Close` now also stops retention and closes the stores opened from the
-  environment, within its timeout: a purge or insert still running is left
+  environment, within its timeout: a purge or write still running is left
   to finish, its stores are closed once it returns, and `Close` returns
   false. Emits do not wait for it, and a later `Close` waits for those
   stores up to its own timeout. Until the next `Init`, rows for those

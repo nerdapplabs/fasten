@@ -169,15 +169,15 @@ DSN forms of the Python SDK:
 | DSN | Store |
 |---|---|
 | `postgres://...` or `postgresql://...` | `PostgresStore`, or `PostgresStreamStore` for the streams |
-| `sqlite:///./rel.db`, `sqlite:////abs/path.db`, `/abs/path.db`, `file:` URI | `SQLiteStore`, or `StreamStore` |
+| `sqlite:///./rel.db`, `sqlite:////abs/path.db`, `/abs/path.db` | `SQLiteStore`, or `StreamStore` |
 
 `?table=` names the table (default `audit_log`, `api_log`, `syslog`) and is
 taken off a Postgres DSN before connecting; `?wal=false` turns WAL off on
 SQLite. A SQLite path is used as written (`%20` stays `%20`) and a
 `#fragment` is dropped, as Python's parser does. A store passed in `Config`
 wins over the environment. The scheme is compared in lower case.
-`OpenStreamStore` takes the same SQLite forms. Unlike Python, JS and Rust,
-Go reads a one-letter scheme (`C:/x.db`) and a `file:` URI as a bare path.
+`OpenStreamStore` takes the same SQLite forms. As in Python, JS and Rust, a
+`file:` URI and a drive letter (`C:/x.db`) are refused.
 
 SQLite uses the `modernc.org/sqlite` driver the SDK already imports. For a
 Postgres DSN, import a `database/sql` driver registered as `postgres`:
@@ -186,27 +186,44 @@ Postgres DSN, import a `database/sql` driver registered as `postgres`:
 import _ "github.com/lib/pq"
 ```
 
+pgx registers itself as `pgx`, so with pgx register its driver under
+`postgres` as well. Only one driver can be registered as `postgres`, so do
+not also import lib/pq:
+
+```go
+import (
+	"database/sql"
+
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+func init() { sql.Register("postgres", stdlib.GetDefaultDriver()) }
+```
+
 `Init` checks every DSN before it opens any store. Any other scheme
 (`mysql://`, `postgresql+psycopg://`), libpq's keyword form (`host=db
 dbname=app`), a SQLite DSN with no path or in a directory that does not
 exist, a table name that is not an SQL identifier, and a Postgres DSN with
 no driver registered make `Init` return an error naming the variable and
-no part of the DSN; DSN errors name a scheme only when the DSN has one. A
-store that cannot be opened (a wrong host or password) fails `Init` with
-the variable, scheme and error type only, since the driver's message can
-quote the user or database name. Every other `Init` check runs before any
+no part of the DSN. A DSN error names a scheme only when `//` follows it,
+or when it is `sqlite`, `postgres` or `postgresql`; otherwise it says
+"DSN form not recognised", as for `host:5432/db`, `file:a.db` or
+`C:/x.db`. A store that cannot be opened (a wrong host or password) fails
+`Init` with the variable, scheme and error type only, since the driver's
+message can quote the user or database name. Every other `Init` check runs before any
 store opens. A failed `Init` keeps the stores, retention and drainer it
 had; if a store fails to open, the stores that `Init` opened are closed
-again and the database files it created are removed, leaving journal and
-WAL files alone.
+again and their files are left in place.
 
 A re-init with the same DSN keeps the store it opened; a re-init with
 another DSN, or with a store passed in instead, closes the store it no
-longer uses once the old drainer has stopped. A `SlogHandler` writes to the
-stores of the latest `Init`.
+longer uses once the old drainer has stopped and the inserts and stream
+writes running on it have returned. A `SlogHandler` writes to the stores of
+the latest `Init`, and so does a sys or api row pushed through the
+`Transport` the re-init replaced.
 
 `Close` stops retention and closes the stores opened from the environment;
-stores passed in `Config` stay open. A purge or insert still running when
+stores passed in `Config` stay open. A purge or write still running when
 the timeout passes is left to finish, its stores are closed once it
 returns, and `Close` returns false. Emits do not wait for it, and a later
 `Close` waits for those stores up to its own timeout. Until the next
