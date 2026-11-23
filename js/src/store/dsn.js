@@ -59,7 +59,9 @@ function _postgres(dsn, defaultTable) {
 const _SCHEMES = ["sqlite", "postgres", "postgresql", ""];
 
 // The DSN split, after checking its scheme. The error names the scheme
-// only: the rest of a DSN can hold a password.
+// only, since the rest of a DSN can hold a password, and only when "//"
+// follows it: in user:password@host/db or host:5432/db the text before the
+// colon is not a scheme.
 function _checked(dsn, kind) {
 	const file = kind === "stream" ? "streams.db" : "audit.db";
 	// libpq's keyword form ("host=db dbname=app"): pg reads only URLs.
@@ -70,6 +72,11 @@ function _checked(dsn, kind) {
 	}
 	const d = _split(dsn);
 	if (!_SCHEMES.includes(d.scheme)) {
+		if (!dsn.slice(d.scheme.length + 1).startsWith("//")) {
+			throw new Error(
+				`fasten: ${kind} DSN form not recognised. Use postgres://..., sqlite:///./${file}, or a bare filesystem path.`,
+			);
+		}
 		throw new Error(
 			`fasten: ${kind} DSN scheme '${d.scheme}' not supported. Use sqlite:///./${file}, postgres://..., or a bare filesystem path.`,
 		);

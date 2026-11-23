@@ -113,7 +113,11 @@ export class SqliteStreamStore {
 			);
 		}
 		if (path !== ":memory:" && !path.startsWith("file:")) {
-			closeSync(openSync(path, "a", 0o600));
+			try {
+				closeSync(openSync(path, "a", 0o600));
+			} catch {
+				// SQLite reports it, without the path, as SqliteStore does.
+			}
 		}
 		this._table = table;
 		this._db = new (_sqlite().DatabaseSync)(path, { timeout: busyTimeoutMs });

@@ -230,6 +230,51 @@ describe('an audit DSN with an unknown scheme is an error, as a stream DSN is', 
         }
     });
 
+    test('DSN errors name a scheme only when the DSN has one', async () => {
+        const words = ['admin', 's3cret', 'db.internal', 'user', 'pw', 'host', 'hunter2'];
+        const cwd = process.cwd();
+        const dir = mkdtempSync(join(DIR, 'form-'));
+        process.chdir(dir);
+        try {
+            for (const [name, kind, file] of [
+                ['FASTEN_AUDIT_DSN', 'audit', 'audit.db'],
+                ['FASTEN_API_DSN', 'stream', 'streams.db'],
+                ['FASTEN_SYSLOG_DSN', 'stream', 'streams.db'],
+            ]) {
+                for (const dsn of ['admin:s3cret@db.internal:5432/app', 'db.internal:5432/app', 'user:pw@host/db']) {
+                    setEnv({ [name]: dsn });
+                    await assert.rejects(init(), (err) =>
+                        err.message === `fasten: ${kind} DSN form not recognised. Use postgres://..., sqlite:///./${file}, or a bare filesystem path.`, dsn);
+                }
+                setEnv({ [name]: 'mysql://u:hunter2@db/app' });
+                await assert.rejects(init(), (err) =>
+                    err.message.includes("scheme 'mysql'") && !words.some((w) => err.message.includes(w)));
+            }
+            assert.deepEqual(readdirSync(dir), []);
+        } finally {
+            process.chdir(cwd);
+        }
+    });
+
+    test('a DSN taken as a path that cannot be opened is not quoted in the error', async () => {
+        const cwd = process.cwd();
+        const dir = mkdtempSync(join(DIR, 'path-'));
+        process.chdir(dir);
+        try {
+            for (const name of VARS) {
+                for (const dsn of ['user@host/db', ' postgres://u:pw@h/db']) {
+                    setEnv({ [name]: dsn });
+                    await assert.rejects(init(), (err) =>
+                        !err.message.includes(dsn.trim()) && !err.message.includes('pw@h')
+                        && !err.message.includes('user@host') && !('path' in err), `${name}=${dsn}`);
+                }
+            }
+            assert.deepEqual(readdirSync(dir), []);
+        } finally {
+            process.chdir(cwd);
+        }
+    });
+
     test('an upper-case postgres scheme opens a PostgresStore', async () => {
         setEnv({ FASTEN_AUDIT_DSN: 'POSTGRES://u:p@db.invalid/x' });
         assert.ok((await init()).auditStore() instanceof PostgresStore);

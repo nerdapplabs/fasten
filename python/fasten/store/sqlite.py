@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Sequence
-from urllib.parse import parse_qs, unquote_to_bytes, urlparse
+from urllib.parse import parse_qs, unquote_to_bytes
 
 from ..attrs import AuditRow
 
@@ -120,15 +120,59 @@ def _create_owner_only(path: str | os.PathLike[str]) -> None:
     os.close(fd)
 
 
+_KEYWORD_FORM = re.compile(r"\s*[A-Za-z_]+\s*=")
+
+
+def is_keyword_dsn(dsn: str) -> bool:
+    """True for libpq's keyword form (host=db dbname=app), which no store
+    reads."""
+    return _KEYWORD_FORM.match(dsn) is not None
+
+
+# A scheme only at the very start, as the JS, Go and Rust SDKs read it.
+# urlparse would strip leading spaces and tabs first, and on Python 3.10
+# take digits (2026:a.db) for a scheme.
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _split_dsn(dsn: str) -> tuple[str, str, str]:
+    """A store DSN's lowercased scheme ("" for a bare path), path and query
+    string, split as the JS SDK splits it."""
+    m = _SCHEME.match(dsn)
+    scheme = m[0][:-1].lower() if m else ""
+    rest = dsn[m.end():] if m else dsn
+    rest = rest.partition("#")[0]
+    rest, _, query = rest.partition("?")
+    if m and rest.startswith("//"):
+        slash = rest.find("/", 2)
+        rest = rest[slash:] if slash >= 0 else ""
+    return scheme, rest, query
+
+
+def dsn_scheme(dsn: str) -> str | None:
+    """The scheme of a store DSN, lowercased, or "" for a bare path. None
+    when the text before the colon is none of the store schemes and "//"
+    does not follow it, as in host:5432/db or user:password@host/db: that
+    text is not a scheme, and errors must not name it."""
+    scheme = _split_dsn(dsn)[0]
+    if scheme in ("", "sqlite", "postgres", "postgresql"):
+        return scheme
+    return scheme if dsn[len(scheme) + 1:].startswith("//") else None
+
+
 def sqlite_dsn_path(dsn: str) -> str:
     """File path of a SQLite DSN. Strips only the URL-separator slash, as the
     stream store does: sqlite:///rel.db is relative, sqlite:////abs/path.db
     and a bare /abs/path.db are absolute."""
-    u = urlparse(dsn)
-    path = u.path
-    if u.scheme and path.startswith("/"):
+    scheme, path, _ = _split_dsn(dsn)
+    if scheme and path.startswith("/"):
         path = path[1:]
     return path
+
+
+def sqlite_dsn_params(dsn: str) -> dict[str, str]:
+    """The query parameters of a SQLite DSN, first value of each."""
+    return {k: v[0] for k, v in parse_qs(_split_dsn(dsn)[2]).items()}
 
 
 class SQLiteStore:
@@ -218,8 +262,7 @@ class SQLiteStore:
 
     @classmethod
     def from_dsn(cls, dsn: str) -> "SQLiteStore":
-        u = urlparse(dsn)
-        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        q = sqlite_dsn_params(dsn)
         path = sqlite_dsn_path(dsn)
         if not path:
             raise ValueError(

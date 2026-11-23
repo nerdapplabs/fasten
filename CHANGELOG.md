@@ -6,6 +6,40 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: JS and Python DSN errors
+
+- DSN errors name a scheme only when the DSN has one, that is when `//`
+  follows it. A DSN such as `host:5432/db` or `user:password@host/db` gets
+  `DSN form not recognised`; an unknown scheme such as `mysql://...` is
+  still named.
+- JS: a `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN` read as a file path that
+  cannot be opened, such as `user@host/db`, fails with SQLite's error, as
+  `FASTEN_AUDIT_DSN` does, instead of an error quoting the DSN.
+- `fasten doctor` describes `FASTEN_AUDIT_DSN` as init opens it: a path
+  such as `sub/my db=1.db` is a SQLite file, not a libpq keyword DSN.
+
+### Changed: Python store DSNs (breaking for existing callers)
+
+These DSNs opened a local SQLite file before and no longer do:
+
+- `FASTEN_AUDIT_DSN` with a scheme other than `sqlite`, `postgres` or
+  `postgresql`, such as `file:f.db` or `mysql://host/app`, which wrote to a
+  file named after the URL path. It is refused, as `FASTEN_API_DSN` and
+  `FASTEN_SYSLOG_DSN` refuse it, and `fasten doctor` reports it.
+- `FASTEN_AUDIT_DSN` with `postgres` or `postgresql` in another case, such
+  as `POSTGRES://...`. It opens Postgres, as the stream DSNs do, and
+  `fasten doctor` describes it the same way.
+- libpq's keyword form, such as `host=db dbname=app` or `tenant=blue.db`, in
+  `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`. It is
+  refused, as JS, Rust and Go refuse it.
+
+A DSN's scheme is read only at its start, as JS, Go and Rust read it:
+
+- ` postgres://...` with a leading space or tab is a file path, not
+  Postgres.
+- On Python 3.10, `2026:a.db` opens that file instead of being refused.
+- A bare path keeps a `;` or a tab: `a;b.db` opens `a;b.db`, not `a`.
+
 ### Added: Go stores from the environment
 
 - `Init` opens the audit store from `FASTEN_AUDIT_DSN` when
