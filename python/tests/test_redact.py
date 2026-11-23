@@ -332,3 +332,57 @@ def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys
     assert "hunter2" not in captured.out
     assert "_redact_failed" in captured.out
     assert captured.err.count("libfasten_core not found") == 1
+
+
+# Values json.dumps cannot encode as they are
+
+def test_custom_value_pattern_applies_under_a_tuple_key():
+    r2 = Redactor(extra_value_patterns=[("acct", r"acct-\d+", "[acct]")])
+    out = r2.redact({(1, 2): "acct-1234", "note": "see acct-99"})
+    # A match replaces the whole value, as on the plain JSON path.
+    assert out == {(1, 2): "[acct]", "note": "[acct]"}
+
+
+def test_custom_replacement_applies_under_an_int_key():
+    r2 = Redactor(replacement="<x>")
+    out = r2.redact({1: {"password": "hunter2"}, "api_key": "k"})
+    assert out[1] == {"password": "<x>"}
+    assert out["api_key"] == "<x>"
+
+
+def test_datetime_value_is_converted_and_redacted(r):
+    import datetime as dt
+    when = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+    out = r.redact({"at": when, "password": when})
+    assert out == {"at": str(when), "password": "***"}
+
+
+def test_value_with_a_secret_in_its_str_is_redacted(r):
+    class Note:
+        def __str__(self) -> str:
+            return "card 4111111111111111"
+
+    out = r.redact({"note": Note(), 7: Note()})
+    assert out == {"note": "***CC***", 7: "***CC***"}
+
+
+def test_size_cap_applies_under_a_tuple_key(monkeypatch, r):
+    monkeypatch.setenv("FASTEN_MAX_DETAIL_BYTES", "64")
+    out = r.redact({(1, 2): "x" * 200})
+    assert out["_truncated"] is True
+
+
+def test_circular_value_becomes_the_unredactable_marker(r):
+    loop: dict = {}
+    loop["self"] = loop
+    assert r.redact(loop) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_log_field_with_a_datetime_is_written(initialized):
+    import datetime as dt
+    import fasten
+    fasten.log.info("tick", at=dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc), token="t")
+    rows = [r for r in fasten.transport().query_syslog(limit=100) if r.get("event") == "tick"]
+    assert len(rows) == 1
+    assert rows[0]["token"] == "***"
+    assert rows[0]["at"].startswith("2026-01-02")
