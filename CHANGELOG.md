@@ -6,10 +6,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed: card numbers sent as integers are redacted
+### Changed: card numbers sent as numbers are redacted
 
-- An integer detail value that the card rule matches is now replaced the
-  same way as when it is sent as a string.
+- A detail value that is a number with no fractional part (an integer or a
+  whole-number float such as `4111111111111111.0`) and that the card rule
+  matches now becomes the string `"***CC***"`, as when it is sent as a
+  string.
 
 ### Fixed: JS and Python DSN errors
 

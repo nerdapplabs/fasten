@@ -902,6 +902,54 @@
       "group": "safe",
       "input":    {"count": 4111},
       "expected": {"count": 4111}
+    },
+    {
+      "name": "value_cc_integer_19_digit",
+      "group": "value_shape",
+      "input":    {"card": 9704000000000000008},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_negative",
+      "group": "value_shape",
+      "input":    {"card": -4111111111111111},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_13_digit",
+      "group": "value_shape",
+      "input":    {"card": 4222222222222},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_in_array",
+      "group": "value_shape",
+      "input":    {"ids": [4111111111111111, 42]},
+      "expected": {"ids": ["***CC***", 42]}
+    },
+    {
+      "name": "safe_integer_above_2_53",
+      "group": "safe",
+      "input":    {"ref": 9007199254740993},
+      "expected": {"ref": 9007199254740993}
+    },
+    {
+      "name": "value_cc_whole_float",
+      "group": "value_shape",
+      "input":    {"f": 4111111111111111.0},
+      "expected": {"f": "***CC***"}
+    },
+    {
+      "name": "safe_float_with_fraction",
+      "group": "safe",
+      "input":    {"f": 4222222222222.5},
+      "expected": {"f": 4222222222222.5}
+    },
+    {
+      "name": "key_rule_wins_over_integer",
+      "group": "priority",
+      "input":    {"password": 4111111111111111},
+      "expected": {"password": "***"}
     }
   ]
 }
