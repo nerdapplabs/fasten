@@ -1,6 +1,7 @@
 //! Key-pattern and value-shape redaction (see spec/redact-conformance):
 //!   1. Object keys matching `REDACT_PATTERNS` get the replacement token.
 //!   2. String values matching a known secret shape get a typed token.
+//!   3. Integer values whose digits form a card number get `***CC***`.
 //!
 //! `REDACTOR` is the default instance used by the C ABI. `Redactor::new`
 //! builds one with extra keys, a custom replacement and extra value patterns.
@@ -349,6 +350,10 @@ impl Redactor {
             Value::String(s) => self
                 .check_value(s)
                 .map_or_else(|| value.clone(), Value::String),
+            // Only the card rule applies to integers; floats are kept.
+            Value::Number(n) if (n.is_u64() || n.is_i64()) && has_card(&n.to_string()) => {
+                Value::String("***CC***".to_owned())
+            }
             _ => value.clone(),
         }
     }
@@ -369,6 +374,43 @@ mod tests {
 
     fn r() -> Redactor {
         Redactor::default()
+    }
+
+    #[test]
+    fn integer_card_redacted() {
+        let out = r().redact_value(&json!({
+            "card": 4_111_111_111_111_111_u64,
+            "neg": -4_111_111_111_111_111_i64,
+            "long": 9_704_000_000_000_000_008_u64,
+            "list": [{"n": 4_539_578_763_621_486_u64}],
+        }));
+        assert_eq!(out["card"], "***CC***");
+        assert_eq!(out["neg"], "***CC***");
+        assert_eq!(out["long"], "***CC***");
+        assert_eq!(out["list"][0]["n"], "***CC***");
+    }
+
+    #[test]
+    fn integer_not_card_kept() {
+        let input = json!({
+            "count": 42,
+            "luhn_fails": 1_234_567_890_123_456_u64,
+            "max": u64::MAX,
+            "float": 4_111_111_111_111_111.0,
+            "flag": true,
+            "none": null,
+        });
+        assert_eq!(r().redact_value(&input), input);
+        let out = r().redact_json(r#"{"f":4111111111111111.0,"e":4.111111111111111e15}"#).unwrap();
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert!(out["f"].is_f64() && out["e"].is_f64(), "{out}");
+    }
+
+    #[test]
+    fn integer_card_uses_card_token_with_custom_replacement() {
+        let rd = Redactor::new(&[], "[gone]", &[(r"^\d+$", "***NUM***")]);
+        let out = rd.redact_value(&json!({"card": 4_111_111_111_111_111_u64, "n": 7}));
+        assert_eq!(out, json!({"card": "***CC***", "n": 7}));
     }
 
     #[test]

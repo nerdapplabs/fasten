@@ -102,6 +102,15 @@ def test_redact_tolerates_non_string_keys(r):
     assert out["nested"]["token"] == "***"
 
 
+def test_integer_card_values_with_non_string_keys(r):
+    out = r.redact({1: 4111111111111111, "n": 42, "t": True, "f": 4111111111111111.0})
+    assert out == {1: "***CC***", "n": 42, "t": True, "f": 4111111111111111.0}
+    assert r.redact({"card": 4111111111111111, "luhn": 1234567890123456}) == {
+        "card": "***CC***",
+        "luhn": 1234567890123456,
+    }
+
+
 def test_structlog_processor_tolerates_non_string_keys():
     """Same guard for the structlog processor path."""
     r2 = Redactor()
