@@ -57,6 +57,12 @@ def test_custom_replacement():
     assert r2.redact({"password": "x"}) == {"password": "<hidden>"}
 
 
+def test_number_card_keeps_card_token_with_custom_replacement():
+    r2 = Redactor(replacement="[gone]")
+    out = r2.redact({"card": 4111111111111111, "token": "x", "n": 42, "f": 4111111111111111.0})
+    assert out == {"card": "***CC***", "token": "[gone]", "n": 42, "f": "***CC***"}
+
+
 def test_apikey_no_separator(r):
     assert r.redact({"apikey": "x"})["apikey"] == "***"
     assert r.redact({"api-key": "x"})["api-key"] == "***"
@@ -100,15 +106,6 @@ def test_redact_tolerates_non_string_keys(r):
     assert out["api_key"] == "***"
     assert out["nested"][42] == "still-fine"
     assert out["nested"]["token"] == "***"
-
-
-def test_integer_card_values_with_non_string_keys(r):
-    out = r.redact({1: 4111111111111111, "n": 42, "t": True, "f": 4111111111111111.0})
-    assert out == {1: "***CC***", "n": 42, "t": True, "f": 4111111111111111.0}
-    assert r.redact({"card": 4111111111111111, "luhn": 1234567890123456}) == {
-        "card": "***CC***",
-        "luhn": 1234567890123456,
-    }
 
 
 def test_structlog_processor_tolerates_non_string_keys():

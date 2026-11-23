@@ -121,9 +121,9 @@ class Redactor:
         else:
             self._key_re = _DEFAULT_KEY_RE
 
-    def _check_value(self, v: str | int) -> Any:
-        """Redact one string or integer value through the core."""
-        out = json.loads(core_ffi.redact_json(json.dumps({"_": v})))
+    def _check_str_value(self, s: str) -> str:
+        """Redact one string value through the core."""
+        out = json.loads(core_ffi.redact_json(json.dumps({"_": s})))
         return out["_"]
 
     def _redact_native(self, value: Any) -> Any:
@@ -141,8 +141,8 @@ class Redactor:
             return result
         if isinstance(value, list):
             return [self._redact_native(v) for v in value]
-        if isinstance(value, (str, int)) and not isinstance(value, bool):
-            return self._check_value(value)
+        if isinstance(value, str):
+            return self._check_str_value(value)
         return value
 
     def _fast_redact_json(self, in_json: str) -> str:
