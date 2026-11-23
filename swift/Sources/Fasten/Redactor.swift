@@ -4,6 +4,7 @@ import Foundation
 ///   1. A key matching a key pattern gets `replacement` as its value.
 ///   2. Otherwise a string value that looks like a known secret (JWT, AWS key,
 ///      card number, ...) is replaced with a token such as "***JWT***".
+///   3. An integer value whose digits form a card number becomes "***CC***".
 public final class Redactor: @unchecked Sendable {
 
     private let keyPatterns:       [NSRegularExpression]
@@ -131,8 +132,27 @@ public final class Redactor: @unchecked Sendable {
             return _redactDict(d)
         } else if let a = val as? [Any] {
             return a.map { _redactValue($0) }
+        } else if let digits = Redactor.integerText(val), Redactor.hasCard(digits) {
+            // Only the card rule applies to integers, as in fasten-core.
+            return "***CC***"
         }
         return val
+    }
+
+    // The decimal text of an integer value; nil for a Bool, a float or
+    // anything else. A floating-point NSNumber is not read as an integer.
+    private static func integerText(_ val: Any) -> String? {
+        if val is Bool { return nil }
+        if let n = val as? NSNumber, ["d", "f"].contains(String(cString: n.objCType)) {
+            return nil
+        }
+        switch val {
+        case let i as Int: return String(i)
+        case let i as Int64: return String(i)
+        case let u as UInt: return String(u)
+        case let u as UInt64: return String(u)
+        default: return nil
+        }
     }
 
     private func _redactString(_ s: String) -> Any {
