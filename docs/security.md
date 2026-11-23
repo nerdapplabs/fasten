@@ -13,7 +13,7 @@ This document covers the security model of the fasten SDK: what it protects, wha
 fasten is a library, not a standalone service. It runs inside the adopter's process and writes to:
 
 - **stdout**: NDJSON audit, sys and api rows (the "ring transport")
-- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python and JS) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
+- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python, JS and Go) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
 
 The runtime layout:
 
@@ -92,13 +92,14 @@ The runtime layout:
 - Go: `NewReader` requires `WithAuth(middleware)`, for example `fasten.NewReader(fasten.WithAuth(fasten.RequireBearer("FASTEN_READER_TOKEN")))`, or `WithoutAuth()`, and panics with neither. `RequireBearer` panics at startup when the variable is unset.
 - JS: `reader({ auth })` from `fasten-sdk/reader` requires `auth`: `{ bearer: token }` (or `requireBearer()`, which throws when `FASTEN_READER_TOKEN` is unset), `{ verify: fn }`, or the explicit opt-out `"none"`. It throws when the reader is built without one. With `bearer` the `Authorization` header must start with exactly `Bearer ` and the rest must equal the token, compared in constant time. A `verify` function must return exactly `true`; anything else is a 401 and a throw is a 500 without its message. The check runs before the tenant scope and the query parameters, so an unauthenticated caller gets a 401, never a 422.
 - JS: the reader matches the request path as sent (`req.url` up to `?`), which is what Node and Express route on, so a guard in front of it that checks the raw path sees the path the reader serves. A path with an empty, `.` or `..` segment, a backslash, or `%2e`, `%2f` or `%5c` is not served.
+- Rust: `fasten::reader::Reader::builder()` needs `.auth(...)`: `Auth::bearer(token)` (or `require_bearer("FASTEN_READER_TOKEN")`, which fails when the variable is unset or empty), `Auth::verify(fn)`, or the explicit opt-out `Auth::None`; `build()` fails without one and with an empty token. The bearer check is as in JS, with the token compared in constant time; a `verify` function that panics is a 401. Authentication runs before the tenant scope and the query parameters, and the reader matches the path as sent, refusing the same paths as JS.
 - C++: `fasten::reader::simplehttp::start(port, prefix, auth)` and `mount()` require an auth function and throw on an empty one; `no_auth()` is the explicit opt-out. With another server, check the caller before calling the `fasten::reader::handle_*` functions.
 - Python: the router docstring leads with the authenticated example and states that the router has no auth of its own. The unauthenticated, trusted-network mount is the secondary example.
 
 **Not mitigated:**
 
-- fasten checks a credential only with its bundled shared-token helpers (`require_bearer()` in Python, `RequireBearer` in Go, `{ bearer }` / `requireBearer()` in JS), which compare one static token. Anything else, such as user identity, roles or token expiry, is the adopter's dependency, middleware or `verify` function. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, a JS reader built with `auth: "none"`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
-- The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on; in JS a scoped doctor reports only the caller's data, so the queue, ring depths, process id, host service and node ids and store type are `null` as well. Store errors go to the service log, not the response.
+- fasten checks a credential only with its bundled shared-token helpers (`require_bearer()` in Python, `RequireBearer` in Go, `{ bearer }` / `requireBearer()` in JS, `Auth::bearer` / `require_bearer()` in Rust), which compare one static token. Anything else, such as user identity, roles or token expiry, is the adopter's dependency, middleware or `verify` function. A Python router mounted with `dependencies=[]`, a Go reader built with `WithoutAuth()`, a JS reader built with `auth: "none"`, a Rust reader built with `Auth::None`, and a C++ reader started with `no_auth()` all serve every route to any caller. This is a deployment concern rather than a library concern, but treat the reader routes like any internal admin endpoint.
+- The `/audit/doctor` endpoint returns queue depth, store row count and init parameters. This is less sensitive than audit rows but should still be gated. With a tenant scope it counts only the caller's rows and leaves out the host `tenant_id` and the row a chain break is on; in JS and Rust a scoped doctor reports only the caller's data, so the queue, ring depths, process id, host service and node ids and store type are `null` as well. Store errors go to the service log, not the response.
 
 ---
 
@@ -109,10 +110,10 @@ The runtime layout:
 **Mitigations in place:**
 
 - The `tenant_id` column is part of the row schema and is stored in the audit table. The `query()` / `count()` methods accept `tenant_id` as a filter.
-- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithAuth(mw), WithTenantScope(...))` in Go, `reader({ auth, tenantScope })` in JS) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`, JS: `enforceTenantIsolation: true`) refuses to build the reader without the hook.
-- In JS the reader applies the tenant scope to every row it returns: audit rows from `/audit`, `/correlate` and `/search` are checked against the tenant after the store's `tenantId` filter, as sys and api rows and `/topology` rows are, so a custom store that ignores `tenantId` does not widen a read.
+- The reader accepts a `tenant_scope` hook (`router(tenant_scope=...)` in Python, `NewReader(WithAuth(mw), WithTenantScope(...))` in Go, `reader({ auth, tenantScope })` in JS, `Reader::builder().tenant_scope(...)` in Rust) that resolves the caller's tenant from the authenticated request. When it is set, every reader endpoint ignores any caller-supplied `?tenant_id=` and scopes results to the resolved tenant. `enforce_tenant_isolation=True` (Go: `EnforceTenantIsolation()`, JS: `enforceTenantIsolation: true`, Rust: `.enforce_tenant_isolation()`) refuses to build the reader without the hook.
+- In JS and Rust the reader applies the tenant scope to every row it returns: audit rows from `/audit`, `/correlate` and `/search` are checked against the tenant after the store's `tenantId` filter, as sys and api rows and `/topology` rows are, so a custom store that ignores `tenantId` does not widen a read.
 - Adopters can also enforce per-tenant filtering in their own auth dependency by extracting the tenant from the authenticated identity and passing it explicitly to `fasten.audit_store().query(tenant_id=...)` (JS: `store.query({ tenantId })`).
-- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`, `js/test/reader.test.mjs`, `js/test/reader_stores.test.mjs`). The Python and Go tests run on in-memory SQLite. The JS tests run on in-memory stores, SQLite and Postgres; the Postgres half runs in CI, where `FASTEN_REQUIRE_POSTGRES=1` makes a missing database a failure.
+- Tenant isolation is covered by tests (`python/tests/test_multitenant.py`, `python/tests/test_tenant_scope.py`, `go/tenant_scope_test.go`, `js/test/reader.test.mjs`, `js/test/reader_stores.test.mjs`, `rust/src/reader_tests.rs`). The Python and Go tests run on in-memory SQLite. The JS tests run on in-memory stores, SQLite and Postgres, and the Rust tests on SQLite and Postgres. The Postgres halves run in CI, where `FASTEN_REQUIRE_POSTGRES=1` makes a missing database a failure.
 
 **Not mitigated:**
 
@@ -131,7 +132,7 @@ The runtime layout:
 - `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields and the value-shape pass to `event` itself. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
 - JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
 - `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
-- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting. In JS and Python an audit DSN with an unknown scheme is an error, as a stream DSN is, and so is libpq's keyword form: the error names a scheme only when the DSN has one, and no file is created.
+- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting. In JS, Python and Go an audit DSN with an unknown scheme is an error, as a stream DSN is, and so is libpq's keyword form: the error names a scheme only when the DSN has one, and no file is created. Go's error for a store from a DSN that cannot be opened names the variable, scheme and error type, not the driver's message.
 - JS `apiLogger` stores the request path as sent, without the query string. Path segments can carry ids or tokens; apiLogger can rewrite the stored path (`path: (req) => string`). A client-supplied `X-Request-ID` is stored as sent and is not authenticated, in Python, Go and JS; in JS a request id that looks like a sentinel is not taken from the client.
 - The C++ fallback that calls the audit sink directly logs the first line of a store error.
 
@@ -184,7 +185,7 @@ The runtime layout:
 **Description:** The in-memory sys and api rings have a fixed capacity. Under high throughput the oldest rows are overwritten first. This is a data-loss concern rather than a security concern, but worth noting:
 
 - The ring size is fixed when the transport is created (default 2000 rows per stream). An adversary who can generate high log volume can push older rows out of the ring before they are read.
-- In JS at most 10,000 writes wait on one api or sys store; past that a row is not written to the store (stdout and the ring still get it) and the stream reads as degraded.
+- In JS and Rust at most 10,000 writes wait on one api or sys store; past that a row is not written to the store (stdout and the ring still get it) and the stream reads as degraded.
 - The audit queue (`queue_capacity`, default 100) blocks `emit()` callers when full, applying back-pressure rather than dropping rows silently. An adversary who can saturate the audit store can make `emit()` block on the request path, but that requires controlling the store, which is outside the threat model.
 
 ---

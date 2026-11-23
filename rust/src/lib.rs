@@ -31,6 +31,23 @@ pub use fasten_core::chain::{
     verify_chain, ChainError, ChainRow, ChainVerifyResult, Json, JsonString, GENESIS,
 };
 
+pub mod dsn;
+pub use dsn::{audit_store_from_dsn, parse_dsn, Dsn, DsnError};
+
+/// Replication (spec/chain-replication.md §4, §5), re-exported from
+/// fasten-core: the rows a node ships, the result of ingesting a batch, and
+/// the error for a batch the stores cannot hold. See [`list_unshipped`],
+/// [`mark_shipped`] and [`ingest_replicated`].
+pub use fasten_core::replication::{BatchError, IngestResult, ReplicatedRow};
+/// Filters and results of the audit reads the HTTP reader uses, re-exported
+/// from fasten-core.
+pub use fasten_core::store::{AuditQuery, AuditSearch, Source};
+
+pub mod streams;
+pub use streams::{is_sentinel, mint_sentinel, stream_store_from_dsn, StreamFilter, StreamRow, StreamStore};
+
+pub mod reader;
+
 pub mod checkpoints;
 pub use checkpoints::{
     checkpoints_since, load_checkpoints, publish_checkpoints, take_checkpoints,
@@ -56,6 +73,9 @@ impl From<AuditStoreError> for Error {
 /// Block until pending audit rows drain (or `timeout` elapses).
 /// Returns `true` at once when no drainer is installed.
 pub fn flush(timeout: std::time::Duration) -> bool { DEFAULT.flush(timeout) }
+
+/// Flush within `timeout`, then stop background work (see [`Engine::close`]).
+pub fn close(timeout: std::time::Duration) -> bool { DEFAULT.close(timeout) }
 
 /// Snapshot of the active drainer, or `None` when none is installed.
 pub fn queue_stats() -> Option<QueueStats> { DEFAULT.queue_stats() }
@@ -339,10 +359,27 @@ pub enum Error {
     /// dead-lettered at once. A custom [`AuditStore`] can return it too.
     #[error("audit store rejected the row: {0}")]
     AuditStoreRejected(String),
+    /// [`AuditStore::purge`] failed. When the connection was lost while it
+    /// ran, how many rows it deleted is unknown and the text says so: run it
+    /// again, and publish checkpoints after it succeeds.
+    #[error("audit store purge: {0}")]
+    AuditStorePurge(String),
     #[error("not supported: {0}")]
     Unsupported(String),
     #[error("{0}")]
     InvalidRetention(String),
+    /// A configuration refused: by `init` (such as `persist_streams` naming
+    /// a stream without a store, or a `FASTEN_*_DSN` that does not parse or
+    /// whose store cannot be opened), by the reader's builder (no auth
+    /// choice, an empty bearer token, a missing tenant scope) or
+    /// [`reader::require_bearer`], by [`mint_sentinel`] (an unknown kind),
+    /// or by a stream store's constructor (a bad table name). An error for a
+    /// DSN names the variable and the scheme only.
+    #[error("{0}")]
+    InvalidConfig(String),
+    /// A stream store write or read failed.
+    #[error("stream store: {0}")]
+    StreamStore(String),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     /// A checkpoint file could not be read or written. Names the path.
@@ -361,6 +398,13 @@ pub enum Error {
     /// Build it with [`Error::custom`].
     #[error(transparent)]
     Custom(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// A replicated batch with a row the stores cannot hold is refused whole.
+impl From<BatchError> for Error {
+    fn from(e: BatchError) -> Self {
+        Error::AuditStoreRejected(e.to_string())
+    }
 }
 
 impl Error {
@@ -635,6 +679,10 @@ pub mod log {
     pub fn error(event: &str, fields: serde_json::Value) { write("error", event, fields); }
     pub fn debug(event: &str, fields: serde_json::Value) { write("debug", event, fields); }
 
+    /// An api row: written to stdout as `{"shape":"api",...}` and kept in
+    /// the api stream. See [`crate::Engine::log_api`].
+    pub fn api(fields: serde_json::Value) { super::DEFAULT.log_api(fields); }
+
     /// Variant for callers without serde_json::json! at hand.
     pub fn info_with<T: Serialize>(event: &str, fields: &T) {
         let v = serde_json::to_value(fields).unwrap_or(serde_json::Value::Null);
@@ -745,6 +793,160 @@ pub trait AuditStore: Send + Sync {
     fn redact_rows(&self, _ids: &[String]) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported("redact_rows".into()))
     }
+
+    /// Unshipped rows exactly as they were sealed, for shipping to another
+    /// node (spec §5), ordered by `monotonic_seq`. `limit == 0` returns all.
+    ///
+    /// With `origin`, `(service_id, source_node_id)`, only the rows that
+    /// identity originated (`origin_id == id`), so rows it ingested from
+    /// other nodes are not shipped again. Without it, every unshipped row.
+    /// [`list_unshipped`] asks for the engine's own identity.
+    fn list_unshipped_sealed(
+        &self,
+        _limit: usize,
+        _origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        Err(Error::Unsupported("list_unshipped_sealed".into()))
+    }
+
+    /// Store one sealed row shipped from another node exactly as it was
+    /// sealed (spec §5): the replicated insert, beside the originated one
+    /// above. Its chain is not verified here: verify the batch first, or use
+    /// [`AuditStore::ingest_replicated`]. The same row again is a no-op; a
+    /// different row under its id or at its node and seq is
+    /// [`Error::AuditStoreRejected`].
+    fn insert_replicated(&self, _row: &ReplicatedRow) -> Result<(), Error> {
+        Err(Error::Unsupported("insert_replicated".into()))
+    }
+
+    /// Set `shipped_at` to now on the rows in `ids`; unknown ids are
+    /// ignored.
+    fn mark_shipped(&self, _ids: &[String]) -> Result<(), Error> {
+        Err(Error::Unsupported("mark_shipped".into()))
+    }
+
+    /// Verify a batch of rows sealed on other nodes and store its verified
+    /// prefix exactly as it was sealed, in one transaction (spec §4).
+    ///
+    /// The batch is verified per node and checked against the stored rows:
+    /// a re-delivered row is skipped, and a different row under a stored id
+    /// or at a stored node and seq, or one that does not link to the stored
+    /// rows before and after it, is a break. Ingest stops at the first
+    /// break and reports it in [`IngestResult`], not as an error. With
+    /// `local_node_id`, a row from that node is a break too. An error
+    /// normally means nothing of the batch was stored, but an error after a
+    /// lost connection can leave it stored; sending the batch again is
+    /// safe, as a re-delivered row is skipped. A batch with a timestamp the
+    /// stores cannot hold is [`Error::AuditStoreRejected`]. A custom store
+    /// builds the result with [`IngestResult::stored`] or
+    /// [`IngestResult::cut`].
+    fn ingest_replicated(
+        &self,
+        _rows: &[ReplicatedRow],
+        _local_node_id: Option<&str>,
+    ) -> Result<IngestResult, Error> {
+        Err(Error::Unsupported("ingest_replicated".into()))
+    }
+
+    /// Delete audit rows older than `before`, per node only a seq prefix
+    /// (spec §2.3), so the rows left still verify; with
+    /// `respect_unshipped`, unshipped rows and the rows above them are kept.
+    /// Returns the rows deleted. The engine never calls it: audit rows are
+    /// kept until the operator purges them (spec §7). A failure is
+    /// [`Error::AuditStorePurge`]; it is never run a second time on its own,
+    /// so a count is that of one DELETE.
+    fn purge(&self, _before: DateTime<Utc>, _respect_unshipped: bool) -> Result<u64, Error> {
+        Err(Error::Unsupported("purge".into()))
+    }
+
+    // The reads below serve the HTTP reader ([`reader::Reader`]). Each
+    // returns rows read as stored, so detail numbers are the tokens that
+    // were hashed. A store without one returns `Unsupported`, and the
+    // reader reports what it cannot serve.
+
+    /// Rows matching `q`, newest first (timestamp, then `monotonic_seq`).
+    fn query(&self, _q: &AuditQuery) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("query".into()))
+    }
+
+    /// How many rows match `q`, ignoring `limit`, `offset` and `after_seq`.
+    fn count(&self, _q: &AuditQuery) -> Result<u64, Error> {
+        Err(Error::Unsupported("count".into()))
+    }
+
+    /// Case-insensitive substring search of `detail` (spec persistent-streams.md §9).
+    fn search(&self, _s: &AuditSearch) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("search".into()))
+    }
+
+    /// Rows written per node, service and tenant within `[since, until]`
+    /// (canonical timestamps), busiest first.
+    fn sources(&self, _since: Option<&str>, _until: Option<&str>) -> Result<Vec<Source>, Error> {
+        Err(Error::Unsupported("sources".into()))
+    }
+
+    /// The node's newest `limit` rows by `monotonic_seq`, oldest first: the
+    /// doctor's chain sample.
+    fn chain_tail(&self, _source_node_id: &str, _limit: u32) -> Result<Vec<ChainRow>, Error> {
+        Err(Error::Unsupported("chain_tail".into()))
+    }
+
+    /// A short name for the store, which `/audit/doctor` reports.
+    fn kind(&self) -> &str {
+        "AuditStore"
+    }
+}
+
+/// A replicated row read as a [`Row`]: a detail number `serde_json` cannot
+/// hold exactly is changed, and a JSON null detail (a redacted row) reads as
+/// empty. A timestamp or `shipped_at` a `Row` cannot hold, or a detail that
+/// is neither an object nor null, is [`Error::AuditStoreRead`].
+#[cfg(all(test, any(feature = "store-sqlite", feature = "store-postgres")))]
+pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Result<Row, Error> {
+    let c = &r.row;
+    let unreadable = |what: &str| Error::AuditStoreRead(format!("row {}: {what} cannot be read as a Row", c.id));
+    let detail = match serde_json::from_str(&c.detail.to_string()) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+        Ok(serde_json::Value::Null) => HashMap::new(),
+        _ => return Err(unreadable("detail")),
+    };
+    let timestamp = c.timestamp.parse().map_err(|_| unreadable("timestamp"))?;
+    let shipped_at = c.shipped_at.as_deref().map(str::parse).transpose().map_err(|_| unreadable("shipped_at"))?;
+    let severity = match c.severity.to_ascii_lowercase().as_str() {
+        "debug" => Severity::Debug,
+        "warn" => Severity::Warn,
+        "error" => Severity::Error,
+        "critical" => Severity::Critical,
+        _ => Severity::Info,
+    };
+    Ok(Row {
+        wire_version: c.wire_version.clone(),
+        id: c.id.clone(),
+        origin_id: c.origin_id.clone(),
+        monotonic_seq: c.monotonic_seq,
+        timestamp,
+        code: c.code.clone(),
+        action: c.action.clone(),
+        severity,
+        service_id: c.service_id.clone(),
+        source_node_id: c.source_node_id.clone(),
+        tenant_id: c.tenant_id.clone(),
+        actor: c.actor.clone(),
+        actor_kind: c.actor_kind.clone(),
+        target: c.target.clone(),
+        category: c.category.clone(),
+        domain: c.domain.clone(),
+        method: c.method.clone(),
+        request_id: c.request_id.clone(),
+        detail,
+        pii_in_detail: r.pii_in_detail,
+        prev_hash: c.prev_hash.clone(),
+        hash: c.hash.clone(),
+        canonical_form_id: c.canonical_form_id.clone(),
+        detail_salt: c.detail_salt.clone(),
+        detail_commitment: c.detail_commitment.clone(),
+        shipped_at,
+    })
 }
 
 #[derive(Clone, Default)]
@@ -779,6 +981,28 @@ pub struct Config {
     /// their detail redacted once older than this (spec §7). Needs an audit
     /// store. None falls back to `FASTEN_RETENTION_PII`.
     pub retention_pii: Option<String>,
+    /// Store for the api stream (spec persistent-streams.md). None falls
+    /// back to `FASTEN_API_DSN`; with neither, api rows are kept in memory
+    /// only.
+    pub api_store: Option<Arc<dyn StreamStore>>,
+    /// Store for the sys stream. None falls back to `FASTEN_SYSLOG_DSN`.
+    pub syslog_store: Option<Arc<dyn StreamStore>>,
+    /// Streams ("api", "sys") that must have a store. When set, `init`
+    /// fails unless it names exactly the streams with a store attached.
+    /// None falls back to `FASTEN_PERSIST_STREAMS` (comma-separated), and
+    /// without that any attached store is used. Audit persistence follows
+    /// `audit_store` alone.
+    pub persist_streams: Option<Vec<String>>,
+    /// Allow free-text search (`/search`, `/sys?q=`), a linear scan. Also on
+    /// when `FASTEN_SEARCH_ENABLED` is 1, true or yes.
+    pub search_enabled: bool,
+    /// Max age of api stream rows, e.g. `"7d"`; older rows are deleted
+    /// hourly. Needs an api store. None falls back to `FASTEN_RETENTION_API`.
+    /// Audit rows are never deleted for age.
+    pub retention_api: Option<String>,
+    /// Max age of sys stream rows. None falls back to
+    /// `FASTEN_RETENTION_SYSLOG`.
+    pub retention_syslog: Option<String>,
 }
 
 /// Read env vars; return Config.
@@ -814,6 +1038,26 @@ pub fn config_from_env() -> Result<Config, Error> {
 /// default), this starts the fasten-core drainer thread (see
 /// `fasten_core::drainer`).
 pub fn init(cfg: Config) -> Result<(), Error> { DEFAULT.init(cfg) }
+
+/// The default engine's unshipped audit rows, exactly as they were sealed,
+/// that it originated (its service and node id), oldest first, for shipping
+/// to another node (spec §5). `limit == 0` returns all. Ship each with
+/// [`ReplicatedRow::to_json`], then call [`mark_shipped`].
+pub fn list_unshipped(limit: usize) -> Result<Vec<ReplicatedRow>, Error> {
+    DEFAULT.list_unshipped(limit)
+}
+
+/// Mark rows of the default engine's audit store as shipped.
+pub fn mark_shipped(ids: &[String]) -> Result<(), Error> {
+    DEFAULT.mark_shipped(ids)
+}
+
+/// Verify a batch of rows from other nodes and store its verified prefix in
+/// the default engine's audit store, refusing rows from the engine's own
+/// node; see [`AuditStore::ingest_replicated`].
+pub fn ingest_replicated(rows: &[ReplicatedRow]) -> Result<IngestResult, Error> {
+    DEFAULT.ingest_replicated(rows)
+}
 
 /// Redact PII rows older than `before` and write an `AUDIT_ROW_REDACTED`
 /// row for each (spec §7). Returns the redacted ids.
@@ -2380,14 +2624,37 @@ pub use postgres_store::PostgresStore;
 
 #[cfg(feature = "store-sqlite")]
 pub mod sqlite_store;
+
+#[cfg(all(test, feature = "store-sqlite"))]
+mod replication_tests;
+
+#[cfg(all(test, feature = "store-postgres", feature = "store-sqlite"))]
+mod pg_recovery_tests;
 #[cfg(feature = "store-sqlite")]
 pub use sqlite_store::SqliteStore;
+
+#[cfg(feature = "store-sqlite")]
+pub mod stream_sqlite;
+#[cfg(feature = "store-sqlite")]
+pub use stream_sqlite::SqliteStreamStore;
+
+#[cfg(feature = "store-postgres")]
+pub mod stream_postgres;
+#[cfg(feature = "store-postgres")]
+pub use stream_postgres::PostgresStreamStore;
 
 // Yaml catalogs, behind the `codes-yaml` feature:
 //
 //   fasten-sdk = { version = "1", features = ["codes-yaml"] }
 //   fasten::codes::load("fleet.codes.yaml")?;
 //   fasten::codes::reload()?;
+
+#[cfg(all(test, feature = "store-sqlite"))]
+mod test_support;
+#[cfg(all(test, feature = "store-sqlite"))]
+mod reader_tests;
+#[cfg(all(test, feature = "store-sqlite"))]
+mod stream_tests;
 
 #[cfg(feature = "codes-yaml")]
 pub mod codes_yaml;
