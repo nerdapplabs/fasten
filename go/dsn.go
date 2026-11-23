@@ -397,7 +397,7 @@ func (e *Engine) unusedEnvStores(next map[string]*envStore) []*envStore {
 
 // releaseEnvStores stops using the stores Init opened from the environment,
 // and returns them for the caller to close once nothing writes to them,
-// with a channel closed once the inserts running on the audit store among
+// with a channel closed once the audit inserts and stream pushes running on
 // them have returned. Later sys and api rows go to the rings only, and
 // audit rows to stdout only. Stores passed in Config are kept.
 func (e *Engine) releaseEnvStores() ([]*envStore, <-chan struct{}) {
@@ -412,6 +412,7 @@ func (e *Engine) releaseEnvStores() ([]*envStore, <-chan struct{}) {
 		return h != nil && store != nil && h.store == store
 	}
 	var inserts *sync.WaitGroup
+	pushed := insertsDone(nil)
 	e.storeMu.Lock()
 	defer e.storeMu.Unlock()
 	if isEnv("FASTEN_AUDIT_DSN", e.auditStore) {
@@ -425,10 +426,10 @@ func (e *Engine) releaseEnvStores() ([]*envStore, <-chan struct{}) {
 		e.syslogStore = nil
 	}
 	if x := e.xport.Load(); x != nil && (isEnv("FASTEN_API_DSN", x.APIStore) || isEnv("FASTEN_SYSLOG_DSN", x.SyslogStore)) {
-		e.xport.Store(x.withStores(e.apiStore, e.syslogStore))
+		_, pushed = e.swapTransport(x.withStores(e.apiStore, e.syslogStore))
 	}
 	e.persistedStreams = persistedStreams(e.auditStore, e.apiStore, e.syslogStore)
-	return stores, insertsDone(inserts)
+	return stores, allDone(insertsDone(inserts), pushed)
 }
 
 // closeStores closes stores, reporting a failure to out. It returns false

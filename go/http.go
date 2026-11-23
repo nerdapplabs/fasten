@@ -457,7 +457,7 @@ func (e *Engine) searchGuard(q, since string) string {
 	if utf8.RuneCountInString(q) > MaxQueryLength {
 		return fmt.Sprintf("q= is capped at %d characters", MaxQueryLength)
 	}
-	if !e.searchEnabled {
+	if !e.config().searchEnabled {
 		return "search disabled — set search.enabled (FASTEN_SEARCH_ENABLED=true) to enable free-text q="
 	}
 	if since == "" {
@@ -1039,11 +1039,12 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		xportBlock["api_ring_depth"] = x.APIDepth()
 	}
 
+	c := e.config()
 	initBlock := map[string]any{
-		"service_id":       e.serviceID,
-		"node_id":          e.nodeID,
-		"tenant_id":        e.tenantID,
-		"failure_strategy": e.failureStrategy,
+		"service_id":       c.serviceID,
+		"node_id":          c.nodeID,
+		"tenant_id":        c.tenantID,
+		"failure_strategy": c.failureStrategy,
 		// Multi-worker awareness: callers can confirm which OS process they hit.
 		"worker_pid": os.Getpid(),
 	}
@@ -1053,7 +1054,7 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Redaction is always applied (RedactDetail) once the engine is initialised.
-	redactorBlock := map[string]any{"active": e.serviceID != ""}
+	redactorBlock := map[string]any{"active": c.serviceID != ""}
 
 	// Spot-check the tamper chain over this node's latest rows.
 	// breaks is nil until verification actually runs; 0 when the chain is
@@ -1070,12 +1071,12 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if t, ok := store.(interface {
 			ChainTail(context.Context, string, int) ([]Row, error)
-		}); ok && e.nodeID != "" {
+		}); ok && c.nodeID != "" {
 			// By seq: a timestamp-ordered sample skips seqs after a clock
 			// step back and reads as a break.
-			recent, err = t.ChainTail(r.Context(), e.nodeID, 50)
+			recent, err = t.ChainTail(r.Context(), c.nodeID, 50)
 		} else {
-			recent, err = store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+			recent, err = store.Query(r.Context(), Filter{SourceNodeID: c.nodeID, Limit: 50})
 		}
 		switch {
 		case err != nil:

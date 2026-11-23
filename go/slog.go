@@ -40,7 +40,7 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 			"event":      r.Message,
 			"timestamp":  canonicalTS(r.Time),
 			"request_id": RequestIDFromContext(ctx),
-			"service_id": Default.serviceID,
+			"service_id": Default.config().serviceID,
 		}
 		for _, a := range h.preAttrs {
 			row[a.Key] = a.Value.Any()

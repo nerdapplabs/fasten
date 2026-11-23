@@ -382,7 +382,7 @@ func Background(ctx context.Context) context.Context { return BackgroundKind(ctx
 // BackgroundKind is Background with an explicit sentinel namespace.
 func BackgroundKind(ctx context.Context, kind string) context.Context {
 	if RequestIDFromContext(ctx) == "" {
-		return WithRequestID(ctx, MintSentinel(kind, Default.serviceID))
+		return WithRequestID(ctx, MintSentinel(kind, Default.config().serviceID))
 	}
 	return ctx
 }
