@@ -110,7 +110,6 @@ CREATE INDEX IF NOT EXISTS idx_%s_seq ON %s(monotonic_seq);
 -- showing up later in verify_chain as tampering.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_%s_node_seq ON %s(source_node_id, monotonic_seq);
 CREATE INDEX IF NOT EXISTS idx_%s_unshipped ON %s(shipped_at) WHERE shipped_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1;
 `, s.table,
 		s.bare, s.table, // idx_<t>_req
 		s.bare, s.table, // idx_<t>_code
@@ -118,7 +117,6 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 		s.bare, s.table, // idx_<t>_seq
 		s.bare, s.table, // uq_<t>_node_seq
 		s.bare, s.table, // idx_<t>_unshipped
-		s.bare, s.table, // idx_<t>_pii
 	)
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
@@ -167,6 +165,15 @@ CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail =
 				return err
 			}
 		}
+	}
+
+	// After the columns above, since a table another SDK created may not
+	// have pii_in_detail yet.
+	if _, err := s.db.Exec(fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS idx_%s_pii ON %s(pii_in_detail) WHERE pii_in_detail = 1`,
+		s.bare, s.table,
+	)); err != nil {
+		return err
 	}
 
 	// Migrate legacy TEXT timestamp columns to TIMESTAMPTZ.
@@ -608,6 +615,9 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 		var piiFlag int
 		var shippedAt *time.Time
 		var wv, hash, prevHash, formID string
+		// NULL in tables another SDK created with nullable columns: older
+		// Python rows, and rows the Rust SDK redacted.
+		var salt, commitment sql.NullString
 		if err := rows.Scan(
 			&r.ID, &r.OriginID, &r.MonotonicSeq,
 			&r.Timestamp, &code, &r.Action, &sev,
@@ -616,10 +626,11 @@ func scanRowsPg(rows *sql.Rows) ([]Row, error) {
 			&r.Target, &r.Category, &domain,
 			&r.Method, &r.RequestID, &detail, &piiFlag, &shippedAt,
 			&wv, &hash, &prevHash, &formID,
-			&r.DetailSalt, &r.DetailCommitment,
+			&salt, &commitment,
 		); err != nil {
 			return nil, err
 		}
+		r.DetailSalt, r.DetailCommitment = salt.String, commitment.String
 		r.Timestamp = r.Timestamp.UTC()
 		r.Code = Code(code)
 		r.Severity = Severity(sev)

@@ -442,6 +442,152 @@ def test_redacting_a_go_sealed_row_keeps_the_chain_valid():
         f"a redacted Go-sealed row broke the chain: {result.reason}"
 
 
+# Cross-SDK: JS seals, Python verifies.
+#
+# spec/js-sealed-form2.json and spec/js-sealed-stdout.jsonl are written by
+# scripts/gen_js_vectors.mjs from the JS engine and Postgres store: the rows
+# as stored (one redacted after sealing), and every audit line the engine
+# wrote. The details hold numbers whose JS text differs from Python's repr,
+# non-ASCII, DEL and astral keys, nested lists and big integers; node-js-u16
+# has a row with unpaired surrogates in its detail.
+
+JS_VECTOR = GO_VECTOR.with_name("js-sealed-form2.json")
+JS_STDOUT = GO_VECTOR.with_name("js-sealed-stdout.jsonl")
+
+
+def _rows_from_js_vector() -> list[AuditRow]:
+    return _rows_from_dicts(json.loads(JS_VECTOR.read_text()))
+
+
+def test_python_verifies_a_js_sealed_form_2_chain():
+    rows = _rows_from_js_vector()
+    assert len(rows) == 6
+    assert all(r.canonical_form_id == "2" and len(r.hash) == 64 for r in rows)
+    assert [(r.source_node_id, r.monotonic_seq) for r in rows] == [
+        ("node-js", 1), ("node-js", 2), ("node-js", 3), ("node-js", 4),
+        ("node-js", 5), ("node-js-u16", 1)]
+    redacted = [r for r in rows if r.detail is None]
+    assert len(redacted) == 1
+    assert not redacted[0].detail_salt and redacted[0].detail_commitment
+    result = verify_chain(rows)
+    assert result.ok, f"Python rejects a JS-sealed form-2 chain: {result.reason}"
+    assert rows[5].detail["name"] == "\udcff.txt"
+    assert rows[1].actor == "op\u00e9\x7f\U0001f600"
+    assert rows[1].target == "sensor/op\u00e9\x7f\U0001f600"
+    assert rows[0].tenant_id == "t\u00e9nant-\x7f-\U0001f600"
+
+
+def test_js_sealed_commitment_recomputes_under_python():
+    for row in _rows_from_js_vector():
+        if row.detail is None:
+            continue
+        assert row.detail_salt is not None
+        assert detail_commitment(row.detail_salt, row.detail) == \
+            row.detail_commitment, \
+            f"commitment disagrees across SDKs for {row.id}"
+
+
+def test_js_sealed_row_detail_tampering_is_caught_by_python():
+    rows = _rows_from_js_vector()
+    assert rows[0].detail["half"] == 75.5
+    assert rows[0].detail["big"] == 2 ** 70
+    attacked = [dataclasses.replace(
+        rows[0], detail={**rows[0].detail, "half": 76.5})] + rows[1:]
+    result = verify_chain(attacked)
+    assert not result.ok and result.first_break_at == 1, \
+        "Python accepted tampered detail on a JS-sealed row"
+
+
+def test_python_ingests_js_sealed_rows():
+    """Replication from a JS node: ingest stores the JS-sealed rows as they
+    were sealed, and they verify as stored."""
+    from fasten.replication import ingest
+    from fasten.store.sqlite import SQLiteStore
+    store = SQLiteStore(":memory:")
+    rows = _rows_from_js_vector()
+    result = ingest(store, rows)
+    assert result.rejected_from_seq is None and result.inserted == len(rows), result.reason
+    stored = store.query(limit=100)
+    assert sorted(r.hash for r in stored) == sorted(r.hash for r in rows)
+    assert verify_chain(stored).ok
+    assert ingest(store, rows).rejected_from_seq is None
+
+
+def test_python_verifies_the_js_stdout_lines_as_an_ingester_reads_them():
+    lines = [json.loads(line) for line in JS_STDOUT.read_text().splitlines()]
+    assert all(d.pop("shape") == "audit" for d in lines)
+    # Two lines per row, in the order written: unsealed at emit, then sealed.
+    by_id: dict[str, list[dict]] = {}
+    for d in lines:
+        by_id.setdefault(d["id"], []).append(d)
+    assert len(by_id) == 6
+    for pair in by_id.values():
+        assert [p["hash"] == "" for p in pair] == [True, False]
+        assert pair[0]["detail"] == pair[1]["detail"]
+    sealed = [pair[1]["id"] for pair in by_id.values()]
+    assert sealed == [r.id for r in _rows_from_js_vector()]
+    result = verify_chain(_rows_from_dicts(lines))
+    assert result.ok, f"Python rejects the JS stdout lines: {result.reason}"
+
+
+# js/test/fixtures/cpython-numbers.json pairs each number token with what
+# CPython writes for json.loads of it; scripts/gen_cpython_numbers.py
+# rewrites the second column. The JS tests read it.
+CPYTHON_NUMBERS = GO_VECTOR.parents[1] / "js" / "test" / "fixtures" / "cpython-numbers.json"
+
+
+def test_the_js_number_fixture_is_what_cpython_writes():
+    fixture = json.loads(CPYTHON_NUMBERS.read_text())
+    assert len(fixture["tokens"]) == 207 and len(fixture["js_numbers"]) == 222
+    for tok, want in fixture["tokens"] + fixture["js_numbers"]:
+        assert json.dumps(json.loads(tok)) == want, tok
+
+
+# Cross-SDK: Rust seals, Python verifies.
+#
+# spec/rust-sealed-form2.json is four rows the Rust SDK sealed through its
+# SQLite store: float, large-integer, non-ASCII, DEL and nested detail, and
+# one row redacted after sealing.
+
+RUST_VECTOR = GO_VECTOR.with_name("rust-sealed-form2.json")
+
+
+def _rows_from_rust_vector() -> list[AuditRow]:
+    return _rows_from_dicts(json.loads(RUST_VECTOR.read_text()))
+
+
+def test_python_verifies_a_rust_sealed_form_2_chain():
+    rows = _rows_from_rust_vector()
+    assert len(rows) == 4
+    assert all(r.canonical_form_id == "2" and r.hash for r in rows)
+    assert [r.monotonic_seq for r in rows] == [1, 2, 3, 4]
+    redacted = [r for r in rows if r.detail is None]
+    assert len(redacted) == 1
+    assert not redacted[0].detail_salt and redacted[0].detail_commitment
+    result = verify_chain(rows)
+    assert result.ok, f"Python rejects a Rust-sealed form-2 chain: {result.reason}"
+
+
+def test_rust_sealed_commitment_recomputes_under_python():
+    for row in _rows_from_rust_vector():
+        if row.detail is None:
+            continue
+        assert row.detail_salt is not None
+        assert detail_commitment(row.detail_salt, row.detail) == \
+            row.detail_commitment, \
+            f"commitment disagrees across SDKs for {row.id}"
+
+
+def test_rust_sealed_row_detail_tampering_is_caught_by_python():
+    rows = _rows_from_rust_vector()
+    assert rows[0].detail["setpoint"] == 75.0
+    attacked = [dataclasses.replace(
+        rows[0], detail={**rows[0].detail, "setpoint": 76.0})] + rows[1:]
+    result = verify_chain(attacked)
+    assert not result.ok and result.first_break_at == 1, \
+        "Python accepted tampered detail on a Rust-sealed row"
+
+
 def test_committed_cross_sdk_vector_matches_current_sealing():
     """spec/python-sealed-forms.json, which Go verifies, must match what
     Python seals today.

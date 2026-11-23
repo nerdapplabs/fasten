@@ -15,9 +15,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlsplit, urlunsplit
 
-from ..store.sqlite import sqlite_dsn_path
+from ..store.sqlite import dsn_scheme, is_keyword_dsn, sqlite_dsn_path
 
 
 @dataclass
@@ -28,10 +28,9 @@ class CheckResult:
     detail: dict[str, Any] | None = None
 
 
-# A libpq key=value DSN ("host=db password=...") has no scheme; init would
-# take it for a SQLite path, so doctor neither prints nor opens it.
+# A libpq key=value DSN ("host=db password=..."): init refuses it, and
+# doctor neither prints nor opens it.
 _KEYWORD_DSN = "unrecognised DSN (not shown; use a postgres:// URL)"
-_KEYWORD_RE = re.compile(r"^\s*\w+\s*=|\s\w+\s*=")
 _TABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?")
 
 
@@ -41,13 +40,7 @@ def _describe(dsn: str, is_postgres: bool) -> str:
         return "postgres"
     if "@" in dsn:
         return "sqlite (path hidden: the DSN has credentials)"
-    if "://" not in dsn and _KEYWORD_RE.search(dsn):
-        return _KEYWORD_DSN
-    try:
-        path = sqlite_dsn_path(dsn)
-    except ValueError:
-        return "unparseable DSN"
-    return f"sqlite {path or '(no path)'}"
+    return f"sqlite {sqlite_dsn_path(dsn) or '(no path)'}"
 
 
 def _error_text(e: Exception, dsn: str) -> str:
@@ -95,8 +88,6 @@ def _probe(dsn: str, is_postgres: bool, sqlite_path: str, default_table: str) ->
 def _check_store(name: str, dsn: str, is_postgres: bool, sqlite_path: str,
                  default_table: str) -> CheckResult:
     backend = _describe(dsn, is_postgres)
-    if backend == _KEYWORD_DSN:
-        return CheckResult(name=name, status="fail", message=backend)
     try:
         rows = _probe(dsn, is_postgres, sqlite_path, default_table)
     except Exception as e:  # noqa: BLE001 — diagnostic context, all failures relevant
@@ -131,6 +122,25 @@ def _check_env() -> CheckResult:
     )
 
 
+def _scheme_failure(name: str, dsn: str) -> CheckResult | None:
+    """A failed check for a DSN init refuses for its scheme or form. The
+    message names the scheme only when the DSN has one."""
+    if is_keyword_dsn(dsn):
+        return CheckResult(name=name, status="fail", message=_KEYWORD_DSN)
+    scheme = dsn_scheme(dsn)
+    try:
+        if scheme:
+            urlsplit(dsn)
+    except ValueError:
+        return CheckResult(name=name, status="fail", message="unparseable DSN")
+    if scheme is None:
+        return CheckResult(name=name, status="fail", message="DSN form not recognised")
+    if scheme not in ("sqlite", "postgres", "postgresql", ""):
+        return CheckResult(name=name, status="fail",
+                           message=f"unsupported DSN scheme {scheme!r}")
+    return None
+
+
 def _check_audit_dsn() -> CheckResult:
     dsn = os.environ.get("FASTEN_AUDIT_DSN")
     if not dsn:
@@ -140,12 +150,11 @@ def _check_audit_dsn() -> CheckResult:
             message="not set: audit rows go to stdout only. Set FASTEN_AUDIT_DSN for durable storage.",
         )
     # Same scheme test and SQLite path as the engine's audit store.
-    try:
-        path = sqlite_dsn_path(dsn)
-    except ValueError:
-        path = ""
-    return _check_store("audit_dsn", dsn, dsn.startswith(("postgres://", "postgresql://")),
-                        path, "audit_log")
+    failed = _scheme_failure("audit_dsn", dsn)
+    if failed:
+        return failed
+    return _check_store("audit_dsn", dsn, dsn_scheme(dsn) in ("postgres", "postgresql"),
+                        sqlite_dsn_path(dsn), "audit_log")
 
 
 def _check_api_dsn() -> CheckResult:
@@ -157,14 +166,10 @@ def _check_api_dsn() -> CheckResult:
             message="not configured — ring-buffer only (default; persist via FASTEN_API_DSN if needed)",
         )
     # Same scheme test and SQLite path as the engine's stream store.
-    try:
-        scheme = urlparse(dsn).scheme.lower()
-    except ValueError:
-        return CheckResult(name="api_dsn", status="fail", message="unparseable DSN")
-    if scheme not in ("sqlite", "postgres", "postgresql", ""):
-        return CheckResult(name="api_dsn", status="fail",
-                           message=f"unsupported DSN scheme {scheme!r}")
-    return _check_store("api_dsn", dsn, scheme in ("postgres", "postgresql"),
+    failed = _scheme_failure("api_dsn", dsn)
+    if failed:
+        return failed
+    return _check_store("api_dsn", dsn, dsn_scheme(dsn) in ("postgres", "postgresql"),
                         sqlite_dsn_path(dsn), "api_log")
 
 

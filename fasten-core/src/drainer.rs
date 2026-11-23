@@ -419,7 +419,7 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                     break;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
+                    let msg = error_text(&e);
                     attempt += 1;
                     // Spec §10: no retry once stopping. Spec §3: no retry for
                     // a row the store rejected.
@@ -452,8 +452,9 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
 /// reported `RowRejected`, the database refused the data (see
 /// `sqlstate_rejects_row` and `sqlite_rejects_row`), or a row with an
 /// explicit seq clashed. A seq-0 row gets a fresh seq on the next attempt,
-/// so its clash is retried.
-fn rejected(e: &Error, row: &Row) -> bool {
+/// so its clash is retried. For the SDK's stores; not a stable API.
+#[doc(hidden)]
+pub fn rejected(e: &Error, row: &Row) -> bool {
     match e {
         Error::CallbackFailed(rc) => *rc < 0,
         Error::RowRejected(_) => true,
@@ -485,13 +486,35 @@ fn sqlite_rejects_row(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// The variant name, e.g. `CallbackFailed`, or the type a `Store` error carries.
+/// The variant name, e.g. `CallbackFailed`, or the type a `Store` or
+/// `RowRejected` error carries when it is a bare identifier, such as the
+/// Rust SDK's `AuditStoreRejected`. One built in this crate carries a
+/// message, which can name rows and nodes, so it is recorded by the
+/// variant name.
 fn error_type(e: &Error) -> String {
-    if let Error::Store(t) = e {
-        return t.clone();
-    }
     let debug = format!("{e:?}");
-    debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
+    let variant = debug.split(['(', ' ', '{']).next().unwrap_or_default();
+    match e {
+        Error::Store(t) | Error::RowRejected(t) if is_identifier(t) => t.clone(),
+        _ => variant.to_owned(),
+    }
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*`: a type name, not a message.
+fn is_identifier(t: &str) -> bool {
+    let mut chars = t.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What `error` and `last_error` record for `e`: its type, as
+/// spec/drainer-conformance.md asks. A callback's return code is kept, as
+/// it is the host's own value.
+fn error_text(e: &Error) -> String {
+    match e {
+        Error::CallbackFailed(_) => e.to_string(),
+        _ => error_type(e),
+    }
 }
 
 fn on_success(inner: &DrainerInner) {
@@ -748,6 +771,25 @@ mod stop_tests {
         fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
     }
 
+    /// What the drainer records for an error: its type, never a message
+    /// that names a row or node.
+    #[test]
+    fn errors_are_recorded_by_type() {
+        assert_eq!(error_text(&Error::Store("PgError".into())), "PgError");
+        assert_eq!(error_text(&Error::Store("row evt-1: not inserted and not stored".into())), "Store");
+        assert_eq!(error_text(&Error::Store("node 'n-1': next monotonic_seq -1 is negative".into())), "Store");
+        assert_eq!(error_text(&Error::Store(String::new())), "Store");
+        assert_eq!(error_text(&Error::Store("42P01".into())), "Store");
+        assert_eq!(error_text(&Error::RowRejected("row evt-1: differs".into())), "RowRejected");
+        assert_eq!(error_text(&Error::RowRejected("AuditStoreRejected".into())), "AuditStoreRejected");
+        assert_eq!(error_text(&Error::RowRejected("_Rejected2".into())), "_Rejected2");
+        assert_eq!(error_text(&Error::RowRejected("2Rejected".into())), "RowRejected");
+        assert_eq!(error_text(&Error::RowRejected("value too long".into())), "RowRejected");
+        assert_eq!(error_text(&Error::RowRejected(String::new())), "RowRejected");
+        assert_eq!(error_text(&Error::SeqClash("row evt-1: seq 3".into())), "SeqClash");
+        assert_eq!(error_text(&Error::CallbackFailed(-2)), "insert callback returned non-zero rc=-2");
+    }
+
     struct RejectingStore(Arc<std::sync::atomic::AtomicUsize>);
 
     impl Store for RejectingStore {
@@ -830,4 +872,88 @@ mod stop_tests {
         assert!(find("audit_drain_dead_letter").is_none());
         assert_eq!(find("audit_drain_lost_at_stop").unwrap()["error_type"], "PgError");
     }
+
+    struct ErrStore(fn() -> crate::error::Error, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Store for ErrStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err((self.0)())
+        }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// `error` and `last_error` hold the error's type; a callback's code
+    /// is kept.
+    #[test]
+    fn failures_are_recorded_by_type() {
+        let cases: [(fn() -> crate::error::Error, &str); 2] = [
+            (|| crate::error::Error::InvalidTimestamp("acct-12345 2026-13-01".into()), "InvalidTimestamp"),
+            (|| crate::error::Error::CallbackFailed(7), "insert callback returned non-zero rc=7"),
+        ];
+        for (make, want) in cases {
+            let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let sink = events.clone();
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let d = Drainer::with_sys_log(Box::new(ErrStore(make, attempts.clone())), DrainerConfig {
+                capacity: 4,
+                retry_initial: Duration::from_millis(5),
+                retry_max: Duration::from_millis(5),
+                retry_jitter: false,
+                max_attempts: 2,
+            }, Some(Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+            })));
+            assert!(d.enqueue(Row { id: "r-1".into(), ..Row::default() }));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while d.stats().dead_lettered_total == 0 {
+                assert!(Instant::now() < deadline, "row was not dead-lettered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            d.stop(Duration::from_secs(2));
+            let events = events.lock().unwrap();
+            let find = |name: &str| events.iter().find(|e| e["event"] == name).cloned().unwrap();
+            assert_eq!(find("audit_drain_failed")["error"], want);
+            assert_eq!(find("audit_drain_dead_letter")["last_error"], want);
+        }
+    }
+
+    /// A row the Rust SDK's store rejects reaches the drainer as
+    /// `RowRejected("AuditStoreRejected")`, and is dead-lettered under that
+    /// name; a rejection carrying a message is recorded as `RowRejected`.
+    #[test]
+    fn rejected_row_is_recorded_by_the_type_it_carries() {
+        let cases: [(fn() -> crate::error::Error, &str); 2] = [
+            (|| crate::error::Error::RowRejected("AuditStoreRejected".into()), "AuditStoreRejected"),
+            (|| crate::error::Error::RowRejected("row r-1: differs".into()), "RowRejected"),
+        ];
+        for (make, want) in cases {
+            let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let sink = events.clone();
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let d = Drainer::with_sys_log(Box::new(ErrStore(make, attempts.clone())), DrainerConfig {
+                capacity: 4,
+                retry_initial: Duration::from_secs(60),
+                retry_max: Duration::from_secs(60),
+                retry_jitter: false,
+                max_attempts: 50,
+            }, Some(Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+            })));
+            assert!(d.enqueue(Row { id: "r-1".into(), ..Row::default() }));
+            assert!(d.flush(Duration::from_secs(5)), "the queue did not drain");
+            d.stop(Duration::from_secs(2));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "one attempt");
+            let events = events.lock().unwrap();
+            let dead = events.iter().find(|e| e["event"] == "audit_drain_dead_letter").cloned().unwrap();
+            assert_eq!(dead["last_error"], want);
+        }
+    }
+
 }

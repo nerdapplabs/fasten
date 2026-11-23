@@ -59,8 +59,9 @@ variable.
 - GitHub artifact attestations (signed with [Sigstore](https://www.sigstore.dev/))
   for every file on a [GitHub release](https://github.com/nerdapplabs/fasten/releases),
   in [`release.yml`](.github/workflows/release.yml).
-  A `vX.Y.Z` release carries Swift, C++ and Rust source archives and the
-  fasten-core library for linux x86_64. A `go/vX.Y.Z` release carries the Go
+  A `vX.Y.Z` release carries Swift, C++ and Rust source archives, the
+  fasten-core library for linux x86_64 and the Python wheels (the files
+  PyPI gets from the 1.0 release). A `go/vX.Y.Z` release carries the Go
   module zip. Each release also has a `SHA256SUMS` file. The source archives
   and the Go module zip are reproducible: `scripts/release/build-artifacts.sh
   <tag> <dir>` run on the tagged commit gives the same bytes when built with
@@ -90,7 +91,7 @@ JavaScript (npm), in the project that installed `fasten-sdk`:
 npm audit signatures
 ```
 
-GitHub release files (Swift, C++, Rust, fasten-core library), with the
+GitHub release files (Swift, C++, Rust, fasten-core library, Python wheels), with the
 [GitHub CLI](https://cli.github.com/):
 
 ```bash
@@ -125,7 +126,7 @@ on sum.golang.org for `github.com/nerdapplabs/fasten/go v1.0.0`.
 |----------|---------------|--------------|-------|
 | Python   | `pip-audit`   | In CI, on pull requests and on pushes to `main` / `dev` that touch `python/` or `fasten-core/` | Zero runtime deps (`dependencies = []` in `pyproject.toml`). CI installs the project and dev deps into a `uv venv`, which has no `pip` / `wheel` to flag, then runs `uvx pip-audit@2.10.1 --path <venv site-packages>` from its own environment, so the audit covers the project venv and not pip-audit's own dependencies. The job fails if site-packages is not found. |
 | Go       | `govulncheck` | By hand, before a release and after any `go.mod` change | Three direct deps: `gopkg.in/yaml.v3` (catalog parsing), `modernc.org/sqlite` (CGO-free SQLite driver, with its indirect deps in `go.mod`) and `github.com/lib/pq` (Postgres driver). It also reports advisories in the Go standard library, so the result depends on the Go patch release in use. |
-| JS       | `npm audit`   | By hand, before a release and after any dependency change | Zero production deps (`package.json` has an empty `dependencies` block). Uses the `node:async_hooks` and `node:crypto` builtins. `pg` (Postgres store) and `js-yaml` (catalog parsing only) are optional and not installed by default. Dev dependencies are audited too. |
+| JS       | `npm audit`   | By hand, before a release and after any dependency change | Zero production deps (`package.json` has an empty `dependencies` block). Uses the `node:async_hooks`, `node:crypto` and `node:sqlite` (SQLite stores) builtins. `pg` (Postgres store) and `js-yaml` (catalog parsing only) are optional and not installed by default. Dev dependencies are audited too. |
 
 Only the Python scan runs in CI today; the Go and JS scans are not gated.
 Advisories in third-party dependencies that are already public are tracked

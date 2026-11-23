@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -40,6 +38,7 @@ type StreamRepository interface {
 type StreamStore struct {
 	db    *sql.DB
 	table string
+	noWAL bool // the DSN had ?wal=false
 
 	// writeFailures counts Insert errors the transport swallowed. Non-zero
 	// marks the stream "store-degraded" for the life of the store, since the
@@ -62,16 +61,25 @@ var streamIndexedFields = []string{
 // For another driver, or an existing *sql.DB, use NewStreamStore and set the
 // pragmas in your own DSN.
 func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
-	path, table, err := parseStreamDSN(dsn, tableName)
+	d, err := parseStreamDSN(dsn, tableName)
 	if err != nil {
 		return nil, err
 	}
-	createOwnerOnly(path)
-	db, err := sql.Open("sqlite", streamPragmaDSN(path))
+	return openSQLiteStreamStore(d)
+}
+
+// openSQLiteStreamStore opens the SQLite stream store for a parsed DSN.
+func openSQLiteStreamStore(d storeDSN) (*StreamStore, error) {
+	createOwnerOnly(d.conn)
+	dsn := d.conn
+	if d.wal {
+		dsn = streamPragmaDSN(dsn)
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("fasten StreamStore open: %w", err)
 	}
-	s, err := NewStreamStore(db, table)
+	s, err := newStreamStoreWAL(db, d.table, d.wal)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -83,11 +91,7 @@ func OpenStreamStore(dsn, tableName string) (*StreamStore, error) {
 // does not create it with the umask. An existing file keeps its mode. If the
 // file cannot be created, the driver reports the error on first use.
 func createOwnerOnly(path string) {
-	if strings.HasPrefix(path, "file:") {
-		path = uriFilePath(path)
-	} else if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
+	path = sqliteFile(path)
 	if path == "" || path == ":memory:" {
 		return
 	}
@@ -99,63 +103,11 @@ func createOwnerOnly(path string) {
 	}
 }
 
-// uriFilePath returns the file path of a SQLite file: URI, or "" when the URI
-// names no file to create (in-memory, read-only, another VFS, or another
-// host).
-func uriFilePath(uri string) string {
-	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
-	rest, query, _ := strings.Cut(rest, "?")
-	for _, p := range strings.Split(query, "&") {
-		key, value, _ := strings.Cut(p, "=")
-		switch {
-		case p == "mode=memory", p == "mode=ro", p == "mode=rw", key == "vfs",
-			key == "immutable" && uriTrue(value):
-			return ""
-		}
-	}
-	if strings.HasPrefix(rest, "//") {
-		host, tail, _ := strings.Cut(rest[2:], "/")
-		if host != "" && host != "localhost" {
-			return ""
-		}
-		rest = "/" + tail
-	}
-	p := uriUnescape(rest)
-	// SQLite ends the path at a %00.
-	if i := strings.IndexByte(p, 0); i >= 0 {
-		p = p[:i]
-	}
-	return p
-}
-
-// uriTrue reads a URI boolean as sqlite3_uri_boolean does.
-func uriTrue(v string) bool {
-	if v != "" && v[0] >= '0' && v[0] <= '9' {
-		digits := v[:len(v)-len(strings.TrimLeft(v, "0123456789"))]
-		return strings.Trim(digits, "0") != ""
-	}
-	switch strings.ToLower(v) {
-	case "yes", "on", "true", "full", "extra", "normal":
-		return true
-	}
-	return false
-}
-
-// uriUnescape decodes %XX escapes as SQLite does: a '%' without two hex
-// digits after it stays as it is.
-func uriUnescape(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '%' && i+2 < len(s) {
-			if v, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
-				b.WriteByte(byte(v))
-				i += 2
-				continue
-			}
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
+// sqliteFile returns the file a SQLite DSN for the driver names: the path
+// without its query.
+func sqliteFile(dsn string) string {
+	path, _, _ := strings.Cut(dsn, "?")
+	return path
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc
@@ -168,41 +120,22 @@ func streamPragmaDSN(dsn string) string {
 	return dsn + "?" + pragmas
 }
 
-// parseStreamDSN returns the file path and table name for a DSN. Accepts:
+// parseStreamDSN parses a SQLite stream store DSN (see parseStoreDSN):
 //   - a bare path: "./streams.db"
 //   - a sqlite URL: "sqlite:///./rel.db" (three slashes = relative),
 //     "sqlite:////abs/path.db" (four = absolute)
-//   - "?table=X" on a sqlite URL to override the default table
-func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
-	table := defaultTable
-	path := dsn
-	if strings.HasPrefix(dsn, "sqlite:") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			// A fixed message: url.Parse's own error, even its cause, can
-			// quote part of the DSN (a password read as a port or an escape).
-			return "", "", errors.New("fasten StreamStore: invalid sqlite DSN")
-		}
-		path = u.Path
-		// Strip the one separator slash: sqlite:///rel.db gives "rel.db",
-		// sqlite:////abs.db gives "/abs.db".
-		if strings.HasPrefix(path, "/") {
-			path = path[1:]
-		}
-		if t := u.Query().Get("table"); t != "" {
-			table = t
-		}
-	} else if strings.Contains(dsn, "://") {
-		// Probably a Postgres or MySQL DSN; reject it rather than treat it as
-		// a file path.
-		return "", "", fmt.Errorf(
+//   - "?table=X" to override the default table, "?wal=false" to turn WAL off
+func parseStreamDSN(dsn, defaultTable string) (storeDSN, error) {
+	d, err := parseStoreDSN(dsn, defaultTable)
+	if err != nil {
+		return storeDSN{}, errors.New("fasten StreamStore: " + err.Error())
+	}
+	if d.scheme != "sqlite" {
+		return storeDSN{}, errors.New(
 			"fasten StreamStore: DSN scheme not supported for SQLite backend. " +
 				"Use sqlite:///./path.db or a bare filesystem path.")
 	}
-	if path == "" {
-		return "", "", fmt.Errorf("fasten StreamStore: the DSN has no path")
-	}
-	return path, table, nil
+	return d, nil
 }
 
 // NewStreamStore creates the stream table on db if needed and returns the
@@ -213,6 +146,10 @@ func parseStreamDSN(dsn, defaultTable string) (string, string, error) {
 // modernc.org/sqlite: "file:app.db?_pragma=synchronous(NORMAL)").
 // OpenStreamStore does this for you.
 func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
+	return newStreamStoreWAL(db, tableName, true)
+}
+
+func newStreamStoreWAL(db *sql.DB, tableName string, wal bool) (*StreamStore, error) {
 	if tableName == "" {
 		return nil, fmt.Errorf("fasten StreamStore: tableName is required")
 	}
@@ -221,7 +158,7 @@ func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 			"fasten StreamStore: tableName %q is not a valid SQL identifier "+
 				"(must match %s)", tableName, validIdentifierRe.String())
 	}
-	s := &StreamStore{db: db, table: tableName}
+	s := &StreamStore{db: db, table: tableName, noWAL: !wal}
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("fasten StreamStore migrate: %w", err)
 	}
@@ -231,9 +168,11 @@ func NewStreamStore(db *sql.DB, tableName string) (*StreamStore, error) {
 func (s *StreamStore) migrate() error {
 	// With WAL, synchronous=NORMAL skips the fsync per commit. A crash can
 	// lose the last few stream rows but leaves the database consistent.
-	ddl := fmt.Sprintf(`
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+	pragmas := "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n"
+	if s.noWAL {
+		pragmas = ""
+	}
+	ddl := pragmas + fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT,

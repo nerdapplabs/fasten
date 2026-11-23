@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -26,21 +27,29 @@ import (
 //	a.Init(fasten.Config{ServiceID: "tenant-a", AuditStore: storeA})
 //	a.Emit(ctx, "ORDER_PLACED", fasten.Target("order/123"))
 type Engine struct {
-	serviceID       string
-	nodeID          string
-	tenantID        string
-	auditStore      AuditRepository
-	xport           *Transport
-	apiStore        StreamRepository // nil = in memory only
-	syslogStore     StreamRepository // nil = in memory only
-	seq             int64            // accessed via atomic ops
-	failureStrategy string
-	searchEnabled   bool // free-text search (/logs/search, q=)
+	conf        atomic.Pointer[engineConfig] // nil before Init
+	auditStore  AuditRepository              // written under storeMu
+	xport       atomic.Pointer[Transport]
+	apiStore    StreamRepository // nil = in memory only; written under storeMu
+	syslogStore StreamRepository // nil = in memory only; written under storeMu
+	seq         int64            // accessed via atomic ops
 
 	// persistedStreams holds the streams that have a store ("audit", "api",
 	// "sys"); the reader reports completeness from it. Nil (before Init)
-	// means none.
+	// means none. Written under storeMu.
 	persistedStreams map[string]bool
+
+	// storeMu guards the store fields. It is held only to read or change
+	// them, never across a store call.
+	storeMu sync.RWMutex
+	// auditInserts counts the inserts running on auditStore. An emit adds
+	// to it under storeMu; a new store gets a new one, so the old store is
+	// closed once the old count reaches zero.
+	auditInserts *sync.WaitGroup
+
+	// envStores holds the stores Init opened from FASTEN_*_DSN, by
+	// variable, so a re-init with the same DSN keeps them.
+	envStores map[string]*envStore
 
 	unchainedStoreLogged  atomic.Bool
 	auditChainUnavailable atomic.Bool
@@ -57,6 +66,10 @@ type Engine struct {
 	storeGen  atomic.Int64  // bumped when Init switches to another audit store
 	closed    atomic.Bool   // Close has run and Init has not since
 
+	// pendingClose, guarded by drainerMu, is closed once the stores a
+	// timed-out Close left open are closed.
+	pendingClose chan struct{}
+
 	// auditWriteSwallowed is set when an audit insert error was swallowed.
 	// It's kept here as well as on the store because AuditRepository
 	// doesn't require NoteWriteFailure. It stays set until the next Init.
@@ -69,10 +82,10 @@ type Engine struct {
 	redactReplacement   string
 
 	// retentionCancel stops this Engine's purger goroutines and retentionWg
-	// waits for them. Init needs both: a purger still running when Init
-	// replaces e.xport would race it.
+	// waits for them, so their stores are closed only once they have exited.
+	// startRetention sets new ones each time.
 	retentionCancel context.CancelFunc
-	retentionWg     sync.WaitGroup
+	retentionWg     *sync.WaitGroup
 
 	// Tenant scope for reader endpoints, set via
 	// NewReader(WithTenantScope(...)). Nil = single-tenant mode
@@ -88,24 +101,23 @@ type Engine struct {
 // Default is the package-level Engine used by all free-function API calls.
 var Default = &Engine{}
 
-// streamStoreFromEnvDSN opens a SQLite stream store from the DSN in envVar,
-// or returns (nil, nil) if it is unset. Postgres DSNs are rejected because
-// this package has no Postgres driver; pass a PostgresStreamStore in Config.
-func streamStoreFromEnvDSN(envVar, table string) (*StreamStore, error) {
-	dsn := envOr(envVar, "")
-	if dsn == "" {
-		return nil, nil
+// engineConfig is the configuration Init sets. Init stores a new one, so an
+// emit that loads it once sees one Init's values.
+type engineConfig struct {
+	serviceID       string
+	nodeID          string
+	tenantID        string
+	failureStrategy string
+	searchEnabled   bool // free-text search (/logs/search, q=)
+}
+
+// config returns the configuration of the last Init, or the zero one before
+// Init.
+func (e *Engine) config() *engineConfig {
+	if c := e.conf.Load(); c != nil {
+		return c
 	}
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return nil, fmt.Errorf("fasten.Init: %s is a Postgres DSN; Go does not "+
-			"autoload Postgres stream stores (no bundled driver): pass an "+
-			"explicit APIStore/SyslogStore", envVar)
-	}
-	s, err := OpenStreamStore(dsn, table)
-	if err != nil {
-		return nil, fmt.Errorf("fasten.Init: %s: %w", envVar, err)
-	}
-	return s, nil
+	return &engineConfig{}
 }
 
 // configureRedaction sets this Engine's extra redact keys and replacement
@@ -142,98 +154,25 @@ func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
 }
 
 // Init configures this Engine. See Config.
+//
+// Everything that can fail is checked before Init changes anything, so a
+// failed Init leaves the Engine as it was.
 func (e *Engine) Init(cfg Config) error {
 	if n := cfg.QueueDrainMaxAttempts; n > 0 && uint64(n) > math.MaxUint32 {
 		return fmt.Errorf("fasten.Init: QueueDrainMaxAttempts must be at most %d (got %d)",
 			uint32(math.MaxUint32), n)
 	}
-	prevStore := e.auditStore
-
-	e.serviceID = firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
-	e.nodeID = firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
-	e.tenantID = firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", ""))
-
-	if e.serviceID == "" || e.nodeID == "" {
+	serviceID := firstNonEmpty(cfg.ServiceID, envOr("FASTEN_SERVICE_ID", ""))
+	nodeID := firstNonEmpty(cfg.NodeID, envOr("FASTEN_NODE_ID", ""))
+	if serviceID == "" || nodeID == "" {
 		return errors.New("fasten.Init: ServiceID and NodeID are required")
 	}
 	// A nil *SQLiteStore in the interface isn't == nil, so every later nil
 	// check would pass and the first method call would panic. Normalise it
 	// once here.
-	e.auditStore = cfg.AuditStore
-	if isTypedNil(e.auditStore) {
-		e.auditStore = nil
+	if isTypedNil(cfg.AuditStore) {
 		cfg.AuditStore = nil
 	}
-	// A new store starts with no swallowed writes; re-init on the same
-	// store keeps them.
-	if !sameStore(prevStore, e.auditStore) {
-		e.storeGen.Add(1)
-		e.auditWriteSwallowed.Store(false)
-	}
-
-	// e.seq is no longer read; the store allocates seq (spec §2.1).
-	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
-		if max, err := seeder.MaxMonotonicSeq(context.Background(), e.serviceID, e.nodeID); err == nil {
-			atomic.StoreInt64(&e.seq, max)
-		}
-	}
-
-	e.hashMu.Lock()
-	e.prevHash = "genesis"
-	e.hashMu.Unlock()
-	e.xport = NewTransport(2000)
-	// Sys and api rows are redacted before they are stored; see
-	// Transport.redactRow.
-	e.xport.redact = e.redactDetail
-	// Stream rows without a request_id get this boot id until the first
-	// real request arrives.
-	e.xport.serviceID = e.serviceID
-	e.xport.bootRequestID = MintSentinel("boot", e.serviceID)
-	// Stream stores not passed in Config are opened from FASTEN_API_DSN and
-	// FASTEN_SYSLOG_DSN (SQLite only).
-	apiStore := cfg.APIStore
-	if apiStore == nil {
-		s, err := streamStoreFromEnvDSN("FASTEN_API_DSN", "api_log")
-		if err != nil {
-			return err
-		}
-		if s != nil {
-			apiStore = s
-		}
-	}
-	syslogStore := cfg.SyslogStore
-	if syslogStore == nil {
-		s, err := streamStoreFromEnvDSN("FASTEN_SYSLOG_DSN", "syslog")
-		if err != nil {
-			return err
-		}
-		if s != nil {
-			syslogStore = s
-		}
-	}
-	e.apiStore = apiStore
-	e.syslogStore = syslogStore
-	e.xport.APIStore = apiStore
-	e.xport.SyslogStore = syslogStore
-
-	if err := e.assertPersistStreams(cfg.PersistStreams, apiStore, syslogStore); err != nil {
-		return err
-	}
-
-	e.persistedStreams = map[string]bool{}
-	if cfg.AuditStore != nil {
-		e.persistedStreams["audit"] = true
-	}
-	if apiStore != nil {
-		e.persistedStreams["api"] = true
-	}
-	if syslogStore != nil {
-		e.persistedStreams["sys"] = true
-	}
-	e.searchEnabled = cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", ""))
-
-	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
-
 	strategy := strings.ToLower(firstNonEmpty(
 		cfg.AuditStoreFailureStrategy,
 		envOr("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", ""),
@@ -247,9 +186,105 @@ func (e *Engine) Init(cfg Config) error {
 			"queue", "raise", strategy,
 		)
 	}
-	e.failureStrategy = strategy
+	// Stores not passed in Config are opened from FASTEN_AUDIT_DSN,
+	// FASTEN_API_DSN and FASTEN_SYSLOG_DSN.
+	slots, err := planEnvStores(cfg, e.envStores)
+	if err != nil {
+		return err
+	}
+	hasAPI := cfg.APIStore != nil || hasSlot(slots, "FASTEN_API_DSN")
+	hasSys := cfg.SyslogStore != nil || hasSlot(slots, "FASTEN_SYSLOG_DSN")
+	if err := assertPersistStreams(cfg.PersistStreams, hasAPI, hasSys); err != nil {
+		return err
+	}
+	ret, err := retentionFromEnv(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII)
+	if err != nil {
+		return err
+	}
+	// A store opened from a DSN can always redact.
+	if ret.pii > 0 && cfg.AuditStore != nil {
+		if _, ok := cfg.AuditStore.(RedactionRepository); !ok {
+			return fmt.Errorf(
+				"fasten.Init: RetentionPII is set but audit store %T does not "+
+					"implement RedactionRepository (spec §7.1): personal data "+
+					"would never be redacted", cfg.AuditStore)
+		}
+	}
+	next, err := e.openEnvStores(slots)
+	if err != nil {
+		return err
+	}
+	// Nothing below fails.
+	if es := next["FASTEN_AUDIT_DSN"]; es != nil {
+		cfg.AuditStore = es.store.(AuditRepository)
+	}
+	if es := next["FASTEN_API_DSN"]; es != nil {
+		cfg.APIStore = es.store.(StreamRepository)
+	}
+	if es := next["FASTEN_SYSLOG_DSN"]; es != nil {
+		cfg.SyslogStore = es.store.(StreamRepository)
+	}
+	unused := e.unusedEnvStores(next)
+	e.envStores = next
 
-	var next *cFastenDrainer
+	e.conf.Store(&engineConfig{
+		serviceID:       serviceID,
+		nodeID:          nodeID,
+		tenantID:        firstNonEmpty(cfg.TenantID, envOr("FASTEN_TENANT_ID", "")),
+		failureStrategy: strategy,
+		searchEnabled:   cfg.SearchEnabled || isTruthy(envOr("FASTEN_SEARCH_ENABLED", "")),
+	})
+
+	// Emits use the new store at once. Inserts still running on the
+	// previous one are waited for below, before it is closed.
+	var prevStore AuditRepository
+	var prevInserts *sync.WaitGroup
+	e.storeMu.Lock()
+	if !sameStore(e.auditStore, cfg.AuditStore) {
+		prevStore, prevInserts = e.auditStore, e.auditInserts
+		e.auditStore = cfg.AuditStore
+		e.auditInserts = &sync.WaitGroup{}
+		// A new store starts with no swallowed writes; re-init on the same
+		// store keeps them.
+		e.storeGen.Add(1)
+		e.auditWriteSwallowed.Store(false)
+	}
+	e.storeMu.Unlock()
+	if testHookStoreSwitched != nil {
+		testHookStoreSwitched()
+	}
+
+	// e.seq is no longer read; the store allocates seq (spec §2.1).
+	if seeder, ok := cfg.AuditStore.(SeqSeeder); ok {
+		if max, err := seeder.MaxMonotonicSeq(context.Background(), serviceID, nodeID); err == nil {
+			atomic.StoreInt64(&e.seq, max)
+		}
+	}
+
+	e.hashMu.Lock()
+	e.prevHash = "genesis"
+	e.hashMu.Unlock()
+	x := NewTransport(2000)
+	// Sys and api rows are redacted before they are stored; see
+	// Transport.redactRow.
+	x.redact = e.redactDetail
+	// Stream rows without a request_id get this boot id until the first
+	// real request arrives.
+	x.serviceID = serviceID
+	x.bootRequestID = MintSentinel("boot", serviceID)
+	x.APIStore = cfg.APIStore
+	x.SyslogStore = cfg.SyslogStore
+	prevX, pushed := e.swapTransport(x)
+	e.warnUnreadDSNEnv()
+	e.storeMu.Lock()
+	e.apiStore = cfg.APIStore
+	e.syslogStore = cfg.SyslogStore
+	e.persistedStreams = persistedStreams(cfg.AuditStore, cfg.APIStore, cfg.SyslogStore)
+	e.storeMu.Unlock()
+
+	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
+
+	var nextDrainer *cFastenDrainer
 	if strategy == "queue" && e.auditStore != nil {
 		capacity := cfg.QueueCapacity
 		if capacity <= 0 {
@@ -267,27 +302,51 @@ func (e *Engine) Init(cfg Config) error {
 		if maxAttempts <= 0 {
 			maxAttempts = 50
 		}
-		next = e.newDrainer(
+		nextDrainer = e.newDrainer(
 			e.auditStore,
 			capacity, retryInitialMs, retryMaxMs, !cfg.DisableQueueJitter, maxAttempts,
 		)
 	}
 	// Swap in the new drainer, then retire the old one: emits keep being
 	// queued while it drains, and its rows and events keep its own config.
-	old, done := e.swapDrainer(next)
+	old, done := e.swapDrainer(nextDrainer)
 	e.closed.Store(false)
 	e.retireOld(old, done, 5*time.Second, time.Time{})
-
-	if err := e.startRetention(cfg.RetentionAPI, cfg.RetentionSyslog, cfg.RetentionPII); err != nil {
-		return err
+	// The old drainer and the streams no longer write to these; nor will
+	// retention once it has stopped.
+	e.stopRetention()
+	if prevStore != nil && slices.ContainsFunc(unused, func(s *envStore) bool { return s.store == prevStore }) {
+		<-insertsDone(prevInserts)
 	}
+	if prevX != nil && slices.ContainsFunc(unused, func(s *envStore) bool {
+		return s.store == prevX.APIStore || s.store == prevX.SyslogStore
+	}) {
+		<-pushed
+	}
+	e.closeStores(e.out(), unused)
+	e.startRetention(ret)
 	return nil
+}
+
+// persistedStreams returns the streams that have a store.
+func persistedStreams(audit AuditRepository, api, syslog StreamRepository) map[string]bool {
+	m := map[string]bool{}
+	if audit != nil {
+		m["audit"] = true
+	}
+	if api != nil {
+		m["api"] = true
+	}
+	if syslog != nil {
+		m["sys"] = true
+	}
+	return m
 }
 
 // assertPersistStreams checks that the streams named in PersistStreams (or
 // FASTEN_PERSIST_STREAMS) are exactly the ones with stores attached. With
 // neither set there is nothing to check.
-func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore StreamRepository) error {
+func assertPersistStreams(fromConfig []string, hasAPI, hasSys bool) error {
 	named := fromConfig
 	if named == nil {
 		if s := envOr("FASTEN_PERSIST_STREAMS", ""); s != "" {
@@ -315,10 +374,10 @@ func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore
 		namedSet[s] = true
 	}
 	have := map[string]bool{}
-	if apiStore != nil {
+	if hasAPI {
 		have["api"] = true
 	}
-	if syslogStore != nil {
+	if hasSys {
 		have["sys"] = true
 	}
 	var missingStore, unlisted []string
@@ -350,77 +409,77 @@ func (e *Engine) assertPersistStreams(fromConfig []string, apiStore, syslogStore
 		strings.Join(parts, "; "))
 }
 
-// startRetention stops any running purgers and starts one for each stream
-// that has a store and a positive retention, from Config or, if that is
-// zero, the env var. An invalid env value is an Init error.
-func (e *Engine) startRetention(apiRet, sysRet, piiRet time.Duration) error {
-	if apiRet == 0 {
-		if s := envOr("FASTEN_RETENTION_API", ""); s != "" {
-			d, err := parseRetentionDuration(s)
-			if err != nil {
-				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_API: %w", err)
-			}
-			apiRet = d
-		}
-	}
-	if sysRet == 0 {
-		if s := envOr("FASTEN_RETENTION_SYSLOG", ""); s != "" {
-			d, err := parseRetentionDuration(s)
-			if err != nil {
-				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_SYSLOG: %w", err)
-			}
-			sysRet = d
-		}
-	}
-	if piiRet == 0 {
-		if s := envOr("FASTEN_RETENTION_PII", ""); s != "" {
-			d, err := parseRetentionDuration(s)
-			if err != nil {
-				return fmt.Errorf("fasten.Init: FASTEN_RETENTION_PII: %w", err)
-			}
-			piiRet = d
-		}
-	}
+// retentionWindows are the retention settings Init starts purgers with.
+type retentionWindows struct {
+	api, sys, pii time.Duration
+}
 
+// retentionFromEnv returns each retention from Config or, if that is zero,
+// the env var. An invalid env value is an Init error.
+func retentionFromEnv(apiRet, sysRet, piiRet time.Duration) (retentionWindows, error) {
+	for _, r := range []struct {
+		name string
+		d    *time.Duration
+	}{
+		{"FASTEN_RETENTION_API", &apiRet},
+		{"FASTEN_RETENTION_SYSLOG", &sysRet},
+		{"FASTEN_RETENTION_PII", &piiRet},
+	} {
+		if *r.d != 0 {
+			continue
+		}
+		if s := envOr(r.name, ""); s != "" {
+			d, err := parseRetentionDuration(s)
+			if err != nil {
+				return retentionWindows{}, fmt.Errorf("fasten.Init: %s: %w", r.name, err)
+			}
+			*r.d = d
+		}
+	}
+	return retentionWindows{api: apiRet, sys: sysRet, pii: piiRet}, nil
+}
+
+// startRetention stops any running purgers and starts one for each stream
+// that has a store and a positive retention. Init has checked that the
+// audit store can redact.
+func (e *Engine) startRetention(ret retentionWindows) {
 	e.stopRetention()
 
-	if (apiRet == 0 || e.apiStore == nil) &&
-		(sysRet == 0 || e.syslogStore == nil) &&
-		(piiRet == 0 || e.auditStore == nil) {
-		return nil
+	if (ret.api == 0 || e.apiStore == nil) &&
+		(ret.sys == 0 || e.syslogStore == nil) &&
+		(ret.pii == 0 || e.auditStore == nil) {
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
 	e.retentionCancel = cancel
+	e.retentionWg = wg
+	// A purge can outlive Close and run into the next Init.
+	serviceID := e.config().serviceID
 	onErr := func(stream string, err error) {
-		e.drainerSysLog("error", "retention_purge_failed", map[string]any{
+		e.sysLogTo(sysOut{e.xport.Load(), serviceID}, "error", "retention_purge_failed", map[string]any{
 			// Type-only, not err.Error() — driver error strings can carry
 			// the offending row value; sys is redacted key-pattern only.
 			"stream": stream, "error_type": fmt.Sprintf("%T", err),
 		})
 	}
-	if apiRet > 0 && e.apiStore != nil {
-		startPurger(ctx, &e.retentionWg, retentionParams{
-			stream: "api", store: e.apiStore, retention: apiRet,
+	if ret.api > 0 && e.apiStore != nil {
+		startPurger(ctx, wg, retentionParams{
+			stream: "api", store: e.apiStore, retention: ret.api,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
-	if sysRet > 0 && e.syslogStore != nil {
-		startPurger(ctx, &e.retentionWg, retentionParams{
-			stream: "sys", store: e.syslogStore, retention: sysRet,
+	if ret.sys > 0 && e.syslogStore != nil {
+		startPurger(ctx, wg, retentionParams{
+			stream: "sys", store: e.syslogStore, retention: ret.sys,
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
 	// Audit rows are only redacted, never purged, so no store or retention.
-	if piiRet > 0 && e.auditStore != nil {
-		if _, ok := e.auditStore.(RedactionRepository); !ok {
-			return fmt.Errorf(
-				"fasten.Init: RetentionPII is set but audit store %T does not "+
-					"implement RedactionRepository (spec §7.1): personal data "+
-					"would never be redacted", e.auditStore)
-		}
-		startPurger(ctx, &e.retentionWg, retentionParams{
-			stream: "audit", piiRetention: piiRet,
+	if ret.pii > 0 && e.auditStore != nil {
+		startPurger(ctx, wg, retentionParams{
+			stream: "audit", piiRetention: ret.pii,
 			redactFn: func(ctx context.Context, before time.Time) error {
 				_, err := e.RedactExpired(ctx, before, "retention")
 				return err
@@ -428,16 +487,32 @@ func (e *Engine) startRetention(apiRet, sysRet, piiRet time.Duration) error {
 			checkInterval: time.Hour, onError: onErr,
 		})
 	}
-	return nil
 }
 
-// stopRetention cancels any running purgers and waits for them to exit.
-func (e *Engine) stopRetention() {
+// cancelRetention cancels any running purgers and returns a channel that is
+// closed once they have exited.
+func (e *Engine) cancelRetention() <-chan struct{} {
 	if e.retentionCancel != nil {
 		e.retentionCancel()
 		e.retentionCancel = nil
 	}
-	e.retentionWg.Wait()
+	wg := e.retentionWg
+	e.retentionWg = nil
+	done := make(chan struct{})
+	if wg == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// stopRetention cancels any running purgers and waits for them to exit.
+func (e *Engine) stopRetention() {
+	<-e.cancelRetention()
 }
 
 // Emit produces an audit row for a registered code.
@@ -451,7 +526,8 @@ func (e *Engine) Emit(ctx context.Context, code Code, opts ...EmitOption) (Row, 
 // and the row is never handed to the drainer. Only the spec §7.2 redaction
 // record uses it, since the caller destroys data once the row is stored.
 func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...EmitOption) (Row, error) {
-	if e.serviceID == "" {
+	c := e.config()
+	if c.serviceID == "" {
 		return Row{}, errors.New("fasten.Init() must be called before Emit()")
 	}
 	m, ok := metaOf(code)
@@ -467,8 +543,9 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 	id := "evt-" + mintLong()
 
 	var tid *string
-	if e.tenantID != "" {
-		tid = &e.tenantID
+	if c.tenantID != "" {
+		t := c.tenantID
+		tid = &t
 	}
 	row := Row{
 		WireVersion:  "1",
@@ -479,8 +556,8 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 		Code:         code,
 		Action:       m.Action,
 		Severity:     m.Severity,
-		ServiceID:    e.serviceID,
-		SourceNodeID: e.nodeID,
+		ServiceID:    c.serviceID,
+		SourceNodeID: c.nodeID,
 		TenantID:     tid,
 		Actor:        "system",
 		ActorKind:    "service",
@@ -527,77 +604,147 @@ func (e *Engine) emitRow(ctx context.Context, code Code, durable bool, opts ...E
 	// it cannot survive a restart or a second process, so it is a chain in
 	// appearance only.
 
-	if e.xport != nil {
-		e.xport.WriteAudit(rowToMap(row))
+	if x := e.xport.Load(); x != nil {
+		x.WriteAudit(rowToMap(row))
 	}
+	return e.storeAudit(ctx, c.failureStrategy, row, durable)
+}
 
-	if e.auditStore != nil {
-		if e.failureStrategy == "queue" {
-			// The drainer retries the insert; the store seals the row when it
-			// lands (spec §2.1, §8). A durable emit must not return before the
-			// row is persisted, so it takes the synchronous path, and so does
-			// a row the drainer refuses.
-			gen := e.storeGen.Load()
-			d := e.activeDrainer()
-			refused := false
-			switch {
-			case durable:
-			case d != nil && d.gen != gen:
-				// Init is switching stores: store it inline in the new one.
-			case d == nil && e.closed.Load():
-				// After Close, rows are stored inline.
-			case d == nil:
-				// No drainer to take the row (spec §7 V-12).
-				refused = true
-				e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
-					"reason": "no_drainer", "row_id": row.ID,
-				})
-			default:
-				queued, reported := d.enqueue(row)
-				refused = !queued
-				if refused && !reported {
-					// fasten-core reports only the rows it refused at stop.
-					e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
-						"reason": "enqueue_refused", "row_id": row.ID,
-					})
-				}
-			}
-			if durable || d == nil || refused {
-				sealed, ferr := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
-				if ferr == nil {
-					row = sealed
-				}
-				if ferr != nil && durable {
-					return row, &AuditStoreError{Err: ferr}
-				}
-				if ferr != nil {
-					// The error is swallowed, so mark the audit stream
-					// degraded.
-					e.markWriteLost(e.auditStore, gen)
-					e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
-						// Type-only — see retention_purge_failed comment.
-						"error_type": fmt.Sprintf("%T", ferr),
-						"row_id":     row.ID,
-					})
-				} else if refused {
-					// Follows the abandoned event.
-					e.drainerSysLog("info", "audit_drain_stored_inline", map[string]any{"row_id": row.ID})
-				}
-			}
-		} else {
-			// "raise": same path as above, but the error is returned.
-			sealed, err := e.allocateAndStore(ctx, e.auditStore, e.out(), row)
-			if err != nil {
-				return row, &AuditStoreError{Err: err}
-			}
-			row = sealed
+// storeAudit stores an emitted row in the audit store, if there is one.
+func (e *Engine) storeAudit(ctx context.Context, strategy string, row Row, durable bool) (Row, error) {
+	store, gen, done := e.useAuditStore()
+	if store == nil {
+		return row, nil
+	}
+	defer done()
+	if strategy != "queue" {
+		// "raise": the error is returned.
+		sealed, err := e.allocateAndStore(ctx, store, e.out(), row)
+		if err != nil {
+			return row, &AuditStoreError{Err: err}
+		}
+		return sealed, nil
+	}
+	// The drainer retries the insert; the store seals the row when it
+	// lands (spec §2.1, §8). A durable emit must not return before the
+	// row is persisted, so it takes the synchronous path, and so does
+	// a row the drainer refuses.
+	d := e.activeDrainer()
+	queued, refused := false, false
+	switch {
+	case durable:
+	case d != nil && d.gen != gen:
+		// Init is switching stores: store it inline in the new one.
+	case d == nil && e.closed.Load():
+		// After Close, rows are stored inline.
+	case d == nil:
+		// No drainer to take the row (spec §7 V-12).
+		refused = true
+		e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+			"reason": "no_drainer", "row_id": row.ID,
+		})
+	default:
+		var reported bool
+		queued, reported = d.enqueue(row)
+		refused = !queued
+		if refused && !reported {
+			// fasten-core reports only the rows it refused at stop.
+			e.drainerSysLog("error", "audit_drain_abandoned", map[string]any{
+				"reason": "enqueue_refused", "row_id": row.ID,
+			})
 		}
 	}
+	if queued {
+		return row, nil
+	}
+	sealed, ferr := e.allocateAndStore(ctx, store, e.out(), row)
+	if ferr == nil {
+		if refused {
+			// Follows the abandoned event.
+			e.drainerSysLog("info", "audit_drain_stored_inline", map[string]any{"row_id": row.ID})
+		}
+		return sealed, nil
+	}
+	if durable {
+		return row, &AuditStoreError{Err: ferr}
+	}
+	// The error is swallowed, so mark the audit stream degraded.
+	e.markWriteLost(store, gen)
+	e.drainerSysLog("error", "audit_sync_fallback_failed", map[string]any{
+		// Type-only — see retention_purge_failed comment.
+		"error_type": fmt.Sprintf("%T", ferr),
+		"row_id":     row.ID,
+	})
 	return row, nil
 }
 
+// useAuditStore returns the audit store and its generation, and counts an
+// insert on the store until done is called; the store is not closed before
+// then. The store is nil when there is none.
+func (e *Engine) useAuditStore() (store AuditRepository, gen int64, done func()) {
+	e.storeMu.RLock()
+	defer e.storeMu.RUnlock()
+	if e.auditStore == nil {
+		return nil, 0, nil
+	}
+	e.auditInserts.Add(1)
+	return e.auditStore, e.storeGen.Load(), e.auditInserts.Done
+}
+
+// currentAuditStore returns the audit store, or nil.
+func (e *Engine) currentAuditStore() AuditRepository {
+	e.storeMu.RLock()
+	defer e.storeMu.RUnlock()
+	return e.auditStore
+}
+
+// insertsDone returns a channel closed once the inserts counted in wg have
+// returned. A nil wg counts none.
+func insertsDone(wg *sync.WaitGroup) <-chan struct{} {
+	done := make(chan struct{})
+	if wg == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// swapTransport makes x the transport and retires the previous one, which
+// it returns with a channel closed once the pushes running on it, and on
+// the transports it replaced, have returned.
+func (e *Engine) swapTransport(x *Transport) (*Transport, <-chan struct{}) {
+	prev := e.xport.Swap(x)
+	if prev == nil {
+		return nil, insertsDone(nil)
+	}
+	done := prev.retire(x)
+	if prev.replaced != nil {
+		done = allDone(done, prev.replaced)
+	}
+	if x != nil {
+		x.replaced = done
+	}
+	return prev, done
+}
+
+// allDone returns a channel closed once every channel in chs is closed.
+func allDone(chs ...<-chan struct{}) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		for _, ch := range chs {
+			<-ch
+		}
+		close(done)
+	}()
+	return done
+}
+
 // GetTransport returns the active Transport (ring buffers + stdout). Nil before Init.
-func (e *Engine) GetTransport() *Transport { return e.xport }
+func (e *Engine) GetTransport() *Transport { return e.xport.Load() }
 
 // GetQueueStats returns a snapshot of the drainer state, or nil in raise mode.
 func (e *Engine) GetQueueStats() *QueueStats {
@@ -640,12 +787,24 @@ func (e *Engine) Flush(timeout time.Duration) bool {
 // drainer and stores any row it still holds. A row not stored once timeout
 // has passed is reported lost (audit_drain_lost_at_stop). Call it on
 // shutdown: Flush alone leaves a row that is still being retried unreported
-// at exit. Emits after Close are stored synchronously. Returns false if a row
-// was lost.
+// at exit.
 //
-// A store call still running at timeout is left to finish in the background,
-// and its row is reported lost then. A second Close while one is running
-// waits for it, up to its own timeout, and returns the same result.
+// Close then stops retention and closes the stores Init opened from
+// FASTEN_AUDIT_DSN, FASTEN_API_DSN and FASTEN_SYSLOG_DSN. Stores passed in
+// Config are not closed. Until the next Init, which opens the DSN stores
+// again, a sys or api row goes to the in-memory ring, and to its store only
+// when that store was passed in Config. An audit row goes to stdout, and is
+// stored only when its store was passed in Config: then it is inserted
+// inline as it is emitted. A row for a store opened from FASTEN_AUDIT_DSN
+// goes to stdout only, unsealed.
+//
+// Returns false if a row was lost, a store did not close, or a store call
+// or purge was still running at timeout. Such a call is left to finish in
+// the background: a row it was storing is reported lost then, and the DSN
+// stores are closed once it returns. A second Close while one is running
+// waits for it, up to its own timeout, and returns the same result. A later
+// Close also waits, up to its own timeout, for stores an earlier Close left
+// open, and returns false if they still are.
 func (e *Engine) Close(timeout time.Duration) bool {
 	e.drainerMu.Lock()
 	if c := e.closing; c != nil {
@@ -677,6 +836,9 @@ type closeCall struct {
 
 func (e *Engine) close(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
+	e.drainerMu.Lock()
+	earlier := e.pendingClose
+	e.drainerMu.Unlock()
 	d := e.activeDrainer()
 	var lost int64
 	if d != nil {
@@ -684,16 +846,20 @@ func (e *Engine) close(timeout time.Duration) bool {
 	}
 	e.closed.Store(true)
 	e.Flush(timeout / 2)
+	// From here an emit does not wait on a store opened from the
+	// environment, however long a call already running on it takes.
+	purged := e.cancelRetention()
+	stores, inserts := e.releaseEnvStores()
 	old, done := e.swapDrainer(nil)
+	var retiring chan struct{}
 	if old != nil {
 		retired := make(chan struct{})
 		go func() {
 			e.retireOld(old, done, 0, deadline)
 			close(retired)
 		}()
-		select {
-		case <-retired:
-		case <-time.After(time.Until(deadline)):
+		if !waitUntil(retired, deadline) {
+			retiring = retired
 			old.reportUnstored()
 			// Flush on a drainer a later Init installs must not wait on this one.
 			e.drainerMu.Lock()
@@ -703,7 +869,55 @@ func (e *Engine) close(timeout time.Duration) bool {
 			e.drainerMu.Unlock()
 		}
 	}
-	return d == nil || d.lost.Load() == lost
+	if !waitUntil(purged, deadline) || retiring != nil || !waitUntil(inserts, deadline) {
+		// The old drainer, a purger or an insert still uses the stores.
+		out := e.out()
+		pending := make(chan struct{})
+		e.drainerMu.Lock()
+		e.pendingClose = pending
+		e.drainerMu.Unlock()
+		go func() {
+			<-purged
+			if retiring != nil {
+				<-retiring
+			}
+			<-inserts
+			e.closeStores(out, stores)
+			if earlier != nil {
+				<-earlier
+			}
+			e.drainerMu.Lock()
+			if e.pendingClose == pending {
+				e.pendingClose = nil
+			}
+			e.drainerMu.Unlock()
+			close(pending)
+		}()
+		return false
+	}
+	closed := e.closeStores(e.out(), stores)
+	if earlier != nil && !waitUntil(earlier, deadline) {
+		return false
+	}
+	return (d == nil || d.lost.Load() == lost) && closed
+}
+
+// waitUntil waits for done to be closed until deadline, and reports whether
+// it was.
+func waitUntil(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // marshalWithShape encodes row plus a "shape" key without modifying row. The
@@ -724,7 +938,7 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 		"event":      event,
 		"timestamp":  canonicalTS(time.Now()),
 		"request_id": RequestIDFromContext(ctx),
-		"service_id": e.serviceID,
+		"service_id": e.config().serviceID,
 	}
 	for i := 0; i+1 < len(kv); i += 2 {
 		k, ok := kv[i].(string)
@@ -739,8 +953,8 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 	// persistent store. PushSyslog would redact anyway; scrub the local
 	// copy up front so the stdout NDJSON also sees the redacted form.
 	row = SyslogRow(e.redactDetail(row))
-	if e.xport != nil {
-		e.xport.PushSyslog(row)
+	if x := e.xport.Load(); x != nil {
+		x.PushSyslog(row)
 	}
 	if b, err := marshalWithShape(row, "sys"); err == nil {
 		fmt.Println(string(b))
@@ -750,17 +964,20 @@ func (e *Engine) LogSys(ctx context.Context, level, event string, kv []any) {
 // ResetForTests resets all runtime state to pre-Init defaults. Tests only.
 func (e *Engine) ResetForTests() {
 	e.uninstallDrainer()
-	e.serviceID = ""
-	e.nodeID = ""
-	e.tenantID = ""
+	e.stopRetention()
+	stores, inserts := e.releaseEnvStores()
+	<-inserts
+	e.closeStores(e.out(), stores)
+	e.conf.Store(nil)
+	e.storeMu.Lock()
 	e.auditStore = nil
-	e.xport = nil
+	e.auditInserts = nil
 	e.apiStore = nil
 	e.syslogStore = nil
 	e.persistedStreams = nil
-	e.searchEnabled = false
+	e.storeMu.Unlock()
+	e.swapTransport(nil)
 	atomic.StoreInt64(&e.seq, 0)
-	e.failureStrategy = ""
 	e.closed.Store(false)
 	e.auditWriteSwallowed.Store(false)
 	e.hashMu.Lock()
@@ -770,11 +987,10 @@ func (e *Engine) ResetForTests() {
 	e.redactExtraKeysJSON = ""
 	e.redactReplacement = ""
 	e.redactMu.Unlock()
-	e.stopRetention()
 }
 
 // SearchEnabled reports whether free-text search is enabled.
-func (e *Engine) SearchEnabled() bool { return e.searchEnabled }
+func (e *Engine) SearchEnabled() bool { return e.config().searchEnabled }
 
 // isTruthy parses a boolean-ish env value ("1", "true", "yes", "on").
 func isTruthy(s string) bool {
@@ -820,6 +1036,10 @@ func (e *Engine) swapDrainer(next *cFastenDrainer) (*cFastenDrainer, chan struct
 	e.retired = done
 	return old, done
 }
+
+// testHookStoreSwitched, when set, runs in Init once emits use the new
+// audit store, before the new drainer is installed.
+var testHookStoreSwitched func()
 
 // testHookRetire, when set, runs before a replaced drainer is retired.
 var testHookRetire func()
@@ -924,7 +1144,7 @@ type sysOut struct {
 	serviceID string
 }
 
-func (e *Engine) out() sysOut { return sysOut{e.xport, e.serviceID} }
+func (e *Engine) out() sysOut { return sysOut{e.xport.Load(), e.config().serviceID} }
 
 // drainerSysLog writes an internal event to the sys stream and to stderr.
 func (e *Engine) drainerSysLog(level, event string, fields map[string]any) {

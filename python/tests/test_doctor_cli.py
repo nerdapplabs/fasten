@@ -37,14 +37,17 @@ def test_postgres_dsn_password_is_never_printed(doctor_env, monkeypatch, capsys,
     assert list(tmp_path.iterdir()) == []  # a postgres DSN never creates a SQLite file
 
 
-def test_uppercase_scheme_is_described_as_init_opens_it(doctor_env, monkeypatch, capsys):
-    monkeypatch.setenv("FASTEN_AUDIT_DSN", "POSTGRES://app:s3cret@h")
+@pytest.mark.parametrize("scheme", ["Postgres", "POSTGRES"])
+def test_uppercase_scheme_is_described_as_init_opens_it(doctor_env, monkeypatch, capsys,
+                                                        tmp_path, scheme):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", f"{scheme}://app:s3cret@127.0.0.1:1/audit")
     out = _run(capsys)
-    assert "sqlite (path hidden" in out and "s3cret" not in out
+    assert "audit_dsn     postgres" in out and "s3cret" not in out
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_sqlite_path_with_credentials_is_not_printed(doctor_env, monkeypatch, capsys):
-    monkeypatch.setenv("FASTEN_AUDIT_DSN", "Postgresql://app:ab/cdEFGH@db")
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sqlite://app:ab/cdEFGH@db")
     out = _run(capsys)
     assert "cdEFGH" not in out and "sqlite (path hidden" in out
 
@@ -134,6 +137,66 @@ def test_an_unsupported_api_dsn_scheme_fails(doctor_env, monkeypatch, capsys):
     monkeypatch.setenv("FASTEN_API_DSN", "mysql://db/api")
     out = _run(capsys)
     assert "unsupported DSN scheme 'mysql'" in out
+
+
+def test_an_unsupported_audit_dsn_scheme_names_only_the_scheme(doctor_env, monkeypatch, capsys,
+                                                               tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "mysql://u:hunter2@db/app")
+    out = _run(capsys)
+    assert out.count("unsupported DSN scheme 'mysql'") == 2
+    assert not any(w in out for w in ("hunter2", "u:", "@db", "/app"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unparseable_dsn_is_reported_without_it(doctor_env, monkeypatch, capsys, tmp_path):
+    dsn = "postgresql://admin:s3\uff20cret@db.internal/app"
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
+    monkeypatch.setenv("FASTEN_API_DSN", dsn)
+    out = _run(capsys)
+    assert out.count("unparseable DSN") == 4
+    assert not any(w in out for w in ("admin", "s3", "cret", "db.internal"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_libpq_keyword_dsn_with_an_at_sign_is_reported_as_init_refuses_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "host=db password=s3@cret")
+    out = _run(capsys)
+    assert "s3@cret" not in out and out.count("unrecognised DSN") == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_path_with_a_space_before_a_key_is_a_sqlite_path_as_init_opens_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    (tmp_path / "sub").mkdir()
+    sqlite3.connect(tmp_path / "sub" / "my db=1.db").execute(
+        "CREATE TABLE audit_log (id TEXT)").connection.close()
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sub/my db=1.db")
+    out = _run(capsys)
+    assert "unrecognised DSN" not in out
+    assert out.count("sqlite sub/my db=1.db (connected") == 2
+
+
+def test_a_postgres_url_after_a_space_is_a_sqlite_path_as_init_opens_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", " postgres://u:pw@h/db")
+    monkeypatch.setenv("FASTEN_API_DSN", " postgres://u:pw@h/db")
+    out = _run(capsys)
+    assert out.count("sqlite (path hidden") == 4
+    assert "pw@h" not in out and "postgres://" not in out
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("dsn", [
+    "admin:s3cret@db.internal:5432/app", "db.internal:5432/app", "user:pw@host/db"])
+def test_dsn_errors_name_a_scheme_only_when_the_dsn_has_one(doctor_env, monkeypatch, capsys,
+                                                             tmp_path, dsn):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", dsn)
+    monkeypatch.setenv("FASTEN_API_DSN", dsn)
+    out = _run(capsys)
+    assert out.count("DSN form not recognised") == 4
+    assert not any(w in out for w in ("admin", "s3cret", "db.internal", "pw@", "5432"))
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_error_hides_details_that_contain_the_password(doctor_env, monkeypatch, capsys):

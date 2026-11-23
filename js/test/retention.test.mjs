@@ -49,7 +49,7 @@ test('listRedactionCandidates canonicalises a string cutoff', async () => {
     const store = Object.create(PostgresStore.prototype);
     store._table = 't';
     store._ensureReady = async () => {};
-    store._pool = { query: async (_sql, params) => { seen.push(params[0]); return { rows: [{ count: 0 }] }; } };
+    store._pool = { query: async (cfg) => { seen.push(cfg.values[0]); return { rows: [{ count: 0 }] }; } };
     await store.listRedactionCandidates({ before: '2026-10-01T00:00:00+05:30', codes: ['X'] });
     assert.equal(seen[0], '2026-09-30T18:30:00.000000Z');
     await assert.rejects(store.listRedactionCandidates({ before: 'not a date', codes: ['X'] }));

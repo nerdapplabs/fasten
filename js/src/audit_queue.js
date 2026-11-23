@@ -16,17 +16,65 @@ const DEGRADED_AFTER = 5;
 // cannot help. `pg` puts the SQLSTATE in `code`: class 22 is a data
 // exception, 23 an integrity violation, 54 a program limit (for example a
 // value too long for an index). Class 42 is retried: a revoked grant or a
-// renamed table is the deploy, not the row. SQLite drivers put
+// renamed table is the deploy, not the row. Some SQLite drivers put
 // SQLITE_CONSTRAINT (with its extended forms such as
-// SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`. Same rules as
-// fasten-core's sqlstate_rejects_row and the Python and Go drainers.
+// SQLITE_CONSTRAINT_UNIQUE) or SQLITE_MISMATCH in `code`; node:sqlite puts
+// ERR_SQLITE_ERROR there and the extended result code in `errcode`, whose
+// low byte is 19 (SQLITE_CONSTRAINT) or 20 (SQLITE_MISMATCH). Same rules
+// as fasten-core's sqlstate_rejects_row and the Python and Go drainers.
+// An AuditRowRejectedError is the store refusing the row itself.
 export function rejectsRow(err) {
+	if (err instanceof AuditRowRejectedError) return true;
 	const code = err?.code;
+	if (code === "ERR_SQLITE_ERROR" && typeof err.errcode === "number") {
+		const primary = err.errcode & 0xff;
+		return primary === 19 || primary === 20;
+	}
 	if (typeof code !== "string") return false;
 	if (code.startsWith("SQLITE_CONSTRAINT") || code === "SQLITE_MISMATCH") {
 		return true;
 	}
 	return code.length === 5 && ["22", "23", "54"].includes(code.slice(0, 2));
+}
+
+/**
+ * The type of an error: its name, or its class name when the name is pg's
+ * "error". The drainer records the error type, as the other SDKs do.
+ * @param {any} err
+ * @returns {string}
+ */
+export function errorType(err) {
+	const name = err?.name;
+	if (typeof name === "string" && name && name !== "error") return name;
+	return err?.constructor?.name || "Error";
+}
+
+/**
+ * The store refused the row itself, so retrying cannot help: a different row
+ * under an id already stored, or a row it cannot seal as given. The drainer
+ * dead-letters it.
+ */
+export class AuditRowRejectedError extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "AuditRowRejectedError";
+	}
+}
+
+/**
+ * The store cannot tell whether a row was stored: its commit failed and the
+ * row could not be read back. Storing it again under the same id is safe,
+ * since the stores take a stored id as stored; a new emit() would store it a
+ * second time under a new id. The drainer retries it.
+ */
+export class AuditOutcomeUnknownError extends Error {
+	constructor(id, cause) {
+		super(
+			`row ${id}: the commit failed and the row could not be read back, so whether it is stored is unknown`,
+		);
+		this.name = "AuditOutcomeUnknownError";
+		this.cause = cause;
+	}
 }
 
 export class AuditStoreError extends Error {
@@ -228,7 +276,7 @@ class AuditQueueDrainer {
 	}
 
 	_onDeadLetter(row, attempt, err) {
-		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		const msg = errorType(err);
 		this._deadLetteredTotal++;
 		this._retryCount = 0;
 		this._inBackoffUntilMs = 0;
@@ -245,7 +293,7 @@ class AuditQueueDrainer {
 	_onLostAtStop(row, err) {
 		this._lostTotal++;
 		this._sysLog("error", "audit_drain_lost_at_stop", {
-			error_type: err?.name ?? "Error",
+			error_type: errorType(err),
 			row_id: row?.id ?? null,
 		});
 	}
@@ -263,7 +311,7 @@ class AuditQueueDrainer {
 	}
 
 	_onFailure(err) {
-		const msg = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+		const msg = errorType(err);
 		const first = this._retryCount === 0;
 		if (first) this._failureBurstStartedAt = Date.now();
 		this._retryCount++;
@@ -342,6 +390,16 @@ export function installDrainer(opts) {
 
 export function uninstallDrainer(timeoutMs) {
 	return _defaultEngine?._uninstallDrainer(timeoutMs) ?? Promise.resolve(true);
+}
+
+// A sys line through the default engine, for code with no engine of its
+// own, such as the stores. Never throws.
+export function sysLog(level, event, fields) {
+	try {
+		_defaultEngine?._drainerSysLog(level, event, fields);
+	} catch {
+		// Logging must not fail the caller.
+	}
 }
 
 export function activeDrainer() {

@@ -122,15 +122,24 @@ void fasten_store_close(FastenStore* store);
 /**
  * Insert a single audit row.
  *
- * A row whose `id` already exists is ignored, so inserts are idempotent.
+ * A row whose `id` already exists is ignored, so inserts are idempotent:
+ * nothing is written and FASTEN_OK is returned, whatever the new row holds.
+ * A repeated id with monotonic_seq 0 keeps the first row's seq and chain
+ * fields. The caller gets only a status, never the row as stored, so it
+ * cannot see the seq or hash the store gave a row; read them back with the
+ * query functions. A row with monotonic_seq 0 must have origin_id equal to
+ * id; any other is refused.
  *
  * monotonic_seq 0 means "allocate": the store assigns the next seq for the
- * row's source_node_id inside the insert transaction (spec §2.1, §8.2). The
- * row is stored unsealed: any chain fields it carries are dropped (stored as
- * prev_hash "", hash "", canonical_form_id "1", no salt or commitment). A
- * non-zero monotonic_seq is written as given, chain fields included; on a
- * table created by this library a (source_node_id, monotonic_seq) clash is
- * an error.
+ * row's source_node_id and seals the row into the node's hash chain, inside
+ * the insert transaction (spec §2.1). Any chain fields the row carries are
+ * replaced: prev_hash is the hash of the node's last sealed row ("genesis"
+ * when there is none), canonical_form_id is "2", and detail_salt,
+ * detail_commitment and hash are computed. A non-zero monotonic_seq is
+ * written as given, chain fields included, so a row without a hash stays
+ * unsealed; do not mix such rows with allocated ones on one source_node_id
+ * (spec §8.2). On a table created by this library a (source_node_id,
+ * monotonic_seq) clash is an error.
  *
  * @param store    Non-null handle returned by fasten_store_open().
  * @param row_json UTF-8 JSON object matching the fasten wire schema.

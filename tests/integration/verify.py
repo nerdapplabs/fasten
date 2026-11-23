@@ -13,6 +13,7 @@ asserts:
   4. Audit and api request_id values are 12 hex chars.
   5. The startup_ok sys row has level, event, request_id and timestamp.
   6. An api row, if any, has method, path, status, request_id, timestamp.
+  7. Every audit row is valid against spec/row-schema.json.
 
 Exits 0 if every check passes, else 1 with the failed check on stderr.
 
@@ -33,7 +34,10 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
+
+ROW_SCHEMA = Path(__file__).resolve().parents[2] / "spec" / "row-schema.json"
 
 REQUIRED_AUDIT_FIELDS = {
     "wire_version",
@@ -60,6 +64,51 @@ def fail(msg: str, ctx: Any = None) -> None:
     if ctx is not None:
         print(f"  context: {json.dumps(ctx, indent=2, default=str)}", file=sys.stderr)
     sys.exit(1)
+
+
+# The keywords spec/row-schema.json uses. A schema that starts using another
+# one fails here, so a check is never skipped without notice.
+_CHECKED = {"type", "enum", "const", "pattern", "minLength"}
+_ANNOTATIONS = {"description", "default", "format", "x-values"}
+_JSON_TYPES = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "null": lambda v: v is None,
+}
+
+
+def schema_errors(row: dict, schema: dict) -> list[str]:
+    """The ways row breaks schema (required, properties,
+    additionalProperties: false, and the keywords in _CHECKED)."""
+    errors = [f"missing {k!r}" for k in schema.get("required", []) if k not in row]
+    props = schema["properties"]
+    if schema.get("additionalProperties") is False:
+        errors += [f"{k!r} is not in the schema" for k in row if k not in props]
+    for key, rule in props.items():
+        unknown = set(rule) - _CHECKED - _ANNOTATIONS
+        if unknown:
+            fail(f"verify.py does not check schema keyword(s) {sorted(unknown)} on {key!r}")
+        if key not in row:
+            continue
+        value = row[key]
+        if "type" in rule:
+            types = rule["type"] if isinstance(rule["type"], list) else [rule["type"]]
+            if not any(_JSON_TYPES[t](value) for t in types):
+                errors.append(f"{key!r} is {value!r}, not {' or '.join(types)}")
+                continue
+        if "const" in rule and value != rule["const"]:
+            errors.append(f"{key!r} is {value!r}, not {rule['const']!r}")
+        if "enum" in rule and value not in rule["enum"]:
+            errors.append(f"{key!r} is {value!r}, not one of {rule['enum']}")
+        if isinstance(value, str):
+            if "pattern" in rule and not re.search(rule["pattern"], value):
+                errors.append(f"{key!r} is {value!r}, which does not match {rule['pattern']}")
+            if "minLength" in rule and len(value) < rule["minLength"]:
+                errors.append(f"{key!r} is shorter than {rule['minLength']}")
+    return errors
 
 
 def main() -> None:
@@ -94,6 +143,12 @@ def main() -> None:
         fail("no {shape: 'audit'} row produced")
     if not sys_rows:
         fail("no {shape: 'sys'} row produced")
+
+    schema = json.loads(ROW_SCHEMA.read_text())
+    for row in audit_rows:
+        errors = schema_errors(row, schema)
+        if errors:
+            fail(f"audit row does not match spec/row-schema.json: {errors}", row)
 
     audit = audit_rows[0]
     missing = REQUIRED_AUDIT_FIELDS - set(audit.keys())

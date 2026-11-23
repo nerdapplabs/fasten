@@ -34,6 +34,14 @@ describe('redact conformance', () => {
         }
     });
 
+    test('a __proto__ key is kept and redacted like any other', () => {
+        const out = coreRedact('{"__proto__":{"password":"hunter2","n":1},"ok":1}');
+        assert.equal(out, '{"__proto__":{"password":"***","n":1},"ok":1}');
+        const got = JSON.parse(out);
+        assert.equal(Object.getPrototypeOf(got), Object.prototype);
+        assert.equal(Object.getPrototypeOf(JSON.parse(coreRedact('{"a":1}'))), Object.prototype);
+    });
+
     // Built at runtime so GitHub push protection doesn't flag the literal.
     test('value_stripe_live', () => {
         const key = 'sk' + '_live_' + 'A'.repeat(24);

@@ -454,15 +454,15 @@ func ingestWithoutLocalNode(
 // SQLiteStore.IngestReplicatedFor). A store with only IngestReplicated gets
 // the same check.
 func (e *Engine) IngestReplicated(ctx context.Context, rows []Row) (IngestResult, error) {
-	switch s := e.auditStore.(type) {
+	switch s := e.currentAuditStore().(type) {
 	case nil:
 		return IngestResult{}, errors.New("fasten IngestReplicated: requires an audit store: call Init with AuditStore first")
 	case LocalIngester:
-		return s.IngestReplicatedFor(ctx, e.nodeID, rows)
+		return s.IngestReplicatedFor(ctx, e.config().nodeID, rows)
 	case interface {
 		IngestReplicated(context.Context, []Row) (IngestResult, error)
 	}:
-		return ingestWithoutLocalNode(ctx, e.nodeID, rows, s.IngestReplicated)
+		return ingestWithoutLocalNode(ctx, e.config().nodeID, rows, s.IngestReplicated)
 	default:
 		return IngestResult{}, errors.New("fasten IngestReplicated: the audit store has no IngestReplicated method")
 	}

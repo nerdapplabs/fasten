@@ -103,7 +103,7 @@ const (
 	Correlation Anchor = "correlation"
 )
 
-// Row is an audit row. It converts to CloudEvent or OTel without loss.
+// Row is an audit row.
 type Row struct {
 	WireVersion  string    `json:"wire_version"`
 	ID           string    `json:"id"`
@@ -382,7 +382,7 @@ func Background(ctx context.Context) context.Context { return BackgroundKind(ctx
 // BackgroundKind is Background with an explicit sentinel namespace.
 func BackgroundKind(ctx context.Context, kind string) context.Context {
 	if RequestIDFromContext(ctx) == "" {
-		return WithRequestID(ctx, MintSentinel(kind, Default.serviceID))
+		return WithRequestID(ctx, MintSentinel(kind, Default.config().serviceID))
 	}
 	return ctx
 }
@@ -423,7 +423,10 @@ type QueueStats struct {
 	CapacitySemantics string  `json:"capacity_semantics"`
 }
 
-// Config for Init. With a nil AuditStore, audit rows only go to stdout.
+// Config for Init. A nil AuditStore, APIStore or SyslogStore is opened from
+// FASTEN_AUDIT_DSN, FASTEN_API_DSN or FASTEN_SYSLOG_DSN when that is set
+// (see the README); with neither, audit rows only go to stdout and the
+// streams stay in memory.
 //
 // AuditStoreFailureStrategy (or FASTEN_AUDIT_STORE_FAILURE_STRATEGY) sets
 // how Emit writes to the store:
@@ -443,9 +446,9 @@ type Config struct {
 	TenantID   string
 	AuditStore AuditRepository
 
-	// APIStore and SyslogStore persist the api and sys streams. Nil keeps
-	// the stream in memory only. Use NewStreamStore (SQLite) or
-	// NewPostgresStreamStore; the caller owns the *sql.DB.
+	// APIStore and SyslogStore persist the api and sys streams. Use
+	// NewStreamStore (SQLite) or NewPostgresStreamStore; the caller owns
+	// the *sql.DB.
 	APIStore    StreamRepository
 	SyslogStore StreamRepository
 
@@ -497,8 +500,10 @@ func GetTransport() *Transport { return Default.GetTransport() }
 // Flush blocks until the Default engine's pending rows drain.
 func Flush(timeout time.Duration) bool { return Default.Flush(timeout) }
 
-// Close flushes and stops the Default engine's drainer; call it on shutdown.
-// It returns within about timeout, and false if a row was lost.
+// Close flushes and stops the Default engine's drainer, stops retention and
+// closes the stores Init opened from FASTEN_*_DSN; call it on shutdown. It
+// returns within about timeout, and false if a row was lost or a store call
+// or purge was still running. See Engine.Close for what later rows do.
 func Close(timeout time.Duration) bool { return Default.Close(timeout) }
 
 // GetQueueStats returns the Default engine's drainer snapshot.

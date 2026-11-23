@@ -6,7 +6,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.0.0-beta.0] - 2026-11-19
+## [1.0.0-beta.0] - 2026-11-23
 
 The first beta. It is a GitHub prerelease, and nothing is on PyPI, npm or
 crates.io until 1.0. The
@@ -17,31 +17,445 @@ of the repository.
 
 ### SDKs in this beta
 
-- **Python and Go** are complete. They seal audit rows into a hash chain,
-  verify a chain, publish and check checkpoints, and include the SQLite and
-  Postgres stores and the HTTP reader. A chain sealed by one verifies in
-  the other.
-- **JS, Rust, C++ and Swift** are previews. They emit, redact and store
-  rows, and allocate sequence numbers, but their rows are not sealed, so
-  they can't be verified for tampering.
+- **Python, Go, Rust and JS** are complete. They seal audit rows into a
+  hash chain, verify a chain, publish and check checkpoints, and include
+  the SQLite and Postgres stores, replication, the HTTP reader, stored sys
+  and api logs, and stores from `FASTEN_*_DSN` variables. A chain sealed by
+  one verifies in the others.
+- **C++ and Swift** are previews. They emit, redact and store rows, and
+  allocate sequence numbers, but their rows are not sealed, so they can't
+  be verified for tampering.
+- The `fasten` command-line tool (`fasten tail`, `fasten tui`) is part of
+  the Python SDK and works against the HTTP reader of Python, Go, Rust and
+  JS.
 
 ### Known issues
 
-- Rows written by the JS, Rust, C++ and Swift SDKs are not sealed.
-- Only Python and Go can share one audit table. Swift writes timestamps in
-  whole seconds, which the Python and Go readers reject (#227).
+- Rows written by the C++ and Swift SDKs are not sealed.
+- Python, Go, Rust and JS can share one audit table. Swift writes
+  timestamps in whole seconds, so its rows can't share a table with the
+  others (#227).
 - With several workers and personal-data retention on, each worker writes
   its own `AUDIT_ROW_REDACTED` row for the same redacted row. The chain
   still verifies (#134).
-- Go fails to read a table that holds a row redacted by the Rust SDK
-  (#131).
-- JS drops a detail key named `__proto__` (#146).
-- The Rust SDK's `PostgresStore` does not reconnect after its connection
-  drops; later rows are dead-lettered until the process restarts (#139).
 - The Python wheels are for Linux with glibc 2.34 or later and for macOS.
   There is no Windows wheel.
 - The Swift tests hang on Linux arm64 (#160).
 - Some dependency versions are behind (#153).
+
+### Fixed: JS and Python DSN errors
+
+- DSN errors name a scheme only when the DSN has one, that is when `//`
+  follows it. A DSN such as `host:5432/db` or `user:password@host/db` gets
+  `DSN form not recognised`; an unknown scheme such as `mysql://...` is
+  still named.
+- JS: a `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN` read as a file path that
+  cannot be opened, such as `user@host/db`, fails with SQLite's error, as
+  `FASTEN_AUDIT_DSN` does, instead of an error quoting the DSN.
+- `fasten doctor` describes `FASTEN_AUDIT_DSN` as init opens it: a path
+  such as `sub/my db=1.db` is a SQLite file, not a libpq keyword DSN.
+
+### Changed: Python store DSNs (breaking for existing callers)
+
+These DSNs opened a local SQLite file before and no longer do:
+
+- `FASTEN_AUDIT_DSN` with a scheme other than `sqlite`, `postgres` or
+  `postgresql`, such as `file:f.db` or `mysql://host/app`, which wrote to a
+  file named after the URL path. It is refused, as `FASTEN_API_DSN` and
+  `FASTEN_SYSLOG_DSN` refuse it, and `fasten doctor` reports it.
+- `FASTEN_AUDIT_DSN` with `postgres` or `postgresql` in another case, such
+  as `POSTGRES://...`. It opens Postgres, as the stream DSNs do, and
+  `fasten doctor` describes it the same way.
+- libpq's keyword form, such as `host=db dbname=app` or `tenant=blue.db`, in
+  `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`. It is
+  refused, as JS, Rust and Go refuse it.
+
+A DSN's scheme is read only at its start, as JS, Go and Rust read it:
+
+- ` postgres://...` with a leading space or tab is a file path, not
+  Postgres.
+- On Python 3.10, `2026:a.db` opens that file instead of being refused.
+- A bare path keeps a `;` or a tab: `a;b.db` opens `a;b.db`, not `a`.
+
+### Added: Go stores from the environment
+
+- `Init` opens the audit store from `FASTEN_AUDIT_DSN` when
+  `Config.AuditStore` is nil, as Python, JS and Rust do: `postgres://` or
+  `postgresql://`, `sqlite:///rel.db`, `sqlite:////abs.db` or a bare path,
+  with `?table=` and `?wal=false`. `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`
+  take the same forms, now including Postgres. A Postgres DSN needs a
+  `database/sql` driver registered as `postgres` (for example
+  `import _ "github.com/lib/pq"`, or pgx's driver registered under that
+  name); without one, `Init` says so. A store passed in `Config` still
+  wins.
+- `Init` checks every DSN, and everything else it can refuse, before
+  opening any store. An unknown scheme, libpq's keyword form, a missing
+  path or directory, or an invalid table name is an `Init` error naming the
+  variable and no part of the DSN; a DSN error names a scheme only when
+  `//` follows it. A store that cannot be opened is reported by the
+  variable, scheme and error type; the stores that `Init` opened are closed
+  again, and their files are left in place. A failed `Init` keeps the
+  stores, retention and drainer it had.
+- SQLite DSN paths, in `Init` and `OpenStreamStore`, are used as written:
+  `%20` is not decoded, a lone `%` is accepted, and a `#fragment` is
+  dropped, as in Python, JS and Rust.
+- For existing `OpenStreamStore` callers: `?table=` and `?wal=false` on a
+  bare path are now honoured (they used to be passed to the driver), and a
+  DSN that starts like a scheme (`name:rest`) is refused, as in Python, JS
+  and Rust. That includes a SQLite `file:` URI and a drive letter
+  (`C:/x.db`); use `sqlite:///` or a bare path instead.
+- `Init` again with the same DSN keeps its store; with another DSN, the old
+  store is closed once the writes running on it have returned, and later
+  rows go to the new store. A `SlogHandler` follows `Init` and `Close`: it
+  writes to the stores of the latest `Init`, not those it was created with.
+  `Init` can run while other goroutines emit and log.
+- `Close` now also stops retention and closes the stores opened from the
+  environment, within its timeout: a purge or write still running is left
+  to finish, its stores are closed once it returns, and `Close` returns
+  false. Emits do not wait for it, and a later `Close` waits for those
+  stores up to its own timeout. Until the next `Init`, rows for those
+  stores go to stdout or the in-memory rings only, and are not counted as
+  store failures. Stores passed in `Config` are not closed and still
+  receive rows.
+- A set `FASTEN_*` variable named like a DSN that `Init` does not read (for
+  example `FASTEN_AUDIT_DNS`) is reported once as `env_dsn_not_read`.
+
+### Fixed: fasten tui
+
+- The sys pane shows a row's `event` when the row has no `message`, as
+  `fasten tail` does. Sys rows from every SDK carry `event`, so the column
+  showed `—` before.
+
+### Changed: JS (breaking for existing callers)
+
+- `PostgresStore.query()` and `listUnshipped()` return rows with the wire's
+  snake_case keys (`origin_id`, `monotonic_seq`, `source_node_id`,
+  `tenant_id`, `pii_in_detail`, `shipped_at`, `prev_hash`, ...), the shape of
+  `Row` and of what `insert()` returns, instead of camelCase. They also carry
+  `wire_version`, `canonical_form_id`, `detail_salt` and
+  `detail_commitment`, and `verifyChain` reads them.
+- An integer in `detail` that a number cannot hold exactly reads back from
+  `query()` as a `BigInt`. `JSON.stringify` throws on it without a replacer.
+- `emit()` throws `ChainError` when `target` is not a string, or a row field
+  is not a string or holds an unpaired surrogate, in both modes and before
+  anything is written.
+- A string `detail` given to `PostgresStore.insert()` must be JSON text of
+  an object; other text is rejected with `AuditRowRejectedError`.
+- `PostgresStore.insert()` and `insertSealed()` reject a row with its own
+  `monotonic_seq` when another row holds that seq on its node.
+- `AuditRepository.purge` is typed `purge({ before, respectUnshipped })`, as
+  `PostgresStore` implements it.
+- A failed write of the first stdout line is logged as
+  `audit_stdout_failed`, not thrown.
+- The drainer's `last_error`, `audit_drain_failed`, `audit_drain_degraded`
+  and `audit_drain_dead_letter` record the error type only, as the other
+  SDKs do. `audit_sync_fallback_failed` reports it as `error_type` (was
+  `error`).
+- `apiStore` is now used: it is the api stream's store (`StreamStore`). It
+  was typed as an audit store and ignored; remove an audit store passed
+  there.
+- `init()` now opens the audit store from `FASTEN_AUDIT_DSN` when no
+  `auditStore` is passed, so an app with that variable set starts writing
+  to that store. An audit or stream DSN with an unknown scheme, or in
+  libpq's keyword form, makes `init()` throw, naming the scheme only.
+- `close()` waits for api and sys store writes and resolves false when they
+  do not finish in its timeout, then closes the stores it opened from
+  `FASTEN_*_DSN`.
+- `init()` now reads `FASTEN_PERSIST_STREAMS`, `FASTEN_RETENTION_API` and
+  `FASTEN_RETENTION_SYSLOG` when the matching option is not passed, and
+  throws on a value it cannot use: a stream name other than `api` or
+  `sys`, a stream named without a store or a store attached but not named,
+  or a retention that is not a positive whole number of `s`, `m`, `h` or
+  `d` (checked even when that stream has no store). A retention for a
+  store without `purge()` throws too. An app with these variables set can
+  now fail to start.
+
+### Added: JS SQLite store, replication, reader and stored logs
+
+- `SqliteStore` (`fasten-sdk/store/sqlite`), on Node's built-in
+  `node:sqlite` with no new dependency, seals rows into the per-node hash
+  chain as `PostgresStore` does, and shares one file with the Python, Go and
+  Rust SQLite stores, adding the columns their tables lack. Its calls are
+  synchronous and block the event loop while they run. `node:sqlite` is a
+  release candidate from Node 24.15.0 and experimental before it.
+- Replication on both stores: `ingestReplicated(rows, { localNodeId })`
+  verifies a replicated batch, checks it against the stored rows, stores the
+  verified prefix as it was sealed, and returns `{ inserted,
+  rejectedFromSeq, reason }` (Python's and Go's `IngestResult`).
+  `insertReplicated(row)` stores one sealed row.
+  `listUnshipped(limit, { serviceId, sourceNodeId, exact })` can list only
+  the rows an identity originated, with detail numbers exact for shipping.
+  The engine adds `listUnshipped()`, `markShipped(ids)` and
+  `ingestReplicated(rows)`, which throw `TypeError` without a store that
+  has the method. A store's `listUnshipped` throws `TypeError` when only
+  one of `serviceId` and `sourceNodeId` is given.
+- HTTP reader (`fasten-sdk/reader`): `reader({ auth, ... })` serves
+  `/audit`, `/audit/doctor`, `/correlate`, `/search`, `/sys`, `/api` and
+  `/topology` with the Python and Go readers' parameters, responses and
+  limits, over either store. `auth` is required (`{ bearer }`,
+  `requireBearer()`, `{ verify }` or `"none"`), and `tenantScope` /
+  `enforceTenantIsolation` scope every route.
+- Stored sys and api logs: `PostgresStreamStore` and `SqliteStreamStore` on
+  the stream tables the other SDKs use, `init({ apiStore, syslogStore,
+  persistStreams, searchEnabled, retentionApi, retentionSyslog })`,
+  `apiLogger()`, `writeApi`, `pushApi`, `pushSyslog`, `mintSentinel` and
+  `isSentinel`. `SqliteStreamStore` methods return promises, and it creates
+  its table on `init()` or first use.
+- Both audit stores gain `search`, `sources`, `chainTail` and
+  `query({ afterSeq })`. On SQLite, search folds ASCII letters only, as the
+  Python and Go SQLite stores do.
+- `init()` opens the audit, api and sys stores from `FASTEN_AUDIT_DSN`,
+  `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` when none is passed, with
+  Python's DSN forms (`postgres://`, `postgresql://`, `sqlite:///rel.db`,
+  `sqlite:////abs.db`, a bare path, `?table=`, `?wal=false`).
+- `PostgresStore` and `PostgresStreamStore` recover when the database drops
+  their connections: a dead idle connection no longer ends the process, and
+  a read or transaction that meets one runs again on a new connection. A
+  stream INSERT is not run again, so a lost connection cannot store a
+  stream row twice; it counts as a failed write.
+- `PostgresStore` takes a pg `Pool` as well as a DSN, so it can share one
+  with `PostgresStreamStore`.
+- `apiLogger({ path })` can rewrite the stored path. A request aborted
+  before its response finished is recorded with status 499 and
+  `aborted: true`. A request id that looks like a sentinel is not taken
+  from the client.
+- The reader matches the request path as sent, applies the tenant scope to
+  every row it returns, and a scoped doctor reports only the caller's data.
+  It resolves the tenant scope before reading query parameters, so a
+  caller without a tenant gets 401, not 422.
+  The doctor's chain block reports `sealed_rows` and gives `verified: null`
+  when no sealed row was checked.
+- `purge({ before })` on both audit stores takes a `Date` or a timestamp in
+  any offset.
+- `SqliteStreamStore` takes `busyTimeoutMs` (default 5000).
+- A set `FASTEN_*` variable named like a DSN variable but not read is
+  reported once at init (`env_dsn_not_read`).
+
+### Added: the JS SDK seals and verifies rows
+
+- The JS `PostgresStore` seals each row into the node's hash chain when it
+  stores it, as Python, Go and Rust do. Writers in any of them share one
+  chain per node on one table, and each verifies the others' rows.
+- When the store returns a row with a hash, the engine writes it to stdout
+  a second time, sealed; in raise mode `emit()` returns it. A retry of a
+  stored id returns the stored row. A store whose `seals()` is true but
+  that returns no hashed row is logged once as `audit_chain_row_unsealed`.
+  `audit_chain_unavailable` is logged with no store, or a store whose
+  `seals()` does not return true. A failed stdout write, or an `error`
+  event on stdout, is logged as `audit_stdout_failed` with `error_code`.
+- A row a store cannot seal as given is rejected with
+  `AuditRowRejectedError` and dead-lettered at once; `AuditSealError`
+  (retried) is left for other seal failures. When a COMMIT fails the store
+  reads the row back once; `AuditOutcomeUnknownError` says it could not.
+- `verifyChain(rows, {checkpoints, partial})` reports `sealedRows`,
+  `checkpointsChecked` and the node of the first break. `seal`,
+  `detailCommitment`, `canonicalJSON` and `parseJson` give the same bytes
+  as the other SDKs; `parseJson` keeps each number as written.
+- Checkpoints: `publishCheckpoints`, `FileCheckpointSink`,
+  `HttpCheckpointSink`, `loadCheckpoints` and `checkpointsSince`, with the
+  other SDKs' file format. `loadCheckpoints` throws `PartialLastLineError`,
+  carrying the checkpoints read so far, when the last line was cut short.
+- `PostgresStore` gains `chainRows`, `allChainRows`, `chainTips` and
+  `insertSealed`, adds the columns a Python or Go table lacks, and has
+  TypeScript types (`fasten-sdk/store/postgres`).
+- A `BigInt` in `detail` keeps its digits.
+- `spec/js-sealed-form2.json` and `spec/js-sealed-stdout.jsonl`, written by
+  `scripts/gen_js_vectors.mjs` from the JS engine and store, hold sealed
+  rows and the stdout lines for them; the Python and Go suites verify both.
+
+### Added: Rust replication, recovery, stored logs, the HTTP reader and stores from the environment
+
+- Replication in fasten-core and the Rust SDK: `ingest_replicated` verifies
+  a batch of rows sealed on other nodes, checks it against the stored rows,
+  stores the verified prefix exactly as sealed in one transaction, and
+  reports the first break in `IngestResult { inserted, rejected_from_seq,
+  reason }`, as the Python, Go and JS stores do; a custom store builds one
+  with `IngestResult::stored` or `IngestResult::cut`, so the break's seq and
+  reason are always set together. `list_unshipped_sealed` lists the rows an
+  identity originated, `ReplicatedRow::to_json` and `from_json` carry them,
+  and `mark_shipped` marks them. The engine has `fasten::list_unshipped`,
+  `mark_shipped` and `ingest_replicated`, scoped to its service and node
+  id; a row from its own node is a break. The SDK re-exports
+  `ReplicatedRow`, `IngestResult` and `BatchError`.
+- `insert_replicated`, the replicated insert of spec §5, on the stores.
+- `purge(before, respect_unshipped)` on the Rust SDK stores. A failure is
+  `Error::AuditStorePurge`. A purge is never run a second time on its own:
+  when the connection is lost while it runs, the error says how many rows
+  it deleted is unknown. The engine never purges audit rows; it purges only
+  the sys and api stores, by `retention_api` and `retention_syslog`.
+- `PostgresStore` (Rust SDK) connects again after losing its connection
+  (SQLSTATE class 08 or 57 other than 57014, a socket error or a closed
+  client) and runs a read or a whole transaction once more. A COMMIT cut
+  short is never run again; an insert reads its row back once. A purge is
+  not run again.
+  `PostgresStreamStore` follows the same rule for reads and purges, and
+  never runs an INSERT again.
+- `init` opens the audit store from `FASTEN_AUDIT_DSN`, and the sys and api
+  stores from `FASTEN_SYSLOG_DSN` and `FASTEN_API_DSN`, when the config has
+  none, in the Python SDK's DSN forms. `init` again with the same DSN keeps
+  the store it opened; with another one, the old store is closed.
+  `fasten::close` releases the stores opened from DSNs, as the JS SDK's
+  close does. `fasten::parse_dsn`, `audit_store_from_dsn` and
+  `stream_store_from_dsn` are public. A set `FASTEN_*` variable named like
+  a DSN that init does not read is reported once as `env_dsn_not_read`.
+- DSN errors name a scheme only when the DSN has one (`//` follows it).
+- A DSN that repeats `table` or `wal` uses the first value that is not
+  empty, as Python's `parse_qs` does.
+- Stored sys and api logs: `SqliteStreamStore` (`store-sqlite`) and
+  `PostgresStreamStore` (`store-postgres`) on the table the Python, Go and
+  JS stream stores use; `Config::api_store`, `syslog_store`,
+  `persist_streams`, `retention_api`, `retention_syslog`,
+  `search_enabled`; `FASTEN_PERSIST_STREAMS`, `FASTEN_RETENTION_API`,
+  `FASTEN_RETENTION_SYSLOG`, `FASTEN_SEARCH_ENABLED`. Writes run in order on
+  one thread per stream, at most 10,000 waiting; a failed write keeps the
+  stdout line, marks the stream degraded and is reported by error type
+  only.
+- `fasten::log::api` for api rows, and `fasten::close`; `fasten::flush` also
+  waits for stream writes. After `close`, log lines and api rows go to
+  stdout only until the next `init`.
+- A `limit` of 0 means no limit in every read: `StreamStore::query` and
+  `search`, `AuditQuery::limit`, `AuditSearch::limit` and `list_unshipped`.
+- HTTP reader, `fasten::reader`: `/audit`, `/audit/doctor`, `/correlate`,
+  `/search`, `/sys`, `/api`, `/topology` from a plain request value, with a
+  required auth choice (`Auth::bearer`, `require_bearer`, `Auth::verify`,
+  `Auth::None`) and an optional tenant scope applied to every row. Where
+  the Python and JS readers differ it follows JS; `rust/README.md` lists
+  the differences. A `Response` carries `Content-Type` and leaves
+  `Content-Length` to the server, and a `Request`'s `Debug` leaves out
+  credential headers. No new dependency; `examples/reader.rs` runs it
+  behind tiny_http.
+- `AuditStore::query`, `count`, `search`, `sources`, `chain_tail` and
+  `kind`, implemented by `SqliteStore` and `PostgresStore`.
+- fasten-core: `store::stream`, `store::stream_sqlite::SqliteStreamStore`,
+  `AuditQuery`, `AuditSearch`, `Source`, and the matching `SqliteStore` read
+  methods. `ReplicatedRow`, `IngestResult`, `BatchError`, `Source`,
+  `reader::Response`, `reader::Auth` and the `Dsn` variants are
+  `#[non_exhaustive]`; `ReplicatedRow::new`, `Source::new` and
+  `Response::new` build them. `AuditQuery`, `AuditSearch`,
+  `StreamFilter` and `reader::Request` stay open to struct literals with
+  `..Default::default()`.
+
+### Changed: Rust and fasten-core
+
+- `init` now opens a store when `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` or
+  `FASTEN_SYSLOG_DSN` is set and the config has no store for it. An unknown
+  scheme, a libpq keyword DSN, or a scheme whose store feature is not built
+  makes `init` fail with `Error::InvalidConfig`, naming the variable and the
+  scheme only, and leaves the stores of the last `init` as they were. So
+  does a store from one of them that cannot be opened:
+  `<variable>: cannot open the <scheme> store (<error type>)`, without the
+  driver's text.
+- A sys line without a request id now carries a sentinel id (`boot-…`, then
+  `orphan-…`) instead of an empty string, as in Python and Go.
+- After `init`, SDK sys events (such as `audit_chain_unavailable`) are also
+  kept in the sys stream and its store.
+- `insert_sealed` refuses a row whose `timestamp` or `shipped_at` is not an
+  RFC 3339 timestamp the Python and Go stores can read, and stores both in
+  the canonical form.
+- fasten-core `mark_shipped` writes `shipped_at` with six fractional digits.
+- fasten-core's `PostgresStore` treats SQLSTATE class 08 and 57 (other than
+  57014) and socket errors as a lost connection, not only a closed client.
+- fasten-core's drainer, which Python and Go use, records the error type in
+  `last_error`, `audit_drain_failed`, `audit_drain_degraded` and
+  `audit_drain_dead_letter`, not the error's text, as
+  spec/drainer-conformance.md asks; a store error or row rejection that
+  fasten-core builds itself is recorded as `Store` or `RowRejected`, and one
+  that carries a type name, such as the Rust SDK's `AuditStoreRejected`,
+  under that name. An insert callback's failure still reads
+  `insert callback returned non-zero rc=<n>`.
+- fasten-core's `PostgresStore::purge` is not run a second time after a
+  lost connection; it returns a `Store` error saying the outcome is
+  unknown.
+
+### Added: the Rust SDK and fasten-core seal and verify rows
+
+- The Rust SDK's `PostgresStore`, and a new `SqliteStore` behind the
+  `store-sqlite` feature, seal each row into the node's hash chain when
+  they store it, as Python and Go do. Rust, Python and Go writers on one
+  table share one chain per node, and each verifies the others' rows.
+- `fasten::verify_chain` checks a chain. Its result has `sealed_rows`, so
+  a result with nothing sealed is visible, and the node and seq of the
+  first break. The stores' `chain_rows` and `all_chain_rows` read rows
+  with their detail exactly as stored; both load every row into memory.
+- Chain checkpoints: `publish_checkpoints`, `FileCheckpointSink`,
+  `load_checkpoints`, `checkpoints_since` and
+  `verify_chain_with_checkpoints` (`CheckpointOptions::whole()` or
+  `partial()`), with Python's and Go's file format and failure reasons.
+  `load_checkpoints` returns `CheckpointFileError::PartialLastLine`, with
+  the checkpoints read so far, when the last line was cut short. There is
+  no HTTP sink yet; implement `CheckpointSink` for one.
+- A stored row is written to stdout twice, unsealed and then sealed, and a
+  synchronous `submit()` returns the sealed row. If the sealed line can't
+  be written, `audit_stdout_failed` is logged and the row is still
+  returned.
+- A row with `monotonic_seq` 0 must have `origin_id` equal to `id`. A
+  different row under an id that is already stored is rejected.
+- `insert_sealed` stores a row sealed elsewhere with its detail text
+  unchanged, so it keeps its hash. `seal_row` and `GENESIS` let an adopter
+  store seal rows; such a store overrides both `AuditStore::seals` and
+  `AuditStore::allocate_and_insert_originated`.
+- New `Error` variants: `Seal`, `AuditStoreRead`, `Chain`,
+  `CheckpointFile` and `Custom` (for a sink or store implementer's own
+  errors). Read failures are no longer reported as insert failures.
+- `PostgresStore::redact_rows` clears the salt to an empty string, where
+  it wrote NULL before, as Python and Go do.
+- Breaking: the Rust `Row` has three new public fields,
+  `canonical_form_id`, `detail_salt` and `detail_commitment`. `Row` now
+  implements `Default`, so a struct literal can end in
+  `..Default::default()`.
+- fasten-core: the `chain` and `checkpoint` modules give the same hashes
+  as Python and Go, including detail holding lone surrogates, `NaN` or
+  `Infinity`. `SqliteStore` and `PostgresStore` seal a row inserted with
+  `monotonic_seq` 0, which also applies to `fasten_store_insert`; a row
+  with its own sequence number is stored as given and stays unsealed
+  unless it already carries a hash. New: `Store::insert_sealed`,
+  `Store::chain_rows`, `Store::chain_tips` (returning `ChainTip`),
+  `ChainRow::from_row` and `Error::Seal`.
+- `spec/rust-sealed-form2.json` holds rows sealed by the Rust SDK; the
+  Python, Go and Rust test suites verify it.
+- A float exactly halfway between two shortest decimal forms, such as
+  `1000000000000000.25`, is written with the even last digit, as CPython
+  and Go write it.
+- The core SQLite and Postgres stores open a table the Python SDK created,
+  adding the `wire_version` and `pii_in_detail` columns it lacks.
+- A row with its own seq at a node and seq another row already holds is
+  rejected, also on tables without a unique `(source_node_id,
+  monotonic_seq)` index such as those Python creates.
+
+### Fixed: `spec/row-schema.json` accepts the rows five SDKs write
+
+- The schema now lists `canonical_form_id`, `detail_salt`,
+  `detail_commitment` and `pii_in_detail`, allows a `null` `detail` (a
+  redacted row), and takes any non-empty `request_id`. Before, it rejected
+  every sealed row and any row whose `request_id` was not 12 hex
+  characters.
+- Rows from the Python, Go, JS, Rust and C++ SDKs now pass. Swift rows
+  still fail: Swift writes ids of `evt-` plus 16 hex characters where the
+  schema has 20.
+- The `timestamp` description says microseconds, as those five SDKs write.
+
+### Fixed: JS keeps a detail key named `__proto__`
+
+- A `__proto__` key in a detail parsed from JSON is kept and redacted like
+  any other key. Before, redaction dropped it and its value.
+
+### Fixed: Go reads rows with a NULL salt or commitment
+
+- The Go SQLite and Postgres stores read a row whose `detail_salt` or
+  `detail_commitment` is NULL as empty. Before, one such row made the whole
+  query fail. Tables created by another SDK allow NULL there, and the Rust
+  SDK writes it when it redacts a row.
+- `NewPostgresStore` opens a table the Python SDK created. Before, it
+  failed with `column "pii_in_detail" does not exist`, because it built an
+  index on that column before adding the column.
+
+### Added: Python wheels on the GitHub release
+
+- Each `vX.Y.Z` GitHub release carries the Python wheels, for Linux (glibc
+  2.34 or later, x86-64 and arm64) and macOS 11 or later. They are listed in
+  `SHA256SUMS` and attested like the other release files. A beta is not on
+  PyPI, so this is where its wheels are: download one and
+  `pip install` the file. A wheel bundles `libfasten_core`.
 
 ### Fixed: Go keeps detail numbers exact
 
@@ -385,6 +799,8 @@ be replaced now.
 - On npm, a release goes under the `latest` dist-tag only when it is above
   every published release; a backport such as 1.0.1 after 1.1.0 goes under
   `release-1.0`.
+- On npm, a release is staged by the workflow and becomes installable when
+  a maintainer approves it with two-factor authentication.
 - The Rust SDK needs Rust 1.90 (`rust-version`), as fasten-core does.
 
 ### Changed: Python, Rust and npm packages are named `fasten-sdk`

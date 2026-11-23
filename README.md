@@ -29,22 +29,24 @@ API for querying the record back.
 
 How far that record is tamper-evident depends on the SDK:
 
-- **Python and Go** seal audit rows into a per-node hash chain when they
-  write to a bundled audit store (SQLite or Postgres). Verifying the chain
-  shows a row that was edited, reordered, or removed from inside the chain.
+- **Python, Go, Rust and JS** seal audit rows into a per-node hash chain
+  when they write to a bundled audit store (SQLite or Postgres in each). Verifying
+  the chain shows a row that was edited, reordered, or removed from inside
+  the chain.
 - Rows cut from the start or end of a chain still verify, and so does a
   chain whose hashes were removed or rebuilt by someone who can write to
-  the store. Catching those needs checkpoints published outside the store.
-- **JS, Rust, C++ and Swift** write unsealed rows, which the chain does not
+  the store. Catching those needs checkpoints published outside the store,
+  which the same four SDKs publish and verify against.
+- **C++ and Swift** write unsealed rows, which the chain does not
   cover.
 
 [docs/security.md](docs/security.md) has the details and what is outside
 the chain's scope.
 
-**Status: v1.0.0-beta.** Python and Go are the complete SDKs; Python is the
-reference. JS, Rust, C++ and Swift are previews: they emit, redact and store
-rows, but don't seal them. Nothing is published to PyPI, npm or crates.io
-yet. The [GitHub release](https://github.com/nerdapplabs/fasten/releases)
+**Status: v1.0.0-beta.** Python, Go, Rust and JS are the complete SDKs;
+Python is the reference. C++ and Swift are previews: they emit, redact and
+store rows, but don't seal them. Nothing is published to PyPI, npm or
+crates.io yet. The [GitHub release](https://github.com/nerdapplabs/fasten/releases)
 has the Python wheels, source archives for Rust, C++ and Swift, and a
 prebuilt `libfasten_core` for Linux x86-64; Go and JS install from a clone.
 
