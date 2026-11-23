@@ -144,6 +144,7 @@ pub(crate) fn error_type(e: &Error) -> &'static str {
     match e {
         Error::AuditStoreInsert(_) => "AuditStoreInsert",
         Error::AuditStoreRejected(_) => "AuditStoreRejected",
+        Error::AuditStorePurge(_) => "AuditStorePurge",
         Error::AuditStoreRead(_) => "AuditStoreRead",
         Error::Seal(_) => "Seal",
         Error::Chain(_) => "Chain",
@@ -153,6 +154,8 @@ pub(crate) fn error_type(e: &Error) -> &'static str {
         Error::Io(_) => "Io",
         Error::Json(_) => "Json",
         Error::Custom(_) => "Custom",
+        Error::StreamStore(_) => "StreamStore",
+        Error::InvalidConfig(_) => "InvalidConfig",
         _ => "Error",
     }
 }

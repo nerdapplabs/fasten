@@ -7,6 +7,7 @@ use crate::{
     chain::ChainRow,
     checkpoint::ChainTip,
     error::Error,
+    replication::{self, IngestResult, IngestTx, ReplicatedRow, StoredRow},
     row::Row,
     store::Filter,
     validate::{split_table, validate_table_name},
@@ -14,8 +15,8 @@ use crate::{
 
 use super::{
     at_seq_sql, chain_row, chain_tips_sql, check_originated, column_seq, non_empty, purge_cutoff, purge_sql,
-    sealed_at, sealed_columns, seq_taken, tip_sql, Outcome, RedactGate, RedactionCandidates, Store, CHAIN_COLUMNS,
-    SELECT_COLUMNS,
+    sealed_at, sealed_columns, seq_taken, tip_sql, AuditQuery, AuditSearch, Outcome, RedactGate, RedactionCandidates,
+    Source, Store, CHAIN_COLUMNS, SELECT_COLUMNS,
 };
 
 /// Row columns a table the Python store created lacks. `migrate` adds them
@@ -39,7 +40,7 @@ impl std::fmt::Debug for SqliteStore {
 /// it with the umask. An existing file keeps its mode. If the file cannot be
 /// created, `Connection::open` reports the error.
 #[cfg(unix)]
-fn create_owner_only(path: &str) {
+pub(crate) fn create_owner_only(path: &str) {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
     let bytes = match path.strip_prefix("file:") {
@@ -113,7 +114,7 @@ fn uri_true(value: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn create_owner_only(_path: &str) {}
+pub(crate) fn create_owner_only(_path: &str) {}
 
 impl SqliteStore {
     /// Open (or create) the SQLite database at `path` and bootstrap the
@@ -275,6 +276,120 @@ impl SqliteStore {
         let rows = stmt
             .query_map(params_refs.as_slice(), |r| map(r))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Rows read as stored, each with the text of its `detail` column, so
+    /// detail numbers are the tokens that were hashed.
+    fn chain_select(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<ChainRow>, Error> {
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(sql)?;
+        let rows = stmt
+            .query_map(params, |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(guard);
+        rows.iter().map(|(row, detail)| chain_row(row, detail)).collect()
+    }
+
+    /// Rows matching `q`, newest first (timestamp, then seq), at most
+    /// `q.limit` (0 for all) after skipping `q.offset`. Read as stored, so
+    /// detail numbers are exact.
+    pub fn read_rows(&self, q: &AuditQuery) -> Result<Vec<ChainRow>, Error> {
+        // Unary +: without statistics SQLite would pick the node/seq index
+        // and sort the node's whole history instead of walking idx_ts.
+        let (mut conds, params) = q.conditions("+source_node_id", |n| format!("?{n}"), |n| format!("?{n}"));
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = params.into_iter().map(|p| Box::new(p) as Box<dyn rusqlite::ToSql>).collect();
+        if q.after_seq > 0 {
+            values.push(Box::new(i64::try_from(q.after_seq).unwrap_or(i64::MAX)));
+            conds.push(format!("monotonic_seq < ?{}", values.len()));
+        }
+        values.push(Box::new(q.sql_limit()));
+        let limit = values.len();
+        values.push(Box::new(i64::try_from(q.offset).unwrap_or(i64::MAX)));
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?{limit} OFFSET ?{}",
+            self.table,
+            where_of(&conds),
+            limit + 1
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(AsRef::as_ref).collect();
+        self.chain_select(&sql, &refs)
+    }
+
+    /// How many rows match `q`, ignoring `limit`, `offset` and `after_seq`.
+    pub fn count_rows(&self, q: &AuditQuery) -> Result<u64, Error> {
+        let (conds, params) = q.conditions("+source_node_id", |n| format!("?{n}"), |n| format!("?{n}"));
+        let sql = format!("SELECT COUNT(*) FROM {} {}", self.table, where_of(&conds));
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n: i64 = guard.prepare(&sql)?.query_row(refs.as_slice(), |r| r.get(0))?;
+        Ok(n.unsigned_abs())
+    }
+
+    /// Case-insensitive substring search of the `detail` text, newest first.
+    pub fn search_rows(&self, s: &AuditSearch) -> Result<Vec<ChainRow>, Error> {
+        let mut conds = vec!["COALESCE(timestamp, '') >= ?1".to_string(), "lower(detail) LIKE ?2 ESCAPE '\\'".to_string()];
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(s.since.clone()), Box::new(super::stream::like_pattern(&s.q.to_lowercase()))];
+        if let Some(u) = s.until.as_deref().filter(|u| !u.is_empty()) {
+            values.push(Box::new(u.to_string()));
+            conds.push(format!("COALESCE(timestamp, '') <= ?{}", values.len()));
+        }
+        if let Some(t) = &s.tenant_id {
+            values.push(Box::new(t.clone()));
+            conds.push(format!("tenant_id = ?{}", values.len()));
+        }
+        values.push(Box::new(s.sql_limit()));
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {} {} ORDER BY timestamp DESC, monotonic_seq DESC LIMIT ?{}",
+            self.table,
+            where_of(&conds),
+            values.len()
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(AsRef::as_ref).collect();
+        self.chain_select(&sql, &refs)
+    }
+
+    /// Row count and first and last timestamp per `(source_node_id,
+    /// service_id, tenant_id)` within `[since, until]`, busiest first.
+    pub fn sources(&self, since: Option<&str>, until: Option<&str>) -> Result<Vec<Source>, Error> {
+        let q = AuditQuery { since: since.map(str::to_string), until: until.map(str::to_string), ..Default::default() };
+        let (conds, params) = q.conditions("source_node_id", |n| format!("?{n}"), |n| format!("?{n}"));
+        let sql = format!(
+            "SELECT source_node_id, service_id, tenant_id, COUNT(*) AS n, MIN(timestamp), MAX(timestamp) \
+             FROM {} {} GROUP BY source_node_id, service_id, tenant_id ORDER BY n DESC, source_node_id, service_id",
+            self.table,
+            where_of(&conds)
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = guard.prepare(&sql)?;
+        let out = stmt
+            .query_map(refs.as_slice(), |r| {
+                Ok(Source {
+                    source_node_id: r.get(0)?,
+                    service_id: r.get(1)?,
+                    tenant_id: r.get(2)?,
+                    rows: r.get::<_, i64>(3)?.unsigned_abs(),
+                    first_seen: r.get(4)?,
+                    last_seen: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    /// The node's newest `limit` rows by `monotonic_seq`, oldest first, read
+    /// as stored: the doctor's chain sample. Ordering by seq, not time, so a
+    /// clock step back does not read as a break.
+    pub fn chain_tail(&self, source_node_id: &str, limit: u32) -> Result<Vec<ChainRow>, Error> {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM {} WHERE source_node_id = ?1 ORDER BY monotonic_seq DESC LIMIT ?2",
+            self.table
+        );
+        let mut rows = self.chain_select(&sql, &[&source_node_id, &i64::from(limit)])?;
+        rows.reverse();
         Ok(rows)
     }
 
@@ -458,13 +573,66 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn list_unshipped_sealed(
+        &self,
+        limit: u32,
+        origin: Option<(&str, &str)>,
+    ) -> Result<Vec<ReplicatedRow>, Error> {
+        let limit: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let t = &self.table;
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let map = |r: &rusqlite::Row| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?));
+        let rows = match origin {
+            // Unary + keeps SQLite off the (node, seq) index, which would walk
+            // the node's whole history, as the Python store does.
+            Some((service_id, node)) => guard
+                .prepare_cached(&format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL AND service_id = ?1 \
+                     AND +source_node_id = ?2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT ?3"
+                ))?
+                .query_map(rusqlite::params![service_id, node, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => guard
+                .prepare_cached(&format!(
+                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1"
+                ))?
+                .query_map(rusqlite::params![limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        drop(guard);
+        rows.iter()
+            .map(|(row, detail)| Ok(ReplicatedRow { row: chain_row(row, detail)?, pii_in_detail: row.pii_in_detail }))
+            .collect()
+    }
+
+    fn ingest_replicated(&self, rows: &[ReplicatedRow], local_node_id: Option<&str>) -> Result<IngestResult, Error> {
+        replication::ingest(
+            rows,
+            local_node_id,
+            |verified| {
+                let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                // BEGIN IMMEDIATE holds off other writers from before the
+                // first read, so the checks still hold at the inserts.
+                let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let out = replication::ingest_on(
+                    &mut Ingest { conn: &tx, table: &self.table, insert_sql: &self.insert_sql },
+                    verified,
+                )?;
+                // Dropping the transaction without a commit rolls it back.
+                if out.is_some() {
+                    tx.commit()?;
+                }
+                Ok(out)
+            },
+            || Error::Store(replication::STORED_MEANWHILE.to_string()),
+        )
+    }
+
     fn mark_shipped(&self, ids: &[String]) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
         // SQLite caps bound parameters (32,766), so chunk the ids, in one
         // transaction. ?1 = shipped_at; ?2 .. = the chunk's ids.
@@ -582,8 +750,58 @@ impl Store for SqliteStore {
     }
 }
 
+/// Ingest's reads and inserts on one SQLite transaction.
+struct Ingest<'a> {
+    conn: &'a Connection,
+    table: &'a str,
+    insert_sql: &'a str,
+}
+
+impl IngestTx for Ingest<'_> {
+    type Error = Error;
+
+    fn by_id(&mut self, id: &str) -> Result<Option<String>, Error> {
+        let sql = format!("SELECT hash FROM {} WHERE id = ?1", self.table);
+        Ok(self.conn.prepare_cached(&sql)?.query_row([id], |r| r.get(0)).optional()?)
+    }
+
+    fn at_seq(&mut self, node: &str, seq: u64) -> Result<Option<StoredRow>, Error> {
+        // A seq past the column's range is not stored.
+        let Ok(seq) = i64::try_from(seq) else { return Ok(None) };
+        let sql = format!(
+            "SELECT id, hash, prev_hash FROM {} WHERE source_node_id = ?1 AND monotonic_seq = ?2 LIMIT 1",
+            self.table
+        );
+        let found = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(rusqlite::params![node, seq], |r| {
+                Ok(StoredRow { id: r.get(0)?, hash: r.get(1)?, prev_hash: r.get(2)? })
+            })
+            .optional()?;
+        Ok(found)
+    }
+
+    fn sealed_below(&mut self, node: &str, seq: u64) -> Result<bool, Error> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE source_node_id = ?1 AND monotonic_seq < ?2 AND hash <> '' LIMIT 1",
+            self.table
+        );
+        let found: Option<i64> =
+            self.conn.prepare_cached(&sql)?.query_row(rusqlite::params![node, seq], |r| r.get(0)).optional()?;
+        Ok(found.is_some())
+    }
+
+    fn insert(&mut self, row: &ReplicatedRow) -> Result<u64, Error> {
+        let (columns, detail) = sealed_columns(&row.row, row.pii_in_detail)?;
+        let n = insert_row(self.conn, self.insert_sql, &columns, column_seq(&columns)?, &detail)?;
+        Ok(n as u64)
+    }
+}
+
 /// Insert `row` at `seq`, with `detail` as the text of its detail column.
-fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<(), Error> {
+fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<usize, Error> {
     let pii: i64 = row.pii_in_detail as i64;
     let mut stmt = conn.prepare_cached(insert_sql)?;
     stmt.execute(rusqlite::params![
@@ -614,9 +832,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: 
         row.detail_salt.as_deref().unwrap_or(""),
         row.detail_commitment.as_deref().unwrap_or(""),
     ])
-    .map_err(seq_clash)?;
-
-    Ok(())
+    .map_err(seq_clash)
 }
 
 /// A UNIQUE failure on insert is the (source_node_id, monotonic_seq) index:
@@ -699,6 +915,14 @@ fn seq_column(r: &rusqlite::Row, idx: usize, owner: &str) -> rusqlite::Result<u6
             format!("{owner}: monotonic_seq {seq} is negative").into(),
         )
     })
+}
+
+fn where_of(conds: &[String]) -> String {
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    }
 }
 
 /// Map a rusqlite `Row` (column order from our SELECT) to a `Row` struct.

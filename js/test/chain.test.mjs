@@ -222,7 +222,7 @@ describe('strings and numbers Python stores that JSON.parse refuses or changes',
     });
 });
 
-describe('vectors sealed by Python and Go', () => {
+describe('vectors sealed by Python, Go and Rust', () => {
     test('spec/python-sealed-forms.json', () => {
         const file = load('spec/python-sealed-forms.json');
         assert.equal(file.current_form, CURRENT_CANONICAL_FORM_ID);
@@ -238,7 +238,7 @@ describe('vectors sealed by Python and Go', () => {
         }
     });
 
-    for (const [path, n] of [['spec/go-sealed-form2.json', 2], ['spec/go-sealed-numbers.json', 1]]) {
+    for (const [path, n] of [['spec/go-sealed-form2.json', 2], ['spec/go-sealed-numbers.json', 1], ['spec/rust-sealed-form2.json', 4]]) {
         test(path, () => {
             const rows = load(path);
             assert.equal(rows.length, n);

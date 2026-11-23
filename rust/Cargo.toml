@@ -36,6 +36,10 @@ store-postgres = ["dep:pg", "fasten-core/postgres-tls"]
 store-sqlite = ["fasten-core/sqlite"]
 codes-yaml = ["serde_yaml"]
 
+[[example]]
+name = "reader"
+required-features = ["store-sqlite"]
+
 [dev-dependencies]
 serde_yaml  = "0.9"
 tiny_http   = "0.12"   # examples/server.rs
