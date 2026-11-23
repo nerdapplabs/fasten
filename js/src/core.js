@@ -247,6 +247,17 @@ function _checkValueShape(s) {
 	return null;
 }
 
+// JSON.parse reviver for redaction: an integer whose digits, as written,
+// form a card number becomes "***CC***", as the string card rule does. The
+// source text is checked, so a float such as 4111111111111111.0 is kept and
+// an integer a number cannot hold exactly keeps its digits.
+function _redactReviver(key, value, context) {
+	const v = bigintReviver(key, value, context);
+	if (typeof v !== "number" && typeof v !== "bigint") return v;
+	const src = context?.source ?? String(v);
+	return /^-?\d+$/.test(src) && _hasCard(src) ? "***CC***" : v;
+}
+
 function _matchesAny(key, patterns) {
 	return patterns.some((p) => p.test(key));
 }
@@ -279,10 +290,11 @@ function _redactObj(val, patterns, replacement) {
 /**
  * Redact a JSON string using the default key-pattern list.
  * Returns a JSON string with matching key values replaced by "***". An
- * integer a number cannot hold exactly keeps its digits.
+ * integer a number cannot hold exactly keeps its digits; one that is a card
+ * number is replaced by "***CC***".
  */
 export function coreRedact(inJson) {
-	const obj = JSON.parse(inJson, bigintReviver);
+	const obj = JSON.parse(inJson, _redactReviver);
 	return JSON.stringify(
 		_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT),
 		bigintReplacer,
@@ -304,7 +316,7 @@ export function coreRedactFull(inJson, extraKeysJson, replacement) {
 		? JSON.parse(extraKeysJson).map((k) => new RegExp(_escapeRe(k), "i"))
 		: [];
 	const patterns = [..._DEFAULT_PATTERNS, ...extra];
-	const obj = JSON.parse(inJson, bigintReviver);
+	const obj = JSON.parse(inJson, _redactReviver);
 	return JSON.stringify(_redactObj(obj, patterns, rep), bigintReplacer);
 }
 

@@ -42,6 +42,17 @@ describe('redact conformance', () => {
         assert.equal(Object.getPrototypeOf(JSON.parse(coreRedact('{"a":1}'))), Object.prototype);
     });
 
+    test('integers follow the card rule as written', () => {
+        assert.equal(
+            coreRedact('{"a":9704000000000000008,"b":-4111111111111111,"c":18446744073709551615}'),
+            '{"a":"***CC***","b":"***CC***","c":18446744073709551615}',
+        );
+        assert.equal(
+            coreRedact('{"f":4111111111111111.0,"n":42,"t":true,"z":null}'),
+            '{"f":4111111111111111,"n":42,"t":true,"z":null}',
+        );
+    });
+
     // Built at runtime so GitHub push protection doesn't flag the literal.
     test('value_stripe_live', () => {
         const key = 'sk' + '_live_' + 'A'.repeat(24);
