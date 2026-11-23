@@ -526,9 +526,9 @@ class SQLiteStore:
         ``detail`` IS hashed, so redacting one would change its hash and cascade
         a re-seal down the rest of the chain. They are counted and logged at
         WARNING rather than skipped quietly: on a store written before the
-        form-"2" upgrade, silence here would let an
-        operator watch redaction "succeed" while the personal data it was
-        supposed to destroy survives untouched.
+        form-"2" upgrade, silence here would let an operator watch redaction
+        "succeed" while the personal data it was supposed to destroy survives
+        untouched.
         """
         if not codes:
             return []

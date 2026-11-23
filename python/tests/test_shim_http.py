@@ -163,4 +163,36 @@ def test_api_logger_reraises_app_error_after_logging(initialized):
         pass
     else:
         raise AssertionError("the app's exception was swallowed")
-    assert len(transport.query_api(limit=100)) == before + 1
+    rows = transport.query_api(limit=100)
+    assert len(rows) == before + 1
+    assert any(r["path"] == "/users" for r in rows)
+
+
+def test_api_logger_log_failure_does_not_replace_app_error(initialized, monkeypatch):
+    transport = fasten.transport()
+
+    def broken(row):
+        raise OSError("stdout closed")
+
+    monkeypatch.setattr(transport, "write_api", broken)
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError as e:
+        assert str(e) == "app failed"
+    else:
+        raise AssertionError("the app's exception was lost")
+
+
+def test_api_logger_log_failure_does_not_fail_a_served_request(initialized, monkeypatch):
+    transport = fasten.transport()
+
+    def broken(row):
+        raise OSError("stdout closed")
+
+    monkeypatch.setattr(transport, "write_api", broken)
+    app = APILogger(_Echo())
+    sent, send = _send_recorder()
+    asyncio.run(app(_scope(), _noop_receive, send))
+    assert any(m["type"] == "http.response.start" for m in sent)

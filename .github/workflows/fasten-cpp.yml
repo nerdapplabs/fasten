@@ -72,6 +72,7 @@ jobs:
           cmake -S . -B build
           -DFASTEN_BUILD_TESTS=ON
           -DFASTEN_BUILD_EXAMPLES=ON
+          -DFASTEN_REQUIRE_POSTGRES=ON
           -DFASTEN_CORE_LIB_DIR=${{ github.workspace }}/fasten-core/target/release
 
       - name: Build

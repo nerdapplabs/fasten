@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -24,6 +25,9 @@ def _client_request_id(raw: bytes) -> str:
         return usable_request_id(raw.decode("ascii"))
     except UnicodeDecodeError:
         return ""
+
+
+_log = logging.getLogger("fasten.shim.http")
 
 
 class RequestIDMiddleware:
@@ -103,11 +107,17 @@ class APILogger:
             from ..emitter import transport as _transport
             t = _transport()
             if t is not None:
-                t.write_api({
-                    "method": scope.get("method", ""),
-                    "path": path,
-                    "status": snapshot["status"],
-                    "duration_ms": duration_ms,
-                    "request_id": snapshot["request_id"],
-                    "timestamp": canonical_now(),
-                })
+                try:
+                    t.write_api({
+                        "method": scope.get("method", ""),
+                        "path": path,
+                        "status": snapshot["status"],
+                        "duration_ms": duration_ms,
+                        "request_id": snapshot["request_id"],
+                        "timestamp": canonical_now(),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    # A failed log write must not replace the app's exception
+                    # or fail a request that was served.
+                    _log.warning("fasten api log write failed: %s", type(e).__name__,
+                                 extra={"_fasten_internal": True})

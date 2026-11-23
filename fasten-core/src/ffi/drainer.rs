@@ -175,10 +175,8 @@ unsafe fn install(
 ) -> FastenErrorCode {
     let r = guarded(|| {
         let h = enter(handle)?;
-        // Every supported target has a 64-bit usize, so the cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
         let cfg = DrainerConfig {
-            capacity: if capacity == 0 { 100 } else { capacity as usize },
+            capacity: if capacity == 0 { 100 } else { usize::try_from(capacity).unwrap_or(usize::MAX) },
             retry_initial: Duration::from_millis(if retry_initial_ms == 0 { 100 } else { retry_initial_ms }),
             retry_max: Duration::from_millis(if retry_max_ms == 0 { 60_000 } else { retry_max_ms }),
             retry_jitter: retry_jitter != 0,

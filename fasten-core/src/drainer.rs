@@ -155,6 +155,11 @@ pub struct Drainer {
 }
 
 impl Drainer {
+    /// Sys events go to stderr.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS cannot spawn the drain thread.
     pub fn new(store: Box<dyn Store>, cfg: DrainerConfig) -> Arc<Self> {
         Self::with_sys_log(store, cfg, None)
     }
@@ -224,7 +229,8 @@ impl Drainer {
             if depth > st.high_water {
                 st.high_water = depth;
             }
-            // Queue sizes are far below 2^52, so the f64 values are exact.
+            // Only compared with the high-water thresholds, so precision loss
+            // on a huge capacity does not matter.
             #[allow(clippy::cast_precision_loss)]
             let ratio = depth as f64 / capacity as f64;
             if ratio >= HW_ERR_PCT && !st.err_hw_fired {
