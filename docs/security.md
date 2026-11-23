@@ -13,7 +13,7 @@ This document covers the security model of the fasten SDK: what it protects, wha
 fasten is a library, not a standalone service. It runs inside the adopter's process and writes to:
 
 - **stdout**: NDJSON audit, sys and api rows (the "ring transport")
-- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python and JS) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
+- **an optional audit store**: a SQLite file or Postgres database, configured with `FASTEN_AUDIT_DSN` (Python, JS and Go) or a store passed to `init()` (every SDK; JS has `SqliteStore` and `PostgresStore`). Without one, audit rows go to stdout only.
 
 The runtime layout:
 
@@ -132,7 +132,7 @@ The runtime layout:
 - `fasten.shim.structlog.configure()` installs the redactor processor into structlog's chain, which applies the key-pattern and value-shape passes to the event dict's payload fields and the value-shape pass to `event` itself. Its `extra_redact_keys` apply to the stdlib bridge it installs too.
 - JS and Swift log helpers, and JS drainer lines on stderr, redact the whole line, message included, as Go and Python do.
 - `fasten doctor` does not print the store DSN; `--json` reports `detail.backend`.
-- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting. In JS an audit DSN with an unknown scheme is an error, as a stream DSN is, and so is libpq's keyword form: the error names the scheme only, and no file is created.
+- Errors about a store DSN (unsupported scheme, no path, a Postgres connection string that can't be parsed) name no part of the DSN. Python and the C++ Postgres store check the string with libpq's parser before connecting. In JS and Go an audit DSN with an unknown scheme is an error, as a stream DSN is, and so is libpq's keyword form: the error names the scheme only (in Go, only when the DSN has one), and no file is created. Go's error for a store from a DSN that cannot be opened names the variable, scheme and error type, not the driver's message.
 - JS `apiLogger` stores the request path as sent, without the query string. Path segments can carry ids or tokens; apiLogger can rewrite the stored path (`path: (req) => string`). A client-supplied `X-Request-ID` is stored as sent and is not authenticated, in Python, Go and JS; in JS a request id that looks like a sentinel is not taken from the client.
 - The C++ fallback that calls the audit sink directly logs the first line of a store error.
 

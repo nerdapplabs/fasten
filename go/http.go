@@ -78,8 +78,8 @@ func APILogger(skipPaths ...string) func(http.Handler) http.Handler {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w}
 			next.ServeHTTP(rec, r)
-			if Default.xport != nil {
-				Default.xport.PushAPI(APIRow{
+			if x := Default.xport.Load(); x != nil {
+				x.PushAPI(APIRow{
 					"method":      r.Method,
 					"path":        r.URL.Path,
 					"status":      rec.Status(),
@@ -305,7 +305,10 @@ func scopeAPIRows(rows []APIRow, scope string) []APIRow {
 // It describes the stream, not one response: a ring that has dropped rows
 // still says "ring". For /correlate, counts vs totals shows truncation.
 func (e *Engine) streamSource(stream string) string {
-	if !e.persistedStreams[stream] {
+	e.storeMu.RLock()
+	persisted, api, sys := e.persistedStreams[stream], e.apiStore, e.syslogStore
+	e.storeMu.RUnlock()
+	if !persisted {
 		return "ring"
 	}
 	if stream == "audit" {
@@ -318,9 +321,9 @@ func (e *Engine) streamSource(stream string) string {
 	var st StreamRepository
 	switch stream {
 	case "api":
-		st = e.apiStore
+		st = api
 	case "sys":
-		st = e.syslogStore
+		st = sys
 	}
 	if st != nil && st.Degraded() {
 		return "store-degraded"
@@ -334,7 +337,7 @@ func (e *Engine) auditDegraded() bool {
 	if e.auditWriteSwallowed.Load() {
 		return true
 	}
-	if d, ok := e.auditStore.(interface{ Degraded() bool }); ok && d.Degraded() {
+	if d, ok := e.currentAuditStore().(interface{ Degraded() bool }); ok && d.Degraded() {
 		return true
 	}
 	if qs := e.GetQueueStats(); qs != nil && qs.DeadLetteredTotal > 0 {
@@ -348,7 +351,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"sys": e.streamSource("sys")}, "error": "fasten not initialised"})
 		return
 	}
@@ -391,7 +394,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
+		rows, ok, err := e.xport.Load().SearchSyslog(qtext, since, until, limit)
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -422,7 +425,7 @@ func (e *Engine) handleSys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	rows, err := e.xport.QuerySyslog(limit, StreamQuery{
+	rows, err := e.xport.Load().QuerySyslog(limit, StreamQuery{
 		Level:     q.Get("level"),
 		RequestID: q.Get("request_id"),
 		ServiceID: q.Get("service_id"),
@@ -454,7 +457,7 @@ func (e *Engine) searchGuard(q, since string) string {
 	if utf8.RuneCountInString(q) > MaxQueryLength {
 		return fmt.Sprintf("q= is capped at %d characters", MaxQueryLength)
 	}
-	if !e.searchEnabled {
+	if !e.config().searchEnabled {
 		return "search disabled — set search.enabled (FASTEN_SEARCH_ENABLED=true) to enable free-text q="
 	}
 	if since == "" {
@@ -519,7 +522,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		fail(msg)
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		fail("fasten not initialised")
 		return
 	}
@@ -552,7 +555,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		switch stream {
 		case "sys":
-			rows, ok, err := e.xport.SearchSyslog(qtext, since, until, limit)
+			rows, ok, err := e.xport.Load().SearchSyslog(qtext, since, until, limit)
 			if err != nil {
 				e.serverError(w, r, err)
 				return
@@ -571,7 +574,7 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		case "api":
-			rows, ok, err := e.xport.SearchAPI(qtext, since, until, limit)
+			rows, ok, err := e.xport.Load().SearchAPI(qtext, since, until, limit)
 			if err != nil {
 				e.serverError(w, r, err)
 				return
@@ -594,10 +597,11 @@ func (e *Engine) handleSearch(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		case "audit":
-			searcher, ok := e.auditStore.(interface {
+			store := e.currentAuditStore()
+			searcher, ok := store.(interface {
 				Search(ctx context.Context, q, since, until, tenantID string, limit int) ([]Row, error)
 			})
-			if e.auditStore == nil || !ok {
+			if store == nil || !ok {
 				errs["audit"] = "requires an audit store with a Search method"
 				counts["audit"] = 0
 				continue
@@ -636,7 +640,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.xport == nil {
+	if e.xport.Load() == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"api": e.streamSource("api")}, "error": "fasten not initialised"})
 		return
 	}
@@ -662,7 +666,7 @@ func (e *Engine) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, uerr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	rows, err := e.xport.QueryAPI(limit, StreamQuery{
+	rows, err := e.xport.Load().QueryAPI(limit, StreamQuery{
 		Method:    q.Get("method"),
 		Path:      q.Get("path"),
 		RequestID: q.Get("request_id"),
@@ -709,11 +713,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 
 	audit := []map[string]any{}
 	var auditTotal *int
-	if e.auditStore != nil {
+	if store := e.currentAuditStore(); store != nil {
 		// Tenant pushed down to the store filter — prevents the
 		// X-Request-ID pivot attack where tenant B guesses/replays a
 		// known tenant-A request_id to read A's rows.
-		rows, err := e.auditStore.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
+		rows, err := store.Query(r.Context(), Filter{RequestID: rid, TenantID: tenant, Limit: limit})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -721,7 +725,7 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 		for _, row := range rows {
 			audit = append(audit, rowToMap(row))
 		}
-		if counter, ok := e.auditStore.(filterCounter); ok {
+		if counter, ok := store.(filterCounter); ok {
 			if n, err := counter.CountFiltered(r.Context(), Filter{RequestID: rid, TenantID: tenant}); err == nil {
 				auditTotal = &n
 			}
@@ -731,14 +735,14 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 	api := []APIRow{}
 	sys := []SyslogRow{}
 	apiTotal, sysTotal := 0, 0
-	if e.xport != nil {
-		a, err := e.xport.QueryAPI(limit, StreamQuery{RequestID: rid})
+	if e.xport.Load() != nil {
+		a, err := e.xport.Load().QueryAPI(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
 		}
 		api = scopeAPIRows(a, tenant)
-		s, err := e.xport.QuerySyslog(limit, StreamQuery{RequestID: rid})
+		s, err := e.xport.Load().QuerySyslog(limit, StreamQuery{RequestID: rid})
 		if err != nil {
 			e.serverError(w, r, err)
 			return
@@ -751,11 +755,11 @@ func (e *Engine) handleCorrelate(w http.ResponseWriter, r *http.Request) {
 			apiTotal = len(api)
 			sysTotal = len(sys)
 		} else {
-			if apiTotal, err = e.xport.CountAPI(StreamQuery{RequestID: rid}); err != nil {
+			if apiTotal, err = e.xport.Load().CountAPI(StreamQuery{RequestID: rid}); err != nil {
 				e.serverError(w, r, err)
 				return
 			}
-			if sysTotal, err = e.xport.CountSyslog(StreamQuery{RequestID: rid}); err != nil {
+			if sysTotal, err = e.xport.Load().CountSyslog(StreamQuery{RequestID: rid}); err != nil {
 				e.serverError(w, r, err)
 				return
 			}
@@ -800,7 +804,8 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if !tok {
 		return
 	}
-	if e.auditStore == nil {
+	store := e.currentAuditStore()
+	if store == nil {
 		writeJSON(w, map[string]any{"rows": []any{}, "completeness": map[string]string{"audit": e.streamSource("audit")}, "error": "audit store not configured"})
 		return
 	}
@@ -859,7 +864,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Until:        until,
 		AfterSeq:     after,
 	}
-	rows, err := e.auditStore.Query(r.Context(), f)
+	rows, err := store.Query(r.Context(), f)
 	if err != nil {
 		e.serverError(w, r, err)
 		return
@@ -873,7 +878,7 @@ func (e *Engine) handleAudit(w http.ResponseWriter, r *http.Request) {
 	// are reported. total is null when it can't be counted, meaning "may
 	// have more"; len(rows) would be capped at limit.
 	var total *int
-	if counter, ok := e.auditStore.(filterCounter); ok {
+	if counter, ok := store.(filterCounter); ok {
 		// CountFiltered ignores Limit, Offset and AfterSeq.
 		if n, cerr := counter.CountFiltered(r.Context(), f); cerr == nil {
 			total = &n
@@ -909,12 +914,13 @@ func (e *Engine) handleTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	empty := map[string]any{"sources": []any{}, "nodes": 0, "services": 0, "tenants": 0}
-	if e.auditStore == nil {
+	store := e.currentAuditStore()
+	if store == nil {
 		empty["error"] = "audit store not configured"
 		writeJSON(w, empty)
 		return
 	}
-	agg, ok := e.auditStore.(sourceAggregator)
+	agg, ok := store.(sourceAggregator)
 	if !ok {
 		empty["error"] = "store does not support topology aggregation"
 		writeJSON(w, empty)
@@ -973,7 +979,7 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	store := e.auditStore
+	store := e.currentAuditStore()
 	storeBlock := map[string]any{
 		"kind":           nil,
 		"reachable":      false,
@@ -1024,20 +1030,21 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	xportBlock := map[string]any{
-		"stdout_active":     e.xport != nil,
+		"stdout_active":     e.xport.Load() != nil,
 		"syslog_ring_depth": 0,
 		"api_ring_depth":    0,
 	}
-	if e.xport != nil {
-		xportBlock["syslog_ring_depth"] = e.xport.SyslogDepth()
-		xportBlock["api_ring_depth"] = e.xport.APIDepth()
+	if x := e.xport.Load(); x != nil {
+		xportBlock["syslog_ring_depth"] = x.SyslogDepth()
+		xportBlock["api_ring_depth"] = x.APIDepth()
 	}
 
+	c := e.config()
 	initBlock := map[string]any{
-		"service_id":       e.serviceID,
-		"node_id":          e.nodeID,
-		"tenant_id":        e.tenantID,
-		"failure_strategy": e.failureStrategy,
+		"service_id":       c.serviceID,
+		"node_id":          c.nodeID,
+		"tenant_id":        c.tenantID,
+		"failure_strategy": c.failureStrategy,
 		// Multi-worker awareness: callers can confirm which OS process they hit.
 		"worker_pid": os.Getpid(),
 	}
@@ -1047,7 +1054,7 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Redaction is always applied (RedactDetail) once the engine is initialised.
-	redactorBlock := map[string]any{"active": e.serviceID != ""}
+	redactorBlock := map[string]any{"active": c.serviceID != ""}
 
 	// Spot-check the tamper chain over this node's latest rows.
 	// breaks is nil until verification actually runs; 0 when the chain is
@@ -1064,12 +1071,12 @@ func (e *Engine) handleAuditDoctor(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if t, ok := store.(interface {
 			ChainTail(context.Context, string, int) ([]Row, error)
-		}); ok && e.nodeID != "" {
+		}); ok && c.nodeID != "" {
 			// By seq: a timestamp-ordered sample skips seqs after a clock
 			// step back and reads as a break.
-			recent, err = t.ChainTail(r.Context(), e.nodeID, 50)
+			recent, err = t.ChainTail(r.Context(), c.nodeID, 50)
 		} else {
-			recent, err = store.Query(r.Context(), Filter{SourceNodeID: e.nodeID, Limit: 50})
+			recent, err = store.Query(r.Context(), Filter{SourceNodeID: c.nodeID, Limit: 50})
 		}
 		switch {
 		case err != nil:

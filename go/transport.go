@@ -83,12 +83,42 @@ type Transport struct {
 	// redact is set by Init to the Engine's redactDetail and applied to sys
 	// and api rows before they are stored anywhere. Nil before Init.
 	redact func(map[string]any) map[string]any
+
+	// pushes counts the pushes running on this transport's stores, so they
+	// are not closed under one. Once the engine replaces the transport,
+	// retired is set and later pushes go to next instead (the ring only
+	// when next is nil). mu guards retired and next.
+	mu      sync.RWMutex
+	retired bool
+	next    *Transport
+	pushes  sync.WaitGroup
+	// replaced, set by the engine, is closed once the pushes on the
+	// transports this one replaced have returned. Nil when there were none.
+	replaced <-chan struct{}
 }
 
 func NewTransport(maxlen int) *Transport {
 	return &Transport{
 		Syslog: newRingBuffer[SyslogRow](maxlen),
 		API:    newRingBuffer[APIRow](maxlen),
+	}
+}
+
+// withStores returns a Transport that shares t's rings and settings and
+// writes to the given stores.
+func (t *Transport) withStores(api, syslog StreamRepository) *Transport {
+	t.bootMu.Lock()
+	over := t.bootOver
+	t.bootMu.Unlock()
+	return &Transport{
+		Syslog:        t.Syslog,
+		API:           t.API,
+		SyslogStore:   syslog,
+		APIStore:      api,
+		serviceID:     t.serviceID,
+		bootRequestID: t.bootRequestID,
+		bootOver:      over,
+		redact:        t.redact,
 	}
 }
 
@@ -122,10 +152,18 @@ func (t *Transport) stampRequestID(row map[string]any) {
 // "store-degraded"; reads come from the store, so they would otherwise
 // miss the row without saying so.
 func (t *Transport) PushSyslog(row SyslogRow) {
+	next, current := t.enter()
+	if next != nil {
+		next.PushSyslog(row)
+		return
+	}
+	if current {
+		defer t.pushes.Done()
+	}
 	t.stampRequestID(row)
 	row = SyslogRow(t.redactRow(row))
 	t.Syslog.Push(row)
-	if t.SyslogStore != nil {
+	if current && t.SyslogStore != nil {
 		if err := t.SyslogStore.Insert(row); err != nil {
 			t.SyslogStore.NoteWriteFailure()
 			// Type-only stderr: a Postgres INSERT error message can carry
@@ -139,16 +177,45 @@ func (t *Transport) PushSyslog(row SyslogRow) {
 // PushAPI adds an API request row to the ring and, if attached, the store.
 // Store failures are handled as in PushSyslog.
 func (t *Transport) PushAPI(row APIRow) {
+	next, current := t.enter()
+	if next != nil {
+		next.PushAPI(row)
+		return
+	}
+	if current {
+		defer t.pushes.Done()
+	}
 	t.stampRequestID(row)
 	row = APIRow(t.redactRow(row))
 	t.API.Push(row)
-	if t.APIStore != nil {
+	if current && t.APIStore != nil {
 		if err := t.APIStore.Insert(row); err != nil {
 			t.APIStore.NoteWriteFailure()
 			// Type-only stderr; see PushSyslog for why.
 			fmt.Fprintf(os.Stderr, "fasten: api persist failed: %T\n", err)
 		}
 	}
+}
+
+// enter counts a push on t and reports true while t is current. Once t is
+// retired it reports false, with the transport that replaced it, if any.
+func (t *Transport) enter() (next *Transport, current bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.retired {
+		return t.next, false
+	}
+	t.pushes.Add(1)
+	return nil, true
+}
+
+// retire sends later pushes on t to next, and returns a channel closed once
+// the pushes running on t's stores have returned.
+func (t *Transport) retire(next *Transport) <-chan struct{} {
+	t.mu.Lock()
+	t.retired, t.next = true, next
+	t.mu.Unlock()
+	return insertsDone(&t.pushes)
 }
 
 // redactRow applies the redact hook, if set.

@@ -294,8 +294,7 @@ variable named like one of these but not read (`FASTEN_AUDIT_DNS`,
 gets one `env_dsn_not_read` warning per process, naming the variable and
 not its value.
 
-Go reads only `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, and only for SQLite;
-Python and JS read all three, for SQLite and Postgres.
+Python, JS and Go read all three, for SQLite and Postgres.
 
 ## Replication
 
