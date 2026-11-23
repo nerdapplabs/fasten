@@ -27,6 +27,8 @@ final class RedactConformanceTests: XCTestCase {
                 value = s
             } else if let i = try? c.decode(Int.self) {
                 value = i
+            } else if let u = try? c.decode(UInt64.self) {
+                value = u
             } else if let n = try? c.decode(Double.self) {
                 value = n
             } else if let b = try? c.decode(Bool.self) {
@@ -61,20 +63,32 @@ final class RedactConformanceTests: XCTestCase {
                        "value_stripe_live: expected ***STRIPE_KEY***")
     }
 
-    func testIntegerCardValues() {
+    func testNumberCardValues() {
         let r = Redactor()
         let got = r.redact([
             "card": 4_111_111_111_111_111,
             "u64": UInt64(9_704_000_000_000_000_008),
+            "whole_float": 4_111_111_111_111_111.0,
+            "ns_float": NSNumber(value: 4_111_111_111_111_111.0),
+            "decimal": NSDecimalNumber(string: "4111111111111111"),
             "luhn_fails": 1_234_567_890_123_456,
-            "float": 4_111_111_111_111_111.0,
+            "fraction": 4_111_111_111_111_111.5,
             "flag": true,
         ])
         XCTAssertEqual(got["card"] as? String, "***CC***")
         XCTAssertEqual(got["u64"] as? String, "***CC***")
+        XCTAssertEqual(got["whole_float"] as? String, "***CC***")
+        XCTAssertEqual(got["ns_float"] as? String, "***CC***")
+        XCTAssertEqual(got["decimal"] as? String, "***CC***")
         XCTAssertEqual(got["luhn_fails"] as? Int, 1_234_567_890_123_456)
-        XCTAssertEqual(got["float"] as? Double, 4_111_111_111_111_111.0)
+        XCTAssertEqual(got["fraction"] as? Double, 4_111_111_111_111_111.5)
         XCTAssertEqual(got["flag"] as? Bool, true)
+    }
+
+    func testNumberCardWithCustomReplacement() {
+        let got = Redactor(replacement: "[gone]").redact(["card": 4_111_111_111_111_111, "token": "x"])
+        XCTAssertEqual(got["card"] as? String, "***CC***")
+        XCTAssertEqual(got["token"] as? String, "[gone]")
     }
 
     func testConformance() throws {
@@ -101,6 +115,7 @@ final class RedactConformanceTests: XCTestCase {
         switch (a, b) {
         case (let x as String, let y as String):   return x == y
         case (let x as Int,    let y as Int):      return x == y
+        case (let x as UInt64, let y as UInt64):   return x == y
         case (let x as Double, let y as Double):   return x == y
         case (let x as Bool,   let y as Bool):     return x == y
         case (_ as NSNull,     _ as NSNull):       return true

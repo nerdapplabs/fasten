@@ -4,7 +4,8 @@ import Foundation
 ///   1. A key matching a key pattern gets `replacement` as its value.
 ///   2. Otherwise a string value that looks like a known secret (JWT, AWS key,
 ///      card number, ...) is replaced with a token such as "***JWT***".
-///   3. An integer value whose digits form a card number becomes "***CC***".
+///   3. A number with no fractional part whose digits form a card number
+///      becomes "***CC***".
 public final class Redactor: @unchecked Sendable {
 
     private let keyPatterns:       [NSRegularExpression]
@@ -132,27 +133,38 @@ public final class Redactor: @unchecked Sendable {
             return _redactDict(d)
         } else if let a = val as? [Any] {
             return a.map { _redactValue($0) }
-        } else if let digits = Redactor.integerText(val), Redactor.hasCard(digits) {
-            // Only the card rule applies to integers, as in fasten-core.
+        } else if let digits = Redactor.wholeNumberText(val), Redactor.hasCard(digits) {
+            // Only the card rule applies to numbers, as in fasten-core.
             return "***CC***"
         }
         return val
     }
 
-    // The decimal text of an integer value; nil for a Bool, a float or
-    // anything else. A floating-point NSNumber is not read as an integer.
-    private static func integerText(_ val: Any) -> String? {
+    // The integer digits of a number with no fractional part: an integer,
+    // or a finite float below 1e19 in magnitude such as 4111111111111111.0,
+    // as fasten-core reads them. Nil for a Bool or any other value.
+    private static func wholeNumberText(_ val: Any) -> String? {
         if val is Bool { return nil }
-        if let n = val as? NSNumber, ["d", "f"].contains(String(cString: n.objCType)) {
-            return nil
+        if let d = val as? NSDecimalNumber {
+            let s = d.stringValue
+            return s.range(of: #"^-?[0-9]+$"#, options: .regularExpression) != nil ? s : nil
         }
         switch val {
         case let i as Int: return String(i)
         case let i as Int64: return String(i)
         case let u as UInt: return String(u)
         case let u as UInt64: return String(u)
+        case let d as Double: return wholeFloatText(d)
+        case let f as Float: return wholeFloatText(Double(f))
         default: return nil
         }
+    }
+
+    private static func wholeFloatText(_ d: Double) -> String? {
+        guard d.isFinite, d.rounded() == d, abs(d) < 1e19 else { return nil }
+        if let i = Int64(exactly: d) { return String(i) }
+        if let u = UInt64(exactly: d) { return String(u) }
+        return nil
     }
 
     private func _redactString(_ s: String) -> Any {
