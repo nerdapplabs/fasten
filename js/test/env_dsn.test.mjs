@@ -256,6 +256,25 @@ describe('an audit DSN with an unknown scheme is an error, as a stream DSN is', 
         }
     });
 
+    test('a DSN taken as a path that cannot be opened is not quoted in the error', async () => {
+        const cwd = process.cwd();
+        const dir = mkdtempSync(join(DIR, 'path-'));
+        process.chdir(dir);
+        try {
+            for (const name of VARS) {
+                for (const dsn of ['user@host/db', ' postgres://u:pw@h/db']) {
+                    setEnv({ [name]: dsn });
+                    await assert.rejects(init(), (err) =>
+                        !err.message.includes(dsn.trim()) && !err.message.includes('pw@h')
+                        && !err.message.includes('user@host') && !('path' in err), `${name}=${dsn}`);
+                }
+            }
+            assert.deepEqual(readdirSync(dir), []);
+        } finally {
+            process.chdir(cwd);
+        }
+    });
+
     test('an upper-case postgres scheme opens a PostgresStore', async () => {
         setEnv({ FASTEN_AUDIT_DSN: 'POSTGRES://u:p@db.invalid/x' });
         assert.ok((await init()).auditStore() instanceof PostgresStore);
