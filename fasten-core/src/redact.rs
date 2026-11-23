@@ -1,7 +1,8 @@
 //! Key-pattern and value-shape redaction (see spec/redact-conformance):
 //!   1. Object keys matching `REDACT_PATTERNS` get the replacement token.
 //!   2. String values matching a known secret shape get a typed token.
-//!   3. Integer values whose digits form a card number get `***CC***`.
+//!   3. Numbers with no fractional part whose digits form a card number
+//!      get `***CC***`.
 //!
 //! `REDACTOR` is the default instance used by the C ABI. `Redactor::new`
 //! builds one with extra keys, a custom replacement and extra value patterns.
@@ -262,6 +263,16 @@ fn luhn_valid(digits: &str) -> bool {
     total % 10 == 0
 }
 
+/// The integer digits of a number with no fractional part: an integer, or
+/// a finite float below 1e19 in magnitude such as `4111111111111111.0`.
+fn whole_number_digits(n: &serde_json::Number) -> Option<String> {
+    if n.is_u64() || n.is_i64() {
+        return Some(n.to_string());
+    }
+    let f = n.as_f64()?;
+    (f.is_finite() && f.fract() == 0.0 && f.abs() < 1e19).then(|| format!("{f:.0}"))
+}
+
 pub struct Redactor {
     key_re:      Regex,
     replacement: String,
@@ -350,8 +361,8 @@ impl Redactor {
             Value::String(s) => self
                 .check_value(s)
                 .map_or_else(|| value.clone(), Value::String),
-            // Only the card rule applies to integers; floats are kept.
-            Value::Number(n) if (n.is_u64() || n.is_i64()) && has_card(&n.to_string()) => {
+            // Only the card rule applies to numbers.
+            Value::Number(n) if whole_number_digits(n).is_some_and(|d| has_card(&d)) => {
                 Value::String("***CC***".to_owned())
             }
             _ => value.clone(),
@@ -391,26 +402,33 @@ mod tests {
     }
 
     #[test]
-    fn integer_not_card_kept() {
+    fn number_not_card_kept() {
         let input = json!({
             "count": 42,
             "luhn_fails": 1_234_567_890_123_456_u64,
             "max": u64::MAX,
-            "float": 4_111_111_111_111_111.0,
+            "fraction": 4_222_222_222_222.5,
+            "large_float": 4.111_111_111_111_111e19,
             "flag": true,
             "none": null,
         });
         assert_eq!(r().redact_value(&input), input);
-        let out = r().redact_json(r#"{"f":4111111111111111.0,"e":4.111111111111111e15}"#).unwrap();
-        let out: Value = serde_json::from_str(&out).unwrap();
-        assert!(out["f"].is_f64() && out["e"].is_f64(), "{out}");
     }
 
     #[test]
-    fn integer_card_uses_card_token_with_custom_replacement() {
+    fn whole_float_card_redacted() {
+        let out = r()
+            .redact_json(r#"{"f":4111111111111111.0,"e":4.111111111111111e15,"n":-4111111111111111.0}"#)
+            .unwrap();
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out, json!({"f": "***CC***", "e": "***CC***", "n": "***CC***"}));
+    }
+
+    #[test]
+    fn number_card_uses_card_token_with_custom_replacement() {
         let rd = Redactor::new(&[], "[gone]", &[(r"^\d+$", "***NUM***")]);
-        let out = rd.redact_value(&json!({"card": 4_111_111_111_111_111_u64, "n": 7}));
-        assert_eq!(out, json!({"card": "***CC***", "n": 7}));
+        let out = rd.redact_value(&json!({"card": 4_111_111_111_111_111_u64, "token": "x", "n": 7}));
+        assert_eq!(out, json!({"card": "***CC***", "token": "[gone]", "n": 7}));
     }
 
     #[test]
