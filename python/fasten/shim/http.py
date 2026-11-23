@@ -9,7 +9,7 @@ import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from ..canonical_ts import canonical_now
-from ..context import _request_id, current_request_id, mint_id, _set_request_id, usable_request_id
+from ..context import _request_id, _set_request_id, current_request_id, mint_id, usable_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
@@ -102,14 +102,12 @@ class APILogger:
             duration_ms = int((time.monotonic() - start) * 1000)
             from ..emitter import transport as _transport
             t = _transport()
-            if t is None:
-                return
-            row = {
-                "method": scope.get("method", ""),
-                "path": path,
-                "status": snapshot["status"],
-                "duration_ms": duration_ms,
-                "request_id": snapshot["request_id"],
-                "timestamp": canonical_now(),
-            }
-            t.write_api(row)
+            if t is not None:
+                t.write_api({
+                    "method": scope.get("method", ""),
+                    "path": path,
+                    "status": snapshot["status"],
+                    "duration_ms": duration_ms,
+                    "request_id": snapshot["request_id"],
+                    "timestamp": canonical_now(),
+                })

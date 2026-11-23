@@ -129,3 +129,38 @@ def test_api_logger_passthrough_for_non_http_scope(initialized):
 
     after = len(transport.query_api(limit=100))
     assert after == before
+
+
+class _Boom:
+    """ASGI app that fails before sending a response."""
+
+    async def __call__(self, scope, receive, send):
+        raise RuntimeError("app failed")
+
+
+def test_api_logger_reraises_app_error_before_init():
+    """Without fasten.init() there is no transport to log to, and the app's
+    exception still reaches the server."""
+    assert fasten.transport() is None
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError as e:
+        assert str(e) == "app failed"
+    else:
+        raise AssertionError("the app's exception was swallowed")
+
+
+def test_api_logger_reraises_app_error_after_logging(initialized):
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    transport = fasten.transport()
+    before = len(transport.query_api(limit=100))
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the app's exception was swallowed")
+    assert len(transport.query_api(limit=100)) == before + 1

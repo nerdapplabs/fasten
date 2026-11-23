@@ -6,6 +6,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: Python `APILogger` keeps the app's exception
+
+- When the app raised before `fasten.init()` had run, `APILogger` returned
+  from its cleanup and the exception never reached the server. It is
+  re-raised now.
+
 ### Fixed: JS and Python DSN errors
 
 - DSN errors name a scheme only when the DSN has one, that is when `//`
