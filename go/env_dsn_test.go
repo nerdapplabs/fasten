@@ -76,7 +76,6 @@ func TestParseStoreDSN_Forms(t *testing.T) {
 		{"./a.db", sqlite("./a.db", "audit_log", true)},
 		{"sqlite:///a.db?table=&wal=true", sqlite("a.db", "audit_log", true)},
 		{"/var/a.db?table=t1&_pragma=busy_timeout(5000)", sqlite("/var/a.db?_pragma=busy_timeout(5000)", "t1", true)},
-		{"file:/var/a.db?mode=rwc&wal=false", sqlite("file:/var/a.db?mode=rwc", "audit_log", false)},
 		{"postgres://u:p@db/app?table=audit.rows&sslmode=disable", pg("postgres://u:p@db/app?sslmode=disable", "audit.rows")},
 		{"PostgreSQL://db/app?table=t", pg("postgresql://db/app", "t")},
 		{"postgres://db/app", pg("postgres://db/app", "audit_log")},
@@ -94,13 +93,17 @@ func TestParseStoreDSN_Forms(t *testing.T) {
 
 func TestParseStoreDSN_ErrorsNameTheSchemeOnly(t *testing.T) {
 	for _, c := range []struct{ dsn, want string }{
-		{"mysql://app:hunter2@db/audit", `"mysql"`},
-		{"postgresql+psycopg://app:hunter2@db/audit", `"postgresql+psycopg"`},
+		{"mysql://app:hunter2@db/audit", `'mysql'`},
+		{"postgresql+psycopg://app:hunter2@db/audit", `'postgresql+psycopg'`},
 		{"host=db password=hunter2", "keyword form"},
 		{" dbname = app password=hunter2", "keyword form"},
 		{"sqlite://", "no path"},
 		{"sqlite:///", "no path"},
 		{"sqlite://app:hunter2@db", "no path"},
+		{"file:///var/hunter2.db", "'file'"},
+		{"file:/var/hunter2.db?mode=rwc", "DSN form not recognised"},
+		{"C:/hunter2/a.db", "DSN form not recognised"},
+		{`C:\hunter2\a.db`, "DSN form not recognised"},
 	} {
 		_, err := parseStoreDSN(c.dsn, "audit_log")
 		if err == nil {
@@ -245,11 +248,11 @@ func TestEnvAuditDSN_ExplicitConfigWins(t *testing.T) {
 
 func TestEnvDSN_BadDSNFailsInitNamingTheVariableOnly(t *testing.T) {
 	for _, c := range []struct{ env, dsn, want string }{
-		{"FASTEN_AUDIT_DSN", "mysql://app:hunter2@db/audit", `"mysql"`},
+		{"FASTEN_AUDIT_DSN", "mysql://app:hunter2@db/audit", `'mysql'`},
 		{"FASTEN_AUDIT_DSN", "host=db user=app password=hunter2", "keyword form"},
-		{"FASTEN_AUDIT_DSN", "postgresql+psycopg://app:hunter2@db/audit", `"postgresql+psycopg"`},
+		{"FASTEN_AUDIT_DSN", "postgresql+psycopg://app:hunter2@db/audit", `'postgresql+psycopg'`},
 		{"FASTEN_AUDIT_DSN", "sqlite://", "no path"},
-		{"FASTEN_API_DSN", "mysql://app:hunter2@db/audit", `"mysql"`},
+		{"FASTEN_API_DSN", "mysql://app:hunter2@db/audit", `'mysql'`},
 		{"FASTEN_SYSLOG_DSN", "host=db password=hunter2", "keyword form"},
 	} {
 		e := envEngine(t)
@@ -285,7 +288,7 @@ func TestEnvDSN_FailedInitCreatesNoFileAndKeepsStores(t *testing.T) {
 	for _, c := range []struct{ env, dsn, want string }{
 		{"FASTEN_SYSLOG_DSN", dir + "/missing/sys.db", "cannot open the sqlite store (*fs.PathError)"},
 		{"FASTEN_SYSLOG_DSN", dir + "/sys.db?table=bad-name", "not a valid SQL identifier"},
-		{"FASTEN_SYSLOG_DSN", "mysql://db/x", `"mysql"`},
+		{"FASTEN_SYSLOG_DSN", "mysql://db/x", `'mysql'`},
 	} {
 		t.Setenv("FASTEN_AUDIT_DSN", dir+"/b.db")
 		t.Setenv(c.env, c.dsn)

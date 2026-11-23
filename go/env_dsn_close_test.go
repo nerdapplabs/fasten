@@ -224,9 +224,9 @@ func TestEnvDSN_LaterCloseWaitsForAnEarlierClose(t *testing.T) {
 	waitClosed(t, emitted, "the hung emit to return")
 }
 
-// The rollback of a failed Init removes the database file it created, not
-// a journal file that appeared meanwhile.
-func TestEnvDSN_RollbackLeavesJournalFiles(t *testing.T) {
+// The rollback of a failed Init leaves the database file it created, which
+// another process may have opened meanwhile, and its journal.
+func TestEnvDSN_RollbackLeavesFiles(t *testing.T) {
 	e := envEngine(t)
 	dir := t.TempDir()
 	bad := dir + "/bad.db"
@@ -247,11 +247,8 @@ func TestEnvDSN_RollbackLeavesJournalFiles(t *testing.T) {
 	if err := initRaise(e, Config{}); err == nil {
 		t.Fatal("want an Init error")
 	}
-	if exists(dir + "/new.db") {
-		t.Fatal("the failed Init left new.db")
-	}
-	if !exists(journal) {
-		t.Fatal("the rollback removed a journal file it did not create")
+	if !exists(dir+"/new.db") || !exists(journal) {
+		t.Fatal("the rollback removed a file")
 	}
 }
 

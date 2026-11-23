@@ -156,6 +156,8 @@ func TestParseStoreDSN_ErrorsNameASchemeOnlyWhenTheDSNHasOne(t *testing.T) {
 		"admin:s3cret@db.internal:5432/app",
 		"db.internal:5432/app",
 		"user:pw@host/db",
+		"c:/user/pw.db",
+		"file:/user/pw.db",
 	} {
 		_, perr := parseStoreDSN(dsn, "audit_log")
 		_, serr := OpenStreamStore(dsn, "syslog")
@@ -180,7 +182,7 @@ func TestParseStoreDSN_ErrorsNameASchemeOnlyWhenTheDSNHasOne(t *testing.T) {
 	}
 	// With "//" after it, the scheme is named.
 	if _, err := parseStoreDSN("mysql://admin:s3cret@db/app", "t"); err == nil ||
-		!strings.Contains(err.Error(), `"mysql"`) || strings.Contains(err.Error(), "s3cret") {
+		!strings.Contains(err.Error(), `'mysql'`) || strings.Contains(err.Error(), "s3cret") {
 		t.Fatalf("error %v", err)
 	}
 	// As in Python, a ':' in a later path segment, or after a leading '.',
@@ -414,8 +416,8 @@ func TestEnvDSN_CloseStopsRetentionKeepsConfigStores(t *testing.T) {
 	}
 }
 
-// A store that fails to open rolls back the ones this Init opened and the
-// files it created; the previous stores stay.
+// A store that fails to open rolls back the ones this Init opened, leaving
+// their files in place; the previous stores stay.
 func TestEnvDSN_OpenFailureRollsBack(t *testing.T) {
 	e := envEngine(t)
 	dir := t.TempDir()
@@ -452,13 +454,8 @@ func TestEnvDSN_OpenFailureRollsBack(t *testing.T) {
 	if err := opened[0].db.Ping(); err == nil {
 		t.Fatal("the store this Init opened is still open")
 	}
-	for _, f := range []string{"new.db", "new.db-wal", "new.db-shm"} {
-		if exists(filepath.Join(dir, f)) {
-			t.Fatalf("the failed Init left %s", f)
-		}
-	}
-	if !exists(bad) {
-		t.Fatal("the rollback removed a file that was there before")
+	if !exists(filepath.Join(dir, "new.db")) || !exists(bad) {
+		t.Fatal("the rollback removed a file")
 	}
 	if e.auditStore != audit || e.envStores["FASTEN_AUDIT_DSN"].store != audit || e.syslogStore != nil {
 		t.Fatal("a failed Init replaced the stores")
@@ -636,15 +633,24 @@ func TestEnvStreamDSN_Init(t *testing.T) {
 	}
 }
 
-// OpenStreamStore takes a file:///abs/path.db URI.
-func TestOpenStreamStore_FileURI(t *testing.T) {
+// OpenStreamStore refuses a file: URI and a drive letter, as Init does,
+// and creates no file for them.
+func TestOpenStreamStore_RefusesFileURIAndDriveLetter(t *testing.T) {
 	dir := t.TempDir()
-	s, err := OpenStreamStore("file://"+dir+"/uri.db?table=my_sys", "syslog")
-	if err != nil {
-		t.Fatalf("OpenStreamStore: %v", err)
+	t.Chdir(dir)
+	for _, c := range []struct{ dsn, want string }{
+		{"file://" + dir + "/uri.db", "DSN scheme 'file' not supported"},
+		{"file:uri.db?mode=rwc", "DSN form not recognised"},
+		{"C:/uri.db", "DSN form not recognised"},
+	} {
+		if s, err := OpenStreamStore(c.dsn, "syslog"); err == nil {
+			s.db.Close()
+			t.Fatalf("%s: want an error", c.dsn)
+		} else if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: error %q", c.dsn, err)
+		}
 	}
-	defer s.db.Close()
-	if s.table != "my_sys" || !exists(dir+"/uri.db") {
-		t.Fatalf("table %q, file created %v", s.table, exists(dir+"/uri.db"))
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("created %s", entries[0].Name())
 	}
 }

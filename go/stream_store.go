@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -104,73 +103,11 @@ func createOwnerOnly(path string) {
 	}
 }
 
-// sqliteFile returns the file a SQLite DSN for the driver names: a bare path
-// without its query, or the file of a file: URI ("" when there is none).
+// sqliteFile returns the file a SQLite DSN for the driver names: the path
+// without its query.
 func sqliteFile(dsn string) string {
-	if strings.HasPrefix(dsn, "file:") {
-		return uriFilePath(dsn)
-	}
 	path, _, _ := strings.Cut(dsn, "?")
 	return path
-}
-
-// uriFilePath returns the file path of a SQLite file: URI, or "" when the URI
-// names no file to create (in-memory, read-only, another VFS, or another
-// host).
-func uriFilePath(uri string) string {
-	rest, _, _ := strings.Cut(strings.TrimPrefix(uri, "file:"), "#")
-	rest, query, _ := strings.Cut(rest, "?")
-	for _, p := range strings.Split(query, "&") {
-		key, value, _ := strings.Cut(p, "=")
-		switch {
-		case p == "mode=memory", p == "mode=ro", p == "mode=rw", key == "vfs",
-			key == "immutable" && uriTrue(value):
-			return ""
-		}
-	}
-	if strings.HasPrefix(rest, "//") {
-		host, tail, _ := strings.Cut(rest[2:], "/")
-		if host != "" && host != "localhost" {
-			return ""
-		}
-		rest = "/" + tail
-	}
-	p := uriUnescape(rest)
-	// SQLite ends the path at a %00.
-	if i := strings.IndexByte(p, 0); i >= 0 {
-		p = p[:i]
-	}
-	return p
-}
-
-// uriTrue reads a URI boolean as sqlite3_uri_boolean does.
-func uriTrue(v string) bool {
-	if v != "" && v[0] >= '0' && v[0] <= '9' {
-		digits := v[:len(v)-len(strings.TrimLeft(v, "0123456789"))]
-		return strings.Trim(digits, "0") != ""
-	}
-	switch strings.ToLower(v) {
-	case "yes", "on", "true", "full", "extra", "normal":
-		return true
-	}
-	return false
-}
-
-// uriUnescape decodes %XX escapes as SQLite does: a '%' without two hex
-// digits after it stays as it is.
-func uriUnescape(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '%' && i+2 < len(s) {
-			if v, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
-				b.WriteByte(byte(v))
-				i += 2
-				continue
-			}
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
 }
 
 // streamPragmaDSN adds the WAL and synchronous=NORMAL pragmas to a modernc
@@ -184,7 +121,7 @@ func streamPragmaDSN(dsn string) string {
 }
 
 // parseStreamDSN parses a SQLite stream store DSN (see parseStoreDSN):
-//   - a bare path: "./streams.db", or a SQLite file: URI
+//   - a bare path: "./streams.db"
 //   - a sqlite URL: "sqlite:///./rel.db" (three slashes = relative),
 //     "sqlite:////abs/path.db" (four = absolute)
 //   - "?table=X" to override the default table, "?wal=false" to turn WAL off

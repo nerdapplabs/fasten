@@ -18,15 +18,15 @@ import (
 //
 //   - postgres://... or postgresql://... (the scheme in any case);
 //   - sqlite:///rel.db (relative), sqlite:////abs.db (absolute), or a bare
-//     path, which may also be a SQLite file: URI;
+//     path;
 //   - ?table=name names the table, and ?wal=false turns SQLite's WAL
 //     journal off.
 //
 // A SQLite path is used as written, without decoding %XX escapes, and a
 // #fragment is dropped, as Python's urlparse does. Any other scheme, and
-// libpq's keyword form (host=db dbname=app), is an error. An error never
-// quotes the DSN, which can hold a password, and names a scheme only when
-// the DSN has one.
+// libpq's keyword form (host=db dbname=app), is an error, and so is a file:
+// URI or a drive letter (C:/x.db). An error never quotes the DSN, which can
+// hold a password, and names a scheme only when "//" follows it.
 
 // dsnEnvVars are the variables Init opens stores from.
 var dsnEnvVars = []string{"FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"}
@@ -56,8 +56,7 @@ func parseStoreDSN(dsn, defaultTable string) (storeDSN, error) {
 			"use postgres://user@host/db, sqlite:///./fasten.db or a bare filesystem path")
 	}
 	scheme := ""
-	// A file: URI and a Windows drive letter are paths, not schemes.
-	if m := dsnSchemeRe.FindStringSubmatch(dsn); m != nil && len(m[1]) > 1 && !strings.EqualFold(m[1], "file") {
+	if m := dsnSchemeRe.FindStringSubmatch(dsn); m != nil {
 		scheme = strings.ToLower(m[1])
 	}
 	switch scheme {
@@ -90,7 +89,7 @@ func parseStoreDSN(dsn, defaultTable string) (storeDSN, error) {
 		// Text before a ':' is a scheme only when "//" follows; otherwise
 		// it can be a user name or a host.
 		if strings.HasPrefix(dsn[len(scheme)+1:], "//") {
-			return storeDSN{}, fmt.Errorf("DSN scheme %q not supported; "+
+			return storeDSN{}, fmt.Errorf("DSN scheme '%s' not supported; "+
 				"use sqlite:///./fasten.db, postgres://... or a bare filesystem path", scheme)
 		}
 		return storeDSN{}, errors.New("DSN form not recognised; " +
@@ -192,7 +191,7 @@ func (d storeDSN) check() error {
 		}
 		if !slices.Contains(sqlDrivers(), "postgres") {
 			return errors.New(`a postgres DSN needs a database/sql driver registered as "postgres", ` +
-				`such as github.com/lib/pq`)
+				`such as github.com/lib/pq, or pgx registered with sql.Register("postgres", stdlib.GetDefaultDriver())`)
 		}
 		return nil
 	}
@@ -337,25 +336,15 @@ var testHookEnvOpened func(*envStore)
 
 // openEnvStores opens the stores slots does not keep, and returns every
 // store for slots by variable. If one fails to open, the stores this call
-// opened are closed again and the database files it created are removed.
-// Journal and WAL files are left alone: another connection may be using
-// them.
+// opened are closed again. Their files are left in place: another process
+// may have opened the same database meanwhile.
 func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
 	next := map[string]*envStore{}
 	var opened []*envStore
-	var created []string
 	for _, s := range slots {
 		if s.held != nil {
 			next[s.name] = s.held
 			continue
-		}
-		file := ""
-		if s.d.scheme == "sqlite" {
-			if f := sqliteFile(s.d.conn); f != "" && f != ":memory:" {
-				if _, err := os.Lstat(f); os.IsNotExist(err) {
-					file = f
-				}
-			}
 		}
 		open := openStreamStore
 		if s.name == "FASTEN_AUDIT_DSN" {
@@ -363,14 +352,8 @@ func (e *Engine) openEnvStores(slots []envSlot) (map[string]*envStore, error) {
 		}
 		// A store that fails to open has closed its handle.
 		es, err := open(s.d)
-		if file != "" {
-			created = append(created, file)
-		}
 		if err != nil {
 			e.closeStores(e.out(), opened)
-			for _, p := range created {
-				os.Remove(p)
-			}
 			return nil, fmt.Errorf("fasten.Init: %s: cannot open the %s store (%s)",
 				s.name, s.d.scheme, errorType(err))
 		}
