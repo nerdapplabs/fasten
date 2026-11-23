@@ -247,15 +247,29 @@ function _checkValueShape(s) {
 	return null;
 }
 
-// JSON.parse reviver for redaction: an integer whose digits, as written,
-// form a card number becomes "***CC***", as the string card rule does. The
-// source text is checked, so a float such as 4111111111111111.0 is kept and
-// an integer a number cannot hold exactly keeps its digits.
+// The integer digits of a number with no fractional part, as fasten-core
+// reads them: an integer in the i64 or u64 range as written, otherwise a
+// whole-number float below 1e19 in magnitude such as 4111111111111111.0.
+// Null for any other number.
+function _wholeNumberDigits(v, src) {
+	if (typeof src === "string" && /^-?\d+$/.test(src)) {
+		const n = BigInt(src);
+		if (n >= -(2n ** 63n) && n < 2n ** 64n) return n.toString();
+	}
+	const f = Number(v);
+	return Number.isInteger(f) && Math.abs(f) < 1e19
+		? BigInt(f).toString()
+		: null;
+}
+
+// JSON.parse reviver for redaction: a number with no fractional part whose
+// digits form a card number becomes "***CC***", as the string card rule
+// does. An integer a number cannot hold exactly keeps its digits.
 function _redactReviver(key, value, context) {
 	const v = bigintReviver(key, value, context);
 	if (typeof v !== "number" && typeof v !== "bigint") return v;
-	const src = context?.source ?? String(v);
-	return /^-?\d+$/.test(src) && _hasCard(src) ? "***CC***" : v;
+	const digits = _wholeNumberDigits(v, context?.source);
+	return digits !== null && _hasCard(digits) ? "***CC***" : v;
 }
 
 function _matchesAny(key, patterns) {
@@ -290,8 +304,8 @@ function _redactObj(val, patterns, replacement) {
 /**
  * Redact a JSON string using the default key-pattern list.
  * Returns a JSON string with matching key values replaced by "***". An
- * integer a number cannot hold exactly keeps its digits; one that is a card
- * number is replaced by "***CC***".
+ * integer a number cannot hold exactly keeps its digits; a number with no
+ * fractional part that is a card number is replaced by "***CC***".
  */
 export function coreRedact(inJson) {
 	const obj = JSON.parse(inJson, _redactReviver);
