@@ -83,4 +83,6 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/fasten-core/target/release
           FASTEN_TEST_POSTGRES_DSN: postgresql://fasten:fasten@localhost:5432/fasten_test
+          # Fail, rather than skip, the Postgres tests if the DSN goes missing.
+          FASTEN_REQUIRE_POSTGRES: '1'
         run: ctest --test-dir build --output-on-failure

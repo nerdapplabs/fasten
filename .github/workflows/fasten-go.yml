@@ -66,6 +66,16 @@ jobs:
         with:
           go-version: "1.26"
 
+      - name: Format (gofmt)
+        working-directory: go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Vet
         working-directory: go
         env:
