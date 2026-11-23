@@ -482,6 +482,26 @@ void core_event_fields_are_redacted() {
     std::cout << "core event fields are redacted: PASS\n";
 }
 
+// When the core cannot redact the fields (here, nesting deeper than it
+// reads), every value but true, false and null becomes the replacement.
+void core_event_fields_fallback_replaces_numbers() {
+    reset_state();
+    fasten::init(cfg("raise"));
+    const std::string deep = std::string(200, '[') + std::string(200, ']');
+    auto f = fasten::detail_::redact_json_fields_({
+        {"rows", deep}, {"card", "4111111111111111"}, {"depth", "1"},
+        {"flushed", "true"}, {"row_id", "null"}, {"note", "\"x\""}});
+    std::string line;
+    for (auto& x : f) line += x.key + "=" + x.json + ";";
+    assert(line.find("4111111111111111") == std::string::npos);
+    assert(line.find("card=\"***\";") != std::string::npos);
+    assert(line.find("depth=\"***\";") != std::string::npos);
+    assert(line.find("flushed=true;") != std::string::npos);
+    assert(line.find("row_id=null;") != std::string::npos);
+    assert(line.find("[[") == std::string::npos);
+    std::cout << "core event fields fallback replaces numbers: PASS\n";
+}
+
 // The sink's error text is redacted in the sys line.
 void sync_fallback_error_is_redacted() {
     reset_state();
@@ -569,6 +589,7 @@ int main() {
     zero_flush_with_idle_drainer();
     core_events_keep_json_types();
     core_event_fields_are_redacted();
+    core_event_fields_fallback_replaces_numbers();
     sync_fallback_error_is_redacted();
     reinit_reports_unstored_rows();
     flush_during_shutdown_waits_for_close();

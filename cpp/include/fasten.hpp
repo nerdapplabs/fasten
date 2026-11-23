@@ -1362,8 +1362,8 @@ inline Fields redact(const Fields& f, const std::string& code) {
 }
 
 // Redacts fields whose values are JSON text, keeping each value's type. If
-// the core returns an error, strings, arrays and objects become the
-// replacement; numbers, booleans and null are kept.
+// the core returns an error, strings, numbers, arrays and objects become the
+// replacement; booleans and null are kept.
 inline std::vector<SysField> redact_json_fields_(
     const std::vector<std::pair<std::string, std::string>>& fields) {
     std::vector<SysField> out;
@@ -1380,9 +1380,9 @@ inline std::vector<SysField> redact_json_fields_(
     if (rc != 0) {
         const std::string repl = redact_replacement_(cfg);
         for (const auto& kv : fields) {
-            const char c = kv.second.empty() ? '"' : kv.second[0];
-            if (c == '"' || c == '[' || c == '{') out.push_back({kv.first, json_str(repl), repl});
-            else out.push_back({kv.first, kv.second, kv.second});
+            const std::string& v = kv.second;
+            if (v == "true" || v == "false" || v == "null") out.push_back({kv.first, v, v});
+            else out.push_back({kv.first, json_str(repl), repl});
         }
         log_redact_failed_(rc);
         return out;
