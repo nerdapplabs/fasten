@@ -102,3 +102,19 @@ func TestRedactReplacementNotUTF8(t *testing.T) {
 		t.Fatalf("want password redacted and ok kept; got %v", got)
 	}
 }
+
+// A number card gets the card token, not the configured replacement.
+func TestRedactNumberCardWithCustomReplacement(t *testing.T) {
+	registerTestCodes(t)
+
+	e := &Engine{}
+	if err := e.Init(Config{ServiceID: "svc", NodeID: "n", RedactReplacement: "[gone]"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.ResetForTests() })
+
+	got := e.redactDetail(map[string]any{"card": 4111111111111111, "token": "x"})
+	if got["card"] != "***CC***" || got["token"] != "[gone]" {
+		t.Fatalf("want card ***CC*** and token [gone]; got %v", got)
+	}
+}
