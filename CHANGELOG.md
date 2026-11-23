@@ -11,6 +11,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - When the app raised before `fasten.init()` had run, `APILogger` returned
   from its cleanup and the exception never reached the server. It is
   re-raised now.
+- A failed API log write is logged as a warning and no longer replaces the
+  app's exception or fails a request that was already served.
 
 ### Fixed: JS and Python DSN errors
 
