@@ -156,9 +156,7 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   and `mark_shipped` marks them. The engine has `fasten::list_unshipped`,
   `mark_shipped` and `ingest_replicated`, scoped to its service and node
   id; a row from its own node is a break. The SDK re-exports
-  `ReplicatedRow`, `IngestResult` and `BatchError`. A store's
-  `list_unshipped` returns an error for a row a `Row` cannot hold, rather
-  than a default.
+  `ReplicatedRow`, `IngestResult` and `BatchError`.
 - `insert_replicated`, the replicated insert of spec §5, on the stores.
 - `purge(before, respect_unshipped)` on the Rust SDK stores. A failure is
   `Error::AuditStorePurge`. A purge is never run a second time on its own:
@@ -180,6 +178,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   close does. `fasten::parse_dsn`, `audit_store_from_dsn` and
   `stream_store_from_dsn` are public. A set `FASTEN_*` variable named like
   a DSN that init does not read is reported once as `env_dsn_not_read`.
+- DSN errors name a scheme only when the DSN has one (`//` follows it).
+- A DSN that repeats `table` or `wal` uses the first value that is not
+  empty, as Python's `parse_qs` does.
 - Stored sys and api logs: `SqliteStreamStore` (`store-sqlite`) and
   `PostgresStreamStore` (`store-postgres`) on the table the Python, Go and
   JS stream stores use; `Config::api_store`, `syslog_store`,
@@ -207,9 +208,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `kind`, implemented by `SqliteStore` and `PostgresStore`.
 - fasten-core: `store::stream`, `store::stream_sqlite::SqliteStreamStore`,
   `AuditQuery`, `AuditSearch`, `Source`, and the matching `SqliteStore` read
-  methods. `IngestResult`, `BatchError`, `Source`, `reader::Response`,
-  `reader::Auth` and the `Dsn` variants are `#[non_exhaustive]`;
-  `Source::new` and `Response::new` build them. `AuditQuery`, `AuditSearch`,
+  methods. `ReplicatedRow`, `IngestResult`, `BatchError`, `Source`,
+  `reader::Response`, `reader::Auth` and the `Dsn` variants are
+  `#[non_exhaustive]`; `ReplicatedRow::new`, `Source::new` and
+  `Response::new` build them. `AuditQuery`, `AuditSearch`,
   `StreamFilter` and `reader::Request` stay open to struct literals with
   `..Default::default()`.
 
@@ -223,9 +225,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   does a store from one of them that cannot be opened:
   `<variable>: cannot open the <scheme> store (<error type>)`, without the
   driver's text.
-- DSN errors name a scheme only when the DSN has one (`//` follows it).
-- A DSN that repeats `table` or `wal` uses the first value that is not
-  empty, as Python's `parse_qs` does, not the last.
 - A sys line without a request id now carries a sentinel id (`boot-…`, then
   `orphan-…`) instead of an empty string, as in Python and Go.
 - After `init`, SDK sys events (such as `audit_chain_unavailable`) are also
@@ -239,8 +238,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - fasten-core's drainer, which Python and Go use, records the error type in
   `last_error`, `audit_drain_failed`, `audit_drain_degraded` and
   `audit_drain_dead_letter`, not the error's text, as
-  spec/drainer-conformance.md asks; a store error that fasten-core builds
-  itself is recorded as `Store`. An insert callback's failure still reads
+  spec/drainer-conformance.md asks; a store error or row rejection that
+  fasten-core builds itself is recorded as `Store` or `RowRejected`, and one
+  that carries a type name, such as the Rust SDK's `AuditStoreRejected`,
+  under that name. An insert callback's failure still reads
   `insert callback returned non-zero rc=<n>`.
 - fasten-core's `PostgresStore::purge` is not run a second time after a
   lost connection; it returns a `Store` error saying the outcome is

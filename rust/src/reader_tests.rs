@@ -172,6 +172,7 @@ fn without_init_the_routes_say_so() {
     assert_eq!(corr["totals"], json!({ "audit": null, "api": 0, "sys": 0 }));
     let doctor = get("/audit/doctor");
     assert_eq!(doctor["store"]["reachable"], false);
+    assert_eq!(doctor["store"]["degraded"], false);
     assert_eq!(doctor["chain"]["verified"], Value::Null);
     assert_eq!(doctor["transport"]["stdout_active"], false);
 }
@@ -418,6 +419,7 @@ fn tenant_scope_applies_to_every_row() {
         log_both(other, "rid-shared", Some("t2"), "needle");
         log_both(other, "rid-shared", None, "needle");
         env.flush();
+        assert!(other.flush(std::time::Duration::from_secs(10)));
         let r = env
             .builder()
             .tenant_scope(|req| req.header("x-tenant").map(str::to_string))
@@ -737,7 +739,9 @@ fn audit_completeness_follows_dead_lettered_rows_of_the_engines_store() {
     engine.init(queued(Arc::new(Refusing))).unwrap();
     let r = Reader::builder().auth(Auth::None).engine(engine).build().unwrap();
     let audit = |r: &Reader| r.handle(&Request::new("GET", "/audit")).json()["completeness"]["audit"].clone();
+    let degraded = |r: &Reader| r.handle(&Request::new("GET", "/audit/doctor")).json()["store"]["degraded"].clone();
     assert_eq!(audit(&r), "store");
+    assert_eq!(degraded(&r), false);
 
     crate::EmitBuilder::new(crate::test_support::CODE, "t").submit_to(engine).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -746,12 +750,15 @@ fn audit_completeness_follows_dead_lettered_rows_of_the_engines_store() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(audit(&r), "store-degraded");
+    assert_eq!(degraded(&r), true);
     let own: Arc<dyn AuditStore> = Arc::new(crate::SqliteStore::open(":memory:", "audit_log").unwrap());
     let given = Reader::builder().auth(Auth::None).engine(engine).audit_store(Some(own.clone())).build().unwrap();
     assert_eq!(audit(&given), "store");
+    assert_eq!(degraded(&given), false);
 
     engine.init(queued(own)).unwrap();
     assert_eq!(audit(&r), "store");
+    assert_eq!(degraded(&r), false);
     engine.close(std::time::Duration::from_secs(5));
 }
 

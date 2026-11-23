@@ -314,17 +314,17 @@ reason }` rather than as an error:
 A row delivered again is skipped and counted in `inserted`, so a batch can
 be resent safely. A batch with a timestamp the Python and Go stores could
 not read back (not RFC 3339, year 0, a UTC year outside 1 to 9999) is
-refused whole with `Error::AuditStoreRejected`. Any error means nothing of
-the batch was stored. On Postgres the batch's node locks are taken in sorted
+refused whole with `Error::AuditStoreRejected`. An error normally means
+nothing of the batch was stored, but an error after a lost connection can
+leave it stored; sending the batch again is safe. On Postgres the batch's node locks are taken in sorted
 order, the lock every SDK's insert takes, so ingest and local writes on one
 table do not interleave on a node.
 
 `ReplicatedRow` carries the row as a `ChainRow`, whose detail keeps each
 number as it was written, and its `pii_in_detail` flag. To store one row
 already verified, without the checks, use the store's
-`insert_replicated(&row)`. The stores'
-`list_unshipped(limit, Some((service_id, node_id)))` returns the same rows
-as `Row`s, whose detail `serde_json` holds, so ship `list_unshipped_sealed`.
+`insert_replicated(&row)`. Build one with `ReplicatedRow::new(row,
+pii_in_detail)`, `ReplicatedRow::from(chain_row)` or `from_json`.
 
 ## Purging audit rows
 

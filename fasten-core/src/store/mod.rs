@@ -318,8 +318,10 @@ pub trait Store: Send + Sync {
     /// Verify a batch of rows sealed on other nodes and store its verified
     /// prefix in one transaction (spec §4), as the Python, Go and JS stores
     /// do.
-    /// A break is reported in the result, not as an error. An error means
-    /// nothing of the batch was stored.
+    /// A break is reported in the result, not as an error. An error
+    /// normally means nothing of the batch was stored, but an error after a
+    /// lost connection can leave it stored; sending the batch again is
+    /// safe, as a re-delivered row is skipped.
     fn ingest_replicated(
         &self,
         _rows: &[ReplicatedRow],

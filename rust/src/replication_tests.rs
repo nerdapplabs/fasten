@@ -596,6 +596,28 @@ fn list_unshipped_refuses_a_row_it_cannot_hold() {
     assert!(rows[0].detail.is_empty());
 }
 
+#[cfg(feature = "store-postgres")]
+#[test]
+fn postgres_list_unshipped_refuses_a_row_it_cannot_hold() {
+    let Some(dsn) = pg::dsn() else { return };
+    let table = pg::table("unshipped");
+    let _drop = pg::DropTable(dsn.clone(), table.clone());
+    let store = crate::PostgresStore::new(&dsn, table.clone()).unwrap();
+    let mut r = row(1, "evt-arr", "node-1", "u/1");
+    r.detail = crate::Json::parse("[1,2]").unwrap();
+    let arr = seal("genesis", &r);
+    let mut r = row(2, "evt-null", "node-1", "u/1");
+    r.detail = crate::Json::Null;
+    let null = seal(&arr.hash, &r);
+    store.insert_replicated(&ReplicatedRow::from(arr)).unwrap();
+    let err = store.list_unshipped(1, None).unwrap_err();
+    assert!(matches!(&err, crate::Error::AuditStoreRead(m) if m.contains("evt-arr") && m.contains("detail")), "{err:?}");
+    store.insert_replicated(&ReplicatedRow::from(null)).unwrap();
+    store.mark_shipped(&["evt-arr".to_string()]).unwrap();
+    let rows = store.list_unshipped(0, None).unwrap();
+    assert!(rows[0].detail.is_empty());
+}
+
 /// The rows of a vector file in spec/.
 pub(crate) fn vector(file: &str) -> Vec<ReplicatedRow> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec").join(file);

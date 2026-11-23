@@ -390,12 +390,21 @@ impl Params {
         self.0.iter().any(|(k, _)| k == name)
     }
 
-    /// Every value is checked for a NUL, used or not.
+    /// Every parameter is checked for a NUL, used or not, as `get` would
+    /// read it: the last value of each name. The first name with one is
+    /// reported. One pass each way, so a long query stays linear.
     fn check_nul(&self) -> Result2<()> {
-        for (k, _) in &self.0 {
-            self.get(k)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut bad = std::collections::HashSet::new();
+        for (k, v) in self.0.iter().rev() {
+            if seen.insert(k.as_str()) && v.contains('\0') {
+                bad.insert(k.as_str());
+            }
         }
-        Ok(())
+        match self.0.iter().find(|(k, _)| bad.contains(k.as_str())) {
+            Some((k, _)) => Err(unprocessable(format!("{k} must not contain a NUL character"))),
+            None => Ok(()),
+        }
     }
 
     fn text(&self, name: &str) -> Result2<Option<String>> {
@@ -539,13 +548,40 @@ impl Out {
         Value::String(format!("\u{1}fasten-raw-{}-{}", self.nonce, self.raws.len() - 1))
     }
 
+    /// `v` as JSON text with each marker replaced by its raw text, in one
+    /// pass over the body.
     fn render(&self, v: &Value) -> String {
-        let mut body = v.to_string();
-        for (i, raw) in self.raws.iter().enumerate() {
-            let marker = Value::String(format!("\u{1}fasten-raw-{}-{i}", self.nonce)).to_string();
-            body = body.replacen(&marker, raw, 1);
+        let body = v.to_string();
+        if self.raws.is_empty() {
+            return body;
         }
-        body
+        // A marker serialises as `"\u0001fasten-raw-<nonce>-<i>"`.
+        let mut prefix = Value::String(format!("\u{1}fasten-raw-{}-", self.nonce)).to_string();
+        prefix.pop();
+        let mut out = String::with_capacity(body.len() + self.raws.iter().map(String::len).sum::<usize>());
+        let mut rest = body.as_str();
+        while let Some(at) = rest.find(&prefix) {
+            let after = &rest[at + prefix.len()..];
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            let raw = after[digits..]
+                .starts_with('"')
+                .then(|| after[..digits].parse::<usize>().ok())
+                .flatten()
+                .and_then(|i| self.raws.get(i));
+            match raw {
+                Some(raw) => {
+                    out.push_str(&rest[..at]);
+                    out.push_str(raw);
+                    rest = &after[digits + 1..];
+                }
+                None => {
+                    out.push_str(&rest[..at + prefix.len()]);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 }
 
@@ -1305,6 +1341,8 @@ fn route_doctor(ctx: &Ctx<'_>, tenant: Option<&str>) -> Value {
         "store": {
             "kind": if scoped { Value::Null } else { json!(store.map(|s| s.kind().to_string())) },
             "reachable": reachable,
+            // As the audit source reads: rows failed to reach this store.
+            "degraded": store.is_some() && ctx.source("audit") == "store-degraded",
             "rows": rows,
             "last_insert_at": null,
             "last_error": last_error,
@@ -1366,6 +1404,29 @@ mod unit_tests {
     #[test]
     fn python_repr() {
         assert_eq!(py_list(&["a", "it's", "b\\"]), r#"['a', "it's", 'b\\']"#);
+    }
+
+    // As get reads them: the last value of each name, the first name with
+    // a NUL reported.
+    #[test]
+    fn nul_check_reads_the_last_value_of_each_name() {
+        let detail = |q: &str| Params::parse(q).check_nul().err().map(|e| e.detail);
+        assert_eq!(detail("a=1&b=2"), None);
+        assert_eq!(detail("a=%00&a=1"), None);
+        assert_eq!(detail("a=1&b=%00&a=%00").as_deref(), Some("a must not contain a NUL character"));
+        assert_eq!(detail("b=1&a=%00&b=x%00").as_deref(), Some("b must not contain a NUL character"));
+        let long: String = (0..20_000).map(|i| format!("k{i}=v&")).collect();
+        assert_eq!(detail(&format!("{long}z=%00")).as_deref(), Some("z must not contain a NUL character"));
+    }
+
+    #[test]
+    fn render_splices_each_raw_once() {
+        let mut out = Out::new();
+        let a = out.raw(r#"{"n":1.50}"#.into());
+        let b = out.raw("[1e400]".into());
+        let v = json!({ "rows": [{ "detail": a }, { "detail": b }, { "s": "\u{1}fasten-raw-x-0" }] });
+        assert_eq!(out.render(&v), r#"{"rows":[{"detail":{"n":1.50}},{"detail":[1e400]},{"s":"\u0001fasten-raw-x-0"}]}"#);
+        assert_eq!(Out::new().render(&json!({ "a": 1 })), r#"{"a":1}"#);
     }
 
     #[test]

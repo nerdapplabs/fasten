@@ -340,26 +340,33 @@ impl Engine {
         if let Some(named) = &persist_streams {
             check_stream_names(named)?;
         }
-        // Every DSN is checked before a store is opened, and every store is
-        // opened before any is let go of, so a failed init leaves the stores
-        // of the last one as they were. A SQLite file in a directory that
-        // does not exist is refused here too, so no other store has created
-        // its file yet.
+        // Every check runs before a store is opened, and every store is
+        // opened before any is let go of, so a failed init creates no file
+        // and leaves the stores of the last one as they were: each DSN is
+        // parsed and checked against the features built in and the tables
+        // its store takes, and a SQLite file in a directory that does not
+        // exist is refused here too.
         let mut parsed = Vec::new();
-        for (name, given) in [
-            ("FASTEN_AUDIT_DSN", cfg.audit_store.is_some()),
-            ("FASTEN_API_DSN", cfg.api_store.is_some()),
-            ("FASTEN_SYSLOG_DSN", cfg.syslog_store.is_some()),
+        for (name, given, default_table) in [
+            ("FASTEN_AUDIT_DSN", cfg.audit_store.is_some(), "audit_log"),
+            ("FASTEN_API_DSN", cfg.api_store.is_some(), "api_log"),
+            ("FASTEN_SYSLOG_DSN", cfg.syslog_store.is_some(), "syslog"),
         ] {
             let dsn = env_dsn(env, name);
             if let (Some(dsn), false) = (dsn, given) {
-                let d = crate::parse_dsn(dsn, "audit_log").map_err(|e| Error::InvalidConfig(format!("{name}: {e}")))?;
+                let d = crate::parse_dsn(dsn, default_table).map_err(|e| Error::InvalidConfig(format!("{name}: {e}")))?;
                 parsed.push((name, d));
             }
         }
         for (name, d) in &parsed {
-            crate::dsn::check_openable(name, d)?;
+            crate::dsn::check_env_dsn(name, d, *name != "FASTEN_AUDIT_DSN")?;
         }
+        let from_env = |name: &str| parsed.iter().any(|(n, _)| *n == name);
+        check_persist_streams(
+            persist_streams.as_deref(),
+            cfg.api_store.is_some() || from_env("FASTEN_API_DSN"),
+            cfg.syslog_store.is_some() || from_env("FASTEN_SYSLOG_DSN"),
+        )?;
         let mut held = self.env_stores.lock_or_recover();
         let (audit_store, audit_env) = store_from_env(cfg.audit_store.take(), env, "FASTEN_AUDIT_DSN", &held.audit, |dsn| {
             crate::dsn::open_audit_store("FASTEN_AUDIT_DSN", dsn)
@@ -371,14 +378,9 @@ impl Engine {
             store_from_env(cfg.syslog_store.take(), env, "FASTEN_SYSLOG_DSN", &held.syslog, |dsn| {
                 crate::streams::open_stream_store("FASTEN_SYSLOG_DSN", dsn, "syslog")
             })?;
-        check_persist_streams(persist_streams.as_deref(), api_store.is_some(), syslog_store.is_some())?;
         let installs = held.installs.wrapping_add(1);
         *held = EnvStores { audit: audit_env, api: api_env, syslog: syslog_env, installs };
-        drop(held);
         cfg.audit_store = audit_store;
-
-        self.stop_purger();
-        self.stop_stream_purgers();
 
         let store = cfg.audit_store.clone();
         let capacity     = cfg.queue_capacity.unwrap_or(100);
@@ -396,7 +398,16 @@ impl Engine {
         cfg_stored.persist_streams = persist_streams;
         cfg_stored.api_store = api_store.clone();
         cfg_stored.syslog_store = syslog_store.clone();
+        // The config is replaced while the env store lock is held, so a
+        // close in between cannot release the new stores from the old
+        // config and leave them in this one. close takes the same two
+        // locks in the same order.
         let previous = self.config.lock_or_recover().replace(cfg_stored.clone());
+        drop(held);
+
+        self.stop_purger();
+        self.stop_stream_purgers();
+
         // A gap in the previous store's history says nothing about another.
         let same_store = match (previous.as_ref().and_then(|c| c.audit_store.as_ref()), store.as_ref()) {
             (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),

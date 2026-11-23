@@ -281,6 +281,28 @@ pub(crate) fn check_openable(label: &str, dsn: &Dsn) -> Result<(), crate::Error>
     }
 }
 
+/// [`check_openable`], and the checks a store from `dsn` would make before
+/// creating anything: the scheme's store feature is built in, and for a
+/// stream store (`stream`) a SQLite table is a bare name, as
+/// [`crate::SqliteStreamStore`] requires. `init` runs it on every DSN
+/// before it opens the first store.
+pub(crate) fn check_env_dsn(label: &str, dsn: &Dsn, stream: bool) -> Result<(), crate::Error> {
+    check_openable(label, dsn)?;
+    let built = match dsn {
+        Dsn::Postgres { .. } => cfg!(feature = "store-postgres"),
+        Dsn::Sqlite { .. } => cfg!(feature = "store-sqlite"),
+    };
+    if !built {
+        return Err(feature_missing(label, dsn));
+    }
+    match dsn {
+        Dsn::Sqlite { table, .. } if stream && table.contains('.') => Err(crate::Error::InvalidConfig(format!(
+            "{label}: fasten SqliteStreamStore: table name {table:?} is not a valid SQL identifier. Use only letters, digits, and underscores."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// The DSN variables `init` reads. FASTEN_AUDIT_DSN opens the audit store;
 /// the stream stores read FASTEN_API_DSN and FASTEN_SYSLOG_DSN.
 pub(crate) const DSN_ENV: [&str; 3] = ["FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"];
@@ -621,6 +643,61 @@ mod init_tests {
             .to_string();
         assert!(err.starts_with("FASTEN_API_DSN: cannot open the sqlite store ("), "{err}");
         assert!(!err.contains("plain-file") && !err.contains(&dir.0.display().to_string()), "{err}");
+    }
+
+    // A persist_streams mismatch, or a stream table only the SQLite stream
+    // store refuses, fails init before the first store opens, so the audit
+    // DSN's file is not created.
+    #[test]
+    fn a_check_that_fails_init_runs_before_any_store_opens() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("a.db");
+        let sys = dir.0.join("s.db");
+        let e = Engine::new();
+
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", audit.display())),
+            ("FASTEN_SYSLOG_DSN", &format!("{}", sys.display())),
+        ]);
+        let cfg = Config { persist_streams: Some(vec!["api".into()]), ..config("dsn-c") };
+        let text = e.init_with_env(cfg, &vars).unwrap_err().to_string();
+        assert!(text.contains("persist_streams / stores mismatch"), "{text}");
+        assert!(!audit.exists() && !sys.exists(), "a failed init created a file");
+
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", audit.display())),
+            ("FASTEN_SYSLOG_DSN", &format!("sqlite:///{}?table=main.syslog", sys.display())),
+        ]);
+        let text = e.init_with_env(config("dsn-c"), &vars).unwrap_err().to_string();
+        assert!(text.starts_with("FASTEN_SYSLOG_DSN: fasten SqliteStreamStore: table name \"main.syslog\""), "{text}");
+        assert!(!audit.exists() && !sys.exists(), "a failed init created a file");
+        assert!(e.current_config().is_err(), "a failed init left a config");
+
+        // With the checks passed, the same DSNs open both files.
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", audit.display())),
+            ("FASTEN_SYSLOG_DSN", &format!("{}", sys.display())),
+        ]);
+        let cfg = Config { persist_streams: Some(vec!["sys".into()]), ..config("dsn-c") };
+        e.init_with_env(cfg, &vars).unwrap();
+        assert!(audit.exists() && sys.exists());
+        e.close(std::time::Duration::from_secs(5));
+    }
+
+    // A DSN whose store feature is not built fails init before the first
+    // store opens.
+    #[cfg(not(feature = "store-postgres"))]
+    #[test]
+    fn a_dsn_without_its_store_feature_fails_init_and_creates_no_file() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("a.db");
+        let vars = env(&[
+            ("FASTEN_AUDIT_DSN", &format!("{}", audit.display())),
+            ("FASTEN_SYSLOG_DSN", "postgres://db/app"),
+        ]);
+        let text = Engine::new().init_with_env(config("dsn-feat"), &vars).unwrap_err().to_string();
+        assert_eq!(text, "FASTEN_SYSLOG_DSN: a postgres DSN needs the store-postgres feature");
+        assert!(!audit.exists(), "a failed init created the audit file");
     }
 
     // close releases the stores opened from DSNs, as JS's close does; a store

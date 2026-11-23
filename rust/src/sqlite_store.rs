@@ -84,10 +84,11 @@ impl SqliteStore {
     /// hold exactly is changed, and a redacted detail reads as empty. A row
     /// a `Row` cannot hold (a timestamp outside its range, a detail that is
     /// not an object) fails the call with [`crate::Error::AuditStoreRead`].
-    /// Ship [`crate::AuditStore::list_unshipped_sealed`] instead, which
-    /// keeps each row as it was hashed. `limit == 0` returns all; `origin`
-    /// is as there.
-    pub fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
+    /// Rows to ship come from [`crate::AuditStore::list_unshipped_sealed`],
+    /// which keeps each row as it was hashed. `limit == 0` returns all;
+    /// `origin` is as there.
+    #[cfg(test)]
+    pub(crate) fn list_unshipped(&self, limit: usize, origin: Option<(&str, &str)>) -> Result<Vec<crate::Row>, crate::Error> {
         let rows = crate::AuditStore::list_unshipped_sealed(self, limit, origin)?;
         rows.iter().map(crate::row_from_replicated).collect()
     }

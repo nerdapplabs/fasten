@@ -20,8 +20,10 @@ use crate::chain::{verify_chain, ChainError, ChainRow, Json, JsonString};
 
 /// A sealed row as one node ships it to another: the row as it was hashed,
 /// with its detail number tokens exact, and its `pii_in_detail` flag, which
-/// the chain does not hash.
+/// the chain does not hash. Build one with [`ReplicatedRow::new`],
+/// `From<ChainRow>` or [`ReplicatedRow::from_json`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplicatedRow {
     pub row: ChainRow,
     pub pii_in_detail: bool,
@@ -34,6 +36,11 @@ impl From<ChainRow> for ReplicatedRow {
 }
 
 impl ReplicatedRow {
+    /// A sealed row with its `pii_in_detail` flag.
+    pub fn new(row: ChainRow, pii_in_detail: bool) -> Self {
+        Self { row, pii_in_detail }
+    }
+
     /// Parse one wire-format row, as [`ChainRow::from_json`] does, with its
     /// `pii_in_detail` flag (`true`, `false`, `1` or `0`; missing is false).
     pub fn from_json(text: &str) -> Result<Self, ChainError> {

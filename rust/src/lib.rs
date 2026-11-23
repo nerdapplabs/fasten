@@ -833,10 +833,13 @@ pub trait AuditStore: Send + Sync {
     /// or at a stored node and seq, or one that does not link to the stored
     /// rows before and after it, is a break. Ingest stops at the first
     /// break and reports it in [`IngestResult`], not as an error. With
-    /// `local_node_id`, a row from that node is a break too. An error means
-    /// nothing of the batch was stored; a batch with a timestamp the stores
-    /// cannot hold is [`Error::AuditStoreRejected`]. A custom store builds
-    /// the result with [`IngestResult::stored`] or [`IngestResult::cut`].
+    /// `local_node_id`, a row from that node is a break too. An error
+    /// normally means nothing of the batch was stored, but an error after a
+    /// lost connection can leave it stored; sending the batch again is
+    /// safe, as a re-delivered row is skipped. A batch with a timestamp the
+    /// stores cannot hold is [`Error::AuditStoreRejected`]. A custom store
+    /// builds the result with [`IngestResult::stored`] or
+    /// [`IngestResult::cut`].
     fn ingest_replicated(
         &self,
         _rows: &[ReplicatedRow],
@@ -898,7 +901,7 @@ pub trait AuditStore: Send + Sync {
 /// hold exactly is changed, and a JSON null detail (a redacted row) reads as
 /// empty. A timestamp or `shipped_at` a `Row` cannot hold, or a detail that
 /// is neither an object nor null, is [`Error::AuditStoreRead`].
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(all(test, any(feature = "store-sqlite", feature = "store-postgres")))]
 pub(crate) fn row_from_replicated(r: &ReplicatedRow) -> Result<Row, Error> {
     let c = &r.row;
     let unreadable = |what: &str| Error::AuditStoreRead(format!("row {}: {what} cannot be read as a Row", c.id));
