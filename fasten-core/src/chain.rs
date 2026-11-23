@@ -104,6 +104,8 @@ impl JsonString {
     fn push_code(&mut self, code: u32) {
         match char::from_u32(code) {
             Some(c) => self.push_str(c.encode_utf8(&mut [0; 4])),
+            // None means a surrogate (at most 0xFFFF), so code >> 12 fits in a u8.
+            #[allow(clippy::cast_possible_truncation)]
             None => self.0.extend_from_slice(&[
                 0xe0 | (code >> 12) as u8,
                 0x80 | ((code >> 6) & 0x3f) as u8,

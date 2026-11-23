@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
-/// Create a missing database file with mode 0600, so SQLite does not create
+/// Create a missing database file with mode 0600, so `SQLite` does not create
 /// it with the umask. An existing file keeps its mode. If the file cannot be
 /// created, `Connection::open` reports the error.
 #[cfg(unix)]
@@ -56,12 +57,12 @@ pub(crate) fn create_owner_only(path: &str) {
     let path = std::ffi::OsStr::from_bytes(&bytes);
     // Not create_new: like SQLite, follow a symlink to a missing file. The
     // mode applies only when the file is created.
-    let _ = std::fs::OpenOptions::new().write(true).create(true).mode(0o600).open(path);
+    let _ = std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path);
 }
 
-/// File path of a SQLite `file:` URI (after the scheme), or `None` when the
+/// File path of a `SQLite` `file:` URI (after the scheme), or `None` when the
 /// URI names no file to create (in-memory, read-only, another VFS, or
-/// another host). Escapes decode as in SQLite: a `%` without two hex digits
+/// another host). Escapes decode as in `SQLite`: a `%` without two hex digits
 /// stays as it is.
 #[cfg(unix)]
 fn uri_file_path(uri: &str) -> Option<Vec<u8>> {
@@ -117,7 +118,7 @@ fn uri_true(value: &str) -> bool {
 pub(crate) fn create_owner_only(_path: &str) {}
 
 impl SqliteStore {
-    /// Open (or create) the SQLite database at `path` and bootstrap the
+    /// Open (or create) the `SQLite` database at `path` and bootstrap the
     /// audit table + indexes.
     ///
     /// `path` may be a filesystem path or `":memory:"`.
@@ -153,10 +154,10 @@ impl SqliteStore {
 
     fn migrate(&self) -> Result<(), Error> {
         let t = &self.table;
-        let chain: String = CHAIN_COLUMNS
-            .iter()
-            .map(|(name, def)| format!("{name} {def},\n                "))
-            .collect();
+        let chain = CHAIN_COLUMNS.iter().fold(String::new(), |mut s, (name, def)| {
+            let _ = write!(s, "{name} {def},\n                ");
+            s
+        });
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {t} (
                 id              TEXT    PRIMARY KEY,
@@ -189,7 +190,7 @@ impl SqliteStore {
         );
 
         // Probe first, so opening an up-to-date table takes no write lock.
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if Self::schema_missing(&guard, t)?.is_nothing() {
             return Ok(());
         }
@@ -262,16 +263,16 @@ impl SqliteStore {
             self.table, where_clause
         );
         if filter.limit > 0 {
-            sql.push_str(&format!(" LIMIT {}", filter.limit));
+            let _ = write!(sql, " LIMIT {}", filter.limit);
             if filter.offset > 0 {
-                sql.push_str(&format!(" OFFSET {}", filter.offset));
+                let _ = write!(sql, " OFFSET {}", filter.offset);
             }
         }
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_owned.iter().map(|p| p.as_ref()).collect();
+            params_owned.iter().map(AsRef::as_ref).collect();
 
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare(&sql)?;
         let rows = stmt
             .query_map(params_refs.as_slice(), |r| map(r))?
@@ -282,7 +283,7 @@ impl SqliteStore {
     /// Rows read as stored, each with the text of its `detail` column, so
     /// detail numbers are the tokens that were hashed.
     fn chain_select(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<ChainRow>, Error> {
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare(sql)?;
         let rows = stmt
             .query_map(params, |r| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?)))?
@@ -322,7 +323,7 @@ impl SqliteStore {
         let (conds, params) = q.conditions("+source_node_id", |n| format!("?{n}"), |n| format!("?{n}"));
         let sql = format!("SELECT COUNT(*) FROM {} {}", self.table, where_of(&conds));
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let n: i64 = guard.prepare(&sql)?.query_row(refs.as_slice(), |r| r.get(0))?;
         Ok(n.unsigned_abs())
     }
@@ -363,7 +364,7 @@ impl SqliteStore {
             where_of(&conds)
         );
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare(&sql)?;
         let out = stmt
             .query_map(refs.as_slice(), |r| {
@@ -410,14 +411,13 @@ impl SqliteStore {
     /// as it is.
     fn put(&self, row: &Row, detail: Option<&str>) -> Result<Outcome, Error> {
         let rendered;
-        let detail = match detail {
-            Some(text) => text,
-            None => {
-                rendered = serde_json::to_string(&row.detail)?;
-                &rendered
-            }
+        let detail = if let Some(text) = detail {
+            text
+        } else {
+            rendered = serde_json::to_string(&row.detail)?;
+            &rendered
         };
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // BEGIN IMMEDIATE takes the write lock before the reads, so two
         // handles on one file cannot both read the same tip (spec §2.1).
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -491,7 +491,7 @@ impl Missing {
     }
 }
 
-/// Ids or codes bound per statement. SQLite caps bound variables per
+/// Ids or codes bound per statement. `SQLite` caps bound variables per
 /// statement (999 before 3.32, 32766 since).
 const BIND_CHUNK: usize = 500;
 
@@ -510,7 +510,7 @@ impl Store for SqliteStore {
     }
 
     fn ping(&self) -> Result<(), Error> {
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.execute_batch("SELECT 1")?;
         Ok(())
     }
@@ -529,7 +529,7 @@ impl Store for SqliteStore {
     }
 
     fn chain_tips(&self) -> Result<Vec<ChainTip>, Error> {
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare(&chain_tips_sql(&self.table))?;
         let tips = stmt
             .query_map([], |r| {
@@ -545,9 +545,9 @@ impl Store for SqliteStore {
         let (where_clause, params_owned) = build_filter_where(filter);
         let sql = format!("SELECT COUNT(*) FROM {} {}", self.table, where_clause);
         let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_owned.iter().map(|p| p.as_ref()).collect();
+            params_owned.iter().map(AsRef::as_ref).collect();
 
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare(&sql)?;
         let n: i64 = stmt.query_row(params_refs.as_slice(), |r| r.get(0))?;
         Ok(n.unsigned_abs())
@@ -565,7 +565,7 @@ impl Store for SqliteStore {
              WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT ?1",
             self.table
         );
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare_cached(&sql)?;
         let rows: Vec<Row> = stmt
             .query_map(rusqlite::params![effective], row_from_sqlite)?
@@ -580,7 +580,7 @@ impl Store for SqliteStore {
     ) -> Result<Vec<ReplicatedRow>, Error> {
         let limit: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
         let t = &self.table;
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let map = |r: &rusqlite::Row| Ok((row_from_sqlite(r)?, r.get::<_, String>(18)?));
         let rows = match origin {
             // Unary + keeps SQLite off the (node, seq) index, which would walk
@@ -610,7 +610,7 @@ impl Store for SqliteStore {
             rows,
             local_node_id,
             |verified| {
-                let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // BEGIN IMMEDIATE holds off other writers from before the
                 // first read, so the checks still hold at the inserts.
                 let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -636,7 +636,7 @@ impl Store for SqliteStore {
 
         // SQLite caps bound parameters (32,766), so chunk the ids, in one
         // transaction. ?1 = shipped_at; ?2 .. = the chunk's ids.
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for chunk in ids.chunks(BIND_CHUNK) {
             let sql = format!(
@@ -658,7 +658,7 @@ impl Store for SqliteStore {
     fn purge(&self, before: &str, respect_unshipped: bool) -> Result<u64, Error> {
         let before = purge_cutoff(before)?;
         let sql = purge_sql(&self.table, "?1", respect_unshipped, false);
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let n = guard.execute(&sql, rusqlite::params![before])?;
         Ok(n as u64)
     }
@@ -668,7 +668,7 @@ impl Store for SqliteStore {
             "SELECT COALESCE(MAX(monotonic_seq), 0) FROM {}",
             self.table
         );
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = guard.prepare_cached(&sql)?;
         let seq: i64 = stmt.query_row([], |r| r.get(0))?;
         Ok(seq.unsigned_abs())
@@ -687,7 +687,7 @@ impl Store for SqliteStore {
         if codes.is_empty() {
             return Ok(out);
         }
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // One read transaction so every chunk sees the same rows.
         let tx = guard.transaction()?;
         let gate = Self::redact_gate(&tx, &self.table)?;
@@ -730,7 +730,7 @@ impl Store for SqliteStore {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let gate = Self::redact_gate(&tx, &self.table)?;
         for chunk in ids.chunks(BIND_CHUNK) {
@@ -750,7 +750,7 @@ impl Store for SqliteStore {
     }
 }
 
-/// Ingest's reads and inserts on one SQLite transaction.
+/// Ingest's reads and inserts on one `SQLite` transaction.
 struct Ingest<'a> {
     conn: &'a Connection,
     table: &'a str,
@@ -802,7 +802,7 @@ impl IngestTx for Ingest<'_> {
 
 /// Insert `row` at `seq`, with `detail` as the text of its detail column.
 fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: &str) -> Result<usize, Error> {
-    let pii: i64 = row.pii_in_detail as i64;
+    let pii: i64 = i64::from(row.pii_in_detail);
     let mut stmt = conn.prepare_cached(insert_sql)?;
     stmt.execute(rusqlite::params![
         row.id,
@@ -835,7 +835,7 @@ fn insert_row(conn: &Connection, insert_sql: &str, row: &Row, seq: i64, detail: 
     .map_err(seq_clash)
 }
 
-/// A UNIQUE failure on insert is the (source_node_id, monotonic_seq) index:
+/// A UNIQUE failure on insert is the (`source_node_id`, `monotonic_seq`) index:
 /// a repeated id is `ON CONFLICT (id) DO NOTHING`.
 fn seq_clash(e: rusqlite::Error) -> Error {
     match &e {

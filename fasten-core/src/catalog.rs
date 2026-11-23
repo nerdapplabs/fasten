@@ -65,7 +65,7 @@ impl CodeRegistry {
     /// - a key that is already registered is an error
     /// - `pii_in_detail=true` forces `retention_class="short"`
     ///
-    /// Codes are inserted one at a time in HashMap order, so a failure can
+    /// Codes are inserted one at a time in `HashMap` order, so a failure can
     /// leave an arbitrary part of the batch registered.
     pub fn register(&mut self, domain: &str, codes: HashMap<String, Meta>) -> Result<(), Error> {
         for (name, mut meta) in codes {

@@ -29,19 +29,19 @@ pub enum Error {
     #[error("row JSON: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// SQLite backend error.
+    /// `SQLite` backend error.
     #[cfg(feature = "sqlite")]
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    /// PostgreSQL backend error.
+    /// `PostgreSQL` backend error.
     #[cfg(feature = "postgres")]
     #[error("postgres: {0}")]
     Postgres(#[from] pg::Error),
 
     // Catalog errors
 
-    /// Code key does not match UPPER_SNAKE_CASE (`^[A-Z][A-Z0-9_]*$`).
+    /// Code key does not match `UPPER_SNAKE_CASE` (`^[A-Z][A-Z0-9_]*$`).
     #[error(
         "register: code key {0:?} must be UPPER_SNAKE_CASE \
          (letters, digits, underscores; starts with a letter)"

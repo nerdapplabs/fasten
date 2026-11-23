@@ -175,6 +175,8 @@ unsafe fn install(
 ) -> FastenErrorCode {
     let r = guarded(|| {
         let h = enter(handle)?;
+        // Every supported target has a 64-bit usize, so the cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
         let cfg = DrainerConfig {
             capacity: if capacity == 0 { 100 } else { capacity as usize },
             retry_initial: Duration::from_millis(if retry_initial_ms == 0 { 100 } else { retry_initial_ms }),
@@ -256,7 +258,7 @@ pub unsafe extern "C" fn fasten_drainer_flush(
     match r {
         Ok(drained) => {
             if !out_fully_drained.is_null() {
-                *out_fully_drained = if drained { 1 } else { 0 };
+                *out_fully_drained = c_int::from(drained);
             }
             FastenErrorCode::Ok
         }

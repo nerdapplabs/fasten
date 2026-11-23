@@ -164,7 +164,7 @@ fn has_auth_header(s: &str) -> bool {
 /// DEL or C1) and a ":". With an empty user name (":token", as some access
 /// tokens are sent) the password needs 16 or more characters.
 fn is_basic_credential(token: &str) -> bool {
-    if token.is_empty() || token.len() % 4 != 0 {
+    if token.is_empty() || !token.len().is_multiple_of(4) {
         return false;
     }
     let mut acc: u32 = 0;
@@ -258,7 +258,7 @@ fn luhn_valid(digits: &str) -> bool {
         }
         total += n;
     }
-    total % 10 == 0
+    total.is_multiple_of(10)
 }
 
 pub struct Redactor {
@@ -283,6 +283,10 @@ impl Redactor {
     /// `replacement`: defaults to `"***"` when empty.
     /// `extra_value_patterns`: `(pattern, replacement_token)` pairs checked
     ///   after the built-in value shapes. First match wins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pattern in `extra_value_patterns` is not a valid regex.
     #[allow(clippy::expect_used)]
     pub fn new(
         extra_keys:             &[&str],

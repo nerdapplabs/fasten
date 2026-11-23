@@ -262,7 +262,7 @@ pub trait Store: Send + Sync {
     }
 
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
-    /// sufficient; on PostgreSQL, a lost connection is re-established first.
+    /// sufficient; on `PostgreSQL`, a lost connection is re-established first.
     fn ping(&self) -> Result<(), Error>;
 
     /// Return rows matching `filter`, ordered by `monotonic_seq ASC`.
@@ -647,7 +647,7 @@ pub fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bo
 /// The purge or redaction cutoff as a canonical UTC timestamp (spec §4.3),
 /// which the stores compare with `timestamp` as text. Takes an RFC 3339 timestamp
 /// with any offset, or a date (midnight UTC); anything else is an
-/// InvalidTimestamp error. As given, an offset or a lowercase `t` sorts
+/// `InvalidTimestamp` error. As given, an offset or a lowercase `t` sorts
 /// differently from the stored form and deletes too much, and a string
 /// like "tomorrow" sorts after every row.
 pub(crate) fn purge_cutoff(before: &str) -> Result<String, Error> {

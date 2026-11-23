@@ -59,6 +59,8 @@ pub(crate) unsafe fn set_error(out_err: *mut *mut c_char, msg: &str) {
 ///
 /// # Safety
 /// `buf`, if non-null, must point to at least `buf_len` writable bytes.
+// Callers pass a u32 buf_len; only a string over i32::MAX bytes would wrap.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) unsafe fn write_to_buf(buf: *mut u8, buf_len: usize, s: &str) -> i32 {
     if buf.is_null() || buf_len == 0 {
         return -(FastenErrorCode::ErrUnknown as i32);
