@@ -12,22 +12,39 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   follows it. A DSN such as `host:5432/db` or `user:password@host/db` gets
   `DSN form not recognised`; an unknown scheme such as `mysql://...` is
   still named.
-- Python's `FASTEN_AUDIT_DSN` refuses an unknown scheme or form, as
-  `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN` do, instead of opening a SQLite
-  file, and `fasten doctor` reports it.
-- Python's `FASTEN_AUDIT_DSN` opens Postgres when its scheme is `postgres`
-  or `postgresql` in any case, such as `POSTGRES://...`, as the stream DSNs
-  do, instead of a SQLite file, and `fasten doctor` describes it the same
-  way.
-- Python refuses libpq's keyword form (`host=db dbname=app`) in
-  `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, as JS, Rust
-  and Go do, instead of opening a SQLite file named after it.
+- JS: a `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN` read as a file path that
+  cannot be opened, such as `user@host/db`, fails with SQLite's error, as
+  `FASTEN_AUDIT_DSN` does, instead of an error quoting the DSN.
+- `fasten doctor` describes `FASTEN_AUDIT_DSN` as init opens it: a path
+  such as `sub/my db=1.db` is a SQLite file, not a libpq keyword DSN.
 
 ### Fixed: fasten tui
 
 - The sys pane shows a row's `event` when the row has no `message`, as
   `fasten tail` does. Sys rows from every SDK carry `event`, so the column
   showed `—` before.
+
+### Changed: Python store DSNs (breaking for existing callers)
+
+These DSNs opened a local SQLite file before and no longer do:
+
+- `FASTEN_AUDIT_DSN` with a scheme other than `sqlite`, `postgres` or
+  `postgresql`, such as `file:f.db` or `mysql://host/app`, which wrote to a
+  file named after the URL path. It is refused, as `FASTEN_API_DSN` and
+  `FASTEN_SYSLOG_DSN` refuse it, and `fasten doctor` reports it.
+- `FASTEN_AUDIT_DSN` with `postgres` or `postgresql` in another case, such
+  as `POSTGRES://...`. It opens Postgres, as the stream DSNs do, and
+  `fasten doctor` describes it the same way.
+- libpq's keyword form, such as `host=db dbname=app` or `tenant=blue.db`, in
+  `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`. It is
+  refused, as JS, Rust and Go refuse it.
+
+A DSN's scheme is read only at its start, as JS, Go and Rust read it:
+
+- ` postgres://...` with a leading space or tab is a file path, not
+  Postgres.
+- On Python 3.10, `2026:a.db` opens that file instead of being refused.
+- A bare path keeps a `;` or a tab: `a;b.db` opens `a;b.db`, not `a`.
 
 ### Changed: JS (breaking for existing callers)
 
