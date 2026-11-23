@@ -58,11 +58,14 @@ def test_dsn_errors_name_a_scheme_only_when_the_dsn_has_one(name, monkeypatch, t
     assert list(tmp_path.iterdir()) == []
 
 
-def test_sqlite_forms_without_slashes_still_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dsn, file", [("sqlite:rel.db", "rel.db"),
+                                       ("2026:a.db", "2026:a.db"),
+                                       ("a;b.db?table=t", "a;b.db")])
+def test_sqlite_forms_without_slashes_still_open(tmp_path, monkeypatch, dsn, file):
     monkeypatch.chdir(tmp_path)
-    store = _stream_store_from_dsn("sqlite:rel.db", "syslog")
+    store = _stream_store_from_dsn(dsn, "syslog")
     assert store.count() == 0
-    assert (tmp_path / "rel.db").exists()
+    assert (tmp_path / file).exists()
 
 
 _VARS = (("FASTEN_AUDIT_DSN", "audit", "audit.db"),
@@ -144,10 +147,40 @@ def test_a_postgres_scheme_in_any_case_opens_postgres(no_dsn_env, monkeypatch, t
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
+@pytest.mark.parametrize("dsn, scheme", [
+    (" postgres://u:pw@h/db", ""),
+    ("\tpostgresql://u:pw@h/db", ""),
+    ("2026:a.db", ""),
+    ("POSTGRES://u@h/db", "postgres"),
+    ("sqlite:rel.db", "sqlite"),
+    ("db.internal:5432/app", None),
+    ("mysql://u@h/db", "mysql"),
+])
+def test_the_scheme_is_read_only_at_the_start(dsn, scheme):
+    from fasten.store.sqlite import dsn_scheme
+    assert dsn_scheme(dsn) == scheme
+
+
+@pytest.mark.parametrize("name", ["FASTEN_AUDIT_DSN", "FASTEN_API_DSN", "FASTEN_SYSLOG_DSN"])
+@pytest.mark.parametrize("dsn", ["user@host/db", " postgres://u:pw@h/db"])
+def test_a_dsn_taken_as_a_path_that_cannot_be_opened_is_not_quoted(
+        no_dsn_env, monkeypatch, tmp_path, name, dsn):
+    import traceback
+    from fasten.engine import Engine
+    monkeypatch.setenv(name, dsn)
+    with pytest.raises(Exception) as e:
+        Engine().init_config(service_id="svc", node_id="n1")
+    text = "".join(traceback.format_exception(e.type, e.value, e.tb))
+    assert dsn.strip() not in text and "pw@h" not in text and "user@host" not in text
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("form, file, table, journal", [
     ("rel.db", "cwd/rel.db", "audit_log", "wal"),
     ("{}/abs.db", "abs.db", "audit_log", "wal"),
     ("./a:b.db", "cwd/a:b.db", "audit_log", "wal"),
+    ("2026:a.db", "cwd/2026:a.db", "audit_log", "wal"),
+    ("a;b.db", "cwd/a;b.db", "audit_log", "wal"),
     ("sqlite:rel.db", "cwd/rel.db", "audit_log", "wal"),
     ("sqlite:///rel.db", "cwd/rel.db", "audit_log", "wal"),
     ("sqlite:///{}/abs.db", "abs.db", "audit_log", "wal"),

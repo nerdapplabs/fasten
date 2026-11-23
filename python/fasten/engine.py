@@ -99,6 +99,8 @@ def _pick(arg: Optional[str], env_name: str, default: str = "") -> str:
 def _check_dsn_scheme(dsn: str, kind: str, file: str) -> str:
     """The DSN's scheme (see dsn_scheme). Raises ValueError for any other
     scheme or form; the message names the scheme only when the DSN has one."""
+    from urllib.parse import urlsplit
+
     from .store.sqlite import dsn_scheme, is_keyword_dsn
 
     if is_keyword_dsn(dsn):
@@ -106,8 +108,11 @@ def _check_dsn_scheme(dsn: str, kind: str, file: str) -> str:
             f"fasten: {kind} DSN in libpq keyword form not supported. "
             f"Use postgres://user@host/db, sqlite:///./{file}, or a bare filesystem path."
         )
+    scheme = dsn_scheme(dsn)
     try:
-        scheme = dsn_scheme(dsn)
+        # urlparse, which the Postgres stores use, refuses some netlocs.
+        if scheme:
+            urlsplit(dsn)
         parsed = True
     except ValueError:
         # Raised below, outside this handler, so the parser's error, which
@@ -164,18 +169,15 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     scheme (e.g. ``postgresql+psycopg://``) raises ValueError rather than
     quietly becoming a local SQLite file.
     """
-    from urllib.parse import parse_qs, urlparse
-
     scheme = _check_dsn_scheme(dsn, "stream", "streams.db")
     if scheme in ("postgres", "postgresql"):
         from .store.stream_postgres import PostgresStreamStore
         return PostgresStreamStore.from_dsn(dsn, default_table)
     from .store.stream import StreamStore
 
-    from .store.sqlite import sqlite_dsn_path
+    from .store.sqlite import sqlite_dsn_params, sqlite_dsn_path
 
-    u = urlparse(dsn)
-    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    q = sqlite_dsn_params(dsn)
     path = sqlite_dsn_path(dsn)
     if not path:
         raise ValueError(

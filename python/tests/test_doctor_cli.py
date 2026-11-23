@@ -166,6 +166,27 @@ def test_a_libpq_keyword_dsn_with_an_at_sign_is_reported_as_init_refuses_it(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_path_with_a_space_before_a_key_is_a_sqlite_path_as_init_opens_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    (tmp_path / "sub").mkdir()
+    sqlite3.connect(tmp_path / "sub" / "my db=1.db").execute(
+        "CREATE TABLE audit_log (id TEXT)").connection.close()
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", "sub/my db=1.db")
+    out = _run(capsys)
+    assert "unrecognised DSN" not in out
+    assert out.count("sqlite sub/my db=1.db (connected") == 2
+
+
+def test_a_postgres_url_after_a_space_is_a_sqlite_path_as_init_opens_it(
+        doctor_env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", " postgres://u:pw@h/db")
+    monkeypatch.setenv("FASTEN_API_DSN", " postgres://u:pw@h/db")
+    out = _run(capsys)
+    assert out.count("sqlite (path hidden") == 4
+    assert "pw@h" not in out and "postgres://" not in out
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("dsn", [
     "admin:s3cret@db.internal:5432/app", "db.internal:5432/app", "user:pw@host/db"])
 def test_dsn_errors_name_a_scheme_only_when_the_dsn_has_one(doctor_env, monkeypatch, capsys,
