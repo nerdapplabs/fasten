@@ -445,9 +445,15 @@ class SQLiteStore:
         With ``local_node_id``, ingest stops at the first row from that node
         (see ``repo.ingest_without_local_node``).
         """
-        from .repo import (IngestResult, check_inserted, cut_at_conflict,
-                           ingest_without_local_node, skipped_unsealed, stored_conflict,
-                           verified_prefix)
+        from .repo import (
+            IngestResult,
+            check_inserted,
+            cut_at_conflict,
+            ingest_without_local_node,
+            skipped_unsealed,
+            stored_conflict,
+            verified_prefix,
+        )
 
         if local_node_id:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
@@ -518,8 +524,9 @@ class SQLiteStore:
         Lists form-"2" rows and unsealed rows (empty ``hash``): no hash covers
         their ``detail`` (spec §7.1). Skips sealed form-"1" rows: their
         ``detail`` IS hashed, so redacting one would change its hash and cascade
-        a re-seal down the rest of the chain. They are counted and logged at WARNING rather than skipped quietly — on a
-        store written before the form-"2" upgrade, silence here would let an
+        a re-seal down the rest of the chain. They are counted and logged at
+        WARNING rather than skipped quietly: on a store written before the
+        form-"2" upgrade, silence here would let an
         operator watch redaction "succeed" while the personal data it was
         supposed to destroy survives untouched.
         """

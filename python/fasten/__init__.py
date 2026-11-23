@@ -6,6 +6,7 @@ pluggable through ``AuditRepository``; HTTP/MQTT/scheduler shims and the
 """
 from __future__ import annotations
 
+from . import replication
 from .attrs import Anchor, AuditRow
 from .chain import ChainVerifyResult, seal, verify_chain
 from .codes import AuditCatalogError, Domain, Meta, RetentionClass, Severity, register, registry
@@ -38,8 +39,8 @@ from .emitter import (
     transport,
 )
 from .engine import AuditStoreError, Engine, FastenConfig
-from .query import Chips, RuleTranslator, Translator, translate as translate_query
-from . import replication
+from .query import Chips, RuleTranslator, Translator
+from .query import translate as translate_query
 from .store.repo import AuditChainError, AuditRepository, IngestResult
 
 __all__ = [

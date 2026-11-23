@@ -27,12 +27,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional
 
+from . import core_ffi as _ffi
 from .attrs import AuditRow
 from .canonical_ts import canonical_now
 from .chain import ChainVerifyResult, _canonical_json, _row_hash, seal, verify_chain
 from .codes import Severity, meta_of
 from .context import current_request_id, mint_id
-from . import core_ffi as _ffi
 from .redact import Redactor, describe_error, redacted_json
 from .transport.stdout import StdoutTransport
 
@@ -173,9 +173,8 @@ def _stream_store_from_dsn(dsn: str, default_table: str) -> Any:
     if scheme in ("postgres", "postgresql"):
         from .store.stream_postgres import PostgresStreamStore
         return PostgresStreamStore.from_dsn(dsn, default_table)
-    from .store.stream import StreamStore
-
     from .store.sqlite import sqlite_dsn_params, sqlite_dsn_path
+    from .store.stream import StreamStore
 
     q = sqlite_dsn_params(dsn)
     path = sqlite_dsn_path(dsn)
@@ -399,7 +398,8 @@ class Engine:
         svc = _pick(service_id, "FASTEN_SERVICE_ID")
         node = _pick(node_id, "FASTEN_NODE_ID")
         if not svc or not node:
-            raise RuntimeError("fasten.init_config: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required")
+            raise RuntimeError(
+                "fasten.init_config: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required")
 
         env_tid = os.environ.get("FASTEN_TENANT_ID")
         tid = tenant_id if tenant_id is not None else (env_tid or None)
@@ -453,9 +453,11 @@ class Engine:
 
         # The environment is used only when the argument is None; an empty
         # value counts as unset.
-        ret_api = retention_api if retention_api is not None else (os.environ.get("FASTEN_RETENTION_API") or None)
-        ret_sys = retention_syslog if retention_syslog is not None else (os.environ.get("FASTEN_RETENTION_SYSLOG") or None)
-        ret_pii = retention_pii if retention_pii is not None else (os.environ.get("FASTEN_RETENTION_PII") or None)
+        def _env_or(value: Optional[str], var: str) -> Optional[str]:
+            return value if value is not None else (os.environ.get(var) or None)
+        ret_api = _env_or(retention_api, "FASTEN_RETENTION_API")
+        ret_sys = _env_or(retention_syslog, "FASTEN_RETENTION_SYSLOG")
+        ret_pii = _env_or(retention_pii, "FASTEN_RETENTION_PII")
 
         # Checked against the attached stores in start(), not here.
         env_ps = os.environ.get("FASTEN_PERSIST_STREAMS")
@@ -785,13 +787,15 @@ class Engine:
                                 "reason": "no_drainer", "row_id": row.id,
                             })
                         elif d.gen != gen:
-                            pass    # init is switching stores: store it inline in the one read above
+                            # init is switching stores: store it inline in the one read above
+                            pass
                         else:
                             store = d.store
                             with d.lock:
                                 d.pending[row.id] = [row, 0]
                             try:
-                                _ffi.drainer_enqueue(d.handle, json.dumps(row.to_dict(), default=str))
+                                _ffi.drainer_enqueue(
+                                    d.handle, json.dumps(row.to_dict(), default=str))
                                 queued = True
                             except Exception as e:  # noqa: BLE001 — enqueue refused; store it inline
                                 with d.lock:
@@ -1121,7 +1125,10 @@ class Engine:
         transport.
         ``persist=False`` skips the syslog store; ``background=True`` writes
         to it from another thread."""
-        stdout, service_id = (via.stdout, via.service_id) if via else (self._stdout, self._service_id)
+        if via:
+            stdout, service_id = via.stdout, via.service_id
+        else:
+            stdout, service_id = self._stdout, self._service_id
         if stdout is None:
             return
         payload: dict[str, Any] = {
@@ -1174,7 +1181,8 @@ class Engine:
                 row_id = json.loads(row_json.decode("utf-8"))["id"]
                 entry = pending.get(row_id)
                 if entry is None:   # already settled here; nothing to store
-                    self._drainer_sys_log("error", "audit_drain_row_not_pending", {"row_id": row_id}, via=d)
+                    self._drainer_sys_log("error", "audit_drain_row_not_pending",
+                                          {"row_id": row_id}, via=d)
                     return 0
                 entry[1] += 1
                 with d.insert_lock:
@@ -1184,7 +1192,8 @@ class Engine:
                     # close() gave up on this call and reported the row lost.
                     recovered = row_id in d.reported
                 if recovered:
-                    self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": [row_id]}, via=d)
+                    self._drainer_sys_log("info", "audit_drain_recovered_at_stop",
+                                          {"row_ids": [row_id]}, via=d)
                 return 0
             except BaseException as e:  # noqa: BLE001 — a failed insert, never "stored"
                 cb_logger.error("insert_cb failed for row %s: %s", row_id,
@@ -1390,7 +1399,8 @@ class Engine:
                         d.pending.pop(row.id, None)
                     recovered.append(row.id)
             if recovered:
-                self._drainer_sys_log("info", "audit_drain_recovered_at_stop", {"row_ids": recovered}, via=d)
+                self._drainer_sys_log("info", "audit_drain_recovered_at_stop",
+                                      {"row_ids": recovered}, via=d)
         finally:
             self._report_unstored(d)
 
@@ -1446,7 +1456,8 @@ class Engine:
         waits on a store, so this is short."""
         for d in drainers:
             with d.lock:
-                d.reported_out.wait_for(lambda: d.reporting == 0,
+                # wait_for runs the lambda before this iteration ends.
+                d.reported_out.wait_for(lambda: d.reporting == 0,  # noqa: B023
                                         max(0.0, deadline - time.monotonic()))
 
     def _atexit_close(self) -> None:
@@ -1520,8 +1531,17 @@ class _Logger:
                 extra={"_fasten_internal": True},
             )
 
-    def debug(self,   event: str, **fields: Any) -> None: self._emit(logging.DEBUG,   event, **fields)
-    def info(self,    event: str, **fields: Any) -> None: self._emit(logging.INFO,     event, **fields)
-    def warn(self,    event: str, **fields: Any) -> None: self._emit(logging.WARNING,  event, **fields)
-    def warning(self, event: str, **fields: Any) -> None: self._emit(logging.WARNING,  event, **fields)
-    def error(self,   event: str, **fields: Any) -> None: self._emit(logging.ERROR,    event, **fields)
+    def debug(self, event: str, **fields: Any) -> None:
+        self._emit(logging.DEBUG, event, **fields)
+
+    def info(self, event: str, **fields: Any) -> None:
+        self._emit(logging.INFO, event, **fields)
+
+    def warn(self, event: str, **fields: Any) -> None:
+        self._emit(logging.WARNING, event, **fields)
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self._emit(logging.WARNING, event, **fields)
+
+    def error(self, event: str, **fields: Any) -> None:
+        self._emit(logging.ERROR, event, **fields)

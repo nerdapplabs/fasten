@@ -9,8 +9,10 @@ from typing import Any, Callable, Iterator, Optional
 from .attrs import AuditRow
 from .chain import verify_chain as _verify_chain
 from .context import current_request_id, mint_sentinel, with_request_id
-from .engine import AuditStoreError  # noqa: F401  re-exported
-from .engine import Engine
+from .engine import (
+    AuditStoreError,  # noqa: F401  re-exported
+    Engine,
+)
 from .redact import Redactor
 from .transport.stdout import StdoutTransport
 
