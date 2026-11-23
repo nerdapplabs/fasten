@@ -878,6 +878,30 @@
       "group": "value_shape",
       "input":    {"note": "Authorization: Basic OnRva2Vu"},
       "expected": {"note": "Authorization: Basic OnRva2Vu"}
+    },
+    {
+      "name": "value_cc_integer",
+      "group": "value_shape",
+      "input":    {"card": 4111111111111111},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_nested",
+      "group": "value_shape",
+      "input":    {"payments": [{"card": 4539578763621486, "amount": 1999}]},
+      "expected": {"payments": [{"card": "***CC***", "amount": 1999}]}
+    },
+    {
+      "name": "safe_integer_not_cc",
+      "group": "safe",
+      "input":    {"ref": 1234567890123456},
+      "expected": {"ref": 1234567890123456}
+    },
+    {
+      "name": "safe_integer_short",
+      "group": "safe",
+      "input":    {"count": 4111},
+      "expected": {"count": 4111}
     }
   ]
 }
