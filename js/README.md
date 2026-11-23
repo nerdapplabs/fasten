@@ -640,6 +640,13 @@ chain verdict (a break without the row it is on). `queue`, `transport`,
 `store.kind`, and `init`'s `service_id`, `node_id`, `tenant_id` and
 `worker_pid` are `null`.
 
+For a terminal view, the Python CLI's `fasten tail` and `fasten tui` work
+against this reader, at whatever prefix you mount it. Install the Python
+package ([python/README.md](../python/README.md#install); `fasten tui`
+needs the `tui` extra), then run
+`fasten tail --url http://host:port/api/v1/logs --token <token>`, with
+`--stream sys` or `--stream api`, `--request-id` and `--json` as needed.
+
 ## Tests
 
 ```bash
