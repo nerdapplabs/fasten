@@ -96,6 +96,19 @@ def test_tui_frame_shows_the_title_keys_and_an_error(monkeypatch):
     assert "HTTP 401 from the reader" in text
 
 
+def test_tui_sys_pane_shows_the_event_of_a_row_without_a_message(monkeypatch):
+    pytest.importorskip("rich")
+    from rich.console import Console
+
+    monkeypatch.setattr(tui, "_errors", {})
+    row = {"timestamp": "2026-11-20T10:00:00.000000Z", "level": "info",
+           "event": "signup_complete", "request_id": "req-1"}
+    view = tui._build_view("http://r/logs", "sys", None, 2.0, True, [], [row], [])
+    console = Console(width=140, height=30, record=True, color_system=None)
+    console.print(view)
+    assert "signup_complete" in console.export_text()
+
+
 @pytest.fixture
 def catalog(tmp_path, monkeypatch):
     """A catalog file, with the registry and yaml state restored after."""
