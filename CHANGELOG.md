@@ -23,6 +23,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `FASTEN_AUDIT_DSN`, `FASTEN_API_DSN` and `FASTEN_SYSLOG_DSN`, as JS, Rust
   and Go do, instead of opening a SQLite file named after it.
 
+### Fixed: fasten tui
+
+- The sys pane shows a row's `event` when the row has no `message`, as
+  `fasten tail` does. Sys rows from every SDK carry `event`, so the column
+  showed `—` before.
+
 ### Changed: JS (breaking for existing callers)
 
 - `PostgresStore.query()` and `listUnshipped()` return rows with the wire's

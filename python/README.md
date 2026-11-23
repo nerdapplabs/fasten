@@ -11,6 +11,7 @@ v1.0 GA tag.
 pip install ./python                # core
 pip install ./python[fastapi]       # + ASGI router for the /logs/* reader
 pip install ./python[postgres]      # + Postgres store
+pip install ./python[tui]           # + fasten tui, the terminal viewer
 ```
 
 Each `vX.Y.Z` [GitHub release](https://github.com/nerdapplabs/fasten/releases)
