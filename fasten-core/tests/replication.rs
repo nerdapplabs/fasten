@@ -406,6 +406,9 @@ mod postgres {
         let t = Table::new(&dsn, "repl_timeout");
         let sep = if dsn.contains('?') { '&' } else { '?' };
         let timed = format!("{dsn}{sep}application_name={}&options=-c%20statement_timeout%3D300", t.name);
+        // The table is created without the timeout: on a busy runner its DDL
+        // can take longer than 300ms, and only the insert below is under test.
+        drop(PostgresStore::connect(&dsn, &t.name).unwrap());
         let store = PostgresStore::connect(&timed, &t.name).unwrap();
         // Advisory locks are shared by the whole database, so this test locks a
         // node no other test uses: under its timeout, another test's lock on the
