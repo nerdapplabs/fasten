@@ -25,8 +25,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Python: a closed or missing stdout (a broken pipe, `pythonw`) no longer
   stops `emit()` or loses the row. The stdout line is skipped and stderr
   says so once.
-- Python: a `datetime` or other non-JSON value in a log call's details is
-  written as text. The record was dropped, or the call raised.
 - Python, Go: a SQLite insert retried after a lost commit returns the row
   that was stored. It printed a row that was never stored, so a capture of
   stdout failed to verify.
@@ -38,9 +36,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ### Fixed: Python redaction patterns
 
-- A string inside a dict with a non-string key gets the configured
-  replacement and `extra_value_redact_patterns`. It went through the default
-  redactor only, so custom patterns were skipped for it.
 - An `extra_value_redact_patterns` entry the core cannot compile raises
   `ValueError` naming it from `fasten.init()`, before the running config
   changes. Before, every detail became `{"_redact_failed": true}` with no
@@ -55,6 +50,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   app's exception or fails a request that was already served.
 - When the app raises before its response starts, the API row records
   status 500, the status the server sends, and the request id.
+
+### Changed: Python redacts every detail shape the same way
+
+- A detail dict with a key JSON cannot encode, such as a tuple, is redacted
+  with the same settings as any other detail: `extra_value_patterns`, the
+  replacement and the size cap all apply. Its keys are kept as they are.
+- A value JSON cannot encode, such as a `datetime`, is converted with `str()`
+  and then redacted. `fasten.log` calls with such a field no longer raise.
+- A value that cannot be encoded at all, such as a dict that contains itself
+  or nesting too deep to encode, is replaced by the unredactable marker. A
+  value whose `str()` raises becomes `<str failed>`; neither raises.
 
 ### Fixed: JS and Python DSN errors
 

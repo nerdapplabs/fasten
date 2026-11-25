@@ -3,8 +3,10 @@
 Values are serialised to JSON and redacted by fasten-core
 (fasten-core/src/redact.rs): values under keys matching REDACT_PATTERNS are
 replaced, then string values that look like known secrets are replaced with a
-typed token. Dicts with non-string keys cannot go through JSON, so their keys
-are matched here with the same patterns and their values handed to the core.
+typed token. Dicts with keys JSON cannot encode keep those keys: their keys are
+matched here with the same patterns and each value is handed to the core with
+the same settings. Values JSON cannot encode, such as datetime, are converted
+with str() first.
 """
 from __future__ import annotations
 
@@ -59,6 +61,32 @@ def _unredactable_marker(value: Any) -> Any:
     return marker["_summary"]
 
 
+def _safe_str(value: Any) -> str:
+    """str() for json.dumps's default: a value whose __str__ raises becomes
+    a fixed marker, so encoding never raises from it."""
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return "<str failed>"
+
+
+def _str_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {_safe_str(k): _str_keys(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_str_keys(v) for v in value]
+    return value
+
+
+def _json_for_size(value: Any) -> str:
+    """JSON text of a value json.dumps refused, for the size cap: keys and
+    values it cannot encode go through str()."""
+    try:
+        return json.dumps(value, default=_safe_str)
+    except (TypeError, ValueError):
+        return json.dumps(_str_keys(value), default=_safe_str)
+
+
 _warned_no_core = False
 
 
@@ -83,7 +111,7 @@ _STRUCTLOG_SKIP = frozenset({
     "timestamp", "level", "logger", "_record", "_from_structlog",
 })
 
-# Only used for dicts with non-string keys.
+# Only used for dicts with keys JSON cannot encode.
 # The patterns use `$` for the end of the key. In Python `$` also matches
 # before a final newline, so they are compiled with `\Z`, as the core reads
 # them.
@@ -129,18 +157,25 @@ class Redactor:
         else:
             self._key_re = _DEFAULT_KEY_RE
 
-    def _check_str_value(self, s: str) -> str:
-        """Redact one string value through the core, with this redactor's
-        replacement and value patterns."""
-        out = json.loads(self._fast_redact_json(json.dumps({"_": s})))
-        return out["_"]
+    def _redact_leaf(self, value: Any) -> Any:
+        """Redact one value through the core with this Redactor's settings.
+        It goes in a list, which has no keys, so only value shapes apply."""
+        out = json.loads(self._fast_redact_json(json.dumps([value], default=_safe_str)))
+        return out[0]
 
     def _redact_native(self, value: Any) -> Any:
-        """Redact a value that contains dicts with non-string keys. Sub-dicts
-        with only string keys and string values still go through the core."""
+        """Redact a value json.dumps cannot encode as it is: a dict with keys
+        such as tuples, or a value such as datetime. Keys are kept; every
+        part JSON can encode, with str() as the fallback, goes through the
+        core with the same settings as redact()."""
         if isinstance(value, dict):
             if all(isinstance(k, str) for k in value):
-                return json.loads(self._fast_redact_json(json.dumps(value, default=str)))
+                try:
+                    in_json = json.dumps(value, default=_safe_str)
+                except TypeError:  # a nested dict has a key JSON cannot encode
+                    pass
+                else:
+                    return json.loads(self._fast_redact_json(in_json))
             result = {}
             for k, v in value.items():
                 if isinstance(k, str) and self._key_re.search(k):
@@ -148,11 +183,9 @@ class Redactor:
                 else:
                     result[k] = self._redact_native(v)
             return result
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             return [self._redact_native(v) for v in value]
-        if isinstance(value, str):
-            return self._check_str_value(value)
-        return value
+        return self._redact_leaf(value)
 
     def _fast_redact_json(self, in_json: str) -> str:
         if self._is_default:
@@ -174,21 +207,25 @@ class Redactor:
 
         Raises OSError when libfasten_core can't be loaded.
         """
-        # json.dumps cannot handle non-string keys.
-        if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
-            return self._redact_native(value)
         try:
-            # default=str: a value JSON has no type for (a datetime, a UUID)
-            # is redacted as its text, as the stdout line writes it, rather
-            # than failing and dropping the record.
-            in_json = json.dumps(value, default=str)
+            in_json = json.dumps(value)
+            # json.dumps turns int keys into strings; keep them as they are.
+            native = isinstance(value, dict) and any(not isinstance(k, str) for k in value)
+        except RecursionError:  # nesting too deep to encode
+            return _unredactable_marker(value)
         except (TypeError, ValueError):
-            return self._redact_native(value)
+            try:
+                in_json = _json_for_size(value)
+            except (TypeError, ValueError, RecursionError):  # e.g. a circular reference
+                return _unredactable_marker(value)
+            native = True
         cap = _max_detail_bytes()
         raw_bytes = len(in_json.encode("utf-8", errors="replace"))
         if raw_bytes > cap:
             return _truncated_marker(value, raw_bytes, cap)
         try:
+            if native:
+                return self._redact_native(value)
             return json.loads(self._fast_redact_json(in_json))
         except OSError:  # libfasten_core didn't load
             raise
