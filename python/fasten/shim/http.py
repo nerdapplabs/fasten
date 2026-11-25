@@ -92,16 +92,24 @@ class APILogger:
         # Capture status + rid at response.start time. Reading current_request_id()
         # after the inner await chain returns is too late: any downstream
         # RequestIDMiddleware will have reset its contextvar token by then.
-        snapshot: dict[str, Any] = {"status": 200, "request_id": ""}
+        snapshot: dict[str, Any] = {"status": 200, "request_id": "", "started": False}
 
         async def send_wrapper(msg: dict[str, Any]) -> None:
             if msg["type"] == "http.response.start":
                 snapshot["status"] = int(msg.get("status", 200))
                 snapshot["request_id"] = current_request_id() or ""
+                snapshot["started"] = True
             await send(msg)
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # The server answers an app error raised before the response
+            # started with a 500, outside this middleware.
+            if not snapshot["started"]:
+                snapshot["status"] = 500
+                snapshot["request_id"] = current_request_id() or ""
+            raise
         finally:
             duration_ms = int((time.monotonic() - start) * 1000)
             from ..emitter import transport as _transport

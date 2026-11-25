@@ -13,6 +13,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   re-raised now.
 - A failed API log write is logged as a warning and no longer replaces the
   app's exception or fails a request that was already served.
+- When the app raises before its response starts, the API row records
+  status 500, the status the server sends, and the request id.
 
 ### Fixed: JS and Python DSN errors
 
