@@ -26,6 +26,7 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -64,6 +65,9 @@ extern "C" {
         const char* extra_keys_json,
         const char* replacement,
         const char* extra_value_patterns_json,
+        char** out_json, char** out_err);
+    int32_t fasten_redact_opts(
+        const char* in_json, const char* options_json,
         char** out_json, char** out_err);
     int32_t fasten_register_codes(
         const char* domain, const char* codes_json, char** out_err);
@@ -387,6 +391,7 @@ inline std::string mint_id_bytes(size_t bytes) {
 struct RedactConfig {
     std::vector<std::string> extra_keys;
     std::string              replacement { fasten::kRedactReplacement };
+    bool                     check_numbers = false;
 };
 
 // Minimal JSON readers for the flat objects libfasten_core returns. They
@@ -1322,7 +1327,17 @@ inline int32_t core_redact_json_(const std::string& in_json, const RedactConfig&
     char* out_json = nullptr;
     char* out_err  = nullptr;
     int32_t rc;
-    if (cfg.extra_keys.empty() &&
+    if (cfg.check_numbers) {
+        std::string opts = "{\"check_numbers\":true,\"replacement\":" + json_str(cfg.replacement)
+            + ",\"extra_keys\":[";
+        bool first = true;
+        for (const auto& k : cfg.extra_keys) {
+            if (!first) opts += ',';
+            opts += json_str(k); first = false;
+        }
+        opts += "]}";
+        rc = fasten_redact_opts(in_json.c_str(), opts.c_str(), &out_json, &out_err);
+    } else if (cfg.extra_keys.empty() &&
         (cfg.replacement.empty() || cfg.replacement == fasten::kRedactReplacement)) {
         rc = fasten_redact(in_json.c_str(), &out_json, &out_err);
     } else {
@@ -1566,6 +1581,10 @@ struct Config {
 
     std::vector<std::string> extra_redact_keys;   // added to the built-in patterns; env FASTEN_REDACT_KEYS
     std::string              redact_replacement;  // default "***"; env FASTEN_REDACT_REPLACEMENT
+    // Check numbers with no fractional part (integers and whole-number
+    // floats) against the card rule; a match becomes "***CC***". 1 on, 0 off,
+    // -1 (default) reads env FASTEN_REDACT_NUMBERS (1, true, yes or on).
+    int                      redact_numbers = -1;
 
     // "queue" (default): emit() queues the row and a background thread calls
     //   the audit sink, retrying with exponential backoff if it throws.
@@ -1612,6 +1631,16 @@ inline void init(Config cfg = {}) {
     redact_cfg.replacement = cfg.redact_replacement.empty()
         ? env_or("FASTEN_REDACT_REPLACEMENT", redact_cfg.replacement.c_str())
         : cfg.redact_replacement;
+    if (cfg.redact_numbers >= 0) {
+        redact_cfg.check_numbers = cfg.redact_numbers != 0;
+    } else {
+        std::string v = env_or("FASTEN_REDACT_NUMBERS", "");
+        const size_t a = v.find_first_not_of(" \t");
+        const size_t b = v.find_last_not_of(" \t");
+        v = a == std::string::npos ? "" : v.substr(a, b - a + 1);
+        for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        redact_cfg.check_numbers = v == "1" || v == "true" || v == "yes" || v == "on";
+    }
 
     std::string strategy = cfg.audit_store_failure_strategy;
     if (strategy.empty()) strategy = env_or("FASTEN_AUDIT_STORE_FAILURE_STRATEGY", "queue");

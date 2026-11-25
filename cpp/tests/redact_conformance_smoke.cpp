@@ -14,10 +14,12 @@
 
 namespace {
 
-std::string redact(const std::string& name, const std::string& json) {
+std::string redact(const std::string& name, const std::string& json, bool check_numbers) {
     char* out  = nullptr;
     char* err  = nullptr;
-    int32_t rc = fasten_redact(json.c_str(), &out, &err);
+    int32_t rc = check_numbers
+        ? fasten_redact_opts(json.c_str(), "{\"check_numbers\":true}", &out, &err)
+        : fasten_redact(json.c_str(), &out, &err);
     if (rc != 0) {
         std::cerr << "FAIL [" << name << "] fasten_redact error: "
                   << (err ? err : "?") << "\n";
@@ -227,13 +229,18 @@ int run_all() {
     }
     int n = 0;
     std::string name, input, expected;
-    while (next_field(spec, "name", pos, name) &&
-           next_field(spec, "input", pos, input) &&
-           next_field(spec, "expected", pos, expected)) {
+    while (next_field(spec, "name", pos, name)) {
+        // "check_numbers": true, if the case has it, sits between its name
+        // and its input.
+        const std::size_t input_at = spec.find("\"input\":", pos);
+        const std::size_t flag_at  = spec.find("\"check_numbers\": true", pos);
+        const bool check_numbers   = flag_at < input_at;
+        if (!next_field(spec, "input", pos, input) ||
+            !next_field(spec, "expected", pos, expected)) break;
         // Both sides in canonical form, so key order and escaping don't
         // matter. The expected value is not redacted: a case the core
         // starts masking by mistake fails here.
-        const std::string got  = canonical(redact(name, input));
+        const std::string got  = canonical(redact(name, input, check_numbers));
         const std::string want = canonical(expected);
         if (got != want) {
             std::cerr << "FAIL [" << name << "]\n"
