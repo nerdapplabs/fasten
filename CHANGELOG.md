@@ -6,6 +6,58 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.0] - 2026-11-23
+
+The first beta. It is a GitHub prerelease, and nothing is on PyPI, npm or
+crates.io until 1.0. The
+[release page](https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0)
+has the Python wheels, a source archive for Rust, and a prebuilt
+`libfasten_core` for Linux x86-64. Go and JS install from a clone of the
+repository.
+
+### SDKs in this release
+
+- **Python, Go, Rust and JS.** They seal audit rows into a hash chain,
+  verify a chain, publish and check checkpoints, and include the SQLite and
+  Postgres stores, replication, the HTTP reader, stored sys and api logs,
+  and stores from `FASTEN_*_DSN` variables. A chain sealed by one verifies
+  in the others.
+- The `fasten` command-line tool (`fasten tail`, `fasten tui`) is part of
+  the Python SDK and works against the HTTP reader of all four.
+- The C++ and Swift code in the repository is not part of this release.
+
+### Known issues
+
+- Replication: if retention purges every row of a node, the node's next
+  row restarts at seq 1 and a receiver that kept its history refuses it.
+  Set retention so a node that replicates never purges all of its rows.
+- Re-init: calling `init()` again on a running engine is not atomic in
+  Python, JS and Rust. A re-init that fails validation can leave part of
+  the new config in place (in Python it also stops retention purging), and
+  rows emitted while a re-init runs can go to the old store. Configure once,
+  at startup.
+- Reader: `/audit` paging with `after` can skip or repeat rows when the
+  store holds rows from several nodes. Narrow each page with `since` and
+  `until` instead.
+- Reader (Go, Rust, JS): a tenant-scoped reader returns no sys or api rows
+  the SDKs wrote, since they carry no `tenant_id`, and its audit pages can
+  come back short.
+- Python: a row with a `wire_version` other than `"1"` reads back as `"1"`
+  and fails verification. Every SDK writes `"1"` today.
+- Go: the `slog` handler ignores `WithGroup`, writes `error` values as `{}`,
+  and lets attributes named `event`, `level`, `timestamp`, `request_id` or
+  `service_id` replace the row's own fields.
+- Go: an audit table created before this release that holds several seq-0
+  rows for one node fails to open.
+- JS: in raise mode with an async store, `emit()` returns a Promise instead
+  of the row.
+- With several workers and personal-data retention on, each worker writes
+  its own `AUDIT_ROW_REDACTED` row for the same redacted row. The chain
+  still verifies (#134).
+- The Python wheels are for Linux with glibc 2.34 or later and for macOS.
+  There is no Windows wheel.
+- Some dependency versions are behind (#153).
+
 ### Fixed: JS and Python DSN errors
 
 - DSN errors name a scheme only when the DSN has one, that is when `//`
@@ -1943,4 +1995,5 @@ The API each SDK has had since before this changelog's first entry:
 - **Java**: a placeholder. The types compile; `emit` throws
   `UnsupportedOperationException`.
 
-[Unreleased]: https://github.com/nerdapplabs/fasten/commits/main
+[Unreleased]: https://github.com/nerdapplabs/fasten/compare/v1.0.0-beta.0...HEAD
+[1.0.0-beta.0]: https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0

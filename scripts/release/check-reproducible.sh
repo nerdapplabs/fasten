@@ -55,16 +55,14 @@ expect() { # expect <dir> <file>...: exactly these files, plus SHA256SUMS
     fail=1
   fi
 }
-expect "$work/out-a/main" "fasten-swift-$tag.tar.gz" "fasten-cpp-$tag.tar.gz" \
-  "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz"
+expect "$work/out-a/main" "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz"
 expect "$work/out-a/go" "fasten-go-v0.0.0-check.zip"
 
 # Wheels are copied in unchanged and listed in SHA256SUMS.
 mkdir -p "$work/wheels"
 printf 'wheel\n' > "$work/wheels/fasten_sdk-0.0.0-py3-none-any.whl"
 (cd "$work/a" && scripts/release/build-artifacts.sh "$tag" "$work/out-w" "$work/lib" "$work/wheels" >/dev/null)
-expect "$work/out-w" "fasten-swift-$tag.tar.gz" "fasten-cpp-$tag.tar.gz" \
-  "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz" \
+expect "$work/out-w" "fasten-rust-$tag.tar.gz" "fasten-core-$tag-linux-$arch.tar.gz" \
   "fasten_sdk-0.0.0-py3-none-any.whl"
 (cd "$work/out-w" && sha256sum --quiet -c SHA256SUMS) || fail=1
 cmp -s "$work/wheels/fasten_sdk-0.0.0-py3-none-any.whl" "$work/out-w/fasten_sdk-0.0.0-py3-none-any.whl" \
@@ -80,10 +78,6 @@ has() { # has <listing> <entry>...
   done
 }
 m=$work/out-a/main
-has "$(tar -tzf "$m/fasten-swift-$tag.tar.gz")" \
-  "fasten-swift-$tag/swift/Package.swift" "fasten-swift-$tag/LICENSE" "fasten-swift-$tag/NOTICE"
-has "$(tar -tzf "$m/fasten-cpp-$tag.tar.gz")" \
-  "fasten-cpp-$tag/cpp/include/fasten.hpp" "fasten-cpp-$tag/LICENSE" "fasten-cpp-$tag/NOTICE"
 has "$(tar -tzf "$m/fasten-rust-$tag.tar.gz")" \
   "fasten-rust-$tag/rust/Cargo.toml" "fasten-rust-$tag/fasten-core/Cargo.lock" \
   "fasten-rust-$tag/fasten-core/include/fasten_core.h" "fasten-rust-$tag/rust-toolchain.toml" \
@@ -98,11 +92,11 @@ has "$(python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv
   "github.com/nerdapplabs/fasten/go@v0.0.0-check/LICENSE" \
   "github.com/nerdapplabs/fasten/go@v0.0.0-check/NOTICE"
 
-# Every tracked file of each SDK is in its archive.
+# Every tracked file of the Rust SDK and fasten-core is in its archive.
 count() { git -C "$work/a" ls-files -- "$@" | wc -l; }
 entries() { tar -tzf "$1" | grep -vcE '^[^/]+/(LICENSE|NOTICE)$' || true; }
-[ "$(entries "$m/fasten-swift-$tag.tar.gz")" -eq "$(count swift)" ] || { echo "FAIL: swift file count"; fail=1; }
-[ "$(entries "$m/fasten-cpp-$tag.tar.gz")" -eq "$(count cpp/include)" ] || { echo "FAIL: cpp file count"; fail=1; }
+[ "$(entries "$m/fasten-rust-$tag.tar.gz")" -eq "$(count rust fasten-core rust-toolchain.toml)" ] \
+  || { echo "FAIL: rust file count"; fail=1; }
 
 # A tracked file that differs from HEAD stops the build, staged or not.
 dirty() { # dirty <name> <command>: build in a clone after the command
