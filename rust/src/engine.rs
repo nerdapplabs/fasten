@@ -328,6 +328,11 @@ impl Engine {
         let retention_syslog = env_or(&cfg.retention_syslog, "FASTEN_RETENTION_SYSLOG");
         let api_horizon = retention_api.as_deref().map(parse_duration).transpose()?;
         let sys_horizon = retention_syslog.as_deref().map(parse_duration).transpose()?;
+        let redact_numbers = cfg.redact_numbers.unwrap_or_else(|| {
+            std::env::var("FASTEN_REDACT_NUMBERS").is_ok_and(|v| {
+                matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            })
+        });
         let search_enabled = cfg.search_enabled
             || std::env::var("FASTEN_SEARCH_ENABLED")
                 .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
@@ -395,6 +400,7 @@ impl Engine {
         cfg_stored.retention_api = retention_api;
         cfg_stored.retention_syslog = retention_syslog;
         cfg_stored.search_enabled = search_enabled;
+        cfg_stored.redact_numbers = Some(redact_numbers);
         cfg_stored.persist_streams = persist_streams;
         cfg_stored.api_store = api_store.clone();
         cfg_stored.syslog_store = syslog_store.clone();
@@ -771,6 +777,7 @@ fn redact_map(row: serde_json::Map<String, serde_json::Value>, cfg: Option<&Conf
         &serde_json::Value::Object(row),
         cfg.and_then(|c| c.extra_redact_keys.as_deref()),
         cfg.and_then(|c| c.redact_replacement.as_deref()),
+        cfg.is_some_and(|c| c.redact_numbers == Some(true)),
     );
     match v {
         serde_json::Value::Object(m) => m,
