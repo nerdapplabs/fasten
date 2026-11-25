@@ -2,9 +2,10 @@
 
 Audit and correlation SDK for C++14 and later. v1.0.0-beta.
 
-> **Preview in this beta.** This SDK emits, redacts and stores audit rows,
-> but does not seal them into the hash chain, so its rows can't be verified
-> for tampering. The Python, Go, Rust and JS SDKs do.
+> **Not part of the 1.0.0-beta release.** The release covers Python, Go,
+> Rust and JS, and has no C++ files. This SDK emits, redacts and stores
+> audit rows, but does not seal them into the hash chain, so its rows can't
+> be verified for tampering. Build it from a clone (below).
 
 The SDK is header-only. Redaction, the code catalog and the audit queue live
 in `libfasten_core` (the Rust library in [`fasten-core/`](../fasten-core)),
@@ -21,35 +22,6 @@ libpq include path, `-I/usr/include/postgresql` on Debian) for
 `include/fasten/codes_yaml.hpp` (it loads code catalogs from YAML).
 `fasten_core.h` is not needed; `fasten.hpp` declares the functions it calls.
 
-### From a GitHub release
-
-Each `vX.Y.Z` release has two files for C++:
-
-- `fasten-cpp-vX.Y.Z.tar.gz`: the headers, under
-  `fasten-cpp-vX.Y.Z/cpp/include/`.
-- `fasten-core-vX.Y.Z-linux-x86_64.tar.gz`: `lib/libfasten_core.so`,
-  `lib/libfasten_core.a` and `include/fasten_core.h`. It needs glibc 2.34 or
-  later and OpenSSL 3 (`libssl3`) at run time.
-
-The release has a prebuilt library for Linux x86_64 only. On macOS or
-another target, build it from a clone (below). `SHA256SUMS` on the release
-lists the checksum of each file.
-
-From the directory with your `app.cpp` and the two downloaded files:
-
-```bash
-V=vX.Y.Z
-tar xzf fasten-cpp-$V.tar.gz
-tar xzf fasten-core-$V-linux-x86_64.tar.gz
-g++ -std=c++14 -O2 -I fasten-cpp-$V/cpp/include app.cpp \
-    -L fasten-core-$V-linux-x86_64/lib -lfasten_core -lsqlite3 -pthread -o app
-LD_LIBRARY_PATH=$PWD/fasten-core-$V-linux-x86_64/lib ./app
-```
-
-Drop `-lsqlite3` if you do not use `SqliteStore`. To skip
-`LD_LIBRARY_PATH`, copy `libfasten_core.so` to a directory the loader
-searches (for example `/usr/local/lib`, then run `ldconfig`).
-
 ### From a clone
 
 Building `libfasten_core` needs Rust (the version in
@@ -63,6 +35,10 @@ g++ -std=c++14 -O2 -I fasten/cpp/include app.cpp \
     -L fasten/fasten-core/target/release -lfasten_core -lsqlite3 -pthread -o app
 LD_LIBRARY_PATH=$PWD/fasten/fasten-core/target/release ./app
 ```
+
+Drop `-lsqlite3` if you do not use `SqliteStore`. To skip
+`LD_LIBRARY_PATH`, copy `libfasten_core.so` to a directory the loader
+searches (for example `/usr/local/lib`, then run `ldconfig`).
 
 On macOS the library is `libfasten_core.dylib`; use `DYLD_LIBRARY_PATH`
 instead of `LD_LIBRARY_PATH`.

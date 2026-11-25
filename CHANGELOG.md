@@ -11,36 +11,28 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 The first beta. It is a GitHub prerelease, and nothing is on PyPI, npm or
 crates.io until 1.0. The
 [release page](https://github.com/nerdapplabs/fasten/releases/tag/v1.0.0-beta.0)
-has the Python wheels, source archives for Rust, C++ and Swift, and a
-prebuilt `libfasten_core` for Linux x86-64. Go and JS install from a clone
-of the repository.
+has the Python wheels, a source archive for Rust, and a prebuilt
+`libfasten_core` for Linux x86-64. Go and JS install from a clone of the
+repository.
 
-### SDKs in this beta
+### SDKs in this release
 
-- **Python, Go, Rust and JS** are complete. They seal audit rows into a
-  hash chain, verify a chain, publish and check checkpoints, and include
-  the SQLite and Postgres stores, replication, the HTTP reader, stored sys
-  and api logs, and stores from `FASTEN_*_DSN` variables. A chain sealed by
-  one verifies in the others.
-- **C++ and Swift** are previews. They emit, redact and store rows, and
-  allocate sequence numbers, but their rows are not sealed, so they can't
-  be verified for tampering.
+- **Python, Go, Rust and JS.** They seal audit rows into a hash chain,
+  verify a chain, publish and check checkpoints, and include the SQLite and
+  Postgres stores, replication, the HTTP reader, stored sys and api logs,
+  and stores from `FASTEN_*_DSN` variables. A chain sealed by one verifies
+  in the others.
 - The `fasten` command-line tool (`fasten tail`, `fasten tui`) is part of
-  the Python SDK and works against the HTTP reader of Python, Go, Rust and
-  JS.
+  the Python SDK and works against the HTTP reader of all four.
+- The C++ and Swift code in the repository is not part of this release.
 
 ### Known issues
 
-- Rows written by the C++ and Swift SDKs are not sealed.
-- Python, Go, Rust and JS can share one audit table. Swift writes
-  timestamps in whole seconds, so its rows can't share a table with the
-  others (#227).
 - With several workers and personal-data retention on, each worker writes
   its own `AUDIT_ROW_REDACTED` row for the same redacted row. The chain
   still verifies (#134).
 - The Python wheels are for Linux with glibc 2.34 or later and for macOS.
   There is no Windows wheel.
-- The Swift tests hang on Linux arm64 (#160).
 - Some dependency versions are behind (#153).
 
 ### Fixed: JS and Python DSN errors

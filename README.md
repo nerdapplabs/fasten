@@ -43,12 +43,12 @@ How far that record is tamper-evident depends on the SDK:
 [docs/security.md](docs/security.md) has the details and what is outside
 the chain's scope.
 
-**Status: v1.0.0-beta.** Python, Go, Rust and JS are the complete SDKs;
-Python is the reference. C++ and Swift are previews: they emit, redact and
-store rows, but don't seal them. Nothing is published to PyPI, npm or
-crates.io yet. The [GitHub release](https://github.com/nerdapplabs/fasten/releases)
-has the Python wheels, source archives for Rust, C++ and Swift, and a
-prebuilt `libfasten_core` for Linux x86-64; Go and JS install from a clone.
+**Status: v1.0.0-beta.** The release covers Python, Go, Rust and JS;
+Python is the reference. The C++ and Swift code here is not part of it.
+Nothing is published to PyPI, npm or crates.io yet. The
+[GitHub release](https://github.com/nerdapplabs/fasten/releases) has the
+Python wheels, a source archive for Rust, and a prebuilt `libfasten_core`
+for Linux x86-64; Go and JS install from a clone.
 
 [Website](https://fasten.sh)
 

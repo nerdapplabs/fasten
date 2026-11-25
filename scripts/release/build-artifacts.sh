@@ -3,8 +3,8 @@
 #
 # Usage: scripts/release/build-artifacts.sh <tag> <out-dir> [core-lib-dir [wheel-dir]]
 #
-#   vX.Y.Z     Swift, C++ and Rust source archives, plus the fasten-core
-#              library when core-lib-dir holds a release build of it, plus
+#   vX.Y.Z     The Rust source archive, plus the fasten-core library when
+#              core-lib-dir holds a release build of it, plus
 #              the Python wheels in wheel-dir, copied as they are.
 #   go/vX.Y.Z  The Go module zip, laid out as the module proxy serves it.
 #
@@ -104,8 +104,6 @@ case $tag in
     pack_go "${tag#go/}"
     ;;
   *)
-    pack "fasten-swift-$tag" swift
-    pack "fasten-cpp-$tag" cpp/include
     pack "fasten-rust-$tag" rust fasten-core rust-toolchain.toml
     if [ -n "$core_lib" ]; then
       pack_core_lib "fasten-core-$tag-linux-$(uname -m)"

@@ -2,9 +2,10 @@
 
 Audit and correlation SDK for Swift apps and services. v1.0.0-beta.
 
-> **Preview in this beta.** This SDK emits, redacts and stores audit rows,
-> but does not seal them into the hash chain, so its rows can't be verified
-> for tampering. The Python, Go, Rust and JS SDKs do.
+> **Not part of the 1.0.0-beta release.** The release covers Python, Go,
+> Rust and JS, and has no Swift files. This SDK emits, redacts and stores
+> audit rows, but does not seal them into the hash chain, so its rows can't
+> be verified for tampering.
 
 The Swift SDK is pure Swift. It does not use `libfasten_core`, so there is
 no Rust build step. It writes audit rows to SQLite but does not seal them:

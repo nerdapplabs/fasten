@@ -132,7 +132,8 @@ jobs:
       id-token: write   # Codecov OIDC upload in fasten-rust.yml
     uses: ./.github/workflows/fasten-rust.yml
 
-  # The C++ and Swift sources and libfasten_core go into the release files.
+  # C++ and Swift are not in the release files; their tests still run, since
+  # they share libfasten_core and the spec vectors with the released SDKs.
   test-cpp:
     needs: tag
     if: ${{ needs.tag.outputs.kind != 'go' }}
