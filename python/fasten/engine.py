@@ -507,6 +507,13 @@ class Engine:
         # Redaction runs in libfasten_core. Without it every log line would
         # be replaced by the unredactable marker, so refuse to start.
         _ffi.get_lib()
+        # Built before anything changes: it raises on a value pattern the core
+        # cannot compile, and the running config must survive that.
+        redactor = Redactor(
+            extra_keys=cfg.extra_redact_keys,
+            replacement=cfg.redact_replacement,
+            extra_value_patterns=cfg.extra_value_redact_patterns,
+        )
 
         # Old purgers would otherwise keep running against the old store.
         self._stop_retention_threads()
@@ -558,11 +565,7 @@ class Engine:
         # No chain state lives in the engine: the store allocates seq and
         # prev_hash inside the insert transaction (spec 2.1).
 
-        self._redactor = Redactor(
-            extra_keys=cfg.extra_redact_keys,
-            replacement=cfg.redact_replacement,
-            extra_value_patterns=cfg.extra_value_redact_patterns,
-        )
+        self._redactor = redactor
         # Stamped on context-less stream rows until the first real request.
         from .context import mint_sentinel
         self._boot_request_id = mint_sentinel("boot", cfg.service_id)

@@ -107,6 +107,14 @@ class Redactor:
         self._extra_vp: list[tuple[str, str]] = [
             (pat, repl) for (_name, pat, repl) in (extra_value_patterns or [])
         ]
+        # The core compiles the patterns (Rust regex syntax, not Python's), so
+        # it checks them here. Otherwise a bad one surfaces in redact(), whose
+        # catch-all turns every detail into the unredactable marker unnoticed.
+        if self._extra_vp:
+            try:
+                core_ffi.redact_json_full("{}", extra_value_patterns=self._extra_vp)
+            except RuntimeError as e:
+                raise ValueError(f"fasten: extra_value_redact_patterns: {e}") from None
         # Use the simple fasten_redact path when no customisation is needed.
         self._is_default = (
             not self._extra_keys
@@ -122,8 +130,9 @@ class Redactor:
             self._key_re = _DEFAULT_KEY_RE
 
     def _check_str_value(self, s: str) -> str:
-        """Redact one string value through the core."""
-        out = json.loads(core_ffi.redact_json(json.dumps({"_": s})))
+        """Redact one string value through the core, with this redactor's
+        replacement and value patterns."""
+        out = json.loads(self._fast_redact_json(json.dumps({"_": s})))
         return out["_"]
 
     def _redact_native(self, value: Any) -> Any:

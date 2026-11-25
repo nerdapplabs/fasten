@@ -332,3 +332,35 @@ def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys
     assert "hunter2" not in captured.out
     assert "_redact_failed" in captured.out
     assert captured.err.count("libfasten_core not found") == 1
+
+
+def test_bad_value_pattern_is_refused_when_configured():
+    """A pattern the core cannot compile is refused where it is configured,
+    naming it, instead of turning every detail into the unredactable marker."""
+    with pytest.raises(ValueError, match=r"extra_value_redact_patterns: .*\(\["):
+        Redactor(extra_value_patterns=[("ok", r"OK_\d+", "X"), ("bad", "([", "Y")])
+
+
+def test_custom_value_patterns_apply_under_non_string_keys():
+    """A dict with a non-string key is redacted value by value; those values
+    get the configured patterns too, not only the defaults."""
+    r = Redactor(extra_value_patterns=[("my", r"MY_SECRET_\w+", "***MY***")])
+    out = r.redact({1: "MY_SECRET_abc", "note": "MY_SECRET_def"})
+    assert out == {1: "***MY***", "note": "***MY***"}
+
+
+def test_rejected_reinit_keeps_the_running_config():
+    """A bad pattern on re-init raises before anything changes, so the
+    engine keeps the redactor it had."""
+    from fasten.engine import Engine
+    e = Engine()
+    e.init(service_id="svc", node_id="n1", extra_redact_keys=["field_x"])
+    try:
+        before = e._redactor
+        with pytest.raises(ValueError):
+            e.init(service_id="svc", node_id="n1",
+                   extra_value_redact_patterns=[("bad", "([", "Y")])
+        assert e._redactor is before
+        assert before.redact({"field_x": "v"}) == {"field_x": "***"}
+    finally:
+        e.close()
