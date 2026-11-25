@@ -58,9 +58,27 @@ def test_custom_replacement():
 
 
 def test_number_card_keeps_card_token_with_custom_replacement():
-    r2 = Redactor(replacement="[gone]")
+    r2 = Redactor(replacement="[gone]", check_numbers=True)
     out = r2.redact({"card": 4111111111111111, "token": "x", "n": 42, "f": 4111111111111111.0})
     assert out == {"card": "***CC***", "token": "[gone]", "n": 42, "f": "***CC***"}
+
+
+def test_numbers_kept_without_check_numbers():
+    value = {"card": 4111111111111111, "f": 4111111111111111.0}
+    assert Redactor().redact(value) == value
+    assert Redactor(replacement="[gone]").redact(value) == value
+    assert Redactor(check_numbers=True).with_extra_keys(["x"]).redact(value) == {
+        "card": "***CC***", "f": "***CC***",
+    }
+
+
+def test_redact_numbers_env_and_argument(monkeypatch):
+    from fasten.engine import Engine
+    e = Engine()
+    assert e.init_config(service_id="s", node_id="n").redact_numbers is False
+    monkeypatch.setenv("FASTEN_REDACT_NUMBERS", "true")
+    assert e.init_config(service_id="s", node_id="n").redact_numbers is True
+    assert e.init_config(service_id="s", node_id="n", redact_numbers=False).redact_numbers is False
 
 
 def test_apikey_no_separator(r):
