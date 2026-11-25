@@ -441,3 +441,19 @@ def test_very_deep_nesting_becomes_the_unredactable_marker(r):
         cur["a"] = {}
         cur = cur["a"]
     assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_redaction_failure_is_logged_once_per_error_type(caplog):
+    """A failure inside redaction blanks the detail; the first of each error
+    type is logged so a bug there is seen. The value is not in the log."""
+    r = Redactor(replacement="<x>")
+
+    def broken(_s):
+        raise KeyError("hunter2")
+    r._fast_redact_json = broken
+    assert r.redact({"note": "a"})["_redact_failed"] is True
+    assert r.redact({"note": "b"})["_redact_failed"] is True
+    logged = [rec.getMessage() for rec in caplog.records if rec.name == "fasten"]
+    assert len(logged) == 1
+    assert logged[0].startswith("redaction failed (KeyError)")
+    assert "hunter2" not in logged[0]

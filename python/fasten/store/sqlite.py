@@ -369,8 +369,8 @@ class SQLiteStore:
                         f"SELECT * FROM {self._table} WHERE id = ?", (row.id,))
                     stored = cur.fetchone()
                     if stored is None:
-                        # Ignored for another constraint, such as a taken
-                        # (node, seq): nothing with this id was written.
+                        # Ignored for another reason, such as a trigger or a
+                        # NOT NULL column: nothing with this id was written.
                         raise sqlite3.IntegrityError(
                             f"fasten: insert of {row.id} was ignored and no row "
                             "with that id is stored")

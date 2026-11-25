@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -55,6 +56,10 @@ func (s *SQLiteStore) Degraded() bool { return s.writeFailures.Load() > 0 }
 // through. Multi-tenant adopters who derive a suffix from a JWT claim
 // or env var without their own validation are the realistic blast radius.
 var validIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// errInsertIgnored: the store dropped the row without an error and holds no
+// row with its id. The store refused it, so the drainer does not retry it.
+var errInsertIgnored = errors.New("insert was ignored and no row with that id is stored")
 
 // auditCols is the column order for every SELECT and INSERT, so scanRows
 // doesn't depend on the table's physical column order.
@@ -348,6 +353,11 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 			"SELECT monotonic_seq, prev_hash, hash, canonical_form_id, detail_salt, detail_commitment FROM "+
 				s.table+" WHERE id = ?", row.ID).Scan(&sealed.MonotonicSeq, &sealed.PrevHash, &sealed.Hash,
 			&sealed.CanonicalFormID, &sealed.DetailSalt, &sealed.DetailCommitment); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Ignored for another constraint, such as a taken (node, seq):
+				// nothing with this id was written.
+				return Row{}, fmt.Errorf("fasten: insert of %s: %w", row.ID, errInsertIgnored)
+			}
 			return Row{}, fmt.Errorf("fasten: reading back the ignored insert of %s: %w", row.ID, err)
 		}
 	}

@@ -23,9 +23,10 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 ### Fixed: rows lost, hung or changed after emit
 
 - Python: a closed or missing stdout (a broken pipe, `pythonw`) no longer
-  stops `emit()` or loses the row. Each lost audit line is logged as an
-  error on the `fasten` logger with its row id; for log and API lines,
-  stderr says so once.
+  stops `emit()` or loses the row. Lost audit lines are logged as an error
+  on the `fasten` logger at most once a minute, naming a row and counting
+  the lines lost since the last report; for log and API lines, stderr says
+  so once.
 - Python, Go: a SQLite insert retried after a lost commit returns the row
   that was stored. It printed a row that was never stored, so a capture of
   stdout failed to verify.
@@ -41,6 +42,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `ValueError` naming it from `fasten.init()`, before the running config
   changes. Before, every detail became `{"_redact_failed": true}` with no
   warning.
+- A detail that fails redaction for any other reason is still replaced by the
+  unredactable marker, and the first failure of each kind is now logged as
+  an error on the `fasten` logger, without the value.
 
 ### Fixed: Python `APILogger` keeps the app's exception
 

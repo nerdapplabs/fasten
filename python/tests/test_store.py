@@ -170,10 +170,10 @@ def test_allocate_ignored_insert_with_no_stored_row_raises(tmp_path):
     import sqlite3
     path = str(tmp_path / "a.db")
     s = SQLiteStore(path)
-    s.query(limit=1)    # the table exists before the trigger goes on it
     with sqlite3.connect(path) as c:
         c.execute("CREATE TRIGGER drop_all BEFORE INSERT ON audit_log "
                   "BEGIN SELECT RAISE(IGNORE); END")
     row = make_row(monotonic_seq=0)
     with pytest.raises(sqlite3.IntegrityError, match=row.id):
         s.allocate_and_insert_originated(row)
+    assert s.query(limit=10) == []

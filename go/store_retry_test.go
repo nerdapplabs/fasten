@@ -65,7 +65,13 @@ func TestAllocateIgnoredInsertWithNoStoredRowFails(t *testing.T) {
 	r.MonotonicSeq, r.PrevHash, r.Hash, r.CanonicalFormID = 0, "", "", ""
 	r.DetailSalt, r.DetailCommitment = "", ""
 	_, err = store.AllocateAndInsertOriginated(context.Background(), r)
-	if !errors.Is(err, sql.ErrNoRows) || !strings.Contains(err.Error(), r.ID) {
-		t.Fatalf("got %v, want an error naming %s that wraps sql.ErrNoRows", err, r.ID)
+	if !errors.Is(err, errInsertIgnored) || !strings.Contains(err.Error(), r.ID) {
+		t.Fatalf("got %v, want an ignored-insert error naming %s", err, r.ID)
+	}
+	if !rejectsRow(err) {
+		t.Fatalf("the drainer would retry a row the store refused: %v", err)
+	}
+	if n, err := store.Count(context.Background()); err != nil || n != 0 {
+		t.Fatalf("stored %d rows (err %v), want 0", n, err)
 	}
 }

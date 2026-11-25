@@ -275,8 +275,9 @@ sealed line written once the store has sealed the row (spec §8). JS and
 Rust emit this event. JS adds `error_code` (the Node error code, or null),
 and logs a failed api line with `request_id` and `shape: "api"` in place of
 `row_id` and `sealed`, and an `error` event on stdout with no row fields.
-Rust adds `service_id`. Python logs a failed sealed line to its own logger
-instead, and Go does not report a failed stdout write.
+Rust adds `service_id`. Python logs a failed unsealed or sealed line to its own
+logger instead, at most once a minute, naming a row and counting the lines
+lost since the last report, and Go does not report a failed stdout write.
 
 ---
 

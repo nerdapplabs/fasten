@@ -8,8 +8,10 @@ from fasten.codes import register, Meta, Severity, RetentionClass
 def fresh_state(monkeypatch):
     """Reset the default Engine to pre-init state before and after each test."""
     from fasten.emitter import _default
+    from fasten import redact
     from fasten.transport import stdout
     monkeypatch.setattr(stdout, "_warned_stdout", False)
+    monkeypatch.setattr(redact, "_noted_redact_failures", set())
     _default.reset_for_tests()
     yield
     _default.reset_for_tests()

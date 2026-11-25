@@ -292,6 +292,8 @@ class _QueueDrainer:
 # as fasten-core's sqlstate_rejects_row.
 _REJECTING_SQLSTATE_CLASSES = ("22", "23", "54")
 
+_LOST_LINE_REPORT_INTERVAL_S = 60.0
+
 
 def _rejects_row(exc: BaseException) -> bool:
     """The store refused the row itself, so retrying cannot help. sqlite3 and
@@ -340,6 +342,9 @@ class Engine:
         self._failure_strategy: str = "queue"
         self._search_enabled: bool = False
         self._stdlib_logger = logging.getLogger("fasten")
+        self._lost_line_lock = threading.Lock()
+        self._lost_lines_unreported = 0
+        self._lost_line_reported_at: Optional[float] = None
 
         self._unchained_store_logged: bool = False
         self._audit_chain_unavailable: bool = False
@@ -401,8 +406,8 @@ class Engine:
             raise RuntimeError(
                 "fasten.init_config: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required")
 
-        # Checked before a DSN store opens a connection, which nothing would
-        # close if the pattern were refused later in start().
+        # Checked before a DSN store opens a connection, so a bad pattern
+        # does not leave one open when start() refuses it.
         if extra_value_redact_patterns:
             Redactor(extra_value_patterns=extra_value_redact_patterns)
 
@@ -776,8 +781,7 @@ class Engine:
             try:
                 self._stdout.write_audit(row.to_dict())
             except Exception as e:  # noqa: BLE001  a lost line must not stop the row being stored (spec 4)
-                logging.getLogger("fasten").error("unsealed stdout line failed for %s: %s",
-                                                  row.id, describe_error(e, self._redactor))
+                self._note_lost_stdout_line("unsealed", row.id, e)
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":
@@ -986,6 +990,8 @@ class Engine:
         self._stdout        = None
         self._redactor      = Redactor()
         self._failure_strategy = "queue"
+        self._lost_lines_unreported = 0
+        self._lost_line_reported_at = None
         self._search_enabled = False
         self._last_init_at  = None
 
@@ -1100,9 +1106,24 @@ class Engine:
             try:
                 stdout.write_audit(sealed.to_dict())
             except Exception as e:  # noqa: BLE001 — the row is stored; don't report it as failed
-                logging.getLogger("fasten").error("sealed stdout line failed for %s: %s",
-                                                  sealed.id, describe_error(e, self._redactor))
+                self._note_lost_stdout_line("sealed", sealed.id, e)
         return sealed
+
+    def _note_lost_stdout_line(self, which: str, row_id: str, exc: BaseException) -> None:
+        """Log a lost audit stdout line at most once per interval: with stdout
+        gone every emit loses two lines, and one error each would bury the
+        log. Each report names a row and counts the lines lost since the last."""
+        now = time.monotonic()
+        with self._lost_line_lock:
+            last = self._lost_line_reported_at
+            if last is not None and now - last < _LOST_LINE_REPORT_INTERVAL_S:
+                self._lost_lines_unreported += 1
+                return
+            skipped, self._lost_lines_unreported = self._lost_lines_unreported, 0
+            self._lost_line_reported_at = now
+        more = f" ({skipped} more audit lines lost since the last report)" if skipped else ""
+        logging.getLogger("fasten").error("%s stdout line failed for %s%s: %s", which, row_id, more,
+                                          describe_error(exc, self._redactor))
 
     def _mark_write_lost(self, store: Any, gen: int) -> None:
         """A row didn't reach ``store``, of store generation ``gen``: durable
