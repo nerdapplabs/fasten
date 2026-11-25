@@ -422,6 +422,37 @@ FastenErrorCode fasten_redact_full(
     char**      out_err
 );
 
+/**
+ * Redact a JSON value with options given as one JSON object. Every field is
+ * optional, and the defaults are those of fasten_redact():
+ *
+ *   {
+ *     "extra_keys":           ["my_field"],
+ *     "replacement":          "[gone]",
+ *     "extra_value_patterns": [{"pattern":"<regex>","replacement":"***X***"}],
+ *     "check_numbers":        true
+ *   }
+ *
+ * check_numbers (default false) checks numbers with no fractional part
+ * (integers and whole-number floats) against the card rule: one whose
+ * integer digits match becomes the string "***CC***". An unknown field is
+ * an error.
+ *
+ * @param in_json      NUL-terminated UTF-8 JSON.
+ * @param options_json Optional: the options object. NULL = defaults.
+ * @param out_json     On success: heap-allocated redacted JSON.
+ *                     Free with fasten_store_free_str(). May be NULL.
+ * @param out_err      Set on error; may be NULL.
+ *
+ * @return FASTEN_OK on success, error code otherwise (out_err set).
+ */
+FastenErrorCode fasten_redact_opts(
+    const char* in_json,
+    const char* options_json,
+    char**      out_json,
+    char**      out_err
+);
+
 /* Code catalog */
 
 /**
@@ -530,6 +561,21 @@ int32_t fasten_redact_full_buf(
     const char* extra_keys_json,
     const char* replacement,
     const char* extra_value_patterns_json,
+    uint8_t*    out_buf,
+    uint32_t    buf_len,
+    uint8_t*    out_err_buf,
+    uint32_t    err_buf_len
+);
+
+/**
+ * Buffer-based variant of fasten_redact_opts.
+ *
+ * @return Bytes written (exclusive of NUL) on success.
+ *         -(FastenErrorCode) on error.
+ */
+int32_t fasten_redact_opts_buf(
+    const char* in_json,
+    const char* options_json,
     uint8_t*    out_buf,
     uint32_t    buf_len,
     uint8_t*    out_err_buf,

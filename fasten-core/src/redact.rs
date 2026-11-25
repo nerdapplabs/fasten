@@ -1,8 +1,8 @@
 //! Key-pattern and value-shape redaction (see spec/redact-conformance):
 //!   1. Object keys matching `REDACT_PATTERNS` get the replacement token.
 //!   2. String values matching a known secret shape get a typed token.
-//!   3. Numbers with no fractional part whose digits form a card number
-//!      get `***CC***`.
+//!   3. With `check_numbers` on (off by default), numbers with no
+//!      fractional part whose digits form a card number get `***CC***`.
 //!
 //! `REDACTOR` is the default instance used by the C ABI. `Redactor::new`
 //! builds one with extra keys, a custom replacement and extra value patterns.
@@ -278,6 +278,8 @@ pub struct Redactor {
     replacement: String,
     /// Custom value patterns appended after the built-in defaults.
     custom_vp:   Vec<(Regex, String)>,
+    /// Whether numbers are checked against the card rule.
+    check_numbers: bool,
 }
 
 impl Default for Redactor {
@@ -286,6 +288,7 @@ impl Default for Redactor {
             key_re:      build_key_re(&[]),
             replacement: DEFAULT_REPLACEMENT.to_owned(),
             custom_vp:   vec![],
+            check_numbers: false,
         }
     }
 }
@@ -318,7 +321,16 @@ impl Redactor {
                 replacement.to_owned()
             },
             custom_vp,
+            check_numbers: false,
         }
+    }
+
+    /// Checks numbers with no fractional part (integers and whole-number
+    /// floats) against the card rule when `on`. Off by default.
+    #[must_use]
+    pub fn with_check_numbers(mut self, on: bool) -> Self {
+        self.check_numbers = on;
+        self
     }
 
     fn check_value(&self, s: &str) -> Option<String> {
@@ -361,8 +373,10 @@ impl Redactor {
             Value::String(s) => self
                 .check_value(s)
                 .map_or_else(|| value.clone(), Value::String),
-            // Only the card rule applies to numbers.
-            Value::Number(n) if whole_number_digits(n).is_some_and(|d| has_card(&d)) => {
+            // Only the card rule applies to numbers, and only when enabled.
+            Value::Number(n)
+                if self.check_numbers && whole_number_digits(n).is_some_and(|d| has_card(&d)) =>
+            {
                 Value::String("***CC***".to_owned())
             }
             _ => value.clone(),
@@ -387,9 +401,19 @@ mod tests {
         Redactor::default()
     }
 
+    fn rn() -> Redactor {
+        Redactor::default().with_check_numbers(true)
+    }
+
+    #[test]
+    fn numbers_kept_by_default() {
+        let input = json!({"card": 4_111_111_111_111_111_u64, "f": 4_111_111_111_111_111.0, "n": 42});
+        assert_eq!(r().redact_value(&input), input);
+    }
+
     #[test]
     fn integer_card_redacted() {
-        let out = r().redact_value(&json!({
+        let out = rn().redact_value(&json!({
             "card": 4_111_111_111_111_111_u64,
             "neg": -4_111_111_111_111_111_i64,
             "long": 9_704_000_000_000_000_008_u64,
@@ -412,21 +436,21 @@ mod tests {
             "flag": true,
             "none": null,
         });
-        assert_eq!(r().redact_value(&input), input);
+        assert_eq!(rn().redact_value(&input), input);
     }
 
     #[test]
     fn whole_float_card_redacted() {
-        let out = r()
-            .redact_json(r#"{"f":4111111111111111.0,"e":4.111111111111111e15,"n":-4111111111111111.0}"#)
+        let out = rn()
+            .redact_json(r#"{"f":4111111111111111.0,"e":4.111111111111111e15,"n":-4111111111111111.0,"m":-9.704000000000016e18}"#)
             .unwrap();
         let out: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(out, json!({"f": "***CC***", "e": "***CC***", "n": "***CC***"}));
+        assert_eq!(out, json!({"f": "***CC***", "e": "***CC***", "n": "***CC***", "m": "***CC***"}));
     }
 
     #[test]
     fn number_card_uses_card_token_with_custom_replacement() {
-        let rd = Redactor::new(&[], "[gone]", &[(r"^\d+$", "***NUM***")]);
+        let rd = Redactor::new(&[], "[gone]", &[(r"^\d+$", "***NUM***")]).with_check_numbers(true);
         let out = rd.redact_value(&json!({"card": 4_111_111_111_111_111_u64, "token": "x", "n": 7}));
         assert_eq!(out, json!({"card": "***CC***", "token": "[gone]", "n": 7}));
     }
