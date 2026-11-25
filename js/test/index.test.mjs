@@ -11,6 +11,7 @@ import * as auditQueue from '../src/audit_queue.js';
 // Outer redaction settings would change what these tests expect.
 delete process.env.FASTEN_REDACT_KEYS;
 delete process.env.FASTEN_REDACT_REPLACEMENT;
+delete process.env.FASTEN_REDACT_NUMBERS;
 
 // Shared test codes
 
@@ -440,6 +441,23 @@ describe('redact customization', () => {
             assert.equal(row.detail.ok, 'v');
         } finally {
             delete process.env.FASTEN_REDACT_REPLACEMENT;
+        }
+    });
+
+    test('redactNumbers option and FASTEN_REDACT_NUMBERS env', () => {
+        const card = () => emit({ code: 'USER_CREATED', target: 'u-1', detail: { card: 4111111111111111 } }).detail.card;
+        initTestSDK();
+        assert.equal(card(), 4111111111111111);
+        initTestSDK({ redactNumbers: true });
+        assert.equal(card(), '***CC***');
+        process.env.FASTEN_REDACT_NUMBERS = '1';
+        try {
+            initTestSDK();
+            assert.equal(card(), '***CC***');
+            initTestSDK({ redactNumbers: false });
+            assert.equal(card(), 4111111111111111);
+        } finally {
+            delete process.env.FASTEN_REDACT_NUMBERS;
         }
     });
 

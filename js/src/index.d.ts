@@ -136,6 +136,12 @@ export interface InitOptions {
 	extraRedactKeys?: string[];
 	/** Replaces redacted values. Also read from FASTEN_REDACT_REPLACEMENT. */
 	redactReplacement?: string | null;
+	/**
+	 * Checks numbers with no fractional part (integers and whole-number
+	 * floats) against the card rule: a match becomes "***CC***". When unset,
+	 * read from FASTEN_REDACT_NUMBERS (1, true, yes or on). Off by default.
+	 */
+	redactNumbers?: boolean;
 	auditStoreFailureStrategy?: "queue" | "raise";
 	queueCapacity?: number;
 	queueRetryInitialMs?: number;

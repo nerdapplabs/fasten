@@ -19,7 +19,7 @@ const numbersAsText = (_k, v, ctx) => (typeof v === 'number' ? { number: ctx.sou
 describe('redact conformance', () => {
     for (const c of cases) {
         test(c.name, () => {
-            const out = coreRedact(JSON.stringify(c.input));
+            const out = coreRedactFull(JSON.stringify(c.input), null, null, c.check_numbers === true);
             const got = JSON.parse(out, numbersAsText);
             const want = JSON.parse(JSON.stringify(c.expected), numbersAsText);
             assert.deepStrictEqual(got, want,
@@ -49,24 +49,31 @@ describe('redact conformance', () => {
         assert.equal(Object.getPrototypeOf(JSON.parse(coreRedact('{"a":1}'))), Object.prototype);
     });
 
-    test('numbers with no fractional part follow the card rule', () => {
+    test('with checkNumbers, numbers with no fractional part follow the card rule', () => {
+        const on = (json) => coreRedactFull(json, null, null, true);
         assert.equal(
-            coreRedact('{"a":9704000000000000008,"b":-4111111111111111,"c":18446744073709551615}'),
+            on('{"a":9704000000000000008,"b":-4111111111111111,"c":18446744073709551615}'),
             '{"a":"***CC***","b":"***CC***","c":18446744073709551615}',
         );
         assert.equal(
-            coreRedact('{"f":4111111111111111.0,"e":4.111111111111111e15,"n":42,"t":true,"z":null}'),
+            on('{"f":4111111111111111.0,"e":4.111111111111111e15,"n":42,"t":true,"z":null}'),
             '{"f":"***CC***","e":"***CC***","n":42,"t":true,"z":null}',
         );
         assert.equal(
-            coreRedact('{"x":4111111111111111.5,"l":1234567890123456}'),
-            '{"x":4111111111111111.5,"l":1234567890123456}',
+            on('{"x":4111111111111111.5,"l":1234567890123456,"m":-9.704000000000016e18}'),
+            '{"x":4111111111111111.5,"l":1234567890123456,"m":"***CC***"}',
         );
+    });
+
+    test('numbers are kept with checkNumbers off', () => {
+        const input = '{"card":4111111111111111,"f":4111111111111111.5,"big":9704000000000000008}';
+        assert.equal(coreRedact(input), input);
+        assert.equal(coreRedactFull(input, null, '[gone]'), input);
     });
 
     test('a number card keeps the card token with a custom replacement', () => {
         assert.equal(
-            coreRedactFull('{"card":4111111111111111,"token":"x"}', null, '[gone]'),
+            coreRedactFull('{"card":4111111111111111,"token":"x"}', null, '[gone]', true),
             '{"card":"***CC***","token":"[gone]"}',
         );
     });

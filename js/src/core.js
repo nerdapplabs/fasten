@@ -262,10 +262,11 @@ function _wholeNumberDigits(v, src) {
 		: null;
 }
 
-// JSON.parse reviver for redaction: a number with no fractional part whose
-// digits form a card number becomes "***CC***", as the string card rule
-// does. An integer a number cannot hold exactly keeps its digits.
-function _redactReviver(key, value, context) {
+// JSON.parse reviver for redaction with checkNumbers on: a number with no
+// fractional part whose digits form a card number becomes "***CC***", as
+// the string card rule does. An integer a number cannot hold exactly keeps
+// its digits.
+function _numberCardReviver(key, value, context) {
 	const v = bigintReviver(key, value, context);
 	if (typeof v !== "number" && typeof v !== "bigint") return v;
 	const digits = _wholeNumberDigits(v, context?.source);
@@ -304,11 +305,10 @@ function _redactObj(val, patterns, replacement) {
 /**
  * Redact a JSON string using the default key-pattern list.
  * Returns a JSON string with matching key values replaced by "***". An
- * integer a number cannot hold exactly keeps its digits; a number with no
- * fractional part that is a card number is replaced by "***CC***".
+ * integer a number cannot hold exactly keeps its digits.
  */
 export function coreRedact(inJson) {
-	const obj = JSON.parse(inJson, _redactReviver);
+	const obj = JSON.parse(inJson, bigintReviver);
 	return JSON.stringify(
 		_redactObj(obj, _DEFAULT_PATTERNS, REDACT_REPLACEMENT),
 		bigintReplacer,
@@ -323,14 +323,24 @@ function _escapeRe(s) {
  * Redact with optional extra key patterns and a custom replacement string.
  * extraKeysJson: JSON array of plain strings, matched literally (e.g. '["my_secret","ssn"]')
  * replacement:   string to substitute (null means "***")
+ * checkNumbers:  when true, a number with no fractional part whose digits
+ *                form a card number becomes "***CC***" (off by default)
  */
-export function coreRedactFull(inJson, extraKeysJson, replacement) {
+export function coreRedactFull(
+	inJson,
+	extraKeysJson,
+	replacement,
+	checkNumbers = false,
+) {
 	const rep = replacement ?? REDACT_REPLACEMENT;
 	const extra = extraKeysJson
 		? JSON.parse(extraKeysJson).map((k) => new RegExp(_escapeRe(k), "i"))
 		: [];
 	const patterns = [..._DEFAULT_PATTERNS, ...extra];
-	const obj = JSON.parse(inJson, _redactReviver);
+	const obj = JSON.parse(
+		inJson,
+		checkNumbers ? _numberCardReviver : bigintReviver,
+	);
 	return JSON.stringify(_redactObj(obj, patterns, rep), bigintReplacer);
 }
 

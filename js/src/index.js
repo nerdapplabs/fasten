@@ -380,6 +380,7 @@ const _EMPTY_CONFIG = Object.freeze({
 	searchEnabled: false,
 	extraRedactKeys: [],
 	redactReplacement: null,
+	redactNumbers: false,
 	failureStrategy: "queue",
 });
 
@@ -542,6 +543,9 @@ export class Engine {
 			streamRetention.push({ name, store: s, ms });
 		}
 		const envSearch = (process.env.FASTEN_SEARCH_ENABLED ?? "").toLowerCase();
+		const envNumbers = (process.env.FASTEN_REDACT_NUMBERS ?? "")
+			.trim()
+			.toLowerCase();
 
 		const prevStore = this.#config.auditStore;
 		this.#config = {
@@ -557,6 +561,9 @@ export class Engine {
 			extraRedactKeys: extraKeys ?? [],
 			redactReplacement:
 				opts.redactReplacement ?? process.env.FASTEN_REDACT_REPLACEMENT ?? null,
+			// Numbers with no fractional part get the card rule; off by default.
+			redactNumbers:
+				opts.redactNumbers ?? ["1", "true", "yes", "on"].includes(envNumbers),
 			failureStrategy: strategy,
 		};
 		// A gap in the previous store's history says nothing about another.
@@ -1207,7 +1214,11 @@ export class Engine {
 	// Redacted copy of obj. A value over FASTEN_MAX_DETAIL_BYTES (default
 	// 64 KiB) is replaced by a truncation marker, as in Python and Go.
 	_redact(obj) {
-		const { extraRedactKeys: extra, redactReplacement: repl } = this.#config;
+		const {
+			extraRedactKeys: extra,
+			redactReplacement: repl,
+			redactNumbers: numbers,
+		} = this.#config;
 		const json = JSON.stringify(obj, bigintReplacer);
 		const cap = _maxDetailBytes();
 		const size = Buffer.byteLength(json, "utf8");
@@ -1220,8 +1231,8 @@ export class Engine {
 			};
 		}
 		return JSON.parse(
-			extra.length || repl
-				? coreRedactFull(json, JSON.stringify(extra), repl)
+			extra.length || repl || numbers
+				? coreRedactFull(json, JSON.stringify(extra), repl, numbers)
 				: coreRedact(json),
 			bigintReviver,
 		);
