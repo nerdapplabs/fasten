@@ -56,10 +56,13 @@ func (e *Engine) redact(d map[string]any, exactNumbers bool) map[string]any {
 	e.redactMu.RLock()
 	extra := e.redactExtraKeysJSON
 	repl := e.redactReplacement
+	numbers := e.redactNumbers
 	e.redactMu.RUnlock()
 
 	var out string
-	if extra != "" || repl != "" {
+	if numbers {
+		out, err = coreRedactJSONOpts(string(b), extra, repl)
+	} else if extra != "" || repl != "" {
 		out, err = coreRedactJSONFull(string(b), extra, repl)
 	} else {
 		out, err = coreRedactJSON(string(b))

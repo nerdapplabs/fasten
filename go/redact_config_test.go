@@ -107,8 +107,9 @@ func TestRedactReplacementNotUTF8(t *testing.T) {
 func TestRedactNumberCardWithCustomReplacement(t *testing.T) {
 	registerTestCodes(t)
 
+	on := true
 	e := &Engine{}
-	if err := e.Init(Config{ServiceID: "svc", NodeID: "n", RedactReplacement: "[gone]"}); err != nil {
+	if err := e.Init(Config{ServiceID: "svc", NodeID: "n", RedactReplacement: "[gone]", RedactNumbers: &on}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.ResetForTests() })
@@ -116,5 +117,36 @@ func TestRedactNumberCardWithCustomReplacement(t *testing.T) {
 	got := e.redactDetail(map[string]any{"card": 4111111111111111, "token": "x"})
 	if got["card"] != "***CC***" || got["token"] != "[gone]" {
 		t.Fatalf("want card ***CC*** and token [gone]; got %v", got)
+	}
+}
+
+// FASTEN_REDACT_NUMBERS turns the number check on; Config.RedactNumbers wins.
+func TestRedactNumbersEnv(t *testing.T) {
+	registerTestCodes(t)
+	detail := map[string]any{"card": 4111111111111111}
+
+	e := &Engine{}
+	t.Cleanup(func() { e.ResetForTests() })
+	if err := e.Init(Config{ServiceID: "svc", NodeID: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.redactDetail(detail); got["card"] != float64(4111111111111111) {
+		t.Fatalf("off by default; got %v", got)
+	}
+
+	t.Setenv("FASTEN_REDACT_NUMBERS", "1")
+	if err := e.Init(Config{ServiceID: "svc", NodeID: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.redactDetail(detail); got["card"] != "***CC***" {
+		t.Fatalf("env on; got %v", got)
+	}
+
+	off := false
+	if err := e.Init(Config{ServiceID: "svc", NodeID: "n", RedactNumbers: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.redactDetail(detail); got["card"] != float64(4111111111111111) {
+		t.Fatalf("config off over env on; got %v", got)
 	}
 }

@@ -20,8 +20,9 @@ import (
 )
 
 type _ConformanceCase struct {
-	Name     string         `json:"name"`
-	Group    string         `json:"group"`
+	Name         string         `json:"name"`
+	Group        string         `json:"group"`
+	CheckNumbers bool           `json:"check_numbers"`
 	Input    map[string]any `json:"input"`
 	Expected map[string]any `json:"expected"`
 }
@@ -53,7 +54,9 @@ func TestRedactConformance(t *testing.T) {
 		t.Run(c.Name, func(t *testing.T) {
 			// The audit detail path returns numbers as json.Number, so
 			// both sides compare by the digits as written.
-			got := Default.redactAuditDetail(c.Input)
+			e := &Engine{}
+			e.configureRedaction(nil, "", &c.CheckNumbers)
+			got := e.redactAuditDetail(c.Input)
 			gotJSON, _ := json.Marshal(got)
 			wantJSON, _ := json.Marshal(c.Expected)
 			gotV, wantV := _decodeNumbers(t, gotJSON), _decodeNumbers(t, wantJSON)
@@ -64,13 +67,22 @@ func TestRedactConformance(t *testing.T) {
 	}
 
 	t.Run("typed_numbers", func(t *testing.T) {
-		got := RedactDetail(map[string]any{
+		detail := map[string]any{
 			"i64": int64(4111111111111111),
 			"u64": uint64(9704000000000000008),
 			"n":   42,
-		})
+		}
+		on := true
+		e := &Engine{}
+		e.configureRedaction(nil, "", &on)
+		got := e.redactDetail(detail)
 		if got["i64"] != "***CC***" || got["u64"] != "***CC***" || got["n"] != float64(42) {
 			t.Errorf("typed numbers: got %v", got)
+		}
+		off := false
+		e.configureRedaction(nil, "", &off)
+		if got := e.redactDetail(detail); got["i64"] != float64(4111111111111111) {
+			t.Errorf("typed numbers with the option off: got %v", got)
 		}
 	})
 

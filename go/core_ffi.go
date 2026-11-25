@@ -8,6 +8,7 @@ package fasten
 */
 import "C"
 import (
+	"encoding/json"
 	"fmt"
 	"unsafe"
 )
@@ -54,6 +55,42 @@ func coreRedactJSONFull(inJSON, extraKeysJSON, replacement string) (string, erro
 	}
 	var outJSON, outErr *C.char
 	rc := C.fasten_redact_full(cIn, cKeys, cRepl, nil, &outJSON, &outErr)
+	if outErr != nil {
+		defer C.fasten_store_free_str(outErr)
+	}
+	if outJSON != nil {
+		defer C.fasten_store_free_str(outJSON)
+	}
+	if rc != C.FASTEN_OK {
+		msg := "redact failed"
+		if outErr != nil {
+			msg = C.GoString(outErr)
+		}
+		return "", fmt.Errorf("fasten: %s", msg)
+	}
+	if outJSON == nil {
+		return inJSON, nil
+	}
+	return C.GoString(outJSON), nil
+}
+
+// coreRedactJSONOpts is coreRedactJSONFull with numbers with no fractional
+// part checked against the card rule too.
+func coreRedactJSONOpts(inJSON, extraKeysJSON, replacement string) (string, error) {
+	opts := map[string]any{"check_numbers": true, "replacement": replacement}
+	if extraKeysJSON != "" {
+		opts["extra_keys"] = json.RawMessage(extraKeysJSON)
+	}
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return "", fmt.Errorf("fasten: %w", err)
+	}
+	cIn := C.CString(inJSON)
+	defer C.free(unsafe.Pointer(cIn))
+	cOpts := C.CString(string(optsJSON))
+	defer C.free(unsafe.Pointer(cOpts))
+	var outJSON, outErr *C.char
+	rc := C.fasten_redact_opts(cIn, cOpts, &outJSON, &outErr)
 	if outErr != nil {
 		defer C.fasten_store_free_str(outErr)
 	}

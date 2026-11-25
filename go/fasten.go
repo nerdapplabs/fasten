@@ -464,6 +464,12 @@ type Config struct {
 	ExtraRedactKeys   []string
 	RedactReplacement string
 
+	// RedactNumbers, when true, checks numbers with no fractional part
+	// (integers and whole-number floats) against the card rule: a match
+	// becomes "***CC***". Nil reads FASTEN_REDACT_NUMBERS (1, true, yes or
+	// on); off by default.
+	RedactNumbers *bool
+
 	AuditStoreFailureStrategy string        // "queue" (default) | "raise"
 	QueueCapacity             int           // default 100
 	QueueRetryInitial         time.Duration // default 100 * time.Millisecond
