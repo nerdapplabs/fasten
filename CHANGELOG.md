@@ -13,8 +13,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   replacement and the size cap all apply. Its keys are kept as they are.
 - A value JSON cannot encode, such as a `datetime`, is converted with `str()`
   and then redacted. `fasten.log` calls with such a field no longer raise.
-- A value that cannot be encoded at all, such as a dict that contains itself,
-  is replaced by the unredactable marker.
+- A value that cannot be encoded at all, such as a dict that contains itself
+  or nesting too deep to encode, is replaced by the unredactable marker. A
+  value whose `str()` raises becomes `<str failed>`; neither raises.
 
 ### Fixed: JS and Python DSN errors
 

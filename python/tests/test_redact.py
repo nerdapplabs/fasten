@@ -386,3 +386,22 @@ def test_log_field_with_a_datetime_is_written(initialized):
     assert len(rows) == 1
     assert rows[0]["token"] == "***"
     assert rows[0]["at"].startswith("2026-01-02")
+
+
+class _StrFails:
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+
+def test_value_whose_str_raises_does_not_raise(r):
+    assert r.redact({1: "ok", "password": _StrFails()}) == {1: "ok", "password": "***"}
+    assert r.redact({"note": _StrFails()}) == {"note": "<str failed>"}
+
+
+def test_very_deep_nesting_becomes_the_unredactable_marker(r):
+    deep: dict = {}
+    cur = deep
+    for _ in range(5000):
+        cur["a"] = {}
+        cur = cur["a"]
+    assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}

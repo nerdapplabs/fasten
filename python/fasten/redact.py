@@ -61,9 +61,18 @@ def _unredactable_marker(value: Any) -> Any:
     return marker["_summary"]
 
 
+def _safe_str(value: Any) -> str:
+    """str() for json.dumps's default: a value whose __str__ raises becomes
+    a fixed marker, so encoding never raises from it."""
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return "<str failed>"
+
+
 def _str_keys(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): _str_keys(v) for k, v in value.items()}
+        return {_safe_str(k): _str_keys(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_str_keys(v) for v in value]
     return value
@@ -73,9 +82,9 @@ def _json_for_size(value: Any) -> str:
     """JSON text of a value json.dumps refused, for the size cap: keys and
     values it cannot encode go through str()."""
     try:
-        return json.dumps(value, default=str)
+        return json.dumps(value, default=_safe_str)
     except (TypeError, ValueError):
-        return json.dumps(_str_keys(value), default=str)
+        return json.dumps(_str_keys(value), default=_safe_str)
 
 
 _warned_no_core = False
@@ -143,7 +152,7 @@ class Redactor:
     def _redact_leaf(self, value: Any) -> Any:
         """Redact one value through the core with this Redactor's settings.
         It goes in a list, which has no keys, so only value shapes apply."""
-        out = json.loads(self._fast_redact_json(json.dumps([value], default=str)))
+        out = json.loads(self._fast_redact_json(json.dumps([value], default=_safe_str)))
         return out[0]
 
     def _redact_native(self, value: Any) -> Any:
@@ -154,7 +163,7 @@ class Redactor:
         if isinstance(value, dict):
             if all(isinstance(k, str) for k in value):
                 try:
-                    in_json = json.dumps(value, default=str)
+                    in_json = json.dumps(value, default=_safe_str)
                 except TypeError:  # a nested dict has a key JSON cannot encode
                     pass
                 else:
@@ -190,11 +199,12 @@ class Redactor:
 
         Raises OSError when libfasten_core can't be loaded.
         """
-        native = False
         try:
             in_json = json.dumps(value)
             # json.dumps turns int keys into strings; keep them as they are.
             native = isinstance(value, dict) and any(not isinstance(k, str) for k in value)
+        except RecursionError:  # nesting too deep to encode
+            return _unredactable_marker(value)
         except (TypeError, ValueError):
             try:
                 in_json = _json_for_size(value)
