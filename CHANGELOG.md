@@ -28,6 +28,29 @@ repository.
 
 ### Known issues
 
+- Replication: if retention purges every row of a node, the node's next
+  row restarts at seq 1 and a receiver that kept its history refuses it.
+  Set retention so a node that replicates never purges all of its rows.
+- Re-init: calling `init()` again on a running engine is not atomic in
+  Python, JS and Rust. A re-init that fails validation can leave part of
+  the new config in place (in Python it also stops retention purging), and
+  rows emitted while a re-init runs can go to the old store. Configure once,
+  at startup.
+- Reader: `/audit` paging with `after` can skip or repeat rows when the
+  store holds rows from several nodes. Narrow each page with `since` and
+  `until` instead.
+- Reader (Go, Rust, JS): a tenant-scoped reader returns no sys or api rows
+  the SDKs wrote, since they carry no `tenant_id`, and its audit pages can
+  come back short.
+- Python: a row with a `wire_version` other than `"1"` reads back as `"1"`
+  and fails verification. Every SDK writes `"1"` today.
+- Go: the `slog` handler ignores `WithGroup`, writes `error` values as `{}`,
+  and lets attributes named `event`, `level`, `timestamp`, `request_id` or
+  `service_id` replace the row's own fields.
+- Go: an audit table created before this release that holds several seq-0
+  rows for one node fails to open.
+- JS: in raise mode with an async store, `emit()` returns a Promise instead
+  of the row.
 - With several workers and personal-data retention on, each worker writes
   its own `AUDIT_ROW_REDACTED` row for the same redacted row. The chain
   still verifies (#134).
