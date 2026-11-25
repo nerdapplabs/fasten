@@ -14,9 +14,12 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   report the wait the drainer actually sleeps.
 - Rust: `queue_capacity: Some(0)` takes the default (100). Every emit used to
   block forever.
-- Rust: a Postgres audit store can be opened, used and dropped from async
-  code. It panicked on a tokio runtime thread with "Cannot start a runtime
-  from within a runtime".
+- JS: `queueCapacity: 0` takes the default (100), as in the other SDKs. It
+  turned off the queue warning events.
+- Rust: a Postgres audit store, and a Postgres api or sys store such as
+  one from `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN`, can be opened, used and
+  dropped from async code. It panicked on a tokio runtime thread with
+  "Cannot start a runtime from within a runtime".
 - Rust: `close()` returns `false` when a row is lost at shutdown. It
   reported success.
 

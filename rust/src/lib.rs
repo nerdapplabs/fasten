@@ -2639,6 +2639,8 @@ mod tests {
 #[cfg(feature = "store-postgres")]
 pub mod postgres_store;
 #[cfg(feature = "store-postgres")]
+mod pg_runtime;
+#[cfg(feature = "store-postgres")]
 pub use postgres_store::PostgresStore;
 
 #[cfg(feature = "store-sqlite")]

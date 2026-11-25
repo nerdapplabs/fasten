@@ -448,11 +448,11 @@ impl PostgresStore {
             let n = all_params.len() + 1;
             let _ = write!(sql, " LIMIT ${n}");
             all_params.push(Box::new(i64::from(filter.limit)));
-            if filter.offset > 0 {
-                let n = all_params.len() + 1;
-                let _ = write!(sql, " OFFSET ${n}");
-                all_params.push(Box::new(i64::from(filter.offset)));
-            }
+        }
+        if filter.offset > 0 {
+            let n = all_params.len() + 1;
+            let _ = write!(sql, " OFFSET ${n}");
+            all_params.push(Box::new(i64::from(filter.offset)));
         }
         let params_refs: Vec<&(dyn ToSql + Sync)> =
             all_params.iter().map(AsRef::as_ref).collect();
@@ -1163,6 +1163,17 @@ mod tests {
             shipped_at: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn offset_without_a_limit_skips_rows() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_offtest").unwrap();
+        for n in 0..5 {
+            store.insert(&make_row(&format!("evt-pgoff-{n}"), "OFFSET_ONLY")).unwrap();
+        }
+        let f: Filter = serde_json::from_str(r#"{"code": "OFFSET_ONLY", "offset": 3}"#).unwrap();
+        assert_eq!(store.query(&f).unwrap().len(), 2);
     }
 
     #[test]

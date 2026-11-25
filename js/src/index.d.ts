@@ -137,6 +137,7 @@ export interface InitOptions {
 	/** Replaces redacted values. Also read from FASTEN_REDACT_REPLACEMENT. */
 	redactReplacement?: string | null;
 	auditStoreFailureStrategy?: "queue" | "raise";
+	/** Warning threshold for the queue; 0 or unset means 100. */
 	queueCapacity?: number;
 	queueRetryInitialMs?: number;
 	queueRetryMaxMs?: number;

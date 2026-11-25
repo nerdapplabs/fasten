@@ -267,6 +267,9 @@ impl SqliteStore {
             if filter.offset > 0 {
                 let _ = write!(sql, " OFFSET {}", filter.offset);
             }
+        } else if filter.offset > 0 {
+            // SQLite takes OFFSET only after a LIMIT; -1 is no limit.
+            let _ = write!(sql, " LIMIT -1 OFFSET {}", filter.offset);
         }
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =
@@ -1000,6 +1003,16 @@ mod tests {
         let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
         let row = make_row("evt-001", "TEST");
         store.insert(&row).unwrap();
+    }
+
+    #[test]
+    fn offset_without_a_limit_skips_rows() {
+        let store = SqliteStore::open(":memory:", "audit_log", false).unwrap();
+        for n in 0..5 {
+            store.insert(&make_row(&format!("evt-off-{n}"), "TEST")).unwrap();
+        }
+        let f: Filter = serde_json::from_str(r#"{"offset": 3}"#).unwrap();
+        assert_eq!(store.query(&f).unwrap().len(), 2);
     }
 
     #[test]

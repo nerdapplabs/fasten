@@ -813,3 +813,8 @@ test('an idle drainer lets the process exit', async () => {
     assert.equal(code, 0, `child did not exit on its own (${Date.now() - t0} ms)`);
     assert.match(err, /stored 1/);
 });
+
+test('queueCapacity 0 means the default, as in the other SDKs', async () => {
+    _initQueue(new RecordingStore(), { queueCapacity: 0 });
+    assert.equal(queueStats().capacity, 100);
+});

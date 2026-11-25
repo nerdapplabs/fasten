@@ -54,7 +54,7 @@ each failure, is capped at `retry_max` (default 60 s), and optionally has
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `capacity` | int | 100 | Maximum occupied slots (queued + in-flight) |
+| `capacity` | int | 100 | Maximum occupied slots (queued + in-flight); 0 means the default |
 | `retry_initial` | duration | 100 ms | First backoff window |
 | `retry_max` | duration | 60 s | Maximum backoff window |
 | `retry_jitter` | bool | true | +/-20 % uniform jitter on each window |

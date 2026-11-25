@@ -618,7 +618,7 @@ export class Engine {
 			this._installDrainer({
 				store: { insert: (row) => this._storeRow(store, row) },
 				sysLog: (l, e, f) => this._drainerSysLog(l, e, f),
-				capacity: opts.queueCapacity ?? 100,
+				capacity: opts.queueCapacity || 100,
 				retryInitialMs: opts.queueRetryInitialMs ?? 100,
 				retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
 				retryJitter: opts.queueRetryJitter ?? true,
