@@ -53,6 +53,14 @@ public enum Fasten {
         return s.isEmpty ? "***" : s
     }
 
+    /// Whether numbers get the card rule, from FASTEN_REDACT_NUMBERS (1, true,
+    /// yes or on), or false if unset. Default for
+    /// `configure(redactNumbers:)`; an explicit argument wins.
+    public static func envRedactNumbers() -> Bool {
+        let s = ProcessInfo.processInfo.environment["FASTEN_REDACT_NUMBERS"] ?? ""
+        return ["1", "true", "yes", "on"].contains(s.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+
     /// Configure fasten. Must be called before `emit()`.
     ///
     /// - Parameters:
@@ -65,6 +73,9 @@ public enum Fasten {
     ///   - queueCapacity: Queue size for `.queue`; `emit()` blocks when full.
     ///   - extraRedactKeys: Additional key names to redact in `detail`.
     ///   - redactReplacement: Value written in place of redacted fields.
+    ///   - redactNumbers: Check numbers with no fractional part (integers and
+    ///                whole-number floats) against the card rule; a match
+    ///                becomes "***CC***". Off by default.
     public static func configure(
         serviceID: String,
         nodeID: String,
@@ -73,12 +84,13 @@ public enum Fasten {
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500,
         extraRedactKeys: [String] = Fasten.envRedactKeys(),
-        redactReplacement: String = Fasten.envRedactReplacement()
+        redactReplacement: String = Fasten.envRedactReplacement(),
+        redactNumbers: Bool = Fasten.envRedactNumbers()
     ) throws {
         _defaultEngine.configure(
             serviceID: serviceID, nodeID: nodeID, tenantID: tenantID,
             store: store, extraRedactKeys: extraRedactKeys,
-            redactReplacement: redactReplacement,
+            redactReplacement: redactReplacement, redactNumbers: redactNumbers,
             strategy: strategy, queueCapacity: queueCapacity
         )
     }

@@ -4,13 +4,14 @@ import Foundation
 ///   1. A key matching a key pattern gets `replacement` as its value.
 ///   2. Otherwise a string value that looks like a known secret (JWT, AWS key,
 ///      card number, ...) is replaced with a token such as "***JWT***".
-///   3. A number with no fractional part whose digits form a card number
-///      becomes "***CC***".
+///   3. With `checkNumbers` on (off by default), a number with no
+///      fractional part whose digits form a card number becomes "***CC***".
 public final class Redactor: @unchecked Sendable {
 
     private let keyPatterns:       [NSRegularExpression]
     private let replacement:       String
     private let extraValueRules:   [(NSRegularExpression, String)]
+    private let checkNumbers:      Bool
 
     // spec/row-schema.json x-fasten-redact.patterns; case-insensitive, matched anywhere in the key.
     private static let defaultKeyPatterns: [NSRegularExpression] = {
@@ -56,9 +57,11 @@ public final class Redactor: @unchecked Sendable {
     public init(
         extraKeys:           [String]                  = [],
         replacement:         String                    = "***",
-        extraValuePatterns:  [(String, String, String)] = []
+        extraValuePatterns:  [(String, String, String)] = [],
+        checkNumbers:        Bool                      = false
     ) {
         self.replacement = replacement
+        self.checkNumbers = checkNumbers
         let extraKeyREs = extraKeys.compactMap {
             try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: $0),
                                      options: .caseInsensitive)
@@ -133,7 +136,7 @@ public final class Redactor: @unchecked Sendable {
             return _redactDict(d)
         } else if let a = val as? [Any] {
             return a.map { _redactValue($0) }
-        } else if let digits = Redactor.wholeNumberText(val), Redactor.hasCard(digits) {
+        } else if checkNumbers, let digits = Redactor.wholeNumberText(val), Redactor.hasCard(digits) {
             // Only the card rule applies to numbers, as in fasten-core.
             return "***CC***"
         }
@@ -164,6 +167,8 @@ public final class Redactor: @unchecked Sendable {
         guard d.isFinite, d.rounded() == d, abs(d) < 1e19 else { return nil }
         if let i = Int64(exactly: d) { return String(i) }
         if let u = UInt64(exactly: d) { return String(u) }
+        // Between -1e19 and Int64.min: the digits of the magnitude.
+        if let u = UInt64(exactly: -d) { return "-" + String(u) }
         return nil
     }
 

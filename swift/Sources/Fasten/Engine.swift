@@ -29,6 +29,7 @@ final class Engine: @unchecked Sendable {
         store: (any AuditStore)? = nil,
         extraRedactKeys: [String] = [],
         redactReplacement: String = "***",
+        redactNumbers: Bool = false,
         strategy: FailureStrategy = .queue,
         queueCapacity: Int = 500
     ) {
@@ -56,7 +57,8 @@ final class Engine: @unchecked Sendable {
             self.tenantID  = tenantID
             self.store     = store
             self.strategy  = strategy
-            self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement)
+            self.redactor  = Redactor(extraKeys: extraRedactKeys, replacement: redactReplacement,
+                                      checkNumbers: redactNumbers)
             let old = drainer
             drainer = next
             if let old { retiring.append(old) }

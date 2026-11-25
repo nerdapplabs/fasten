@@ -9,6 +9,7 @@ final class RedactConformanceTests: XCTestCase {
     private struct ConformanceCase: Decodable {
         let name: String
         let group: String
+        let check_numbers: Bool?
         let input: AnyCodable
         let expected: AnyCodable
     }
@@ -63,8 +64,14 @@ final class RedactConformanceTests: XCTestCase {
                        "value_stripe_live: expected ***STRIPE_KEY***")
     }
 
+    func testNumbersKeptByDefault() {
+        let got = Redactor().redact(["card": 4_111_111_111_111_111, "f": 4_111_111_111_111_111.0])
+        XCTAssertEqual(got["card"] as? Int, 4_111_111_111_111_111)
+        XCTAssertEqual(got["f"] as? Double, 4_111_111_111_111_111.0)
+    }
+
     func testNumberCardValues() {
-        let r = Redactor()
+        let r = Redactor(checkNumbers: true)
         let got = r.redact([
             "card": 4_111_111_111_111_111,
             "u64": UInt64(9_704_000_000_000_000_008),
@@ -73,8 +80,10 @@ final class RedactConformanceTests: XCTestCase {
             "decimal": NSDecimalNumber(string: "4111111111111111"),
             "luhn_fails": 1_234_567_890_123_456,
             "fraction": 4_111_111_111_111_111.5,
+            "below_int64_min": -9.704000000000016e18,
             "flag": true,
         ])
+        XCTAssertEqual(got["below_int64_min"] as? String, "***CC***")
         XCTAssertEqual(got["card"] as? String, "***CC***")
         XCTAssertEqual(got["u64"] as? String, "***CC***")
         XCTAssertEqual(got["whole_float"] as? String, "***CC***")
@@ -86,16 +95,17 @@ final class RedactConformanceTests: XCTestCase {
     }
 
     func testNumberCardWithCustomReplacement() {
-        let got = Redactor(replacement: "[gone]").redact(["card": 4_111_111_111_111_111, "token": "x"])
+        let got = Redactor(replacement: "[gone]", checkNumbers: true)
+            .redact(["card": 4_111_111_111_111_111, "token": "x"])
         XCTAssertEqual(got["card"] as? String, "***CC***")
         XCTAssertEqual(got["token"] as? String, "[gone]")
     }
 
     func testConformance() throws {
-        let redactor = Redactor()
         let cases = try loadCases()
 
         for c in cases {
+            let redactor = Redactor(checkNumbers: c.check_numbers ?? false)
             guard let input = c.input.value as? [String: Any] else {
                 XCTFail("[\(c.name)] input is not a [String:Any]"); continue
             }
