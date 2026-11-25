@@ -302,6 +302,28 @@ final class DrainerConformanceTests: XCTestCase {
         }
     }
 
+    // §4: a row stored straight after a dead letter reports recovery, and
+    // each failing row reports its own first failure.
+    func testRecoveryIsReportedAfterADeadLetter() {
+        let cases: [(Int, [String])] = [
+            (2, ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_recovered"]),
+            (3, ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_failed",
+                 "audit_drain_recovered"]),
+        ]
+        for (failures, want) in cases {
+            let log = SysLog()
+            let drainer = QueueDrainer(
+                store: TestStore(failures: failures), retryInitialMs: 1, retryMaxMs: 1,
+                retryJitter: false, maxAttempts: 2,
+                sysLog: { level, name, fields in log.add(level, name, fields) })
+            drainer.enqueue(row("a"))
+            drainer.enqueue(row("b"))
+            XCTAssertTrue(drainer.flush(timeout: 5))
+            XCTAssertEqual(log.events.filter { $0.hasPrefix("audit_drain_") }, want, "failures=\(failures)")
+            drainer.close()
+        }
+    }
+
     // §10: a row whose one shutdown attempt fails is reported.
     func testRowFailingItsStopAttemptIsReportedLost() throws {
         let store = TestStore(failures: 1_000)

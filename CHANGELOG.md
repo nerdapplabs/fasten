@@ -14,7 +14,8 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - A row stored straight after a dead-lettered row reports
   `audit_drain_recovered`, as the spec asks for an insert that succeeds after
   failures. The dead letter cleared the failure state, so no recovery was
-  reported. Each failing row still reports its own `audit_drain_failed`.
+  reported. Each failing row still reports its own `audit_drain_failed`. The
+  JS and Swift drainers, which do not use fasten-core's, get the same fix.
 - The drainer sleeps the backoff it reports in `in_backoff_until` and
   `audit_drain_degraded`, instead of a second, differently jittered one.
 - A store filter's `limit` and `offset` may be left out of its JSON, as
@@ -27,6 +28,16 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   code. The sync client panicked on a tokio runtime thread ("Cannot start a
   runtime from within a runtime"); from such a thread its calls now run on a
   separate thread.
+
+### Fixed: Python redaction patterns
+
+- A string inside a dict with a non-string key gets the configured
+  replacement and `extra_value_redact_patterns`. It went through the default
+  redactor only, so custom patterns were skipped for it.
+- An `extra_value_redact_patterns` entry the core cannot compile raises
+  `ValueError` naming it from `fasten.init()`, before the running config
+  changes. Before, every detail became `{"_redact_failed": true}` with no
+  warning.
 
 ### Changed (breaking): fasten-core filters and redaction API
 
