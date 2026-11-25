@@ -30,8 +30,10 @@ name = "fasten"
 
 [features]
 default = []
-async = ["tokio"]
-store-postgres = ["dep:pg", "fasten-core/postgres-tls"]
+async = ["dep:tokio"]
+# tokio, already a dependency of pg, tells the store when it is called from a
+# runtime thread, where the sync client cannot run.
+store-postgres = ["dep:pg", "dep:tokio", "fasten-core/postgres-tls"]
 # SQLite is compiled in, so the build needs a C compiler.
 store-sqlite = ["fasten-core/sqlite"]
 codes-yaml = ["serde_yaml"]
