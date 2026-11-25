@@ -86,6 +86,15 @@ NUMBERS_DETAIL = {
     "nested": {"list": [1, 2.5, {"x": 0.0001}]},
 }
 
+# Floats a reader that is not exact can take for a neighbouring double, the
+# first two among them, and the range limits.
+FLOATS_DETAIL = {
+    "a": 4111111111111111.5, "b": 4111111111111038.0, "c": 9007199254740992.0,
+    "d": 2.225073858507201e-308, "e": 0.1, "f": 1e21,
+    "g": 1.7976931348623157e308, "h": 5e-324, "i": 1.2345678901234568e17,
+    "j": 2.5e-07, "k": -0.0, "l": 0.30000000000000004,
+}
+
 
 def _row(row_id: str, ts: datetime, detail: dict | None = None) -> AuditRow:
     return AuditRow(
@@ -134,6 +143,9 @@ def build() -> dict:
 
     add("form2_numbers", seal("genesis", dataclasses.replace(
         _row("evt-form2_numbers", MICROS, NUMBERS_DETAIL), detail_salt=PINNED_SALT)))
+
+    add("form2_floats", seal("genesis", dataclasses.replace(
+        _row("evt-form2_floats", MICROS, FLOATS_DETAIL), detail_salt=PINNED_SALT)))
 
     # Shipped rows: sealed with shipped_at null, then marked shipped. Every
     # form hashes shipped_at as null (spec §1.1), so marking moves no hash.

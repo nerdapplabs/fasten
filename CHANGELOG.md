@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: fasten-core reads floats exactly
+
+- A float in a row's detail passed to fasten-core as JSON is stored and
+  hashed as the value written, as Python, Go and JS read it. Before, a few
+  values were read as a neighbouring double, for example
+  `4111111111111111.5` as `4111111111111111.0`. Rows already stored verify
+  as before.
+
 ### Fixed: JS and Python DSN errors
 
 - DSN errors name a scheme only when the DSN has one, that is when `//`

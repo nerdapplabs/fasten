@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use fasten_core::chain::{
-    canonical_json, detail_commitment, row_hash, seal, verify_chain, ChainRow, Json, JsonString,
+    canonical_json, detail_commitment, row_hash, seal, seal_row, verify_chain, ChainRow, Json, JsonString,
     CURRENT_CANONICAL_FORM_ID,
 };
 use fasten_core::row::Row;
@@ -135,6 +135,64 @@ fn floats_render_as_cpython_repr() {
     }
 }
 
+/// A row from JSON text with `{"v": token}` as its detail, read as the C ABI
+/// and the stores read it.
+fn row_with_detail_number(token: &str) -> Row {
+    serde_json::from_str(&format!(
+        r#"{{"wire_version": "1", "id": "evt-f", "origin_id": "evt-f", "monotonic_seq": 1,
+            "timestamp": "2026-06-15T10:30:45.123456Z", "code": "SENSOR_READ",
+            "action": "read", "severity": "info", "service_id": "gateway",
+            "source_node_id": "node-1", "actor": "plc-7", "actor_kind": "device",
+            "target": "sensor/42", "category": "telemetry", "domain": "plant",
+            "method": "mqtt", "request_id": "req-f", "detail": {{"v": {token}}}}}"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn row_detail_floats_read_exactly() {
+    // (token, repr(float(token)))
+    let cases = [
+        ("4111111111111111.5", "4111111111111111.5"),
+        ("4111111111111038.0", "4111111111111038.0"),
+        ("9007199254740993.0", "9007199254740992.0"),
+        ("2.2250738585072011e-308", "2.225073858507201e-308"),
+        ("1.00000000000000011102230246251565404236316680908203125", "1.0"),
+        ("0.1", "0.1"), ("1e21", "1e+21"), ("1.7976931348623157e308", "1.7976931348623157e+308"),
+        ("5e-324", "5e-324"), ("4.9406564584124654e-324", "5e-324"),
+        ("123456789012345678.0", "1.2345678901234568e+17"), ("2.5e-7", "2.5e-07"),
+        ("-0.0", "-0.0"), ("0.30000000000000004", "0.30000000000000004"),
+        ("2.2250738585072014e-308", "2.2250738585072014e-308"),
+    ];
+    for (token, want) in cases {
+        let row = row_with_detail_number(token);
+        assert_eq!(row.detail["v"].as_f64(), token.parse::<f64>().ok(), "token {token}");
+        assert_eq!(canonical_json(&Json::from(&row.detail)), format!(r#"{{"v":{want}}}"#), "token {token}");
+        // The detail column text reads back as the same value.
+        let stored = serde_json::to_string(&row.detail).unwrap();
+        assert_eq!(canonical_json(&Json::parse(&stored).unwrap()), format!(r#"{{"v":{want}}}"#), "token {token}");
+    }
+}
+
+/// The Python-sealed float row, read as a `Row` and sealed again with its
+/// salt, takes the hash Python gave it.
+#[test]
+fn python_sealed_floats_seal_the_same_from_a_row() {
+    let file = load("spec/python-sealed-forms.json");
+    let case = file
+        .get("cases")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .find(|c| c.get("label").and_then(Json::as_str) == Some("form2_floats"))
+        .unwrap();
+    let text = case.get("row").unwrap().to_string();
+    let mut row: Row = serde_json::from_str(&text).unwrap();
+    let want = row.hash.take().unwrap();
+    let sealed = seal_row("genesis", &row).unwrap();
+    assert_eq!(sealed.hash.as_deref(), Some(want.as_str()));
+}
+
 #[test]
 fn parse_rejects_what_is_not_json() {
     for bad in ["", "{", "[1,]", "{\"a\":}", "01", "1.", "-", "1e", "\"a", "\"\\x\"", "nul",
@@ -152,7 +210,7 @@ fn python_sealed_forms_verify() {
     let file = load("spec/python-sealed-forms.json");
     assert_eq!(file.get("current_form").and_then(Json::as_str), Some(CURRENT_CANONICAL_FORM_ID));
     let cases = cases(file.get("cases").unwrap());
-    assert_eq!(cases.len(), 11);
+    assert_eq!(cases.len(), 12);
     for (label, row) in &cases {
         assert_verifies(label, std::slice::from_ref(row));
         assert_commitment(label, row);
