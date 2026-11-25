@@ -29,6 +29,15 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   runtime from within a runtime"); from such a thread its calls now run on a
   separate thread.
 
+### Security: dependency updates for open Dependabot alerts
+
+- Python dev lock (`python/uv.lock`): `certifi` 2026.11.20 and `anyio`
+  4.16.0. `fasten-sdk` itself has no runtime dependencies, so installs were
+  not affected; the lock also picks up `pyyaml`, which the dev extra already
+  listed.
+- Java placeholder SDK and `fasten-core/bindings/java`: `jackson-databind`
+  2.18.11, and `postgresql` 42.7.11 in the SDK.
+
 ### Fixed: Python redaction patterns
 
 - A string inside a dict with a non-string key gets the configured
