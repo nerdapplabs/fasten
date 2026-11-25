@@ -148,3 +148,17 @@ def test_memory_store_serialises_compound_ops(tmp_path):
         t.join()
     assert errors == []
     assert len(s.query(limit=200)) == 80
+
+
+def test_allocate_retry_returns_the_stored_row(store):
+    """A retry after a commit whose result was lost inserts an id that is
+    already stored. INSERT OR IGNORE drops it, so the store returns the
+    stored row, not a freshly sealed one at the next seq that was never
+    written (stdout printed that one, and a capture failed to verify)."""
+    from fasten.chain import verify_chain
+    row = make_row(monotonic_seq=0)
+    first = store.allocate_and_insert_originated(row)
+    retry = store.allocate_and_insert_originated(row)
+    assert (retry.monotonic_seq, retry.hash) == (first.monotonic_seq, first.hash)
+    assert verify_chain([retry]).ok
+    assert len(store.chain_tail("node-1", 10)) == 1

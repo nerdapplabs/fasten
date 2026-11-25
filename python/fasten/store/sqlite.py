@@ -361,7 +361,13 @@ class SQLiteStore:
                 prev_hash = tip[0] if tip else "genesis"
                 sealed = seal(prev_hash, dataclasses.replace(
                     row, monotonic_seq=next_seq))
-                self._insert_row_core(conn, sealed)
+                if not self._insert_row_core(conn, sealed):
+                    # The id is already stored (a retry after a commit whose
+                    # result was lost): return that row, not the one just
+                    # sealed, which was never written.
+                    cur = conn.execute(
+                        f"SELECT * FROM {self._table} WHERE id = ?", (row.id,))
+                    sealed = self._row(cur.fetchone())
                 conn.commit()
             except BaseException:
                 conn.rollback()

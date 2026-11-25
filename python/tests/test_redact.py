@@ -364,3 +364,15 @@ def test_rejected_reinit_keeps_the_running_config():
         assert before.redact({"field_x": "v"}) == {"field_x": "***"}
     finally:
         e.close()
+
+
+def test_datetime_in_detail_is_redacted_as_text():
+    """A value JSON has no type for went through json.dumps twice and raised
+    the second time, so the stdlib handler dropped the record and a direct
+    log call raised. It is redacted as its text now."""
+    from datetime import datetime, timezone
+    at = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    r = Redactor()
+    assert r.redact({"at": at, "password": "hunter2"}) == {"at": str(at), "password": "***"}
+    assert r.redact({1: {"at": at, "password": "hunter2"}}) == {1: {"at": str(at), "password": "***"}}
+    assert r._redact_for_log({"at": at})["at"] == str(at)

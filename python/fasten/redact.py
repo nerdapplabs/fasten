@@ -140,7 +140,7 @@ class Redactor:
         with only string keys and string values still go through the core."""
         if isinstance(value, dict):
             if all(isinstance(k, str) for k in value):
-                return json.loads(self._fast_redact_json(json.dumps(value)))
+                return json.loads(self._fast_redact_json(json.dumps(value, default=str)))
             result = {}
             for k, v in value.items():
                 if isinstance(k, str) and self._key_re.search(k):
@@ -178,7 +178,10 @@ class Redactor:
         if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
             return self._redact_native(value)
         try:
-            in_json = json.dumps(value)
+            # default=str: a value JSON has no type for (a datetime, a UUID)
+            # is redacted as its text, as the stdout line writes it, rather
+            # than failing and dropping the record.
+            in_json = json.dumps(value, default=str)
         except (TypeError, ValueError):
             return self._redact_native(value)
         cap = _max_detail_bytes()

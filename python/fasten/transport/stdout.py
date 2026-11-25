@@ -18,6 +18,27 @@ from ..redact import Redactor
 from ..store.ring import RingBuffer
 from ..store.stream import StreamStore
 
+_warned_stdout = False
+
+
+def _write_stdout(line: str) -> None:
+    """Write one line to stdout. A failed write (a closed pipe, or no stdout
+    under pythonw) must not stop the row being stored (spec 4), so it costs
+    only the line, and stderr says so once per process."""
+    global _warned_stdout
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception as exc:  # noqa: BLE001  any failure: EPIPE, None, closed
+        if _warned_stdout:
+            return
+        _warned_stdout = True
+        try:
+            sys.stderr.write(f"fasten: stdout write failed ({type(exc).__name__}); "
+                             "rows are still stored\n")
+        except Exception:  # noqa: BLE001  stderr can be gone too
+            pass
+
 
 class StdoutTransport:
     """Stdout writer with in-memory rings for the sys and api streams.
@@ -111,8 +132,7 @@ class StdoutTransport:
         row = self._redact(row)
         self._syslog.push(row)
         self._persist(self._syslog_store, row, "syslog")
-        sys.stdout.write(json.dumps({"shape": "sys", **row}, default=str) + "\n")
-        sys.stdout.flush()
+        _write_stdout(json.dumps({"shape": "sys", **row}, default=str))
 
     def push_syslog(self, row: dict[str, Any]) -> None:
         """Like write_syslog() but without the stdout line."""
@@ -192,8 +212,7 @@ class StdoutTransport:
         row = self._redact(row)
         self._api.push(row)
         self._persist(self._api_store, row, "api")
-        sys.stdout.write(json.dumps({"shape": "api", **row}, default=str) + "\n")
-        sys.stdout.flush()
+        _write_stdout(json.dumps({"shape": "api", **row}, default=str))
 
     def push_api(self, row: dict[str, Any]) -> None:
         """Like write_api() but without the stdout line."""
@@ -226,5 +245,4 @@ class StdoutTransport:
 
     def write_audit(self, row: dict[str, Any]) -> None:
         """Write an audit row to stdout. Storing it is the Engine's job."""
-        sys.stdout.write(json.dumps({"shape": "audit", **row}, default=str) + "\n")
-        sys.stdout.flush()
+        _write_stdout(json.dumps({"shape": "audit", **row}, default=str))
