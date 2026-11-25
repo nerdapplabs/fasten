@@ -23,8 +23,9 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 ### Fixed: rows lost, hung or changed after emit
 
 - Python: a closed or missing stdout (a broken pipe, `pythonw`) no longer
-  stops `emit()` or loses the row. The stdout line is skipped and stderr
-  says so once.
+  stops `emit()` or loses the row. Each lost audit line is logged as an
+  error on the `fasten` logger with its row id; for log and API lines,
+  stderr says so once.
 - Python, Go: a SQLite insert retried after a lost commit returns the row
   that was stored. It printed a row that was never stored, so a capture of
   stdout failed to verify.

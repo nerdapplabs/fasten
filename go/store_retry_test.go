@@ -2,6 +2,10 @@ package fasten
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +43,29 @@ func TestAllocateRetryReturnsTheStoredRow(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d rows, want 1", n)
+	}
+}
+
+// An insert ignored for a reason other than its id being stored leaves nothing
+// to read back. That is a failed insert, not a stored row.
+func TestAllocateIgnoredInsertWithNoStoredRowFails(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "a.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := NewSQLiteStore(db, "audit_ignored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TRIGGER drop_all BEFORE INSERT ON audit_ignored BEGIN SELECT RAISE(IGNORE); END"); err != nil {
+		t.Fatal(err)
+	}
+	r := makeRemoteChain(1, "svc", "node-1")[0]
+	r.MonotonicSeq, r.PrevHash, r.Hash, r.CanonicalFormID = 0, "", "", ""
+	r.DetailSalt, r.DetailCommitment = "", ""
+	_, err = store.AllocateAndInsertOriginated(context.Background(), r)
+	if !errors.Is(err, sql.ErrNoRows) || !strings.Contains(err.Error(), r.ID) {
+		t.Fatalf("got %v, want an error naming %s that wraps sql.ErrNoRows", err, r.ID)
 	}
 }

@@ -358,6 +358,18 @@ def test_rejected_reinit_keeps_the_running_config():
         e.close()
 
 
+def test_bad_value_pattern_is_refused_before_a_dsn_store_opens(tmp_path, monkeypatch):
+    """init_config opens DSN stores; a pattern refused after that would leave
+    a connection nothing closes. It is checked first, so no store is opened."""
+    from fasten.engine import Engine
+    db = tmp_path / "audit.db"
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", str(db))
+    with pytest.raises(ValueError, match="extra_value_redact_patterns"):
+        Engine().init_config(service_id="svc", node_id="n1",
+                             extra_value_redact_patterns=[("bad", "([", "Y")])
+    assert not db.exists()
+
+
 # Values json.dumps cannot encode as they are
 
 def test_custom_value_pattern_applies_under_a_tuple_key():

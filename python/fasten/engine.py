@@ -401,6 +401,11 @@ class Engine:
             raise RuntimeError(
                 "fasten.init_config: FASTEN_SERVICE_ID and FASTEN_NODE_ID are required")
 
+        # Checked before a DSN store opens a connection, which nothing would
+        # close if the pattern were refused later in start().
+        if extra_value_redact_patterns:
+            Redactor(extra_value_patterns=extra_value_redact_patterns)
+
         env_tid = os.environ.get("FASTEN_TENANT_ID")
         tid = tenant_id if tenant_id is not None else (env_tid or None)
 
@@ -768,7 +773,11 @@ class Engine:
         # Write the unsealed row to stdout first so it is logged even if the
         # store blocks or fails; the sealed row follows (spec 8).
         if self._stdout is not None:
-            self._stdout.write_audit(row.to_dict())
+            try:
+                self._stdout.write_audit(row.to_dict())
+            except Exception as e:  # noqa: BLE001  a lost line must not stop the row being stored (spec 4)
+                logging.getLogger("fasten").error("unsealed stdout line failed for %s: %s",
+                                                  row.id, describe_error(e, self._redactor))
 
         if self._audit_store is not None:
             if self._failure_strategy == "queue":

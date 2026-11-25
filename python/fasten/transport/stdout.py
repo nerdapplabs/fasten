@@ -244,5 +244,7 @@ class StdoutTransport:
         return self._api.count(**filters)
 
     def write_audit(self, row: dict[str, Any]) -> None:
-        """Write an audit row to stdout. Storing it is the Engine's job."""
-        _write_stdout(json.dumps({"shape": "audit", **row}, default=str))
+        """Write an audit row to stdout. Storing it is the Engine's job. A failed
+        write raises, so the caller logs which row lost its line."""
+        sys.stdout.write(json.dumps({"shape": "audit", **row}, default=str) + "\n")
+        sys.stdout.flush()

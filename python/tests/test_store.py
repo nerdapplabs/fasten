@@ -162,3 +162,18 @@ def test_allocate_retry_returns_the_stored_row(store):
     assert (retry.monotonic_seq, retry.hash) == (first.monotonic_seq, first.hash)
     assert verify_chain([retry]).ok
     assert len(store.chain_tail("node-1", 10)) == 1
+
+
+def test_allocate_ignored_insert_with_no_stored_row_raises(tmp_path):
+    """An insert ignored for a reason other than its id being stored leaves
+    nothing to read back. That is a failed insert, not a stored row."""
+    import sqlite3
+    path = str(tmp_path / "a.db")
+    s = SQLiteStore(path)
+    s.query(limit=1)    # the table exists before the trigger goes on it
+    with sqlite3.connect(path) as c:
+        c.execute("CREATE TRIGGER drop_all BEFORE INSERT ON audit_log "
+                  "BEGIN SELECT RAISE(IGNORE); END")
+    row = make_row(monotonic_seq=0)
+    with pytest.raises(sqlite3.IntegrityError, match=row.id):
+        s.allocate_and_insert_originated(row)

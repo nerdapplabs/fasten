@@ -367,7 +367,14 @@ class SQLiteStore:
                     # sealed, which was never written.
                     cur = conn.execute(
                         f"SELECT * FROM {self._table} WHERE id = ?", (row.id,))
-                    sealed = self._row(cur.fetchone())
+                    stored = cur.fetchone()
+                    if stored is None:
+                        # Ignored for another constraint, such as a taken
+                        # (node, seq): nothing with this id was written.
+                        raise sqlite3.IntegrityError(
+                            f"fasten: insert of {row.id} was ignored and no row "
+                            "with that id is stored")
+                    sealed = self._row(stored)
                 conn.commit()
             except BaseException:
                 conn.rollback()

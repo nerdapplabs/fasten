@@ -348,7 +348,7 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 			"SELECT monotonic_seq, prev_hash, hash, canonical_form_id, detail_salt, detail_commitment FROM "+
 				s.table+" WHERE id = ?", row.ID).Scan(&sealed.MonotonicSeq, &sealed.PrevHash, &sealed.Hash,
 			&sealed.CanonicalFormID, &sealed.DetailSalt, &sealed.DetailCommitment); err != nil {
-			return Row{}, err
+			return Row{}, fmt.Errorf("fasten: reading back the ignored insert of %s: %w", row.ID, err)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {

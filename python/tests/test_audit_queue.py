@@ -291,16 +291,19 @@ class _BrokenPipe:
 
 
 @pytest.mark.parametrize("stdout", [_BrokenPipe(), None], ids=["epipe", "no-stdout"])
-def test_broken_stdout_still_stores_the_row(tmp_path, monkeypatch, stdout):
+def test_broken_stdout_still_stores_the_row(tmp_path, monkeypatch, stdout, caplog):
     """The unsealed stdout line is written before the store. A closed pipe,
     or no stdout under pythonw, costs that line only (spec 4): emit() does
-    not raise and the row is stored."""
+    not raise, the row is stored, and each lost line is logged with its row."""
     store = FlakyStore(str(tmp_path / "a.db"))
     _init(store)
     monkeypatch.setattr(sys, "stdout", stdout)
     row = fasten.emit(code="USER_CREATED", target="u-1")
     assert fasten.flush(timeout=2.0)
     assert [r.id for r in _rows(store)] == [row.id]
+    lost = [r.getMessage() for r in caplog.records if r.name == "fasten"]
+    assert any(m.startswith(f"unsealed stdout line failed for {row.id}") for m in lost)
+    assert any(m.startswith(f"sealed stdout line failed for {row.id}") for m in lost)
 
 
 def test_v12_emit_after_drainer_stopped_is_stored(tmp_path):

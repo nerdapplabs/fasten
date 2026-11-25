@@ -2402,6 +2402,25 @@ mod tests {
         e.reset_for_tests();
     }
 
+    // A row still waiting out its backoff when close stops the drainer is
+    // lost: close reports false and the engine reports the gap (spec §10).
+    #[test]
+    fn close_reports_a_row_lost_at_stop() {
+        register("close_lost".into(), [("CLOSE_LOST".into(), plain_meta("close_lost"))]).unwrap();
+        let store = Arc::new(IdStore { fail: true, ..Default::default() });
+        let e = Engine::new();
+        e.init(Config {
+            queue_retry_initial: Some(Duration::from_secs(60)),
+            disable_queue_jitter: true,
+            ..queue_config("svc-close-lost", store)
+        })
+        .unwrap();
+        EmitBuilder::new("CLOSE_LOST", "t").submit_to(&e).expect("submit");
+        assert!(!e.close(Duration::from_millis(300)));
+        assert!(e.audit_degraded());
+        e.reset_for_tests();
+    }
+
     // Raise mode returns the insert error.
     #[test]
     fn submit_errors_in_raise_mode_when_insert_fails() {
