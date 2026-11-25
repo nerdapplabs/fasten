@@ -6,37 +6,17 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed: fasten-core drainer, filters and redaction; Rust Postgres under tokio
+### Fixed: queue-mode drain events and capacity; Rust Postgres from async code
 
-- A drainer built with a queue capacity of 0 takes the default (100), as the
-  C ABI already did. Before, every enqueue blocked forever, and stop could not
-  wake them.
-- A row stored straight after a dead-lettered row reports
-  `audit_drain_recovered`, as the spec asks for an insert that succeeds after
-  failures. The dead letter cleared the failure state, so no recovery was
-  reported. Each failing row still reports its own `audit_drain_failed`. The
-  JS and Swift drainers, which do not use fasten-core's, get the same fix.
-- The drainer sleeps the backoff it reports in `in_backoff_until` and
-  `audit_drain_degraded`, instead of a second, differently jittered one.
-- A store filter's `limit` and `offset` may be left out of its JSON, as
-  `fasten_core.h` says every key may; they default to 0.
-- A redaction value pattern that does not compile returns
-  `FASTEN_ERR_BAD_JSON` naming the pattern and the reason, instead of an
-  internal panic. `fasten_redact_full` and its buffer variant reuse the last
-  redactor built rather than recompiling the patterns on every call.
+- All SDKs: a row stored straight after a dead-lettered row now reports
+  `audit_drain_recovered`. No recovery was reported before.
+- Python, Go, C++, Rust: `in_backoff_until` and `audit_drain_degraded`
+  report the wait the drainer actually sleeps.
+- Rust: `queue_capacity: Some(0)` takes the default (100). Every emit used to
+  block forever.
 - Rust: a Postgres audit store can be opened, used and dropped from async
-  code. The sync client panicked on a tokio runtime thread ("Cannot start a
-  runtime from within a runtime"); from such a thread its calls now run on a
-  separate thread.
-
-### Security: dependency updates for open Dependabot alerts
-
-- Python dev lock (`python/uv.lock`): `certifi` 2026.11.20 and `anyio`
-  4.16.0. `fasten-sdk` itself has no runtime dependencies, so installs were
-  not affected; the lock also picks up `pyyaml`, which the dev extra already
-  listed.
-- Java placeholder SDK and `fasten-core/bindings/java`: `jackson-databind`
-  2.18.11, and `postgresql` 42.7.11 in the SDK.
+  code. It panicked on a tokio runtime thread with "Cannot start a runtime
+  from within a runtime".
 
 ### Fixed: Python redaction patterns
 
@@ -47,17 +27,6 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
   `ValueError` naming it from `fasten.init()`, before the running config
   changes. Before, every detail became `{"_redact_failed": true}` with no
   warning.
-
-### Changed (breaking): fasten-core filters and redaction API
-
-- A store filter with a key it does not recognise is refused with
-  `FASTEN_ERR_BAD_JSON`. Unknown keys were ignored before, so a misspelt key
-  could match every row.
-- Rust: `fasten_core::redact::Redactor::new` takes only keys and a
-  replacement. Value patterns are added with `with_value_patterns`, which
-  returns `Error::InvalidPattern` for a pattern that does not compile.
-- Rust: `fasten_core::error::Error` has a new variant, `InvalidPattern`, so an
-  exhaustive `match` on it needs an arm.
 
 ### Fixed: Python `APILogger` keeps the app's exception
 
