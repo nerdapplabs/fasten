@@ -253,6 +253,19 @@ test('drainer first failure emits warn to sys (captured via stderr)', async () =
         `expected audit_drain_recovered; got ${JSON.stringify(events)}`);
 });
 
+test('changing the row emit() returned does not change what is stored', async () => {
+    const store = new RecordingStore();
+    _initQueue(store);
+    const row = emit({ code: 'USER_CREATED', target: 'u-1', detail: { note: 'ok', password: 'hunter2' } });
+    assert.equal(row.detail.password, '***');
+    row.detail.password = 'hunter2';
+    row.detail.note = 'changed';
+    assert.equal(await flush(2000), true);
+    assert.equal(store.rows.length, 1);
+    assert.equal(store.rows[0].detail.password, '***');
+    assert.equal(store.rows[0].detail.note, 'ok');
+});
+
 // Emits one row per target through `store` and returns the drainer's
 // audit_drain_* events in order.
 async function drainEvents(store, targets, opts = {}) {

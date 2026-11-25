@@ -17,6 +17,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - Rust: a Postgres audit store can be opened, used and dropped from async
   code. It panicked on a tokio runtime thread with "Cannot start a runtime
   from within a runtime".
+- Rust: `close()` returns `false` when a row is lost at shutdown. It
+  reported success.
+
+### Fixed: rows lost, hung or changed after emit
+
+- Python: a closed or missing stdout (a broken pipe, `pythonw`) no longer
+  stops `emit()` or loses the row. The stdout line is skipped and stderr
+  says so once.
+- Python: a `datetime` or other non-JSON value in a log call's details is
+  written as text. The record was dropped, or the call raised.
+- Python, Go: a SQLite insert retried after a lost commit returns the row
+  that was stored. It printed a row that was never stored, so a capture of
+  stdout failed to verify.
+- JS: changing the row `emit()` returned no longer changes what is stored,
+  and can no longer undo its redaction.
+- Go: calling `Load` and `Reload` at the same time no longer deadlocks, and
+  `Reload` no longer drops codes a concurrent `Load` added.
+- Go: two loggers made from one `SlogHandler` keep their own attributes.
 
 ### Fixed: Python redaction patterns
 
