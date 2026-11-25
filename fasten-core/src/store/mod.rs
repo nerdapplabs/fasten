@@ -13,7 +13,10 @@ use crate::{
 /// All string fields are exact-match predicates.  `since` / `until` are
 /// ISO-8601 UTC timestamp bounds applied to the `timestamp` column.
 /// A `None` field is ignored (no constraint).  `limit == 0` means no limit.
+/// Every key may be left out of the JSON form (`fasten_core.h`), so a
+/// missing `limit` or `offset` is 0.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Filter {
     pub request_id:     Option<String>,
     pub code:           Option<String>,
@@ -678,3 +681,18 @@ pub mod stream_sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+#[cfg(test)]
+mod tests {
+    use super::Filter;
+
+    /// Every key is optional in the JSON form, `limit` and `offset` included.
+    #[test]
+    fn filter_keys_are_all_optional() {
+        let f: Filter = serde_json::from_str(r#"{"code":"X"}"#).unwrap();
+        assert_eq!(f.code.as_deref(), Some("X"));
+        assert_eq!((f.limit, f.offset), (0, 0));
+        let f: Filter = serde_json::from_str("{}").unwrap();
+        assert!(f.code.is_none() && f.limit == 0);
+    }
+}
