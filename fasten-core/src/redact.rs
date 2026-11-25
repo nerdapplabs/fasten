@@ -281,27 +281,10 @@ impl Default for Redactor {
 impl Redactor {
     /// `extra_keys`: plain strings, not regexes; they are escaped.
     /// `replacement`: defaults to `"***"` when empty.
-    /// `extra_value_patterns`: `(pattern, replacement_token)` pairs checked
-    ///   after the built-in value shapes. First match wins.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a pattern in `extra_value_patterns` is not a valid regex.
-    #[allow(clippy::expect_used)]
-    pub fn new(
-        extra_keys:             &[&str],
-        replacement:            &str,
-        extra_value_patterns:   &[(&str, &str)],
-    ) -> Self {
+    #[must_use]
+    pub fn new(extra_keys: &[&str], replacement: &str) -> Self {
         let escaped: Vec<String> = extra_keys.iter().map(|k| regex::escape(k)).collect();
         let extra_refs: Vec<&str> = escaped.iter().map(String::as_str).collect();
-        let custom_vp = extra_value_patterns
-            .iter()
-            .map(|(pat, repl)| {
-                let re = Regex::new(pat).expect("extra_value_pattern is a valid regex");
-                (re, (*repl).to_owned())
-            })
-            .collect();
         Self {
             key_re:      build_key_re(&extra_refs),
             replacement: if replacement.is_empty() {
@@ -309,8 +292,23 @@ impl Redactor {
             } else {
                 replacement.to_owned()
             },
-            custom_vp,
+            custom_vp:   vec![],
         }
+    }
+
+    /// Adds `(pattern, replacement_token)` pairs, checked after the built-in
+    /// value shapes; first match wins. The patterns come from the host, so a
+    /// bad one is an error for the caller, not a panic.
+    ///
+    /// # Errors
+    ///
+    /// `Error::InvalidPattern` if a pattern is not a valid regex.
+    pub fn with_value_patterns(mut self, patterns: &[(&str, &str)]) -> Result<Self, Error> {
+        for (pat, repl) in patterns {
+            let re = Regex::new(pat).map_err(|_| Error::InvalidPattern((*pat).to_owned()))?;
+            self.custom_vp.push((re, (*repl).to_owned()));
+        }
+        Ok(self)
     }
 
     fn check_value(&self, s: &str) -> Option<String> {
@@ -470,7 +468,7 @@ mod tests {
 
     #[test]
     fn extra_keys_custom_redactor() {
-        let r = Redactor::new(&["my_secret_field"], "REDACTED", &[]);
+        let r = Redactor::new(&["my_secret_field"], "REDACTED");
         let out = r.redact_value(&json!({"my_secret_field": "val", "name": "Bob"}));
         assert_eq!(out["my_secret_field"], "REDACTED");
         assert_eq!(out["name"], "Bob");
@@ -478,9 +476,17 @@ mod tests {
 
     #[test]
     fn extra_value_patterns_applied() {
-        let r = Redactor::new(&[], "", &[("custom_[A-Z]{8}", "***CUSTOM***")]);
+        let r = Redactor::new(&[], "")
+            .with_value_patterns(&[("custom_[A-Z]{8}", "***CUSTOM***")])
+            .unwrap();
         let out = r.redact_value(&json!({"ref": "custom_ABCDEFGH"}));
         assert_eq!(out["ref"], "***CUSTOM***");
+    }
+
+    #[test]
+    fn invalid_value_pattern_is_an_error() {
+        let err = Redactor::new(&[], "").with_value_patterns(&[("ok_[0-9]+", "A"), ("([", "B")]);
+        assert!(matches!(err, Err(Error::InvalidPattern(p)) if p == "(["));
     }
 
     #[test]

@@ -412,6 +412,8 @@ FastenErrorCode fasten_redact(
  * @param out_err                   Set on error; may be NULL.
  *
  * @return FASTEN_OK on success, error code otherwise (out_err set).
+ *         A pattern that is not a valid regex returns FASTEN_ERR_BAD_JSON,
+ *         with out_err naming the pattern.
  */
 FastenErrorCode fasten_redact_full(
     const char* in_json,

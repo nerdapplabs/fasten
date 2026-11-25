@@ -704,7 +704,7 @@ pub(crate) fn redact_value(
         let refs: Vec<&str> = extra
             .map(|k| k.iter().map(String::as_str).collect())
             .unwrap_or_default();
-        Redactor::new(&refs, repl, &[]).redact_value(v)
+        Redactor::new(&refs, repl).redact_value(v)
     } else {
         REDACTOR.redact_value(v)
     }
