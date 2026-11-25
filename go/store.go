@@ -335,8 +335,21 @@ func (s *SQLiteStore) AllocateAndInsertOriginated(ctx context.Context, row Row) 
 
 	row.MonotonicSeq = nextSeq
 	sealed := Seal(prevHash, row)
-	if _, err := s.insertRowExec(ctx, conn, sealed); err != nil {
+	n, err := s.insertRowExec(ctx, conn, sealed)
+	if err != nil {
 		return Row{}, err
+	}
+	if n == 0 {
+		// The id is already stored (a retry after a commit whose result was
+		// lost). Return the stored row, as PostgresStore does, not the one
+		// just sealed, which INSERT OR IGNORE dropped.
+		sealed = row
+		if err := conn.QueryRowContext(ctx,
+			"SELECT monotonic_seq, prev_hash, hash, canonical_form_id, detail_salt, detail_commitment FROM "+
+				s.table+" WHERE id = ?", row.ID).Scan(&sealed.MonotonicSeq, &sealed.PrevHash, &sealed.Hash,
+			&sealed.CanonicalFormID, &sealed.DetailSalt, &sealed.DetailCommitment); err != nil {
+			return Row{}, err
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return Row{}, err

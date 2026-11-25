@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const fleetYAML = `
@@ -216,5 +217,44 @@ func TestReload_NoOpWithoutLoad(t *testing.T) {
 	resetYAMLState(t)
 	if err := Reload(); err != nil {
 		t.Fatalf("Reload with no prior Load should be no-op, got %v", err)
+	}
+}
+
+// Load and Reload took yamlMu and regMu in opposite orders, so running them
+// at once could deadlock, and Reload could publish a registry built from a
+// path list that a Load had just extended, dropping that Load's codes.
+func TestLoadRacingReloadNeitherDeadlocksNorDropsCodes(t *testing.T) {
+	resetYAMLState(t)
+	if err := Load(writeYAML(t, fleetYAML)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const n = 20
+	paths := make([]string, n)
+	for i := range paths {
+		code := "RACE_CODE_" + itoa(i)
+		paths[i] = writeYAML(t, "domain: race\nemitter: race\ncodes:\n  "+code+
+			":\n    category: race\n    action: run\n    severity: info\n    description: race\n")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		finished := make(chan struct{}, 2*n)
+		for i := 0; i < n; i++ {
+			go func(p string) { _ = Load(p); finished <- struct{}{} }(paths[i])
+			go func() { _ = Reload(); finished <- struct{}{} }()
+		}
+		for i := 0; i < 2*n; i++ {
+			<-finished
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Load and Reload deadlocked")
+	}
+	for i := 0; i < n; i++ {
+		if _, ok := metaOf(Code("RACE_CODE_" + itoa(i))); !ok {
+			t.Fatalf("RACE_CODE_%d was loaded but is missing after the reloads", i)
+		}
 	}
 }
