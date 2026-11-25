@@ -6,12 +6,18 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed: card numbers sent as numbers are redacted
+### Added: an option to redact card numbers sent as numbers
 
-- A detail value that is a number with no fractional part (an integer or a
-  whole-number float such as `4111111111111111.0`) and that the card rule
-  matches now becomes the string `"***CC***"`, as when it is sent as a
-  string.
+- With the option on, a detail value that is a number with no fractional
+  part (an integer or a whole-number float such as `4111111111111111.0`)
+  and that the card rule matches becomes the string `"***CC***"`, as when it
+  is sent as a string. It is off by default, so numbers are kept as sent.
+- Set it with `FASTEN_REDACT_NUMBERS=1` or the SDK setting: `redact_numbers`
+  (Python `fasten.init`, Rust `Config`, C++ `Config`), `RedactNumbers` (Go
+  `Config`), `redactNumbers` (JS `init`, Swift `configure`). An explicit
+  setting wins over the variable.
+- fasten-core: `fasten_redact_opts` and `fasten_redact_opts_buf` take the
+  redaction options as one JSON object, including `check_numbers`.
 
 ### Fixed: JS and Python DSN errors
 
