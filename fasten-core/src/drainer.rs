@@ -535,8 +535,9 @@ fn error_text(e: &Error) -> String {
 
 fn on_success(inner: &DrainerInner) {
     let mut st = lock_or_recover(&inner.stats);
-    // A burst lasts until a row is stored, even if a dead-lettered row ended
-    // its own retries, so this success is the recovery.
+    // Spec: recovered fires when an insert succeeds after one or more
+    // failures. A dead letter leaves failure_burst_at set for this reason,
+    // so a success straight after one still counts.
     let recovering = st.failure_burst_at.is_some();
     let recovery_secs = if recovering {
         st.failure_burst_at.map_or(0.0, |t| t.elapsed().as_secs_f64())
@@ -570,8 +571,10 @@ fn on_success(inner: &DrainerInner) {
 /// `in_backoff_until` and `audit_drain_degraded` report.
 fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) -> Duration {
     let mut st = lock_or_recover(&inner.stats);
-    let first = st.failure_burst_at.is_none();
-    if first {
+    // Spec: audit_drain_failed fires when retry_count goes from 0 to 1, so
+    // once per failing row, a row after a dead letter included.
+    let first = st.retry_count == 0;
+    if st.failure_burst_at.is_none() {
         st.failure_burst_at = Some(Instant::now());
     }
     st.retry_count = attempt;
@@ -618,9 +621,9 @@ fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
         st.dlq.pop_front();
     }
     st.dlq.push_back(row.clone());
-    // The next row starts its own retries, but the burst (failure_burst_at,
-    // degraded_fired, last_error) runs on until a row is stored, so that
-    // success reports audit_drain_recovered.
+    // The next row starts its own retries, and its first failure reports
+    // audit_drain_failed again. failure_burst_at is kept until a row is
+    // stored, so that success reports audit_drain_recovered.
     st.retry_count = 0;
     st.in_backoff_until = None;
     inner.slots.release();
@@ -950,38 +953,66 @@ mod stop_tests {
         fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
     }
 
-    /// A dead-lettered row does not end the failure burst: the next stored
-    /// row reports `audit_drain_recovered`, and the burst's
-    /// `audit_drain_failed` is not repeated for the second row.
-    #[test]
-    fn recovery_is_reported_after_a_dead_letter() {
+    /// Drains `ids` through `store` with `max_attempts` and returns the
+    /// `audit_drain_*` events in order. Queue high-water events are left out.
+    fn drain_events(store: Box<dyn Store>, max_attempts: usize, ids: &[&str]) -> Vec<String> {
         let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let sink = events.clone();
-        let d = Drainer::with_sys_log(
-            Box::new(FailFirstStore(2, Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
-            DrainerConfig {
-                capacity: 4,
-                retry_initial: Duration::from_millis(5),
-                retry_max: Duration::from_millis(5),
-                retry_jitter: false,
-                max_attempts: 2,
-            },
-            Some(Arc::new(move |line: &str| {
-                sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
-            })),
-        );
-        assert!(d.enqueue(Row { id: "a".into(), ..Row::default() }));
-        assert!(d.enqueue(Row { id: "b".into(), ..Row::default() }));
+        let d = Drainer::with_sys_log(store, DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts,
+        }, Some(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+        })));
+        for id in ids {
+            assert!(d.enqueue(Row { id: (*id).into(), ..Row::default() }));
+        }
         assert!(d.flush(Duration::from_secs(5)), "the queue did not drain");
-        let stats = d.stats();
-        assert_eq!(stats.dead_lettered_total, 1);
-        assert_eq!(stats.last_error, None);
+        assert_eq!(d.stats().last_error, None, "the last row was stored");
         d.stop(Duration::from_secs(2));
-        let names: Vec<String> = events.lock().unwrap().iter()
+        let names = events.lock().unwrap().iter()
             .map(|e| e["event"].as_str().unwrap_or_default().to_owned())
             .filter(|n| n.starts_with("audit_drain_"))
             .collect();
-        assert_eq!(names, ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_recovered"]);
+        names
+    }
+
+    fn fail_first(n: usize) -> Box<dyn Store> {
+        Box::new(FailFirstStore(n, Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+    }
+
+    /// A row stored straight after a dead letter reports
+    /// `audit_drain_recovered`: it succeeds after failures (spec §4).
+    #[test]
+    fn recovery_is_reported_right_after_a_dead_letter() {
+        assert_eq!(
+            drain_events(fail_first(2), 2, &["a", "b"]),
+            ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_recovered"],
+        );
+    }
+
+    /// The row after a dead letter reports its own first failure, as
+    /// `retry_count` goes from 0 to 1 again, and recovery once it is stored.
+    #[test]
+    fn row_after_a_dead_letter_reports_its_own_failure() {
+        assert_eq!(
+            drain_events(fail_first(3), 2, &["a", "b"]),
+            ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_failed", "audit_drain_recovered"],
+        );
+    }
+
+    /// A row rejected on its first attempt is no failure burst: the next
+    /// stored row reports no recovery.
+    #[test]
+    fn rejected_row_then_success_reports_no_recovery() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            drain_events(Box::new(RejectingStore(attempts)), 50, &["bad", "good"]),
+            ["audit_drain_dead_letter"],
+        );
     }
 
     /// `error` and `last_error` hold the error's type; a callback's code

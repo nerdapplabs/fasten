@@ -97,9 +97,11 @@ pub enum Error {
     #[error("{0} is not supported by this store")]
     Unsupported(&'static str),
 
-    /// A host-supplied redaction value pattern is not a valid regex.
-    #[error("redaction value pattern {0:?} is not a valid regex")]
-    InvalidPattern(String),
+    /// A host-supplied redaction value pattern does not compile: the
+    /// pattern, then the regex crate's reason (a syntax error, or a size
+    /// limit for a valid but too large pattern).
+    #[error("redaction value pattern {0:?} does not compile: {1}")]
+    InvalidPattern(String, String),
 
     /// A purge cutoff that is neither an RFC 3339 timestamp nor a date.
     #[error("purge cutoff {0:?} is not an RFC 3339 timestamp or a date")]
@@ -183,7 +185,7 @@ impl From<&Error> for FastenErrorCode {
             // An invalid argument, like a NULL or non-UTF-8 one.
             Error::InvalidTimestamp(_) => FastenErrorCode::ErrNullArg,
             // The patterns arrive as a JSON argument and fail its validation.
-            Error::InvalidPattern(_)   => FastenErrorCode::ErrBadJson,
+            Error::InvalidPattern(..)  => FastenErrorCode::ErrBadJson,
             Error::Store(_)            => FastenErrorCode::ErrBackend,
             Error::RowRejected(_)      => FastenErrorCode::ErrBackend,
             Error::Seal(_)             => FastenErrorCode::ErrBackend,

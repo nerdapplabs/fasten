@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(code, FastenErrorCode::ErrBadJson);
         let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_owned();
         unsafe { super::super::fasten_store_free_str(err) };
-        assert!(msg.contains("([") && msg.contains("not a valid regex"), "{msg}");
+        assert!(msg.contains("([") && msg.contains("does not compile"), "{msg}");
 
         let good = CString::new(r#"[{"pattern":"custom_[A-Z]{8}","replacement":"***C***"}]"#).unwrap();
         for _ in 0..2 {
@@ -257,5 +257,52 @@ mod tests {
             unsafe { super::super::fasten_store_free_str(out) };
             assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["ref"], "***C***");
         }
+    }
+
+    /// `fasten_redact_full` with the given arguments; panics unless it succeeds.
+    fn redact_full(input: &str, keys: &str, repl: &str, patterns: &str) -> serde_json::Value {
+        let (input, keys) = (CString::new(input).unwrap(), CString::new(keys).unwrap());
+        let (repl, patterns) = (CString::new(repl).unwrap(), CString::new(patterns).unwrap());
+        let mut out: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            fasten_redact_full(input.as_ptr(), keys.as_ptr(), repl.as_ptr(), patterns.as_ptr(), &mut out, ptr::null_mut())
+        };
+        assert_eq!(code, FastenErrorCode::Ok);
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_owned();
+        unsafe { super::super::fasten_store_free_str(out) };
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// The reused redactor is rebuilt whenever any argument changes: a
+    /// stale one would apply the wrong keys or replacement.
+    #[test]
+    fn reused_redactor_follows_every_argument() {
+        let input = r#"{"field_a":"x","field_b":"y"}"#;
+        let out = redact_full(input, r#"["field_a"]"#, "[A]", "[]");
+        assert_eq!((out["field_a"].as_str(), out["field_b"].as_str()), (Some("[A]"), Some("y")));
+        let out = redact_full(input, r#"["field_a"]"#, "[B]", "[]");
+        assert_eq!(out["field_a"], "[B]");
+        let out = redact_full(input, r#"["field_b"]"#, "[B]", "[]");
+        assert_eq!((out["field_a"].as_str(), out["field_b"].as_str()), (Some("x"), Some("[B]")));
+    }
+
+    /// The buffer variant reports a bad pattern the same way.
+    #[test]
+    fn buf_variant_reports_a_bad_pattern() {
+        let input = CString::new(r#"{"k":"v"}"#).unwrap();
+        let empty = CString::new("[]").unwrap();
+        let repl = CString::new("").unwrap();
+        let bad = CString::new(r#"[{"pattern":"([","replacement":"X"}]"#).unwrap();
+        let mut out = [0u8; 256];
+        let mut err = [0u8; 256];
+        let rc = unsafe {
+            fasten_redact_full_buf(
+                input.as_ptr(), empty.as_ptr(), repl.as_ptr(), bad.as_ptr(),
+                out.as_mut_ptr(), 256, err.as_mut_ptr(), 256,
+            )
+        };
+        assert_eq!(rc, -(FastenErrorCode::ErrBadJson as i32));
+        let msg = CStr::from_bytes_until_nul(&err).unwrap().to_str().unwrap();
+        assert!(msg.contains("([") && msg.contains("does not compile"), "{msg}");
     }
 }

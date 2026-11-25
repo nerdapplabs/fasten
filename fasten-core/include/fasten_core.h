@@ -192,6 +192,8 @@ FastenErrorCode fasten_store_ping(FastenStore* store, char** out_err);
  *                        "until"           timestamp <= value (ISO-8601)
  *                        "limit"           max rows (0 = no limit)
  *                        "offset"          skip this many matching rows
+ *                      Any other key is FASTEN_ERR_BAD_JSON, so a misspelt
+ *                      key cannot widen the filter to every row.
  * @param out_rows_json On success: set to a heap-allocated UTF-8 JSON array
  *                      of row objects, ordered by monotonic_seq ASC.
  *                      Free with fasten_store_free_str(). May be NULL.
@@ -412,8 +414,8 @@ FastenErrorCode fasten_redact(
  * @param out_err                   Set on error; may be NULL.
  *
  * @return FASTEN_OK on success, error code otherwise (out_err set).
- *         A pattern that is not a valid regex returns FASTEN_ERR_BAD_JSON,
- *         with out_err naming the pattern.
+ *         A pattern that does not compile returns FASTEN_ERR_BAD_JSON, with
+ *         out_err naming the pattern and the reason.
  */
 FastenErrorCode fasten_redact_full(
     const char* in_json,

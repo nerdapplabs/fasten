@@ -773,6 +773,19 @@ fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 /// own instead. `None` only once dropped.
 struct Conn(Option<pg::Client>);
 
+/// Closes `client` on a new thread. If the OS refuses one, the client is
+/// leaked rather than dropped here: dropping it on the runtime thread
+/// panics, and a panic in drop during unwinding aborts the process.
+fn close_off_runtime(client: pg::Client) {
+    let client = std::mem::ManuallyDrop::new(client);
+    let spawned = std::thread::Builder::new()
+        .name("fasten-pg-close".into())
+        .spawn(move || drop(std::mem::ManuallyDrop::into_inner(client)));
+    if spawned.is_err() {
+        eprintln!("fasten: no thread to close a Postgres connection on; it was left open");
+    }
+}
+
 impl std::ops::Deref for Conn {
     type Target = pg::Client;
     fn deref(&self) -> &pg::Client {
@@ -789,7 +802,7 @@ impl std::ops::DerefMut for Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         if let Some(client) = self.0.take().filter(|_| in_runtime()) {
-            std::thread::spawn(move || drop(client));
+            close_off_runtime(client);
         }
     }
 }
@@ -1310,8 +1323,10 @@ mod tests {
         }
     }
 
-    /// Opened, written, read and dropped on a tokio runtime thread, where
-    /// the sync client panics if it runs there.
+    /// Opened, written, read, purged and dropped on a tokio runtime thread,
+    /// where the sync client panics if it runs there. The drop closes the
+    /// connection on another thread, so this shows only that the runtime
+    /// thread does not panic.
     #[tokio::test]
     async fn works_from_a_tokio_runtime() {
         let Some(dsn) = dsn() else { return };
@@ -1321,6 +1336,8 @@ mod tests {
         crate::AuditStore::insert(&store, &row).expect("insert on a runtime thread");
         let rows = store.chain_rows(&row.source_node_id).expect("read on a runtime thread");
         assert_eq!(rows.len(), 1);
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        crate::AuditStore::purge(&store, cutoff, false).expect("purge on a runtime thread");
         drop(store);
         tokio::task::spawn_blocking(move || {
             let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");

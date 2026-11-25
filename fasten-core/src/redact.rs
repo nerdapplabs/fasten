@@ -305,7 +305,7 @@ impl Redactor {
     /// `Error::InvalidPattern` if a pattern is not a valid regex.
     pub fn with_value_patterns(mut self, patterns: &[(&str, &str)]) -> Result<Self, Error> {
         for (pat, repl) in patterns {
-            let re = Regex::new(pat).map_err(|_| Error::InvalidPattern((*pat).to_owned()))?;
+            let re = Regex::new(pat).map_err(|e| Error::InvalidPattern((*pat).to_owned(), e.to_string()))?;
             self.custom_vp.push((re, (*repl).to_owned()));
         }
         Ok(self)
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn invalid_value_pattern_is_an_error() {
         let err = Redactor::new(&[], "").with_value_patterns(&[("ok_[0-9]+", "A"), ("([", "B")]);
-        assert!(matches!(err, Err(Error::InvalidPattern(p)) if p == "(["));
+        assert!(matches!(err, Err(Error::InvalidPattern(p, reason)) if p == "([" && !reason.is_empty()));
     }
 
     #[test]

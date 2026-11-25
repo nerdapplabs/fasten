@@ -14,9 +14,10 @@ use crate::{
 /// ISO-8601 UTC timestamp bounds applied to the `timestamp` column.
 /// A `None` field is ignored (no constraint).  `limit == 0` means no limit.
 /// Every key may be left out of the JSON form (`fasten_core.h`), so a
-/// missing `limit` or `offset` is 0.
+/// missing `limit` or `offset` is 0. An unknown key is refused: a misspelt
+/// filter would otherwise match every row.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Filter {
     pub request_id:     Option<String>,
     pub code:           Option<String>,
@@ -694,5 +695,13 @@ mod tests {
         assert_eq!((f.limit, f.offset), (0, 0));
         let f: Filter = serde_json::from_str("{}").unwrap();
         assert!(f.code.is_none() && f.limit == 0);
+    }
+
+    /// A misspelt key is refused rather than ignored, which would turn the
+    /// filter into "every row".
+    #[test]
+    fn filter_refuses_an_unknown_key() {
+        let err = serde_json::from_str::<Filter>(r#"{"reqest_id":"abc"}"#).unwrap_err();
+        assert!(err.to_string().contains("reqest_id"), "{err}");
     }
 }

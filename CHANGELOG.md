@@ -11,23 +11,33 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - A drainer built with a queue capacity of 0 takes the default (100), as the
   C ABI already did. Before, every enqueue blocked forever, and stop could not
   wake them.
-- After a row is dead-lettered, the next stored row reports
-  `audit_drain_recovered`. The failure burst now lasts until a row is stored,
-  so its `audit_drain_failed` is not repeated for the next row.
+- A row stored straight after a dead-lettered row reports
+  `audit_drain_recovered`, as the spec asks for an insert that succeeds after
+  failures. The dead letter cleared the failure state, so no recovery was
+  reported. Each failing row still reports its own `audit_drain_failed`.
 - The drainer sleeps the backoff it reports in `in_backoff_until` and
   `audit_drain_degraded`, instead of a second, differently jittered one.
 - A store filter's `limit` and `offset` may be left out of its JSON, as
   `fasten_core.h` says every key may; they default to 0.
-- A redaction value pattern that is not a valid regex returns
-  `FASTEN_ERR_BAD_JSON` naming the pattern, instead of an internal panic.
-  `fasten_redact_full` and its buffer variant reuse the last redactor built
-  rather than recompiling the patterns on every call.
-- Rust: `Redactor::new` takes keys and a replacement; value patterns are added
-  with `with_value_patterns`, which returns an error for a bad pattern.
+- A redaction value pattern that does not compile returns
+  `FASTEN_ERR_BAD_JSON` naming the pattern and the reason, instead of an
+  internal panic. `fasten_redact_full` and its buffer variant reuse the last
+  redactor built rather than recompiling the patterns on every call.
 - Rust: a Postgres audit store can be opened, used and dropped from async
   code. The sync client panicked on a tokio runtime thread ("Cannot start a
   runtime from within a runtime"); from such a thread its calls now run on a
   separate thread.
+
+### Changed (breaking): fasten-core filters and redaction API
+
+- A store filter with a key it does not recognise is refused with
+  `FASTEN_ERR_BAD_JSON`. Unknown keys were ignored before, so a misspelt key
+  could match every row.
+- Rust: `fasten_core::redact::Redactor::new` takes only keys and a
+  replacement. Value patterns are added with `with_value_patterns`, which
+  returns `Error::InvalidPattern` for a pattern that does not compile.
+- Rust: `fasten_core::error::Error` has a new variant, `InvalidPattern`, so an
+  exhaustive `match` on it needs an arm.
 
 ### Fixed: Python `APILogger` keeps the app's exception
 
