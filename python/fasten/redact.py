@@ -146,8 +146,11 @@ class Redactor:
         extra_keys: list[str] | None = None,
         replacement: str = _REDACT_REPLACEMENT,
         extra_value_patterns: Optional[list[tuple[str, str, str]]] = None,
+        check_numbers: bool = False,
     ) -> None:
         self._extra_keys  = extra_keys or []
+        # Numbers with no fractional part get the card rule too.
+        self._check_numbers = check_numbers
         self._replacement = replacement or _REDACT_REPLACEMENT
         # (name, pattern, repl) to (pattern, repl); the name is only a label.
         self._extra_vp: list[tuple[str, str]] = [
@@ -166,6 +169,7 @@ class Redactor:
             not self._extra_keys
             and self._replacement == _REDACT_REPLACEMENT
             and not self._extra_vp
+            and not self._check_numbers
         )
         # Python regex for the non-string-key fallback path.
         if self._extra_keys:
@@ -213,6 +217,7 @@ class Redactor:
             extra_keys=self._extra_keys or None,
             replacement=self._replacement if self._replacement != _REDACT_REPLACEMENT else None,
             extra_value_patterns=self._extra_vp or None,
+            check_numbers=self._check_numbers,
         )
 
     def redact(self, value: Any) -> Any:
@@ -269,6 +274,7 @@ class Redactor:
             extra_keys=[*self._extra_keys, *keys],
             replacement=self._replacement,
             extra_value_patterns=[("", pat, repl) for pat, repl in self._extra_vp],
+            check_numbers=self._check_numbers,
         )
 
     def as_structlog_processor(self) -> Callable[..., Any]:

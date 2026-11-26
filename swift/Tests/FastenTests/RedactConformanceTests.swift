@@ -9,6 +9,7 @@ final class RedactConformanceTests: XCTestCase {
     private struct ConformanceCase: Decodable {
         let name: String
         let group: String
+        let check_numbers: Bool?
         let input: AnyCodable
         let expected: AnyCodable
     }
@@ -25,6 +26,14 @@ final class RedactConformanceTests: XCTestCase {
                 value = a.map { $0.value }
             } else if let s = try? c.decode(String.self) {
                 value = s
+            } else if let n = try? c.decode(Double.self), n.rounded() != n {
+                // On Linux decode(Int.self) also accepts a float and drops
+                // its fraction, so the integer paths only see whole numbers.
+                value = n
+            } else if let i = try? c.decode(Int.self) {
+                value = i
+            } else if let u = try? c.decode(UInt64.self) {
+                value = u
             } else if let n = try? c.decode(Double.self) {
                 value = n
             } else if let b = try? c.decode(Bool.self) {
@@ -59,11 +68,48 @@ final class RedactConformanceTests: XCTestCase {
                        "value_stripe_live: expected ***STRIPE_KEY***")
     }
 
+    func testNumbersKeptByDefault() {
+        let got = Redactor().redact(["card": 4_111_111_111_111_111, "f": 4_111_111_111_111_111.0])
+        XCTAssertEqual(got["card"] as? Int, 4_111_111_111_111_111)
+        XCTAssertEqual(got["f"] as? Double, 4_111_111_111_111_111.0)
+    }
+
+    func testNumberCardValues() {
+        let r = Redactor(checkNumbers: true)
+        let got = r.redact([
+            "card": 4_111_111_111_111_111,
+            "u64": UInt64(9_704_000_000_000_000_008),
+            "whole_float": 4_111_111_111_111_111.0,
+            "ns_float": NSNumber(value: 4_111_111_111_111_111.0),
+            "decimal": NSDecimalNumber(string: "4111111111111111"),
+            "luhn_fails": 1_234_567_890_123_456,
+            "fraction": 4_111_111_111_111_111.5,
+            "below_int64_min": -9.704000000000016e18,
+            "flag": true,
+        ])
+        XCTAssertEqual(got["below_int64_min"] as? String, "***CC***")
+        XCTAssertEqual(got["card"] as? String, "***CC***")
+        XCTAssertEqual(got["u64"] as? String, "***CC***")
+        XCTAssertEqual(got["whole_float"] as? String, "***CC***")
+        XCTAssertEqual(got["ns_float"] as? String, "***CC***")
+        XCTAssertEqual(got["decimal"] as? String, "***CC***")
+        XCTAssertEqual(got["luhn_fails"] as? Int, 1_234_567_890_123_456)
+        XCTAssertEqual(got["fraction"] as? Double, 4_111_111_111_111_111.5)
+        XCTAssertEqual(got["flag"] as? Bool, true)
+    }
+
+    func testNumberCardWithCustomReplacement() {
+        let got = Redactor(replacement: "[gone]", checkNumbers: true)
+            .redact(["card": 4_111_111_111_111_111, "token": "x"])
+        XCTAssertEqual(got["card"] as? String, "***CC***")
+        XCTAssertEqual(got["token"] as? String, "[gone]")
+    }
+
     func testConformance() throws {
-        let redactor = Redactor()
         let cases = try loadCases()
 
         for c in cases {
+            let redactor = Redactor(checkNumbers: c.check_numbers ?? false)
             guard let input = c.input.value as? [String: Any] else {
                 XCTFail("[\(c.name)] input is not a [String:Any]"); continue
             }
@@ -82,6 +128,8 @@ final class RedactConformanceTests: XCTestCase {
     private func _equalAny(_ a: Any, _ b: Any) -> Bool {
         switch (a, b) {
         case (let x as String, let y as String):   return x == y
+        case (let x as Int,    let y as Int):      return x == y
+        case (let x as UInt64, let y as UInt64):   return x == y
         case (let x as Double, let y as Double):   return x == y
         case (let x as Bool,   let y as Bool):     return x == y
         case (_ as NSNull,     _ as NSNull):       return true

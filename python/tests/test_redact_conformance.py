@@ -19,7 +19,7 @@ def _load_cases():
 
 @pytest.mark.parametrize("case", _load_cases(), ids=lambda c: c["name"])
 def test_redact_conformance(case):
-    r = Redactor()
+    r = Redactor(check_numbers=case.get("check_numbers", False))
     result = r.redact(case["input"])
     assert result == case["expected"], (
         f"[{case['name']}] got {result!r}, want {case['expected']!r}"

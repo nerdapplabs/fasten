@@ -482,6 +482,39 @@ void core_event_fields_are_redacted() {
     std::cout << "core event fields are redacted: PASS\n";
 }
 
+// When the core cannot redact the fields (here, nesting deeper than it
+// reads), every value but true, false and null becomes the replacement.
+// When the core fails, the fallback keeps true, false and null; numbers are
+// replaced only when the option checks them, as the core would.
+std::string fallback_fields(int redact_numbers) {
+    reset_state();
+    auto c = cfg("raise");
+    c.redact_numbers = redact_numbers;
+    fasten::init(c);
+    const std::string deep = std::string(200, '[') + std::string(200, ']');
+    auto f = fasten::detail_::redact_json_fields_({
+        {"rows", deep}, {"card", "4111111111111111"}, {"depth", "1"},
+        {"flushed", "true"}, {"row_id", "null"}, {"note", "\"x\""}});
+    std::string line;
+    for (auto& x : f) line += x.key + "=" + x.json + ";";
+    assert(line.find("flushed=true;") != std::string::npos);
+    assert(line.find("row_id=null;") != std::string::npos);
+    assert(line.find("note=\"***\";") != std::string::npos);
+    assert(line.find("[[") == std::string::npos);
+    return line;
+}
+
+void core_event_fields_fallback_numbers() {
+    std::string line = fallback_fields(1);
+    assert(line.find("4111111111111111") == std::string::npos);
+    assert(line.find("card=\"***\";") != std::string::npos);
+    assert(line.find("depth=\"***\";") != std::string::npos);
+    line = fallback_fields(0);
+    assert(line.find("card=4111111111111111;") != std::string::npos);
+    assert(line.find("depth=1;") != std::string::npos);
+    std::cout << "core event fields fallback numbers: PASS\n";
+}
+
 // The sink's error text is redacted in the sys line.
 void sync_fallback_error_is_redacted() {
     reset_state();
@@ -569,6 +602,7 @@ int main() {
     zero_flush_with_idle_drainer();
     core_events_keep_json_types();
     core_event_fields_are_redacted();
+    core_event_fields_fallback_numbers();
     sync_fallback_error_is_redacted();
     reinit_reports_unstored_rows();
     flush_during_shutdown_waits_for_close();

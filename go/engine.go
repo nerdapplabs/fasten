@@ -80,6 +80,7 @@ type Engine struct {
 	redactMu            sync.RWMutex
 	redactExtraKeysJSON string
 	redactReplacement   string
+	redactNumbers       bool
 
 	// retentionCancel stops this Engine's purger goroutines and retentionWg
 	// waits for them, so their stores are closed only once they have exited.
@@ -122,9 +123,10 @@ func (e *Engine) config() *engineConfig {
 
 // configureRedaction sets this Engine's extra redact keys and replacement
 // from config, or else from FASTEN_REDACT_KEYS (comma-separated) and
-// FASTEN_REDACT_REPLACEMENT. Both are always set, so a repeat Init doesn't
-// keep the previous values.
-func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
+// FASTEN_REDACT_REPLACEMENT, and whether numbers get the card rule from
+// config, or else from FASTEN_REDACT_NUMBERS. All are always set, so a
+// repeat Init doesn't keep the previous values.
+func (e *Engine) configureRedaction(extraKeys []string, replacement string, numbers *bool) {
 	if len(extraKeys) == 0 {
 		if env := envOr("FASTEN_REDACT_KEYS", ""); env != "" {
 			for _, k := range strings.Split(env, ",") {
@@ -147,9 +149,15 @@ func (e *Engine) configureRedaction(extraKeys []string, replacement string) {
 		replacement = ""
 	}
 
+	checkNumbers := isTruthy(envOr("FASTEN_REDACT_NUMBERS", ""))
+	if numbers != nil {
+		checkNumbers = *numbers
+	}
+
 	e.redactMu.Lock()
 	e.redactExtraKeysJSON = extraJSON
 	e.redactReplacement = replacement
+	e.redactNumbers = checkNumbers
 	e.redactMu.Unlock()
 }
 
@@ -282,7 +290,7 @@ func (e *Engine) Init(cfg Config) error {
 	e.persistedStreams = persistedStreams(cfg.AuditStore, cfg.APIStore, cfg.SyslogStore)
 	e.storeMu.Unlock()
 
-	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement)
+	e.configureRedaction(cfg.ExtraRedactKeys, cfg.RedactReplacement, cfg.RedactNumbers)
 
 	var nextDrainer *cFastenDrainer
 	if strategy == "queue" && e.auditStore != nil {
@@ -986,6 +994,7 @@ func (e *Engine) ResetForTests() {
 	e.redactMu.Lock()
 	e.redactExtraKeysJSON = ""
 	e.redactReplacement = ""
+	e.redactNumbers = false
 	e.redactMu.Unlock()
 }
 

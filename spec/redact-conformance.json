@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "description": "Cross-language redaction conformance corpus. Every SDK MUST pass every case. The Rust implementation in fasten-core/src/redact.rs is canonical. Input and expected are JSON-serialisable objects. Value-shape tests use the neutral key 'note' so key-pattern redaction does not interfere. NOTE: The Stripe live-key case (sk_live_[A-Za-z0-9]{24,}) is intentionally absent — JSON cannot use string concatenation so the literal would trigger GitHub push protection. Each SDK covers it via a runtime-constructed test in its own test suite.",
+  "description": "Cross-language redaction conformance corpus. Every SDK MUST pass every case. The Rust implementation in fasten-core/src/redact.rs is canonical. Input and expected are JSON-serialisable objects. Value-shape tests use the neutral key 'note' so key-pattern redaction does not interfere. NOTE: The Stripe live-key case (sk_live_[A-Za-z0-9]{24,}) is intentionally absent — JSON cannot use string concatenation so the literal would trigger GitHub push protection. Each SDK covers it via a runtime-constructed test in its own test suite. A case with \"check_numbers\": true runs with the option that checks numbers with no fractional part against the card rule; without it the option is off, the default.",
   "replacement": "***",
   "cases": [
     {
@@ -878,6 +878,123 @@
       "group": "value_shape",
       "input":    {"note": "Authorization: Basic OnRva2Vu"},
       "expected": {"note": "Authorization: Basic OnRva2Vu"}
+    },
+    {
+      "name": "value_cc_integer",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"card": 4111111111111111},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_nested",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"payments": [{"card": 4539578763621486, "amount": 1999}]},
+      "expected": {"payments": [{"card": "***CC***", "amount": 1999}]}
+    },
+    {
+      "name": "safe_integer_not_cc",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"ref": 1234567890123456},
+      "expected": {"ref": 1234567890123456}
+    },
+    {
+      "name": "safe_integer_short",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"count": 4111},
+      "expected": {"count": 4111}
+    },
+    {
+      "name": "value_cc_integer_19_digit",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"card": 9704000000000000008},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_negative",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"card": -4111111111111111},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_13_digit",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"card": 4222222222222},
+      "expected": {"card": "***CC***"}
+    },
+    {
+      "name": "value_cc_integer_in_array",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"ids": [4111111111111111, 42]},
+      "expected": {"ids": ["***CC***", 42]}
+    },
+    {
+      "name": "safe_integer_above_2_53",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"ref": 9007199254740993},
+      "expected": {"ref": 9007199254740993}
+    },
+    {
+      "name": "value_cc_whole_float",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"f": 4111111111111111.0},
+      "expected": {"f": "***CC***"}
+    },
+    {
+      "name": "safe_float_with_fraction",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"f": 4222222222222.5},
+      "expected": {"f": 4222222222222.5}
+    },
+    {
+      "name": "safe_float_with_fraction_16_digit",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"f": 4111111111111111.5},
+      "expected": {"f": 4111111111111111.5}
+    },
+    {
+      "name": "value_cc_whole_float_16_digit",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"f": 4111111111111038.0},
+      "expected": {"f": "***CC***"}
+    },
+    {
+      "name": "key_rule_wins_over_integer",
+      "group": "priority",
+      "check_numbers": true,
+      "input":    {"password": 4111111111111111},
+      "expected": {"password": "***"}
+    },
+    {
+      "name": "value_cc_negative_whole_float",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"n": -9.704000000000016e18},
+      "expected": {"n": "***CC***"}
+    },
+    {
+      "name": "safe_integer_card_check_numbers_off",
+      "group": "safe",
+      "input":    {"card": 4111111111111111},
+      "expected": {"card": 4111111111111111}
+    },
+    {
+      "name": "safe_integer_order_id_check_numbers_off",
+      "group": "safe",
+      "input":    {"order_id": 4175167669791},
+      "expected": {"order_id": 4175167669791}
     }
   ]
 }

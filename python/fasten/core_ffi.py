@@ -84,6 +84,13 @@ def _configure(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p),
     ]
 
+    # Missing from a libfasten_core built before it; only check_numbers uses it.
+    if hasattr(lib, "fasten_redact_opts"):
+        lib.fasten_redact_opts.restype  = c_int
+        lib.fasten_redact_opts.argtypes = [
+            c_char_p, c_char_p, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p),
+        ]
+
     lib.fasten_register_codes.restype  = c_int
     lib.fasten_register_codes.argtypes = [c_char_p, c_char_p, ctypes.POINTER(c_char_p)]
 
@@ -207,9 +214,22 @@ def redact_json_full(
     extra_keys: Optional[list[str]] = None,
     replacement: Optional[str] = None,
     extra_value_patterns: Optional[list[tuple[str, str]]] = None,
+    check_numbers: bool = False,
 ) -> str:
-    """Redact with custom key patterns, replacement, and value-shape patterns."""
+    """Redact with custom key patterns, replacement, and value-shape patterns.
+    ``check_numbers`` checks numbers with no fractional part against the
+    card rule."""
     lib    = get_lib()
+    if check_numbers:
+        opts = {
+            "extra_keys": extra_keys or [],
+            "replacement": replacement or "",
+            "extra_value_patterns": [
+                {"pattern": p, "replacement": r} for (p, r) in (extra_value_patterns or [])
+            ],
+            "check_numbers": True,
+        }
+        return _call_out_str(lib.fasten_redact_opts, in_json.encode(), json.dumps(opts).encode())
     ek_j   = json.dumps(extra_keys).encode() if extra_keys else None
     repl_b = replacement.encode() if replacement else None
     evp_j  = (

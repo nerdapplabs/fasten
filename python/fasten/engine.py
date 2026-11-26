@@ -84,6 +84,8 @@ class FastenConfig:
     # unless it matches the attached stores exactly. None means "whatever has
     # a store". Audit persistence is controlled by audit_store alone.
     persist_streams: Optional[frozenset[str]]
+    # Numbers with no fractional part get the card rule (off by default).
+    redact_numbers: bool = False
 
 
 _DSN_SCHEMES = ("sqlite", "postgres", "postgresql", "")
@@ -393,6 +395,7 @@ class Engine:
         retention_syslog: Optional[str] = None,
         retention_pii: Optional[str] = None,
         persist_streams: Optional[list[str] | set[str] | frozenset[str]] = None,
+        redact_numbers: Optional[bool] = None,
     ) -> FastenConfig:
         """Resolve arguments and environment variables into a FastenConfig.
 
@@ -439,6 +442,9 @@ class Engine:
             if os.environ.get("FASTEN_REDACT_KEYS") else None
         )
         replacement = _pick(redact_replacement, "FASTEN_REDACT_REPLACEMENT", "***")
+        if redact_numbers is None:
+            env_numbers = os.environ.get("FASTEN_REDACT_NUMBERS", "")
+            redact_numbers = env_numbers.strip().lower() in ("1", "true", "yes", "on")
 
         env_strategy = os.environ.get("FASTEN_AUDIT_STORE_FAILURE_STRATEGY")
         strategy = (env_strategy or audit_store_failure_strategy or "queue").lower()
@@ -496,6 +502,7 @@ class Engine:
             api_store=resolved_api_store,
             syslog_store=resolved_syslog_store,
             redact_replacement=replacement,
+            redact_numbers=redact_numbers,
             extra_redact_keys=[k.strip() for k in raw_keys if k.strip()] if raw_keys else None,
             extra_value_redact_patterns=extra_value_redact_patterns,
             audit_store_failure_strategy=strategy,
@@ -523,6 +530,7 @@ class Engine:
             extra_keys=cfg.extra_redact_keys,
             replacement=cfg.redact_replacement,
             extra_value_patterns=cfg.extra_value_redact_patterns,
+            check_numbers=cfg.redact_numbers,
         )
 
         # Old purgers would otherwise keep running against the old store.
@@ -689,6 +697,7 @@ class Engine:
         retention_syslog: str | None = None,
         retention_pii: str | None = None,
         persist_streams: list[str] | set[str] | frozenset[str] | None = None,
+        redact_numbers: bool | None = None,
     ) -> None:
         """Initialise this Engine. Equivalent to start(init_config(...))."""
         self.start(self.init_config(
@@ -704,6 +713,7 @@ class Engine:
             retention_api=retention_api, retention_syslog=retention_syslog,
             retention_pii=retention_pii,
             persist_streams=persist_streams,
+            redact_numbers=redact_numbers,
         ))
 
     def emit(

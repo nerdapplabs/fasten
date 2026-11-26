@@ -205,6 +205,86 @@ pub unsafe extern "C" fn fasten_redact_full(
     }
 }
 
+/// Options for `fasten_redact_opts`. Every field is optional.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RedactOptions {
+    extra_keys:           Vec<String>,
+    replacement:          String,
+    extra_value_patterns: Vec<ExtraValuePattern>,
+    check_numbers:        bool,
+}
+
+fn redact_with_options(input: &str, options_json: Option<&str>) -> Result<String, crate::error::Error> {
+    let opts: RedactOptions = match options_json {
+        Some(json) if !json.is_empty() => serde_json::from_str(json)?,
+        _ => RedactOptions::default(),
+    };
+    let key_refs: Vec<&str> = opts.extra_keys.iter().map(String::as_str).collect();
+    let vp_refs: Vec<(&str, &str)> = opts
+        .extra_value_patterns
+        .iter()
+        .map(|p| (p.pattern.as_str(), p.replacement.as_str()))
+        .collect();
+    Redactor::new(&key_refs, &opts.replacement)
+        .with_value_patterns(&vp_refs)?
+        .with_check_numbers(opts.check_numbers)
+        .redact_json(input)
+}
+
+/// Redact a JSON value with options given as one JSON object:
+/// `{"extra_keys":[...],"replacement":"...","extra_value_patterns":[...],
+/// "check_numbers":true}`. Every field is optional; the defaults are those
+/// of `fasten_redact`. `check_numbers` turns on the card rule for numbers
+/// with no fractional part.
+///
+/// `in_json`:      UTF-8 JSON string.
+/// `options_json`: nullable: the options object. NULL = defaults.
+/// `out_json`:     set to heap-allocated redacted JSON on success.
+///                 Free with `fasten_store_free_str`. May be NULL.
+/// `out_err`:      set on error; may be NULL.
+///
+/// Returns `FASTEN_OK` (0) on success, an error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_redact_opts(
+    in_json:      *const c_char,
+    options_json: *const c_char,
+    out_json:     *mut *mut c_char,
+    out_err:      *mut *mut c_char,
+) -> FastenErrorCode {
+    let r = guarded(|| redact_with_options(read_req(in_json)?, read_opt(options_json)?));
+    match r {
+        Ok(json) => {
+            set_error(out_json, &json);
+            FastenErrorCode::Ok
+        }
+        Err((code, msg)) => {
+            set_error(out_err, &msg);
+            code
+        }
+    }
+}
+
+/// Buffer-based variant of `fasten_redact_opts`.
+///
+/// Returns bytes written (exclusive of NUL) on success.
+/// Returns `-(FastenErrorCode as i32)` on error.
+#[no_mangle]
+pub unsafe extern "C" fn fasten_redact_opts_buf(
+    in_json:      *const c_char,
+    options_json: *const c_char,
+    out_buf:      *mut u8,
+    buf_len:      u32,
+    out_err_buf:  *mut u8,
+    err_buf_len:  u32,
+) -> i32 {
+    let r = guarded(|| redact_with_options(read_req(in_json)?, read_opt(options_json)?));
+    match r {
+        Ok(json)      => write_to_buf(out_buf, buf_len as usize, &json),
+        Err((c, msg)) => write_err_to_buf(out_err_buf, err_buf_len as usize, &msg, c),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{CStr, CString};
@@ -228,6 +308,39 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["password"], "***");
         assert_eq!(v["ok"], "v");
+    }
+
+    fn redact_opts(input: &str, options: Option<&str>) -> (FastenErrorCode, String) {
+        let input = CString::new(input).unwrap();
+        let options = options.map(|o| CString::new(o).unwrap());
+        let mut out: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            fasten_redact_opts(
+                input.as_ptr(),
+                options.as_ref().map_or(ptr::null(), |o| o.as_ptr()),
+                &mut out,
+                &mut err,
+            )
+        };
+        let p = if out.is_null() { err } else { out };
+        let text = if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned() };
+        if !p.is_null() {
+            unsafe { super::super::fasten_store_free_str(p) };
+        }
+        (code, text)
+    }
+
+    #[test]
+    fn opts_check_numbers() {
+        let input = r#"{"card":4111111111111111,"token":"x"}"#;
+        let (code, out) = redact_opts(input, None);
+        assert_eq!(code, FastenErrorCode::Ok);
+        assert_eq!(out, r#"{"card":4111111111111111,"token":"***"}"#);
+        let (_, out) = redact_opts(input, Some(r#"{"check_numbers":true,"replacement":"[gone]"}"#));
+        assert_eq!(out, r#"{"card":"***CC***","token":"[gone]"}"#);
+        let (code, _) = redact_opts(input, Some(r#"{"check_number":true}"#));
+        assert_ne!(code, FastenErrorCode::Ok);
     }
 
     /// A bad value pattern from the host is an `ErrBadJson` naming the

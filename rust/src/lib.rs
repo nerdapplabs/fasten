@@ -694,17 +694,18 @@ pub(crate) fn redact_value(
     v: &serde_json::Value,
     extra: Option<&[String]>,
     replacement: Option<&str>,
+    numbers: bool,
 ) -> serde_json::Value {
     use fasten_core::redact::{Redactor, REDACTOR};
     // An empty replacement means the built-in "***". Build a custom Redactor
-    // only when there are extra keys or a custom replacement.
+    // only when there are extra keys, a custom replacement or numbers to check.
     let repl = replacement.unwrap_or("");
     let has_extra = extra.is_some_and(|k| !k.is_empty());
-    if has_extra || !repl.is_empty() {
+    if has_extra || !repl.is_empty() || numbers {
         let refs: Vec<&str> = extra
             .map(|k| k.iter().map(String::as_str).collect())
             .unwrap_or_default();
-        Redactor::new(&refs, repl).redact_value(v)
+        Redactor::new(&refs, repl).with_check_numbers(numbers).redact_value(v)
     } else {
         REDACTOR.redact_value(v)
     }
@@ -714,9 +715,10 @@ fn redact_detail(
     detail: HashMap<String, serde_json::Value>,
     extra: Option<&[String]>,
     replacement: Option<&str>,
+    numbers: bool,
 ) -> HashMap<String, serde_json::Value> {
     let v = serde_json::Value::Object(detail.into_iter().collect());
-    match redact_value(&v, extra, replacement) {
+    match redact_value(&v, extra, replacement, numbers) {
         serde_json::Value::Object(map) => map.into_iter().collect(),
         _ => unreachable!("redact_value on Object always returns Object"),
     }
@@ -958,6 +960,10 @@ pub struct Config {
     /// Custom redaction replacement token (None means the built-in "***").
     /// `config_from_env` reads it from FASTEN_REDACT_REPLACEMENT.
     pub redact_replacement: Option<String>,
+    /// Check numbers with no fractional part (integers and whole-number
+    /// floats) against the card rule: a match becomes `"***CC***"`. None
+    /// reads `FASTEN_REDACT_NUMBERS` (1, true, yes or on); off by default.
+    pub redact_numbers: Option<bool>,
     /// Durable audit store. With `audit_store_failure_strategy = "queue"`,
     /// `EmitBuilder::submit()` puts rows on a bounded in-memory queue that is
     /// drained in the background.
@@ -1192,6 +1198,7 @@ impl EmitBuilder {
                 kept,
                 cfg.extra_redact_keys.as_deref(),
                 cfg.redact_replacement.as_deref(),
+                cfg.redact_numbers == Some(true),
             );
             out.insert("_redacted".into(), serde_json::Value::String(REDACT_REPLACEMENT.into()));
             out.insert("_pii_in_detail".into(), serde_json::Value::Bool(true));
@@ -1201,6 +1208,7 @@ impl EmitBuilder {
                 self.detail,
                 cfg.extra_redact_keys.as_deref(),
                 cfg.redact_replacement.as_deref(),
+                cfg.redact_numbers == Some(true),
             )
         };
         let row = Row {
@@ -1327,7 +1335,7 @@ mod tests {
             "nested".into(),
             serde_json::json!({"token": "xyz", "ok": "keep"}),
         );
-        let out = redact_detail(d, None, None);
+        let out = redact_detail(d, None, None, false);
         assert_eq!(out["email"], serde_json::json!("a@b.com"));
         assert_eq!(out["api_key"], serde_json::json!("***"));
         assert_eq!(out["nested"]["token"], serde_json::json!("***"));
@@ -1341,7 +1349,7 @@ mod tests {
         d.insert("badge".into(), serde_json::json!("b"));
         d.insert("ok".into(), serde_json::json!("v"));
         let extra = vec!["badge".to_string()];
-        let out = redact_detail(d, Some(&extra), Some("[X]"));
+        let out = redact_detail(d, Some(&extra), Some("[X]"), false);
         assert_eq!(out["password"], serde_json::json!("[X]"));
         assert_eq!(out["badge"], serde_json::json!("[X]"));
         assert_eq!(out["ok"], serde_json::json!("v"));
@@ -1350,9 +1358,24 @@ mod tests {
         let mut d2 = HashMap::new();
         d2.insert("secret".into(), serde_json::json!("s"));
         d2.insert("ok".into(), serde_json::json!("v"));
-        let out2 = redact_detail(d2, None, Some("##"));
+        let out2 = redact_detail(d2, None, Some("##"), false);
         assert_eq!(out2["secret"], serde_json::json!("##"));
         assert_eq!(out2["ok"], serde_json::json!("v"));
+    }
+
+    #[test]
+    fn redact_numbers_only_when_enabled() {
+        let detail = || {
+            let mut d = HashMap::new();
+            d.insert("card".into(), serde_json::json!(4_111_111_111_111_111_u64));
+            d.insert("token".into(), serde_json::json!("x"));
+            d
+        };
+        let off = redact_detail(detail(), None, Some("[gone]"), false);
+        assert_eq!(off["card"], serde_json::json!(4_111_111_111_111_111_u64));
+        let on = redact_detail(detail(), None, Some("[gone]"), true);
+        assert_eq!(on["card"], serde_json::json!("***CC***"));
+        assert_eq!(on["token"], serde_json::json!("[gone]"));
     }
 
     #[test]
