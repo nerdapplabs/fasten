@@ -32,7 +32,6 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-
 DEFAULT_URL = "http://localhost:9000/api/v1/logs"
 STREAMS = ("audit", "sys", "api")
 

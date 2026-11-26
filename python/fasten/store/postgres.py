@@ -446,9 +446,16 @@ class PostgresStore:
         With ``local_node_id``, ingest stops at the first row from that node
         (see ``repo.ingest_without_local_node``).
         """
-        from .repo import (IngestResult, StoredMeanwhile, check_inserted, cut_at_conflict,
-                           ingest_without_local_node, skipped_unsealed, stored_conflict,
-                           verified_prefix)
+        from .repo import (
+            IngestResult,
+            StoredMeanwhile,
+            check_inserted,
+            cut_at_conflict,
+            ingest_without_local_node,
+            skipped_unsealed,
+            stored_conflict,
+            verified_prefix,
+        )
 
         if local_node_id:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
@@ -464,7 +471,8 @@ class PostgresStore:
                     # against what is already stored (spec §4): a conflicting
                     # row is reported, never ignored.
                     for node in sorted({r.source_node_id for r in verified + unsealed}):
-                        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (node,))
+                        cur.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (node,))
 
                     def by_id(row_id: str) -> str | None:
                         cur.execute(f"SELECT hash FROM {self._table} WHERE id = %s", (row_id,))
@@ -779,8 +787,10 @@ class PostgresStore:
                         "tenant_id": r[2],
                         "rows": int(r[3]),
                         # TIMESTAMPTZ in a Go-created table: same canonical form.
-                        "first_seen": _utc_iso(first_seen) if isinstance(first_seen, datetime) else first_seen,
-                        "last_seen": _utc_iso(last_seen) if isinstance(last_seen, datetime) else last_seen,
+                        "first_seen": (_utc_iso(first_seen)
+                                       if isinstance(first_seen, datetime) else first_seen),
+                        "last_seen": (_utc_iso(last_seen)
+                                      if isinstance(last_seen, datetime) else last_seen),
                     })
                 return out
 

@@ -334,6 +334,42 @@ def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys
     assert captured.err.count("libfasten_core not found") == 1
 
 
+def test_bad_value_pattern_is_refused_when_configured():
+    """A pattern the core cannot compile is refused where it is configured,
+    naming it, instead of turning every detail into the unredactable marker."""
+    with pytest.raises(ValueError, match=r"extra_value_redact_patterns: .*\(\["):
+        Redactor(extra_value_patterns=[("ok", r"OK_\d+", "X"), ("bad", "([", "Y")])
+
+
+def test_rejected_reinit_keeps_the_running_config():
+    """A bad pattern on re-init raises before anything changes, so the
+    engine keeps the redactor it had."""
+    from fasten.engine import Engine
+    e = Engine()
+    e.init(service_id="svc", node_id="n1", extra_redact_keys=["field_x"])
+    try:
+        before = e._redactor
+        with pytest.raises(ValueError):
+            e.init(service_id="svc", node_id="n1",
+                   extra_value_redact_patterns=[("bad", "([", "Y")])
+        assert e._redactor is before
+        assert before.redact({"field_x": "v"}) == {"field_x": "***"}
+    finally:
+        e.close()
+
+
+def test_bad_value_pattern_is_refused_before_a_dsn_store_opens(tmp_path, monkeypatch):
+    """init_config opens DSN stores; a pattern refused after that would leave
+    a connection nothing closes. It is checked first, so no store is opened."""
+    from fasten.engine import Engine
+    db = tmp_path / "audit.db"
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", str(db))
+    with pytest.raises(ValueError, match="extra_value_redact_patterns"):
+        Engine().init_config(service_id="svc", node_id="n1",
+                             extra_value_redact_patterns=[("bad", "([", "Y")])
+    assert not db.exists()
+
+
 # Values json.dumps cannot encode as they are
 
 def test_custom_value_pattern_applies_under_a_tuple_key():
@@ -405,3 +441,19 @@ def test_very_deep_nesting_becomes_the_unredactable_marker(r):
         cur["a"] = {}
         cur = cur["a"]
     assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_redaction_failure_is_logged_once_per_error_type(caplog):
+    """A failure inside redaction blanks the detail; the first of each error
+    type is logged so a bug there is seen. The value is not in the log."""
+    r = Redactor(replacement="<x>")
+
+    def broken(_s):
+        raise KeyError("hunter2")
+    r._fast_redact_json = broken
+    assert r.redact({"note": "a"})["_redact_failed"] is True
+    assert r.redact({"note": "b"})["_redact_failed"] is True
+    logged = [rec.getMessage() for rec in caplog.records if rec.name == "fasten"]
+    assert len(logged) == 1
+    assert logged[0].startswith("redaction failed (KeyError)")
+    assert "hunter2" not in logged[0]

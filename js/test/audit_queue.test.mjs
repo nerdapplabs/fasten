@@ -253,6 +253,75 @@ test('drainer first failure emits warn to sys (captured via stderr)', async () =
         `expected audit_drain_recovered; got ${JSON.stringify(events)}`);
 });
 
+test('changing the row emit() returned does not change what is stored', async () => {
+    const store = new RecordingStore();
+    _initQueue(store);
+    const row = emit({ code: 'USER_CREATED', target: 'u-1', detail: { note: 'ok', password: 'hunter2' } });
+    assert.equal(row.detail.password, '***');
+    row.detail.password = 'hunter2';
+    row.detail.note = 'changed';
+    assert.equal(await flush(2000), true);
+    assert.equal(store.rows.length, 1);
+    assert.equal(store.rows[0].detail.password, '***');
+    assert.equal(store.rows[0].detail.note, 'ok');
+});
+
+// Emits one row per target through `store` and returns the drainer's
+// audit_drain_* events in order.
+async function drainEvents(store, targets, opts = {}) {
+    const captured = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => {
+        try {
+            const obj = JSON.parse(String(chunk).trim());
+            if (obj.shape === 'sys') captured.push(obj.event);
+        } catch { /* not json */ }
+        return origWrite(chunk, ...rest);
+    };
+    try {
+        _initQueue(store, {
+            queueRetryInitialMs: 5,
+            queueRetryMaxMs: 5,
+            queueRetryJitter: false,
+            ...opts,
+        });
+        for (const target of targets) emit({ code: 'USER_CREATED', target });
+        assert.equal(await flush(2000), true);
+    } finally {
+        process.stderr.write = origWrite;
+    }
+    return captured.filter((e) => e.startsWith('audit_drain_'));
+}
+
+// Rejects the row whose target is 'bad' (SQLSTATE 23505), stores the rest.
+class RejectBadStore extends RecordingStore {
+    insert(row) {
+        if (row.target === 'bad') throw Object.assign(new Error('duplicate'), { code: '23505' });
+        super.insert(row);
+    }
+}
+
+test('a row stored right after a dead letter reports recovery (spec §4)', async () => {
+    assert.deepEqual(
+        await drainEvents(new FlakyStore(2), ['a', 'b'], { queueDrainMaxAttempts: 2 }),
+        ['audit_drain_failed', 'audit_drain_dead_letter', 'audit_drain_recovered'],
+    );
+});
+
+test('the row after a dead letter reports its own first failure', async () => {
+    assert.deepEqual(
+        await drainEvents(new FlakyStore(3), ['a', 'b'], { queueDrainMaxAttempts: 2 }),
+        ['audit_drain_failed', 'audit_drain_dead_letter', 'audit_drain_failed', 'audit_drain_recovered'],
+    );
+});
+
+test('a row rejected on its first attempt, then a success, reports no recovery', async () => {
+    assert.deepEqual(
+        await drainEvents(new RejectBadStore(), ['bad', 'good']),
+        ['audit_drain_dead_letter'],
+    );
+});
+
 test('drainer degraded after 5 failures', async () => {
     const store = new BrokenStore();
     const captured = [];
@@ -743,4 +812,9 @@ test('an idle drainer lets the process exit', async () => {
     });
     assert.equal(code, 0, `child did not exit on its own (${Date.now() - t0} ms)`);
     assert.match(err, /stored 1/);
+});
+
+test('queueCapacity 0 means the default, as in the other SDKs', async () => {
+    _initQueue(new RecordingStore(), { queueCapacity: 0 });
+    assert.equal(queueStats().capacity, 100);
 });

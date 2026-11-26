@@ -5,11 +5,12 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from ..canonical_ts import canonical_now
-from ..context import _request_id, current_request_id, mint_id, _set_request_id, usable_request_id
+from ..context import _request_id, _set_request_id, current_request_id, mint_id, usable_request_id
 
 Receive = Callable[[], Awaitable[dict[str, Any]]]
 Send = Callable[[dict[str, Any]], Awaitable[None]]
@@ -24,6 +25,9 @@ def _client_request_id(raw: bytes) -> str:
         return usable_request_id(raw.decode("ascii"))
     except UnicodeDecodeError:
         return ""
+
+
+_log = logging.getLogger("fasten.shim.http")
 
 
 class RequestIDMiddleware:
@@ -88,28 +92,40 @@ class APILogger:
         # Capture status + rid at response.start time. Reading current_request_id()
         # after the inner await chain returns is too late: any downstream
         # RequestIDMiddleware will have reset its contextvar token by then.
-        snapshot: dict[str, Any] = {"status": 200, "request_id": ""}
+        snapshot: dict[str, Any] = {"status": 200, "request_id": "", "started": False}
 
         async def send_wrapper(msg: dict[str, Any]) -> None:
             if msg["type"] == "http.response.start":
                 snapshot["status"] = int(msg.get("status", 200))
                 snapshot["request_id"] = current_request_id() or ""
+                snapshot["started"] = True
             await send(msg)
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # The server answers an app error raised before the response
+            # started with a 500, outside this middleware.
+            if not snapshot["started"]:
+                snapshot["status"] = 500
+                snapshot["request_id"] = current_request_id() or ""
+            raise
         finally:
             duration_ms = int((time.monotonic() - start) * 1000)
             from ..emitter import transport as _transport
             t = _transport()
-            if t is None:
-                return
-            row = {
-                "method": scope.get("method", ""),
-                "path": path,
-                "status": snapshot["status"],
-                "duration_ms": duration_ms,
-                "request_id": snapshot["request_id"],
-                "timestamp": canonical_now(),
-            }
-            t.write_api(row)
+            if t is not None:
+                try:
+                    t.write_api({
+                        "method": scope.get("method", ""),
+                        "path": path,
+                        "status": snapshot["status"],
+                        "duration_ms": duration_ms,
+                        "request_id": snapshot["request_id"],
+                        "timestamp": canonical_now(),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    # A failed log write must not replace the app's exception
+                    # or fail a request that was served.
+                    _log.warning("fasten api log write failed: %s", type(e).__name__,
+                                 extra={"_fasten_internal": True})

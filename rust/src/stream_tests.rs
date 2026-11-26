@@ -456,3 +456,24 @@ fn backends_include_postgres_when_required() {
     }
     assert!(labels.contains(&"sqlite"));
 }
+
+// Opened, written, read, purged and dropped on a tokio runtime thread, where
+// the sync client panics if it runs there: an app under tokio::main with
+// FASTEN_API_DSN or FASTEN_SYSLOG_DSN set.
+#[cfg(feature = "store-postgres")]
+#[tokio::test]
+async fn postgres_stream_store_works_from_a_tokio_runtime() {
+    let Some(dsn) = crate::test_support::pg_dsn() else { return };
+    let table = uniq("tokio");
+    let s = crate::PostgresStreamStore::new(&dsn, &table).expect("open on a runtime thread");
+    s.insert(&row(json!({ "request_id": "r-tokio" }))).expect("insert on a runtime thread");
+    assert_eq!(s.count().expect("read on a runtime thread"), 1);
+    s.purge(chrono::Utc::now() - chrono::Duration::days(1)).expect("purge on a runtime thread");
+    drop(s);
+    tokio::task::spawn_blocking(move || {
+        let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {table}")).expect("drop");
+    })
+    .await
+    .expect("cleanup");
+}

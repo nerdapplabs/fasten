@@ -297,7 +297,8 @@ final class QueueDrainer: @unchecked Sendable {
 
     private func _onSuccess(_ row: AuditRow) {
         cond.lock()
-        let wasRetrying = retryCount > 0
+        // Spec: recovered fires when an insert succeeds after failures, a
+        // success straight after a dead letter included.
         let burstStart  = failureBurstStart
         retryCount      = 0
         inBackoffUntil  = .distantPast
@@ -305,7 +306,7 @@ final class QueueDrainer: @unchecked Sendable {
         lastError       = nil
         degradedFired   = false
         cond.unlock()
-        if wasRetrying, let s = burstStart {
+        if let s = burstStart {
             sysLog("info", "audit_drain_recovered",
                    ["recovery_after_seconds": round3(Date().timeIntervalSince(s))])
         }
@@ -316,8 +317,10 @@ final class QueueDrainer: @unchecked Sendable {
 
     private func _onFailure(_ msg: String) {
         cond.lock()
+        // Spec: failed fires once per failing row (retry_count 0 to 1). The
+        // burst start is kept until a row is stored, across dead letters.
         let isFirst = retryCount == 0
-        if isFirst { failureBurstStart = Date() }
+        if failureBurstStart == nil { failureBurstStart = Date() }
         retryCount += 1
         lastError   = msg
         let delayMs = _backoffMs(retryCount)

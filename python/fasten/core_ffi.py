@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+
 def _find_lib() -> str:
     if (env := os.environ.get("FASTEN_CORE_LIB")):
         return env
@@ -122,7 +123,8 @@ def _configure(lib: ctypes.CDLL) -> None:
     ]
 
     lib.fasten_drainer_stats_json.restype  = c_int
-    lib.fasten_drainer_stats_json.argtypes = [vp, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
+    lib.fasten_drainer_stats_json.argtypes = [
+        vp, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p)]
 
     lib.fasten_drainer_close.restype  = None
     lib.fasten_drainer_close.argtypes = [vp]
@@ -159,7 +161,8 @@ def _call_out_str(fn: Any, *args: Any) -> str:
     err  = ctypes.c_char_p(None)
     rc   = fn(*args, ctypes.byref(out), ctypes.byref(err))
     if rc != _FASTEN_OK:
-        msg = err.value.decode("utf-8", errors="replace") if err.value else f"fasten error code {rc}"
+        msg = (err.value.decode("utf-8", errors="replace") if err.value
+               else f"fasten error code {rc}")
         if err.value:
             lib.fasten_store_free_str(err)
         raise _rc_to_error(rc, msg)
@@ -175,7 +178,8 @@ def _call_no_out(fn: Any, *args: Any) -> None:
     err = ctypes.c_char_p(None)
     rc  = fn(*args, ctypes.byref(err))
     if rc != _FASTEN_OK:
-        msg = err.value.decode("utf-8", errors="replace") if err.value else f"fasten error code {rc}"
+        msg = (err.value.decode("utf-8", errors="replace") if err.value
+               else f"fasten error code {rc}")
         if err.value:
             lib.fasten_store_free_str(err)
         raise _rc_to_error(rc, msg)

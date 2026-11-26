@@ -164,7 +164,7 @@ fn has_auth_header(s: &str) -> bool {
 /// DEL or C1) and a ":". With an empty user name (":token", as some access
 /// tokens are sent) the password needs 16 or more characters.
 fn is_basic_credential(token: &str) -> bool {
-    if token.is_empty() || token.len() % 4 != 0 {
+    if token.is_empty() || !token.len().is_multiple_of(4) {
         return false;
     }
     let mut acc: u32 = 0;
@@ -258,7 +258,7 @@ fn luhn_valid(digits: &str) -> bool {
         }
         total += n;
     }
-    total % 10 == 0
+    total.is_multiple_of(10)
 }
 
 pub struct Redactor {
@@ -281,23 +281,10 @@ impl Default for Redactor {
 impl Redactor {
     /// `extra_keys`: plain strings, not regexes; they are escaped.
     /// `replacement`: defaults to `"***"` when empty.
-    /// `extra_value_patterns`: `(pattern, replacement_token)` pairs checked
-    ///   after the built-in value shapes. First match wins.
-    #[allow(clippy::expect_used)]
-    pub fn new(
-        extra_keys:             &[&str],
-        replacement:            &str,
-        extra_value_patterns:   &[(&str, &str)],
-    ) -> Self {
+    #[must_use]
+    pub fn new(extra_keys: &[&str], replacement: &str) -> Self {
         let escaped: Vec<String> = extra_keys.iter().map(|k| regex::escape(k)).collect();
         let extra_refs: Vec<&str> = escaped.iter().map(String::as_str).collect();
-        let custom_vp = extra_value_patterns
-            .iter()
-            .map(|(pat, repl)| {
-                let re = Regex::new(pat).expect("extra_value_pattern is a valid regex");
-                (re, (*repl).to_owned())
-            })
-            .collect();
         Self {
             key_re:      build_key_re(&extra_refs),
             replacement: if replacement.is_empty() {
@@ -305,8 +292,23 @@ impl Redactor {
             } else {
                 replacement.to_owned()
             },
-            custom_vp,
+            custom_vp:   vec![],
         }
+    }
+
+    /// Adds `(pattern, replacement_token)` pairs, checked after the built-in
+    /// value shapes; first match wins. The patterns come from the host, so a
+    /// bad one is an error for the caller, not a panic.
+    ///
+    /// # Errors
+    ///
+    /// `Error::InvalidPattern` if a pattern is not a valid regex.
+    pub fn with_value_patterns(mut self, patterns: &[(&str, &str)]) -> Result<Self, Error> {
+        for (pat, repl) in patterns {
+            let re = Regex::new(pat).map_err(|e| Error::InvalidPattern((*pat).to_owned(), e.to_string()))?;
+            self.custom_vp.push((re, (*repl).to_owned()));
+        }
+        Ok(self)
     }
 
     fn check_value(&self, s: &str) -> Option<String> {
@@ -466,7 +468,7 @@ mod tests {
 
     #[test]
     fn extra_keys_custom_redactor() {
-        let r = Redactor::new(&["my_secret_field"], "REDACTED", &[]);
+        let r = Redactor::new(&["my_secret_field"], "REDACTED");
         let out = r.redact_value(&json!({"my_secret_field": "val", "name": "Bob"}));
         assert_eq!(out["my_secret_field"], "REDACTED");
         assert_eq!(out["name"], "Bob");
@@ -474,9 +476,17 @@ mod tests {
 
     #[test]
     fn extra_value_patterns_applied() {
-        let r = Redactor::new(&[], "", &[("custom_[A-Z]{8}", "***CUSTOM***")]);
+        let r = Redactor::new(&[], "")
+            .with_value_patterns(&[("custom_[A-Z]{8}", "***CUSTOM***")])
+            .unwrap();
         let out = r.redact_value(&json!({"ref": "custom_ABCDEFGH"}));
         assert_eq!(out["ref"], "***CUSTOM***");
+    }
+
+    #[test]
+    fn invalid_value_pattern_is_an_error() {
+        let err = Redactor::new(&[], "").with_value_patterns(&[("ok_[0-9]+", "A"), ("([", "B")]);
+        assert!(matches!(err, Err(Error::InvalidPattern(p, reason)) if p == "([" && !reason.is_empty()));
     }
 
     #[test]

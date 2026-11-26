@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
-from ..context import mint_id, with_request_id, current_request_id, usable_request_id
+from ..context import current_request_id, mint_id, usable_request_id, with_request_id
 
 
 async def publish(client: Any, topic: str, payload: dict[str, Any]) -> None:
@@ -15,7 +15,10 @@ async def publish(client: Any, topic: str, payload: dict[str, Any]) -> None:
     await client.publish(topic, json.dumps(enriched))
 
 
-def handler(topic: str) -> Callable[[Callable[..., Awaitable[None]]], Callable[..., Awaitable[None]]]:
+_Handler = Callable[..., Awaitable[None]]
+
+
+def handler(topic: str) -> Callable[[_Handler], _Handler]:
     """Decorator that runs the handler with the request_id from ``_req``,
     or a new one when ``_req`` is missing or not a usable request id
     (``context.usable_request_id``).

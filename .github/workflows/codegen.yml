@@ -16,6 +16,8 @@ on:
       - 'cpp/include/fasten.hpp'
       - 'fasten-core/src/redact.rs'
       - 'swift/Sources/Fasten/Redactor.swift'
+      - 'swift/Sources/Fasten/Engine.swift'
+      - 'swift/Sources/Fasten/Fasten.swift'
       - '.github/workflows/codegen.yml'
   pull_request:
     paths:
@@ -28,6 +30,8 @@ on:
       - 'cpp/include/fasten.hpp'
       - 'fasten-core/src/redact.rs'
       - 'swift/Sources/Fasten/Redactor.swift'
+      - 'swift/Sources/Fasten/Engine.swift'
+      - 'swift/Sources/Fasten/Fasten.swift'
       - '.github/workflows/codegen.yml'
 
 permissions:

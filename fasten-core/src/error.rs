@@ -29,19 +29,19 @@ pub enum Error {
     #[error("row JSON: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// SQLite backend error.
+    /// `SQLite` backend error.
     #[cfg(feature = "sqlite")]
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    /// PostgreSQL backend error.
+    /// `PostgreSQL` backend error.
     #[cfg(feature = "postgres")]
     #[error("postgres: {0}")]
     Postgres(#[from] pg::Error),
 
     // Catalog errors
 
-    /// Code key does not match UPPER_SNAKE_CASE (`^[A-Z][A-Z0-9_]*$`).
+    /// Code key does not match `UPPER_SNAKE_CASE` (`^[A-Z][A-Z0-9_]*$`).
     #[error(
         "register: code key {0:?} must be UPPER_SNAKE_CASE \
          (letters, digits, underscores; starts with a letter)"
@@ -96,6 +96,12 @@ pub enum Error {
     /// callback-backed store).
     #[error("{0} is not supported by this store")]
     Unsupported(&'static str),
+
+    /// A host-supplied redaction value pattern does not compile: the
+    /// pattern, then the regex crate's reason (a syntax error, or a size
+    /// limit for a valid but too large pattern).
+    #[error("redaction value pattern {0:?} does not compile: {1}")]
+    InvalidPattern(String, String),
 
     /// A purge cutoff that is neither an RFC 3339 timestamp nor a date.
     #[error("purge cutoff {0:?} is not an RFC 3339 timestamp or a date")]
@@ -178,6 +184,8 @@ impl From<&Error> for FastenErrorCode {
             Error::SeqClash(_)         => FastenErrorCode::ErrBackend,
             // An invalid argument, like a NULL or non-UTF-8 one.
             Error::InvalidTimestamp(_) => FastenErrorCode::ErrNullArg,
+            // The patterns arrive as a JSON argument and fail its validation.
+            Error::InvalidPattern(..)  => FastenErrorCode::ErrBadJson,
             Error::Store(_)            => FastenErrorCode::ErrBackend,
             Error::RowRejected(_)      => FastenErrorCode::ErrBackend,
             Error::Seal(_)             => FastenErrorCode::ErrBackend,

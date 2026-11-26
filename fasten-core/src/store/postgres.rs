@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use pg::types::ToSql;
@@ -49,7 +50,7 @@ pub fn connection_lost(e: &pg::Error) -> bool {
         let code = code.code();
         return code != "57014" && (code.starts_with("08") || code.starts_with("57"));
     }
-    std::error::Error::source(e).is_some_and(|s| s.is::<std::io::Error>())
+    std::error::Error::source(e).is_some_and(<dyn std::error::Error>::is::<std::io::Error>)
 }
 
 /// How a `require`-level DSN checks the server certificate.
@@ -116,7 +117,7 @@ fn parse_dsn(dsn: &str) -> Result<pg::Config, Error> {
 /// `verify-full` is strict in every SDK; libpq's `require` (Python, C++)
 /// does not check the certificate.
 ///
-/// Without the feature, connects with NoTls and refuses a DSN that asks for
+/// Without the feature, connects with `NoTls` and refuses a DSN that asks for
 /// TLS instead of connecting in plaintext.
 #[cfg(feature = "postgres-tls")]
 pub fn connect_client(dsn: &str) -> Result<pg::Client, Error> {
@@ -274,7 +275,7 @@ impl std::fmt::Debug for PostgresStore {
 }
 
 impl PostgresStore {
-    /// Connect to PostgreSQL at `dsn`, auto-create the schema (if schema-
+    /// Connect to `PostgreSQL` at `dsn`, auto-create the schema (if schema-
     /// qualified), create the audit table + indexes, and prepare the INSERT
     /// statement.
     ///
@@ -325,14 +326,14 @@ impl PostgresStore {
     where
         F: Fn(&mut Inner) -> Result<R, Error>,
     {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.client.is_closed() {
             *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
         }
-        match f(&mut *guard) {
+        match f(&mut guard) {
             Err(Error::Postgres(ref e)) if connection_lost(e) || guard.client.is_closed() => {
                 *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
-                f(&mut *guard)
+                f(&mut guard)
             }
             other => other,
         }
@@ -346,11 +347,11 @@ impl PostgresStore {
     where
         F: FnOnce(&mut Inner) -> Result<R, Error>,
     {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.client.is_closed() || guard.client.is_valid(VALID_TIMEOUT).is_err() {
             *guard = Inner::connect(&self.dsn, &self.insert_sql)?;
         }
-        match f(&mut *guard) {
+        match f(&mut guard) {
             Err(Error::Postgres(ref e)) if connection_lost(e) || guard.client.is_closed() => Err(Error::Store(format!(
                 "{what}: the connection was lost while it ran, so its outcome is unknown; run it again"
             ))),
@@ -375,12 +376,11 @@ impl PostgresStore {
     /// as it is.
     fn put(&self, row: &Row, detail: Option<&str>) -> Result<Outcome, Error> {
         let rendered;
-        let detail = match detail {
-            Some(text) => text,
-            None => {
-                rendered = serde_json::to_string(&row.detail)?;
-                &rendered
-            }
+        let detail = if let Some(text) = detail {
+            text
+        } else {
+            rendered = serde_json::to_string(&row.detail)?;
+            &rendered
         };
         let bare = self.bare.as_str();
         // Same lock key as the Python and Go stores, so every writer for
@@ -446,16 +446,16 @@ impl PostgresStore {
         );
         if filter.limit > 0 {
             let n = all_params.len() + 1;
-            sql.push_str(&format!(" LIMIT ${n}"));
+            let _ = write!(sql, " LIMIT ${n}");
             all_params.push(Box::new(i64::from(filter.limit)));
-            if filter.offset > 0 {
-                let n = all_params.len() + 1;
-                sql.push_str(&format!(" OFFSET ${n}"));
-                all_params.push(Box::new(i64::from(filter.offset)));
-            }
+        }
+        if filter.offset > 0 {
+            let n = all_params.len() + 1;
+            let _ = write!(sql, " OFFSET ${n}");
+            all_params.push(Box::new(i64::from(filter.offset)));
         }
         let params_refs: Vec<&(dyn ToSql + Sync)> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+            all_params.iter().map(AsRef::as_ref).collect();
 
         self.with_reconnect(|inner| {
             inner.client.query(sql.as_str(), &params_refs).map_err(Error::Postgres)
@@ -528,14 +528,14 @@ impl Store for PostgresStore {
         let (where_clause, all_params) = build_filter_where(filter);
         let sql = format!("SELECT COUNT(*) FROM {}{}", self.table, where_clause);
         let params_refs: Vec<&(dyn ToSql + Sync)> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+            all_params.iter().map(AsRef::as_ref).collect();
 
         self.with_reconnect(|inner| {
             let rows = inner
                 .client
                 .query(sql.as_str(), &params_refs)
                 .map_err(Error::Postgres)?;
-            let n: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
+            let n: i64 = rows.first().map_or(0, |r| r.get(0));
             Ok(n.unsigned_abs())
         })
     }
@@ -563,20 +563,17 @@ impl Store for PostgresStore {
     ) -> Result<Vec<ReplicatedRow>, Error> {
         let limit: i64 = if limit == 0 { i64::MAX } else { i64::from(limit) };
         let t = &self.table;
-        let rows = match origin {
-            Some((service_id, node)) => {
-                let sql = format!(
-                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL AND service_id = $1 \
-                     AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3"
-                );
-                self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&service_id, &node, &limit])?))?
-            }
-            None => {
-                let sql = format!(
-                    "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1"
-                );
-                self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&limit])?))?
-            }
+        let rows = if let Some((service_id, node)) = origin {
+            let sql = format!(
+                "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL AND service_id = $1 \
+                 AND source_node_id = $2 AND origin_id = id ORDER BY monotonic_seq ASC LIMIT $3"
+            );
+            self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&service_id, &node, &limit])?))?
+        } else {
+            let sql = format!(
+                "SELECT {SELECT_COLUMNS} FROM {t} WHERE shipped_at IS NULL ORDER BY monotonic_seq ASC LIMIT $1"
+            );
+            self.with_reconnect(|inner| Ok(inner.client.query(sql.as_str(), &[&limit])?))?
         };
         rows.iter()
             .map(|r| {
@@ -660,7 +657,7 @@ impl Store for PostgresStore {
                 .client
                 .query(sql.as_str(), &[])
                 .map_err(Error::Postgres)?;
-            let seq: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
+            let seq: i64 = rows.first().map_or(0, |r| r.get(0));
             Ok(seq.unsigned_abs())
         })
     }
@@ -811,7 +808,7 @@ fn execute_insert(
     detail_str: &str,
     bare: &str,
 ) -> Result<u64, Error> {
-    let pii: i16 = row.pii_in_detail as i16;
+    let pii: i16 = i16::from(row.pii_in_detail);
     let tenant: Option<&str> = row.tenant_id.as_deref();
     let shipped: Option<&str> = row.shipped_at.as_deref();
     let prev_hash = row.prev_hash.as_deref().unwrap_or("");
@@ -881,10 +878,10 @@ fn migrate(
         pg_exec(client, &format!("CREATE SCHEMA IF NOT EXISTS {s}"))?;
     }
 
-    let chain: String = CHAIN_COLUMNS
-        .iter()
-        .map(|(name, def)| format!("{name} {def},\n                "))
-        .collect();
+    let chain = CHAIN_COLUMNS.iter().fold(String::new(), |mut s, (name, def)| {
+        let _ = write!(s, "{name} {def},\n                ");
+        s
+    });
     pg_exec(
         client,
         &format!(
@@ -1025,9 +1022,9 @@ fn build_insert_sql(table: &str) -> String {
 
 /// Build `" WHERE col = $1 AND ..."` and matching params for the Postgres
 /// extended-query protocol.  Params are assigned `$N` starting at 1.
-fn build_filter_where(f: &Filter) -> (String, Vec<Box<(dyn ToSql + Sync)>>) {
+fn build_filter_where(f: &Filter) -> (String, Vec<Box<dyn ToSql + Sync>>) {
     let mut parts: Vec<String> = Vec::new();
-    let mut params: Vec<Box<(dyn ToSql + Sync)>> = Vec::new();
+    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
     let mut n: u32 = 1;
 
     if let Some(ref v) = f.request_id {
@@ -1166,6 +1163,17 @@ mod tests {
             shipped_at: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn offset_without_a_limit_skips_rows() {
+        let Some(dsn) = dsn() else { return };
+        let store = PostgresStore::connect(&dsn, "fasten_sc_pg_offtest").unwrap();
+        for n in 0..5 {
+            store.insert(&make_row(&format!("evt-pgoff-{n}"), "OFFSET_ONLY")).unwrap();
+        }
+        let f: Filter = serde_json::from_str(r#"{"code": "OFFSET_ONLY", "offset": 3}"#).unwrap();
+        assert_eq!(store.query(&f).unwrap().len(), 2);
     }
 
     #[test]

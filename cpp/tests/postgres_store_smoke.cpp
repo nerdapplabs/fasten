@@ -368,6 +368,11 @@ int main() {
 
     const char* raw_dsn = get_dsn();
     if (!raw_dsn) {
+        const char* req = std::getenv("FASTEN_REQUIRE_POSTGRES");
+        if (req && std::string(req) == "1") {
+            std::cerr << "FASTEN_REQUIRE_POSTGRES=1 but FASTEN_TEST_POSTGRES_DSN is not set\n";
+            return 1;
+        }
         std::cout << "FASTEN_TEST_POSTGRES_DSN not set, skipping live tests.\n";
         std::cout << "All PostgreSQL store smoke tests passed.\n";
         return 0;

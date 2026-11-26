@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 /// Wire-format audit row. Fields map 1-to-1 with the fasten JSON wire spec.
 ///
 /// Timestamps are plain ISO-8601 strings so they survive the C FFI boundary
-/// without a DateTime parser in the store layer. The calling SDK is responsible
+/// without a `DateTime` parser in the store layer. The calling SDK is responsible
 /// for producing well-formed timestamps; the store persists them as-is.
 ///
 /// `detail` is a JSON value (object, array, or scalar) stored as TEXT in
-/// both SQLite and PostgreSQL. The TEXT is valid JSON, so the Postgres column
+/// both `SQLite` and `PostgreSQL`. The TEXT is valid JSON, so the Postgres column
 /// can be altered to JSONB if it needs indexing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Row {
