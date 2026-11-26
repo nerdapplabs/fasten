@@ -1,12 +1,11 @@
 """The ambient ``request_id``, held in a contextvar so async tasks inherit it."""
 from __future__ import annotations
 
-import re
 import contextvars
+import re
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, Optional
-
 
 _request_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "fasten_request_id", default=None

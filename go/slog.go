@@ -55,9 +55,13 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	// Capped at its length so append copies: appending in place into spare
+	// capacity let two loggers made from one parent overwrite each other's
+	// attrs.
+	pre := h.preAttrs[:len(h.preAttrs):len(h.preAttrs)]
 	return &SlogHandler{
 		next:     h.next.WithAttrs(attrs),
-		preAttrs: append(h.preAttrs, attrs...),
+		preAttrs: append(pre, attrs...),
 		group:    h.group,
 	}
 }

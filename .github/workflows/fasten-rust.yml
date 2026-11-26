@@ -96,6 +96,11 @@ jobs:
           apt-get install -y -qq pkg-config libssl-dev
           cargo test --all-features --locked --quiet
 
+      # The lints fasten-core declares in src/lib.rs, enforced for library code.
+      - name: Lint fasten-core (clippy)
+        working-directory: fasten-core
+        run: cargo clippy --all-features --locked -- -D warnings
+
       - name: Install llvm-tools for coverage
         run: rustup component add llvm-tools-preview
 

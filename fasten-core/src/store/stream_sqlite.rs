@@ -1,5 +1,5 @@
-//! SQLite store for the api or sys stream: the same table as the Python, Go
-//! and JS SQLite stream stores (spec persistent-streams.md §2).
+//! `SQLite` store for the api or sys stream: the same table as the Python, Go
+//! and JS `SQLite` stream stores (spec persistent-streams.md §2).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use super::stream::{
 };
 use crate::error::Error;
 
-/// One stream's table in a SQLite file. Rows come back newest first,
+/// One stream's table in a `SQLite` file. Rows come back newest first,
 /// decoded from the stored JSON.
 ///
 /// A file database uses WAL with `synchronous=NORMAL`, so a commit is a WAL
@@ -67,7 +67,7 @@ impl SqliteStreamStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Store one row: the whole row as JSON in `payload`, the lifted fields

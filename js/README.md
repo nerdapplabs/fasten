@@ -202,7 +202,7 @@ verify with `checkpointsSince` (see "Chain checkpoints").
 block on a counting semaphore the way Python, Go, Rust and C++ do.
 `queueCapacity` is a warning threshold (it drives the
 `audit_queue_high_water` / `audit_queue_near_full` sys events), not a hard
-cap.
+cap. 0 means the default, 100, as in the other SDKs.
 
 ## SQLite store
 

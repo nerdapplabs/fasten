@@ -151,7 +151,14 @@ if(FASTEN_BUILD_TESTS)
         message(STATUS "SQLite::SQLite3 target unavailable, skipping sqlite_store_smoke and pii_redaction_smoke")
     endif()
 
-    find_package(PostgreSQL QUIET)
+    # CI sets this so a missing libpq fails the build instead of dropping
+    # postgres_store_smoke from the test list.
+    option(FASTEN_REQUIRE_POSTGRES "Fail if libpq is not found" OFF)
+    if(FASTEN_REQUIRE_POSTGRES)
+        find_package(PostgreSQL REQUIRED)
+    else()
+        find_package(PostgreSQL QUIET)
+    endif()
     if(TARGET PostgreSQL::PostgreSQL)
         add_executable(postgres_store_smoke tests/postgres_store_smoke.cpp)
         target_link_libraries(postgres_store_smoke PRIVATE fasten PostgreSQL::PostgreSQL)

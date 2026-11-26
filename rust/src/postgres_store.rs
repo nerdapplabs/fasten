@@ -11,6 +11,8 @@ use fasten_core::chain::{ChainRow, GENESIS};
 use fasten_core::checkpoint::ChainTip;
 use fasten_core::replication::{self, IngestResult, IngestTx, ReplicatedRow, StoredRow, Verified};
 use fasten_core::store::postgres::connection_lost;
+
+use crate::pg_runtime::{off_runtime, Conn};
 use pg::types::ToSql;
 
 // Table names must match ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$
@@ -268,7 +270,7 @@ fn inspect_columns(
 /// }).expect("init");
 /// ```
 pub struct PostgresStore {
-    client: Mutex<pg::Client>,
+    client: Mutex<Conn>,
     /// Kept to connect again after the connection is lost.
     dsn: String,
     table: String,
@@ -351,6 +353,10 @@ impl PostgresStore {
     /// documentation.
     pub fn new(dsn: &str, table: impl Into<String>) -> Result<Self, crate::Error> {
         let table = table.into();
+        off_runtime(|| Self::open(dsn, table))
+    }
+
+    fn open(dsn: &str, table: String) -> Result<Self, crate::Error> {
         validate_table_name(&table)?;
 
         let (schema_opt, bare) = match table.split_once('.') {
@@ -381,7 +387,7 @@ impl PostgresStore {
         let cols = inspect_columns(&mut client, schema_opt.as_deref(), &bare)?;
 
         Ok(Self {
-            client: Mutex::new(client),
+            client: Mutex::new(Conn(Some(client))),
             dsn: dsn.to_owned(),
             table,
             idx: bare,
@@ -389,7 +395,7 @@ impl PostgresStore {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, pg::Client> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Conn> {
         self.client.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -401,18 +407,23 @@ impl PostgresStore {
     /// second run does what one run does, or a whole transaction, which a
     /// lost connection rolls back. A COMMIT that failed on a lost
     /// connection comes back as `Fail::Commit` and is not run again.
-    fn retry<T>(&self, mut f: impl FnMut(&mut pg::Client) -> Result<T, Fail>) -> Result<T, Fail> {
-        let mut client = self.lock();
-        if client.is_closed() {
-            *client = reconnect(&self.dsn, crate::Error::AuditStoreInsert)?;
-        }
-        match f(&mut client) {
-            Err(Fail::Lost(_)) => {
-                *client = reconnect(&self.dsn, crate::Error::AuditStoreInsert)?;
-                f(&mut client)
+    fn retry<T: Send>(
+        &self,
+        mut f: impl FnMut(&mut pg::Client) -> Result<T, Fail> + Send,
+    ) -> Result<T, Fail> {
+        off_runtime(|| {
+            let mut client = self.lock();
+            if client.is_closed() {
+                *client = Conn(Some(reconnect(&self.dsn, crate::Error::AuditStoreInsert)?));
             }
-            other => other,
-        }
+            match f(&mut client) {
+                Err(Fail::Lost(_)) => {
+                    *client = Conn(Some(reconnect(&self.dsn, crate::Error::AuditStoreInsert)?));
+                    f(&mut client)
+                }
+                other => other,
+            }
+        })
     }
 
     /// After a COMMIT that failed on a lost connection, the row stored under
@@ -1156,23 +1167,25 @@ impl crate::AuditStore for PostgresStore {
             Some(db) => format!("{e}: {}", db.message()),
             None => e.to_string(),
         });
-        let mut client = self.lock();
-        // A connection that ended while idle is replaced before the DELETE.
-        if client.is_closed() || client.is_valid(VALID_TIMEOUT).is_err() {
-            *client = reconnect(&self.dsn, crate::Error::AuditStorePurge)?;
-        }
-        // Not run again after a lost connection: the DELETE may have
-        // committed, and a second run would return only what it deleted.
-        client.execute(&sql as &str, &[&before]).map_err(|e| {
-            if connection_lost(&e) || client.is_closed() {
-                crate::Error::AuditStorePurge(
-                    "the connection was lost while the purge ran, so how many rows it deleted is unknown; \
-                     run it again"
-                        .into(),
-                )
-            } else {
-                failed(e)
+        off_runtime(|| {
+            let mut client = self.lock();
+            // A connection that ended while idle is replaced before the DELETE.
+            if client.is_closed() || client.is_valid(VALID_TIMEOUT).is_err() {
+                *client = Conn(Some(reconnect(&self.dsn, crate::Error::AuditStorePurge)?));
             }
+            // Not run again after a lost connection: the DELETE may have
+            // committed, and a second run would return only what it deleted.
+            client.execute(&sql as &str, &[&before]).map_err(|e| {
+                if connection_lost(&e) || client.is_closed() {
+                    crate::Error::AuditStorePurge(
+                        "the connection was lost while the purge ran, so how many rows it deleted is unknown; \
+                         run it again"
+                            .into(),
+                    )
+                } else {
+                    failed(e)
+                }
+            })
         })
     }
 
@@ -1255,6 +1268,30 @@ mod tests {
             detail_commitment: None,
             shipped_at: None,
         }
+    }
+
+    /// Opened, written, read, purged and dropped on a tokio runtime thread,
+    /// where the sync client panics if it runs there. The drop closes the
+    /// connection on another thread, so this shows only that the runtime
+    /// thread does not panic.
+    #[tokio::test]
+    async fn works_from_a_tokio_runtime() {
+        let Some(dsn) = dsn() else { return };
+        let table = format!("audit_tokio_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let store = PostgresStore::new(&dsn, table.as_str()).expect("open on a runtime thread");
+        let row = make_row(&uniq("evt"), "TOKIO_TEST");
+        crate::AuditStore::insert(&store, &row).expect("insert on a runtime thread");
+        let rows = store.chain_rows(&row.source_node_id).expect("read on a runtime thread");
+        assert_eq!(rows.len(), 1);
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        crate::AuditStore::purge(&store, cutoff, false).expect("purge on a runtime thread");
+        drop(store);
+        tokio::task::spawn_blocking(move || {
+            let mut c = pg::Client::connect(&dsn, pg::NoTls).expect("connect");
+            c.batch_execute(&format!("DROP TABLE IF EXISTS {table}")).expect("drop");
+        })
+        .await
+        .expect("cleanup");
     }
 
     fn fresh_store(dsn: &str, table: &str) -> PostgresStore {

@@ -361,7 +361,20 @@ class SQLiteStore:
                 prev_hash = tip[0] if tip else "genesis"
                 sealed = seal(prev_hash, dataclasses.replace(
                     row, monotonic_seq=next_seq))
-                self._insert_row_core(conn, sealed)
+                if not self._insert_row_core(conn, sealed):
+                    # The id is already stored (a retry after a commit whose
+                    # result was lost): return that row, not the one just
+                    # sealed, which was never written.
+                    cur = conn.execute(
+                        f"SELECT * FROM {self._table} WHERE id = ?", (row.id,))
+                    stored = cur.fetchone()
+                    if stored is None:
+                        # Ignored for another reason, such as a trigger or a
+                        # NOT NULL column: nothing with this id was written.
+                        raise sqlite3.IntegrityError(
+                            f"fasten: insert of {row.id} was ignored and no row "
+                            "with that id is stored")
+                    sealed = self._row(stored)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -445,9 +458,15 @@ class SQLiteStore:
         With ``local_node_id``, ingest stops at the first row from that node
         (see ``repo.ingest_without_local_node``).
         """
-        from .repo import (IngestResult, check_inserted, cut_at_conflict,
-                           ingest_without_local_node, skipped_unsealed, stored_conflict,
-                           verified_prefix)
+        from .repo import (
+            IngestResult,
+            check_inserted,
+            cut_at_conflict,
+            ingest_without_local_node,
+            skipped_unsealed,
+            stored_conflict,
+            verified_prefix,
+        )
 
         if local_node_id:
             return ingest_without_local_node(self.ingest_replicated, rows, local_node_id)
@@ -518,10 +537,11 @@ class SQLiteStore:
         Lists form-"2" rows and unsealed rows (empty ``hash``): no hash covers
         their ``detail`` (spec §7.1). Skips sealed form-"1" rows: their
         ``detail`` IS hashed, so redacting one would change its hash and cascade
-        a re-seal down the rest of the chain. They are counted and logged at WARNING rather than skipped quietly — on a
-        store written before the form-"2" upgrade, silence here would let an
-        operator watch redaction "succeed" while the personal data it was
-        supposed to destroy survives untouched.
+        a re-seal down the rest of the chain. They are counted and logged at
+        WARNING rather than skipped quietly: on a store written before the
+        form-"2" upgrade, silence here would let an operator watch redaction
+        "succeed" while the personal data it was supposed to destroy survives
+        untouched.
         """
         if not codes:
             return []

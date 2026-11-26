@@ -148,3 +148,32 @@ def test_memory_store_serialises_compound_ops(tmp_path):
         t.join()
     assert errors == []
     assert len(s.query(limit=200)) == 80
+
+
+def test_allocate_retry_returns_the_stored_row(store):
+    """A retry after a commit whose result was lost inserts an id that is
+    already stored. INSERT OR IGNORE drops it, so the store returns the
+    stored row, not a freshly sealed one at the next seq that was never
+    written (stdout printed that one, and a capture failed to verify)."""
+    from fasten.chain import verify_chain
+    row = make_row(monotonic_seq=0)
+    first = store.allocate_and_insert_originated(row)
+    retry = store.allocate_and_insert_originated(row)
+    assert (retry.monotonic_seq, retry.hash) == (first.monotonic_seq, first.hash)
+    assert verify_chain([retry]).ok
+    assert len(store.chain_tail("node-1", 10)) == 1
+
+
+def test_allocate_ignored_insert_with_no_stored_row_raises(tmp_path):
+    """An insert ignored for a reason other than its id being stored leaves
+    nothing to read back. That is a failed insert, not a stored row."""
+    import sqlite3
+    path = str(tmp_path / "a.db")
+    s = SQLiteStore(path)
+    with sqlite3.connect(path) as c:
+        c.execute("CREATE TRIGGER drop_all BEFORE INSERT ON audit_log "
+                  "BEGIN SELECT RAISE(IGNORE); END")
+    row = make_row(monotonic_seq=0)
+    with pytest.raises(sqlite3.IntegrityError, match=row.id):
+        s.allocate_and_insert_originated(row)
+    assert s.query(limit=10) == []

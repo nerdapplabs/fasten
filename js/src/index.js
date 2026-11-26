@@ -618,7 +618,7 @@ export class Engine {
 			this._installDrainer({
 				store: { insert: (row) => this._storeRow(store, row) },
 				sysLog: (l, e, f) => this._drainerSysLog(l, e, f),
-				capacity: opts.queueCapacity ?? 100,
+				capacity: opts.queueCapacity || 100,
 				retryInitialMs: opts.queueRetryInitialMs ?? 100,
 				retryMaxMs: opts.queueRetryMaxMs ?? 60_000,
 				retryJitter: opts.queueRetryJitter ?? true,
@@ -710,9 +710,13 @@ export class Engine {
 		const row = this._buildRow(input);
 		if (cfg.auditStore) {
 			if (cfg.failureStrategy === "queue") {
+				// The row is stored after emit() returns, so store a copy: a
+				// caller changing the returned row (its detail, say) must not
+				// change what is stored, or undo its redaction.
+				const queued = structuredClone(row);
 				const d = this._drainer;
 				if (d) {
-					d.put(row);
+					d.put(queued);
 				} else {
 					const failed = (err) => {
 						this.#auditWriteSwallowed = true;
@@ -722,7 +726,7 @@ export class Engine {
 						});
 					};
 					try {
-						const p = this._storeRow(cfg.auditStore, row);
+						const p = this._storeRow(cfg.auditStore, queued);
 						if (typeof p?.then === "function") p.then(undefined, failed);
 					} catch (err) {
 						failed(err);

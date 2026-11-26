@@ -317,7 +317,8 @@ def purge_sql(table: str, param: str, respect_unshipped: bool, postgres: bool = 
     )
     if postgres:
         return f"{bound}DELETE FROM {table} AS d USING bound WHERE {match}"
-    return f"DELETE FROM {table} WHERE id IN ({bound}SELECT d.id FROM bound, {table} AS d WHERE {match})"
+    return (f"DELETE FROM {table} WHERE id IN "
+            f"({bound}SELECT d.id FROM bound, {table} AS d WHERE {match})")
 
 
 _MAX_SEQ = 9223372036854775807

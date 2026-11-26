@@ -109,7 +109,8 @@ def start_purger(
                         logger.error("retention on_error callback raised: %s",
                                      describe_error(cb_e, redactor))
                 else:
-                    logger.warning("fasten retention %s failed: %s", label, describe_error(e, redactor))
+                    logger.warning("fasten retention %s failed: %s",
+                                   label, describe_error(e, redactor))
 
             # Separate try blocks so a redaction failure does not skip the
             # purge.

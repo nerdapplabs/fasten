@@ -314,7 +314,9 @@ def _first_break(sorted_rows: "list[AuditRow]") -> "tuple[int, str] | None":
         if i > 0:
             prev = sorted_rows[i - 1]
             if prev.hash and row.prev_hash != prev.hash:
-                return row.monotonic_seq, f"row {row.id}: prev_hash does not match preceding row {prev.id}"
+                return row.monotonic_seq, (
+                    f"row {row.id}: prev_hash does not match preceding row {prev.id}"
+                )
             # Only a node's first sealed row may skip the check above: the
             # store links it to "genesis" when the unsealed row before it is
             # at seq-1, and a purged head leaves a gap where the window starts.
@@ -433,7 +435,8 @@ def verify_chain(
         first = dup
     newest: dict[str, int] = {}
     for cp in checkpoints or ():
-        newest[cp.source_node_id] = max(cp.monotonic_seq, newest.get(cp.source_node_id, cp.monotonic_seq))
+        newest[cp.source_node_id] = max(
+            cp.monotonic_seq, newest.get(cp.source_node_id, cp.monotonic_seq))
     index = {n: _NodeIndex(by_node[n].values()) for n in newest if by_node.get(n)}
     for cp in sorted(checkpoints or (), key=lambda c: (c.source_node_id, c.monotonic_seq)):
         node = index.get(cp.source_node_id)
@@ -448,6 +451,7 @@ def verify_chain(
         if found is not None and (first is None or found[0] < first[0]):
             first = found
     if first is not None:
-        return ChainVerifyResult(ok=False, total_rows=len(rows), first_break_at=first[0], reason=first[1])
+        return ChainVerifyResult(ok=False, total_rows=len(rows),
+                                 first_break_at=first[0], reason=first[1])
 
     return ChainVerifyResult(ok=True, total_rows=len(rows), first_break_at=None, reason=None)

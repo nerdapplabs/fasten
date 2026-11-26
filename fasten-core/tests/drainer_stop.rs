@@ -142,6 +142,55 @@ fn no_retry_after_stop() {
     assert!(!events.lock().unwrap().iter().any(|l| l.contains("audit_drain_dead_letter")));
 }
 
+/// Blocks in insert until released, then panics.
+struct PanicAfterGate {
+    gate: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Store for PanicAfterGate {
+    fn insert(&self, _row: &Row) -> Result<(), Error> {
+        let _ = self.gate.lock().unwrap().recv();
+        panic!("store failed");
+    }
+    fn ping(&self) -> Result<(), Error> { Ok(()) }
+    fn query(&self, _: &Filter) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+    fn count(&self, _: &Filter) -> Result<u64, Error> { Ok(0) }
+    fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, Error> { Ok(vec![]) }
+    fn mark_shipped(&self, _: &[String]) -> Result<(), Error> { Ok(()) }
+    fn purge(&self, _: &str, _: bool) -> Result<u64, Error> { Ok(0) }
+    fn max_monotonic_seq(&self) -> Result<u64, Error> { Ok(0) }
+}
+
+#[test]
+fn a_store_panic_during_stop_loses_the_row() {
+    use fasten_core::drainer::SysLog;
+    let (release, gate) = mpsc::channel();
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink: SysLog = {
+        let events = events.clone();
+        Arc::new(move |line: &str| events.lock().unwrap().push(line.to_owned()))
+    };
+    let store = PanicAfterGate { gate: Mutex::new(gate) };
+    let d = Drainer::with_sys_log(Box::new(store), cfg(4, Duration::from_secs(10)), Some(sink));
+    d.enqueue(row("r-1"));
+    thread::sleep(Duration::from_millis(50)); // the drain thread is inside insert
+    let stopper = {
+        let d = d.clone();
+        thread::spawn(move || d.stop(Duration::from_secs(5)))
+    };
+    thread::sleep(Duration::from_millis(50)); // stop has been requested
+    release.send(()).unwrap();
+    within(Duration::from_secs(10), move || stopper.join().unwrap());
+    assert_eq!(d.stats().dead_lettered_total, 0);
+    let lost: Vec<serde_json::Value> = events.lock().unwrap().iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|e: &serde_json::Value| e["event"] == "audit_drain_lost_at_stop")
+        .collect();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0]["row_id"], "r-1");
+    assert_eq!(lost[0]["error_type"], "panic");
+}
+
 #[test]
 fn every_accepted_row_is_stored_or_dead_lettered_when_stop_races_enqueue() {
     for round in 0..300 {

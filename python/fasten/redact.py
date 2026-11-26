@@ -11,6 +11,7 @@ with str() first.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -47,6 +48,23 @@ def _truncated_marker(value: Any, size: int, cap: int) -> Any:
     if isinstance(value, dict):
         return marker
     return marker["_summary"]
+
+
+_noted_redact_failures: set[str] = set()
+
+
+def _note_redact_failure(exc: BaseException) -> None:
+    """Log the first redaction failure of each error type, so a bug in the
+    redaction path is seen instead of silently blanking every detail. The
+    message is left out: it can hold the value being redacted."""
+    name = type(exc).__name__
+    if name in _noted_redact_failures:
+        return
+    # Added before logging: a handler that redacts must not log it again.
+    _noted_redact_failures.add(name)
+    logging.getLogger("fasten").error(
+        "redaction failed (%s); the detail was replaced by the unredactable marker\n%s",
+        name, "\n".join(_frames(exc)))
 
 
 def _unredactable_marker(value: Any) -> Any:
@@ -135,6 +153,14 @@ class Redactor:
         self._extra_vp: list[tuple[str, str]] = [
             (pat, repl) for (_name, pat, repl) in (extra_value_patterns or [])
         ]
+        # The core compiles the patterns (Rust regex syntax, not Python's), so
+        # it checks them here. Otherwise a bad one surfaces in redact(), whose
+        # catch-all turns every detail into the unredactable marker unnoticed.
+        if self._extra_vp:
+            try:
+                core_ffi.redact_json_full("{}", extra_value_patterns=self._extra_vp)
+            except RuntimeError as e:
+                raise ValueError(f"fasten: extra_value_redact_patterns: {e}") from None
         # Use the simple fasten_redact path when no customisation is needed.
         self._is_default = (
             not self._extra_keys
@@ -221,7 +247,8 @@ class Redactor:
             return json.loads(self._fast_redact_json(in_json))
         except OSError:  # libfasten_core didn't load
             raise
-        except Exception:  # noqa: BLE001  deep nesting or invalid utf-8
+        except Exception as e:  # noqa: BLE001  deep nesting or invalid utf-8
+            _note_redact_failure(e)
             return _unredactable_marker(value)
 
     def _redact_for_log(self, value: Any) -> Any:

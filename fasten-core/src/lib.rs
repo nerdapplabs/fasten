@@ -31,7 +31,7 @@
 //! | `aarch64-apple-darwin`       | macOS Apple Silicon (M-series)           |
 //! | `x86_64-pc-windows-msvc`     | Windows (DLL)                            |
 //!
-//! SQLite is bundled (no system dep); PostgreSQL uses the pure-Rust wire
+//! `SQLite` is bundled (no system dep); `PostgreSQL` uses the pure-Rust wire
 //! protocol (no libpq required on any target).
 //!
 //! # Feature flags
