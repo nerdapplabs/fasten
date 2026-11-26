@@ -6,13 +6,24 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed: fasten-core reads floats exactly
+### Fixed: floats in audit details are stored as written
 
-- A float in a row's detail passed to fasten-core as JSON is stored and
-  hashed as the value written, as Python, Go and JS read it. Before, a few
-  values were read as a neighbouring double, for example
-  `4111111111111111.5` as `4111111111111111.0`. Rows already stored verify
-  as before.
+- Python, Go and Rust: a float in an audit row's detail is stored and
+  hashed as the value written. Before, a few values were changed to a
+  neighbouring double, for example `4111111111111111.5` to
+  `4111111111111111.0`, because these SDKs redact details in fasten-core.
+  JS was not affected. Rows already stored verify as before.
+
+### Changed: Python redacts every detail shape the same way
+
+- A detail dict with a key JSON cannot encode, such as a tuple, is redacted
+  with the same settings as any other detail: `extra_value_patterns`, the
+  replacement and the size cap all apply. Its keys are kept as they are.
+- A value JSON cannot encode, such as a `datetime`, is converted with `str()`
+  and then redacted. `fasten.log` calls with such a field no longer raise.
+- A value that cannot be encoded at all, such as a dict that contains itself
+  or nesting too deep to encode, is replaced by the unredactable marker. A
+  value whose `str()` raises becomes `<str failed>`; neither raises.
 
 ### Fixed: JS and Python DSN errors
 
