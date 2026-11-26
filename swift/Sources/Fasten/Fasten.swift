@@ -58,7 +58,7 @@ public enum Fasten {
     /// `configure(redactNumbers:)`; an explicit argument wins.
     public static func envRedactNumbers() -> Bool {
         let s = ProcessInfo.processInfo.environment["FASTEN_REDACT_NUMBERS"] ?? ""
-        return ["1", "true", "yes", "on"].contains(s.trimmingCharacters(in: .whitespaces).lowercased())
+        return ["1", "true", "yes", "on"].contains(s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     /// Configure fasten. Must be called before `emit()`.

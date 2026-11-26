@@ -1395,9 +1395,15 @@ inline std::vector<SysField> redact_json_fields_(
     if (rc != 0) {
         const std::string repl = redact_replacement_(cfg);
         for (const auto& kv : fields) {
+            // Numbers are kept unless the option checks them; literals always are.
             const std::string& v = kv.second;
-            if (v == "true" || v == "false" || v == "null") out.push_back({kv.first, v, v});
-            else out.push_back({kv.first, json_str(repl), repl});
+            const char c = v.empty() ? '"' : v[0];
+            const bool literal = v == "true" || v == "false" || v == "null";
+            if (c == '"' || c == '[' || c == '{' || (cfg.check_numbers && !literal)) {
+                out.push_back({kv.first, json_str(repl), repl});
+            } else {
+                out.push_back({kv.first, v, v});
+            }
         }
         log_redact_failed_(rc);
         return out;
@@ -1635,8 +1641,8 @@ inline void init(Config cfg = {}) {
         redact_cfg.check_numbers = cfg.redact_numbers != 0;
     } else {
         std::string v = env_or("FASTEN_REDACT_NUMBERS", "");
-        const size_t a = v.find_first_not_of(" \t");
-        const size_t b = v.find_last_not_of(" \t");
+        const size_t a = v.find_first_not_of(" \t\r\n");
+        const size_t b = v.find_last_not_of(" \t\r\n");
         v = a == std::string::npos ? "" : v.substr(a, b - a + 1);
         for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         redact_cfg.check_numbers = v == "1" || v == "true" || v == "yes" || v == "on";

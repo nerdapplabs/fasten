@@ -957,6 +957,20 @@
       "expected": {"f": 4222222222222.5}
     },
     {
+      "name": "safe_float_with_fraction_16_digit",
+      "group": "safe",
+      "check_numbers": true,
+      "input":    {"f": 4111111111111111.5},
+      "expected": {"f": 4111111111111111.5}
+    },
+    {
+      "name": "value_cc_whole_float_16_digit",
+      "group": "value_shape",
+      "check_numbers": true,
+      "input":    {"f": 4111111111111038.0},
+      "expected": {"f": "***CC***"}
+    },
+    {
       "name": "key_rule_wins_over_integer",
       "group": "priority",
       "check_numbers": true,
