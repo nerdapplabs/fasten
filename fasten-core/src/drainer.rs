@@ -98,11 +98,11 @@ impl Sem {
 }
 
 fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn cv_wait_or_recover<'a, T>(cv: &Condvar, g: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-    cv.wait(g).unwrap_or_else(|e| e.into_inner())
+    cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Default)]
@@ -155,6 +155,11 @@ pub struct Drainer {
 }
 
 impl Drainer {
+    /// Sys events go to stderr.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS cannot spawn the drain thread.
     pub fn new(store: Box<dyn Store>, cfg: DrainerConfig) -> Arc<Self> {
         Self::with_sys_log(store, cfg, None)
     }
@@ -162,7 +167,17 @@ impl Drainer {
     /// Like `new`, but sys events go to `sys_log` instead of stderr. It is
     /// called with no drainer lock held, from the drain thread or from the
     /// thread calling enqueue or stop.
-    pub fn with_sys_log(store: Box<dyn Store>, cfg: DrainerConfig, sys_log: Option<SysLog>) -> Arc<Self> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS cannot spawn the drain thread.
+    pub fn with_sys_log(store: Box<dyn Store>, mut cfg: DrainerConfig, sys_log: Option<SysLog>) -> Arc<Self> {
+        // Zero slots would block every enqueue forever, and stop() resets the
+        // slots to the same zero, so nothing could wake them. Zero means the
+        // default here, as it does at the C ABI.
+        if cfg.capacity == 0 {
+            cfg.capacity = DrainerConfig::default().capacity;
+        }
         let capacity = cfg.capacity;
         let inner = Arc::new(DrainerInner {
             store,
@@ -182,9 +197,10 @@ impl Drainer {
             calls_cv: Condvar::new(),
         });
         let inner2 = inner.clone();
+        #[allow(clippy::expect_used)]
         let handle = thread::Builder::new()
             .name("fasten-drainer".into())
-            .spawn(move || drain_loop(inner2))
+            .spawn(move || drain_loop(&inner2))
             .expect("spawn drainer thread");
         Arc::new(Self { inner, handle: Mutex::new(Some(handle)) })
     }
@@ -219,6 +235,9 @@ impl Drainer {
             if depth > st.high_water {
                 st.high_water = depth;
             }
+            // Only compared with the high-water thresholds, so precision loss
+            // on a huge capacity does not matter.
+            #[allow(clippy::cast_precision_loss)]
             let ratio = depth as f64 / capacity as f64;
             if ratio >= HW_ERR_PCT && !st.err_hw_fired {
                 st.err_hw_fired = true;
@@ -284,7 +303,7 @@ impl Drainer {
                 return false;
             }
             let result = self.inner.flush_cv.wait_timeout(st, remaining)
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             st = result.0;
         }
     }
@@ -362,7 +381,7 @@ impl Drop for Drainer {
     }
 }
 
-fn drain_loop(inner: Arc<DrainerInner>) {
+fn drain_loop(inner: &Arc<DrainerInner>) {
     // Runs on normal return and on panic, so flush never waits on a dead thread.
     struct Exit<'a>(&'a DrainerInner);
     impl Drop for Exit<'_> {
@@ -373,8 +392,8 @@ fn drain_loop(inner: Arc<DrainerInner>) {
             self.0.flush_cv.notify_all();
         }
     }
-    let _exit = Exit(&inner);
-    drain_rows(&inner);
+    let _exit = Exit(inner);
+    drain_rows(inner);
 }
 
 fn drain_rows(inner: &Arc<DrainerInner>) {
@@ -402,16 +421,13 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
         loop {
             // Don't let a panicking Store impl kill the thread.
             let call = panic::catch_unwind(panic::AssertUnwindSafe(|| inner.store.insert(&row)));
-            let result = match call {
-                Ok(r) => r,
-                Err(_) => {
-                    if in_shutdown || inner.stop.load(Ordering::Acquire) {
-                        on_lost_at_stop(inner, &row, "panic");
-                    } else {
-                        on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
-                    }
-                    break;
+            let Ok(result) = call else {
+                if in_shutdown || inner.stop.load(Ordering::Acquire) {
+                    on_lost_at_stop(inner, &row, "panic");
+                } else {
+                    on_dead_letter(inner, &row, attempt + 1, "store.insert panicked");
                 }
+                break;
             };
             match result {
                 Ok(()) => {
@@ -431,9 +447,9 @@ fn drain_rows(inner: &Arc<DrainerInner>) {
                         on_dead_letter(inner, &row, attempt, &msg);
                         break;
                     }
-                    on_failure(inner, &msg, attempt);
-                    // Sleep in short steps so stop() takes effect quickly.
-                    let backoff = compute_backoff(inner, attempt);
+                    // Sleep the backoff on_failure reported, in short steps so
+                    // stop() takes effect quickly.
+                    let backoff = on_failure(inner, &msg, attempt);
                     let deadline = Instant::now() + backoff;
                     loop {
                         let rem = deadline.saturating_duration_since(Instant::now());
@@ -477,7 +493,7 @@ pub fn sqlstate_rejects_row(sqlstate: &str) -> bool {
     matches!(sqlstate.get(..2), Some("22" | "23" | "54"))
 }
 
-/// SQLite's constraint and datatype-mismatch errors.
+/// `SQLite`'s constraint and datatype-mismatch errors.
 #[cfg(feature = "sqlite")]
 fn sqlite_rejects_row(e: &rusqlite::Error) -> bool {
     matches!(
@@ -519,9 +535,12 @@ fn error_text(e: &Error) -> String {
 
 fn on_success(inner: &DrainerInner) {
     let mut st = lock_or_recover(&inner.stats);
-    let recovering = st.retry_count > 0 && st.failure_burst_at.is_some();
+    // Spec: recovered fires when an insert succeeds after one or more
+    // failures. A dead letter leaves failure_burst_at set for this reason,
+    // so a success straight after one still counts.
+    let recovering = st.failure_burst_at.is_some();
     let recovery_secs = if recovering {
-        st.failure_burst_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+        st.failure_burst_at.map_or(0.0, |t| t.elapsed().as_secs_f64())
     } else {
         0.0
     };
@@ -548,10 +567,14 @@ fn on_success(inner: &DrainerInner) {
     inner.flush_cv.notify_all();
 }
 
-fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
+/// Records the failure and returns the backoff to sleep, the same one
+/// `in_backoff_until` and `audit_drain_degraded` report.
+fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) -> Duration {
     let mut st = lock_or_recover(&inner.stats);
+    // Spec: audit_drain_failed fires when retry_count goes from 0 to 1, so
+    // once per failing row, a row after a dead letter included.
     let first = st.retry_count == 0;
-    if first {
+    if st.failure_burst_at.is_none() {
         st.failure_burst_at = Some(Instant::now());
     }
     st.retry_count = attempt;
@@ -570,11 +593,10 @@ fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
     if should_degraded {
         let st2 = lock_or_recover(&inner.stats);
         let remaining = st2.in_backoff_until
-            .map(|t| {
+            .map_or(0.0, |t| {
                 let r = t.saturating_duration_since(Instant::now()).as_secs_f64();
                 (r * 1000.0).round() / 1000.0
-            })
-            .unwrap_or(0.0);
+            });
         drop(st2);
         lock_or_recover(&inner.stats).degraded_fired = true;
         inner.sys_event("error", "audit_drain_degraded", &serde_json::json!({
@@ -583,6 +605,7 @@ fn on_failure(inner: &DrainerInner, msg: &str, attempt: usize) {
             "last_error": msg,
         }));
     }
+    backoff
 }
 
 fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
@@ -598,9 +621,11 @@ fn on_dead_letter(inner: &DrainerInner, row: &Row, attempts: usize, msg: &str) {
         st.dlq.pop_front();
     }
     st.dlq.push_back(row.clone());
+    // The next row starts its own retries, and its first failure reports
+    // audit_drain_failed again. failure_burst_at is kept until a row is
+    // stored, so that success reports audit_drain_recovered.
     st.retry_count = 0;
     st.in_backoff_until = None;
-    st.failure_burst_at = None;
     inner.slots.release();
     drop(st);
     inner.flush_cv.notify_all();
@@ -618,18 +643,14 @@ fn on_lost_at_stop(inner: &DrainerInner, row: &Row, error_type: &str) {
     inner.flush_cv.notify_all();
 }
 
-fn compute_backoff(inner: &DrainerInner, attempt: usize) -> Duration {
-    compute_backoff_val(
-        attempt, inner.cfg.retry_initial, inner.cfg.retry_max, inner.cfg.retry_jitter,
-    )
-}
-
 fn compute_backoff_val(
     attempt: usize,
     initial: Duration,
     max: Duration,
     jitter: bool,
 ) -> Duration {
+    // At most 63, so it fits in a u32.
+    #[allow(clippy::cast_possible_truncation)]
     let shift = attempt.saturating_sub(1).min(63) as u32;
     let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
     let base = initial * factor.try_into().unwrap_or(u32::MAX);
@@ -638,13 +659,15 @@ fn compute_backoff_val(
         return capped;
     }
     // +/-20% jitter, seeded from the clock's subsecond nanos (no rand dependency).
+    // Only a retry_max over u64::MAX ms (about 584 million years) would truncate.
+    #[allow(clippy::cast_possible_truncation)]
     let ms = capped.as_millis() as u64;
     let jitter_range = ms / 5;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(12345);
-    let j = seed as u64 % (jitter_range * 2 + 1);
+    let j = u64::from(seed) % (jitter_range * 2 + 1);
     let jittered = ms.saturating_add(j).saturating_sub(jitter_range);
     Duration::from_millis(jittered)
 }
@@ -753,6 +776,27 @@ mod stop_tests {
         let start = Instant::now();
         assert!(d.flush(Duration::from_secs(30)));
         assert!(start.elapsed() < Duration::from_secs(5), "flush waited for its timeout");
+    }
+
+    /// A zero capacity takes the default instead of blocking every enqueue.
+    #[test]
+    fn zero_capacity_takes_the_default() {
+        let d = Drainer::new(Box::new(OkStore), DrainerConfig {
+            capacity: 0,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts: 3,
+        });
+        assert_eq!(d.stats().capacity, DrainerConfig::default().capacity);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        thread::spawn(move || {
+            let _ = tx.send(d2.enqueue(Row { id: "r-1".into(), ..Row::default() }));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true), "enqueue blocked");
+        assert!(d.flush(Duration::from_secs(5)));
+        d.stop(Duration::from_secs(2));
     }
 
     struct TypedFailStore(Arc<std::sync::atomic::AtomicUsize>);
@@ -887,6 +931,88 @@ mod stop_tests {
         fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
         fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
         fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// Fails the first `fails` inserts, then succeeds.
+    struct FailFirstStore(usize, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Store for FailFirstStore {
+        fn insert(&self, _: &Row) -> Result<(), crate::error::Error> {
+            if self.1.fetch_add(1, Ordering::SeqCst) < self.0 {
+                Err(crate::error::Error::Store("PgError".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn ping(&self) -> Result<(), crate::error::Error> { Ok(()) }
+        fn query(&self, _: &Filter) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn count(&self, _: &Filter) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn list_unshipped(&self, _: u32) -> Result<Vec<Row>, crate::error::Error> { Ok(vec![]) }
+        fn mark_shipped(&self, _: &[String]) -> Result<(), crate::error::Error> { Ok(()) }
+        fn purge(&self, _: &str, _: bool) -> Result<u64, crate::error::Error> { Ok(0) }
+        fn max_monotonic_seq(&self) -> Result<u64, crate::error::Error> { Ok(0) }
+    }
+
+    /// Drains `ids` through `store` with `max_attempts` and returns the
+    /// `audit_drain_*` events in order. Queue high-water events are left out.
+    fn drain_events(store: Box<dyn Store>, max_attempts: usize, ids: &[&str]) -> Vec<String> {
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = events.clone();
+        let d = Drainer::with_sys_log(store, DrainerConfig {
+            capacity: 4,
+            retry_initial: Duration::from_millis(5),
+            retry_max: Duration::from_millis(5),
+            retry_jitter: false,
+            max_attempts,
+        }, Some(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(serde_json::from_str(line).unwrap());
+        })));
+        for id in ids {
+            assert!(d.enqueue(Row { id: (*id).into(), ..Row::default() }));
+        }
+        assert!(d.flush(Duration::from_secs(5)), "the queue did not drain");
+        assert_eq!(d.stats().last_error, None, "the last row was stored");
+        d.stop(Duration::from_secs(2));
+        let names = events.lock().unwrap().iter()
+            .map(|e| e["event"].as_str().unwrap_or_default().to_owned())
+            .filter(|n| n.starts_with("audit_drain_"))
+            .collect();
+        names
+    }
+
+    fn fail_first(n: usize) -> Box<dyn Store> {
+        Box::new(FailFirstStore(n, Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+    }
+
+    /// A row stored straight after a dead letter reports
+    /// `audit_drain_recovered`: it succeeds after failures (spec §4).
+    #[test]
+    fn recovery_is_reported_right_after_a_dead_letter() {
+        assert_eq!(
+            drain_events(fail_first(2), 2, &["a", "b"]),
+            ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_recovered"],
+        );
+    }
+
+    /// The row after a dead letter reports its own first failure, as
+    /// `retry_count` goes from 0 to 1 again, and recovery once it is stored.
+    #[test]
+    fn row_after_a_dead_letter_reports_its_own_failure() {
+        assert_eq!(
+            drain_events(fail_first(3), 2, &["a", "b"]),
+            ["audit_drain_failed", "audit_drain_dead_letter", "audit_drain_failed", "audit_drain_recovered"],
+        );
+    }
+
+    /// A row rejected on its first attempt is no failure burst: the next
+    /// stored row reports no recovery.
+    #[test]
+    fn rejected_row_then_success_reports_no_recovery() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            drain_events(Box::new(RejectingStore(attempts)), 50, &["bad", "good"]),
+            ["audit_drain_dead_letter"],
+        );
     }
 
     /// `error` and `last_error` hold the error's type; a callback's code

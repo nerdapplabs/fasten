@@ -27,11 +27,11 @@ import os
 from datetime import datetime
 from typing import Any, Optional
 
-from ..canonical_ts import canonical_now, canonical_ts
 from .. import audit_store as _active_audit_store
 from .. import persisted_streams as _active_persisted_streams
 from .. import redactor as _active_redactor
 from .. import search_enabled as _active_search_enabled
+from ..canonical_ts import canonical_now, canonical_ts
 
 # Imported at module level so FastAPI can resolve the string annotation
 # `request: Request`; otherwise it treats `request` as a query parameter.
@@ -40,7 +40,6 @@ try:
 except ImportError:  # pragma: no cover  fastapi missing; router() raises anyway
     pass
 from .. import transport as _active_transport
-
 
 _UNSET: Any = object()
 
@@ -132,7 +131,9 @@ def router(
             raise HTTPException(status_code=401, detail="unauthenticated: tenant scope unresolved")
         return t
 
-    def _scope_stream_rows(rows: list[dict[str, Any]], scope: Optional[str]) -> list[dict[str, Any]]:
+    def _scope_stream_rows(
+        rows: list[dict[str, Any]], scope: Optional[str],
+    ) -> list[dict[str, Any]]:
         """Post-filter sys/api stream rows by tenant. sys/api rows are
         freeform dicts with an optional ``tenant_id`` key — not a lifted
         index column — so we can't push this down to the store the way
@@ -180,7 +181,7 @@ def router(
             raise HTTPException(
                 status_code=422,
                 detail=f"{name} must be RFC3339 (e.g. 2026-08-21T10:00:00Z): {e}",
-            )
+            ) from e
         return canonical_ts(dt)
 
     def _search_guard(q: Optional[str], since: Optional[str]) -> Optional[str]:

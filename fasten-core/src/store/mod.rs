@@ -13,7 +13,11 @@ use crate::{
 /// All string fields are exact-match predicates.  `since` / `until` are
 /// ISO-8601 UTC timestamp bounds applied to the `timestamp` column.
 /// A `None` field is ignored (no constraint).  `limit == 0` means no limit.
+/// Every key may be left out of the JSON form (`fasten_core.h`), so a
+/// missing `limit` or `offset` is 0. An unknown key is refused: a misspelt
+/// filter would otherwise match every row.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Filter {
     pub request_id:     Option<String>,
     pub code:           Option<String>,
@@ -262,7 +266,7 @@ pub trait Store: Send + Sync {
     }
 
     /// Verify the backend is reachable. A lightweight query (`SELECT 1`) is
-    /// sufficient; on PostgreSQL, a lost connection is re-established first.
+    /// sufficient; on `PostgreSQL`, a lost connection is re-established first.
     fn ping(&self) -> Result<(), Error>;
 
     /// Return rows matching `filter`, ordered by `monotonic_seq ASC`.
@@ -647,7 +651,7 @@ pub fn purge_sql(table: &str, param: &str, respect_unshipped: bool, postgres: bo
 /// The purge or redaction cutoff as a canonical UTC timestamp (spec §4.3),
 /// which the stores compare with `timestamp` as text. Takes an RFC 3339 timestamp
 /// with any offset, or a date (midnight UTC); anything else is an
-/// InvalidTimestamp error. As given, an offset or a lowercase `t` sorts
+/// `InvalidTimestamp` error. As given, an offset or a lowercase `t` sorts
 /// differently from the stored form and deletes too much, and a string
 /// like "tomorrow" sorts after every row.
 pub(crate) fn purge_cutoff(before: &str) -> Result<String, Error> {
@@ -678,3 +682,26 @@ pub mod stream_sqlite;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+#[cfg(test)]
+mod tests {
+    use super::Filter;
+
+    /// Every key is optional in the JSON form, `limit` and `offset` included.
+    #[test]
+    fn filter_keys_are_all_optional() {
+        let f: Filter = serde_json::from_str(r#"{"code":"X"}"#).unwrap();
+        assert_eq!(f.code.as_deref(), Some("X"));
+        assert_eq!((f.limit, f.offset), (0, 0));
+        let f: Filter = serde_json::from_str("{}").unwrap();
+        assert!(f.code.is_none() && f.limit == 0);
+    }
+
+    /// A misspelt key is refused rather than ignored, which would turn the
+    /// filter into "every row".
+    #[test]
+    fn filter_refuses_an_unknown_key() {
+        let err = serde_json::from_str::<Filter>(r#"{"reqest_id":"abc"}"#).unwrap_err();
+        assert!(err.to_string().contains("reqest_id"), "{err}");
+    }
+}

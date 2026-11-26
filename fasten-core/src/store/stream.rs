@@ -1,6 +1,6 @@
 //! What the api and sys stream stores share (spec persistent-streams.md):
 //! the table layout, the lifted columns, the read filters and the search
-//! pattern. The SQLite and Postgres stream stores of every SDK use the same
+//! pattern. The `SQLite` and Postgres stream stores of every SDK use the same
 //! table, so one SDK can read and append to what another wrote.
 
 use serde_json::{Map, Value};

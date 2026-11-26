@@ -129,3 +129,111 @@ def test_api_logger_passthrough_for_non_http_scope(initialized):
 
     after = len(transport.query_api(limit=100))
     assert after == before
+
+
+class _Boom:
+    """ASGI app that fails before sending a response."""
+
+    async def __call__(self, scope, receive, send):
+        raise RuntimeError("app failed")
+
+
+def test_api_logger_reraises_app_error_before_init():
+    """Without fasten.init() there is no transport to log to, and the app's
+    exception still reaches the server."""
+    assert fasten.transport() is None
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError as e:
+        assert str(e) == "app failed"
+    else:
+        raise AssertionError("the app's exception was swallowed")
+
+
+def test_api_logger_reraises_app_error_after_logging(initialized):
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    transport = fasten.transport()
+    before = len(transport.query_api(limit=100))
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the app's exception was swallowed")
+    rows = transport.query_api(limit=100)
+    assert len(rows) == before + 1
+    row = next(r for r in rows if r["path"] == "/users")
+    assert row["status"] == 500
+
+
+def test_api_logger_log_failure_does_not_replace_app_error(initialized, monkeypatch):
+    transport = fasten.transport()
+
+    def broken(row):
+        raise OSError("stdout closed")
+
+    monkeypatch.setattr(transport, "write_api", broken)
+    app = APILogger(_Boom())
+    _, send = _send_recorder()
+    try:
+        asyncio.run(app(_scope(), _noop_receive, send))
+    except RuntimeError as e:
+        assert str(e) == "app failed"
+    else:
+        raise AssertionError("the app's exception was lost")
+
+
+def test_api_logger_log_failure_does_not_fail_a_served_request(initialized, monkeypatch):
+    transport = fasten.transport()
+
+    def broken(row):
+        raise OSError("stdout closed")
+
+    monkeypatch.setattr(transport, "write_api", broken)
+    app = APILogger(_Echo())
+    sent, send = _send_recorder()
+    asyncio.run(app(_scope(), _noop_receive, send))
+    assert any(m["type"] == "http.response.start" for m in sent)
+
+
+class _StartThenBoom:
+    """ASGI app that starts a 201 response, then fails."""
+
+    async def __call__(self, scope, receive, send):
+        await send({"type": "http.response.start", "status": 201, "headers": []})
+        raise RuntimeError("app failed")
+
+
+def test_api_logger_keeps_the_status_already_sent(initialized):
+    app = RequestIDMiddleware(APILogger(_StartThenBoom()))
+    _, send = _send_recorder()
+    scope = {**_scope(), "headers": [(b"x-request-id", b"deadbeefcafe")]}
+    try:
+        asyncio.run(app(scope, _noop_receive, send))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the app's exception was swallowed")
+    rows = fasten.transport().query_api(limit=100)
+    assert len(rows) == 1
+    assert rows[0]["status"] == 201
+    assert rows[0]["request_id"] == "deadbeefcafe"
+
+
+def test_api_logger_records_500_and_request_id_when_the_app_fails(initialized):
+    app = RequestIDMiddleware(APILogger(_Boom()))
+    _, send = _send_recorder()
+    scope = {**_scope(), "headers": [(b"x-request-id", b"deadbeefcafe")]}
+    try:
+        asyncio.run(app(scope, _noop_receive, send))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the app's exception was swallowed")
+    rows = fasten.transport().query_api(limit=100)
+    assert len(rows) == 1
+    assert rows[0]["status"] == 500
+    assert rows[0]["request_id"] == "deadbeefcafe"

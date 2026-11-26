@@ -100,23 +100,24 @@ func MustLoad(path string) {
 // left alone. Codes no longer in any file become unknown (Emit returns an
 // error); codes added with Register() are kept.
 func Reload() error {
+	// yamlMu is held from reading the path list to the swap, so a Load
+	// meanwhile waits rather than being dropped by a registry built from the
+	// old list. The order is yamlMu then regMu, as in Load; the reverse
+	// deadlocked against a concurrent Load. Emit takes only regMu.
 	yamlMu.Lock()
-	paths := append([]string{}, yamlPaths...)
-	yamlMu.Unlock()
+	defer yamlMu.Unlock()
 
-	if len(paths) == 0 {
+	if len(yamlPaths) == 0 {
 		return nil
 	}
 
-	fresh, err := buildFromYAMLPaths(paths)
+	fresh, err := buildFromYAMLPaths(yamlPaths)
 	if err != nil {
 		return err
 	}
 
 	regMu.Lock()
 	defer regMu.Unlock()
-	yamlMu.Lock()
-	defer yamlMu.Unlock()
 
 	programmatic := map[Code]Meta{}
 	for code, meta := range _registry {

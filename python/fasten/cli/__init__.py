@@ -66,7 +66,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     if args.cmd == "dump":
-        from ..codes import AuditCatalogError, load as load_catalog
+        from ..codes import AuditCatalogError
+        from ..codes import load as load_catalog
         for path in args.catalog:
             try:
                 load_catalog(path)

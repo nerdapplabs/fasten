@@ -365,7 +365,7 @@ pub unsafe extern "C" fn fasten_store_mark_shipped(
 /// Delete rows whose `timestamp` is before `before_iso8601`.
 ///
 /// `before_iso8601`:     RFC 3339 timestamp (any offset) or a date (midnight
-///                       UTC); anything else is FASTEN_ERR_NULL_ARG. Rows strictly older are
+///                       UTC); anything else is `FASTEN_ERR_NULL_ARG`. Rows strictly older are
 ///                       deleted, per node only below the lowest kept seq
 ///                       (spec §2.3).
 /// `respect_unshipped`:  non-zero: keep rows with `shipped_at IS NULL` and
@@ -637,6 +637,8 @@ pub unsafe extern "C" fn fasten_store_free_str(s: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn fasten_store_version() -> *const c_char {
     static VERSION: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    // A Cargo version string never contains a NUL byte.
+    #[allow(clippy::expect_used)]
     VERSION
         .get_or_init(|| {
             CString::new(env!("CARGO_PKG_VERSION")).expect("version is NUL-free")

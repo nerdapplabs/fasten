@@ -147,7 +147,8 @@ def _check_audit_dsn() -> CheckResult:
         return CheckResult(
             name="audit_dsn",
             status="fail",
-            message="not set: audit rows go to stdout only. Set FASTEN_AUDIT_DSN for durable storage.",
+            message=("not set: audit rows go to stdout only. "
+                     "Set FASTEN_AUDIT_DSN for durable storage."),
         )
     # Same scheme test and SQLite path as the engine's audit store.
     failed = _scheme_failure("audit_dsn", dsn)
@@ -163,7 +164,8 @@ def _check_api_dsn() -> CheckResult:
         return CheckResult(
             name="api_dsn",
             status="ok",
-            message="not configured — ring-buffer only (default; persist via FASTEN_API_DSN if needed)",
+            message=("not configured — ring-buffer only "
+                     "(default; persist via FASTEN_API_DSN if needed)"),
         )
     # Same scheme test and SQLite path as the engine's stream store.
     failed = _scheme_failure("api_dsn", dsn)
@@ -203,7 +205,8 @@ def _check_shim_http() -> CheckResult:
         return CheckResult(
             name="shim_http",
             status="warn",
-            message=f"fasten.shim.http not importable: {e} (HTTP correlation will not auto-propagate)",
+            message=(f"fasten.shim.http not importable: {e} "
+                     "(HTTP correlation will not auto-propagate)"),
         )
 
 
@@ -214,7 +217,8 @@ def _check_correlation() -> CheckResult:
         return CheckResult(
             name="correlation",
             status="ok",
-            message="current_request_id() = None (no active request scope — expected for CLI invocation)",
+            message=("current_request_id() = None "
+                     "(no active request scope — expected for CLI invocation)"),
         )
     return CheckResult(
         name="correlation",

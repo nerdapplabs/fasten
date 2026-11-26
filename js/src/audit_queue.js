@@ -312,8 +312,13 @@ class AuditQueueDrainer {
 
 	_onFailure(err) {
 		const msg = errorType(err);
+		// Spec: failed fires when retry_count goes from 0 to 1, so once per
+		// failing row. The burst start is kept from the first failure until a
+		// row is stored, across dead letters, so recovery is timed from it.
 		const first = this._retryCount === 0;
-		if (first) this._failureBurstStartedAt = Date.now();
+		if (this._failureBurstStartedAt === null) {
+			this._failureBurstStartedAt = Date.now();
+		}
 		this._retryCount++;
 		this._lastError = msg;
 		const crossedDegraded =
@@ -336,8 +341,10 @@ class AuditQueueDrainer {
 	}
 
 	_onSuccess() {
+		// Spec: recovered fires when an insert succeeds after failures, a
+		// success straight after a dead letter included.
 		let recoveredAfter = null;
-		if (this._retryCount > 0 && this._failureBurstStartedAt !== null) {
+		if (this._failureBurstStartedAt !== null) {
 			recoveredAfter = (Date.now() - this._failureBurstStartedAt) / 1000;
 		}
 		this._retryCount = 0;

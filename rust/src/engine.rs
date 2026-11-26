@@ -609,15 +609,23 @@ impl Engine {
         let streams = self.streams.lock_or_recover().take();
         let written = streams.is_none_or(|s| s.close(deadline));
         let old = { let mut slot = self.drainer.lock_or_recover(); slot.take() };
+        // Spec §10: close returns false when a row was lost at stop, as
+        // install_drainer already reports for a drainer it retires.
+        let mut stored = true;
         if let Some(d) = old {
+            let unstored_before = d.unstored_total();
             d.stop(deadline.saturating_duration_since(std::time::Instant::now()));
+            if d.unstored_total() > unstored_before {
+                self.audit_swallowed.store(true, Ordering::Relaxed);
+                stored = false;
+            }
         }
         #[cfg(test)]
         if let Some(f) = BEFORE_RELEASE.with(|h| h.borrow_mut().take()) {
             f();
         }
         self.release_env_stores(installs);
-        flushed && written
+        flushed && written && stored
     }
 
     /// Let go of the stores opened from DSN variables, in the env store

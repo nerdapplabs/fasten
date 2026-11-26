@@ -11,6 +11,8 @@ use fasten_core::store::stream::{
 };
 use pg::types::ToSql;
 
+use crate::pg_runtime::{off_runtime, Conn};
+
 use crate::streams::{StreamFilter, StreamRow, StreamStore};
 use crate::Error;
 
@@ -44,7 +46,7 @@ pub struct PostgresStreamStore {
     dsn: String,
     table: String,
     insert_sql: String,
-    client: Mutex<Option<pg::Client>>,
+    client: Mutex<Option<Conn>>,
     write_failures: AtomicU64,
 }
 
@@ -96,6 +98,10 @@ impl PostgresStreamStore {
     /// `"syslog"` to share tables with the other SDKs. `sslmode` is handled
     /// as in [`crate::PostgresStore`].
     pub fn new(dsn: &str, table: &str) -> Result<Self, Error> {
+        off_runtime(|| Self::open(dsn, table))
+    }
+
+    fn open(dsn: &str, table: &str) -> Result<Self, Error> {
         let (schema, bare) = match table.split_once('.') {
             Some((s, t)) => (Some(s), t),
             None => (None, table),
@@ -119,7 +125,7 @@ impl PostgresStreamStore {
             dsn: dsn.to_string(),
             table: table.to_string(),
             insert_sql,
-            client: Mutex::new(Some(client)),
+            client: Mutex::new(Some(Conn(Some(client)))),
             write_failures: AtomicU64::new(0),
         })
     }
@@ -131,15 +137,20 @@ impl PostgresStreamStore {
 
     /// Run `f` on the connection, opening one first when there is none or it
     /// has closed. With `retry`, a call that loses its connection runs once
-    /// more on a new one.
-    fn call<T>(&self, retry: bool, f: impl Fn(&mut pg::Client) -> Result<T, pg::Error>) -> Result<T, Error> {
+    /// more on a new one. Runs off a tokio runtime thread, as
+    /// [`crate::PostgresStore`] does.
+    fn call<T: Send>(&self, retry: bool, f: impl Fn(&mut pg::Client) -> Result<T, pg::Error> + Sync) -> Result<T, Error> {
+        off_runtime(|| self.call_here(retry, &f))
+    }
+
+    fn call_here<T>(&self, retry: bool, f: impl Fn(&mut pg::Client) -> Result<T, pg::Error>) -> Result<T, Error> {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
         for attempt in 0..2 {
-            if guard.as_ref().is_none_or(pg::Client::is_closed) {
+            if guard.as_deref().is_none_or(pg::Client::is_closed) {
                 *guard = None;
-                *guard = Some(reconnect(&self.dsn)?);
+                *guard = Some(Conn(Some(reconnect(&self.dsn)?)));
             }
-            let Some(client) = guard.as_mut() else { break };
+            let Some(client) = guard.as_deref_mut() else { break };
             match f(client) {
                 Ok(v) => return Ok(v),
                 Err(e) => {

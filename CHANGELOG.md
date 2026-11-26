@@ -19,6 +19,78 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 - fasten-core: `fasten_redact_opts` and `fasten_redact_opts_buf` take the
   redaction options as one JSON object, including `check_numbers`.
 
+### Fixed: floats in audit details are stored as written
+
+- Python, Go and Rust: a float in an audit row's detail is stored and
+  hashed as the value written. Before, a few values were changed to a
+  neighbouring double, for example `4111111111111111.5` to
+  `4111111111111111.0`, because these SDKs redact details in fasten-core.
+  JS was not affected. Rows already stored verify as before.
+
+### Fixed: queue-mode drain events and capacity; Rust Postgres from async code
+
+- All SDKs: a row stored straight after a dead-lettered row now reports
+  `audit_drain_recovered`. No recovery was reported before.
+- Python, Go, C++, Rust: `in_backoff_until` and `audit_drain_degraded`
+  report the wait the drainer actually sleeps.
+- Rust: `queue_capacity: Some(0)` takes the default (100). Every emit used to
+  block forever.
+- JS: `queueCapacity: 0` takes the default (100), as in the other SDKs. It
+  turned off the queue warning events.
+- Rust: a Postgres audit store, and a Postgres api or sys store such as
+  one from `FASTEN_API_DSN` or `FASTEN_SYSLOG_DSN`, can be opened, used and
+  dropped from async code. It panicked on a tokio runtime thread with
+  "Cannot start a runtime from within a runtime".
+- Rust: `close()` returns `false` when a row is lost at shutdown. It
+  reported success.
+
+### Fixed: rows lost, hung or changed after emit
+
+- Python: a closed or missing stdout (a broken pipe, `pythonw`) no longer
+  stops `emit()` or loses the row. Lost audit lines are logged as an error
+  on the `fasten` logger at most once a minute, naming a row and counting
+  the lines lost since the last report; for log and API lines, stderr says
+  so once.
+- Python, Go: a SQLite insert retried after a lost commit returns the row
+  that was stored. It printed a row that was never stored, so a capture of
+  stdout failed to verify.
+- JS: changing the row `emit()` returned no longer changes what is stored,
+  and can no longer undo its redaction.
+- Go: calling `Load` and `Reload` at the same time no longer deadlocks, and
+  `Reload` no longer drops codes a concurrent `Load` added.
+- Go: two loggers made from one `SlogHandler` keep their own attributes.
+
+### Fixed: Python redaction patterns
+
+- An `extra_value_redact_patterns` entry the core cannot compile raises
+  `ValueError` naming it from `fasten.init()`, before the running config
+  changes. Before, every detail became `{"_redact_failed": true}` with no
+  warning.
+- A detail that fails redaction for any other reason is still replaced by the
+  unredactable marker, and the first failure of each kind is now logged as
+  an error on the `fasten` logger, without the value.
+
+### Fixed: Python `APILogger` keeps the app's exception
+
+- When the app raised before `fasten.init()` had run, `APILogger` returned
+  from its cleanup and the exception never reached the server. It is
+  re-raised now.
+- A failed API log write is logged as a warning and no longer replaces the
+  app's exception or fails a request that was already served.
+- When the app raises before its response starts, the API row records
+  status 500, the status the server sends, and the request id.
+
+### Changed: Python redacts every detail shape the same way
+
+- A detail dict with a key JSON cannot encode, such as a tuple, is redacted
+  with the same settings as any other detail: `extra_value_patterns`, the
+  replacement and the size cap all apply. Its keys are kept as they are.
+- A value JSON cannot encode, such as a `datetime`, is converted with `str()`
+  and then redacted. `fasten.log` calls with such a field no longer raise.
+- A value that cannot be encoded at all, such as a dict that contains itself
+  or nesting too deep to encode, is replaced by the unredactable marker. A
+  value whose `str()` raises becomes `<str failed>`; neither raises.
+
 ### Fixed: JS and Python DSN errors
 
 - DSN errors name a scheme only when the DSN has one, that is when `//`

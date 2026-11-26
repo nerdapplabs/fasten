@@ -356,3 +356,128 @@ def test_stdout_transport_log_rows_do_not_raise_without_the_core(no_core, capsys
     assert "hunter2" not in captured.out
     assert "_redact_failed" in captured.out
     assert captured.err.count("libfasten_core not found") == 1
+
+
+def test_bad_value_pattern_is_refused_when_configured():
+    """A pattern the core cannot compile is refused where it is configured,
+    naming it, instead of turning every detail into the unredactable marker."""
+    with pytest.raises(ValueError, match=r"extra_value_redact_patterns: .*\(\["):
+        Redactor(extra_value_patterns=[("ok", r"OK_\d+", "X"), ("bad", "([", "Y")])
+
+
+def test_rejected_reinit_keeps_the_running_config():
+    """A bad pattern on re-init raises before anything changes, so the
+    engine keeps the redactor it had."""
+    from fasten.engine import Engine
+    e = Engine()
+    e.init(service_id="svc", node_id="n1", extra_redact_keys=["field_x"])
+    try:
+        before = e._redactor
+        with pytest.raises(ValueError):
+            e.init(service_id="svc", node_id="n1",
+                   extra_value_redact_patterns=[("bad", "([", "Y")])
+        assert e._redactor is before
+        assert before.redact({"field_x": "v"}) == {"field_x": "***"}
+    finally:
+        e.close()
+
+
+def test_bad_value_pattern_is_refused_before_a_dsn_store_opens(tmp_path, monkeypatch):
+    """init_config opens DSN stores; a pattern refused after that would leave
+    a connection nothing closes. It is checked first, so no store is opened."""
+    from fasten.engine import Engine
+    db = tmp_path / "audit.db"
+    monkeypatch.setenv("FASTEN_AUDIT_DSN", str(db))
+    with pytest.raises(ValueError, match="extra_value_redact_patterns"):
+        Engine().init_config(service_id="svc", node_id="n1",
+                             extra_value_redact_patterns=[("bad", "([", "Y")])
+    assert not db.exists()
+
+
+# Values json.dumps cannot encode as they are
+
+def test_custom_value_pattern_applies_under_a_tuple_key():
+    r2 = Redactor(extra_value_patterns=[("acct", r"acct-\d+", "[acct]")])
+    out = r2.redact({(1, 2): "acct-1234", "note": "see acct-99"})
+    # A match replaces the whole value, as on the plain JSON path.
+    assert out == {(1, 2): "[acct]", "note": "[acct]"}
+
+
+def test_custom_replacement_applies_under_an_int_key():
+    r2 = Redactor(replacement="<x>")
+    out = r2.redact({1: {"password": "hunter2"}, "api_key": "k"})
+    assert out[1] == {"password": "<x>"}
+    assert out["api_key"] == "<x>"
+
+
+def test_datetime_value_is_converted_and_redacted(r):
+    import datetime as dt
+    when = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+    out = r.redact({"at": when, "password": when})
+    assert out == {"at": str(when), "password": "***"}
+
+
+def test_value_with_a_secret_in_its_str_is_redacted(r):
+    class Note:
+        def __str__(self) -> str:
+            return "card 4111111111111111"
+
+    out = r.redact({"note": Note(), 7: Note()})
+    assert out == {"note": "***CC***", 7: "***CC***"}
+
+
+def test_size_cap_applies_under_a_tuple_key(monkeypatch, r):
+    monkeypatch.setenv("FASTEN_MAX_DETAIL_BYTES", "64")
+    out = r.redact({(1, 2): "x" * 200})
+    assert out["_truncated"] is True
+
+
+def test_circular_value_becomes_the_unredactable_marker(r):
+    loop: dict = {}
+    loop["self"] = loop
+    assert r.redact(loop) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_log_field_with_a_datetime_is_written(initialized):
+    import datetime as dt
+    import fasten
+    fasten.log.info("tick", at=dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc), token="t")
+    rows = [r for r in fasten.transport().query_syslog(limit=100) if r.get("event") == "tick"]
+    assert len(rows) == 1
+    assert rows[0]["token"] == "***"
+    assert rows[0]["at"].startswith("2026-01-02")
+
+
+class _StrFails:
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+
+def test_value_whose_str_raises_does_not_raise(r):
+    assert r.redact({1: "ok", "password": _StrFails()}) == {1: "ok", "password": "***"}
+    assert r.redact({"note": _StrFails()}) == {"note": "<str failed>"}
+
+
+def test_very_deep_nesting_becomes_the_unredactable_marker(r):
+    deep: dict = {}
+    cur = deep
+    for _ in range(5000):
+        cur["a"] = {}
+        cur = cur["a"]
+    assert r.redact(deep) == {"_redact_failed": True, "_summary": "<unredactable>"}
+
+
+def test_redaction_failure_is_logged_once_per_error_type(caplog):
+    """A failure inside redaction blanks the detail; the first of each error
+    type is logged so a bug there is seen. The value is not in the log."""
+    r = Redactor(replacement="<x>")
+
+    def broken(_s):
+        raise KeyError("hunter2")
+    r._fast_redact_json = broken
+    assert r.redact({"note": "a"})["_redact_failed"] is True
+    assert r.redact({"note": "b"})["_redact_failed"] is True
+    logged = [rec.getMessage() for rec in caplog.records if rec.name == "fasten"]
+    assert len(logged) == 1
+    assert logged[0].startswith("redaction failed (KeyError)")
+    assert "hunter2" not in logged[0]

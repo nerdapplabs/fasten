@@ -282,6 +282,48 @@ def test_stdout_failure_after_store_is_not_a_failed_insert(tmp_path, monkeypatch
     assert not _default.audit_write_swallowed()
 
 
+class _BrokenPipe:
+    def write(self, _s):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.parametrize("stdout", [_BrokenPipe(), None], ids=["epipe", "no-stdout"])
+def test_broken_stdout_still_stores_the_row(tmp_path, monkeypatch, stdout, caplog):
+    """The unsealed stdout line is written before the store. A closed pipe,
+    or no stdout under pythonw, costs that line only (spec 4): emit() does
+    not raise, the row is stored, and the lost line is logged with its row."""
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    row = fasten.emit(code="USER_CREATED", target="u-1")
+    assert fasten.flush(timeout=2.0)
+    assert [r.id for r in _rows(store)] == [row.id]
+    lost = [r.getMessage() for r in caplog.records if r.name == "fasten"]
+    assert len(lost) == 1 and lost[0].startswith(f"unsealed stdout line failed for {row.id}:")
+
+
+def test_lost_stdout_lines_are_reported_once_per_interval(tmp_path, monkeypatch, caplog):
+    """With stdout gone every emit loses two lines. One error per interval
+    names a row and counts the lines lost since the last report."""
+    store = FlakyStore(str(tmp_path / "a.db"))
+    _init(store)
+    monkeypatch.setattr(sys, "stdout", _BrokenPipe())
+    fasten.emit(code="USER_CREATED", target="u-1")
+    fasten.emit(code="USER_CREATED", target="u-2")
+    assert fasten.flush(timeout=2.0)
+    assert len([r for r in caplog.records if r.name == "fasten"]) == 1
+
+    _default._lost_line_reported_at -= 61
+    row = fasten.emit(code="USER_CREATED", target="u-3")
+    lost = [r.getMessage() for r in caplog.records if r.name == "fasten"]
+    assert len(lost) == 2
+    assert lost[1].startswith(
+        f"unsealed stdout line failed for {row.id} (3 more audit lines lost since the last report):")
+
+
 def test_v12_emit_after_drainer_stopped_is_stored(tmp_path):
     store = FlakyStore(str(tmp_path / "a.db"))
     _init(store)

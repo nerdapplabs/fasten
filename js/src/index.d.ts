@@ -143,6 +143,7 @@ export interface InitOptions {
 	 */
 	redactNumbers?: boolean;
 	auditStoreFailureStrategy?: "queue" | "raise";
+	/** Warning threshold for the queue; 0 or unset means 100. */
 	queueCapacity?: number;
 	queueRetryInitialMs?: number;
 	queueRetryMaxMs?: number;
