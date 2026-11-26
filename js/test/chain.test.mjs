@@ -226,7 +226,7 @@ describe('vectors sealed by Python, Go and Rust', () => {
     test('spec/python-sealed-forms.json', () => {
         const file = load('spec/python-sealed-forms.json');
         assert.equal(file.current_form, CURRENT_CANONICAL_FORM_ID);
-        assert.equal(file.cases.length, 11);
+        assert.equal(file.cases.length, 12);
         for (const { label, row } of file.cases) {
             assertSealed(label, row);
             assertVerifies(label, [row]);

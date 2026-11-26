@@ -6,6 +6,14 @@ Versioning: [Semantic Versioning 2.0](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed: floats in audit details are stored as written
+
+- Python, Go and Rust: a float in an audit row's detail is stored and
+  hashed as the value written. Before, a few values were changed to a
+  neighbouring double, for example `4111111111111111.5` to
+  `4111111111111111.0`, because these SDKs redact details in fasten-core.
+  JS was not affected. Rows already stored verify as before.
+
 ### Fixed: queue-mode drain events and capacity; Rust Postgres from async code
 
 - All SDKs: a row stored straight after a dead-lettered row now reports
