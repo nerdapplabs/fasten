@@ -23,8 +23,8 @@ type _ConformanceCase struct {
 	Name         string         `json:"name"`
 	Group        string         `json:"group"`
 	CheckNumbers bool           `json:"check_numbers"`
-	Input    map[string]any `json:"input"`
-	Expected map[string]any `json:"expected"`
+	Input        map[string]any `json:"input"`
+	Expected     map[string]any `json:"expected"`
 }
 
 func _loadConformanceCases(t *testing.T) []_ConformanceCase {

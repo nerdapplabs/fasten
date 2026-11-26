@@ -26,6 +26,10 @@ final class RedactConformanceTests: XCTestCase {
                 value = a.map { $0.value }
             } else if let s = try? c.decode(String.self) {
                 value = s
+            } else if let n = try? c.decode(Double.self), n.rounded() != n {
+                // On Linux decode(Int.self) also accepts a float and drops
+                // its fraction, so the integer paths only see whole numbers.
+                value = n
             } else if let i = try? c.decode(Int.self) {
                 value = i
             } else if let u = try? c.decode(UInt64.self) {
