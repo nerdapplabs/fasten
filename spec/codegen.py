@@ -8,8 +8,7 @@ Usage:
     python spec/codegen.py --write   update adapter files in place
     python spec/codegen.py --check   exit 1 if any adapter is out of date
 
-Covers the Python, Go, JS, Rust and C++ SDKs. gen_java is not in ADAPTERS, so
-the generated block in java/ is not checked.
+Covers the Python, Go, JS, Rust, C++ and Java SDKs.
 
 The output matches what the formatters leave (gofmt for Go, Biome for JS), so
 a formatted file passes --check.
@@ -334,6 +333,8 @@ ADAPTERS = [
             "//", gen_rust),
     Adapter("cpp",    ROOT / "cpp" / "include" / "fasten.hpp",
             "//", gen_cpp),
+    Adapter("java",   ROOT / "java" / "src" / "main" / "java" / "sh" / "fasten" / "Fasten.java",
+            "//", gen_java),
 ]
 
 
