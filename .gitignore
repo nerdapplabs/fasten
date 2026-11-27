@@ -1,3 +1,6 @@
+# OS cruft, repo-wide
+.DS_Store
+
 # C++ build artifacts
 cpp/audit_queue_smoke
 cpp/pii_smoke
@@ -59,4 +62,3 @@ swift/Package.resolved
 
 # Website
 website/dist/
-.DS_Store
